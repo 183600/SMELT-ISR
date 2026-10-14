@@ -476,8 +476,13 @@ class SparseMoE(nn.Module):
         # 完全一致。
         outputs = torch.empty_like(gathered)
 
+        # 专家循环位于每层每次前向/反向的热路径上，
+        # 属性查找开销按 层数×调用次数 累积；
+        # 提升为局部变量，数值语义不变。
+        experts = self.experts
+
         start = 0
-        for expert_id, expert in enumerate(self.experts):
+        for expert_id, expert in enumerate(experts):
             count = counts[expert_id]
 
             if count == 0:
@@ -878,6 +883,17 @@ class LanguageModel(nn.Module):
             for i in range(self.middle_start, self.middle_end)
         )
 
+        # 前向热路径上的常驻权重引用：避免每次前向重复
+        # 逐层属性查找；与 position_embedding.weight 指向
+        # 同一参数（共享存储）。经 object.__setattr__ 写入
+        # 实例字典，避免重复注册到 _parameters 而污染
+        # state_dict 与检查点兼容。
+        object.__setattr__(
+            self,
+            "position_embedding_weight",
+            self.position_embedding.weight,
+        )
+
         # B 第一轮 middle[1:] 的常驻视图：与每次前向切出
         # middle[1:] 内容完全相同。
         self.middle_blocks_rest = self.middle_blocks[1:]
@@ -976,7 +992,7 @@ class LanguageModel(nn.Module):
         # 属性查找结果缓存为局部变量。
         x = self.token_embedding(input_ids)
         x.add_(
-            self.position_embedding.weight[:time]
+            self.position_embedding_weight[:time]
         )
 
         aux_losses: List[torch.Tensor] = []
