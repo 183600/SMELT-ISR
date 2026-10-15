@@ -707,9 +707,6 @@ class SparseMoE(nn.Module):
             return output.view(out_shape)
 
         # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
-        # 这里必须保持 out-of-place：原地乘法会与需要门控权重
-        # 的自动求导（AOTAutograd / torch.compile）冲突，
-        # 触发「梯度计算所需的张量被原地修改」错误。
         weights = top_weights.to(
             expert_outputs.dtype
         ).unsqueeze(-1)
@@ -859,12 +856,8 @@ class TransformerBlock(nn.Module):
         #
         # 每个分支都保留完整残差：x + residual_scale * expert。
         #
-        # dtype 一致时先原地缩放，再与残差广播相加：一次写入
-        # 直接得到 [batch, k1, time, dim] 连续分支张量，后续
-        # 按 batch 展平无需再做一次布局拷贝；加法与逐算子路径
-        # 使用同一 elementwise 语义（加法交换律按位成立），
-        # 数值逐位一致。autocast 下残差流精度更高时走
-        # out-of-place 的类型提升路径。
+        # dtype 一致时原地完成缩放与残差相加；
+        # autocast 下残差流精度更高时走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             expert_outputs.mul_(
                 self.residual_scale,
@@ -965,9 +958,6 @@ class TransformerBlock(nn.Module):
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：广播乘 + 沿分支维求和。
-            # 必须保持 out-of-place：门控权重需要梯度，原地
-            # 乘法会让 AOTAutograd 的版本检查失败
-            #（torch.compile 下反向报错）。
             x = (
                 branches
                 * gates.to(branches.dtype).unsqueeze(-1)
@@ -2609,9 +2599,6 @@ def main():
             group["lr"] for group in optimizer.param_groups
         ]
 
-    # 检查点载荷中的模型/优化器张量已在上面的 load_state_dict
-    # 中拷入各自的模块（optimizer 内部会深拷贝），此后不再有
-    # 引用；及时释放可避免整份检查点在设备上常驻。
     if rng_payload is not None:
         del rng_payload
 
