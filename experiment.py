@@ -283,65 +283,6 @@ class Expert(nn.Module):
 # Sparse MoE
 # ============================================================
 
-class _SplitExpertInputs(torch.autograd.Function):
-    """
-    dispatch 的输入侧：按每专家计数切分排序后的 assignment。
-
-    forward 等价于 index_select 后按 counts split；
-    backward 把各段梯度直接 index_add 回 flat。各段互不
-    重叠且并集完整，累加顺序与「先还原整块梯度再散射」
-    一致，数值逐位相同。
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        flat: torch.Tensor,
-        sorted_token_ids: torch.Tensor,
-        counts: list,
-    ) -> Tuple[torch.Tensor, ...]:
-        ctx.counts = counts
-        ctx.flat_shape = flat.shape
-
-        if ctx.needs_input_grad[0]:
-            ctx.save_for_backward(sorted_token_ids)
-
-        gathered = flat.index_select(0, sorted_token_ids)
-        return tuple(gathered.split(counts, dim=0))
-
-    @staticmethod
-    def backward(
-        ctx,
-        *segment_grads: torch.Tensor,
-    ) -> Tuple[Optional[torch.Tensor], None, None]:
-        (sorted_token_ids,) = ctx.saved_tensors
-
-        grad_flat = None
-        start = 0
-
-        for grad, count in zip(segment_grads, ctx.counts):
-            if count == 0:
-                continue
-
-            end = start + count
-
-            if grad_flat is None:
-                grad_flat = torch.zeros(
-                    ctx.flat_shape,
-                    dtype=grad.dtype,
-                    device=grad.device,
-                )
-
-            grad_flat.index_add_(
-                0,
-                sorted_token_ids[start:end],
-                grad,
-            )
-            start = end
-
-        return grad_flat, None, None
-
-
 class _MergeExpertOutputs(torch.autograd.Function):
     """
     dispatch 的输出侧：把各专家输出散射回原始 assignment 顺序。
@@ -599,15 +540,12 @@ class SparseMoE(nn.Module):
                 rounding_mode="floor",
             )
 
-        counts = self._read_counts(counts)
+        # 先发起 gather（不依赖 counts），再回读 counts：
+        # D2H 等待期间 GPU 可继续执行 gather。
+        gathered = flat.index_select(0, sorted_token_ids)
 
-        # 每专家连续输入段由单个自定义节点切出，反向按段
-        # 直接 index_add 回 flat。
-        segments = _SplitExpertInputs.apply(
-            flat,
-            sorted_token_ids,
-            counts,
-        )
+        counts = self._read_counts(counts)
+        segments = gathered.split(counts, dim=0)
 
         # 逐专家计算其连续输入段；空段原样占位，不产生
         # 专家调用。
@@ -1369,12 +1307,6 @@ class ByteDataset:
         self.val = tokens[split:]
         self.seq_len = seq_len
 
-        # 窗口偏移。
-        self._offsets = torch.arange(
-            seq_len + 1,
-            device=tokens.device,
-        )
-
         # 窗口暂存槽按调用方的 device 决定是否启用。
         self._stage_slots = None
         self._stage_index = 0
@@ -1392,45 +1324,41 @@ class ByteDataset:
                 "验证集长度不足"
             )
 
+        # unfold 产生 [num_windows, seq_len + 1] 的滑动窗口
+        # 视图（stride 为 1），采样时按起点直接 index_select，
+        # 不必为每个批次构造（并搬运）int64 索引张量。
+        self._train_windows = self.train.unfold(
+            0,
+            seq_len + 1,
+            1,
+        )
+        self._val_windows = self.val.unfold(
+            0,
+            seq_len + 1,
+            1,
+        )
+
     def _gather_windows(
         self,
-        data: torch.Tensor,
+        windows: torch.Tensor,
         starts: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
         """
-        按窗口起点收集 [num_starts, seq_len + 1] 的字节窗口，
-        并搬运到目标设备（尚未转 int64）。
+        按窗口起点从 [num_windows, seq_len + 1] 的窗口视图收集字节，
+        并搬运到目标设备（尚未转整数索引）。
 
         CUDA 下经暂存槽搬运，CPU 下走普通索引路径。
         """
-        # starts 与 _offsets 均为 CPU 张量，窗口切片在 CPU 完成。
-        numel = starts.numel() * (self.seq_len + 1)
-        index_stage = getattr(self, "_index_stage", None)
-        if index_stage is None or index_stage.numel() < numel:
-            with torch.inference_mode(False):
-                index_stage = torch.empty(numel, dtype=torch.int64)
-            self._index_stage = index_stage
-
-        flat_index_2d = index_stage[:numel].view(
-            starts.numel(),
-            self.seq_len + 1,
-        )
-        torch.add(
-            starts[:, None],
-            self._offsets[None, :],
-            out=flat_index_2d,
-        )
-        flat_index = flat_index_2d.reshape(-1)
+        num_rows = starts.numel()
 
         if device.type != "cuda" or not torch.cuda.is_available():
             # index_select 连续收集，收集到的字节内容完全一致。
             return torch.index_select(
-                data,
+                windows,
                 0,
-                flat_index,
-            # 空批（0 窗口）时不能用 -1 推导列数。
-            ).view(-1, self.seq_len + 1).to(device)
+                starts,
+            ).to(device)
 
         if self._stage_slots is None:
             # 每槽: [缓冲区或 None, 拷贝完成 Event 或 None]
@@ -1447,6 +1375,7 @@ class ByteDataset:
         else:
             event.synchronize()
 
+        numel = num_rows * (self.seq_len + 1)
         buffer = slot[0]
         if buffer is None or buffer.numel() < numel:
             with torch.inference_mode(False):
@@ -1457,10 +1386,11 @@ class ByteDataset:
                 )
             slot[0] = buffer
 
-        staged = buffer[:numel]
-        torch.index_select(data, 0, flat_index, out=staged)
-        # 空批（0 窗口）时不能用 -1 推导列数。
-        staged = staged.view(-1, self.seq_len + 1)
+        staged = buffer[:numel].view(
+            num_rows,
+            self.seq_len + 1,
+        )
+        torch.index_select(windows, 0, starts, out=staged)
 
         chunks = staged.to(device, non_blocking=True)
 
@@ -1478,8 +1408,10 @@ class ByteDataset:
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if split == "train":
+            windows = self._train_windows
             data = self.train
         elif split == "val":
+            windows = self._val_windows
             data = self.val
         else:
             raise ValueError(f"未知 split: {split}")
@@ -1493,14 +1425,16 @@ class ByteDataset:
             generator=generator,
         )
 
-        # 窗口先以 uint8 搬运，到目标设备后再转 int64。
+        # 窗口先以 uint8 搬运：输入 embedding 只接受 int32/int64，
+        # 在目标设备上转 int32；目标 token 保持 uint8（cross_entropy
+        # 直接支持 Byte 目标），省去整批 int64 转换。
         chunks = self._gather_windows(
-            data,
+            windows,
             starts,
             device,
-        ).long()
+        )
 
-        x = chunks[:, :-1]
+        x = chunks[:, :-1].to(torch.int32)
         y = chunks[:, 1:]
 
         return x, y
@@ -1543,12 +1477,15 @@ class ByteDataset:
         starts = self._starts[begin:begin + batch_size]
 
         chunks = self._gather_windows(
-            self.val,
+            self._val_windows,
             starts,
             device,
-        ).long()
+        )
 
-        return chunks[:, :-1], chunks[:, 1:]
+        x = chunks[:, :-1].to(torch.int32)
+        y = chunks[:, 1:]
+
+        return x, y
 
 
 # ============================================================
