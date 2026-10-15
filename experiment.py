@@ -828,25 +828,15 @@ class TransformerBlock(nn.Module):
         # [batch, time, k1, dim]
         #
         # 每个分支都保留完整残差：x + residual_scale * expert。
-        #
-        # dtype 一致时原地完成缩放与残差相加；缩放系数为 1.0 时
-        # 乘以 1.0 是逐位恒等（含 NaN/Inf）。
-        # autocast 下残差流精度更高时走 out-of-place 的类型提升路径。
-        if expert_outputs.dtype == x.dtype:
-            if self.residual_scale != 1.0:
-                expert_outputs.mul_(
-                    self.residual_scale,
-                )
-            branches = torch.add(
-                x.unsqueeze(1),
-                expert_outputs.permute(0, 2, 1, 3),
-            )
-        else:
-            branches = torch.add(
-                x.unsqueeze(1),
-                expert_outputs.permute(0, 2, 1, 3),
-                alpha=self.residual_scale,
-            )
+        # 缩放与残差相加用 add(alpha=) 一趟完成：alpha 乘法
+        # 与单独 mul 逐位一致，缩放系数为 1.0 时按位恒等
+        #（含 NaN/Inf）。dtype 不一致（autocast 残差流精度更
+        # 高）时同一路径靠类型提升合并。
+        branches = torch.add(
+            x.unsqueeze(1),
+            expert_outputs.permute(0, 2, 1, 3),
+            alpha=self.residual_scale,
+        )
 
         return (
             branches,
@@ -2488,14 +2478,25 @@ def main():
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    use_fused_adamw = device.type == "cuda"
-
+    # 优先使用 fused AdamW（CUDA 与新版 torch 的 CPU 均
+    # 支持）。支持范围随 torch 版本与设备变化，旧版本会在
+    # 构造或首次 step() 的惰性校验中才报错，因此先用一个
+    # 单元素参数真实走一遍 step 探测，不支持时回退到默认
+    # 实现。显式传 fused=False 会关闭默认解析，在只支持单
+    # 张量路径的设备上无法再启用多张量 / fused 优化。
+    probe = torch.zeros(1, device=device, requires_grad=True)
+    probe.grad = torch.zeros_like(probe)
+    try:
+        torch.optim.AdamW([probe], lr=args.lr, fused=True).step()
+        fused_adamw = True
+    except (RuntimeError, TypeError):
+        fused_adamw = False
     try:
         optimizer = torch.optim.AdamW(
             param_groups,
             lr=args.lr,
             weight_decay=args.weight_decay,
-            fused=use_fused_adamw,
+            fused=fused_adamw,
         )
     except (RuntimeError, TypeError):
         optimizer = torch.optim.AdamW(
@@ -2803,6 +2804,12 @@ def main():
 
     last_saved_step: Optional[int] = None
 
+    # 最近一次周期性验证的步数与结果。训练步数恰好落在
+    # 验证点上时，最后一步的参数在周期验证后不再变化，
+    # 结尾验证可直接复用同一批固定窗口的结果。
+    last_eval_step: Optional[int] = None
+    last_eval_metrics: Optional[Dict[str, float]] = None
+
     # 采样始终按步序进行（消费 train_generator 的顺序不变）。
     prefetched_batch: Optional[
         Tuple[torch.Tensor, torch.Tensor]
@@ -2923,6 +2930,9 @@ def main():
             )
             pending_records[-1]["extra"] = eval_metrics
 
+            last_eval_step = step + 1
+            last_eval_metrics = eval_metrics
+
             records = flush_records()
             print(records[-1])
             metrics_file.flush()
@@ -2971,14 +2981,20 @@ def main():
             args,
         )
 
-    final_metrics = evaluate(
-        model,
-        dataset,
-        args.batch_size,
-        args.eval_batches,
-        device,
-        amp_dtype=amp_dtype,
-    )
+    # 周期验证恰好覆盖最后一个训练步时（如 steps 是
+    # eval_interval 的整数倍），参数自那次验证后未再更新，
+    # 固定窗口集合也相同，直接复用结果，避免重复评估。
+    if last_eval_step == end_step and last_eval_metrics is not None:
+        final_metrics = last_eval_metrics
+    else:
+        final_metrics = evaluate(
+            model,
+            dataset,
+            args.batch_size,
+            args.eval_batches,
+            device,
+            amp_dtype=amp_dtype,
+        )
 
     final_record = {
         "step": "final",
