@@ -707,17 +707,14 @@ class SparseMoE(nn.Module):
             return output.view(out_shape)
 
         # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
+        # 这里必须保持 out-of-place：原地乘法会与需要门控权重
+        # 的自动求导（AOTAutograd / torch.compile）冲突，
+        # 触发「梯度计算所需的张量被原地修改」错误。
         weights = top_weights.to(
             expert_outputs.dtype
         ).unsqueeze(-1)
 
-        # 加权乘原地写回 dispatch 的输出缓冲：此处之后
-        # expert_outputs 不再被其它节点使用，逐元素乘法与
-        # out-of-place 版本使用同一 kernel 与舍入路径，
-        # 数值逐位一致。
-        expert_outputs.mul_(weights)
-
-        merged = expert_outputs.sum(dim=-2)
+        merged = (expert_outputs * weights).sum(dim=-2)
         merged = merged.reshape(out_shape)
 
         # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
@@ -968,13 +965,13 @@ class TransformerBlock(nn.Module):
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：广播乘 + 沿分支维求和。
-            # 加权乘原地写回 branches（此后不再被其它节点使用），
-            # 逐元素乘法与 out-of-place 版本使用同一 kernel 与
-            # 舍入路径，数值逐位一致。
-            branches.mul_(
-                gates.to(branches.dtype).unsqueeze(-1)
-            )
-            x = branches.sum(dim=-2)
+            # 必须保持 out-of-place：门控权重需要梯度，原地
+            # 乘法会让 AOTAutograd 的版本检查失败
+            #（torch.compile 下反向报错）。
+            x = (
+                branches
+                * gates.to(branches.dtype).unsqueeze(-1)
+            ).sum(dim=-2)
 
         return x, [aux1, aux2]
 
