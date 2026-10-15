@@ -867,25 +867,45 @@ class TransformerBlock(nn.Module):
         # expert_outputs:
         # [batch, time, k1, dim]
         #
-        # 每个分支都保留完整残差。
-        # 残差相加原地写回 dispatch 的输出缓冲：此处之后
-        # expert_outputs 不再被其它节点使用（各 dispatch 分支
-        # 均返回持有独立存储的张量），add_ 与逐算子 add 使用
-        # 同一 kernel 与舍入路径，数值逐位一致，省去一份
+        # 每个分支都保留完整残差：x + residual_scale * expert。
+        #
+        # dtype 一致时残差相加原地写回 dispatch 的输出缓冲：
+        # 此处之后 expert_outputs 不再被其它节点使用（各
+        # dispatch 分支均返回持有独立存储的张量），先把专家
+        # 输出乘上 residual_scale、再加残差，与逐算子
+        # torch.add(x, expert, alpha=scale) 语义一致，省去一份
         # [batch, k1, time, dim] 的激活分配。残差先按
         # [batch, time, k1, dim] 的连续布局相加，再切到
         # [batch, k1, time, dim] 的分支视图，原地写入无需
         # 跨步寻址。
-        expert_outputs.add_(
-            x.unsqueeze(-2),
-            alpha=self.residual_scale,
-        )
-        branches = expert_outputs.permute(
-            0,
-            2,
-            1,
-            3,
-        )
+        #
+        # autocast 下残差流精度更高（x 为 fp32、专家输出为
+        # bf16）：原地 add 会把 fp32 残差静默降到 bf16，与其它
+        # 模式的残差精度不一致，必须走 out-of-place 的类型提升
+        # 路径。
+        if expert_outputs.dtype == x.dtype:
+            expert_outputs.mul_(
+                self.residual_scale,
+            ).add_(
+                x.unsqueeze(-2),
+            )
+            branches = expert_outputs.permute(
+                0,
+                2,
+                1,
+                3,
+            )
+        else:
+            branches = torch.add(
+                x.unsqueeze(-2),
+                expert_outputs,
+                alpha=self.residual_scale,
+            ).permute(
+                0,
+                2,
+                1,
+                3,
+            )
 
         return (
             branches,
@@ -932,14 +952,25 @@ class TransformerBlock(nn.Module):
             k1,
         )
 
-        # 残差原地并入 expert_outputs（此后不再作其它用途，
-        # 见 first_branch_step 的同类说明），数值逐位一致，
-        # 省去一份 [batch, time, k1, dim] 的激活分配。
-        expert_outputs.add_(
-            x.unsqueeze(-2),
-            alpha=self.residual_scale,
-        )
-        branches = expert_outputs
+        # 残差并入 expert_outputs（此后不再作其它用途，
+        # 见 first_branch_step 的同类说明）：dtype 一致时原地
+        # 完成 x + residual_scale * expert，省去一份
+        # [batch, time, k1, dim] 的激活分配；autocast 下残差流
+        # 精度更高时原地 add 会把残差降精度，改用 out-of-place
+        # 的类型提升路径。
+        if expert_outputs.dtype == x.dtype:
+            expert_outputs.mul_(
+                self.residual_scale,
+            ).add_(
+                x.unsqueeze(-2),
+            )
+            branches = expert_outputs
+        else:
+            branches = torch.add(
+                x.unsqueeze(-2),
+                expert_outputs,
+                alpha=self.residual_scale,
+            )
 
         # branches:
         # [batch, time, k1, dim]
