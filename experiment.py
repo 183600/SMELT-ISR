@@ -1482,7 +1482,7 @@ def save_checkpoint(
     scaler: Optional[torch.amp.GradScaler],
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     step: int,
-    train_generator: torch.Generator,
+    train_generator_state: torch.Tensor,
     args: argparse.Namespace,
 ):
     # torch.compile 包装后 state_dict 带有 "_orig_mod." 前缀，
@@ -1500,7 +1500,7 @@ def save_checkpoint(
             else None
         ),
         "step": step,
-        "train_generator_state": train_generator.get_state(),
+        "train_generator_state": train_generator_state,
         "torch_rng_state": torch.get_rng_state(),
         "python_rng_state": random.getstate(),
         "cuda_rng_state": (
@@ -2542,6 +2542,21 @@ def main():
 
     last_saved_step: Optional[int] = None
 
+    # 预取管线：反向 kernel 入队后 CPU 立即收集下一步的
+    # 训练窗口并发起异步 H2D 拷贝，使数据采集与设备上的
+    # 反向/优化器计算重叠，消去每步的串行气垫。
+    # 采样始终按步序进行（消费 train_generator 的顺序与
+    # 不预取时完全一致），数值结果不变。
+    prefetched_batch: Optional[
+        Tuple[torch.Tensor, torch.Tensor]
+    ] = None
+
+    # 每步采样下一批之前记录 generator 状态；该状态正是
+    # 「从 step+1 恢复训练」所需的采样起点。存档写入它而
+    # 不是当时的 generator 实时状态，从而预取多吃掉的那个
+    # 批次不会让 resume 跳批或重批。
+    checkpoint_gen_state: Optional[torch.Tensor] = None
+
     for step in range(start_step, args.steps):
         # 优化器更新成功时会立即推进 scheduler；先采样本步
         # 实际使用的 lr，保证日志语义不变。
@@ -2551,12 +2566,16 @@ def main():
             set_to_none=True,
         )
 
-        x, y = dataset.batch(
-            "train",
-            args.batch_size,
-            train_generator,
-            device,
-        )
+        if prefetched_batch is None:
+            x, y = dataset.batch(
+                "train",
+                args.batch_size,
+                train_generator,
+                device,
+            )
+        else:
+            x, y = prefetched_batch
+            prefetched_batch = None
 
         with train_autocast:
             result = model(x, y)
@@ -2569,7 +2588,24 @@ def main():
 
         if scaler is not None:
             scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
+        # 反向已入队；此时 CPU 侧预取下一批，窗口收集与
+        # H2D 传输同设备剩余的反向/优化器计算重叠。
+        # 先记录的状态对应「从 step+1 恢复」的采样起点，
+        # 也是本步存档应保存的 generator 状态。
+        checkpoint_gen_state = train_generator.get_state()
+
+        if step + 1 < args.steps:
+            prefetched_batch = dataset.batch(
+                "train",
+                args.batch_size,
+                train_generator,
+                device,
+            )
+
+        if scaler is not None:
             scaler.unscale_(optimizer)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -2587,8 +2623,6 @@ def main():
                 )
             scaler.update()
         else:
-            loss.backward()
-
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 train_params,
                 args.grad_clip,
@@ -2655,7 +2689,8 @@ def main():
                 scaler,
                 scheduler,
                 step + 1,
-                train_generator,
+                # 本步存档应记录的采样起点（见循环顶部的注释）。
+                checkpoint_gen_state,
                 args,
             )
             last_saved_step = step + 1
@@ -2680,7 +2715,15 @@ def main():
             scaler,
             scheduler,
             end_step,
-            train_generator,
+            # 循环结束时最后一次采样前记录的状态即
+            # 「从 end_step 恢复」的采样起点；
+            # 循环未执行时（start_step >= steps）没有
+            # 任何采样发生，直接取当前状态。
+            (
+                checkpoint_gen_state
+                if checkpoint_gen_state is not None
+                else train_generator.get_state()
+            ),
             args,
         )
 
