@@ -2626,6 +2626,25 @@ def main():
             )
             args.warmup_steps = saved_warmup
 
+        # 梯度裁剪直接改变每次更新后的参数，是优化轨迹的
+        # 一部分。resume 时若用当前 CLI 的 --grad-clip（默认
+        # 1.0），与原运行不同就会让恢复训练偏离原轨迹。
+        saved_grad_clip = rng_payload.get(
+            "args",
+            {},
+        ).get("grad_clip")
+
+        if (
+            saved_grad_clip is not None
+            and saved_grad_clip != args.grad_clip
+        ):
+            print(
+                "resume restored grad_clip "
+                f"{args.grad_clip} -> {saved_grad_clip} "
+                "(grad_clip 决定优化轨迹)"
+            )
+            args.grad_clip = saved_grad_clip
+
     scheduler = build_lr_schedule(
         optimizer,
         args.warmup_steps,
