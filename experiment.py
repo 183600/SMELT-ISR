@@ -106,7 +106,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-        # torch>=2.4 提供融合实现，内部使用高精度累加，
+        # torch>=2.4 提供内置实现，内部使用高精度累加，
         # 语义与手动实现一致。
         self._fused = (
             F.rms_norm if hasattr(F, "rms_norm") else None
@@ -153,7 +153,7 @@ class CausalSelfAttention(nn.Module):
     def core(self, x: torch.Tensor) -> torch.Tensor:
         """
         Attention 主体，返回输出投影之前的 [batch, length, dim]。
-        供调用方选择普通投影或融合残差的 addmm 投影。
+        调用方负责完成输出投影与残差相加。
         """
         batch, length, dim = x.shape
 
@@ -182,7 +182,7 @@ class CausalSelfAttention(nn.Module):
 
 class _SwiGLU(torch.autograd.Function):
     """
-    对融合的 [.., 2*hidden] 中线性输出做 SwiGLU：
+    对 [.., 2*hidden] 的线性输出做 SwiGLU：
     前一半过 SiLU 后与后一半相乘。
     """
 
@@ -214,8 +214,8 @@ class _SwiGLU(torch.autograd.Function):
         grad_h = torch.empty_like(h)
         grad_h_gate, grad_h_up = grad_h.chunk(2, dim=-1)
 
-        # grad_up 半区先暂存 grad_out * up 作为 silu 反向的输入，
-        # 之后原地改写成 grad_up；该半区最终会被 grad_up 完整覆盖。
+        # grad_up 半区先写入 grad_out * up 作为 silu 反向的输入，
+        # 该半区最终会被 grad_up 完整覆盖。
         torch.mul(grad_out, up, out=grad_h_up)
         torch.ops.aten.silu_backward.grad_input(
             grad_h_up,
@@ -223,10 +223,9 @@ class _SwiGLU(torch.autograd.Function):
             grad_input=grad_h_gate,
         )
 
-        # grad_up = grad_out * silu(gate)。σ(gate) 先写入复用的暂存，
-        # 再与 gate 相乘得到 silu(gate)：与 F.silu 融合 kernel 内部
-        # 的 x * σ(x) 逐元素运算序列和舍入一致；最后 grad_out * silu
-        # 的乘法结合顺序也与原实现相同，数值逐位一致。
+        # grad_up = grad_out * silu(gate)：σ(gate) 与 gate 相乘得到
+        # silu(gate)，与 F.silu 的 x * σ(x) 运算序列和舍入一致；
+        # 最后 grad_out * silu 的乘法结合顺序相同，数值逐位一致。
         torch.sigmoid(gate, out=grad_h_up)
         torch.mul(gate, grad_h_up, out=grad_h_up)
         torch.mul(grad_out, grad_h_up, out=grad_h_up)
@@ -241,9 +240,8 @@ class Expert(nn.Module):
     def __init__(self, dim: int, hidden: int):
         super().__init__()
 
-        # gate 与 up 的输入完全相同，合并为一个 [dim, 2*hidden]
-        # 线性层再按最后一维切分；参数量与数值
-        # 语义不变（每个输出仍是独立的点积）。
+        # [dim, 2*hidden] 线性层在最后一维按 [gate; up] 切分，
+        # 每个输出仍是独立的点积。
         self.gate_up = nn.Linear(dim, 2 * hidden, bias=False)
         self.down = nn.Linear(hidden, dim, bias=False)
 
@@ -592,7 +590,7 @@ class SparseMoE(nn.Module):
         )
 
         # 展平后的 assignment 下标 j 对应 token j // top_k；
-        # top_k == 1 时排序下标本身就是 token 下标，跳过整除分配。
+        # top_k == 1 时排序下标本身就是 token 下标。
         if top_k == 1:
             sorted_token_ids = perm
         else:
@@ -706,8 +704,8 @@ class SparseMoE(nn.Module):
         # top_k == 1 时门控权重来自单元素 softmax，
         # 恒等于 1.0（精确值），其对 router logits 的反向
         # 梯度也恒为 0（softmax 反向的 w*(1-w) 按位为 0），
-        # 因此加权乘法可以整体省略，与 bmm 退化结果逐位一致；
-        # 有残差时用单次 add(alpha=) 完成「缩放 + 残差相加」。
+        # 加权和退化为恒等；
+        # 有残差时用 add(alpha=) 完成「缩放 + 残差相加」。
         if top_k == 1:
             output = expert_outputs.reshape(-1, dim)
 
@@ -729,7 +727,7 @@ class SparseMoE(nn.Module):
         merged = merged.reshape(out_shape)
 
         # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
-        # 由类型提升合并（输出取更高精度），语义与原先一致。
+        # 由类型提升合并（输出取更高精度），语义不变。
         if residual is not None:
             merged = torch.add(
                 residual,
@@ -780,9 +778,9 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         core = self.attn.core(self.norm_attn(x))
 
-        # dtype 一致（非 autocast，如 CPU/fp32）时用单次 addmm
-        # 完成「投影 + 缩放 + 残差相加」；autocast 下 dtype
-        # 不匹配，回退到两步写法。
+        # dtype 一致（非 autocast，如 CPU/fp32）时以 addmm
+        # 计算「投影 + 缩放 + 残差相加」；autocast 下 dtype
+        # 不匹配，改用普通投影加残差。
         if core.dtype == x.dtype:
             batch, length, dim = x.shape
             return torch.addmm(
@@ -871,7 +869,7 @@ class TransformerBlock(nn.Module):
         # 每个分支都保留完整残差：x + residual_scale * expert。
         #
         # dtype 一致时原地完成缩放与残差相加；缩放系数为 1.0 时
-        # 乘以 1.0 是逐位恒等（含 NaN/Inf），跳过缩放遍历。
+        # 乘以 1.0 是逐位恒等（含 NaN/Inf）。
         # autocast 下残差流精度更高时走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             if self.residual_scale != 1.0:
@@ -932,8 +930,8 @@ class TransformerBlock(nn.Module):
 
         # 残差并入 expert_outputs：dtype 一致时原地完成
         # x + residual_scale * expert；缩放系数为 1.0 时
-        # 乘以 1.0 是逐位恒等，跳过缩放遍历。autocast 下
-        # 残差流精度更高时走 out-of-place 的类型提升路径。
+        # 乘以 1.0 是逐位恒等。autocast 下残差流精度更高时
+        # 走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             if self.residual_scale != 1.0:
                 expert_outputs.mul_(
@@ -1220,7 +1218,7 @@ class LanguageModel(nn.Module):
                 x = branches.squeeze(1)
             else:
                 # 归一化后的 top-k gate 在每个 token 上和为 1。
-                # 跨分支收缩用逐分支 fused multiply-add 累加。
+                # 跨分支收缩按分支顺序加权累加。
                 branch_weights = gates.to(branches.dtype).unbind(-1)
 
                 x = branches[:, 0].mul(
@@ -2677,8 +2675,7 @@ def main():
         train_generator.set_state(train_generator_state)
 
     if args.compile:
-        # 在状态加载之后编译。MoE 专家分段长度由数据决定，
-        # 采用自动动态形状。
+        # 在状态加载之后编译。MoE 专家分段长度由数据决定。
         model = torch.compile(model)
 
     dataset = ByteDataset(
