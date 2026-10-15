@@ -747,16 +747,22 @@ class TransformerBlock(nn.Module):
         # [batch, time, k1, dim]
         #
         # 每个分支都保留完整残差。
-        branches = torch.add(
+        # 残差相加原地写回 dispatch 的输出缓冲：此处之后
+        # expert_outputs 不再被其它节点使用（各 dispatch 分支
+        # 均返回持有独立存储的张量），add_ 与逐算子 add 使用
+        # 同一 kernel 与舍入路径，数值逐位一致，省去一份
+        # [batch, k1, time, dim] 的激活分配。
+        expert_outputs = expert_outputs.permute(
+            0,
+            2,
+            1,
+            3,
+        )
+        expert_outputs.add_(
             x.unsqueeze(1),
-            expert_outputs.permute(
-                0,
-                2,
-                1,
-                3,
-            ),
             alpha=self.residual_scale,
         )
+        branches = expert_outputs
 
         return (
             branches,
@@ -803,11 +809,14 @@ class TransformerBlock(nn.Module):
             k1,
         )
 
-        branches = torch.add(
+        # 残差原地并入 expert_outputs（此后不再作其它用途，
+        # 见 first_branch_step 的同类说明），数值逐位一致，
+        # 省去一份 [batch, time, k1, dim] 的激活分配。
+        expert_outputs.add_(
             x.unsqueeze(-2),
-            expert_outputs,
             alpha=self.residual_scale,
         )
+        branches = expert_outputs
 
         # branches:
         # [batch, time, k1, dim]
