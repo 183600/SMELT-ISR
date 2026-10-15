@@ -573,9 +573,7 @@ class SparseMoE(nn.Module):
         门控加权合并 […, top_k, dim] 的专家输出。
 
         加权和以广播乘 + 沿 top_k 维求和实现：top_k 通常只有
-        个位数，而 baddbmm/bmm 会把每个 token 当成一个独立的
-        1×top_k @ top_k×dim 微型 GEMM，批量调用小 GEMM 的
-        开销远大于逐元素实现；dtype 不匹配（autocast 残差流
+        个位数；dtype 不匹配（autocast 残差流
         精度更高）时同一路径靠类型提升合并残差，语义不变。
         """
         top_k = expert_outputs.size(-2)
@@ -892,7 +890,7 @@ class LanguageModel(nn.Module):
             for i in range(self.middle_start, self.middle_end)
         )
 
-        # 前向热路径上的常驻权重引用：避免每次前向重复
+        # 常驻权重引用：避免每次前向重复
         # 逐层属性查找；与 position_embedding.weight 指向
         # 同一参数（共享存储）。经 object.__setattr__ 写入
         # 实例字典，避免重复注册到 _parameters 而污染
@@ -2634,8 +2632,7 @@ def main():
     last_saved_step: Optional[int] = None
 
     # 预取管线：反向 kernel 入队后 CPU 立即收集下一步的
-    # 训练窗口并发起异步 H2D 拷贝，使数据采集与设备上的
-    # 反向/优化器计算重叠，消去每步的串行气垫。
+    # 训练窗口并发起异步 H2D 拷贝。
     # 采样始终按步序进行（消费 train_generator 的顺序与
     # 不预取时完全一致），数值结果不变。
     prefetched_batch: Optional[
@@ -2682,8 +2679,7 @@ def main():
         else:
             loss.backward()
 
-        # 反向已入队；此时 CPU 侧预取下一批，窗口收集与
-        # H2D 传输同设备剩余的反向/优化器计算重叠。
+        # 反向已入队；此时 CPU 侧预取下一批。
         # 先记录的状态对应「从 step+1 恢复」的采样起点，
         # 也是本步存档应保存的 generator 状态。
         checkpoint_gen_state = train_generator.get_state()
