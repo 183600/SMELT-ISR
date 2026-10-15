@@ -2143,6 +2143,30 @@ def run_self_test():
         expected_lr,
     )
 
+    # 旧检查点没有 scheduler 状态时 param group 缺少
+    # initial_lr；start_step > 0 重建调度必须仍能工作，
+    # 而不是在 LRScheduler 构造时报 KeyError。
+    legacy_param = nn.Parameter(torch.randn(2))
+    legacy_optimizer = torch.optim.AdamW(
+        [legacy_param],
+        lr=0.1,
+    )
+    legacy_optimizer.param_groups[0].pop(
+        "initial_lr",
+        None,
+    )
+
+    legacy_scheduler = build_lr_schedule(
+        legacy_optimizer,
+        warmup_steps=0,
+        total_steps=8,
+        start_step=2,
+    )
+
+    assert (
+        legacy_scheduler.get_last_lr()[0] > 0.0
+    ), "legacy resume must rebuild the LR schedule"
+
     # resume 时必须用存档中的 warmup_steps 重建 lr_lambda。
     warmup_param = nn.Parameter(torch.randn(2))
     warmup_optimizer = torch.optim.AdamW(
@@ -2224,6 +2248,12 @@ def build_lr_schedule(
     total_steps: int,
     start_step: int = 0,
 ):
+    # last_epoch >= 0 时 LRScheduler 要求 param group 中存在
+    # initial_lr；旧检查点没有 scheduler 状态时该键缺失，
+    # 用当前的基准 lr 补齐，避免恢复训练直接报 KeyError。
+    if start_step > 0:
+        for group in optimizer.param_groups:
+            group.setdefault("initial_lr", group["lr"])
 
     def lr_lambda(step: int) -> float:
         # step 从 0 开始计数。
@@ -2638,6 +2668,18 @@ def main():
         scheduler.load_state_dict(
             rng_payload["scheduler"]
         )
+
+        # 梯度非有限的步会跳过 scheduler.step，存档里的
+        # last_epoch 可能落后于训练步数；按恢复后的 last_epoch
+        # 重算 lr，避免恢复后第一个训练步的 LR 错位一步。
+        for group, base_lr, lr_lambda in zip(
+            optimizer.param_groups,
+            scheduler.base_lrs,
+            scheduler.lr_lambdas,
+        ):
+            group["lr"] = base_lr * lr_lambda(
+                scheduler.last_epoch
+            )
 
         # state_dict 里的 _last_lr 是存档时旧调度的计算结果；
         # resume 后按当前调度同步日志视图。
