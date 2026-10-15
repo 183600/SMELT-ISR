@@ -46,8 +46,6 @@ class Config:
     residual_scale: float = 1.0
 
     def validate(self):
-        # 不能用 assert：python -O 会剥离断言，非法结构必须始终
-        # 在入口处显式失败，否则中间层划分会被静默错位。
         if self.mode not in {"smelt", "local_base", "A", "B"}:
             raise ValueError(f"未知 mode: {self.mode}")
         if self.vocab_size <= 0:
@@ -428,7 +426,7 @@ class SparseMoE(nn.Module):
             for _ in range(cfg.n_experts)
         ])
 
-        # dispatch 中 counts 的主机侧回读暂存与完成事件，懒初始化。
+        # counts 回读的暂存与完成事件。
         self._counts_stage = None
         self._counts_event = None
 
@@ -491,19 +489,13 @@ class SparseMoE(nn.Module):
 
     def _issue_counts_readback(self, counts: torch.Tensor) -> None:
         """
-        启动 counts 的主机侧异步回读：先拷入锁页暂存并记录
-        完成事件，到需要逐专家计数时再等待读取；与
-        _read_counts 配对使用。
+        启动 counts 回读：先拷入暂存并记录完成事件，
+        到需要逐专家计数时再读取；与 _read_counts 配对使用。
         """
         if not counts.is_cuda:
             return
 
         if self._counts_stage is None:
-            # 与 ByteDataset 的锁页槽同理：若首次 dispatch 恰在
-            # evaluate 的 inference_mode 下发生（例如纯评估或
-            # start_step >= steps 的恢复场景），锁页暂存会成为
-            # inference tensor，之后普通模式下对其 copy_ 会直接
-            # 报错。创建时显式退出 inference mode。
             with torch.inference_mode(False):
                 self._counts_stage = torch.empty(
                     self.n_experts,
@@ -512,8 +504,6 @@ class SparseMoE(nn.Module):
                 )
             self._counts_event = torch.cuda.Event()
 
-        # 拷贝和事件都必须记在 counts 所在的 CUDA 设备上；
-        # 否则模型位于非当前设备时，同步会等待到错误设备的流。
         with torch.cuda.device(counts.device):
             self._counts_stage.copy_(counts, non_blocking=True)
             self._counts_event.record()
@@ -576,7 +566,6 @@ class SparseMoE(nn.Module):
 
         assignment_experts = top_indices.reshape(-1)
 
-        # counts 的主机侧回读在排序与收集期间异步进行。
         self._issue_counts_readback(counts)
 
         # 按 expert id 做稳定排序：
@@ -693,9 +682,9 @@ class SparseMoE(nn.Module):
         """
         门控加权合并 […, top_k, dim] 的专家输出。
 
-        加权和以广播乘 + 沿 top_k 维求和实现：top_k 通常只有
-        个位数；dtype 不匹配（autocast 残差流
-        精度更高）时同一路径靠类型提升合并残差，语义不变。
+        加权和以广播乘 + 沿 top_k 维求和实现；dtype 不匹配
+        （autocast 残差流精度更高）时同一路径靠类型提升
+        合并残差，语义不变。
         """
         top_k = expert_outputs.size(-2)
         dim = expert_outputs.size(-1)
@@ -777,11 +766,9 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         core = self.attn.core(self.norm_attn(x))
 
-        # 输入与输出投影 dtype 一致（非 autocast，如 CPU/fp32）时，
-        # 用单次 addmm 完成「投影 + 缩放 + 残差相加」；
-        # 数值与先 mm 后 add 一致。
-        # autocast 下残差流保持更高精度（如 bf16 算子 + fp32 残差），
-        # dtype 不匹配，回退到原先的两步写法，数值语义不变。
+        # dtype 一致（非 autocast，如 CPU/fp32）时用单次 addmm
+        # 完成「投影 + 缩放 + 残差相加」；autocast 下 dtype
+        # 不匹配，回退到两步写法。
         if core.dtype == x.dtype:
             batch, length, dim = x.shape
             return torch.addmm(
@@ -869,20 +856,8 @@ class TransformerBlock(nn.Module):
         #
         # 每个分支都保留完整残差：x + residual_scale * expert。
         #
-        # dtype 一致时残差相加原地写回 dispatch 的输出缓冲：
-        # 此处之后 expert_outputs 不再被其它节点使用（各
-        # dispatch 分支均返回持有独立存储的张量），先把专家
-        # 输出乘上 residual_scale、再加残差，与逐算子
-        # torch.add(x, expert, alpha=scale) 语义一致，省去一份
-        # [batch, k1, time, dim] 的激活分配。残差先按
-        # [batch, time, k1, dim] 的连续布局相加，再切到
-        # [batch, k1, time, dim] 的分支视图，原地写入无需
-        # 跨步寻址。
-        #
-        # autocast 下残差流精度更高（x 为 fp32、专家输出为
-        # bf16）：原地 add 会把 fp32 残差静默降到 bf16，与其它
-        # 模式的残差精度不一致，必须走 out-of-place 的类型提升
-        # 路径。
+        # dtype 一致时原地完成缩放与残差相加；
+        # autocast 下残差流精度更高时走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             expert_outputs.mul_(
                 self.residual_scale,
@@ -935,10 +910,6 @@ class TransformerBlock(nn.Module):
         x = self.attention_step(x)
 
         if not delayed:
-            # local_base 必须与 A 使用相同的专家计算量，才是真正的
-            # 「立即合并」对照：A 第二轮在 k1 个分支上各选 k2 个专家；
-            # 合并后的单分支第二轮相应选择 k1*k2 个专家（受专家总数
-            # 上限截断）。否则延迟合并的收益会与额外专家 FLOPs 混杂。
             matched_k2 = min(
                 self.moe.n_experts,
                 k1 * k2,
@@ -952,12 +923,9 @@ class TransformerBlock(nn.Module):
             k1,
         )
 
-        # 残差并入 expert_outputs（此后不再作其它用途，
-        # 见 first_branch_step 的同类说明）：dtype 一致时原地
-        # 完成 x + residual_scale * expert，省去一份
-        # [batch, time, k1, dim] 的激活分配；autocast 下残差流
-        # 精度更高时原地 add 会把残差降精度，改用 out-of-place
-        # 的类型提升路径。
+        # 残差并入 expert_outputs：dtype 一致时原地完成
+        # x + residual_scale * expert；autocast 下残差流精度
+        # 更高时走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             expert_outputs.mul_(
                 self.residual_scale,
@@ -998,8 +966,7 @@ class TransformerBlock(nn.Module):
             #（且是无梯度常数），加权和退化为恒等，数值逐位一致。
             x = branches.squeeze(-2)
         else:
-            # 跨分支的门控加权和：广播乘 + 沿分支维求和，
-            # 避免逐 token 的 1×k1 @ k1×dim 微型 batched GEMM。
+            # 跨分支的门控加权和：广播乘 + 沿分支维求和。
             x = (
                 branches * gates.to(branches.dtype).unsqueeze(-1)
             ).sum(dim=-2)
@@ -1053,19 +1020,15 @@ class LanguageModel(nn.Module):
             for i in range(self.middle_start, self.middle_end)
         )
 
-        # 常驻权重引用：避免每次前向重复
-        # 逐层属性查找；与 position_embedding.weight 指向
-        # 同一参数（共享存储）。经 object.__setattr__ 写入
-        # 实例字典，避免重复注册到 _parameters 而污染
-        # state_dict 与检查点兼容。
+        # 与 position_embedding.weight 指向同一参数（共享存储）。
+        # 经 object.__setattr__ 写入实例字典，避免重复注册到
+        # _parameters 而污染 state_dict 与检查点兼容。
         object.__setattr__(
             self,
             "position_embedding_weight",
             self.position_embedding.weight,
         )
 
-        # B 第一轮 middle[1:] 的常驻视图：与每次前向切出
-        # middle[1:] 内容完全相同。
         self.middle_blocks_rest = self.middle_blocks[1:]
 
         # 是否对每个 Block 使用 activation checkpointing：
@@ -1159,7 +1122,6 @@ class LanguageModel(nn.Module):
             )
 
         # token embedding 与按序列长度切片的位置 embedding 相加。
-        # 属性查找结果缓存为局部变量。
         x = self.token_embedding(input_ids)
         x.add_(
             self.position_embedding_weight[:time]
@@ -1340,10 +1302,7 @@ class ByteDataset:
     ):
         data_path = Path(filename)
 
-        # 直接读入可写的字节缓冲区，避免 read_bytes() 的
-        # bytes 与随后的 bytearray 复制同时驻留造成的
-        # 双份峰值内存。文件在读取期间被截断时按实际
-        # 读入长度处理。
+        # 文件在读取期间被截断时按实际读入长度处理。
         buf = bytearray(data_path.stat().st_size)
         with open(data_path, "rb") as handle:
             filled = handle.readinto(buf)
@@ -1356,12 +1315,8 @@ class ByteDataset:
                 "数据文件太小，至少需要 seq_len + 2 个字节"
             )
 
-        # 显式持有缓冲区引用，避免 frombuffer 依赖
-        # 无名临时对象的生命周期。
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
-        # 语料本身保持普通分页内存：H2D 传输只经过
-        # _gather_windows 的锁页暂存槽，整段语料没有必要锁页。
         _ = device
 
         split = int(
@@ -1378,10 +1333,7 @@ class ByteDataset:
             device=tokens.device,
         )
 
-        # CUDA 训练时用于 H2D 的锁页暂存双缓冲：CPU 侧窗口
-        # 收集直接写入锁页区，双缓冲轮换 + cuda Event 保证
-        # 复用安全；数值与逐位内容不变（收集的仍是同一批字节）。
-        # 按调用方的 device 决定是否启用，懒初始化。
+        # 窗口暂存槽按调用方的 device 决定是否启用。
         self._stage_slots = None
         self._stage_index = 0
 
@@ -1408,20 +1360,12 @@ class ByteDataset:
         按窗口起点收集 [num_starts, seq_len + 1] 的字节窗口，
         并搬运到目标设备（尚未转 int64）。
 
-        CUDA 下使用锁页暂存双缓冲 + cuda Event 轮换复用；
-        CPU 下维持普通索引路径。
+        CUDA 下经暂存槽搬运，CPU 下走普通索引路径。
         """
         # starts 与 _offsets 均为 CPU 张量，窗口切片在 CPU 完成。
-        # 直接构造展平下标，两条路径共用一次加法，且无需
-        # 物化二维 windows 再 reshape。
-        # 下标缓冲区按容量复用。
         numel = starts.numel() * (self.seq_len + 1)
         index_stage = getattr(self, "_index_stage", None)
         if index_stage is None or index_stage.numel() < numel:
-            # evaluate 在 inference_mode 下运行；若缓冲区恰在评估中
-            # 首次创建会成为 inference tensor，之后在普通模式的
-            # 训练批里对其 out= 原地写入会直接报错。创建时显式
-            # 退出 inference mode，保证缓冲区是普通张量。
             with torch.inference_mode(False):
                 index_stage = torch.empty(numel, dtype=torch.int64)
             self._index_stage = index_stage
@@ -1453,8 +1397,6 @@ class ByteDataset:
         slot = self._stage_slots[self._stage_index]
         self._stage_index ^= 1
 
-        # 每个槽位的完成 Event 只创建一次，后续反复 record /
-        # synchronize 复用（Event 支持重复 record）。
         # 复用前确认上一次拷贝已完成。
         event = slot[1]
         if event is None:
@@ -1465,8 +1407,6 @@ class ByteDataset:
 
         buffer = slot[0]
         if buffer is None or buffer.numel() < numel:
-            # 与 _index_stage 同理：锁页缓冲区若在 inference_mode
-            # 内首次创建，后续普通模式下的 index_select out= 会报错。
             with torch.inference_mode(False):
                 buffer = torch.empty(
                     numel,
@@ -1476,8 +1416,6 @@ class ByteDataset:
             slot[0] = buffer
 
         staged = buffer[:numel]
-        # index_select out= 直接收集进锁页区，与 data[windows]
-        # 的字节内容完全一致。
         torch.index_select(data, 0, flat_index, out=staged)
         # 空批（0 窗口）时不能用 -1 推导列数。
         staged = staged.view(-1, self.seq_len + 1)
@@ -1513,8 +1451,7 @@ class ByteDataset:
             generator=generator,
         )
 
-        # 数据常驻 CPU，采样窗口在 CPU 上切片后经锁页暂存区
-        # 搬入；uint8 先做传输，到目标设备后再扩张为 int64。
+        # 窗口先以 uint8 搬运，到目标设备后再转 int64。
         chunks = self._gather_windows(
             data,
             starts,
@@ -1548,7 +1485,6 @@ class ByteDataset:
             num_starts,
         )
 
-        # 起点序列只与 total_batches 有关，按参数缓存。
         if getattr(self, "_starts_total", None) != total_batches:
             # 均匀覆盖整个验证流。total_batches <= num_starts，
             # linspace 的间距不小于 1，round 后不会重复。
@@ -1625,7 +1561,7 @@ def evaluate(
 
                 result = model(x, y)
 
-                # 与训练循环一致：logits 在前向返回后不再使用，立即解除引用。
+                # logits 在前向返回后不再使用。
                 result.pop("logits", None)
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
@@ -1725,7 +1661,6 @@ def run_self_test():
 
     set_seed(123)
 
-    # 结构配置校验不能使用 assert 实现；在 python -O 下也必须失败。
     try:
         Config(
             vocab_size=256,
@@ -1846,8 +1781,6 @@ def run_self_test():
         + [2] * middle_count
     )
 
-    # local_base 的第二轮路由宽度必须匹配 A 的 k1*k2 分支计算，
-    # 否则它会把「延迟合并」和「额外专家 FLOPs」混在一起。
     local_probe = LanguageModel(
         Config(
             **{
@@ -2195,9 +2128,7 @@ def run_self_test():
         expected_lr,
     )
 
-    # resume 时必须用存档中的 warmup_steps 重建 lr_lambda：
-    # warmup 段长度是调度定义的一部分却不进 state_dict，
-    # 换用新 warmup 重建会让共享区间内每步 lr 静默错位。
+    # resume 时必须用存档中的 warmup_steps 重建 lr_lambda。
     warmup_param = nn.Parameter(torch.randn(2))
     warmup_optimizer = torch.optim.AdamW(
         [warmup_param],
@@ -2216,8 +2147,8 @@ def run_self_test():
         warmup_optimizer.step()
         original.step()
 
-    # 若 resume 时用错误的 warmup（例如 CLI 默认值）重建，
-    # 则 lr 序列必然与原运行偏离，这正是被禁止的行为。
+    # 反例：用错误的 warmup（例如 CLI 默认值）重建，
+    # lr 序列与原运行不同。
     wrong_param = nn.Parameter(torch.randn(2))
     wrong_optimizer = torch.optim.AdamW(
         [wrong_param],
@@ -2383,9 +2314,7 @@ def main():
     device = torch.device(args.device)
 
     if device.type == "cuda":
-        # expandable_segments 为纯分配器行为，不改变任何数值结果；
-        # 用户已显式配置时保持不变。需在首次 CUDA 分配之前设置，
-        # 故放在 model.to() 之前。
+        # 需在首次 CUDA 分配之前设置。
         os.environ.setdefault(
             "PYTORCH_CUDA_ALLOC_CONF",
             "expandable_segments:True",
@@ -2403,9 +2332,7 @@ def main():
 
     if args.resume is not None:
         rng_payload = load_checkpoint(args.resume, device)
-        # 模型结构配置从检查点读取。忽略后续版本新增的配置键，
-        # 让当前代码可以恢复自己的旧结构；缺失键仍由 dataclass
-        # 默认值和随后的 state_dict 形状校验暴露，不做猜测。
+        # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
         known_config_fields = {
             field.name for field in fields(Config)
@@ -2562,9 +2489,6 @@ def main():
 
         # 检查点中的 RNG 状态统一先拉回 CPU 再恢复
         #（set_rng_state / set_state 只接受 CPU ByteTensor）。
-        # 这里与 scheduler/scaler 的旧检查点兼容逻辑保持一致：
-        # 旧存档可能没有 RNG 键，缺失时保留当前 set_seed 状态，
-        # 而不是在 resume 时直接 KeyError。
         train_generator_state = rng_payload.get(
             "train_generator_state"
         )
@@ -2672,9 +2596,7 @@ def main():
         rng_payload is not None
         and rng_payload.get("scheduler") is not None
     ):
-        # 恢复 scheduler 的 base_lrs 与 last_epoch。优化器 lr
-        # 已在上文按检查点的 base_lrs 重建，不会被已衰减值
-        # 二次缩放。
+        # 恢复 scheduler 的 base_lrs 与 last_epoch。
         scheduler.load_state_dict(
             rng_payload["scheduler"]
         )
@@ -2692,10 +2614,7 @@ def main():
         train_generator.set_state(train_generator_state)
 
     if args.compile:
-        # 在状态加载之后编译，state_dict 键不受影响。
-        # 训练/评估的输入形状固定（seq_len、batch_size 不变），
-        # 关闭动态形状让 Inductor 按静态形状特化；
-        # 若实际形状变化，仅会为该形状重新编译一次，语义不变。
+        # 在状态加载之后编译。
         model = torch.compile(model, dynamic=False)
 
     dataset = ByteDataset(
@@ -2742,11 +2661,10 @@ def main():
     model.train()
 
     # 参数集合在训练期间不会变化（torch.compile 只包装调用，
-    # 不增删参数），预取一次列表。
+    # 不增删参数）。
     train_params = list(model.parameters())
 
-    # autocast 上下文在整个训练循环中复用同一个实例，
-    # 其开关状态由已固定的 amp_dtype 决定。
+    # autocast 上下文的开关状态由已固定的 amp_dtype 决定。
     train_autocast = torch.autocast(
         device_type="cuda",
         dtype=amp_dtype,
@@ -2762,8 +2680,7 @@ def main():
             return []
 
         # 暂存项按 [lm, aux, grad_norm] 逐组平铺，堆叠后
-        # reshape 成 [N, 3] 行，与逐步先 stack 成行再整段
-        # stack 的值逐位一致。
+        # reshape 成 [N, 3] 行。
         values = torch.stack(
             pending_scalars
         ).view(-1, 3).tolist()
@@ -2803,18 +2720,13 @@ def main():
 
     last_saved_step: Optional[int] = None
 
-    # 预取管线：反向 kernel 入队后 CPU 立即收集下一步的
-    # 训练窗口并发起异步 H2D 拷贝。
-    # 采样始终按步序进行（消费 train_generator 的顺序与
-    # 不预取时完全一致），数值结果不变。
+    # 采样始终按步序进行（消费 train_generator 的顺序不变）。
     prefetched_batch: Optional[
         Tuple[torch.Tensor, torch.Tensor]
     ] = None
 
-    # 每步采样下一批之前记录 generator 状态；该状态正是
-    # 「从 step+1 恢复训练」所需的采样起点。存档写入它而
-    # 不是当时的 generator 实时状态，从而预取多吃掉的那个
-    # 批次不会让 resume 跳批或重批。
+    # 每步采样下一批之前记录 generator 状态，即
+    # 「从 step+1 恢复训练」所需的采样起点。
     checkpoint_gen_state: Optional[torch.Tensor] = None
 
     for step in range(start_step, args.steps):
@@ -2851,9 +2763,8 @@ def main():
         else:
             loss.backward()
 
-        # 反向已入队；此时 CPU 侧预取下一批。
-        # 先记录的状态对应「从 step+1 恢复」的采样起点，
-        # 也是本步存档应保存的 generator 状态。
+        # 记录本步存档应保存的 generator 状态，
+        # 对应「从 step+1 恢复」的采样起点。
         checkpoint_gen_state = train_generator.get_state()
 
         if step + 1 < args.steps:
@@ -2898,12 +2809,7 @@ def main():
                     "optimizer and LR schedule skipped"
                 )
 
-        # detach 后只保留标量值，不延长计算图生命周期。
-        # 三个标量按序平铺暂存，flush 时一次 stack 成行；
-        # 三者本同为 fp32
-        #（lm_loss/aux_loss 为 fp32 交叉熵与 router fp32 损失，
-        # grad_norm 为 fp32 归约结果），无需额外 dtype 转换，
-        # 逐位值不变。
+        # detach 后只保留标量值；三者均为 fp32，无需额外转换。
         pending_scalars.append(
             result["lm_loss"].detach()
         )
@@ -2914,7 +2820,6 @@ def main():
             grad_norm.detach()
         )
 
-        # logits/loss 和 batch 张量此后都不再使用，显式解除引用。
         del result, loss, x, y
 
         pending_records.append({
@@ -2957,15 +2862,10 @@ def main():
     # 先把暂存的逐步记录落盘，保持文件内 step 顺序。
     flush_records()
 
-    # 结尾存档的 step 必须反映优化器真实前进到的步数。
-    # 若以 start_step >= args.steps 恢复（例如拿 step=100
-    # 的检查点却只让 --steps=50），循环体不执行，此时仍
-    # 用 args.steps 覆盖存档会让检查点的 step 回退，
-    # 导致下次 resume 重放区间、scheduler 错位。
+    # 结尾存档的 step 取优化器真实前进到的步数；
+    # 循环未执行时（start_step >= args.steps）也取 start_step。
     end_step = max(start_step, args.steps)
 
-    # 循环内最后一次存档已在 end_step 时，结尾重复写出的
-    # 检查点内容（step、RNG、args）与那次完全相同，直接复用。
     if last_saved_step != end_step:
         save_checkpoint(
             str(out_dir / "last.pt"),
