@@ -718,12 +718,29 @@ class SparseMoE(nn.Module):
 
             return output.view(out_shape)
 
-        # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
-        weights = top_weights.to(
-            expert_outputs.dtype
-        ).unsqueeze(-1)
+        weights = top_weights.to(expert_outputs.dtype)
 
-        merged = (expert_outputs * weights).sum(dim=-2)
+        # 必须保持对 expert_outputs / weights 的 out-of-place：
+        # 原地乘法会让 AOTAutograd 的版本检查失败
+        #（torch.compile 下反向报错）。
+        if top_k == 2:
+            # top_k == 2 时用 mul + addcmul 累加，等价于
+            # 广播乘后沿 top_k 维求和（w0*x0 + w1*x1），
+            # 但不产生 […, top_k, dim] 的中间张量。
+            # addcmul 只原地写入加权乘产生的新张量。
+            merged = expert_outputs.select(-2, 0).mul(
+                weights.select(-1, 0).unsqueeze(-1)
+            )
+            merged.addcmul_(
+                expert_outputs.select(-2, 1),
+                weights.select(-1, 1).unsqueeze(-1),
+            )
+        else:
+            # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
+            merged = (
+                expert_outputs * weights.unsqueeze(-1)
+            ).sum(dim=-2)
+
         merged = merged.reshape(out_shape)
 
         # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
@@ -975,10 +992,26 @@ class TransformerBlock(nn.Module):
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：广播乘 + 沿分支维求和。
-            x = (
-                branches
-                * gates.to(branches.dtype).unsqueeze(-1)
-            ).sum(dim=-2)
+            # 必须保持对 branches / gates 的 out-of-place：
+            # 门控权重需要梯度，原地乘法会让 AOTAutograd 的
+            # 版本检查失败（torch.compile 下反向报错）。
+            weights = gates.to(branches.dtype)
+
+            if branches.size(-2) == 2:
+                # k1 == 2 时用 mul + addcmul 累加
+                #（w0*b0 + w1*b1），不产生 […, k1, dim] 的
+                # 中间张量；addcmul 只原地写入加权乘产生的新张量。
+                x = branches.select(-2, 0).mul(
+                    weights.select(-1, 0).unsqueeze(-1)
+                )
+                x.addcmul_(
+                    branches.select(-2, 1),
+                    weights.select(-1, 1).unsqueeze(-1),
+                )
+            else:
+                x = (
+                    branches * weights.unsqueeze(-1)
+                ).sum(dim=-2)
 
         return x, [aux1, aux2]
 
@@ -2370,7 +2403,12 @@ def main():
     rng_payload = None
 
     if args.resume is not None:
-        rng_payload = load_checkpoint(args.resume, device)
+        # 先在 CPU 上载入再拷入模型/优化器设备：检查点（含
+        # 优化器状态）不再整体驻留显存，降低恢复时的显存峰值。
+        rng_payload = load_checkpoint(
+            args.resume,
+            torch.device("cpu"),
+        )
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
         known_config_fields = {
@@ -2819,15 +2857,12 @@ def main():
         # 引用无关。
         del result["logits"]
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
         # 记录本步存档应保存的 generator 状态，
         # 对应「从 step+1 恢复」的采样起点。
         checkpoint_gen_state = train_generator.get_state()
 
+        # 提前采样并搬运下一批：CPU 侧窗口构造与 H2D 拷贝
+        # 与随后的反向计算重叠；采样顺序不变。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
                 "train",
@@ -2835,6 +2870,11 @@ def main():
                 train_generator,
                 device,
             )
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if scaler is not None:
             scaler.unscale_(optimizer)
