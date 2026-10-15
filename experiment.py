@@ -572,10 +572,11 @@ class SparseMoE(nn.Module):
         """
         门控加权合并 […, top_k, dim] 的专家输出。
 
-        提供 residual 且与 expert_outputs dtype 一致（非 autocast）
-        时，用单次 baddbmm 完成「加权和 + 缩放 + 残差相加」；
-        数值与先 bmm 后 add 一致。dtype 不匹配（autocast 残差流
-        精度更高）时回退 bmm + add，数值语义不变。
+        加权和以广播乘 + 沿 top_k 维求和实现：top_k 通常只有
+        个位数，而 baddbmm/bmm 会把每个 token 当成一个独立的
+        1×top_k @ top_k×dim 微型 GEMM，批量调用小 GEMM 的
+        开销远大于逐元素实现；dtype 不匹配（autocast 残差流
+        精度更高）时同一路径靠类型提升合并残差，语义不变。
         """
         top_k = expert_outputs.size(-2)
         dim = expert_outputs.size(-1)
@@ -597,28 +598,16 @@ class SparseMoE(nn.Module):
 
             return output.view(out_shape)
 
+        # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
         weights = top_weights.to(
             expert_outputs.dtype
-        ).reshape(-1, 1, top_k)
+        ).unsqueeze(-1)
 
-        outputs = expert_outputs.reshape(-1, top_k, dim)
+        merged = (expert_outputs * weights).sum(dim=-2)
+        merged = merged.reshape(out_shape)
 
-        if (
-            residual is not None
-            and residual.dtype == expert_outputs.dtype
-        ):
-            return torch.baddbmm(
-                residual.reshape(-1, 1, dim),
-                weights,
-                outputs,
-                beta=1.0,
-                alpha=residual_scale,
-            ).view(out_shape)
-
-        # 用 bmm 完成门控加权和，直接输出 [num_tokens, dim]，
-        # 也避免对 dispatch 输出的 view 做原地写入。
-        merged = torch.bmm(weights, outputs).view(out_shape)
-
+        # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
+        # 由类型提升合并（输出取更高精度），语义与原先一致。
         if residual is not None:
             merged = torch.add(
                 residual,
@@ -827,8 +816,8 @@ class TransformerBlock(nn.Module):
         #
         # SparseMoE 支持任意前置维度，因此每个 branch
         # 的 token 会独立经过 Router。
-        # 第二轮合并时直接把残差融进 baddbmm / addcmul；
-        # dtype 不匹配时回退路径的算子序列与原先完全一致。
+        # 第二轮合并时直接把残差融进 merge 的
+        # 加权和 + 残差相加路径。
         expert_outputs2, gates2, _, aux2 = self.moe.unmerged(
             self.norm_moe(branches),
             k2,
@@ -848,11 +837,11 @@ class TransformerBlock(nn.Module):
             #（且是无梯度常数），加权和退化为恒等，数值逐位一致。
             x = branches.squeeze(-2)
         else:
-            # 用单个 batched matmul 完成跨分支的门控加权和。
-            x = torch.matmul(
-                gates.to(branches.dtype).unsqueeze(-2),
-                branches,
-            ).squeeze(-2)
+            # 跨分支的门控加权和：广播乘 + 沿分支维求和，
+            # 避免逐 token 的 1×k1 @ k1×dim 微型 batched GEMM。
+            x = (
+                branches * gates.to(branches.dtype).unsqueeze(-1)
+            ).sum(dim=-2)
 
         return x, [aux1, aux2]
 
