@@ -491,9 +491,6 @@ class SparseMoE(nn.Module):
         # 完全一致。
         outputs = torch.empty_like(gathered)
 
-        # 专家循环位于每层每次前向/反向的热路径上，
-        # 属性查找开销按 层数×调用次数 累积；
-        # 提升为局部变量，数值语义不变。
         experts = self.experts
 
         start = 0
