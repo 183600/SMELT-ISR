@@ -365,10 +365,24 @@ class _MergeExpertOutputs(torch.autograd.Function):
 
         first = expert_outputs[0]
 
+        # autocast 下残差流保持 fp32，空段的占位张量来自 flat
+        # 的切片，因此仍为 fp32；非空专家的输出才是 bf16/fp16。
+        # index_copy_ 要求 self 与 source 同 dtype，输出缓冲必须
+        # 按非空专家的 dtype 分配：否则 0 号专家恰好没有 token 时
+        # 缓冲会被定成 fp32，写入非空专家的输出直接报错。
+        output_dtype = next(
+            (
+                tensor.dtype
+                for tensor, count in zip(expert_outputs, counts)
+                if count > 0
+            ),
+            first.dtype,
+        )
+
         outputs = torch.empty(
             perm.numel(),
             first.size(-1),
-            dtype=first.dtype,
+            dtype=output_dtype,
             device=first.device,
         )
 
@@ -1829,6 +1843,37 @@ def run_self_test():
         torch.tensor(2.0, device=uniform_aux.device),
         rtol=1e-5,
         atol=1e-6,
+    )
+
+    # autocast 下残差流保持 fp32，空段占位张量（flat 的切片）
+    # 因此是 fp32，而非空专家的输出是 bf16；散射缓冲必须按非空
+    # 专家的 dtype 分配，否则 index_copy_ 因 dtype 不一致报错。
+    merge_perm = torch.tensor([1, 0, 2])
+    merge_counts = [0, 2, 1]
+    merged = _MergeExpertOutputs.apply(
+        merge_perm,
+        merge_counts,
+        torch.empty(0, 4, dtype=torch.float32),
+        torch.tensor(
+            [[1.0] * 4, [2.0] * 4],
+            dtype=torch.bfloat16,
+        ),
+        torch.tensor(
+            [[3.0] * 4],
+            dtype=torch.bfloat16,
+        ),
+    )
+    assert merged.dtype == torch.bfloat16
+    assert torch.equal(
+        merged,
+        torch.tensor(
+            [
+                [2.0] * 4,
+                [1.0] * 4,
+                [3.0] * 4,
+            ],
+            dtype=torch.bfloat16,
+        ),
     )
 
     # B 在 k1=k2=top_k=1 时应与 SMELT 数值等价。
