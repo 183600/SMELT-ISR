@@ -2340,8 +2340,7 @@ def main():
     rng_payload = None
 
     if args.resume is not None:
-        # 先在 CPU 上载入再拷入模型/优化器设备：检查点（含
-        # 优化器状态）不再整体驻留显存，降低恢复时的显存峰值。
+        # 检查点先载入 CPU，再按目标设备分别搬运。
         rng_payload = load_checkpoint(
             args.resume,
             torch.device("cpu"),
