@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
 import random
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -44,15 +46,24 @@ class Config:
     residual_scale: float = 1.0
 
     def validate(self):
-        assert self.mode in {"smelt", "local_base", "A", "B"}
-        assert self.vocab_size > 0
-        assert self.seq_len > 0
-        assert self.d_model % self.n_heads == 0
-        assert self.n_layers >= 4
-        assert self.n_layers % 4 == 0
-        assert 1 <= self.top_k <= self.n_experts
-        assert 1 <= self.k1 <= self.n_experts
-        assert 1 <= self.k2 <= self.n_experts
+        # 不能用 assert：python -O 会剥离断言，非法结构必须始终
+        # 在入口处显式失败，否则中间层划分会被静默错位。
+        if self.mode not in {"smelt", "local_base", "A", "B"}:
+            raise ValueError(f"未知 mode: {self.mode}")
+        if self.vocab_size <= 0:
+            raise ValueError("vocab_size 必须为正整数")
+        if self.seq_len <= 0:
+            raise ValueError("seq_len 必须为正整数")
+        if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
+            raise ValueError("d_model 必须能被正的 n_heads 整除")
+        if self.n_layers < 4 or self.n_layers % 4 != 0:
+            raise ValueError("n_layers 必须是大于等于 4 的 4 的倍数")
+        if not 1 <= self.top_k <= self.n_experts:
+            raise ValueError("top_k 必须满足 1 <= top_k <= n_experts")
+        if not 1 <= self.k1 <= self.n_experts:
+            raise ValueError("k1 必须满足 1 <= k1 <= n_experts")
+        if not 1 <= self.k2 <= self.n_experts:
+            raise ValueError("k2 必须满足 1 <= k2 <= n_experts")
 
     @property
     def middle_start(self) -> int:
@@ -382,8 +393,12 @@ class SparseMoE(nn.Module):
                     pin_memory=True,
                 )
             self._counts_event = torch.cuda.Event()
-        self._counts_stage.copy_(counts, non_blocking=True)
-        self._counts_event.record()
+
+        # 拷贝和事件都必须记在 counts 所在的 CUDA 设备上；
+        # 否则模型位于非当前设备时，同步会等待到错误设备的流。
+        with torch.cuda.device(counts.device):
+            self._counts_stage.copy_(counts, non_blocking=True)
+            self._counts_event.record()
 
     def _read_counts(self, counts: torch.Tensor) -> list:
         if counts.is_cuda:
@@ -787,8 +802,16 @@ class TransformerBlock(nn.Module):
         x = self.attention_step(x)
 
         if not delayed:
+            # local_base 必须与 A 使用相同的专家计算量，才是真正的
+            # 「立即合并」对照：A 第二轮在 k1 个分支上各选 k2 个专家；
+            # 合并后的单分支第二轮相应选择 k1*k2 个专家（受专家总数
+            # 上限截断）。否则延迟合并的收益会与额外专家 FLOPs 混杂。
+            matched_k2 = min(
+                self.moe.n_experts,
+                k1 * k2,
+            )
             x, aux1 = self.moe_step(x, k1)
-            x, aux2 = self.moe_step(x, k2)
+            x, aux2 = self.moe_step(x, matched_k2)
             return x, [aux1, aux2]
 
         expert_outputs, gates, _, aux1 = self.moe.unmerged(
@@ -1546,6 +1569,24 @@ def run_self_test():
 
     set_seed(123)
 
+    # 结构配置校验不能使用 assert 实现；在 python -O 下也必须失败。
+    try:
+        Config(
+            vocab_size=256,
+            seq_len=8,
+            d_model=16,
+            n_heads=4,
+            n_layers=5,
+            n_experts=3,
+            expert_hidden=24,
+        ).validate()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "非法 n_layers 必须在 -O 模式下仍然报错"
+        )
+
     common = dict(
         vocab_size=256,
         seq_len=8,
@@ -1647,6 +1688,44 @@ def run_self_test():
     assert probe.route_widths == (
         [1] * (middle_count - 1)
         + [2] * middle_count
+    )
+
+    # local_base 的第二轮路由宽度必须匹配 A 的 k1*k2 分支计算，
+    # 否则它会把「延迟合并」和「额外专家 FLOPs」混在一起。
+    local_probe = LanguageModel(
+        Config(
+            **{
+                **common,
+                "n_experts": 4,
+                "mode": "local_base",
+                "k1": 2,
+                "k2": 2,
+            }
+        )
+    )
+    local_widths = []
+    for block in local_probe.blocks:
+        original_route = block.moe.route
+
+        def record_route(
+            route_x,
+            route_k,
+            *,
+            original_route=original_route,
+        ):
+            local_widths.append(route_k)
+            return original_route(route_x, route_k)
+
+        block.moe.route = record_route
+
+    with torch.no_grad():
+        local_probe(x)
+
+    middle_count = len(local_probe.middle_blocks)
+    assert local_widths == (
+        [common["top_k"]]
+        + [2, 4] * middle_count
+        + [common["top_k"]]
     )
 
     # Top-k 负载均衡损失的规模不能随 k 改变而归一化。
@@ -2168,8 +2247,29 @@ def main():
 
     if args.resume is not None:
         rng_payload = load_checkpoint(args.resume, device)
-        # 模型结构配置从检查点读取。
-        cfg = Config(**rng_payload["config"])
+        # 模型结构配置从检查点读取。忽略后续版本新增的配置键，
+        # 让当前代码可以恢复自己的旧结构；缺失键仍由 dataclass
+        # 默认值和随后的 state_dict 形状校验暴露，不做猜测。
+        saved_config = rng_payload["config"]
+        known_config_fields = {
+            field.name for field in fields(Config)
+        }
+        unknown_config_fields = sorted(
+            set(saved_config) - known_config_fields
+        )
+        if unknown_config_fields:
+            print(
+                "resume ignored unknown config fields: "
+                + json.dumps(
+                    unknown_config_fields,
+                    ensure_ascii=False,
+                )
+            )
+        cfg = Config(**{
+            key: value
+            for key, value in saved_config.items()
+            if key in known_config_fields
+        })
     else:
         cfg = Config(
             seq_len=args.seq_len,
@@ -2291,7 +2391,12 @@ def main():
     if rng_payload is not None:
         model.load_state_dict(rng_payload["model"])
         optimizer.load_state_dict(rng_payload["optimizer"])
-        start_step = rng_payload["step"]
+        start_step = int(rng_payload.get("step", 0))
+        if "step" not in rng_payload:
+            print(
+                "legacy checkpoint has no step; "
+                "resuming from step 0"
+            )
 
         if (
             scaler is not None
