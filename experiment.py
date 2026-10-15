@@ -223,11 +223,11 @@ class _SwiGLU(torch.autograd.Function):
             grad_input=grad_h_gate,
         )
 
-        # grad_up = grad_out * silu(gate)：σ(gate) 与 gate 相乘得到
-        # silu(gate)，与 F.silu 的 x * σ(x) 运算序列和舍入一致；
-        # 最后 grad_out * silu 的乘法结合顺序相同，数值逐位一致。
-        torch.sigmoid(gate, out=grad_h_up)
-        torch.mul(gate, grad_h_up, out=grad_h_up)
+        # grad_up = grad_out * silu(gate)：用 forward 同一个
+        # silu 算子在相同输入上重算 silu(gate)，与其保存值逐位
+        # 一致（确定性逐元素算子），因此 grad_out 的乘法与逐算子
+        # 反向完全一致；该半区此前的临时值被完整覆盖。
+        torch.ops.aten.silu.out(gate, out=grad_h_up)
         torch.mul(grad_out, grad_h_up, out=grad_h_up)
         return grad_h
 
@@ -424,7 +424,9 @@ class SparseMoE(nn.Module):
             minlength=self.n_experts,
         )
 
-        hard_load = counts.to(router_probs.dtype) / flat.size(0)
+        # counts 是 int64，与 Python 整数相除按默认 dtype 提升为
+        # fp32，与显式转成 fp32 后再除逐位一致。
+        hard_load = counts / flat.size(0)
 
         soft_load = router_probs.mean(dim=0)
 
@@ -534,6 +536,10 @@ class SparseMoE(nn.Module):
         # top_k == 1 时排序下标本身就是 token 下标。
         if top_k == 1:
             sorted_token_ids = perm
+        elif top_k == 2:
+            # 非负 int64 整除 2 与算术右移等价（精确、向下取整），
+            # 排列与除法路径逐位一致。
+            sorted_token_ids = perm >> 1
         else:
             sorted_token_ids = perm.div(
                 top_k,
