@@ -365,11 +365,8 @@ class _MergeExpertOutputs(torch.autograd.Function):
 
         first = expert_outputs[0]
 
-        # autocast 下残差流保持 fp32，空段的占位张量来自 flat
-        # 的切片，因此仍为 fp32；非空专家的输出才是 bf16/fp16。
-        # index_copy_ 要求 self 与 source 同 dtype，输出缓冲必须
-        # 按非空专家的 dtype 分配：否则 0 号专家恰好没有 token 时
-        # 缓冲会被定成 fp32，写入非空专家的输出直接报错。
+        # 输出缓冲按非空专家的 dtype 分配：空段占位张量来自
+        # fp32 残差流的切片，不代表专家输出的真实 dtype。
         output_dtype = next(
             (
                 tensor.dtype
@@ -1845,9 +1842,8 @@ def run_self_test():
         atol=1e-6,
     )
 
-    # autocast 下残差流保持 fp32，空段占位张量（flat 的切片）
-    # 因此是 fp32，而非空专家的输出是 bf16；散射缓冲必须按非空
-    # 专家的 dtype 分配，否则 index_copy_ 因 dtype 不一致报错。
+    # 空段占位张量为 fp32，非空专家输出为 bf16；
+    # 散射缓冲按非空专家的 dtype 分配。
     merge_perm = torch.tensor([1, 0, 2])
     merge_counts = [0, 2, 1]
     merged = _MergeExpertOutputs.apply(

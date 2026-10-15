@@ -219,5 +219,3 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Experiment artifacts (never committed to the remote)
-
