@@ -216,7 +216,11 @@ class _SwiGLU(torch.autograd.Function):
         grad_h_gate, grad_h_up = grad_h.chunk(2, dim=-1)
 
         temp = grad_out * up
-        grad_h_gate.copy_(torch.ops.aten.silu_backward(temp, gate))
+        torch.ops.aten.silu_backward.grad_input(
+            temp,
+            gate,
+            grad_input=grad_h_gate,
+        )
 
         # grad_up = grad_out * silu(gate)。σ(gate) 先写入复用的暂存，
         # 再与 gate 相乘得到 silu(gate)：与 F.silu 融合 kernel 内部
@@ -279,6 +283,120 @@ class Expert(nn.Module):
 # ============================================================
 # Sparse MoE
 # ============================================================
+
+class _SplitExpertInputs(torch.autograd.Function):
+    """
+    dispatch 的输入侧：按每专家计数切分排序后的 assignment。
+
+    forward 等价于 index_select 后按 counts split；
+    backward 把各段梯度直接 index_add 回 flat。各段互不
+    重叠且并集完整，累加顺序与「先还原整块梯度再散射」
+    一致，数值逐位相同。
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        flat: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        counts: list,
+    ) -> Tuple[torch.Tensor, ...]:
+        ctx.counts = counts
+        ctx.flat_shape = flat.shape
+
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(sorted_token_ids)
+
+        gathered = flat.index_select(0, sorted_token_ids)
+        return tuple(gathered.split(counts, dim=0))
+
+    @staticmethod
+    def backward(
+        ctx,
+        *segment_grads: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], None, None]:
+        (sorted_token_ids,) = ctx.saved_tensors
+
+        grad_flat = None
+        start = 0
+
+        for grad, count in zip(segment_grads, ctx.counts):
+            if count == 0:
+                continue
+
+            end = start + count
+
+            if grad_flat is None:
+                grad_flat = torch.zeros(
+                    ctx.flat_shape,
+                    dtype=grad.dtype,
+                    device=grad.device,
+                )
+
+            grad_flat.index_add_(
+                0,
+                sorted_token_ids[start:end],
+                grad,
+            )
+            start = end
+
+        return grad_flat, None, None
+
+
+class _MergeExpertOutputs(torch.autograd.Function):
+    """
+    dispatch 的输出侧：把各专家输出散射回原始 assignment 顺序。
+
+    forward 与逐专家 index_copy_ 写入同一缓冲一致；
+    backward 只需一次按 perm 的 index_select，再按计数切成
+    各专家输出的梯度视图。
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        perm: torch.Tensor,
+        counts: list,
+        *expert_outputs: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.counts = counts
+
+        if any(t.requires_grad for t in expert_outputs):
+            ctx.save_for_backward(perm)
+
+        first = expert_outputs[0]
+
+        outputs = torch.empty(
+            perm.numel(),
+            first.size(-1),
+            dtype=first.dtype,
+            device=first.device,
+        )
+
+        start = 0
+        for out, count in zip(expert_outputs, counts):
+            if count == 0:
+                continue
+
+            end = start + count
+            outputs.index_copy_(0, perm[start:end], out)
+            start = end
+
+        return outputs
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_outputs: torch.Tensor,
+    ) -> Tuple[None, None, Tuple[torch.Tensor, ...]]:
+        (perm,) = ctx.saved_tensors
+
+        grad_sorted = grad_outputs.index_select(0, perm)
+
+        segment_grads = grad_sorted.split(ctx.counts, dim=0)
+
+        return (None, None) + tuple(segment_grads)
+
 
 class SparseMoE(nn.Module):
     """
@@ -480,36 +598,39 @@ class SparseMoE(nn.Module):
                 rounding_mode="floor",
             )
 
-        gathered = flat.index_select(0, sorted_token_ids)
-
         counts = self._read_counts(counts)
 
-        # 逐专家计算排序后连续的输入段，并将其直接散射回原始
-        # （未排序）位置。各专家的 perm 区间互不重叠、并集恰好
-        # 覆盖全部 assignment，因此空缓冲区会被完整写入；
-        # 写入位置与各段数值与「先 cat 再一次 index_copy_」
-        # 完全一致。
-        outputs = torch.empty_like(gathered)
+        # 每专家连续输入段由单个自定义节点切出，反向按段
+        # 直接 index_add 回 flat。
+        segments = _SplitExpertInputs.apply(
+            flat,
+            sorted_token_ids,
+            counts,
+        )
 
-        experts = self.experts
-
-        start = 0
-        for expert_id, expert in enumerate(experts):
-            count = counts[expert_id]
-
-            if count == 0:
-                continue
-
-            end = start + count
-            outputs.index_copy_(
-                0,
-                perm[start:end],
-                expert(gathered[start:end]),
+        # 逐专家计算其连续输入段；空段原样占位，不产生
+        # 专家调用。
+        expert_outputs = [
+            (
+                expert(segment)
+                if count > 0
+                else segment
             )
+            for count, expert, segment in zip(
+                counts,
+                self.experts,
+                segments,
+            )
+        ]
 
-            start = end
-
-        return outputs.view(
+        # 各专家输出由单个自定义节点散射回原始（未排序）
+        # 位置；各段互不重叠且并集恰好覆盖全部 assignment，
+        # 空缓冲区会被完整写入。
+        return _MergeExpertOutputs.apply(
+            perm,
+            counts,
+            *expert_outputs,
+        ).view(
             num_tokens,
             top_k,
             dim,
@@ -751,18 +872,20 @@ class TransformerBlock(nn.Module):
         # expert_outputs 不再被其它节点使用（各 dispatch 分支
         # 均返回持有独立存储的张量），add_ 与逐算子 add 使用
         # 同一 kernel 与舍入路径，数值逐位一致，省去一份
-        # [batch, k1, time, dim] 的激活分配。
-        expert_outputs = expert_outputs.permute(
+        # [batch, k1, time, dim] 的激活分配。残差先按
+        # [batch, time, k1, dim] 的连续布局相加，再切到
+        # [batch, k1, time, dim] 的分支视图，原地写入无需
+        # 跨步寻址。
+        expert_outputs.add_(
+            x.unsqueeze(-2),
+            alpha=self.residual_scale,
+        )
+        branches = expert_outputs.permute(
             0,
             2,
             1,
             3,
         )
-        expert_outputs.add_(
-            x.unsqueeze(1),
-            alpha=self.residual_scale,
-        )
-        branches = expert_outputs
 
         return (
             branches,
@@ -1184,17 +1307,26 @@ class ByteDataset:
         val_fraction: float = 0.05,
         device: Optional[torch.device] = None,
     ):
-        raw = Path(filename).read_bytes()
+        data_path = Path(filename)
 
-        if len(raw) < seq_len + 2:
+        # 直接读入可写的字节缓冲区，避免 read_bytes() 的
+        # bytes 与随后的 bytearray 复制同时驻留造成的
+        # 双份峰值内存。文件在读取期间被截断时按实际
+        # 读入长度处理。
+        buf = bytearray(data_path.stat().st_size)
+        with open(data_path, "rb") as handle:
+            filled = handle.readinto(buf)
+
+        if filled != len(buf):
+            del buf[filled:]
+
+        if len(buf) < seq_len + 2:
             raise ValueError(
                 "数据文件太小，至少需要 seq_len + 2 个字节"
             )
 
         # 显式持有缓冲区引用，避免 frombuffer 依赖
         # 无名临时对象的生命周期。
-        buf = bytearray(raw)
-        del raw
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
         # 语料本身保持普通分页内存：H2D 传输只经过
