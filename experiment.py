@@ -87,6 +87,11 @@ def set_seed(seed: int):
     # 反向等 CUDA 算子若不存在确定性实现会明确告警，而不是
     # 静默产生跨重启不可复现的微小差异。
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # 本文件所有 torch.empty 缓冲在使用前都会被完整写入，
+    # 不依赖未初始化内存的 NaN 填充来保证结果确定性。
+    torch.utils.deterministic.fill_uninitialized_memory = False
+
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -152,17 +157,13 @@ class CausalSelfAttention(nn.Module):
         """
         batch, length, dim = x.shape
 
-        qkv = self.qkv(x)
-        # 一次 permute 直接得到 [batch, heads, length, head_dim]。
-        qkv = qkv.view(
-            batch,
-            length,
-            3,
-            self.n_heads,
-            self.head_dim,
-        ).permute(2, 0, 3, 1, 4)
+        q, k, v = self.qkv(x).view(
+            batch, length, 3, self.n_heads, self.head_dim
+        ).unbind(2)
 
-        q, k, v = qkv.unbind(dim=0)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         y = F.scaled_dot_product_attention(
             q,
