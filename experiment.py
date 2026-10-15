@@ -711,7 +711,13 @@ class SparseMoE(nn.Module):
             expert_outputs.dtype
         ).unsqueeze(-1)
 
-        merged = (expert_outputs * weights).sum(dim=-2)
+        # 加权乘原地写回 dispatch 的输出缓冲：此处之后
+        # expert_outputs 不再被其它节点使用，逐元素乘法与
+        # out-of-place 版本使用同一 kernel 与舍入路径，
+        # 数值逐位一致。
+        expert_outputs.mul_(weights)
+
+        merged = expert_outputs.sum(dim=-2)
         merged = merged.reshape(out_shape)
 
         # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
@@ -856,30 +862,25 @@ class TransformerBlock(nn.Module):
         #
         # 每个分支都保留完整残差：x + residual_scale * expert。
         #
-        # dtype 一致时原地完成缩放与残差相加；
-        # autocast 下残差流精度更高时走 out-of-place 的类型提升路径。
+        # dtype 一致时先原地缩放，再与残差广播相加：一次写入
+        # 直接得到 [batch, k1, time, dim] 连续分支张量，后续
+        # 按 batch 展平无需再做一次布局拷贝；加法与逐算子路径
+        # 使用同一 elementwise 语义（加法交换律按位成立），
+        # 数值逐位一致。autocast 下残差流精度更高时走
+        # out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             expert_outputs.mul_(
                 self.residual_scale,
-            ).add_(
-                x.unsqueeze(-2),
             )
-            branches = expert_outputs.permute(
-                0,
-                2,
-                1,
-                3,
+            branches = torch.add(
+                x.unsqueeze(1),
+                expert_outputs.permute(0, 2, 1, 3),
             )
         else:
             branches = torch.add(
-                x.unsqueeze(-2),
-                expert_outputs,
+                x.unsqueeze(1),
+                expert_outputs.permute(0, 2, 1, 3),
                 alpha=self.residual_scale,
-            ).permute(
-                0,
-                2,
-                1,
-                3,
             )
 
         return (
@@ -967,9 +968,13 @@ class TransformerBlock(nn.Module):
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：广播乘 + 沿分支维求和。
-            x = (
-                branches * gates.to(branches.dtype).unsqueeze(-1)
-            ).sum(dim=-2)
+            # 加权乘原地写回 branches（此后不再被其它节点使用），
+            # 逐元素乘法与 out-of-place 版本使用同一 kernel 与
+            # 舍入路径，数值逐位一致。
+            branches.mul_(
+                gates.to(branches.dtype).unsqueeze(-1)
+            )
+            x = branches.sum(dim=-2)
 
         return x, [aux1, aux2]
 
@@ -2606,6 +2611,12 @@ def main():
         scheduler._last_lr = [
             group["lr"] for group in optimizer.param_groups
         ]
+
+    # 检查点载荷中的模型/优化器张量已在上面的 load_state_dict
+    # 中拷入各自的模块（optimizer 内部会深拷贝），此后不再有
+    # 引用；及时释放可避免整份检查点在设备上常驻。
+    if rng_payload is not None:
+        del rng_payload
 
     train_generator = torch.Generator().manual_seed(
         args.seed
