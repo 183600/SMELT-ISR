@@ -408,7 +408,10 @@ class SparseMoE(nn.Module):
     ]:
         flat = x.reshape(-1, x.size(-1))
 
-        router_logits = self.router(flat).float()
+        router_logits = F.linear(
+            flat,
+            self.router.weight,
+        ).float()
         router_probs = router_logits.softmax(dim=-1)
 
         top_values, top_indices = router_logits.topk(
@@ -452,6 +455,24 @@ class SparseMoE(nn.Module):
             counts,
             aux_loss,
         )
+
+    def _cast_for_autocast(
+        self,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        CUDA autocast 下把张量转换为 autocast dtype；其余情况
+        原样返回（dtype 一致时 to 也是无拷贝的空操作）。
+        """
+        if not tensor.is_cuda or not torch.is_autocast_enabled():
+            return tensor
+
+        try:
+            dtype = torch.get_autocast_dtype("cuda")
+        except AttributeError:
+            dtype = torch.get_autocast_gpu_dtype()
+
+        return tensor.to(dtype)
 
     def _issue_counts_readback(self, counts: torch.Tensor) -> None:
         """
@@ -506,14 +527,18 @@ class SparseMoE(nn.Module):
         # 单专家时所有 token 都路由到同一个专家，
         # 排序等价于恒等排列。
         if self.n_experts == 1:
+            expert_flat = self._cast_for_autocast(flat)
+
             # top_k == 1 时 repeat_interleave 是纯拷贝。
             if top_k == 1:
-                return self.experts[0](flat).unsqueeze(1)
+                return self.experts[0].forward(expert_flat).unsqueeze(1)
 
             # 所有 assignment 指向同一专家：对 [N, dim] 计算
             # 一次再 expand 出 slot 维。
             # expand 是 stride=0 视图，后面用 reshape 而不能用 view。
-            return self.experts[0](flat).unsqueeze(1).expand(
+            return self.experts[0].forward(expert_flat).unsqueeze(
+                1
+            ).expand(
                 num_tokens,
                 top_k,
                 dim,
@@ -523,8 +548,14 @@ class SparseMoE(nn.Module):
         # 所有专家。每位专家处理完整输入，再按路由下标
         # gather 回 [token, slot] 位置。
         if top_k == self.n_experts:
+            # 所有专家共用同一份输入副本。
+            expert_flat = self._cast_for_autocast(flat)
+
             per_expert = torch.stack(
-                [expert(flat) for expert in self.experts],
+                [
+                    expert.forward(expert_flat)
+                    for expert in self.experts
+                ],
                 dim=1,
             )
             gather_index = top_indices.unsqueeze(-1).expand(
@@ -557,30 +588,27 @@ class SparseMoE(nn.Module):
                 rounding_mode="floor",
             )
 
-        # 按排序下标收集输入，随后回读 counts。
-        gathered = flat.index_select(0, sorted_token_ids)
-
-        if gathered.is_cuda and torch.is_autocast_enabled():
-            try:
-                gather_dtype = torch.get_autocast_dtype("cuda")
-            except AttributeError:
-                gather_dtype = torch.get_autocast_gpu_dtype()
-            gathered = gathered.to(gather_dtype)
+        # 按排序下标收集输入，随后回读 counts。autocast 下
+        # 先转换再收集：收集结果直接就是目标 dtype，与收集后
+        # 转换的取值一致。
+        gather_source = self._cast_for_autocast(flat)
+        gathered = gather_source.index_select(0, sorted_token_ids)
 
         counts = self._read_counts(counts)
         segments = gathered.split(counts, dim=0)
 
         # 逐专家计算其连续输入段；空段原样占位，不产生
         # 专家调用。
+        experts = self.experts
         expert_outputs = [
             (
-                expert(segment)
+                expert.forward(segment)
                 if count > 0
                 else segment
             )
             for count, expert, segment in zip(
                 counts,
-                self.experts,
+                experts,
                 segments,
             )
         ]
