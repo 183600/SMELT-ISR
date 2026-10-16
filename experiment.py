@@ -530,8 +530,11 @@ class SparseMoE(nn.Module):
         ):
             self._issue_counts_readback(counts)
 
-        # counts 是 int64，与 Python 整数相除提升为 fp32。
-        hard_load = counts / flat.size(0)
+        # counts 显式转 fp32，与 soft_load（router_logits 已
+        # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
+        # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
+        # torch.dot 报错。
+        hard_load = counts.float() / flat.size(0)
 
         soft_load = router_probs.mean(dim=0)
 
