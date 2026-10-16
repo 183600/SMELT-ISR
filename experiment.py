@@ -406,9 +406,6 @@ class SparseMoE(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        # autocast 下先转换一次 [N, dim]：router 线性与
-        # dispatch 的 gather 共用同一份低精度输入，避免各自
-        # 转换产生额外拷贝与 kernel。
         flat = self._cast_for_autocast(
             x.reshape(-1, x.size(-1))
         )
@@ -442,9 +439,7 @@ class SparseMoE(nn.Module):
             minlength=self.n_experts,
         )
 
-        # 一般路径的 dispatch 稍后才需要逐专家 counts；此处
-        # 提前发起 D2H 回读，使其与负载统计、排序、gather
-        # 并行。条件与 dispatch 一般路径保持一致。
+        # 与 dispatch 的一般路径一致时发起 counts 回读。
         if (
             counts.is_cuda
             and self.n_experts > 1
@@ -507,7 +502,6 @@ class SparseMoE(nn.Module):
             self._counts_event = torch.cuda.Event()
             self._counts_stream = torch.cuda.Stream(device=counts.device)
 
-        # D2H 拷贝只依赖 bincount 的结果，放到专用 stream 上执行。
         self._counts_stream.wait_stream(
             torch.cuda.current_stream(counts.device)
         )
@@ -711,8 +705,7 @@ class SparseMoE(nn.Module):
             if residual is not None:
                 flat_residual = residual.reshape(-1, dim)
 
-                # dtype 一致时原地完成「缩放 + 残差相加」，
-                # 省去一份输出缓冲。
+                # dtype 一致时原地完成「缩放 + 残差相加」。
                 if output.dtype == flat_residual.dtype:
                     if residual_scale != 1.0:
                         output.mul_(residual_scale)
@@ -726,14 +719,12 @@ class SparseMoE(nn.Module):
 
             return output.view(out_shape)
 
-        # 权重先补出 slot 维再转换 dtype，循环内只做视图选择。
+        # 权重补出 slot 维并转换 dtype。
         weights = top_weights.to(
             expert_outputs.dtype
         ).unsqueeze(-1)
 
-        # 对 expert_outputs / weights 保持 out-of-place：首个
-        # slot 的加权乘产生输出缓冲，其余 slot 用 addcmul
-        # 原地累加。
+        # 对 expert_outputs / weights 保持 out-of-place。
         merged = expert_outputs.select(-2, 0).mul(
             weights.select(-2, 0)
         )
@@ -746,9 +737,8 @@ class SparseMoE(nn.Module):
         merged = merged.reshape(out_shape)
 
         if residual is not None:
-            # 同上：dtype 一致时原地累加；dtype 不匹配
-            # （autocast 残差流精度更高）时用 add(alpha=)
-            # 完成「缩放 + 残差相加」，由类型提升合并。
+            # dtype 一致时原地累加；dtype 不匹配（autocast）时
+            # 用 add(alpha=) 完成「缩放 + 残差相加」。
             if merged.dtype == residual.dtype:
                 if residual_scale != 1.0:
                     merged.mul_(residual_scale)
@@ -945,8 +935,8 @@ class TransformerBlock(nn.Module):
         )
 
         # 残差并入 expert_outputs：dtype 一致时原地完成
-        # x + residual_scale * expert；autocast 下残差流精度
-        # 更高时走 out-of-place 的类型提升路径。
+        # x + residual_scale * expert；dtype 不匹配时用
+        # add(alpha=) 合并。
         if expert_outputs.dtype == x.dtype:
             if self.residual_scale != 1.0:
                 expert_outputs.mul_(
@@ -2976,7 +2966,7 @@ def main():
         # 对应「从 step+1 恢复」的采样起点。
         checkpoint_gen_state = train_generator.get_state()
 
-        # 提前采样并搬运下一批；采样顺序不变。
+        # 采样下一批并搬运到设备；采样顺序不变。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
                 "train",
