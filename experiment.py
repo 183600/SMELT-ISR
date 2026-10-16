@@ -1744,8 +1744,7 @@ class ByteDataset:
 # Data audit (leakage / distribution checks)
 # ============================================================
 
-# 重复窗口扫描的采样上限：窗口数超过该值时按等间距抽样，
-# 保证审计开销与语料大小无关。
+# 重复窗口扫描的采样上限：窗口数超过该值时按等间距抽样。
 _AUDIT_MAX_WINDOWS = 100000
 
 # train/val(/test) 字节分布 JS 距离超过该值时报分布偏移警告。
@@ -1778,15 +1777,15 @@ def _window_signature_scan(
     offset: int,
     length: int,
     window_len: int,
-    budget: int = _AUDIT_MAX_WINDOWS,
+    max_windows: int = _AUDIT_MAX_WINDOWS,
 ) -> Dict[str, object]:
     """
     对 [offset, offset + length) 内的滑动窗口做有界签名扫描。
 
     对每个采样窗口取 blake2b-128 摘要，用于发现跨 split 的重复
     内容（数据泄露的常见来源）与 split 内部重复。窗口数超过
-    budget 时等间距抽样，返回实际采样规模，避免大语料上开销
-    不可控。该扫描只做数据审计，不参与特征计算或模型决策。
+    max_windows 时等间距抽样，返回实际采样规模。该扫描只做
+    数据审计，不参与特征计算或模型决策。
     """
     total = length - window_len + 1
 
@@ -1799,7 +1798,7 @@ def _window_signature_scan(
             "signatures": {},
         }
 
-    stride = max(1, math.ceil(total / budget))
+    stride = max(1, math.ceil(total / max_windows))
 
     signatures: Dict[bytes, List[int]] = {}
     within_duplicates = 0
@@ -3955,8 +3954,7 @@ def main():
     except (RuntimeError, TypeError):
         fused_adamw = False
     # fused 不可用时改用 foreach 批量更新：逐元素计算与逐参数
-    # 路径逐位一致（已验证），但每个参数一组小算子会合并为少
-    # 量多张量算子，显著减少调度开销。
+    # 路径逐位一致（已验证）。
     try:
         optimizer = torch.optim.AdamW(
             param_groups,
