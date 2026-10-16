@@ -335,14 +335,17 @@ class _MergeExpertOutputs(torch.autograd.Function):
             device=first.device,
         )
 
-        start = 0
-        for out, count in zip(expert_outputs, counts):
+        # 散射下标按计数一次切分，与各专家输出、计数对齐；
+        # 空段仍按计数占位，不产生 index_copy_。
+        for out, index, count in zip(
+            expert_outputs,
+            perm.split(counts),
+            counts,
+        ):
             if count == 0:
                 continue
 
-            end = start + count
-            outputs.index_copy_(0, perm[start:end], out)
-            start = end
+            outputs.index_copy_(0, index, out)
 
         return outputs
 
@@ -575,6 +578,13 @@ class SparseMoE(nn.Module):
 
         assignment_experts = top_indices.reshape(-1)
 
+        # CUDA 上排序按元素位宽计费：int32 的索引读写与
+        # radix 排序遍数都约为 int64 的一半；CUDA 的
+        # index_select / index_copy_ 同样接受 int32 下标，
+        # CPU 侧则要求 int64，故仅在 CUDA 上收窄。
+        if assignment_experts.is_cuda:
+            assignment_experts = assignment_experts.to(torch.int32)
+
         # 按 expert id 排序：每个专家的输入在排序后连续，
         # 按段切片分发。同一专家内部的行序不影响结果
         #（专家按行独立计算，散射下标互不重复），因此无需
@@ -724,14 +734,17 @@ class SparseMoE(nn.Module):
             expert_outputs.dtype
         ).unsqueeze(-1)
 
-        # 对 expert_outputs / weights 保持 out-of-place。
-        merged = expert_outputs.select(-2, 0).mul(
-            weights.select(-2, 0)
-        )
+        # 对 expert_outputs / weights 保持 out-of-place；
+        # unbind 出的 slot 视图与逐次 select 等价，但只推进
+        # 一次视图切分。
+        slots = expert_outputs.unbind(-2)
+        weight_slots = weights.unbind(-2)
+
+        merged = slots[0].mul(weight_slots[0])
         for index in range(1, top_k):
             merged.addcmul_(
-                expert_outputs.select(-2, index),
-                weights.select(-2, index),
+                slots[index],
+                weight_slots[index],
             )
 
         merged = merged.reshape(out_shape)
