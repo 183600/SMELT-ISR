@@ -627,14 +627,24 @@ class SparseMoE(nn.Module):
         dim = expert_outputs.size(-1)
 
         # top_k == 1 时门控权重恒为 1.0（单元素 softmax），
-        # 加权和退化为恒等；有残差时用 add(alpha=) 完成
-        # 「缩放 + 残差相加」。
+        # 加权和退化为恒等；有残差时完成「缩放 + 残差相加」。
         if top_k == 1:
             output = expert_outputs.reshape(-1, dim)
 
             if residual is not None:
+                flat_residual = residual.reshape(-1, dim)
+
+                # 缩放系数为 1 且 dtype 一致时，merged 缓冲在本次
+                # 调用后不再被其它节点引用，可直接原地累加残差；
+                # a + b 与 b + a 逐位相同。
+                if (
+                    residual_scale == 1.0
+                    and output.dtype == flat_residual.dtype
+                ):
+                    return output.add_(flat_residual).view(out_shape)
+
                 return torch.add(
-                    residual.reshape(-1, dim),
+                    flat_residual,
                     output,
                     alpha=residual_scale,
                 ).view(out_shape)
@@ -657,9 +667,16 @@ class SparseMoE(nn.Module):
 
         merged = merged.reshape(out_shape)
 
-        # add(alpha=) 完成「缩放 + 残差相加」，dtype 不匹配时
-        # 由类型提升合并（输出取更高精度），语义不变。
         if residual is not None:
+            # 同上：缩放系数为 1 且 dtype 一致时原地累加，
+            # 省去一份 […, dim] 激活；否则用 add(alpha=) 完成
+            # 「缩放 + 残差相加」，dtype 不匹配时由类型提升合并。
+            if (
+                residual_scale == 1.0
+                and merged.dtype == residual.dtype
+            ):
+                return merged.add_(residual)
+
             merged = torch.add(
                 residual,
                 merged,
