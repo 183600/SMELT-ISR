@@ -578,10 +578,12 @@ class SparseMoE(nn.Module):
 
         assignment_experts = top_indices.reshape(-1)
 
-        # CUDA 上排序按元素位宽计费：int32 的索引读写与
-        # radix 排序遍数都约为 int64 的一半；CUDA 的
-        # index_select / index_copy_ 同样接受 int32 下标，
-        # CPU 侧则要求 int64，故仅在 CUDA 上收窄。
+        # CUDA 上排序按元素位宽计费：int32 的排序键读写与
+        # radix 排序遍数都约为 int64 的一半，收窄仅作用于
+        # 排序键本身。torch.sort 返回的排序下标始终是 int64
+        #（与其键 dtype 无关），后续 index_select 收集与
+        # index_copy_ 散射的下标都不受此处收窄影响；CPU
+        # 侧排序开销小，不做转换。
         if assignment_experts.is_cuda:
             assignment_experts = assignment_experts.to(torch.int32)
 
