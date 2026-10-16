@@ -7105,10 +7105,10 @@ def main():
         type=str,
         default="",
         help=(
-            "本轮实验要验证的科学假设（必填，见 "
-            "docs/experiment_protocol.md）：写清楚「预期"
-            "什么改动带来什么效果、依据什么指标判定成败」，"
-            "带着假设做实验而不是排列组合超参数"
+            "本轮实验要验证的科学假设（必填）：写清楚"
+            "「预期什么改动带来什么效果、依据什么指标"
+            "判定成败」，带着假设做实验而不是排列组合"
+            "超参数"
         ),
     )
     parser.add_argument(
@@ -7380,8 +7380,8 @@ def main():
         )
 
     # 假设纪律：全新训练必须带明确的科学假设，避免
-    # 「盲目排列组合超参数」（详见 hypothesis_check_error
-    # 的说明与 docs/experiment_protocol.md）。
+    # 「盲目排列组合超参数」（检查逻辑见
+    # hypothesis_check_error）。
     hypothesis_error = hypothesis_check_error(args)
 
     if hypothesis_error is not None:
