@@ -2541,12 +2541,13 @@ def early_stop_state_from_records(
     evals_without_improvement = 0
 
     for record in records:
+        step = record.get("step")
+        if not isinstance(step, int):
+            continue
         if "val_loss" not in record:
             continue
 
         val_loss = record.get("val_loss")
-        step = record.get("step")
-
         if val_loss is None:
             continue
 
@@ -2557,7 +2558,7 @@ def early_stop_state_from_records(
             or val_loss < best_loss - min_delta
         ):
             best_loss = val_loss
-            best_step = step if isinstance(step, int) else None
+            best_step = step
             evals_without_improvement = 0
         else:
             evals_without_improvement += 1
@@ -3305,8 +3306,9 @@ def _count_forward_flops(
 
     - 线性层（mm/addmm，含专家与路由）用
       torch.utils.flop_counter.FlopCounterMode 实测；
-    - SDPA 内部的注意力矩阵乘不计入 FlopCounter，用模块
-      pre-hook 按 4·B·T²·D 补上（乘加各计 1 次浮点运算）。
+    - SDPA 内部的注意力矩阵乘不计入 FlopCounter，测量期间
+      包装每个 Block 的 attention_step 按 4·B·T²·D 补上
+      （乘加各计 1 次浮点运算）。
 
     返回的是一次前向的总 FLOPs，用于跨模式比较计算量。
     """
@@ -3326,25 +3328,28 @@ def _count_forward_flops(
 
     attention_flops = [0]
 
-    def _attention_hook(module, args):
-        inp = args[0]
-        if inp.dim() == 3:
-            # numel = B·T·D，乘 4·T 即 4·B·T²·D。
-            attention_flops[0] += (
-                4 * int(inp.size(-2)) * int(inp.numel())
-            )
-
-    # 注意：TransformerBlock 直接调用 self.attn.core()，不会经过
-    # CausalSelfAttention.__call__，因此 hook 必须挂在 Block 上
-    # （smelt 模式的中间层会被执行两轮，hook 自然只统计真实次数）。
-    handles = []
+    # 训练路径会直接调用 first_branch_step / local_two_stage 等
+    # Block 方法而不经过 __call__，模块级 hook 会漏计；所有路径
+    # 最终都要走 attention_step，因此在测量期间按实例包装它。
+    wrapped_modules: List[TransformerBlock] = []
     for module in model.modules():
-        if isinstance(module, TransformerBlock):
-            handles.append(
-                module.register_forward_pre_hook(
-                    _attention_hook
+        if not isinstance(module, TransformerBlock):
+            continue
+        original_attention_step = module.attention_step
+
+        def _wrapped_attention_step(
+            inputs: torch.Tensor,
+            _original=original_attention_step,
+        ) -> torch.Tensor:
+            if inputs.dim() == 3:
+                # numel = B·T·D，乘 4·T 即 4·B·T²·D。
+                attention_flops[0] += (
+                    4 * int(inputs.size(-2)) * int(inputs.numel())
                 )
-            )
+            return _original(inputs)
+
+        module.attention_step = _wrapped_attention_step
+        wrapped_modules.append(module)
 
     try:
         try:
@@ -3360,8 +3365,8 @@ def _count_forward_flops(
     except Exception:
         return flops
     finally:
-        for handle in handles:
-            handle.remove()
+        for module in wrapped_modules:
+            del module.attention_step
 
     flops["linear_flops"] = linear_flops
     flops["attention_flops"] = int(attention_flops[0])
@@ -5223,6 +5228,23 @@ def run_self_test():
     assert early_best_step == 20
     assert early_no_improve == 2
 
+    # 非整数 step 的记录（如最终汇总）不参与早停判定。
+    (
+        early_best,
+        early_best_step,
+        early_no_improve,
+    ) = early_stop_state_from_records(
+        [
+            {"step": 10, "val_loss": 5.0},
+            {"step": 20, "val_loss": 4.0},
+            {"step": "final", "val_loss": 9.9},
+        ],
+        min_delta=0.0,
+    )
+    assert early_best == 4.0
+    assert early_best_step == 20
+    assert early_no_improve == 0
+
     # NaN/Inf 排查：越界数据必须被发现；非有限梯度必须被定位。
     bad_data_check = _check_batch_integrity(
         torch.tensor([[0, 300]], dtype=torch.int32),
@@ -5355,11 +5377,49 @@ def run_self_test():
         efficiency["flops_per_forward"] is None
         or int(efficiency["flops_per_forward"]) > 0
     )
-    # attention 的 FLOPs 由 Block 级 hook 估计；Block 被真实
-    # 执行时该值必须为正，否则说明 hook 挂错了对象。
+    # attention 的 FLOPs 按每个 Block 的 attention_step 实际
+    # 执行次数估计；独立插桩同一批次做对照，两者必须一致。
     assert (
         efficiency["flops_attention"] is None
         or int(efficiency["flops_attention"]) > 0
+    )
+
+    expected_attention_flops = [0]
+    probe_modules = []
+    for probe_module in efficiency_model.modules():
+        if not isinstance(probe_module, TransformerBlock):
+            continue
+        original_probe_step = probe_module.attention_step
+
+        def probe_attention_step(
+            inputs: torch.Tensor,
+            _original=original_probe_step,
+        ) -> torch.Tensor:
+            expected_attention_flops[0] += (
+                4 * int(inputs.size(-2)) * int(inputs.numel())
+            )
+            return _original(inputs)
+
+        probe_module.attention_step = probe_attention_step
+        probe_modules.append(probe_module)
+
+    probe_generator = torch.Generator().manual_seed(0)
+    probe_x, probe_y = eval_dataset.batch(
+        "train",
+        2,
+        probe_generator,
+        eval_device,
+    )
+    try:
+        with torch.no_grad():
+            efficiency_model(probe_x, probe_y)
+    finally:
+        for probe_module in probe_modules:
+            del probe_module.attention_step
+
+    assert (
+        int(efficiency["flops_attention"])
+        == expected_attention_flops[0]
     )
     assert efficiency["measurement"]["mode"] == "B"
 
