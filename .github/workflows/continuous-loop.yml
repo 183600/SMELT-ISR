@@ -167,6 +167,9 @@ jobs:
           # NVIDIA 不可用（无 key / 端点失效 / 无 GLM 模型）时自然回落免费 deepseek。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
+          # ⭐ 兜底：免费 deepseek-v4.1-flash-free 不可用（限流/下线/调用失败）时，
+          #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
+          PICKLE_MODEL="opencode/big-pickle"
           NVIDIA_PROB=20
           NVIDIA_MODEL=""
           CURRENT_PROVIDER=""
@@ -261,7 +264,7 @@ jobs:
           # ---------- 切换 provider（每次调用都重写/清理配置，防 agent 篡改） ----------
           switch_provider() {
             case "$1" in
-              free)
+              free|pickle)
                 rm -f "$HOME/.config/opencode/opencode.json" \
                       "$HOME/.config/opencode/opencode.jsonc" \
                       "$HOME/.config/opencode/config.json" 2>/dev/null
@@ -289,9 +292,15 @@ jobs:
               switch_provider free
               return 0
             fi
+            # ⭐ 免费 deepseek 失效：优先切换 big-pickle 兜底
+            if ! is_broken pickle; then
+              switch_provider pickle
+              echo "[info] 免费 deepseek 本阶段失效，改用 big-pickle 兜底：$PICKLE_MODEL"
+              return 0
+            fi
             if ! is_broken nvidia && probe_nvidia; then
               switch_provider nvidia
-              echo "[info] 免费 deepseek 本阶段失效，改用 NVIDIA：$NVIDIA_MODEL"
+              echo "[info] 免费 deepseek 与 big-pickle 均失效，改用 NVIDIA：$NVIDIA_MODEL"
               return 0
             fi
             echo "[warn] 所有 provider 本阶段均失败过，重置失效标记继续尝试"
@@ -363,13 +372,25 @@ jobs:
           }
           ensure_readme
 
+          # ---------- 提交信息附带本轮实际使用的模型（写入 /tmp/last_model_used.txt） ----------
+          MODEL_TAG_FILE=/tmp/last_model_used.txt
+          record_model() {
+            printf '%s' "$1" > "$MODEL_TAG_FILE" 2>/dev/null || true
+          }
+          model_tag() {
+            local m=""
+            [ -f "$MODEL_TAG_FILE" ] && m="$(head -c 120 "$MODEL_TAG_FILE" 2>/dev/null)"
+            [ -n "$m" ] && printf ' [model: %s]' "$m"
+            return 0
+          }
+
           commit_and_push() {
             # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
             git checkout HEAD -- .github 2>/dev/null || true
             git clean -fdq .github 2>/dev/null || true
             ensure_readme
             git add -A || true
-            git commit -m "auto: iteration $1" || true
+            git commit -m "auto: iteration $1$(model_tag)" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
@@ -381,7 +402,7 @@ jobs:
             ensure_readme
             git add -A || true
             if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown" || true
+              git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
               git pull --rebase origin "$BRANCH" || git rebase --abort || true
               git push origin "HEAD:${BRANCH}" || true
               echo "[trap] partial work committed & pushed"
@@ -419,6 +440,7 @@ jobs:
               local MODEL_DESC="$FREE_MODEL"
               case "$CURRENT_PROVIDER" in
                 nvidia) MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
+                pickle) MODEL_DESC="$PICKLE_MODEL" ;;
               esac
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$MODEL_DESC ==========="
 
@@ -428,10 +450,17 @@ jobs:
               rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
               if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
+                record_model "nvidia/$NVIDIA_MODEL"
                 timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
+              elif [ "$CURRENT_PROVIDER" = "pickle" ]; then
+                # big-pickle 无 reasoning effort 档位，不传 --variant
+                record_model "$PICKLE_MODEL"
+                timeout --kill-after=180 "$budget" opencode run -m "$PICKLE_MODEL" "$prompt" 2>&1 | tee "$OUT"
               elif [ -n "$VARIANT" ]; then
+                record_model "$FREE_MODEL"
                 timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
               else
+                record_model "$FREE_MODEL"
                 timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
               fi
               local EC=$?
@@ -549,7 +578,8 @@ jobs:
             [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
           fi
           git add -A
-          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
+          LAST_MODEL="$(head -c 120 /tmp/last_model_used.txt 2>/dev/null || true)"
+          git commit -m "auto: end of 5h run, cleanup${LAST_MODEL:+ [model: $LAST_MODEL]}" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
