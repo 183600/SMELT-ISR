@@ -116,9 +116,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
         # torch>=2.4 提供内置实现，内部使用高精度累加，
-        # 语义与手动实现一致。CUDA 上融合核更快；CPU 上
-        # 该实现会经组合算子展开成多步，反而慢于手动公式
-        #（两者数值一致），因此仅在 CUDA 张量上走融合路径。
+        # 语义与手动实现一致。
         self._fused = (
             F.rms_norm if hasattr(F, "rms_norm") else None
         )
