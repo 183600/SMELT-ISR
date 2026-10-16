@@ -19,7 +19,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 
 - `top_k`：普通 Block 的 MoE 路由宽度。
 - `k1` / `k2`：第一轮分支数与第二轮路由宽度。
-- `balance_coef`：负载均衡损失的系数。
+- `balance_coef`：负载均衡损失的系数。辅助损失按 token 数归一化，
+  均匀路由时约为 `top_k`，均衡强度随路由宽度线性增大；跨
+  `k1`/`k2`/`top_k` 比较实验时应按比例折算系数（保持
+  `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
 - `residual_scale`：残差缩放系数。
 
 ## 代码组织

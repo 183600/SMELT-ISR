@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -425,7 +426,9 @@ class SparseMoE(nn.Module):
 
         # Top-k 版本的 Switch 风格负载均衡损失。
         # f_i 是「被分配给专家 i 的 token 比例」，以 token
-        # 数量为分母。
+        # 数量为分母；均匀路由时 E * sum(f_i * P_i) 恰好等于
+        # top_k，均衡强度随路由宽度线性增大，跨 k 比较时
+        # 应按比例折算 balance_coef（保持 balance_coef * k 不变）。
         counts = torch.bincount(
             top_indices.reshape(-1),
             minlength=self.n_experts,
@@ -1295,6 +1298,9 @@ class ByteDataset:
                 "数据文件太小，至少需要 seq_len + 2 个字节"
             )
 
+        # 语料内容指纹：恢复训练时用来确认数据文件没有变化。
+        self.data_sha256 = hashlib.sha256(buf).hexdigest()
+
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
         _ = device
@@ -2034,6 +2040,10 @@ def run_self_test():
         )
         eval_device = torch.device("cpu")
 
+        assert eval_dataset.data_sha256 == hashlib.sha256(
+            bytes(range(256))
+        ).hexdigest()
+
         first = eval_dataset.fixed_val_batch(
             0,
             batches=2,
@@ -2360,6 +2370,7 @@ def main():
     start_step = 0
     scaler = None
     rng_payload = None
+    saved_data_sha256 = None
 
     if args.resume is not None:
         # 检查点先载入 CPU，再按目标设备分别搬运。
@@ -2367,6 +2378,10 @@ def main():
             args.resume,
             torch.device("cpu"),
         )
+        saved_data_sha256 = rng_payload.get(
+            "args",
+            {},
+        ).get("data_sha256")
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
         known_config_fields = {
@@ -2752,6 +2767,22 @@ def main():
         cfg.seq_len,
         device=device,
     )
+
+    # 语料指纹写入 args，随 config.json 与检查点一起存档；
+    # 恢复训练时若数据文件内容已变化，采样轨迹会与原运行不同，
+    # 这里明确提示而不是静默继续。
+    args.data_sha256 = dataset.data_sha256
+
+    if (
+        saved_data_sha256 is not None
+        and saved_data_sha256 != dataset.data_sha256
+    ):
+        print(
+            "resume data file content changed "
+            f"({saved_data_sha256[:12]}... -> "
+            f"{dataset.data_sha256[:12]}...); "
+            "采样轨迹与原运行不再一致"
+        )
 
     n_params = sum(
         p.numel() for p in model.parameters()
