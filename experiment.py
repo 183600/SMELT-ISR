@@ -618,7 +618,8 @@ class SparseMoE(nn.Module):
         """
         门控加权合并 […, top_k, dim] 的专家输出。
 
-        加权和以广播乘 + 沿 top_k 维求和实现；dtype 不匹配
+        加权和以逐 slot 的 mul + addcmul 累加实现，
+        等价于广播乘后沿 top_k 维求和；dtype 不匹配
         （autocast 残差流精度更高）时同一路径靠类型提升
         合并残差，语义不变。
         """
@@ -642,22 +643,17 @@ class SparseMoE(nn.Module):
 
         weights = top_weights.to(expert_outputs.dtype)
 
-        # 对 expert_outputs / weights 保持 out-of-place。
-        if top_k == 2:
-            # top_k == 2 时用 mul + addcmul 计算
-            # w0*x0 + w1*x1，等价于广播乘后沿 top_k 维求和。
-            merged = expert_outputs.select(-2, 0).mul(
-                weights.select(-1, 0).unsqueeze(-1)
-            )
+        # 对 expert_outputs / weights 保持 out-of-place：首个
+        # slot 的加权乘产生输出缓冲，其余 slot 用 addcmul
+        # 原地累加，不产生 […, top_k, dim] 的中间张量。
+        merged = expert_outputs.select(-2, 0).mul(
+            weights.select(-1, 0).unsqueeze(-1)
+        )
+        for index in range(1, top_k):
             merged.addcmul_(
-                expert_outputs.select(-2, 1),
-                weights.select(-1, 1).unsqueeze(-1),
+                expert_outputs.select(-2, index),
+                weights.select(-1, index).unsqueeze(-1),
             )
-        else:
-            # […, top_k, 1]，按最后一维广播相乘后沿 top_k 求和。
-            merged = (
-                expert_outputs * weights.unsqueeze(-1)
-            ).sum(dim=-2)
 
         merged = merged.reshape(out_shape)
 
@@ -894,23 +890,19 @@ class TransformerBlock(nn.Module):
             # 加权和退化为恒等。
             x = branches.squeeze(-2)
         else:
-            # 跨分支的门控加权和：广播乘 + 沿分支维求和，
-            # 对 branches / gates 保持 out-of-place。
+            # 跨分支的门控加权和：逐分支 mul + addcmul 累加，
+            # 对 branches / gates 保持 out-of-place，不产生
+            # […, k1, dim] 的中间张量。
             weights = gates.to(branches.dtype)
 
-            if branches.size(-2) == 2:
-                # k1 == 2 时用 mul + addcmul 计算 w0*b0 + w1*b1。
-                x = branches.select(-2, 0).mul(
-                    weights.select(-1, 0).unsqueeze(-1)
-                )
+            x = branches.select(-2, 0).mul(
+                weights.select(-1, 0).unsqueeze(-1)
+            )
+            for index in range(1, branches.size(-2)):
                 x.addcmul_(
-                    branches.select(-2, 1),
-                    weights.select(-1, 1).unsqueeze(-1),
+                    branches.select(-2, index),
+                    weights.select(-1, index).unsqueeze(-1),
                 )
-            else:
-                x = (
-                    branches * weights.unsqueeze(-1)
-                ).sum(dim=-2)
 
         return x, [aux1, aux2]
 
