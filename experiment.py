@@ -2654,6 +2654,26 @@ def main():
             )
             args.grad_clip = saved_grad_clip
 
+        # 验证窗口集合由 batch_size * eval_batches 决定。batch_size
+        # 已恢复，若 eval_batches 沿用当前 CLI（默认 20），恢复训练
+        # 后的验证窗口集合会与恢复前不同，metrics.jsonl 中同一
+        # 条曲线上的 val_loss 将不再可逐位对齐。
+        saved_eval_batches = rng_payload.get(
+            "args",
+            {},
+        ).get("eval_batches")
+
+        if (
+            saved_eval_batches is not None
+            and saved_eval_batches != args.eval_batches
+        ):
+            print(
+                "resume restored eval_batches "
+                f"{args.eval_batches} -> {saved_eval_batches} "
+                "(验证窗口集合由 batch_size*eval_batches 决定)"
+            )
+            args.eval_batches = saved_eval_batches
+
     scheduler = build_lr_schedule(
         optimizer,
         args.warmup_steps,
