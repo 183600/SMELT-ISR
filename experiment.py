@@ -1318,8 +1318,12 @@ class LanguageModel(nn.Module):
         blocks = self.blocks
         call = self._call
 
+        # dense 模式没有中间循环区域，全部 Block 由下面的 dense
+        # 分支统一执行；跳过前后区域循环，避免边界 Block 重复执行。
+        pre_end = 0 if cfg.mode == "dense" else self.middle_start
+
         # 中间区域之前的层。
-        for index in range(self.middle_start):
+        for index in range(pre_end):
             x, aux = call(
                 blocks[index],
                 x,
@@ -1438,8 +1442,11 @@ class LanguageModel(nn.Module):
                 )
                 aux_losses.extend(block_aux)
 
-        # 中间区域之后的层。
-        for index in range(self.middle_end, cfg.n_layers):
+        # 中间区域之后的层（dense 模式已在上面统一执行）。
+        post_start = (
+            cfg.n_layers if cfg.mode == "dense" else self.middle_end
+        )
+        for index in range(post_start, cfg.n_layers):
             x, aux = call(
                 blocks[index],
                 x,
@@ -2252,7 +2259,7 @@ def _binary_roc_auc(
     # 分数共享平均秩 (start + end) / 2（1 基、右开）。
     average_rank = (
         starts[group] + 1 + ends[group]
-    ).float() / 2.0
+    ).double() / 2.0
 
     positive_ranks = average_rank[
         labels[order].bool()
@@ -2864,6 +2871,14 @@ class NgramBaseline:
             )
 
         context_len = order - 1
+
+        if context_len > seq_len:
+            # 阶数高于窗口可提供的最大上下文长度：没有任何
+            # 有效位置，调用方将整阶回退到低阶模型。此处直接
+            # 返回空结果，避免 unfold 的 size 越界报错。
+            empty = torch.empty(0, dtype=torch.int64)
+            return empty, empty, 0
+
         t_min = context_len - 1
         n_valid = seq_len - t_min
 
@@ -8232,10 +8247,6 @@ def main():
     # 时用它作为存档与最终评估的步数。
     last_completed_step = start_step
 
-    # 最近一次周期性验证的步数与结果。
-    last_eval_step: Optional[int] = None
-    last_eval_metrics: Optional[Dict[str, float]] = None
-
     # 采样始终按步序进行（消费 train_generator 的顺序不变）。
     prefetched_batch: Optional[
         Tuple[torch.Tensor, torch.Tensor]
@@ -8460,9 +8471,6 @@ def main():
                 "extra",
                 {},
             ).update(eval_metrics)
-
-            last_eval_step = step + 1
-            last_eval_metrics = eval_metrics
 
             records = flush_records()
             print(records[-1])
