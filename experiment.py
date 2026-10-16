@@ -533,8 +533,9 @@ class SparseMoE(nn.Module):
         # counts 显式转 fp32，与 soft_load（router_logits 已
         # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
         # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
-        # torch.dot 报错。
-        hard_load = counts.float() / flat.size(0)
+        # torch.dot 报错。归一化就地完成，省去一次输出分配。
+        hard_load = counts.float()
+        hard_load.div_(flat.size(0))
 
         soft_load = router_probs.mean(dim=0)
 
@@ -1862,21 +1863,41 @@ def audit_data_splits(
 
     for split in split_names:
         tokens = getattr(dataset, split)
-        tokens_long = tokens.to(torch.int64)
 
-        hist = torch.bincount(
-            tokens_long,
-            minlength=256,
-        ).to(torch.float64)
+        # 字节管线固定为 uint8，直方图直接在原始 dtype 上
+        # 统计，避免整段语料转 int64 产生 8× 临时内存，
+        # 也免去全量值域比较（uint8 天然落在 0..255，越界
+        # 恒为 0）。其他 dtype（若日后扩展管线）回退到旧的
+        # int64 校验路径，保持诊断语义不变。
+        if tokens.dtype == torch.uint8:
+            try:
+                hist = torch.bincount(
+                    tokens,
+                    minlength=256,
+                )
+            except RuntimeError:
+                # 旧版本 bincount 仅接受 int64 输入，退回转换。
+                hist = torch.bincount(
+                    tokens.to(torch.int64),
+                    minlength=256,
+                )
+            hist = hist.to(torch.float64)
+            invalid = 0
+        else:
+            tokens_long = tokens.to(torch.int64)
+            hist = torch.bincount(
+                tokens_long,
+                minlength=256,
+            ).to(torch.float64)
+            invalid = int(
+                ((tokens_long < 0) | (tokens_long > 255)).sum()
+            )
+
         histograms[split] = hist / hist.sum()
 
         top_share, top_byte = torch.topk(
             histograms[split],
             k=5,
-        )
-
-        invalid = int(
-            ((tokens_long < 0) | (tokens_long > 255)).sum()
         )
 
         begin, end = dataset.split_bounds[split]
