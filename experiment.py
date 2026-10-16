@@ -196,8 +196,13 @@ class _SwiGLU(torch.autograd.Function):
             # 判断是否需要保存。
             ctx.save_for_backward(h)
 
-        # SiLU 保持 out-of-place，mul_ 原地写入其输出。
-        return F.silu(gate).mul_(up)
+            # h 需要保存供反向使用，SiLU 保持 out-of-place，
+            # mul_ 原地写入其输出。
+            return F.silu(gate).mul_(up)
+
+        # 无需反向时 h 只是临时张量，SiLU 直接原地写入
+        # gate（h 的前半区），省去一份中间激活。
+        return F.silu(gate, inplace=True).mul_(up)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:
@@ -371,9 +376,10 @@ class SparseMoE(nn.Module):
             for _ in range(cfg.n_experts)
         ])
 
-        # counts 回读的暂存与完成事件。
+        # counts 回读的暂存、完成事件与专用 stream。
         self._counts_stage = None
         self._counts_event = None
+        self._counts_stream = None
 
     def route(
         self,
@@ -431,8 +437,8 @@ class SparseMoE(nn.Module):
 
     def _issue_counts_readback(self, counts: torch.Tensor) -> None:
         """
-        启动 counts 回读：先拷入暂存并记录完成事件，
-        到需要逐专家计数时再读取；与 _read_counts 配对使用。
+        启动 counts 回读：在专用 stream 上拷入暂存并记录完成
+        事件，到需要逐专家计数时再读取；与 _read_counts 配对使用。
         """
         if not counts.is_cuda:
             return
@@ -445,10 +451,21 @@ class SparseMoE(nn.Module):
                     pin_memory=True,
                 )
             self._counts_event = torch.cuda.Event()
+            self._counts_stream = torch.cuda.Stream(device=counts.device)
 
-        with torch.cuda.device(counts.device):
+        # D2H 拷贝只依赖 bincount 的结果。放到专用 stream 上，
+        # 与 compute stream 上随后的 argsort/gather 并行执行，
+        # 避免 64B 拷贝占用 compute stream 的执行间隙。
+        self._counts_stream.wait_stream(
+            torch.cuda.current_stream(counts.device)
+        )
+        with torch.cuda.stream(self._counts_stream):
             self._counts_stage.copy_(counts, non_blocking=True)
             self._counts_event.record()
+
+        # 源张量分配于 compute stream，可能在拷贝完成前被缓存
+        # 分配器回收复用，需声明与拷贝 stream 的关联。
+        counts.record_stream(self._counts_stream)
 
     def _read_counts(self, counts: torch.Tensor) -> list:
         if counts.is_cuda:
