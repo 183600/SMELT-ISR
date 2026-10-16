@@ -89,7 +89,7 @@ def set_seed(seed: int):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
     # 本文件所有 torch.empty 缓冲在使用前都会被完整写入，
-    # 不依赖未初始化内存的 NaN 填充来保证结果确定性。
+    # 不依赖未初始化缓冲的 NaN 填充来保证结果确定性。
     torch.utils.deterministic.fill_uninitialized_memory = False
 
     torch.backends.cudnn.deterministic = True
@@ -192,14 +192,11 @@ class _SwiGLU(torch.autograd.Function):
 
         if h.requires_grad:
             # gate/up 是 h 的切片视图，保存 h 即可同时覆盖两者。
-            # forward 内 grad mode 默认关闭，不能用
-            # torch.is_grad_enabled() 判断是否需要保存；
-            # requires_grad 为 False 时不会建反向节点。
+            # forward 内 grad mode 默认关闭，因此以 requires_grad
+            # 判断是否需要保存。
             ctx.save_for_backward(h)
 
-        # mul_ 原地写入 SiLU 的输出；SiLU 本身必须保持
-        # out-of-place（其反向依赖输入或输出缓冲，若再做
-        # in-place 会破坏 saved tensor）。
+        # SiLU 保持 out-of-place，mul_ 原地写入其输出。
         return F.silu(gate).mul_(up)
 
     @staticmethod
@@ -207,15 +204,13 @@ class _SwiGLU(torch.autograd.Function):
         (h,) = ctx.saved_tensors
         gate, up = h.chunk(2, dim=-1)
 
-        # 与逐算子反向相同的算子序列：mul 反向给出两路梯度，
-        # gate 路再过 silu 反向；两路梯度分别直接写回融合输出的
-        # 对应半区（两半区互不重叠且并集完整，空缓冲会被完整覆盖）。
-        # silu_backward 的 out= 变体与函数式版本逐位一致。
+        # mul 反向给出两路梯度，gate 路再过 silu 反向；
+        # 两路梯度分别写回 grad_h 的对应半区
+        #（两半区互不相交且并集完整）。
         grad_h = torch.empty_like(h)
         grad_h_gate, grad_h_up = grad_h.chunk(2, dim=-1)
 
-        # grad_up 半区先写入 grad_out * up 作为 silu 反向的输入，
-        # 该半区最终会被 grad_up 完整覆盖。
+        # grad_up 半区先写入 grad_out * up 作为 silu 反向的输入。
         torch.mul(grad_out, up, out=grad_h_up)
         torch.ops.aten.silu_backward.grad_input(
             grad_h_up,
@@ -223,10 +218,7 @@ class _SwiGLU(torch.autograd.Function):
             grad_input=grad_h_gate,
         )
 
-        # grad_up = grad_out * silu(gate)：用 forward 同一个
-        # silu 算子在相同输入上重算 silu(gate)，与其保存值逐位
-        # 一致（确定性逐元素算子），因此 grad_out 的乘法与逐算子
-        # 反向完全一致；该半区此前的临时值被完整覆盖。
+        # grad_up = grad_out * silu(gate)。
         torch.ops.aten.silu.out(gate, out=grad_h_up)
         torch.mul(grad_out, grad_h_up, out=grad_h_up)
         return grad_h
@@ -256,9 +248,9 @@ class Expert(nn.Module):
         *args,
         **kwargs,
     ):
-        # 兼容旧检查点中分开保存的 gate.weight / up.weight：
-        # 按 [gate; up] 顺序拼接后并入 gate_up.weight，
-        # 与 forward 中 chunk 的切分顺序一致。
+        # 分开保存的 gate.weight / up.weight 按 [gate; up] 顺序
+        # 拼接后并入 gate_up.weight，与 forward 中 chunk 的
+        # 切分顺序一致。
         old_gate = prefix + "gate.weight"
         old_up = prefix + "up.weight"
 
@@ -287,9 +279,9 @@ class _MergeExpertOutputs(torch.autograd.Function):
     """
     dispatch 的输出侧：把各专家输出散射回原始 assignment 顺序。
 
-    forward 与逐专家 index_copy_ 写入同一缓冲一致；
-    backward 只需一次按 perm 的 index_select，再按计数切成
-    各专家输出的梯度视图。
+    forward 把各专家输出写回原始 assignment 顺序的缓冲；
+    backward 按 perm 收集梯度，再按计数切成各专家输出的
+    梯度视图。
     """
 
     @staticmethod
@@ -405,27 +397,22 @@ class SparseMoE(nn.Module):
         )
 
         # top-k 内部的 softmax 等价于完整 softmax 概率的
-        # 重新归一化，直接对 top-k logits 求 softmax。
-        # top_k == 1 时单元素 softmax 恒为 1.0，且其反向
-        # w*(1-w) 按位为 0；直接以 ones 构造与 softmax 路径的
-        # 前向数值和参数梯度逐位一致。
+        # 重新归一化，直接对 top-k logits 求 softmax；
+        # top_k == 1 时权重为单元素 softmax，恒为 1.0。
         if top_k == 1:
             top_weights = torch.ones_like(top_values)
         else:
             top_weights = top_values.softmax(dim=-1)
 
         # Top-k 版本的 Switch 风格负载均衡损失。
-        # f_i 是「被分配给专家 i 的 token 比例」，必须以 token
-        # 数量而不是 assignment 数量为分母；否则 top-k 改变时
-        # 同一 balance_coef 对应的实际均衡强度会随 k 成反比变化，
-        # 使不同 k 配置的实验不再可比。
+        # f_i 是「被分配给专家 i 的 token 比例」，以 token
+        # 数量为分母。
         counts = torch.bincount(
             top_indices.reshape(-1),
             minlength=self.n_experts,
         )
 
-        # counts 是 int64，与 Python 整数相除按默认 dtype 提升为
-        # fp32，与显式转成 fp32 后再除逐位一致。
+        # counts 是 int64，与 Python 整数相除提升为 fp32。
         hard_load = counts / flat.size(0)
 
         soft_load = router_probs.mean(dim=0)
@@ -484,19 +471,16 @@ class SparseMoE(nn.Module):
         num_tokens, top_k = top_indices.shape
         dim = flat.size(-1)
 
-        # 单专家时所有 token 都路由到同一个专家，排序等价于
-        # 恒等排列；直接对 repeat_interleave 展开后的输入跑
-        # 一次专家即可，数值与排序路径逐位一致。
+        # 单专家时所有 token 都路由到同一个专家，
+        # 排序等价于恒等排列。
         if self.n_experts == 1:
-            # top_k == 1 时 repeat_interleave 是纯拷贝，
-            # 直接跑一次专家再补回 slot 维，数值逐位一致。
+            # top_k == 1 时 repeat_interleave 是纯拷贝。
             if top_k == 1:
                 return self.experts[0](flat).unsqueeze(1)
 
             # 所有 assignment 指向同一专家：对 [N, dim] 计算
-            # 一次再 expand 出 slot 维，数值逐位一致。
-            # expand 只是 stride=0 视图，后面用 reshape
-            # （按需物化）而不能用 view。
+            # 一次再 expand 出 slot 维。
+            # expand 是 stride=0 视图，后面用 reshape 而不能用 view。
             return self.experts[0](flat).unsqueeze(1).expand(
                 num_tokens,
                 top_k,
@@ -504,9 +488,8 @@ class SparseMoE(nn.Module):
             )
 
         # 稠密路由（top_k == n_experts）：每个 token 被分配给
-        # 所有专家，分组排序退化为恒等。让每位专家处理完整输入，
-        # 再按路由下标 gather 回 [token, slot] 位置，
-        # 数值与排序路径逐位一致。
+        # 所有专家。每位专家处理完整输入，再按路由下标
+        # gather 回 [token, slot] 位置。
         if top_k == self.n_experts:
             per_expert = torch.stack(
                 [expert(flat) for expert in self.experts],
@@ -524,9 +507,8 @@ class SparseMoE(nn.Module):
         self._issue_counts_readback(counts)
 
         # 按 expert id 做稳定排序：
-        # 每个专家的输入在排序后连续，按段切片即可分发；
-        # 稳定排序保持同一专家内 token 顺序不变，
-        # 数值结果与逐专家索引完全一致。
+        # 每个专家的输入在排序后连续，按段切片分发；
+        # 稳定排序保持同一专家内 token 顺序不变。
         perm = torch.argsort(
             assignment_experts,
             stable=True,
@@ -537,8 +519,7 @@ class SparseMoE(nn.Module):
         if top_k == 1:
             sorted_token_ids = perm
         elif top_k == 2:
-            # 非负 int64 整除 2 与算术右移等价（精确、向下取整），
-            # 排列与除法路径逐位一致。
+            # 非负 int64 整除 2 与算术右移等价（精确、向下取整）。
             sorted_token_ids = perm >> 1
         else:
             sorted_token_ids = perm.div(
@@ -546,8 +527,7 @@ class SparseMoE(nn.Module):
                 rounding_mode="floor",
             )
 
-        # 先发起 gather（不依赖 counts），再回读 counts：
-        # D2H 等待期间 GPU 可继续执行 gather。
+        # 按排序下标收集输入，随后回读 counts。
         gathered = flat.index_select(0, sorted_token_ids)
 
         counts = self._read_counts(counts)
@@ -603,7 +583,7 @@ class SparseMoE(nn.Module):
         )
 
         # dispatch 的 n_experts == 1 分支返回 expand 视图，
-        # 此处用 reshape 兼容非连续输入。
+        # 此处用 reshape 处理非连续输入。
         expert_outputs = expert_outputs.reshape(
             *x.shape[:-1],
             top_k,
@@ -645,11 +625,9 @@ class SparseMoE(nn.Module):
         top_k = expert_outputs.size(-2)
         dim = expert_outputs.size(-1)
 
-        # top_k == 1 时门控权重来自单元素 softmax，
-        # 恒等于 1.0（精确值），其对 router logits 的反向
-        # 梯度也恒为 0（softmax 反向的 w*(1-w) 按位为 0），
-        # 加权和退化为恒等；
-        # 有残差时用 add(alpha=) 完成「缩放 + 残差相加」。
+        # top_k == 1 时门控权重恒为 1.0（单元素 softmax），
+        # 加权和退化为恒等；有残差时用 add(alpha=) 完成
+        # 「缩放 + 残差相加」。
         if top_k == 1:
             output = expert_outputs.reshape(-1, dim)
 
@@ -664,14 +642,10 @@ class SparseMoE(nn.Module):
 
         weights = top_weights.to(expert_outputs.dtype)
 
-        # 必须保持对 expert_outputs / weights 的 out-of-place：
-        # 原地乘法会让 AOTAutograd 的版本检查失败
-        #（torch.compile 下反向报错）。
+        # 对 expert_outputs / weights 保持 out-of-place。
         if top_k == 2:
-            # top_k == 2 时用 mul + addcmul 累加，等价于
-            # 广播乘后沿 top_k 维求和（w0*x0 + w1*x1），
-            # 但不产生 […, top_k, dim] 的中间张量。
-            # addcmul 只原地写入加权乘产生的新张量。
+            # top_k == 2 时用 mul + addcmul 计算
+            # w0*x0 + w1*x1，等价于广播乘后沿 top_k 维求和。
             merged = expert_outputs.select(-2, 0).mul(
                 weights.select(-1, 0).unsqueeze(-1)
             )
@@ -828,10 +802,8 @@ class TransformerBlock(nn.Module):
         # [batch, time, k1, dim]
         #
         # 每个分支都保留完整残差：x + residual_scale * expert。
-        # 缩放与残差相加用 add(alpha=) 一趟完成：alpha 乘法
-        # 与单独 mul 逐位一致，缩放系数为 1.0 时按位恒等
-        #（含 NaN/Inf）。dtype 不一致（autocast 残差流精度更
-        # 高）时同一路径靠类型提升合并。
+        # dtype 不一致（autocast 残差流精度更高）时靠类型
+        # 提升合并。
         branches = torch.add(
             x.unsqueeze(1),
             expert_outputs.permute(0, 2, 1, 3),
@@ -880,9 +852,8 @@ class TransformerBlock(nn.Module):
         )
 
         # 残差并入 expert_outputs：dtype 一致时原地完成
-        # x + residual_scale * expert；缩放系数为 1.0 时
-        # 乘以 1.0 是逐位恒等。autocast 下残差流精度更高时
-        # 走 out-of-place 的类型提升路径。
+        # x + residual_scale * expert；autocast 下残差流精度
+        # 更高时走 out-of-place 的类型提升路径。
         if expert_outputs.dtype == x.dtype:
             if self.residual_scale != 1.0:
                 expert_outputs.mul_(
@@ -904,8 +875,6 @@ class TransformerBlock(nn.Module):
         #
         # SparseMoE 支持任意前置维度，因此每个 branch
         # 的 token 会独立经过 Router。
-        # 第二轮合并时直接把残差融进 merge 的
-        # 加权和 + 残差相加路径。
         expert_outputs2, gates2, _, aux2 = self.moe.unmerged(
             self.norm_moe(branches),
             k2,
@@ -919,22 +888,18 @@ class TransformerBlock(nn.Module):
             residual_scale=self.residual_scale,
         )
 
-        # 第一轮门控权重只在第二轮结束后使用。
+        # 第一轮门控权重在第二轮结束后使用。
         if branches.size(-2) == 1:
-            # k1 == 1 时单元素 softmax 权重恒为精确 1.0
-            #（且是无梯度常数），加权和退化为恒等，数值逐位一致。
+            # k1 == 1 时单元素 softmax 权重恒为 1.0，
+            # 加权和退化为恒等。
             x = branches.squeeze(-2)
         else:
-            # 跨分支的门控加权和：广播乘 + 沿分支维求和。
-            # 必须保持对 branches / gates 的 out-of-place：
-            # 门控权重需要梯度，原地乘法会让 AOTAutograd 的
-            # 版本检查失败（torch.compile 下反向报错）。
+            # 跨分支的门控加权和：广播乘 + 沿分支维求和，
+            # 对 branches / gates 保持 out-of-place。
             weights = gates.to(branches.dtype)
 
             if branches.size(-2) == 2:
-                # k1 == 2 时用 mul + addcmul 累加
-                #（w0*b0 + w1*b1），不产生 […, k1, dim] 的
-                # 中间张量；addcmul 只原地写入加权乘产生的新张量。
+                # k1 == 2 时用 mul + addcmul 计算 w0*b0 + w1*b1。
                 x = branches.select(-2, 0).mul(
                     weights.select(-1, 0).unsqueeze(-1)
                 )
@@ -997,8 +962,8 @@ class LanguageModel(nn.Module):
         )
 
         # 与 position_embedding.weight 指向同一参数（共享存储）。
-        # 经 object.__setattr__ 写入实例字典，避免重复注册到
-        # _parameters 而污染 state_dict 与检查点兼容。
+        # 经 object.__setattr__ 写入实例字典，不重复注册到
+        # _parameters。
         object.__setattr__(
             self,
             "position_embedding_weight",
@@ -1179,9 +1144,8 @@ class LanguageModel(nn.Module):
             # [batch, k1, time, dim]
             #
             if branches.size(1) == 1:
-                # k1 == 1 时 gate 来自单元素 softmax，恒为精确 1.0
-                #（且是无梯度常数），分支维收缩退化为恒等；
-                # 直接去掉分支维，与 matmul 收缩结果逐位一致。
+                # k1 == 1 时 gate 来自单元素 softmax，恒为 1.0，
+                # 分支维收缩退化为恒等，直接去掉分支维。
                 x = branches.squeeze(1)
             else:
                 # 归一化后的 top-k gate 在每个 token 上和为 1。
@@ -1321,8 +1285,7 @@ class ByteDataset:
             )
 
         # unfold 产生 [num_windows, seq_len + 1] 的滑动窗口
-        # 视图（stride 为 1），采样时按起点直接 index_select，
-        # 不必为每个批次构造（并搬运）int64 索引张量。
+        # 视图（stride 为 1），采样时按起点 index_select。
         self._train_windows = self.train.unfold(
             0,
             seq_len + 1,
@@ -1349,7 +1312,6 @@ class ByteDataset:
         num_rows = starts.numel()
 
         if device.type != "cuda" or not torch.cuda.is_available():
-            # index_select 连续收集，收集到的字节内容完全一致。
             return torch.index_select(
                 windows,
                 0,
@@ -1423,7 +1385,7 @@ class ByteDataset:
 
         # 窗口先以 uint8 搬运：输入 embedding 只接受 int32/int64，
         # 在目标设备上转 int32；目标 token 保持 uint8（cross_entropy
-        # 直接支持 Byte 目标），省去整批 int64 转换。
+        # 直接支持 Byte 目标）。
         chunks = self._gather_windows(
             windows,
             starts,
@@ -1447,8 +1409,7 @@ class ByteDataset:
 
         不用随机数，因此验证估计不随运行进程、CUDA 状态或
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合
-        完全相同。请求窗口多于合法起点时仅取一遍无重复起点，
-        避免同一验证样本因 round 重叠而以不同权重计入均值。
+        完全相同。请求窗口多于合法起点时仅取一遍无重复起点。
         """
         # 合法起点共 len(val) - seq_len 个。
         num_starts = len(self.val) - self.seq_len
@@ -1506,8 +1467,7 @@ def evaluate(
         and device.type == "cuda"
     )
 
-    # 按目标 token 数加权累加；最后一批不足 batch_size 时，
-    # 也不会与满批获得相同的聚合权重。
+    # 按目标 token 数加权累加。
     total = torch.zeros(
         (),
         device=device,
@@ -1529,8 +1489,7 @@ def evaluate(
                     device,
                 )
 
-                # 请求窗口超过验证集合法起点时，后继批次为空；
-                # 已收集的窗口均不重复，不能用原 batches 作分母。
+                # 请求窗口超过验证集合法起点时，后继批次为空。
                 if x.size(0) == 0:
                     break
 
@@ -1576,7 +1535,7 @@ def save_checkpoint(
     args: argparse.Namespace,
 ):
     # torch.compile 包装后 state_dict 带有 "_orig_mod." 前缀，
-    # 存档时解包，保证编译版与原始版产出的检查点可以互换。
+    # 存档时解包。
     raw_model = getattr(model, "_orig_mod", model)
 
     payload = {
@@ -1650,7 +1609,7 @@ def run_self_test():
         pass
     else:
         raise AssertionError(
-            "非法 n_layers 必须在 -O 模式下仍然报错"
+            "非法 n_layers 在 -O 模式下也必须被拒绝"
         )
 
     common = dict(
@@ -1715,9 +1674,7 @@ def run_self_test():
         for grad in gradients:
             assert torch.isfinite(grad).all()
 
-    # B 的第一轮必须全程使用 k1，第二轮使用 k2。若在
-    # 第一轮后续 Block 中混用 k2，就不再是两个轮次不同宽度
-    # 路由的延迟合并基线。
+    # B 的第一轮全程使用 k1，第二轮使用 k2。
     class RouteWidthProbe(LanguageModel):
         def __init__(self, cfg: Config):
             super().__init__(cfg)
@@ -1792,7 +1749,6 @@ def run_self_test():
         + [common["top_k"]]
     )
 
-    # Top-k 负载均衡损失的规模不能随 k 改变而归一化。
     # 对均匀 Router，f_i 与 P_i 的乘积求和恰好等于 k。
     aux_moe = SparseMoE(
         Config(
@@ -2054,8 +2010,8 @@ def run_self_test():
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
 
-    # 请求窗口数超过验证起点数时，评估必须只使用每个
-    # 起点一次；后继批次为空，而不是让 round 造成不等权重复。
+    # 请求窗口数超过验证起点数时，评估只使用每个起点一次；
+    # 后继批次为空。
     overfull_first = eval_dataset.fixed_val_batch(
         0,
         batches=3,
@@ -2133,9 +2089,8 @@ def run_self_test():
         expected_lr,
     )
 
-    # 旧检查点没有 scheduler 状态时 param group 缺少
-    # initial_lr；start_step > 0 重建调度必须仍能工作，
-    # 而不是在 LRScheduler 构造时报 KeyError。
+    # param group 缺少 initial_lr 时，
+    # start_step > 0 重建调度仍能工作。
     legacy_param = nn.Parameter(torch.randn(2))
     legacy_optimizer = torch.optim.AdamW(
         [legacy_param],
@@ -2176,7 +2131,7 @@ def run_self_test():
         warmup_optimizer.step()
         original.step()
 
-    # 反例：用错误的 warmup（例如 CLI 默认值）重建，
+    # 用不同的 warmup（例如 CLI 默认值）重建时，
     # lr 序列与原运行不同。
     wrong_param = nn.Parameter(torch.randn(2))
     wrong_optimizer = torch.optim.AdamW(
@@ -2201,7 +2156,7 @@ def run_self_test():
         torch.tensor(wrong_lrs),
     ), "warmup mismatch must change the LR schedule"
 
-    # 用存档 warmup 重建后逐位一致。
+    # 用存档 warmup 重建后 lr 序列与原运行一致。
     rebuilt_param = nn.Parameter(torch.randn(2))
     rebuilt_optimizer = torch.optim.AdamW(
         [rebuilt_param],
@@ -2239,8 +2194,7 @@ def build_lr_schedule(
     start_step: int = 0,
 ):
     # last_epoch >= 0 时 LRScheduler 要求 param group 中存在
-    # initial_lr；旧检查点没有 scheduler 状态时该键缺失，
-    # 用当前的基准 lr 补齐，避免恢复训练直接报 KeyError。
+    # initial_lr；该键缺失时用当前的基准 lr 补齐。
     if start_step > 0:
         for group in optimizer.param_groups:
             group.setdefault("initial_lr", group["lr"])
@@ -2447,8 +2401,7 @@ def main():
 
     # weight decay 只作用于 2D 权重矩阵；
     # 1D 参数（RMSNorm 增益）与 embedding（含与其共享的
-    # lm_head）不做 weight decay，这是 LLM 训练的标准做法，
-    # 否则会同时压缩输入嵌入与输出 logit 的尺度。
+    # lm_head）不做 weight decay。
     decay_params = []
     no_decay_params = []
 
@@ -2458,10 +2411,8 @@ def main():
         else:
             no_decay_params.append(param)
 
-    # embedding 与 lm_head 共享同一个 2D 参数，
-    # 单独排除，避免上面的 ndim 规则将其归入 decay 组；
-    # position embedding 同理，也属于上面声明不做
-    # weight decay 的 embedding。
+    # embedding 与 lm_head 共享同一个 2D 参数，单独排除；
+    # position embedding 同理。
     embedding_params = (
         model.token_embedding.weight,
         model.position_embedding.weight,
@@ -2478,12 +2429,7 @@ def main():
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    # 优先使用 fused AdamW（CUDA 与新版 torch 的 CPU 均
-    # 支持）。支持范围随 torch 版本与设备变化，旧版本会在
-    # 构造或首次 step() 的惰性校验中才报错，因此先用一个
-    # 单元素参数真实走一遍 step 探测，不支持时回退到默认
-    # 实现。显式传 fused=False 会关闭默认解析，在只支持单
-    # 张量路径的设备上无法再启用多张量 / fused 优化。
+    # 用单元素参数探测 fused AdamW 是否可用。
     probe = torch.zeros(1, device=device, requires_grad=True)
     probe.grad = torch.zeros_like(probe)
     try:
@@ -2511,8 +2457,7 @@ def main():
         scaler = None
     elif device.type == "cuda":
         amp_dtype = torch.float16
-        # torch.amp.GradScaler(device) 自 torch 2.3 起可用；
-        # 兼容 README 声明的 torch>=2.2 下限。
+        # torch.amp.GradScaler(device) 自 torch 2.3 起可用。
         try:
             scaler = torch.amp.GradScaler("cuda")
         except (AttributeError, TypeError):
@@ -2573,8 +2518,8 @@ def main():
         if saved_scheduler is not None:
             base_lrs = saved_scheduler["base_lrs"]
         else:
-            # 旧检查点没有 scheduler 状态时，使用存档中记录
-            # 的原始 lr 作为 base_lr 重建调度。
+            # 没有 scheduler 状态时，使用存档中记录的原始 lr
+            # 作为 base_lr 重建调度。
             saved_base_lr = rng_payload.get(
                 "args",
                 {},
@@ -2613,12 +2558,9 @@ def main():
             )
             args.batch_size = saved_batch
 
-        # lr_lambda 的 warmup 段是调度定义的一部分，但不在
-        # scheduler 的 state_dict 里。resume 时若用当前 CLI 的
-        # --warmup-steps 重建 lambda，共享区间内每一步的 lr 都会
-        # 与原运行不一致（例如原 warmup=5、resume 默认 100，
-        # 余弦段会被错当成 warmup 段）。因此恢复存档中的
-        # warmup_steps；--steps 仍允许用户调整以延长/缩短训练。
+        # warmup 段是 lr 调度定义的一部分，但不在 scheduler 的
+        # state_dict 里；resume 时按存档恢复 warmup_steps，
+        # --steps 仍允许用户调整以延长/缩短训练。
         saved_warmup = rng_payload.get(
             "args",
             {},
@@ -2635,9 +2577,8 @@ def main():
             )
             args.warmup_steps = saved_warmup
 
-        # 梯度裁剪直接改变每次更新后的参数，是优化轨迹的
-        # 一部分。resume 时若用当前 CLI 的 --grad-clip（默认
-        # 1.0），与原运行不同就会让恢复训练偏离原轨迹。
+        # 梯度裁剪直接改变每次更新后的参数；
+        # resume 时按存档恢复 grad_clip。
         saved_grad_clip = rng_payload.get(
             "args",
             {},
@@ -2654,10 +2595,8 @@ def main():
             )
             args.grad_clip = saved_grad_clip
 
-        # 验证窗口集合由 batch_size * eval_batches 决定。batch_size
-        # 已恢复，若 eval_batches 沿用当前 CLI（默认 20），恢复训练
-        # 后的验证窗口集合会与恢复前不同，metrics.jsonl 中同一
-        # 条曲线上的 val_loss 将不再可逐位对齐。
+        # 验证窗口集合由 batch_size * eval_batches 决定；
+        # resume 时按存档恢复 eval_batches。
         saved_eval_batches = rng_payload.get(
             "args",
             {},
@@ -2690,9 +2629,7 @@ def main():
             rng_payload["scheduler"]
         )
 
-        # 梯度非有限的步会跳过 scheduler.step，存档里的
-        # last_epoch 可能落后于训练步数；按恢复后的 last_epoch
-        # 重算 lr，避免恢复后第一个训练步的 LR 错位一步。
+        # 按恢复后的 last_epoch 重算 lr。
         for group, base_lr, lr_lambda in zip(
             optimizer.param_groups,
             scheduler.base_lrs,
@@ -2752,10 +2689,7 @@ def main():
     metrics_path = out_dir / "metrics.jsonl"
 
     # metrics_file 在整个训练期间持续打开。
-    # resume 时追加到原日志末尾以保持断点续训的完整记录；
-    # 全新训练必须截断重写：否则复用旧 --out 目录时，
-    # config.json 已被覆盖成新配置，metrics.jsonl 却混入
-    # 旧实验的行，实验产物口径将不再对应同一次运行。
+    # resume 时追加到原日志末尾；全新训练截断重写。
     metrics_file = open(
         metrics_path,
         "a" if args.resume is not None else "w",
@@ -2824,9 +2758,7 @@ def main():
 
     last_saved_step: Optional[int] = None
 
-    # 最近一次周期性验证的步数与结果。训练步数恰好落在
-    # 验证点上时，最后一步的参数在周期验证后不再变化，
-    # 结尾验证可直接复用同一批固定窗口的结果。
+    # 最近一次周期性验证的步数与结果。
     last_eval_step: Optional[int] = None
     last_eval_metrics: Optional[Dict[str, float]] = None
 
@@ -2863,17 +2795,14 @@ def main():
             result = model(x, y)
             loss = result["loss"]
 
-        # 训练循环不再使用 logits；loss 是已算好的标量，
-        # 反向图持有自己保存的中间量，与 Python 侧的张量
-        # 引用无关。
+        # 训练循环不再使用 logits。
         del result["logits"]
 
         # 记录本步存档应保存的 generator 状态，
         # 对应「从 step+1 恢复」的采样起点。
         checkpoint_gen_state = train_generator.get_state()
 
-        # 提前采样并搬运下一批：CPU 侧窗口构造与 H2D 拷贝
-        # 与随后的反向计算重叠；采样顺序不变。
+        # 提前采样并搬运下一批；采样顺序不变。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
                 "train",
@@ -2910,8 +2839,7 @@ def main():
                 args.grad_clip,
             )
 
-            # 任何发散步都不应推进优化器或 LR schedule，
-            # 否则训练步数与调度进度会随溢出次数漂移。
+            # 发散步不推进优化器或 LR schedule。
             if grad_norm.isfinite():
                 optimizer.step()
                 scheduler.step()
@@ -3001,9 +2929,7 @@ def main():
             args,
         )
 
-    # 周期验证恰好覆盖最后一个训练步时（如 steps 是
-    # eval_interval 的整数倍），参数自那次验证后未再更新，
-    # 固定窗口集合也相同，直接复用结果，避免重复评估。
+    # 参数自最近一次周期验证后未更新时复用其结果。
     if last_eval_step == end_step and last_eval_metrics is not None:
         final_metrics = last_eval_metrics
     else:
