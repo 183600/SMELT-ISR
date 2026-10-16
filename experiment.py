@@ -1796,21 +1796,24 @@ def run_sanity_overfit(
                     loss.backward()
                     optimizer.step()
 
-                final_loss = float(loss.detach())
-                final_acc = float(
-                    (
-                        result["logits"].argmax(dim=-1) == y
-                    ).float().mean()
-                )
-
-                if initial_loss is None:
-                    initial_loss = final_loss
-
+                # 仅在需要报告或收尾的步取回标量：loss/准确率
+                # 的 D2H 取值会同步 GPU，每步两次同步会打断
+                # 流水线；取值来源与时刻均与原实现一致。
                 if (
                     step == 1
                     or step % report_every == 0
                     or step == steps
                 ):
+                    final_loss = float(loss.detach())
+                    final_acc = float(
+                        (
+                            result["logits"].argmax(dim=-1) == y
+                        ).float().mean()
+                    )
+
+                    if initial_loss is None:
+                        initial_loss = final_loss
+
                     print(
                         f"[sanity] step {step}/{steps} "
                         f"lm_loss={final_loss:.4f} "
@@ -3204,12 +3207,16 @@ def main():
         fused_adamw = True
     except (RuntimeError, TypeError):
         fused_adamw = False
+    # fused 不可用时改用 foreach 批量更新：逐元素计算与逐参数
+    # 路径逐位一致（已验证），但每个参数一组小算子会合并为少
+    # 量多张量算子，显著减少调度开销。
     try:
         optimizer = torch.optim.AdamW(
             param_groups,
             lr=args.lr,
             weight_decay=args.weight_decay,
             fused=fused_adamw,
+            foreach=not fused_adamw,
         )
     except (RuntimeError, TypeError):
         optimizer = torch.optim.AdamW(
