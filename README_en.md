@@ -108,10 +108,10 @@ still recommended.
 
 ```bash
 # Run the sanity check only, without starting training
-python experiment.py --data corpus.txt --mode B --sanity-only
+python experiment.py --data corpus.txt --mode B --sanity-only --out runs/sanity_B
 
 # Explicitly skip the check (once the setup is well validated)
-python experiment.py --data corpus.txt --mode B --skip-sanity-check ...
+python experiment.py --data corpus.txt --mode B --skip-sanity-check --out runs/B_seed42
 ```
 
 Results are stored in `metrics.jsonl` (`{"step": "sanity", ...}`) and in the

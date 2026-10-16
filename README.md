@@ -114,10 +114,10 @@ bug 时盲目开始全量训练。
 
 ```bash
 # 只跑 sanity check，不开始训练
-python experiment.py --data corpus.txt --mode B --sanity-only
+python experiment.py --data corpus.txt --mode B --sanity-only --out runs/sanity_B
 
 # 显式跳过检查（已充分验证的前提下）
-python experiment.py --data corpus.txt --mode B --skip-sanity-check ...
+python experiment.py --data corpus.txt --mode B --skip-sanity-check --out runs/B_seed42
 ```
 
 检查结果会写入 `metrics.jsonl`（`{"step": "sanity", ...}`）与
