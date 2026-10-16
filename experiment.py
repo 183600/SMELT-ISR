@@ -658,12 +658,10 @@ class SparseMoE(nn.Module):
 
         assignment_experts = top_indices.reshape(-1)
 
-        # CUDA 上排序按元素位宽计费：int32 的排序键读写与
-        # radix 排序遍数都约为 int64 的一半，收窄仅作用于
-        # 排序键本身。torch.sort 返回的排序下标始终是 int64
-        #（与其键 dtype 无关），后续 index_select 收集与
-        # index_copy_ 散射的下标都不受此处收窄影响；CPU
-        # 侧排序开销小，不做转换。
+        # 收窄仅作用于排序键本身：torch.sort 返回的排序下标
+        # 始终是 int64（与其键 dtype 无关），后续 index_select
+        # 收集与 index_copy_ 散射的下标不受此处影响；CPU 侧
+        # 下标须保持 int64，因此仅在 CUDA 上收窄。
         if assignment_experts.is_cuda:
             assignment_experts = assignment_experts.to(torch.int32)
 
@@ -817,8 +815,7 @@ class SparseMoE(nn.Module):
         ).unsqueeze(-1)
 
         # 对 expert_outputs / weights 保持 out-of-place；
-        # unbind 出的 slot 视图与逐次 select 等价，但只推进
-        # 一次视图切分。
+        # unbind 出的 slot 视图与逐次 select 等价。
         slots = expert_outputs.unbind(-2)
         weight_slots = weights.unbind(-2)
 
@@ -1726,9 +1723,9 @@ def run_sanity_overfit(
     损失迅速趋近 0 或下一 token 准确率接近 100%。
 
     这是必要不充分的检查：连小批量都无法过拟合，通常意味着
-    梯度没有正确反传、损失计算错误、优化器配置错误等严重 bug；
+    梯度没有正确反传、损失计算错误、优化器配置错误等严重缺陷；
     但通过也不代表代码完全正确，数据增强、特征对齐、标签映射
-    等 bug 仍可能漏网，仍需配合中间结果检查。
+    等缺陷仍可能漏网，仍需配合中间结果检查。
 
     函数内部固定 seed 并在结束后恢复调用前的全部 RNG 状态，
     因此是否运行本检查不影响主训练的随机轨迹。
