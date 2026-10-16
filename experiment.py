@@ -66,6 +66,10 @@ class Config:
             raise ValueError("k1 必须满足 1 <= k1 <= n_experts")
         if not 1 <= self.k2 <= self.n_experts:
             raise ValueError("k2 必须满足 1 <= k2 <= n_experts")
+        if not math.isfinite(self.balance_coef) or self.balance_coef < 0.0:
+            raise ValueError("balance_coef 必须是有限非负数")
+        if not math.isfinite(self.residual_scale) or self.residual_scale < 0.0:
+            raise ValueError("residual_scale 必须是有限非负数")
 
     @property
     def middle_start(self) -> int:
@@ -340,7 +344,7 @@ class _MergeExpertOutputs(torch.autograd.Function):
     def backward(
         ctx,
         grad_outputs: torch.Tensor,
-    ) -> Tuple[None, None, Tuple[torch.Tensor, ...]]:
+    ) -> tuple:
         (perm,) = ctx.saved_tensors
 
         grad_sorted = grad_outputs.index_select(0, perm)
