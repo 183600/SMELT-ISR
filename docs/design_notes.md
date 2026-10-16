@@ -79,10 +79,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   梯度/优化器状态），报告写入触发的 `metrics.jsonl` 记录。
 - `analyze_bad_cases`、`print_bad_cases`：分组错误案例并从
   歧义、系统性混淆、疑似标签噪声、不确定四类原因中给出归类。
-- `measure_efficiency`、`print_efficiency`：参数量、前向 FLOPs
-  （线性层实测 + 注意力估计）、延迟/吞吐与进程峰值内存。
+- `measure_efficiency`、`print_efficiency`：参数量与前向 FLOPs
+  （线性层实测 + 注意力估计）。
 - `compare_runs`、`print_comparison`：汇总多个运行目录的
-  config 与最终指标，输出精度-效率对照表。
+  config 与最终指标。
 
 ## 结果分析方法
 
@@ -104,14 +104,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   记录上下文、目标/预测字节、是否命中同窗口重复模式，按四类原因
   归类；完整报告写入 `out_dir/bad_cases.json`。测试集解封的
   唯一一次评估会附带 test 坏案例。
-- **效率口径**：验证损失改善必须与参数量、FLOPs、延迟、峰值内存
-  一起汇报。FLOPs 线性层部分用 `FlopCounterMode` 实测，注意力按
-  4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层执行两轮，按真实
-  执行次数累计）；CPU 路径以进程峰值 RSS 作为内存粗粒度口径。
+- **效率口径**：FLOPs 线性层部分用 `FlopCounterMode` 实测，
+  注意力按 4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层
+  执行两轮，按真实执行次数累计）。
 - **早停**：`--early-stop-patience` 启用；NaN 验证损失不算「改善」；
   `--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑语义一致。
 - **运行对比**：`--compare RUN_DIR...` 只读运行目录，汇总各模式
-  在相同数据上的精度与效率，用于回答「涨点多少、代价多少」。
+  在相同数据上的指标。
 
 ## 可复现性与实验追踪
 

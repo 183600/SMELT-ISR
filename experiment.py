@@ -534,7 +534,7 @@ class SparseMoE(nn.Module):
         # counts 显式转 fp32，与 soft_load（router_logits 已
         # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
         # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
-        # torch.dot 报错。归一化就地完成，省去一次输出分配。
+        # torch.dot 报错。归一化就地完成。
         hard_load = counts.float()
         hard_load.div_(flat.size(0))
 
@@ -1866,10 +1866,9 @@ def audit_data_splits(
         tokens = getattr(dataset, split)
 
         # 字节管线固定为 uint8，直方图直接在原始 dtype 上
-        # 统计，避免整段语料转 int64 产生 8× 临时内存，
-        # 也免去全量值域比较（uint8 天然落在 0..255，越界
-        # 恒为 0）。其他 dtype（若日后扩展管线）回退到旧的
-        # int64 校验路径，保持诊断语义不变。
+        # 统计（uint8 天然落在 0..255，越界恒为 0）。其他
+        # dtype（若日后扩展管线）回退到 int64 校验路径，
+        # 保持诊断语义不变。
         if tokens.dtype == torch.uint8:
             try:
                 hist = torch.bincount(
@@ -3312,8 +3311,7 @@ def _count_forward_flops(
     - SDPA 内部的注意力矩阵乘不计入 FlopCounter，用模块
       pre-hook 按 4·B·T²·D 补上（乘加各计 1 次浮点运算）。
 
-    返回的是一次前向的总 FLOPs；用于跨模式比较计算量，
-    不用于绝对性能断言。
+    返回的是一次前向的总 FLOPs，用于跨模式比较计算量。
     """
     flops: Dict[str, Optional[int]] = {
         "linear_flops": None,
@@ -3415,12 +3413,10 @@ def measure_efficiency(
     iters: int = 5,
 ) -> Dict[str, object]:
     """
-    效率测量：参数量、前向 FLOPs、推理延迟/吞吐与峰值显存。
+    效率测量：参数量、前向 FLOPs 等模型规模指标。
 
-    评价结构改进不能只看验证损失涨点：本测量在训练结束时对
-    当前模型测一次，与精度指标一起写入 config.json 与
-    metrics.jsonl（``{"step": "efficiency", ...}``），用于回答
-    「提升多少精度、付出多少参数/计算/延迟/显存」。
+    本测量在训练结束时对当前模型测一次，与精度指标一起写入
+    config.json 与 metrics.jsonl（``{"step": "efficiency", ...}``）。
     """
     was_training = model.training
     raw_model = _unwrap_model(model)
@@ -3499,8 +3495,7 @@ def measure_efficiency(
             )
             del output
         else:
-            # CPU 路径：跑一次训练模式前反向后取进程峰值 RSS，
-            # 作为内存占用的粗粒度口径。
+            # CPU 路径：跑一次训练模式前反向。
             model.train()
             with autocast:
                 output = model(x, y)
@@ -3561,7 +3556,7 @@ def measure_efficiency(
 
 
 def print_efficiency(efficiency: Dict[str, object]) -> None:
-    """打印效率测量摘要（精度之外的参数量/计算/延迟/显存口径）。"""
+    """打印效率测量摘要。"""
     def _format(value, unit="", spec=".3f"):
         if value is None:
             return "-"
@@ -3591,12 +3586,11 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
 
 def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
     """
-    汇总多个运行目录的精度与效率指标，供跨模式权衡对比。
+    汇总多个运行目录的 config 与最终指标。
 
     读取每个目录的 config.json（结构、参数量、efficiency）与
     metrics.jsonl（final/test/curve_analysis），输出统一口径的
-    行；用于检查「涨点是否值得多出来的参数量、计算量、延迟与
-    显存」。
+    行。
     """
     rows: List[Dict[str, object]] = []
 
@@ -3694,7 +3688,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
 
 
 def print_comparison(rows: List[Dict[str, object]]) -> None:
-    """以对齐表格打印多个运行的精度-效率权衡。"""
+    """以对齐表格打印多个运行的汇总指标。"""
     header = (
         f"{'run':<20} {'mode':<9} {'params':>9} "
         f"{'val_loss':>9} {'test_loss':>9} {'lat(ms)':>9} "
@@ -3827,9 +3821,8 @@ def run_sanity_overfit(
                     loss.backward()
                     optimizer.step()
 
-                # 仅在需要报告或收尾的步取回标量：loss/准确率
-                # 的 D2H 取值会同步 GPU，每步两次同步会打断
-                # 流水线；取值来源与时刻均与原实现一致。
+                # 仅在需要报告或收尾的步取回标量，取值来源
+                # 与时刻均与原实现一致。
                 if (
                     step == 1
                     or step % report_every == 0
@@ -4017,7 +4010,7 @@ def write_run_config(
     }
 
     # resume 会重写 config.json；保留上次运行结束时补充的
-    # efficiency 测量结果，避免恢复训练后丢失效率口径。
+    # efficiency 测量结果。
     config_path = out_dir / "config.json"
     if config_path.exists():
         try:
@@ -5334,7 +5327,7 @@ def run_self_test():
         bad_case_report["category_counts"].keys()
     ) <= valid_categories
 
-    # 效率测量：参数量与模型一致，延迟/FLOPs 为正（或明确不可用）。
+    # 效率测量：参数量与模型一致，各测量值有效或明确不可用。
     efficiency_model = LanguageModel(
         Config(
             **common,
@@ -5365,15 +5358,15 @@ def run_self_test():
         efficiency["flops_per_forward"] is None
         or int(efficiency["flops_per_forward"]) > 0
     )
-    # attention 的 FLOPs 由 Block 级 hook 估计；Block 被真实执行
-    # 时该值必须为正，否则说明 hook 挂错了对象（回归守卫）。
+    # attention 的 FLOPs 由 Block 级 hook 估计；Block 被真实
+    # 执行时该值必须为正，否则说明 hook 挂错了对象。
     assert (
         efficiency["flops_attention"] is None
         or int(efficiency["flops_attention"]) > 0
     )
     assert efficiency["measurement"]["mode"] == "B"
 
-    # 运行对比：从 config.json / metrics.jsonl 读出精度与效率行。
+    # 运行对比：从 config.json / metrics.jsonl 读出汇总行。
     with tempfile.TemporaryDirectory() as compare_dir:
         for name, val_loss in (
             ("run_a", 3.0),
@@ -5580,10 +5573,7 @@ def main():
     parser.add_argument(
         "--skip-efficiency",
         action="store_true",
-        help=(
-            "跳过训练结束后的效率测量"
-            "（参数量/FLOPs/延迟/显存）"
-        ),
+        help="跳过训练结束后的效率测量",
     )
     parser.add_argument(
         "--compare",
@@ -5591,7 +5581,7 @@ def main():
         default=None,
         metavar="RUN_DIR",
         help=(
-            "不训练，直接对比多个运行目录的精度与效率指标"
+            "不训练，直接对比多个运行目录的指标"
             "后退出"
         ),
     )
@@ -6532,8 +6522,7 @@ def main():
             )
 
             # 损失与梯度范数都必须有限才推进优化器：任一非有限
-            # 都意味着这一步的参数更新不可信。两个判定合并成
-            # 一次设备同步，不增加每步的同步次数。
+            # 都意味着这一步的参数更新不可信。
             finite_step = bool(
                 torch.isfinite(grad_norm)
                 & torch.isfinite(loss)
@@ -6892,8 +6881,7 @@ def main():
         metrics_file.flush()
 
     # --------------------------------------------------------
-    # 结果分析 3：效率测量（参数量/计算量/延迟/显存）。
-    # 评价改进不能只看指标涨点，需要与付出的资源一起报告。
+    # 结果分析 3：效率测量。
     # --------------------------------------------------------
     if not args.skip_efficiency:
         efficiency = measure_efficiency(
