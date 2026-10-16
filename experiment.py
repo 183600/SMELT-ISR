@@ -317,8 +317,8 @@ class _MergeExpertOutputs(torch.autograd.Function):
 
         first = expert_outputs[0]
 
-        # 输出缓冲按非空专家的 dtype 分配：空段占位张量来自
-        # fp32 残差流的切片，不代表专家输出的真实 dtype。
+        # 输出缓冲按非空专家输出分配 dtype；空段是 dispatch
+        # 输入的空切片占位，不参与 dtype 判定。
         output_dtype = next(
             (
                 tensor.dtype
@@ -529,7 +529,6 @@ class SparseMoE(nn.Module):
         if self.n_experts == 1:
             expert_flat = self._cast_for_autocast(flat)
 
-            # top_k == 1 时 repeat_interleave 是纯拷贝。
             if top_k == 1:
                 return self.experts[0].forward(expert_flat).unsqueeze(1)
 
@@ -914,6 +913,9 @@ class TransformerBlock(nn.Module):
         x = self.attention_step(x)
 
         if not delayed:
+            # 立即合并对照与 A 的第二轮计算量对齐：A 在 k1 个
+            # 分支上各路由 k2 个专家，单分支的第二轮相应取
+            # min(n_experts, k1 * k2) 个专家。
             matched_k2 = min(
                 self.moe.n_experts,
                 k1 * k2,
