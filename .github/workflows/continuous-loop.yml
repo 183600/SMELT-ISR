@@ -127,6 +127,8 @@ jobs:
 
       - name: Run opencode for ~5 hours (4 phases per iteration)
         timeout-minutes: 300
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -146,14 +148,149 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
-          # ================= 模型：opencode Zen deepseek-v4.1-flash-free =================
-          # 原 Kimi/Moonshot 端点（无有效 key，健康检查 401）与 NVIDIA 端点
-          # （moonshotai/kimi-k3 已于 2026-10-15 EOL，返回 410 Gone）均不可用，
-          # 改为调用 opencode 官方 Zen 网关的免费模型 deepseek-v4.1-flash-free：
-          # 在 opencode 客户端内调用免鉴权，支持 tool call 与 reasoning effort。
-          MODEL="opencode/deepseek-v4.1-flash-free"
+          # ================= 模型策略：80% opencode 免费 deepseek / 20% NVIDIA GLM =================
+          # 主力（80%）：opencode 自带的免费 deepseek —— Zen 网关 deepseek-v4.1-flash-free，
+          #             在 opencode 客户端内调用免鉴权，支持 tool call 与 reasoning effort；
+          # 副选（20%）：https://integrate.api.nvidia.com/v1 的 glm-5.3（目录中不存在时
+          #             自动改用 glm-5-3-flash），需要仓库 secret NVIDIA_API_KEY；
+          # NVIDIA 不可用（无 key / 端点失效 / 无 GLM 模型）时自然回落免费 deepseek。
+          # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
+          FREE_MODEL="opencode/deepseek-v4.1-flash-free"
+          NVIDIA_PROB=20
+          NVIDIA_MODEL=""
+          CURRENT_PROVIDER=""
+          PROVIDER_BROKEN=""
 
-          # ---------- 思考强度：有 max 选 max，没有 max 选 high，否则不设置 ----------
+          mark_broken() {
+            case ",$PROVIDER_BROKEN," in *",$1,"*) ;; *) PROVIDER_BROKEN="$PROVIDER_BROKEN${PROVIDER_BROKEN:+,}$1" ;; esac
+          }
+          is_broken() {
+            case ",$PROVIDER_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+          }
+
+          # ---------- NVIDIA GLM 探测：优先 glm-5.3，没有则 glm-5-3-flash ----------
+          # 探测成功同时把 nvidia provider 配置写入 ~/.config/opencode/opencode.nvidia.json
+          # （可选合并 $1 指定的基准配置，保留其中已有字段，如权限锁定）。
+          cat > /tmp/probe_nvidia.py <<'PYEOF'
+          import json, os, sys, urllib.request
+
+          def emit(status, model=''):
+              print((status + ' ' + model).strip())
+              sys.exit(0)
+
+          def norm(s):
+              return s.lower().replace('.', '-').replace('_', '-')
+
+          key = os.environ.get('NVIDIA_API_KEY', '').strip()
+          if not key:
+              emit('DOWN')
+          try:
+              req = urllib.request.Request(
+                  'https://integrate.api.nvidia.com/v1/models',
+                  headers={'Authorization': 'Bearer ' + key})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  d = json.load(r)
+          except Exception:
+              emit('DOWN')
+
+          ids = [m.get('id', '') for m in (d.get('data') or []) if m.get('id')]
+
+          def pick(cands, target):
+              if not cands:
+                  return ''
+              def keyf(x):
+                  return (0 if norm(x.rsplit('/', 1)[-1]) == target else 1, len(x))
+              return sorted(cands, key=keyf)[0]
+
+          primary = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)]
+          flash = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)]
+          mid = pick(primary, 'glm-5-3') or pick(flash, 'glm-5-3-flash')
+          if not mid:
+              emit('NOMODEL')
+
+          cfg = {}
+          base = sys.argv[1] if len(sys.argv) > 1 else ''
+          if base and os.path.exists(base):
+              try:
+                  with open(base) as f:
+                      cfg = json.load(f)
+              except Exception:
+                  cfg = {}
+          cfg['$schema'] = 'https://opencode.ai/config.json'
+          cfg.setdefault('provider', {})
+          cfg['provider']['nvidia'] = {
+              'npm': '@ai-sdk/openai-compatible',
+              'name': 'NVIDIA',
+              'options': {
+                  'baseURL': 'https://integrate.api.nvidia.com/v1',
+                  'apiKey': '{env:NVIDIA_API_KEY}',
+              },
+              'models': {mid: {'name': mid}},
+          }
+          cfg['model'] = 'nvidia/' + mid
+          try:
+              os.makedirs(os.path.expanduser('~/.config/opencode'), exist_ok=True)
+              with open(os.path.expanduser('~/.config/opencode/opencode.nvidia.json'), 'w') as f:
+                  json.dump(cfg, f, indent=2, ensure_ascii=False)
+          except Exception:
+              pass
+          emit('OK', mid)
+          PYEOF
+
+          probe_nvidia() {
+            local out st mid
+            out="$(python3 /tmp/probe_nvidia.py 2>/dev/null)" || out="DOWN"
+            st="${out%% *}"; mid="${out#* }"
+            if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
+              NVIDIA_MODEL="$mid"; return 0
+            fi
+            NVIDIA_MODEL=""; return 1
+          }
+
+          # ---------- 切换 provider（每次调用都重写/清理配置，防 agent 篡改） ----------
+          switch_provider() {
+            case "$1" in
+              free)
+                rm -f "$HOME/.config/opencode/opencode.json" \
+                      "$HOME/.config/opencode/opencode.jsonc" \
+                      "$HOME/.config/opencode/config.json" 2>/dev/null
+                ;;
+              nvidia)
+                cp -f "$HOME/.config/opencode/opencode.nvidia.json" \
+                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+                ;;
+            esac
+            CURRENT_PROVIDER="$1"
+          }
+
+          # ---------- 每次调用按 80/20 抽样选 provider，失效自动换边 ----------
+          pick_provider() {
+            local roll=$((RANDOM % 100))
+            if [ "$roll" -lt "$NVIDIA_PROB" ]; then
+              if ! is_broken nvidia && probe_nvidia; then
+                switch_provider nvidia
+                echo "[info] 抽中 NVIDIA GLM（${NVIDIA_PROB}%）：$NVIDIA_MODEL"
+                return 0
+              fi
+              echo "[info] 抽中 NVIDIA 但不可用（无 key / 端点失效 / 无 glm-5.3(-flash)），回退免费 deepseek"
+            fi
+            if ! is_broken free; then
+              switch_provider free
+              return 0
+            fi
+            if ! is_broken nvidia && probe_nvidia; then
+              switch_provider nvidia
+              echo "[info] 免费 deepseek 本阶段失效，改用 NVIDIA：$NVIDIA_MODEL"
+              return 0
+            fi
+            echo "[warn] 所有 provider 本阶段均失败过，重置失效标记继续尝试"
+            PROVIDER_BROKEN=""
+            switch_provider free
+            return 0
+          }
+
+          # ---------- 思考强度（仅免费 deepseek 路径）：有 max 选 max，没有 max 选 high，否则不设置 ----------
+          # NVIDIA GLM 走 openai-compatible 端点，不设置思考强度。
           # 先刷新 opencode 的模型目录缓存（models.dev），再解析该模型支持的
           # reasoning effort 档位。检测失败时兜底 max（无效 variant 会被
           # opencode 静默忽略，不会导致调用失败）。
@@ -185,7 +322,7 @@ jobs:
             NONE)     VARIANT="" ;;
             *)        VARIANT="max" ;;
           esac
-          echo "[info] model=$MODEL | 思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] 免费deepseek=$FREE_MODEL (80%) | NVIDIA glm-5.3 (${NVIDIA_PROB}%) | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
 
           i=0
 
@@ -244,12 +381,13 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（deepseek 失败反复重试，直到预算用尽） ----------
+          # ---------- 单阶段执行（80/20 抽样选 provider，失效自动换边，反复重试） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
             local attempt=0
+            PROVIDER_BROKEN=""
 
             while :; do
               attempt=$((attempt+1))
@@ -266,18 +404,24 @@ jobs:
                 return 1
               fi
 
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$MODEL${VARIANT:+ variant=$VARIANT} ==========="
+              pick_provider
+              local MODEL_DESC="$FREE_MODEL"
+              case "$CURRENT_PROVIDER" in
+                nvidia) MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
+              esac
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$MODEL_DESC ==========="
 
-              # 防止 agent 在仓库/用户目录写入 opencode 配置，干扰后续调用
-              rm -f ./opencode.json ./opencode.jsonc ./.opencode.json \
-                    "$HOME/.config/opencode/opencode.json" \
-                    "$HOME/.config/opencode/opencode.jsonc" \
-                    "$HOME/.config/opencode/config.json" 2>/dev/null
+              # 防止 agent 写入的 opencode 配置干扰后续调用：
+              # nvidia 路径恢复探测生成的模板，free 路径确保无自定义配置
+              # （switch_provider 已处理 ~/.config/opencode/，这里只清仓库内残留）
+              rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
-              if [ -n "$VARIANT" ]; then
-                timeout --kill-after=180 "$budget" opencode run -m "$MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
+              if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
+                timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
+              elif [ -n "$VARIANT" ]; then
+                timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
               else
-                timeout --kill-after=180 "$budget" opencode run -m "$MODEL" "$prompt" 2>&1 | tee "$OUT"
+                timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
               fi
               local EC=$?
 
@@ -292,15 +436,18 @@ jobs:
                 return $EC
               fi
 
-              # 限流 / 免费额度限制：等 3 分钟再试
+              # 限流 / 免费额度限制：标记当前 provider 本阶段失效，换边重试
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
-                echo "[warn] phase=$phase 命中限流/免费额度限制，180s 后重试 (attempt=$attempt)"
+                mark_broken "$CURRENT_PROVIDER"
+                echo "[warn] phase=$phase 命中限流/免费额度限制 (provider=$CURRENT_PROVIDER)，180s 后换 provider 重试 (attempt=$attempt)"
                 sleep 180
                 continue
               fi
 
-              # 其它失败：反复尝试，直到阶段预算或全局时间用尽
-              echo "[warn] phase=$phase 调用失败 (exit=$EC)，60s 后重试 (attempt=$attempt)"
+              # 其它失败：标记当前 provider 本阶段失效，换边重试，
+              # 直到阶段预算或全局时间用尽
+              mark_broken "$CURRENT_PROVIDER"
+              echo "[warn] phase=$phase provider=$CURRENT_PROVIDER 调用失败 (exit=$EC)，60s 后换 provider 重试 (attempt=$attempt)"
               sleep 60
             done
 
