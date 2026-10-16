@@ -431,8 +431,7 @@ class SparseMoE(nn.Module):
 
         soft_load = router_probs.mean(dim=0)
 
-        # 逐专家 f_i * P_i 之和用一维点积完成，省去乘积
-        # 中间张量。
+        # 逐专家 f_i * P_i 求和。
         aux_loss = self.n_experts * torch.dot(
             hard_load,
             soft_load,
@@ -2255,7 +2254,7 @@ def build_lr_schedule(
 def main():
     # 分配器配置必须在任何 CUDA 初始化之前生效；构造 parser 时
     # 解析 --device 默认值就会调用 torch.cuda.is_available()，
-    # 因此放在最前。expandable_segments 降低碎片、压低峰值显存。
+    # 因此放在最前。
     os.environ.setdefault(
         "PYTORCH_CUDA_ALLOC_CONF",
         "expandable_segments:True",
