@@ -166,7 +166,7 @@ class CausalSelfAttention(nn.Module):
         """
         batch, length, dim = x.shape
 
-        q, k, v = self.qkv(x).view(
+        q, k, v = F.linear(x, self.qkv.weight).view(
             batch, length, 3, self.n_heads, self.head_dim
         ).unbind(2)
 
@@ -186,7 +186,7 @@ class CausalSelfAttention(nn.Module):
         return y.view(batch, length, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.out(self.core(x))
+        return F.linear(self.core(x), self.out.weight)
 
 
 class _SwiGLU(torch.autograd.Function):
@@ -406,7 +406,12 @@ class SparseMoE(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        flat = x.reshape(-1, x.size(-1))
+        # autocast 下先转换一次 [N, dim]：router 线性与
+        # dispatch 的 gather 共用同一份低精度输入，避免各自
+        # 转换产生额外拷贝与 kernel。
+        flat = self._cast_for_autocast(
+            x.reshape(-1, x.size(-1))
+        )
 
         router_logits = F.linear(
             flat,
@@ -436,6 +441,16 @@ class SparseMoE(nn.Module):
             top_indices.reshape(-1),
             minlength=self.n_experts,
         )
+
+        # 一般路径的 dispatch 稍后才需要逐专家 counts；此处
+        # 提前发起 D2H 回读，使其与负载统计、排序、gather
+        # 并行。条件与 dispatch 一般路径保持一致。
+        if (
+            counts.is_cuda
+            and self.n_experts > 1
+            and top_k != self.n_experts
+        ):
+            self._issue_counts_readback(counts)
 
         # counts 是 int64，与 Python 整数相除提升为 fp32。
         hard_load = counts / flat.size(0)
@@ -565,8 +580,6 @@ class SparseMoE(nn.Module):
             return per_expert.gather(1, gather_index)
 
         assignment_experts = top_indices.reshape(-1)
-
-        self._issue_counts_readback(counts)
 
         # 按 expert id 排序：每个专家的输入在排序后连续，
         # 按段切片分发。同一专家内部的行序不影响结果
@@ -806,7 +819,7 @@ class TransformerBlock(nn.Module):
         # add(alpha=) 完成「缩放 + 相加」。
         return torch.add(
             x,
-            self.attn.out(core),
+            F.linear(core, self.attn.out.weight),
             alpha=self.residual_scale,
         )
 
@@ -1138,7 +1151,7 @@ class LanguageModel(nn.Module):
             )
 
         # token embedding 与按序列长度切片的位置 embedding 相加。
-        x = self.token_embedding(input_ids)
+        x = F.embedding(input_ids, self.token_embedding.weight)
         x.add_(
             self.position_embedding_weight[:time]
         )
@@ -1265,7 +1278,7 @@ class LanguageModel(nn.Module):
             aux_losses.append(aux)
 
         x = self.final_norm(x)
-        logits = self.lm_head(x)
+        logits = F.linear(x, self.lm_head.weight)
 
         aux_loss = torch.stack(aux_losses).mean()
 
