@@ -698,11 +698,11 @@ class SparseMoE(nn.Module):
             if residual is not None:
                 flat_residual = residual.reshape(-1, dim)
 
-                # 缩放系数为 1 且 dtype 一致时直接原地累加残差。
-                if (
-                    residual_scale == 1.0
-                    and output.dtype == flat_residual.dtype
-                ):
+                # dtype 一致时原地完成「缩放 + 残差相加」，
+                # 省去一份输出缓冲。
+                if output.dtype == flat_residual.dtype:
+                    if residual_scale != 1.0:
+                        output.mul_(residual_scale)
                     return output.add_(flat_residual).view(out_shape)
 
                 return torch.add(
@@ -713,30 +713,32 @@ class SparseMoE(nn.Module):
 
             return output.view(out_shape)
 
-        weights = top_weights.to(expert_outputs.dtype)
+        # 权重先补出 slot 维再转换 dtype，循环内只做视图选择。
+        weights = top_weights.to(
+            expert_outputs.dtype
+        ).unsqueeze(-1)
 
         # 对 expert_outputs / weights 保持 out-of-place：首个
         # slot 的加权乘产生输出缓冲，其余 slot 用 addcmul
         # 原地累加。
         merged = expert_outputs.select(-2, 0).mul(
-            weights.select(-1, 0).unsqueeze(-1)
+            weights.select(-2, 0)
         )
         for index in range(1, top_k):
             merged.addcmul_(
                 expert_outputs.select(-2, index),
-                weights.select(-1, index).unsqueeze(-1),
+                weights.select(-2, index),
             )
 
         merged = merged.reshape(out_shape)
 
         if residual is not None:
-            # 同上：缩放系数为 1 且 dtype 一致时原地累加；
-            # 否则用 add(alpha=) 完成「缩放 + 残差相加」，
-            # dtype 不匹配时由类型提升合并。
-            if (
-                residual_scale == 1.0
-                and merged.dtype == residual.dtype
-            ):
+            # 同上：dtype 一致时原地累加；dtype 不匹配
+            # （autocast 残差流精度更高）时用 add(alpha=)
+            # 完成「缩放 + 残差相加」，由类型提升合并。
+            if merged.dtype == residual.dtype:
+                if residual_scale != 1.0:
+                    merged.mul_(residual_scale)
                 return merged.add_(residual)
 
             merged = torch.add(
@@ -974,15 +976,15 @@ class TransformerBlock(nn.Module):
         else:
             # 跨分支的门控加权和：逐分支 mul + addcmul 累加，
             # 对 branches / gates 保持 out-of-place。
-            weights = gates.to(branches.dtype)
+            weights = gates.to(branches.dtype).unsqueeze(-1)
 
             x = branches.select(-2, 0).mul(
-                weights.select(-1, 0).unsqueeze(-1)
+                weights.select(-2, 0)
             )
             for index in range(1, branches.size(-2)):
                 x.addcmul_(
                     branches.select(-2, index),
-                    weights.select(-1, index).unsqueeze(-1),
+                    weights.select(-2, index),
                 )
 
         return x, [aux1, aux2]
@@ -1223,16 +1225,18 @@ class LanguageModel(nn.Module):
             else:
                 # 归一化后的 top-k gate 在每个 token 上和为 1。
                 # 跨分支收缩按分支顺序加权累加。
-                branch_weights = gates.to(branches.dtype).unbind(-1)
+                branch_weights = gates.to(
+                    branches.dtype
+                ).unsqueeze(-1).unbind(-2)
 
                 x = branches[:, 0].mul(
-                    branch_weights[0].unsqueeze(-1)
+                    branch_weights[0]
                 )
 
                 for index in range(1, len(branch_weights)):
                     x.addcmul_(
                         branches[:, index],
-                        branch_weights[index].unsqueeze(-1),
+                        branch_weights[index],
                     )
 
         # ----------------------------------------------------
