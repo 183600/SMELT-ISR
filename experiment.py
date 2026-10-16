@@ -252,7 +252,12 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # gate 与 up 的融合输出直接进入 SwiGLU。
-        return self.down(_SwiGLU.apply(self.gate_up(x)))
+        return F.linear(
+            _SwiGLU.apply(
+                F.linear(x, self.gate_up.weight)
+            ),
+            self.down.weight,
+        )
 
     def _load_from_state_dict(
         self,
@@ -551,6 +556,13 @@ class SparseMoE(nn.Module):
 
         # 按排序下标收集输入，随后回读 counts。
         gathered = flat.index_select(0, sorted_token_ids)
+
+        if gathered.is_cuda and torch.is_autocast_enabled():
+            try:
+                gather_dtype = torch.get_autocast_dtype("cuda")
+            except AttributeError:
+                gather_dtype = torch.get_autocast_gpu_dtype()
+            gathered = gathered.to(gather_dtype)
 
         counts = self._read_counts(counts)
         segments = gathered.split(counts, dim=0)
@@ -2498,7 +2510,9 @@ def main():
 
     if rng_payload is not None:
         model.load_state_dict(rng_payload["model"])
+        rng_payload.pop("model", None)
         optimizer.load_state_dict(rng_payload["optimizer"])
+        rng_payload.pop("optimizer", None)
         start_step = int(rng_payload.get("step", 0))
         if "step" not in rng_payload:
             print(
@@ -2511,6 +2525,7 @@ def main():
             and rng_payload.get("scaler") is not None
         ):
             scaler.load_state_dict(rng_payload["scaler"])
+            rng_payload.pop("scaler", None)
 
         # 检查点中的 RNG 状态统一先拉回 CPU 再恢复
         #（set_rng_state / set_state 只接受 CPU ByteTensor）。
