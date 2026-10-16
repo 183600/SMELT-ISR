@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import math
 import os
+import platform
 import random
+import subprocess
+import sys
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,6 +19,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+try:
+    import numpy as np
+except ImportError:
+    # NumPy 不是必需依赖；安装时一并固定其随机种子。
+    np = None
+
+
+# 分配器与 cuBLAS 确定性工作区配置必须在任何 CUDA 上下文创建
+# 之前生效（设备属性查询、内存分配都会创建上下文）。放在模块
+# 导入时设置，训练入口与自测入口都覆盖到。
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True",
+)
+
+# use_deterministic_algorithms 下 cuBLAS 需要显式的工作区配置
+#（PyTorch 官方要求 :4096:8 或 :16:8），否则结果可能不可复现
+# 并触发告警。
+os.environ.setdefault(
+    "CUBLAS_WORKSPACE_CONFIG",
+    ":4096:8",
+)
 
 
 # ============================================================
@@ -86,11 +113,32 @@ class Config:
 # ============================================================
 
 def set_seed(seed: int):
+    """
+    固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子。
+
+    数据采样不经过 DataLoader worker，而由显式的
+    torch.Generator 承担（见 ByteDataset.batch 与 main 中的
+    train_generator）：其初始种子同样来自 --seed，当前状态随
+    检查点一起存档，恢复训练时逐位还原。
+
+    跨硬件架构仍可能因浮点归约顺序产生微小差异；同一台机器
+    上的多次运行应保持一致。
+    """
     random.seed(seed)
+
+    if np is not None:
+        np.random.seed(seed)
+
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
+        # manual_seed_all 覆盖当前可见的所有 CUDA 设备。
         torch.cuda.manual_seed_all(seed)
+
+    # PYTHONHASHSEED 只对之后启动的子进程（如 torch.compile 的
+    # 编译进程）生效；当前解释器的哈希种子在启动时已经确定，
+    # 需要严格复现时应在命令行显式设置该环境变量。
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
 
     # 要求 PyTorch 优先选用确定性实现。bincount、attention
     # 反向等 CUDA 算子若不存在确定性实现会明确告警，而不是
@@ -103,6 +151,38 @@ def set_seed(seed: int):
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _capture_rng_state() -> Dict[str, object]:
+    """
+    捕获当前进程的全部随机数状态，供临时代码（如 sanity check）
+    运行后原样恢复，保证是否运行临时代码不影响主训练轨迹。
+    """
+    state: Dict[str, object] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+        "cuda": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+    if np is not None:
+        state["numpy"] = np.random.get_state()
+    return state
+
+
+def _restore_rng_state(state: Dict[str, object]) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+    numpy_state = state.get("numpy")
+    if numpy_state is not None and np is not None:
+        np.random.set_state(numpy_state)
 
 
 # ============================================================
@@ -1352,6 +1432,8 @@ class ByteDataset:
 
         # 语料内容指纹：恢复训练时用来确认数据文件没有变化。
         self.data_sha256 = hashlib.sha256(buf).hexdigest()
+        self.num_bytes = len(buf)
+        self.val_fraction = val_fraction
 
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
@@ -1616,6 +1698,318 @@ def evaluate(
         "val_ppl": math.exp(min(loss, 80.0)),
         "val_bits_per_byte": loss / math.log(2.0),
     }
+
+
+# ============================================================
+# Sanity overfit check
+# ============================================================
+
+def run_sanity_overfit(
+    cfg: Config,
+    dataset: ByteDataset,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    *,
+    batch_size: int,
+    steps: int,
+    lr: float,
+    loss_threshold: float,
+    acc_threshold: float,
+    seed: int,
+) -> Dict[str, object]:
+    """
+    过拟合小批量数据的 sanity check。
+
+    在开始全量训练前，用同一模型结构在一个固定小批次上训练：
+    关闭负载均衡辅助损失、weight decay、梯度裁剪、warmup 等
+    一切正则化（数据管线本身没有 dropout / 数据增强），要求训练
+    损失迅速趋近 0 或下一 token 准确率接近 100%。
+
+    这是必要不充分的检查：连小批量都无法过拟合，通常意味着
+    梯度没有正确反传、损失计算错误、优化器配置错误等严重 bug；
+    但通过也不代表代码完全正确，数据增强、特征对齐、标签映射
+    等 bug 仍可能漏网，仍需配合中间结果检查。
+
+    函数内部固定 seed 并在结束后恢复调用前的全部 RNG 状态，
+    因此是否运行本检查不影响主训练的随机轨迹。
+    """
+    saved_rng_state = _capture_rng_state()
+
+    try:
+        set_seed(seed)
+
+        # balance_coef=0：关闭辅助负载均衡损失（正则项）。
+        sanity_cfg = replace(cfg, balance_coef=0.0)
+        model = LanguageModel(sanity_cfg).to(device)
+        model.train()
+
+        n_params = sum(
+            p.numel() for p in model.parameters()
+        )
+
+        # 固定一个小批次：整个检查期间重复使用同一批数据。
+        generator = torch.Generator().manual_seed(seed)
+        x, y = dataset.batch(
+            "train",
+            batch_size,
+            generator,
+            device,
+        )
+
+        # weight_decay=0、无 warmup、无梯度裁剪：全部正则化关闭。
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=0.0,
+        )
+
+        use_amp = (
+            amp_dtype is not None
+            and device.type == "cuda"
+        )
+        scaler = None
+        if use_amp and amp_dtype == torch.float16:
+            try:
+                scaler = torch.amp.GradScaler("cuda")
+            except (AttributeError, TypeError):
+                scaler = torch.cuda.amp.GradScaler()
+
+        report_every = max(1, steps // 5)
+
+        initial_loss: Optional[float] = None
+        final_loss = float("nan")
+        final_acc = float("nan")
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            for step in range(1, steps + 1):
+                optimizer.zero_grad(set_to_none=True)
+
+                result = model(x, y)
+                loss = result["lm_loss"]
+
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+
+                final_loss = float(loss.detach())
+                final_acc = float(
+                    (
+                        result["logits"].argmax(dim=-1) == y
+                    ).float().mean()
+                )
+
+                if initial_loss is None:
+                    initial_loss = final_loss
+
+                if (
+                    step == 1
+                    or step % report_every == 0
+                    or step == steps
+                ):
+                    print(
+                        f"[sanity] step {step}/{steps} "
+                        f"lm_loss={final_loss:.4f} "
+                        f"token_acc={final_acc:.4f}"
+                    )
+
+        passed = (
+            final_loss <= loss_threshold
+            or final_acc >= acc_threshold
+        )
+
+        return {
+            "passed": passed,
+            "n_params": n_params,
+            "steps": steps,
+            "batch_size": batch_size,
+            "lr": lr,
+            "seed": seed,
+            "initial_lm_loss": initial_loss,
+            "final_lm_loss": final_loss,
+            "final_token_accuracy": final_acc,
+            "loss_threshold": loss_threshold,
+            "acc_threshold": acc_threshold,
+        }
+    finally:
+        # 恢复调用前的 RNG 状态：sanity check 不改变主训练轨迹。
+        _restore_rng_state(saved_rng_state)
+
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# ============================================================
+# Experiment tracking
+# ============================================================
+
+def _git_output(*args: str) -> Optional[str]:
+    """
+    在仓库根目录运行 git 命令并返回 stdout；失败时返回 None。
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return result.stdout.strip()
+
+
+def collect_run_metadata(device: torch.device) -> Dict[str, object]:
+    """
+    收集本轮实验的代码版本与运行环境信息，写入 config.json，
+    保证实验可追溯：代码版本 + 环境 + 超参数 + 种子 +
+    数据指纹（args.data_sha256）+ 训练曲线（metrics.jsonl）。
+    """
+    commit = _git_output("rev-parse", "HEAD")
+    status = _git_output("status", "--porcelain")
+
+    device_name = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            device_name = torch.cuda.get_device_name(device)
+        except (AssertionError, RuntimeError, ValueError):
+            device_name = None
+
+    return {
+        "timestamp_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        "command": " ".join(sys.argv),
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "numpy_version": (
+            getattr(np, "__version__", None)
+            if np is not None
+            else None
+        ),
+        "cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "device": str(device),
+        "device_count": (
+            torch.cuda.device_count()
+            if torch.cuda.is_available()
+            else 0
+        ),
+        "device_name": device_name,
+        "git_commit": commit,
+        "git_dirty": (
+            bool(status) if status is not None else None
+        ),
+        "deterministic_algorithms": (
+            torch.are_deterministic_algorithms_enabled()
+        ),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cublas_workspace_config": os.environ.get(
+            "CUBLAS_WORKSPACE_CONFIG"
+        ),
+        "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+    }
+
+
+def write_run_config(
+    out_dir: Path,
+    cfg: Config,
+    args: argparse.Namespace,
+    n_params: int,
+    run_metadata: Dict[str, object],
+    sanity_result: Optional[Dict[str, object]],
+) -> None:
+    """
+    写出 config.json：结构配置、完整超参数、参数量、数据指纹、
+    代码版本/运行环境，以及 sanity check 结果。
+    """
+    payload = {
+        "config": asdict(cfg),
+        "args": vars(args),
+        "n_params": n_params,
+        "data": {
+            "path": args.data,
+            "sha256": getattr(args, "data_sha256", None),
+            "bytes": getattr(args, "data_bytes", None),
+            "val_fraction": getattr(
+                args,
+                "data_val_fraction",
+                None,
+            ),
+        },
+        "run_metadata": run_metadata,
+        "sanity_check": sanity_result,
+    }
+
+    with open(
+        out_dir / "config.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            payload,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def write_jsonl_record(
+    path: Path,
+    record: Dict[str, object],
+    append: bool = True,
+) -> None:
+    """
+    追加（或重写）一行 JSON 记录到 metrics.jsonl。
+    """
+    with open(
+        path,
+        "a" if append else "w",
+        encoding="utf-8",
+    ) as f:
+        f.write(
+            json.dumps(record, ensure_ascii=False) + "\n"
+        )
+
+
+def load_previous_sanity_result(
+    out_dir: Path,
+) -> Optional[Dict[str, object]]:
+    """
+    读取已有 config.json 中的 sanity check 结果。
+
+    resume 会重写 config.json；保留原始运行的 sanity 结果，
+    避免追踪信息在恢复训练后丢失（metrics.jsonl 首行也有记录）。
+    """
+    path = out_dir / "config.json"
+
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    result = payload.get("sanity_check")
+    return result if isinstance(result, dict) else None
 
 
 # ============================================================
@@ -2282,6 +2676,86 @@ def run_self_test():
         torch.tensor(rebuilt_lrs),
     )
 
+    # set_seed 必须让 Python / NumPy / PyTorch 的随机流可复现。
+    set_seed(2024)
+    first_draw = (
+        random.random(),
+        torch.rand(4),
+        (
+            float(np.random.rand())
+            if np is not None
+            else None
+        ),
+    )
+    set_seed(2024)
+    second_draw = (
+        random.random(),
+        torch.rand(4),
+        (
+            float(np.random.rand())
+            if np is not None
+            else None
+        ),
+    )
+
+    assert first_draw[0] == second_draw[0]
+    assert torch.equal(first_draw[1], second_draw[1])
+    if np is not None:
+        assert first_draw[2] == second_draw[2]
+
+    # sanity check 必须能在小批量上过拟合，且结束后恢复调用前的
+    # RNG 状态（不影响主训练轨迹）。
+    sanity_cfg = Config(
+        **common,
+        mode="B",
+    )
+
+    rng_before = torch.get_rng_state()
+    python_rng_before = random.getstate()
+
+    sanity_metrics = run_sanity_overfit(
+        sanity_cfg,
+        eval_dataset,
+        eval_device,
+        amp_dtype=None,
+        batch_size=2,
+        steps=200,
+        lr=1e-2,
+        loss_threshold=0.5,
+        acc_threshold=0.9,
+        seed=321,
+    )
+
+    assert sanity_metrics["passed"], sanity_metrics
+    assert torch.equal(
+        torch.get_rng_state(),
+        rng_before,
+    )
+    assert random.getstate() == python_rng_before
+
+    # 学习率极小时不应通过，确认判定逻辑不是恒真。
+    failed_metrics = run_sanity_overfit(
+        sanity_cfg,
+        eval_dataset,
+        eval_device,
+        amp_dtype=None,
+        batch_size=2,
+        steps=1,
+        lr=1e-9,
+        loss_threshold=0.0,
+        acc_threshold=1.0,
+        seed=321,
+    )
+
+    assert not failed_metrics["passed"]
+
+    # 运行元数据必须包含代码版本与随机种子相关的追踪字段。
+    metadata = collect_run_metadata(torch.device("cpu"))
+
+    assert "git_commit" in metadata
+    assert "torch_version" in metadata
+    assert "deterministic_algorithms" in metadata
+
     print("self-test passed")
 
 
@@ -2326,14 +2800,8 @@ def build_lr_schedule(
 
 
 def main():
-    # 分配器配置必须在任何 CUDA 初始化之前生效；构造 parser 时
-    # 解析 --device 默认值就会调用 torch.cuda.is_available()，
-    # 因此放在最前。
-    os.environ.setdefault(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "expandable_segments:True",
-    )
-
+    # 分配器与 cuBLAS 工作区配置在模块导入时已设置（见文件顶部），
+    # 保证在任何 CUDA 上下文创建之前生效。
     parser = argparse.ArgumentParser(
         description="SMELT-ISR 训练入口",
     )
@@ -2383,6 +2851,39 @@ def main():
     parser.add_argument("--save-interval", type=int, default=500)
 
     parser.add_argument(
+        "--skip-sanity-check",
+        action="store_true",
+        help=(
+            "跳过全量训练前的过拟合小批量 sanity check"
+            "（默认在新训练开始时运行）"
+        ),
+    )
+    parser.add_argument(
+        "--sanity-only",
+        action="store_true",
+        help="只运行 sanity check 并写出结果，不开始全量训练",
+    )
+    parser.add_argument("--sanity-batch-size", type=int, default=4)
+    parser.add_argument("--sanity-steps", type=int, default=300)
+    parser.add_argument("--sanity-lr", type=float, default=3e-3)
+    parser.add_argument(
+        "--sanity-loss-threshold",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--sanity-acc-threshold",
+        type=float,
+        default=0.99,
+    )
+    parser.add_argument(
+        "--note",
+        type=str,
+        default="",
+        help="本轮实验备注，随 config.json 一起存档",
+    )
+
+    parser.add_argument(
         "--device",
         type=str,
         default=(
@@ -2413,6 +2914,27 @@ def main():
         parser.error("--weight-decay 必须是有限非负数")
     if not math.isfinite(args.grad_clip) or args.grad_clip <= 0:
         parser.error("--grad-clip 必须为正数")
+    if args.skip_sanity_check and args.sanity_only:
+        parser.error(
+            "--skip-sanity-check 与 --sanity-only 不能同时使用"
+        )
+    if args.sanity_batch_size <= 0:
+        parser.error("--sanity-batch-size 必须为正整数")
+    if args.sanity_steps <= 0:
+        parser.error("--sanity-steps 必须为正整数")
+    if not math.isfinite(args.sanity_lr) or args.sanity_lr <= 0:
+        parser.error("--sanity-lr 必须是有限正数")
+    if (
+        not math.isfinite(args.sanity_loss_threshold)
+        or args.sanity_loss_threshold < 0
+    ):
+        parser.error(
+            "--sanity-loss-threshold 必须是非负有限数"
+        )
+    if not 0.0 < args.sanity_acc_threshold <= 1.0:
+        parser.error(
+            "--sanity-acc-threshold 必须落在 (0, 1]"
+        )
 
     device = torch.device(args.device)
 
@@ -2420,11 +2942,26 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    # AMP dtype 由设备与硬件能力决定：bf16 无需 GradScaler，
+    # fp16 需要梯度缩放。在 sanity check 与主训练之前统一确定。
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        amp_dtype: Optional[torch.dtype] = torch.bfloat16
+        scaler = None
+    elif device.type == "cuda":
+        amp_dtype = torch.float16
+        # torch.amp.GradScaler(device) 自 torch 2.3 起可用。
+        try:
+            scaler = torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):
+            scaler = torch.cuda.amp.GradScaler()
+    else:
+        amp_dtype = None
+        scaler = None
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     start_step = 0
-    scaler = None
     rng_payload = None
     saved_data_sha256 = None
 
@@ -2507,6 +3044,126 @@ def main():
             )
 
     cfg.validate()
+
+    # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
+    # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
+    # 数据版本指纹写入实验追踪信息。
+    dataset = ByteDataset(
+        args.data,
+        cfg.seq_len,
+        device=device,
+    )
+
+    # 语料指纹/大小写入 args，随 config.json 与检查点一起存档；
+    # 恢复训练时若数据文件内容已变化，采样轨迹会与原运行不同，
+    # 这里明确提示而不是静默继续。
+    args.data_sha256 = dataset.data_sha256
+    args.data_bytes = dataset.num_bytes
+    args.data_val_fraction = dataset.val_fraction
+
+    if (
+        saved_data_sha256 is not None
+        and saved_data_sha256 != dataset.data_sha256
+    ):
+        print(
+            "resume data file content changed "
+            f"({saved_data_sha256[:12]}... -> "
+            f"{dataset.data_sha256[:12]}...); "
+            "采样轨迹与原运行不再一致"
+        )
+
+    # 全新训练默认先跑过拟合小批量 sanity check；恢复训练默认跳过
+    # （可以用 --sanity-only 单独检查）。--skip-sanity-check 显式跳过。
+    run_sanity = (
+        args.sanity_only
+        or (
+            args.resume is None
+            and not args.skip_sanity_check
+        )
+    )
+
+    sanity_result: Optional[Dict[str, object]] = None
+    sanity_record: Optional[Dict[str, object]] = None
+
+    if run_sanity:
+        print(
+            "[sanity] 过拟合小批量检查: "
+            f"batch_size={args.sanity_batch_size}, "
+            f"steps={args.sanity_steps}, "
+            f"lr={args.sanity_lr}, "
+            f"loss<={args.sanity_loss_threshold} "
+            f"或 acc>={args.sanity_acc_threshold}"
+        )
+
+        sanity_result = run_sanity_overfit(
+            cfg,
+            dataset,
+            device,
+            amp_dtype=amp_dtype,
+            batch_size=args.sanity_batch_size,
+            steps=args.sanity_steps,
+            lr=args.sanity_lr,
+            loss_threshold=args.sanity_loss_threshold,
+            acc_threshold=args.sanity_acc_threshold,
+            seed=args.seed,
+        )
+
+        sanity_record = {
+            "step": "sanity",
+            **sanity_result,
+        }
+
+        if sanity_result["passed"]:
+            print(
+                "[sanity] PASSED: "
+                f"final lm_loss="
+                f"{sanity_result['final_lm_loss']:.4f}, "
+                f"token_acc="
+                f"{sanity_result['final_token_accuracy']:.4f}"
+            )
+        else:
+            print(
+                "[sanity] FAILED: 模型未能在小批量上过拟合 "
+                f"(final lm_loss="
+                f"{sanity_result['final_lm_loss']:.4f}, "
+                f"token_acc="
+                f"{sanity_result['final_token_accuracy']:.4f})。"
+                "这通常意味着梯度没有反向传播、损失计算错误、"
+                "优化器或学习率配置有严重问题；请先排查再开始"
+                "全量训练。确需跳过可用 --skip-sanity-check。"
+            )
+
+    if args.sanity_only or (
+        sanity_result is not None
+        and not sanity_result["passed"]
+    ):
+        # 保存追踪信息后退出：失败记录本身也是实验追踪的一部分，
+        # 不盲目开始全量训练。
+        write_run_config(
+            out_dir,
+            cfg,
+            args,
+            n_params=int(sanity_result["n_params"]),
+            run_metadata=collect_run_metadata(device),
+            sanity_result=sanity_result,
+        )
+        write_jsonl_record(
+            out_dir / "metrics.jsonl",
+            sanity_record,
+            append=args.resume is not None,
+        )
+        print(
+            json.dumps(
+                {"sanity_check": sanity_result},
+                ensure_ascii=False,
+            )
+        )
+
+        if not sanity_result["passed"]:
+            raise SystemExit(1)
+
+        return
+
     set_seed(args.seed)
 
     model = LanguageModel(cfg).to(device)
@@ -2563,21 +3220,6 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
-
-    # bf16 无需 GradScaler；fp16 需要梯度缩放。
-    if device.type == "cuda" and torch.cuda.is_bf16_supported():
-        amp_dtype: Optional[torch.dtype] = torch.bfloat16
-        scaler = None
-    elif device.type == "cuda":
-        amp_dtype = torch.float16
-        # torch.amp.GradScaler(device) 自 torch 2.3 起可用。
-        try:
-            scaler = torch.amp.GradScaler("cuda")
-        except (AttributeError, TypeError):
-            scaler = torch.cuda.amp.GradScaler()
-    else:
-        amp_dtype = None
-        scaler = None
 
     if rng_payload is not None:
         model.load_state_dict(rng_payload["model"])
@@ -2818,49 +3460,30 @@ def main():
         # 在状态加载之后编译。MoE 专家分段长度由数据决定。
         model = torch.compile(model)
 
-    dataset = ByteDataset(
-        args.data,
-        cfg.seq_len,
-        device=device,
-    )
-
-    # 语料指纹写入 args，随 config.json 与检查点一起存档；
-    # 恢复训练时若数据文件内容已变化，采样轨迹会与原运行不同，
-    # 这里明确提示而不是静默继续。
-    args.data_sha256 = dataset.data_sha256
-
-    if (
-        saved_data_sha256 is not None
-        and saved_data_sha256 != dataset.data_sha256
-    ):
-        print(
-            "resume data file content changed "
-            f"({saved_data_sha256[:12]}... -> "
-            f"{dataset.data_sha256[:12]}...); "
-            "采样轨迹与原运行不再一致"
-        )
-
     n_params = sum(
         p.numel() for p in model.parameters()
     )
     print(f"mode={cfg.mode} params={n_params:,}")
     print(f"device={device} start_step={start_step}")
 
-    with open(
-        out_dir / "config.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            {
-                "config": asdict(cfg),
-                "args": vars(args),
-                "n_params": n_params,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
+    # 恢复训练默认跳过 sanity check；保留原运行的结果，
+    # 避免重写 config.json 时丢失该追踪信息。
+    config_sanity_result = sanity_result
+    if config_sanity_result is None and args.resume is not None:
+        config_sanity_result = load_previous_sanity_result(
+            out_dir
         )
+
+    # config.json 记录完整实验追踪信息：结构配置、超参数、种子、
+    # 数据指纹、代码版本/运行环境与 sanity check 结果。
+    write_run_config(
+        out_dir,
+        cfg,
+        args,
+        n_params,
+        collect_run_metadata(device),
+        config_sanity_result,
+    )
 
     metrics_path = out_dir / "metrics.jsonl"
 
@@ -2871,6 +3494,17 @@ def main():
         "a" if args.resume is not None else "w",
         encoding="utf-8",
     )
+
+    if sanity_record is not None:
+        # sanity check 结果也进入训练曲线文件，便于统一追溯。
+        metrics_file.write(
+            json.dumps(
+                sanity_record,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
 
     model.train()
 

@@ -80,7 +80,31 @@ python experiment.py --data corpus.txt --mode local_base --k1 2 --k2 2 --out run
 python experiment.py --data corpus.txt --mode A --k1 2 --k2 2 --out runs/A_seed42
 ```
 
-### 4. 恢复训练
+### 4. 训练前的过拟合 sanity check
+每次全新训练（非 `--resume`）开始前，脚本会先抽取一个小批次
+（`--sanity-batch-size`，默认 4 条序列），在同一模型结构上做过拟合检查：
+关闭负载均衡辅助损失、weight decay、梯度裁剪与 warmup 等一切正则化，
+要求训练损失迅速趋近 0 或下一 token 准确率接近 100%（阈值由
+`--sanity-loss-threshold`、`--sanity-acc-threshold` 控制）。未通过时会
+明确报错并以非零状态码退出，避免在存在梯度未反传、损失计算错误等严重
+bug 时盲目开始全量训练。
+
+注意这是**必要不充分**检查：通过也不代表代码完全正确，数据增强、特征
+对齐、标签映射等 bug 仍可能漏网，还需配合中间结果检查。
+
+```bash
+# 只跑 sanity check，不开始训练
+python experiment.py --data corpus.txt --mode B --sanity-only
+
+# 显式跳过检查（已充分验证的前提下）
+python experiment.py --data corpus.txt --mode B --skip-sanity-check ...
+```
+
+检查结果会写入 `metrics.jsonl`（`{"step": "sanity", ...}`）与
+`config.json` 的 `sanity_check` 字段；检查内部固定种子并在结束后恢复
+RNG 状态，因此是否运行检查不影响主训练的随机轨迹。
+
+### 5. 恢复训练
 模型配置会从检查点自动读取，恢复时只需保证数据与总训练步数一致：
 ```bash
 python experiment.py \
@@ -106,14 +130,15 @@ python experiment.py \
 - **残差缩放口径**：`residual_scale` 全局作用于所有区域、所有子层的残差更新（循环区域内/外一致）。SMELT 论文对循环区域内的子层残差更新按循环次数 $1/r$ 缩放（循环两次即 1/2）；本基座未实现按区域区分的 $1/r$ 缩放。跨模式对比应保持 `residual_scale` 一致，把全局系数设为 0.5 并不等价于论文口径。
 - **负载均衡尺度**：辅助损失中 $f_i$ 按 token 数归一化，而不是按 assignment 数归一化；均匀路由时 $E \sum_i f_i P_i \approx k$，均衡强度随路由宽度线性增大。跨 $k_1/k_2/\text{top-}k$ 比较实验时应按比例折算系数（保持 `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
 - **验证协议**：每次评估使用跨验证集等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；最终评估结果也会追加到 `metrics.jsonl`。
-- **确定性**：训练入口要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。跨设备数值仍可能因浮点归约顺序产生微小差异。
+- **确定性**：训练入口固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子，数据采样由显式 `torch.Generator` 承担（种子与状态随检查点存档），并设置 `CUBLAS_WORKSPACE_CONFIG`、要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。跨硬件架构仍可能因浮点归约顺序产生微小差异。
+- **实验追踪**：每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
 
 ## 📂 输出结构
 
 每次实验运行会生成以下目录结构：
 ```text
 runs/<exp_name>/
-├── config.json      # 完整配置与参数量
+├── config.json      # 完整配置、参数量、随机种子、数据指纹、代码版本/环境、sanity check 结果
 ├── metrics.jsonl    # 逐行记录训练/验证指标及最终评估 (loss, ppl, lr, grad_norm等)
 └── last.pt          # 模型权重、优化器、学习率调度器及随机种子状态（原子写入）
 ```

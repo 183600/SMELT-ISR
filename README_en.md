@@ -80,7 +80,37 @@ python experiment.py --data corpus.txt --mode local_base --k1 2 --k2 2 --out run
 python experiment.py --data corpus.txt --mode A --k1 2 --k2 2 --out runs/A_seed42
 ```
 
-### 4. Resume training
+### 4. Pre-training overfit sanity check
+Before every fresh training run (i.e., without `--resume`), the script first
+draws a small batch (`--sanity-batch-size`, 4 sequences by default) and trains
+the same model architecture on it with all regularization disabled — the
+auxiliary load-balancing loss, weight decay, gradient clipping and warmup are
+turned off. Training must drive the loss quickly toward 0 or the next-token
+accuracy toward 100% (thresholds: `--sanity-loss-threshold`,
+`--sanity-acc-threshold`). On failure the script reports the problem and exits
+with a non-zero status instead of blindly starting full training, since failing
+to overfit even a tiny batch usually indicates broken gradients, a wrong loss,
+or an optimizer/LR misconfiguration.
+
+Note this is a **necessary but not sufficient** check: passing it does not prove
+the code is fully correct — bugs in data augmentation, feature alignment or
+label mapping can still slip through, so intermediate-result inspection is
+still recommended.
+
+```bash
+# Run the sanity check only, without starting training
+python experiment.py --data corpus.txt --mode B --sanity-only
+
+# Explicitly skip the check (once the setup is well validated)
+python experiment.py --data corpus.txt --mode B --skip-sanity-check ...
+```
+
+Results are stored in `metrics.jsonl` (`{"step": "sanity", ...}`) and in the
+`sanity_check` field of `config.json`. The check fixes its own seed and restores
+the RNG state afterwards, so running it does not change the main training
+trajectory.
+
+### 5. Resume training
 Model config is read from the checkpoint automatically; just keep data and total steps consistent:
 ```bash
 python experiment.py \
@@ -104,14 +134,15 @@ python experiment.py \
 - **Residual-scaling convention**: `residual_scale` applies globally to every residual update in all regions (inside and outside the looped span). The SMELT paper scales residual updates within the looped span by $1/r$ (1/2 for two visits); this base does not implement region-specific $1/r$ scaling. Keep `residual_scale` equal across modes; a global 0.5 is not equivalent to the paper's convention.
 - **Load-balancing scale**: $f_i$ in the auxiliary loss is normalized by token count, not assignment count; under uniform routing $E \sum_i f_i P_i \approx k$, so balancing strength grows linearly with routing width. When comparing across $k_1/k_2/\text{top-}k$, scale the coefficient accordingly (keep `balance_coef × k` constant); otherwise routing width is confounded with balancing strength.
 - **Validation protocol**: each evaluation uses fixed windows evenly spaced across the validation set, independent of any RNG, bit-aligned across models and resumed runs; final results are appended to `metrics.jsonl`.
-- **Determinism**: the training entry point asks PyTorch to prefer deterministic kernels; a warning is emitted if a CUDA kernel lacks a deterministic implementation. Small cross-device numeric differences from reduction order may remain.
+- **Determinism**: the training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN seeds; data sampling is driven by an explicit `torch.Generator` whose seed and state are checkpointed; `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic kernels (a warning is emitted if a CUDA kernel lacks a deterministic implementation). Small cross-hardware numeric differences from reduction order may remain.
+- **Experiment tracking**: each run automatically records the code revision (git commit / dirty flag), environment (Python / torch / CUDA / device), full hyperparameters and seeds, data fingerprint (SHA-256, byte count), training curves and final results in `config.json` and `metrics.jsonl` — no manual bookkeeping required.
 
 ## 📂 Output layout
 
 Each run produces:
 ```text
 runs/<exp_name>/
-├── config.json      # full config and parameter count
+├── config.json      # full config, parameter count, seeds, data fingerprint, code/env info, sanity-check result
 ├── metrics.jsonl    # per-line train/val metrics and final eval (loss, ppl, lr, grad_norm, ...)
 └── last.pt          # weights, optimizer, LR scheduler and RNG states (atomic write)
 ```

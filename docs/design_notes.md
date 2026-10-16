@@ -41,8 +41,28 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `TransformerBlock`：注意力步骤、MoE 步骤，以及分支与两轮路由逻辑。
 - `LanguageModel`：按模式组装完整前向。
 - `ByteDataset`、`evaluate`：字节级数据管线与验证。
+- `run_sanity_overfit`：训练前的过拟合小批量 sanity check。
 - `save_checkpoint`、`load_checkpoint`：断点存档与恢复。
-- `run_self_test`：结构、梯度、因果性与模式等价性自测。
+- `collect_run_metadata`、`write_run_config`：实验追踪信息收集与落盘。
+- `run_self_test`：结构、梯度、因果性、模式等价性与 sanity check 判定自测。
+
+## 可复现性与实验追踪
+
+- `set_seed` 固定 Python / NumPy（若安装）/ PyTorch(CPU+CUDA) / cuDNN
+  的随机种子；`CUBLAS_WORKSPACE_CONFIG=:4096:8` 与
+  `use_deterministic_algorithms(True, warn_only=True)` 配合使用。
+  数据采样不使用 DataLoader worker，而由显式 `torch.Generator`
+  承担，其种子与状态随检查点存档。
+- 全新训练开始前默认运行过拟合小批量 sanity check：
+  同一模型结构在固定小批次上训练，关闭辅助均衡损失、weight decay、
+  梯度裁剪与 warmup，要求训练损失迅速趋近 0 或下一 token 准确率
+  接近 100%。检查内部固定种子并在结束后恢复 RNG 状态，不影响主训练
+  轨迹；失败时以非零状态码退出，不开始全量训练。这是必要不充分
+  检查，通过后仍需核对中间结果。可用 `--sanity-only` 单独运行、
+  `--skip-sanity-check` 跳过。
+- 每轮实验的代码版本、运行环境、超参数与随机种子、数据指纹、
+  sanity check 结果写入 `config.json`；训练曲线与最终结果写入
+  `metrics.jsonl`，全程自动记录。
 
 ## 训练入口
 
@@ -52,4 +72,6 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 
 常用参数：`--steps`、`--batch-size`、`--lr`、`--warmup-steps`、
 `--grad-clip`、`--eval-interval`、`--save-interval`、`--resume`、
-`--grad-checkpoint`、`--compile`。
+`--grad-checkpoint`、`--compile`、`--seed`、`--note`、`--sanity-only`、
+`--skip-sanity-check`、`--sanity-batch-size`、`--sanity-steps`、
+`--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`。
