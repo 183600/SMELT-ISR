@@ -70,6 +70,48 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `collect_run_metadata`、`write_run_config`：实验追踪信息收集与落盘。
 - `run_self_test`：结构、梯度、因果性、模式等价性、数据划分/
   测试集封存与 sanity check 判定自测。
+- `analyze_training_curve`、`print_curve_analysis`：从 `metrics.jsonl`
+  重建训练/验证曲线并给出过拟合、欠拟合、未收敛、发散等判定。
+- `early_stop_state_from_records`：恢复训练时从历史验证点重建早停
+  状态（最优值、最优步、连续未改善次数）。
+- `diagnose_non_finite`、`print_non_finite_report`：首次出现
+  NaN/Inf 损失或梯度时的四步排查（数据 → 前向数值 → 混合精度 →
+  梯度/优化器状态），报告写入触发的 `metrics.jsonl` 记录。
+- `analyze_bad_cases`、`print_bad_cases`：分组错误案例并从
+  歧义、系统性混淆、疑似标签噪声、不确定四类原因中给出归类。
+- `measure_efficiency`、`print_efficiency`：参数量、前向 FLOPs
+  （线性层实测 + 注意力估计）、延迟/吞吐与进程峰值内存。
+- `compare_runs`、`print_comparison`：汇总多个运行目录的
+  config 与最终指标，输出精度-效率对照表。
+
+## 结果分析方法
+
+- **曲线而非单点**：每轮实验结束时从 `metrics.jsonl` 重建曲线，
+  在 `{"step": "curve_analysis", ...}` 中记录状态与建议。
+  判定需要至少 3 个验证点；验证损失在最优值后又明显回升判为
+  过拟合，训练损失仍在下降或验证损失远高于 `ln(vocab_size)` 时
+  判为欠拟合/尚未学到（`--steps` 不足），出现非有限事件判为发散。
+  训练损失或梯度任一非有限都计为非有限事件并写入记录。
+- **NaN/Inf 系统排查**：训练循环检测到非有限损失/梯度时跳过该步
+  的优化器与调度器更新，首次事件自动运行 `diagnose_non_finite`：
+  1）数据批次是否存在 NaN/Inf 或越界 token（整数比较前提升到
+  64 位，避免 uint8 回绕误报，前向证据不足时补跑一次诊断前向）；
+  2）logits 是否非有限、是否接近低精度上限；3）fp16/bf16 混合精度
+  溢出；4）逐参数梯度与优化器状态是否被污染。参数或优化器状态
+  已被污染（或连续三次事件）时提前停止训练，不覆盖 `last.pt`，
+  提示从污染前检查点恢复并降低学习率/收紧 `--grad-clip`。
+- **坏案例分析**：从验证集固定窗口抽取置信度最低的若干 token，
+  记录上下文、目标/预测字节、是否命中同窗口重复模式，按四类原因
+  归类；完整报告写入 `out_dir/bad_cases.json`。测试集解封的
+  唯一一次评估会附带 test 坏案例。
+- **效率口径**：验证损失改善必须与参数量、FLOPs、延迟、峰值内存
+  一起汇报。FLOPs 线性层部分用 `FlopCounterMode` 实测，注意力按
+  4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层执行两轮，按真实
+  执行次数累计）；CPU 路径以进程峰值 RSS 作为内存粗粒度口径。
+- **早停**：`--early-stop-patience` 启用；NaN 验证损失不算「改善」；
+  `--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑语义一致。
+- **运行对比**：`--compare RUN_DIR...` 只读运行目录，汇总各模式
+  在相同数据上的精度与效率，用于回答「涨点多少、代价多少」。
 
 ## 可复现性与实验追踪
 
@@ -101,3 +143,8 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--skip-sanity-check`、`--sanity-batch-size`、`--sanity-steps`、
 `--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`、
 `--val-fraction`、`--test-fraction`、`--evaluate-test`。
+
+结果分析相关参数：`--early-stop-patience`（默认 0，关闭早停）、
+`--early-stop-min-delta`、`--bad-cases`（默认 10，0 关闭）、
+`--skip-efficiency`（跳过结束时的效率测量）、
+`--compare RUN_DIR...`（只读对比多个运行目录，不训练）。

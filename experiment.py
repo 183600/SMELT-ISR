@@ -11,6 +11,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -2125,6 +2126,1609 @@ def evaluate(
 
 
 # ============================================================
+# Training-curve analysis
+# ============================================================
+
+# 曲线诊断最少需要的验证点数：少于该数量时只报告原始曲线，
+# 不给出过拟合/欠拟合结论，避免用一两个点下判断。
+_CURVE_MIN_EVAL_POINTS = 3
+
+# 验证损失从最优点回升超过该比例、且训练损失仍在下降时
+# 判定为过拟合。
+_CURVE_OVERFIT_REGRESSION = 0.02
+
+# 判定「训练损失仍在下降」的最小相对降幅。
+_CURVE_TRAIN_STILL_DESCENDING = 0.02
+
+# 最近一次验证间隔内训练/验证损失仍下降超过该比例时，
+# 判定为尚未收敛（继续训练可能还有收益）。
+_CURVE_STILL_DESCENDING = 0.05
+
+# 整体相对下降小于该比例、且最终训练损失仍接近随机基线
+# （baseline_loss）时判定为欠拟合/几乎没有学到东西。
+_CURVE_NO_LEARN_DROP = 0.05
+_CURVE_NO_LEARN_BASELINE = 0.9
+
+_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values, width=48):
+    """
+    把一列数值渲染成等宽 Unicode 走势条，便于在终端快速扫
+    训练曲线走势；数值越小时块越低（损失越小越靠下）。
+    """
+    values = [float(value) for value in values]
+
+    if not values:
+        return ""
+
+    if len(values) > width:
+        stride = len(values) / width
+        values = [
+            values[min(len(values) - 1, int(index * stride))]
+            for index in range(width)
+        ]
+
+    low = min(values)
+    high = max(values)
+
+    if high - low <= 0.0:
+        return _SPARK_BLOCKS[0] * len(values)
+
+    return "".join(
+        _SPARK_BLOCKS[
+            min(
+                len(_SPARK_BLOCKS) - 1,
+                int(
+                    (value - low)
+                    / (high - low)
+                    * (len(_SPARK_BLOCKS) - 1)
+                    + 0.5
+                ),
+            )
+        ]
+        for value in values
+    )
+
+
+def analyze_training_curve(
+    records: List[Dict[str, object]],
+    baseline_loss: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    基于完整训练曲线（metrics.jsonl）而不是最终单个数值做诊断。
+
+    对每个周期验证点，取「自上次验证以来训练损失的平均值」与
+    val_loss 配对，按以下规则给出结论：
+
+    - ``overfitting``：验证损失最优点早于最后一次验证、最终
+      验证损失较最优值回升超过阈值，而训练损失仍在下降；
+    - ``underfitting``：训练损失整体几乎不降，且最终仍接近随
+      机基线（ln(vocab_size)）；
+    - ``not_converged``：最近一次间隔内训练与验证损失仍同步
+      明显下降，说明训练步数/学习率还没到平台；
+    - ``diverged``：最近一步损失非有限（NaN/Inf）；
+    - ``healthy``：训练与验证损失同步下降且验证未回升；
+    - ``insufficient_data``：验证点不足以做结论。
+
+    返回的诊断会追加为 ``{"step": "curve_analysis", ...}``
+    记录，并打印对应建议（过拟合→正则化/增大数据/早停，
+    欠拟合→查学习率、优化器与数据管道）。
+    """
+    train_points: List[Tuple[int, float]] = []
+    nonfinite_steps: List[int] = []
+    eval_points: List[Dict[str, object]] = []
+    pending: List[float] = []
+
+    for record in records:
+        step = record.get("step")
+
+        if not isinstance(step, int):
+            continue
+
+        if "grad_norm" in record or "train_loss" in record:
+            train_loss = record.get("train_loss")
+            # 非有限事件既可能落在损失上（写盘为 null），也可能
+            # 只落在梯度上（损失仍有限但 grad_norm 为 null）。
+            nonfinite = train_loss is None or (
+                "grad_norm" in record
+                and record.get("grad_norm") is None
+            )
+            if nonfinite:
+                if (
+                    not nonfinite_steps
+                    or nonfinite_steps[-1] != step
+                ):
+                    nonfinite_steps.append(step)
+            if train_loss is not None:
+                train_loss = float(train_loss)
+                train_points.append((step, train_loss))
+                pending.append(train_loss)
+
+        if "val_loss" not in record:
+            continue
+
+        val_loss = record.get("val_loss")
+
+        if val_loss is None:
+            if (
+                not nonfinite_steps
+                or nonfinite_steps[-1] != step
+            ):
+                nonfinite_steps.append(step)
+            eval_points.append({
+                "step": step,
+                "val_loss": None,
+                "train_loss": None,
+            })
+            pending = []
+            continue
+
+        train_at_eval = (
+            sum(pending) / len(pending)
+            if pending
+            else (train_points[-1][1] if train_points else None)
+        )
+
+        eval_points.append({
+            "step": step,
+            "val_loss": float(val_loss),
+            "train_loss": train_at_eval,
+        })
+        pending = []
+
+    finite_evals = [
+        point
+        for point in eval_points
+        if point["val_loss"] is not None
+    ]
+
+    # 「最近仍是非有限」才判定发散；早先出现过 NaN 但后续恢复
+    # 的运行保留警告但不直接判发散。
+    recent_nonfinite = bool(nonfinite_steps) and (
+        not train_points
+        or nonfinite_steps[-1] >= train_points[-1][0]
+    )
+    last_eval_nonfinite = bool(
+        eval_points and eval_points[-1]["val_loss"] is None
+    )
+
+    warnings: List[str] = []
+
+    analysis: Dict[str, object] = {
+        "n_train_steps": len(train_points),
+        "n_eval_points": len(finite_evals),
+        "n_nonfinite_events": len(nonfinite_steps),
+        "nonfinite_steps": nonfinite_steps[-10:],
+        "warnings": warnings,
+        "status": "insufficient_data",
+        "recommendation": (
+            "验证点不足，继续训练后再看曲线；"
+            "至少需要 3 个周期验证点。"
+        ),
+    }
+
+    if nonfinite_steps:
+        warnings.append(
+            f"训练/验证损失出现 {len(nonfinite_steps)} 次非有限"
+            "（NaN/Inf）记录；按排查路径逐项检查：数据是否含 "
+            "NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合"
+            "精度溢出 → 梯度爆炸/学习率过大（见 "
+            "diagnose_non_finite 输出的 nan_diagnosis 记录）。"
+        )
+
+    if (recent_nonfinite or last_eval_nonfinite) and (
+        eval_points or train_points
+    ):
+        analysis["status"] = "diverged"
+        analysis["recommendation"] = (
+            "损失已发散为 NaN/Inf，不要继续加载该检查点训练；"
+            "先按 diagnose_non_finite 的四步路径排查，"
+            "再考虑降低学习率/开启梯度裁剪后重跑。"
+        )
+        analysis["curve_sparkline_train"] = _sparkline(
+            [value for _, value in train_points]
+        )
+        return analysis
+
+    if len(finite_evals) < _CURVE_MIN_EVAL_POINTS:
+        analysis["curve_sparkline_train"] = _sparkline(
+            [value for _, value in train_points]
+        )
+        analysis["curve_sparkline_val"] = _sparkline(
+            [point["val_loss"] for point in finite_evals]
+        )
+        return analysis
+
+    first = finite_evals[0]
+    last = finite_evals[-1]
+    previous = finite_evals[-2]
+
+    best_index = min(
+        range(len(finite_evals)),
+        key=lambda index: finite_evals[index]["val_loss"],
+    )
+    best = finite_evals[best_index]
+
+    regression = (
+        (last["val_loss"] - best["val_loss"])
+        / max(float(best["val_loss"]), 1e-12)
+    )
+
+    def _relative_drop(newer, older):
+        if older is None or newer is None:
+            return None
+        older = float(older)
+        newer = float(newer)
+        if older <= 0.0:
+            return None
+        return (older - newer) / older
+
+    train_drop_total = _relative_drop(
+        last["train_loss"],
+        first["train_loss"],
+    )
+    train_still_down = (
+        best_index < len(finite_evals) - 1
+        and last["train_loss"] is not None
+        and best["train_loss"] is not None
+        and float(last["train_loss"])
+        < float(best["train_loss"])
+        * (1.0 - _CURVE_TRAIN_STILL_DESCENDING)
+    )
+    recent_train_drop = _relative_drop(
+        last["train_loss"],
+        previous["train_loss"],
+    )
+    recent_val_drop = _relative_drop(
+        last["val_loss"],
+        previous["val_loss"],
+    )
+
+    analysis.update({
+        "first_train_loss": first["train_loss"],
+        "last_train_loss": last["train_loss"],
+        "first_val_loss": first["val_loss"],
+        "last_val_loss": last["val_loss"],
+        "best_val_loss": best["val_loss"],
+        "best_val_step": best["step"],
+        "val_regression_from_best": round(regression, 6),
+        "train_val_gap_first": (
+            round(
+                float(first["train_loss"])
+                - float(first["val_loss"]),
+                6,
+            )
+            if first["train_loss"] is not None
+            else None
+        ),
+        "train_val_gap_last": (
+            round(
+                float(last["train_loss"])
+                - float(last["val_loss"]),
+                6,
+            )
+            if last["train_loss"] is not None
+            else None
+        ),
+        "curve_sparkline_train": _sparkline(
+            [value for _, value in train_points]
+        ),
+        "curve_sparkline_val": _sparkline(
+            [point["val_loss"] for point in finite_evals]
+        ),
+    })
+
+    if (
+        best_index <= len(finite_evals) - 2
+        and regression >= _CURVE_OVERFIT_REGRESSION
+        and train_still_down
+    ):
+        analysis["status"] = "overfitting"
+        analysis["recommendation"] = (
+            f"验证损失在第 {best['step']} 步达到最优 "
+            f"{float(best['val_loss']):.4f} 后回升 "
+            f"{regression * 100:.1f}%，训练损失仍在下降："
+            "典型过拟合。建议按序尝试：加正则化"
+            "（调大 --weight-decay / 适度增大 balance_coef）、"
+            "增大训练数据、用 --early-stop-patience 早停"
+            "（不要把验证损失回升后的步数计入结论）。"
+        )
+    elif (
+        train_drop_total is not None
+        and train_drop_total < _CURVE_NO_LEARN_DROP
+        and (
+            baseline_loss is None
+            or (
+                last["train_loss"] is not None
+                and float(last["train_loss"])
+                > _CURVE_NO_LEARN_BASELINE * baseline_loss
+            )
+        )
+    ):
+        analysis["status"] = "underfitting"
+        analysis["recommendation"] = (
+            f"训练损失整体仅下降 "
+            f"{max(0.0, train_drop_total) * 100:.1f}%，"
+            "接近随机基线，训练与验证都没有有效下降："
+            "欠拟合或学习率/数据管道有问题。建议检查："
+            "学习率是否过小或过大、优化器配置、标签与输入是否"
+            "对齐（可先跑 --sanity-only 小批量过拟合检查）、"
+            "模型容量与训练步数是否足够。"
+        )
+    elif (
+        recent_train_drop is not None
+        and recent_val_drop is not None
+        and recent_train_drop > _CURVE_STILL_DESCENDING
+        and recent_val_drop > _CURVE_STILL_DESCENDING
+    ):
+        analysis["status"] = "not_converged"
+        analysis["recommendation"] = (
+            "最近一次验证间隔内训练与验证损失仍在同步明显下降，"
+            "尚未收敛。建议增大 --steps（或调大学习率后重跑），"
+            "并参考 learning-rate 曲线确认退火是否太慢。"
+        )
+    else:
+        analysis["status"] = "healthy"
+        analysis["recommendation"] = (
+            "训练与验证损失同步下降、验证未回升或仅轻微波动，"
+            "曲线健康；如需进一步改善，可关注仍未收敛时的"
+            "更多步数与模型容量。"
+        )
+
+    analysis["recent_train_drop"] = (
+        None
+        if recent_train_drop is None
+        else round(recent_train_drop, 6)
+    )
+    analysis["recent_val_drop"] = (
+        None
+        if recent_val_drop is None
+        else round(recent_val_drop, 6)
+    )
+    analysis["train_still_down"] = train_still_down
+
+    return analysis
+
+
+def print_curve_analysis(analysis: Dict[str, object]) -> None:
+    """打印训练曲线诊断摘要、走势条与建议。"""
+    print(
+        "[curve] 状态: "
+        f"{analysis.get('status')} | "
+        f"验证点 {analysis.get('n_eval_points')} 个 | "
+        f"非有限事件 {analysis.get('n_nonfinite_events')} 次"
+    )
+
+    if analysis.get("best_val_loss") is not None:
+        print(
+            "[curve] 最优验证损失 "
+            f"{float(analysis['best_val_loss']):.4f} @ step "
+            f"{analysis.get('best_val_step')}，"
+            "最终验证损失 "
+            f"{float(analysis['last_val_loss']):.4f}"
+            "（相对最优回升 "
+            f"{float(analysis.get('val_regression_from_best') or 0.0) * 100:.1f}%），"
+            "最终训练损失 "
+            f"{float(analysis['last_train_loss']):.4f}"
+        )
+
+    if analysis.get("curve_sparkline_train"):
+        print(
+            "[curve] train " + str(analysis["curve_sparkline_train"])
+        )
+
+    if analysis.get("curve_sparkline_val"):
+        print(
+            "[curve] val   " + str(analysis["curve_sparkline_val"])
+        )
+
+    for warning in analysis.get("warnings", []):
+        print(f"[curve] 警告: {warning}")
+
+    print(f"[curve] 建议: {analysis.get('recommendation')}")
+
+
+def early_stop_state_from_records(
+    records: List[Dict[str, object]],
+    min_delta: float,
+) -> Tuple[Optional[float], Optional[int], int]:
+    """
+    从已有 metrics.jsonl 记录恢复早停状态（最优验证损失、最优
+    步数、连续未改善次数），保证 resume 后早停判定与原运行一致。
+    """
+    best_loss: Optional[float] = None
+    best_step: Optional[int] = None
+    evals_without_improvement = 0
+
+    for record in records:
+        if "val_loss" not in record:
+            continue
+
+        val_loss = record.get("val_loss")
+        step = record.get("step")
+
+        if val_loss is None:
+            continue
+
+        val_loss = float(val_loss)
+
+        if (
+            best_loss is None
+            or val_loss < best_loss - min_delta
+        ):
+            best_loss = val_loss
+            best_step = step if isinstance(step, int) else None
+            evals_without_improvement = 0
+        else:
+            evals_without_improvement += 1
+
+    return best_loss, best_step, evals_without_improvement
+
+
+# ============================================================
+# Bad-case analysis
+# ============================================================
+
+# top1 概率与目标 token 概率之差小于该值时视为「样本模糊」：
+# 正确答案与模型首选几乎并列，不是明确的模型错误。
+_BAD_CASE_AMBIGUOUS_MARGIN = 0.1
+
+# 模型以该置信度以上的概率给出错误答案时，优先怀疑模型盲区
+# 或标注噪声。
+_BAD_CASE_CONFIDENT = 0.9
+
+# 目标字节在评估 split 中的占比低于该值且模型高置信度答错时，
+# 提示标注本身可能有误（需人工复核）。
+_BAD_CASE_RARE_TARGET_SHARE = 0.005
+
+# 同一 (target, predicted) 混淆对在错误列表中出现该次数以上时，
+# 视为系统性混淆（模型盲区），而不是孤立个例。
+_BAD_CASE_SYSTEMATIC_COUNT = 3
+
+
+def _render_byte(value: int) -> str:
+    """把单个字节渲染为可打印文本（不可打印字节用 \\xNN）。"""
+    value = int(value)
+    if 32 <= value < 127:
+        return chr(value)
+    return f"\\x{value:02x}"
+
+
+def _render_bytes(values) -> str:
+    """把字节序列渲染为可打印文本。"""
+    return "".join(_render_byte(value) for value in values)
+
+
+@torch.inference_mode()
+def analyze_bad_cases(
+    model: LanguageModel,
+    dataset: ByteDataset,
+    batch_size: int,
+    batches: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype] = None,
+    split: str = "val",
+    top_n: int = 10,
+    context_before: int = 16,
+    context_after: int = 8,
+) -> Dict[str, object]:
+    """
+    坏案例分析：把预测错误的样本打印出来并归类错误原因。
+
+    使用与周期验证完全相同的固定窗口（protocol 口径一致），
+    对每个目标 token 计算：
+
+    - loss / 置信度（top1 概率）/ margin（top1 概率 − 目标概率）；
+    - 污染最严重的 top_n 个 token，附上下文文本、目标与预测
+      字节、错误类别；
+    - 高频混淆对（target→predicted）与逐目标字节错误率；
+    - 错误类别统计：ambiguous（样本极其模糊）、
+      systematic_confusion（同类混淆反复出现，模型盲区）、
+      label_noise_suspect（目标字节稀少但模型高置信度答错，
+      提示标注可能有误）、uncertain（其余）。
+
+    仅访问 val（或显式解封后的 test），绝不接触训练期间尘封的
+    测试集；输出既打印，也写回 metrics.jsonl 的
+    ``{"step": "bad_cases", ...}`` 记录，完整报告另存
+    bad_cases.json，作为提出新改进思路的证据来源。
+    """
+    was_training = model.training
+    model.eval()
+
+    use_amp = (
+        amp_dtype is not None
+        and device.type == "cuda"
+    )
+
+    vocab_size = _unwrap_model(model).cfg.vocab_size
+
+    losses: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    predictions: List[torch.Tensor] = []
+    confidences: List[torch.Tensor] = []
+    margins: List[torch.Tensor] = []
+    windows: List[torch.Tensor] = []
+
+    try:
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            for batch_index in range(batches):
+                x, y = dataset.fixed_eval_batch(
+                    split,
+                    batch_index,
+                    batches,
+                    batch_size,
+                    device,
+                )
+
+                if x.size(0) == 0:
+                    break
+
+                result = model(x)
+
+                # 坏案例统计只在 fp32 下做，避免半精度下
+                # softmax/gather 的数值误差影响错误归因。
+                logits = result["logits"].float()
+                del result
+
+                batch, length, width = logits.shape
+
+                loss_tokens = F.cross_entropy(
+                    logits.reshape(-1, width),
+                    y.reshape(-1),
+                    reduction="none",
+                ).view(batch, length)
+
+                probabilities = logits.softmax(dim=-1)
+                top2 = probabilities.topk(2, dim=-1)
+
+                predicted = top2.indices[..., 0]
+                confidence = top2.values[..., 0]
+                target_probability = probabilities.gather(
+                    -1,
+                    y.unsqueeze(-1).to(torch.int64),
+                ).squeeze(-1)
+
+                # 还原完整窗口：x = tokens[:-1]，y = tokens[1:]。
+                window = torch.cat(
+                    [x[:, :1].to(torch.uint8), y],
+                    dim=1,
+                )
+
+                losses.append(loss_tokens.reshape(-1).cpu())
+                targets.append(y.reshape(-1).cpu())
+                predictions.append(
+                    predicted.reshape(-1).to(torch.int16).cpu()
+                )
+                confidences.append(
+                    confidence.reshape(-1).to(torch.float16).cpu()
+                )
+                margins.append(
+                    (confidence - target_probability)
+                    .reshape(-1)
+                    .to(torch.float16)
+                    .cpu()
+                )
+                windows.append(window.cpu())
+
+        if not losses:
+            return {
+                "split": split,
+                "tokens_evaluated": 0,
+                "token_accuracy": None,
+                "top_cases": [],
+                "top_confusions": [],
+                "error_rate_by_target": [],
+                "category_counts": {},
+                "summary": "评估窗口为空，未生成坏案例。",
+            }
+
+        loss_all = torch.cat(losses)
+        target_all = torch.cat(targets).to(torch.int64)
+        predicted_all = torch.cat(predictions).to(torch.int64)
+        confidence_all = torch.cat(confidences).float()
+        margin_all = torch.cat(margins).float()
+        window_all = torch.cat(windows)
+
+        num_tokens = loss_all.numel()
+        sequence_length = window_all.size(1) - 1
+
+        wrong_mask = target_all != predicted_all
+        token_accuracy = float(
+            (1.0 - wrong_mask.float().mean()).item()
+        )
+
+        # 逐目标字节在评估 split 中的占比，用于标注噪声提示。
+        target_counts = torch.bincount(
+            target_all,
+            minlength=vocab_size,
+        ).to(torch.float64)
+        target_share = target_counts / max(1.0, float(num_tokens))
+
+        # 高频混淆对：target * vocab + predicted。
+        confusion_index = (
+            target_all * vocab_size + predicted_all
+        )
+        confusion_counts = torch.bincount(
+            confusion_index[wrong_mask],
+            minlength=vocab_size * vocab_size,
+        )
+        confusion_count_by_token = confusion_counts[
+            confusion_index
+        ]
+
+        top_confusion_values, top_confusion_indices = torch.topk(
+            confusion_counts,
+            k=min(10, int((confusion_counts > 0).sum().item()) or 1),
+        )
+
+        top_confusions = []
+        for count, index in zip(
+            top_confusion_values.tolist(),
+            top_confusion_indices.tolist(),
+        ):
+            if count <= 0:
+                break
+            top_confusions.append([
+                int(index) // vocab_size,
+                int(index) % vocab_size,
+                int(count),
+            ])
+
+        # 逐目标字节错误率（只保留出现过的目标字节，按错误率排序）。
+        error_counts = torch.bincount(
+            target_all[wrong_mask],
+            minlength=vocab_size,
+        )
+        error_rate = torch.where(
+            target_counts > 0,
+            error_counts.to(torch.float64)
+            / target_counts.clamp(min=1),
+            torch.zeros(vocab_size, dtype=torch.float64),
+        )
+        seen = target_counts > 0
+        seen_indices = torch.nonzero(seen).reshape(-1)
+        seen_rates = error_rate[seen_indices]
+        order = torch.argsort(seen_rates, descending=True)
+        error_rate_by_target = []
+        for index in order[:10].tolist():
+            byte = int(seen_indices[index])
+            error_rate_by_target.append([
+                byte,
+                round(float(seen_rates[index]), 6),
+                int(target_counts[byte]),
+            ])
+
+        # 污染最严重的 top_n token。
+        count = min(top_n, num_tokens)
+        top_losses, top_indices = torch.topk(loss_all, k=count)
+
+        top_cases = []
+        for rank, flat_index in enumerate(
+            top_indices.tolist()
+        ):
+            row = flat_index // sequence_length
+            position = flat_index % sequence_length
+
+            target = int(target_all[flat_index])
+            predicted = int(predicted_all[flat_index])
+            confidence = float(confidence_all[flat_index])
+            margin = float(margin_all[flat_index])
+            pair_count = int(
+                confusion_count_by_token[flat_index]
+            )
+
+            if margin < _BAD_CASE_AMBIGUOUS_MARGIN:
+                category = "ambiguous"
+            elif (
+                pair_count >= _BAD_CASE_SYSTEMATIC_COUNT
+                and confidence >= 0.5
+            ):
+                category = "systematic_confusion"
+            elif (
+                confidence >= _BAD_CASE_CONFIDENT
+                and float(target_share[target])
+                < _BAD_CASE_RARE_TARGET_SHARE
+            ):
+                category = "label_noise_suspect"
+            else:
+                category = "uncertain"
+
+            window = window_all[row]
+            target_position = position + 1
+            begin = max(0, target_position - context_before)
+            end = min(
+                window.numel(),
+                target_position + 1 + context_after,
+            )
+            fragment = window[begin:end].tolist()
+            marker = target_position - begin
+
+            context = (
+                _render_bytes(fragment[:marker])
+                + "["
+                + _render_byte(target)
+                + "]"
+                + _render_bytes(fragment[marker + 1:])
+            )
+
+            top_cases.append({
+                "rank": rank + 1,
+                "target": target,
+                "target_text": _render_byte(target),
+                "predicted": predicted,
+                "predicted_text": _render_byte(predicted),
+                "loss": round(float(loss_all[flat_index]), 6),
+                "confidence": round(confidence, 6),
+                "margin": round(margin, 6),
+                "category": category,
+                "confusion_count": pair_count,
+                "context": context,
+                "window_text": _render_bytes(
+                    window.tolist()
+                ),
+            })
+
+        category_counts: Dict[str, int] = {}
+        for case in top_cases:
+            key = str(case["category"])
+            category_counts[key] = (
+                category_counts.get(key, 0) + 1
+            )
+
+        top1 = top_cases[0] if top_cases else None
+        summary = (
+            f"评估 {num_tokens} 个 token，token 准确率 "
+            f"{token_accuracy:.4f}；最差样本 "
+            + (
+                "target="
+                f"'{_render_byte(int(top1['target']))}', "
+                "predicted="
+                f"'{_render_byte(int(top1['predicted']))}', "
+                f"loss={float(top1['loss']):.4f}, "
+                f"category={top1['category']}。"
+                if top1 is not None
+                else "无。"
+            )
+        )
+
+        report: Dict[str, object] = {
+            "split": split,
+            "tokens_evaluated": int(num_tokens),
+            "token_accuracy": round(token_accuracy, 6),
+            "top_cases": top_cases,
+            "top_confusions": top_confusions,
+            "error_rate_by_target": error_rate_by_target,
+            "category_counts": category_counts,
+            "summary": summary,
+        }
+
+        return report
+    finally:
+        model.train(was_training)
+
+
+def print_bad_cases(report: Dict[str, object]) -> None:
+    """打印坏案例报告：最差样本、混淆对与错误分类统计。"""
+    split = report.get("split")
+    print(
+        f"[bad-case] split={split} tokens="
+        f"{report.get('tokens_evaluated')} "
+        f"token_acc={report.get('token_accuracy')}"
+    )
+
+    for case in report.get("top_cases", []):
+        print(
+            f"[bad-case]   #{case['rank']} "
+            f"loss={case['loss']:.4f} "
+            f"conf={case['confidence']:.3f} "
+            f"margin={case['margin']:.3f} "
+            f"target='{case['target_text']}' "
+            f"pred='{case['predicted_text']}' "
+            f"category={case['category']} | "
+            f"{case['context']}"
+        )
+
+    if report.get("top_confusions"):
+        pairs = " ".join(
+            f"'{_render_byte(target)}'→"
+            f"'{_render_byte(predicted)}'({count})"
+            for target, predicted, count in report[
+                "top_confusions"
+            ][:5]
+        )
+        print(f"[bad-case] 高频混淆对: {pairs}")
+
+    if report.get("category_counts"):
+        print(
+            "[bad-case] 错误类别统计: "
+            + json.dumps(
+                report["category_counts"],
+                ensure_ascii=False,
+            )
+        )
+
+    print(f"[bad-case] 小结: {report.get('summary')}")
+
+
+# ============================================================
+# Non-finite (NaN/Inf) diagnosis
+# ============================================================
+
+# 非有限损失/梯度的系统排查路径（顺序固定，先查证据更简单
+# 的环节，再查混合精度与优化环节）。
+_NONFINITE_CHECKLIST = [
+    "1) 数据：批次内是否存在 NaN/Inf 或越界 token"
+    "（字节管线的整数 token 天然无 NaN，越界/负值可能来自"
+    "上游 dtype 或编码错误；扩展到连续值特征后必须查 NaN/Inf）。",
+    "2) 前向数值：logits 是否非有限、绝对值是否接近低精度"
+    "上限；有限 logits + 非有限损失通常是 log(0)/除零/目标"
+    "越界等损失侧问题。",
+    "3) 混合精度：fp16 autocast 下 matmul/softmax 溢出会先"
+    "出现大绝对值再变 NaN；可对比关闭 AMP（--device cpu 或"
+    "换 bf16）判断。",
+    "4) 梯度与优化：逐参数梯度是否爆炸/非有限、参数与优化器"
+    "状态是否已被污染；若是则降低学习率、开启/收紧梯度裁剪"
+    "（--grad-clip）并从污染前的检查点恢复。",
+]
+
+
+def _check_batch_integrity(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    vocab_size: int,
+) -> Dict[str, object]:
+    """检查一个训练批次的值域与非有限元素。"""
+    info: Dict[str, object] = {
+        "x_dtype": str(x.dtype),
+        "y_dtype": str(y.dtype),
+        "x_min": None,
+        "x_max": None,
+        "y_min": None,
+        "y_max": None,
+        "nonfinite_elements": 0,
+        "out_of_range_elements": 0,
+        "ok": True,
+    }
+
+    for name, tensor in (("x", x), ("y", y)):
+        if tensor.numel() == 0:
+            continue
+
+        if tensor.is_floating_point():
+            finite_mask = torch.isfinite(tensor)
+            info["nonfinite_elements"] = int(
+                info["nonfinite_elements"]
+            ) + int((~finite_mask).sum())
+            if bool(finite_mask.any()):
+                finite_values = tensor[finite_mask]
+                info[f"{name}_min"] = float(
+                    finite_values.min()
+                )
+                info[f"{name}_max"] = float(
+                    finite_values.max()
+                )
+        else:
+            info[f"{name}_min"] = int(tensor.min())
+            info[f"{name}_max"] = int(tensor.max())
+
+        # uint8 与 Python 整数比较会按 uint8 回绕（如 255 >= 256
+        # 会溢出成 255 >= 0 而误报），先提升到 int64 再判值域。
+        comparison = tensor.to(torch.int64)
+        info["out_of_range_elements"] = int(
+            info["out_of_range_elements"]
+        ) + int(
+            ((comparison < 0) | (comparison >= vocab_size)).sum()
+        )
+
+    info["ok"] = (
+        int(info["nonfinite_elements"]) == 0
+        and int(info["out_of_range_elements"]) == 0
+    )
+    return info
+
+
+def diagnose_non_finite(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    result: Dict[str, torch.Tensor],
+    grad_norm: torch.Tensor,
+    *,
+    step: int,
+    lr: float,
+    amp_dtype: Optional[torch.dtype] = None,
+    scaler: Optional[object] = None,
+    vocab_size: int = 256,
+) -> Dict[str, object]:
+    """
+    非有限损失/梯度出现时的系统排查。
+
+    按固定路径收集证据：数据值域与非有限元素 → logits/损失
+    数值（log(0)、除零、softmax 溢出）→ 低精度上限 → 逐参数
+    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态。返回的
+    报告会附加到触发该步的 metrics 记录（nan_diagnosis 字段）
+    并打印，之后按报告中的 next_steps 逐项排除。
+    """
+    findings: List[str] = []
+    checks: Dict[str, object] = {}
+
+    report: Dict[str, object] = {
+        "step": step,
+        "lr": lr,
+        "checks": checks,
+        "findings": findings,
+        "next_steps": list(_NONFINITE_CHECKLIST),
+    }
+
+    # ---- 1) 数据 ----
+    data_check = _check_batch_integrity(x, y, vocab_size)
+    checks["data"] = data_check
+    if not data_check["ok"]:
+        findings.append(
+            "数据批次包含非有限或越界元素"
+            f"（nonfinite={data_check['nonfinite_elements']}, "
+            f"out_of_range={data_check['out_of_range_elements']}）"
+        )
+
+    # ---- 2) 前向数值 ----
+    logits = result.get("logits")
+    loss = result.get("loss")
+    lm_loss = result.get("lm_loss")
+    aux_loss = result.get("aux_loss")
+
+    # 训练循环在反向之前就释放了 logits；诊断时补跑一次前向，
+    # 否则前向数值检查拿不到证据。只在确认出错后执行一次。
+    probe_source = "training result"
+    if logits is None and isinstance(model, LanguageModel):
+        was_training = model.training
+        try:
+            model.eval()
+            probe_use_amp = (
+                amp_dtype is not None
+                and x.is_cuda
+            )
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=amp_dtype,
+                    enabled=probe_use_amp,
+                ):
+                    probe = model(x)
+            probe_logits = probe.get("logits")
+            if probe_logits is not None:
+                logits = probe_logits
+                probe_source = "diagnostic forward probe"
+        except Exception:
+            pass
+        finally:
+            model.train(was_training)
+
+    def _finite(value) -> Optional[bool]:
+        if value is None or not torch.is_tensor(value):
+            return None
+        return bool(torch.isfinite(value).all())
+
+    logits_absmax = None
+    logits_dtype = None
+    if logits is not None and torch.is_tensor(logits):
+        logits_dtype = str(logits.dtype)
+        if logits.numel() > 0:
+            logits_absmax = float(
+                logits.detach().abs().max()
+            )
+
+    overflow_limit = None
+    if amp_dtype == torch.float16:
+        overflow_limit = 65504.0
+    elif amp_dtype == torch.bfloat16:
+        overflow_limit = float(
+            torch.finfo(torch.bfloat16).max
+        )
+
+    checks["forward"] = {
+        "logits_source": probe_source,
+        "logits_dtype": logits_dtype,
+        "logits_finite": _finite(logits),
+        "logits_absmax": logits_absmax,
+        "lm_loss_finite": _finite(lm_loss),
+        "aux_loss_finite": _finite(aux_loss),
+        "total_loss_finite": _finite(loss),
+        "amp_dtype": (
+            str(amp_dtype) if amp_dtype is not None else None
+        ),
+        "low_precision_overflow_limit": overflow_limit,
+    }
+
+    if _finite(logits) is False:
+        findings.append(
+            "logits 已含 NaN/Inf：优先怀疑低精度 matmul/softmax "
+            "溢出或模型内部数值爆炸"
+        )
+    if (
+        logits_absmax is not None
+        and overflow_limit is not None
+        and logits_absmax > overflow_limit / 2.0
+    ):
+        findings.append(
+            f"logits 绝对值 {logits_absmax:.3e} 已接近 "
+            f"{amp_dtype} 上限 {overflow_limit:.3e}，"
+            "低精度溢出风险高"
+        )
+    if (
+        _finite(logits) is True
+        and _finite(loss) is False
+    ):
+        findings.append(
+            "logits 有限但总损失非有限：检查损失侧（目标越界、"
+            "log(0)、除零、混合精度下的归约）"
+        )
+
+    # ---- 3) 逐参数梯度 ----
+    nonfinite_grad_params: List[str] = []
+    gradient_absmax: List[Tuple[float, str]] = []
+
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach()
+        if bool(torch.isfinite(gradient).all()):
+            gradient_absmax.append(
+                (float(gradient.abs().max()), name)
+            )
+        else:
+            nonfinite_grad_params.append(name)
+
+    gradient_absmax.sort(reverse=True)
+
+    grad_norm_value = None
+    if torch.is_tensor(grad_norm) and bool(
+        torch.isfinite(grad_norm)
+    ):
+        grad_norm_value = float(grad_norm)
+
+    checks["gradients"] = {
+        "grad_norm": grad_norm_value,
+        "nonfinite_grad_params": nonfinite_grad_params[:5],
+        "n_nonfinite_grad_params": len(nonfinite_grad_params),
+        "largest_grad_absmax": [
+            [round(value, 6), name]
+            for value, name in gradient_absmax[:5]
+        ],
+    }
+
+    if nonfinite_grad_params:
+        findings.append(
+            f"{len(nonfinite_grad_params)} 个参数的梯度非有限"
+            "（梯度爆炸/损失侧 NaN 反传）"
+        )
+    elif grad_norm_value is None and torch.is_tensor(grad_norm):
+        findings.append(
+            "梯度总体范数非有限但逐参数梯度均为有限："
+            "可能是裁剪/缩放链路上的数值问题"
+        )
+
+    # ---- 4) 参数与优化器状态污染 ----
+    nonfinite_params = [
+        name
+        for name, parameter in model.named_parameters()
+        if not bool(
+            torch.isfinite(parameter.detach()).all()
+        )
+    ]
+    checks["parameters_nonfinite"] = nonfinite_params[:5]
+    if nonfinite_params:
+        findings.append(
+            f"{len(nonfinite_params)} 个参数已含 NaN/Inf："
+            "参数已被污染，应从污染前的检查点恢复"
+        )
+
+    nonfinite_state_keys = []
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value) and not bool(
+                torch.isfinite(value).all()
+            ):
+                nonfinite_state_keys.append(key)
+    nonfinite_state_keys = sorted(set(nonfinite_state_keys))
+    checks["optimizer_state_nonfinite_keys"] = (
+        nonfinite_state_keys[:5]
+    )
+    if nonfinite_state_keys:
+        findings.append(
+            "优化器状态（"
+            + ", ".join(nonfinite_state_keys)
+            + "）已含 NaN/Inf：状态已被污染，需要从检查点恢复"
+        )
+
+    # ---- 5) 学习率与梯度缩放 ----
+    checks["lr"] = lr
+    if scaler is not None:
+        try:
+            checks["grad_scale"] = float(
+                scaler.get_scale()
+            )
+        except Exception:
+            checks["grad_scale"] = None
+
+    if not findings:
+        findings.append(
+            "本轮检查未定位到单一根因：按 next_steps 顺序逐项"
+            "复现排查（数据→损失→混合精度→梯度/学习率）"
+        )
+
+    return report
+
+
+def print_non_finite_report(report: Dict[str, object]) -> None:
+    """打印非有限值的系统排查报告。"""
+    print(
+        f"[nan] step {report.get('step')} 检测到非有限损失/梯度，"
+        f"lr={report.get('lr')}"
+    )
+    for finding in report.get("findings", []):
+        print(f"[nan] 发现: {finding}")
+    for line in report.get("next_steps", []):
+        print(f"[nan] 排查: {line}")
+
+
+# ============================================================
+# Efficiency measurement
+# ============================================================
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """取出 torch.compile 包装前的原始模型。"""
+    return getattr(model, "_orig_mod", model)
+
+
+def _count_non_embedding_params(model: LanguageModel) -> int:
+    """统计不含 token/position embedding 的参数量。"""
+    excluded = {
+        id(model.token_embedding.weight),
+        id(model.position_embedding.weight),
+    }
+    return sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if id(parameter) not in excluded
+    )
+
+
+def _count_forward_flops(
+    model: LanguageModel,
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> Dict[str, Optional[int]]:
+    """
+    统计一次前向的理论计算量。
+
+    - 线性层（mm/addmm，含专家与路由）用
+      torch.utils.flop_counter.FlopCounterMode 实测；
+    - SDPA 内部的注意力矩阵乘不计入 FlopCounter，用模块
+      pre-hook 按 4·B·T²·D 补上（乘加各计 1 次浮点运算）。
+
+    返回的是一次前向的总 FLOPs；用于跨模式比较计算量，
+    不用于绝对性能断言。
+    """
+    flops: Dict[str, Optional[int]] = {
+        "linear_flops": None,
+        "attention_flops": None,
+        "total_flops_per_forward": None,
+        "flops_note": (
+            "linear(mm/addmm) 实测 + attention(4·B·T²·D) 估计"
+        ),
+    }
+
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+    except Exception:
+        return flops
+
+    attention_flops = [0]
+
+    def _attention_hook(module, args):
+        inp = args[0]
+        if inp.dim() == 3:
+            # numel = B·T·D，乘 4·T 即 4·B·T²·D。
+            attention_flops[0] += (
+                4 * int(inp.size(-2)) * int(inp.numel())
+            )
+
+    # 注意：TransformerBlock 直接调用 self.attn.core()，不会经过
+    # CausalSelfAttention.__call__，因此 hook 必须挂在 Block 上
+    # （smelt 模式的中间层会被执行两轮，hook 自然只统计真实次数）。
+    handles = []
+    for module in model.modules():
+        if isinstance(module, TransformerBlock):
+            handles.append(
+                module.register_forward_pre_hook(
+                    _attention_hook
+                )
+            )
+
+    try:
+        try:
+            counter_context = FlopCounterMode(display=False)
+        except TypeError:
+            counter_context = FlopCounterMode()
+
+        with torch.no_grad():
+            with counter_context as counter:
+                model(x, y)
+
+        linear_flops = int(counter.get_total_flops())
+    except Exception:
+        return flops
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    flops["linear_flops"] = linear_flops
+    flops["attention_flops"] = int(attention_flops[0])
+    flops["total_flops_per_forward"] = (
+        linear_flops + int(attention_flops[0])
+    )
+    return flops
+
+
+def _process_peak_rss_mb() -> Optional[float]:
+    """
+    进程峰值常驻内存（MB）：Linux 读 /proc/self/status 的
+    VmHWM，其他平台退回 resource.getrusage。
+    """
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return round(
+                        int(line.split()[1]) / 1024.0,
+                        3,
+                    )
+    except (OSError, ValueError, IndexError):
+        pass
+
+    try:
+        import resource
+
+        peak_kb = resource.getrusage(
+            resource.RUSAGE_SELF
+        ).ru_maxrss
+        if sys.platform == "darwin":
+            return round(peak_kb / (1024.0 * 1024.0), 3)
+        return round(peak_kb / 1024.0, 3)
+    except Exception:
+        return None
+
+
+def measure_efficiency(
+    model: nn.Module,
+    dataset: ByteDataset,
+    device: torch.device,
+    batch_size: int,
+    amp_dtype: Optional[torch.dtype] = None,
+    warmup: int = 2,
+    iters: int = 5,
+) -> Dict[str, object]:
+    """
+    效率测量：参数量、前向 FLOPs、推理延迟/吞吐与峰值显存。
+
+    评价结构改进不能只看验证损失涨点：本测量在训练结束时对
+    当前模型测一次，与精度指标一起写入 config.json 与
+    metrics.jsonl（``{"step": "efficiency", ...}``），用于回答
+    「提升多少精度、付出多少参数/计算/延迟/显存」。
+    """
+    was_training = model.training
+    raw_model = _unwrap_model(model)
+    cfg = raw_model.cfg
+
+    generator = torch.Generator().manual_seed(0)
+    x, y = dataset.batch(
+        "train",
+        batch_size,
+        generator,
+        device,
+    )
+
+    use_amp = (
+        amp_dtype is not None
+        and device.type == "cuda"
+    )
+    autocast = torch.autocast(
+        device_type="cuda",
+        dtype=amp_dtype,
+        enabled=use_amp,
+    )
+
+    flops = _count_forward_flops(raw_model, x, y)
+
+    latency_seconds = None
+    inference_peak_mb = None
+    training_peak_mb = None
+
+    try:
+        model.eval()
+
+        with torch.no_grad(), autocast:
+            for _ in range(max(0, warmup)):
+                model(x, y)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+        timings: List[float] = []
+        with torch.no_grad(), autocast:
+            for _ in range(max(1, iters)):
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                start = time.perf_counter()
+                model(x, y)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                timings.append(time.perf_counter() - start)
+
+        timings.sort()
+        latency_seconds = timings[len(timings) // 2]
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+
+            model.train()
+            with autocast:
+                output = model(x, y)
+                output["loss"].backward()
+            training_peak_mb = round(
+                torch.cuda.max_memory_allocated(device)
+                / 1e6,
+                3,
+            )
+            model.zero_grad(set_to_none=True)
+
+            torch.cuda.reset_peak_memory_stats(device)
+            with torch.no_grad(), autocast:
+                model(x, y)
+            inference_peak_mb = round(
+                torch.cuda.max_memory_allocated(device)
+                / 1e6,
+                3,
+            )
+            del output
+        else:
+            # CPU 路径：跑一次训练模式前反向后取进程峰值 RSS，
+            # 作为内存占用的粗粒度口径。
+            model.train()
+            with autocast:
+                output = model(x, y)
+                output["loss"].backward()
+            model.zero_grad(set_to_none=True)
+            del output
+    finally:
+        model.train(was_training)
+
+    tokens = int(x.numel())
+
+    result: Dict[str, object] = {
+        "n_params_total": int(
+            sum(
+                parameter.numel()
+                for parameter in raw_model.parameters()
+            )
+        ),
+        "n_params_non_embedding": int(
+            _count_non_embedding_params(raw_model)
+        ),
+        "flops_per_forward": flops[
+            "total_flops_per_forward"
+        ],
+        "flops_linear": flops["linear_flops"],
+        "flops_attention": flops["attention_flops"],
+        "flops_note": flops["flops_note"],
+        "latency_ms_per_forward": (
+            round(latency_seconds * 1e3, 4)
+            if latency_seconds is not None
+            else None
+        ),
+        "throughput_tokens_per_sec": (
+            round(tokens / latency_seconds, 2)
+            if latency_seconds
+            else None
+        ),
+        "inference_peak_memory_mb": inference_peak_mb,
+        "training_peak_memory_mb": training_peak_mb,
+        "process_peak_rss_mb": _process_peak_rss_mb(),
+        "batch_size": int(batch_size),
+        "seq_len": int(x.size(1)),
+        "tokens_per_forward": tokens,
+        "measurement": {
+            "device": str(device),
+            "amp_dtype": (
+                str(amp_dtype)
+                if amp_dtype is not None
+                else None
+            ),
+            "warmup": int(warmup),
+            "iters": int(iters),
+            "mode": cfg.mode,
+        },
+    }
+
+    return result
+
+
+def print_efficiency(efficiency: Dict[str, object]) -> None:
+    """打印效率测量摘要（精度之外的参数量/计算/延迟/显存口径）。"""
+    def _format(value, unit="", spec=".3f"):
+        if value is None:
+            return "-"
+        return format(float(value), spec) + unit
+
+    print(
+        "[efficiency] "
+        f"params={efficiency.get('n_params_total')} "
+        f"(non-embedding="
+        f"{efficiency.get('n_params_non_embedding')}) | "
+        f"FLOPs/forward="
+        f"{_format(efficiency.get('flops_per_forward'), '', '.3e')} | "
+        f"latency={_format(efficiency.get('latency_ms_per_forward'), 'ms')} | "
+        f"throughput="
+        f"{_format(efficiency.get('throughput_tokens_per_sec'), 'tok/s')}"
+    )
+    print(
+        "[efficiency] "
+        f"inference_peak="
+        f"{_format(efficiency.get('inference_peak_memory_mb'), 'MB')} | "
+        f"training_peak="
+        f"{_format(efficiency.get('training_peak_memory_mb'), 'MB')} | "
+        f"process_peak_rss="
+        f"{_format(efficiency.get('process_peak_rss_mb'), 'MB')}"
+    )
+
+
+def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
+    """
+    汇总多个运行目录的精度与效率指标，供跨模式权衡对比。
+
+    读取每个目录的 config.json（结构、参数量、efficiency）与
+    metrics.jsonl（final/test/curve_analysis），输出统一口径的
+    行；用于检查「涨点是否值得多出来的参数量、计算量、延迟与
+    显存」。
+    """
+    rows: List[Dict[str, object]] = []
+
+    for path in paths:
+        run_dir = Path(path)
+        row: Dict[str, object] = {
+            "run": run_dir.name,
+            "path": str(run_dir),
+        }
+
+        config_payload: Dict[str, object] = {}
+        config_path = run_dir / "config.json"
+        if config_path.exists():
+            try:
+                with open(
+                    config_path,
+                    encoding="utf-8",
+                ) as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    config_payload = loaded
+            except (OSError, json.JSONDecodeError):
+                config_payload = {}
+
+        run_config = config_payload.get("config") or {}
+        if isinstance(run_config, dict):
+            row["mode"] = run_config.get("mode")
+            row["top_k"] = run_config.get("top_k")
+            row["k1"] = run_config.get("k1")
+            row["k2"] = run_config.get("k2")
+
+        row["n_params"] = config_payload.get("n_params")
+
+        efficiency = config_payload.get("efficiency") or {}
+        if not isinstance(efficiency, dict):
+            efficiency = {}
+        row["latency_ms_per_forward"] = efficiency.get(
+            "latency_ms_per_forward"
+        )
+        row["flops_per_forward"] = efficiency.get(
+            "flops_per_forward"
+        )
+        row["peak_memory_mb"] = (
+            efficiency.get("training_peak_memory_mb")
+            if efficiency.get("training_peak_memory_mb")
+            is not None
+            else efficiency.get("process_peak_rss_mb")
+        )
+
+        records = read_metrics_records(
+            run_dir / "metrics.jsonl"
+        )
+        final_record = None
+        test_record = None
+        curve_record = None
+
+        for record in records:
+            step = record.get("step")
+            if step == "final":
+                final_record = record
+            elif step == "test":
+                test_record = record
+            elif step == "curve_analysis":
+                curve_record = record
+
+        row["val_loss"] = (
+            final_record.get("val_loss")
+            if final_record is not None
+            else None
+        )
+        row["val_ppl"] = (
+            final_record.get("val_ppl")
+            if final_record is not None
+            else None
+        )
+        row["test_loss"] = (
+            test_record.get("test_loss")
+            if test_record is not None
+            else None
+        )
+        row["curve_status"] = (
+            curve_record.get("status")
+            if curve_record is not None
+            else None
+        )
+        row["early_stopped"] = (
+            final_record.get("early_stopped")
+            if final_record is not None
+            else None
+        )
+
+        rows.append(row)
+
+    return rows
+
+
+def print_comparison(rows: List[Dict[str, object]]) -> None:
+    """以对齐表格打印多个运行的精度-效率权衡。"""
+    header = (
+        f"{'run':<20} {'mode':<9} {'params':>9} "
+        f"{'val_loss':>9} {'test_loss':>9} {'lat(ms)':>9} "
+        f"{'GFLOPs':>8} {'mem(MB)':>9} {'curve':<18}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    def _value(value, spec=".4f", scale=1.0):
+        if value is None:
+            return "-"
+        return format(float(value) * scale, spec)
+
+    for row in rows:
+        flops = row.get("flops_per_forward")
+        gflops = (
+            f"{float(flops) / 1e9:.3f}"
+            if flops is not None
+            else "-"
+        )
+        print(
+            f"{str(row.get('run'))[:19]:<20} "
+            f"{str(row.get('mode'))[:8]:<9} "
+            f"{str(row.get('n_params')):>9} "
+            f"{_value(row.get('val_loss')):>9} "
+            f"{_value(row.get('test_loss')):>9} "
+            f"{_value(row.get('latency_ms_per_forward'), '.4f'):>9} "
+            f"{gflops:>8} "
+            f"{_value(row.get('peak_memory_mb'), '.1f'):>9} "
+            f"{str(row.get('curve_status')):<18}"
+        )
+
+
+# ============================================================
 # Sanity overfit check
 # ============================================================
 
@@ -2354,6 +3958,26 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     }
 
 
+def _json_safe(value):
+    """
+    把记录中的非有限浮点值（NaN/Inf）递归转成 None。
+
+    json.dumps 默认会把 NaN/Inf 写成非标准 JSON 字面量
+    （NaN / Infinity），其他语言的解析器会拒绝；统一转成 null
+    以保留该字段但明确标记为「非有限」，避免污染整份日志。
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {
+            key: _json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def write_run_config(
     out_dir: Path,
     cfg: Config,
@@ -2392,17 +4016,84 @@ def write_run_config(
         "sanity_check": sanity_result,
     }
 
+    # resume 会重写 config.json；保留上次运行结束时补充的
+    # efficiency 测量结果，避免恢复训练后丢失效率口径。
+    config_path = out_dir / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                previous = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            previous = None
+        if isinstance(previous, dict) and "efficiency" in previous:
+            payload.setdefault(
+                "efficiency",
+                previous["efficiency"],
+            )
+
     with open(
-        out_dir / "config.json",
+        config_path,
         "w",
         encoding="utf-8",
     ) as f:
         json.dump(
-            payload,
+            _json_safe(payload),
             f,
             ensure_ascii=False,
             indent=2,
         )
+
+
+def update_run_config(out_dir: Path, key: str, value) -> None:
+    """
+    训练结束后把补充的分析结果（如 efficiency）并入 config.json。
+
+    读出已有 config.json、合并单个键后整体重写；config.json 的
+    主体在训练开始前已经写出，这里只追加事后测量结果。
+    """
+    path = out_dir / "config.json"
+    payload: Dict[str, object] = {}
+
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+
+    payload[key] = value
+
+    previous_mode = 0o644
+    if path.exists():
+        try:
+            previous_mode = path.stat().st_mode & 0o777
+        except OSError:
+            previous_mode = 0o644
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(out_dir),
+        prefix=".config.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(
+            _json_safe(payload),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+        temp_path = Path(handle.name)
+
+    os.replace(temp_path, path)
+
+    try:
+        os.chmod(path, previous_mode)
+    except OSError:
+        pass
 
 
 def write_jsonl_record(
@@ -2419,8 +4110,39 @@ def write_jsonl_record(
         encoding="utf-8",
     ) as f:
         f.write(
-            json.dumps(record, ensure_ascii=False) + "\n"
+            json.dumps(
+                _json_safe(record),
+                ensure_ascii=False,
+            )
+            + "\n"
         )
+
+
+def read_metrics_records(path: Path) -> List[Dict[str, object]]:
+    """
+    读取 metrics.jsonl 的全部记录；跳过损坏的行。
+
+    训练结束后的曲线诊断、坏案例报告与 --compare 汇总都基于
+    这份记录，保证分析与训练写盘使用同一份数据来源。
+    """
+    if not path.exists():
+        return []
+
+    records: List[Dict[str, object]] = []
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+
+    return records
 
 
 def test_record_exists(path: Path) -> bool:
@@ -3406,6 +5128,295 @@ def run_self_test():
     assert "torch_version" in metadata
     assert "deterministic_algorithms" in metadata
 
+    # ---- 结果分析工具自测 ----
+    # NaN/Inf 写盘前必须转成 null，保证 JSON 严格可解析。
+    assert json.dumps(
+        _json_safe({"a": float("nan"), "b": [float("inf"), 1.0]})
+    ) == '{"a": null, "b": [null, 1.0]}'
+
+    with tempfile.TemporaryDirectory() as safe_dir:
+        safe_path = Path(safe_dir) / "metrics.jsonl"
+        write_jsonl_record(
+            safe_path,
+            {"step": 1, "train_loss": float("nan")},
+        )
+        safe_records = read_metrics_records(safe_path)
+    assert safe_records[0]["train_loss"] is None
+
+    # 曲线诊断必须区分过拟合 / 欠拟合 / 未收敛 / 发散 / 健康。
+    baseline = math.log(256.0)
+
+    overfit_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.10},
+            {"step": 20, "train_loss": 4.0, "val_loss": 4.50},
+            {"step": 30, "train_loss": 3.0, "val_loss": 4.40},
+            {"step": 40, "train_loss": 2.0, "val_loss": 4.60},
+            {"step": 50, "train_loss": 1.5, "val_loss": 4.90},
+        ],
+        baseline_loss=baseline,
+    )
+    assert overfit_analysis["status"] == "overfitting", (
+        overfit_analysis
+    )
+    assert overfit_analysis["best_val_step"] == 30
+
+    underfit_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.50, "val_loss": 5.55},
+            {"step": 20, "train_loss": 5.49, "val_loss": 5.54},
+            {"step": 30, "train_loss": 5.48, "val_loss": 5.53},
+        ],
+        baseline_loss=baseline,
+    )
+    assert underfit_analysis["status"] == "underfitting", (
+        underfit_analysis
+    )
+
+    descending_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.2},
+            {"step": 20, "train_loss": 4.2, "val_loss": 4.4},
+            {"step": 30, "train_loss": 3.4, "val_loss": 3.6},
+        ],
+        baseline_loss=baseline,
+    )
+    assert descending_analysis["status"] == "not_converged", (
+        descending_analysis
+    )
+
+    healthy_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
+            {"step": 20, "train_loss": 4.0, "val_loss": 4.3},
+            {"step": 30, "train_loss": 3.18, "val_loss": 3.45},
+            {"step": 40, "train_loss": 3.15, "val_loss": 3.46},
+        ],
+        baseline_loss=baseline,
+    )
+    assert healthy_analysis["status"] == "healthy", (
+        healthy_analysis
+    )
+
+    diverged_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
+            {"step": 20, "train_loss": None, "val_loss": None},
+            {
+                "step": 30,
+                "train_loss": 4.9,
+                "grad_norm": None,
+            },
+        ],
+        baseline_loss=baseline,
+    )
+    assert diverged_analysis["status"] == "diverged", (
+        diverged_analysis
+    )
+    assert diverged_analysis["n_nonfinite_events"] == 2
+
+    # 早停状态恢复：最优值与连续未改善次数必须与历史一致。
+    (
+        early_best,
+        early_best_step,
+        early_no_improve,
+    ) = early_stop_state_from_records(
+        [
+            {"step": 10, "val_loss": 5.0},
+            {"step": 20, "val_loss": 4.0},
+            {"step": 30, "val_loss": 4.1},
+            {"step": 40, "val_loss": 4.05},
+        ],
+        min_delta=0.0,
+    )
+    assert early_best == 4.0
+    assert early_best_step == 20
+    assert early_no_improve == 2
+
+    # NaN/Inf 排查：越界数据必须被发现；非有限梯度必须被定位。
+    bad_data_check = _check_batch_integrity(
+        torch.tensor([[0, 300]], dtype=torch.int32),
+        torch.tensor([[1, 2]], dtype=torch.uint8),
+        256,
+    )
+    assert not bad_data_check["ok"]
+
+    # uint8 与 Python 整数比较会回绕（255 >= 256 误判为越界），
+    # 上限内的 uint8 token 必须判定为合法。
+    uint8_range_check = _check_batch_integrity(
+        torch.tensor([[0, 255]], dtype=torch.uint8),
+        torch.tensor([[0, 255]], dtype=torch.uint8),
+        256,
+    )
+    assert uint8_range_check["ok"], uint8_range_check
+
+    diag_cfg = Config(
+        **common,
+        mode="B",
+    )
+    diag_model = LanguageModel(diag_cfg)
+    diag_model.train()
+    diag_optimizer = torch.optim.AdamW(
+        diag_model.parameters(),
+        lr=1e-3,
+    )
+
+    with torch.enable_grad():
+        diag_result = diag_model(x, y)
+        diag_result["loss"].backward()
+
+    diag_param = next(diag_model.parameters())
+    assert diag_param.grad is not None
+    diag_param.grad.fill_(float("nan"))
+
+    diag_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        diag_result,
+        torch.tensor(float("nan")),
+        step=1,
+        lr=1e-3,
+        amp_dtype=None,
+        vocab_size=256,
+    )
+    assert diag_report["checks"]["data"]["ok"]
+    assert (
+        diag_report["checks"]["gradients"][
+            "n_nonfinite_grad_params"
+        ]
+        >= 1
+    )
+
+    # 坏案例分析：结构完整、类别合法，且只使用 val 固定窗口。
+    bad_case_model = LanguageModel(
+        Config(
+            **common,
+            mode="B",
+        )
+    ).eval()
+
+    bad_case_report = analyze_bad_cases(
+        bad_case_model,
+        eval_dataset,
+        batch_size=2,
+        batches=2,
+        device=eval_device,
+        amp_dtype=None,
+        split="val",
+        top_n=3,
+    )
+
+    valid_categories = {
+        "ambiguous",
+        "systematic_confusion",
+        "label_noise_suspect",
+        "uncertain",
+    }
+
+    assert bad_case_report["tokens_evaluated"] > 0
+    assert bad_case_report["split"] == "val"
+    assert bad_case_report["token_accuracy"] is not None
+    assert 0.0 <= float(
+        bad_case_report["token_accuracy"]
+    ) <= 1.0
+    assert len(bad_case_report["top_cases"]) == min(
+        3,
+        int(bad_case_report["tokens_evaluated"]),
+    )
+    for case in bad_case_report["top_cases"]:
+        assert case["category"] in valid_categories
+        assert case["context"]
+        assert 0.0 <= float(case["confidence"]) <= 1.0
+
+    assert set(
+        bad_case_report["category_counts"].keys()
+    ) <= valid_categories
+
+    # 效率测量：参数量与模型一致，延迟/FLOPs 为正（或明确不可用）。
+    efficiency_model = LanguageModel(
+        Config(
+            **common,
+            mode="B",
+        )
+    )
+    efficiency = measure_efficiency(
+        efficiency_model,
+        eval_dataset,
+        eval_device,
+        batch_size=2,
+        amp_dtype=None,
+        warmup=0,
+        iters=1,
+    )
+
+    assert efficiency["n_params_total"] == sum(
+        parameter.numel()
+        for parameter in efficiency_model.parameters()
+    )
+    assert (
+        efficiency["n_params_non_embedding"]
+        <= efficiency["n_params_total"]
+    )
+    assert efficiency["latency_ms_per_forward"] is not None
+    assert float(efficiency["latency_ms_per_forward"]) > 0.0
+    assert (
+        efficiency["flops_per_forward"] is None
+        or int(efficiency["flops_per_forward"]) > 0
+    )
+    # attention 的 FLOPs 由 Block 级 hook 估计；Block 被真实执行
+    # 时该值必须为正，否则说明 hook 挂错了对象（回归守卫）。
+    assert (
+        efficiency["flops_attention"] is None
+        or int(efficiency["flops_attention"]) > 0
+    )
+    assert efficiency["measurement"]["mode"] == "B"
+
+    # 运行对比：从 config.json / metrics.jsonl 读出精度与效率行。
+    with tempfile.TemporaryDirectory() as compare_dir:
+        for name, val_loss in (
+            ("run_a", 3.0),
+            ("run_b", 2.9),
+        ):
+            run_dir = Path(compare_dir) / name
+            run_dir.mkdir()
+            with open(
+                run_dir / "config.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    {
+                        "config": {"mode": "B"},
+                        "n_params": 100,
+                        "efficiency": {
+                            "latency_ms_per_forward": 1.5,
+                        },
+                    },
+                    f,
+                )
+            write_jsonl_record(
+                run_dir / "metrics.jsonl",
+                {
+                    "step": "final",
+                    "val_loss": val_loss,
+                    "val_ppl": 10.0,
+                },
+            )
+
+        comparison_rows = compare_runs([
+            str(Path(compare_dir) / "run_a"),
+            str(Path(compare_dir) / "run_b"),
+        ])
+
+    assert len(comparison_rows) == 2
+    assert comparison_rows[0]["val_loss"] == 3.0
+    assert comparison_rows[1]["mode"] == "B"
+    assert comparison_rows[0][
+        "latency_ms_per_forward"
+    ] == 1.5
+
     print("self-test passed")
 
 
@@ -3456,14 +5467,24 @@ def main():
         description="SMELT-ISR 训练入口",
     )
 
-    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument(
+        "--data",
+        type=str,
+        default=None,
+        help="训练语料文件（--compare 模式可省略）",
+    )
     parser.add_argument(
         "--mode",
         type=str,
         default="B",
         choices=["smelt", "local_base", "A", "B"],
     )
-    parser.add_argument("--out", type=str, required=True)
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="输出目录（--compare 模式可省略）",
+    )
     parser.add_argument("--resume", type=str, default=None)
 
     parser.add_argument(
@@ -3526,6 +5547,54 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--save-interval", type=int, default=500)
+
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help=(
+            "按验证损失早停：连续 N 次周期验证无改善后提前结束"
+            "训练（0=关闭）；早停状态跨 --resume 从 metrics.jsonl"
+            "恢复"
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help=(
+            "早停判定的最小改善幅度：验证损失需下降超过该值"
+            "才算改善（默认 0，即任何下降都算）"
+        ),
+    )
+    parser.add_argument(
+        "--bad-cases",
+        type=int,
+        default=10,
+        help=(
+            "训练结束后在验证集上输出损失最高的 N 个坏案例"
+            "（0=关闭）；--evaluate-test 时同一次解封中"
+            "也输出测试集坏案例"
+        ),
+    )
+    parser.add_argument(
+        "--skip-efficiency",
+        action="store_true",
+        help=(
+            "跳过训练结束后的效率测量"
+            "（参数量/FLOPs/延迟/显存）"
+        ),
+    )
+    parser.add_argument(
+        "--compare",
+        nargs="+",
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "不训练，直接对比多个运行目录的精度与效率指标"
+            "后退出"
+        ),
+    )
 
     parser.add_argument(
         "--skip-sanity-check",
@@ -3632,6 +5701,27 @@ def main():
             "--val-fraction + --test-fraction 必须小于 1"
             "（训练集不能为空）"
         )
+    if args.early_stop_patience < 0:
+        parser.error("--early-stop-patience 不能为负")
+    if (
+        not math.isfinite(args.early_stop_min_delta)
+        or args.early_stop_min_delta < 0
+    ):
+        parser.error(
+            "--early-stop-min-delta 必须是有限非负数"
+        )
+    if args.bad_cases < 0:
+        parser.error("--bad-cases 不能为负")
+
+    # --compare 模式只读运行目录，不需要 --data / --out。
+    if args.compare is not None:
+        print_comparison(compare_runs(args.compare))
+        return
+
+    if args.data is None:
+        parser.error("--data 必填（除非使用 --compare）")
+    if args.out is None:
+        parser.error("--out 必填（除非使用 --compare）")
 
     device = torch.device(args.device)
 
@@ -4259,6 +6349,34 @@ def main():
 
     metrics_path = out_dir / "metrics.jsonl"
 
+    # 早停状态：resume 时从原运行的 metrics.jsonl 恢复「最优验证
+    # 损失 / 最优步 / 连续未改善次数」，保证早停判定跨恢复一致；
+    # 全新训练不读旧文件（文件会被截断重写）。
+    best_val_loss: Optional[float] = None
+    best_val_step: Optional[int] = None
+    evals_without_improvement = 0
+
+    if (
+        args.early_stop_patience > 0
+        and args.resume is not None
+    ):
+        (
+            best_val_loss,
+            best_val_step,
+            evals_without_improvement,
+        ) = early_stop_state_from_records(
+            read_metrics_records(metrics_path),
+            args.early_stop_min_delta,
+        )
+
+    early_stopped = False
+    nonfinite_events = 0
+    consecutive_nonfinite = 0
+    numerical_stop = False
+    numerical_polluted = False
+    nan_diagnosis: Optional[Dict[str, object]] = None
+    nan_record_pending = False
+
     # metrics_file 在整个训练期间持续打开。
     # resume 时追加到原日志末尾；全新训练截断重写。
     metrics_file = open(
@@ -4271,7 +6389,7 @@ def main():
         # sanity check 结果也进入训练曲线文件，便于统一追溯。
         metrics_file.write(
             json.dumps(
-                sanity_record,
+                _json_safe(sanity_record),
                 ensure_ascii=False,
             )
             + "\n"
@@ -4326,7 +6444,7 @@ def main():
                 record.update(extra)
             metrics_file.write(
                 json.dumps(
-                    record,
+                    _json_safe(record),
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -4342,6 +6460,10 @@ def main():
         return records
 
     last_saved_step: Optional[int] = None
+
+    # 真正完成（前向+反向+更新判定）的最后一步；早停提前退出
+    # 时用它作为存档与最终评估的步数。
+    last_completed_step = start_step
 
     # 最近一次周期性验证的步数与结果。
     last_eval_step: Optional[int] = None
@@ -4409,14 +6531,54 @@ def main():
                 args.grad_clip,
             )
 
-            if grad_norm.isfinite():
+            # 损失与梯度范数都必须有限才推进优化器：任一非有限
+            # 都意味着这一步的参数更新不可信。两个判定合并成
+            # 一次设备同步，不增加每步的同步次数。
+            finite_step = bool(
+                torch.isfinite(grad_norm)
+                & torch.isfinite(loss)
+            )
+
+            if finite_step:
                 scaler.step(optimizer)
                 scheduler.step()
+                consecutive_nonfinite = 0
             else:
+                nonfinite_events += 1
+                consecutive_nonfinite += 1
                 print(
-                    f"step {step + 1}: non-finite gradient; "
+                    f"step {step + 1}: non-finite loss/gradient; "
                     "optimizer and LR schedule skipped"
                 )
+                if nan_diagnosis is None:
+                    nan_diagnosis = diagnose_non_finite(
+                        model,
+                        optimizer,
+                        x,
+                        y,
+                        result,
+                        grad_norm,
+                        step=step + 1,
+                        lr=current_lr,
+                        amp_dtype=amp_dtype,
+                        scaler=scaler,
+                        vocab_size=cfg.vocab_size,
+                    )
+                    print_non_finite_report(nan_diagnosis)
+                    nan_record_pending = True
+                    nan_checks = nan_diagnosis.get("checks", {})
+                    if (
+                        nan_checks.get("parameters_nonfinite")
+                        or nan_checks.get(
+                            "optimizer_state_nonfinite_keys"
+                        )
+                    ):
+                        # 参数/优化器状态已被污染，继续训练毫无
+                        # 意义（每次更新都被跳过）。
+                        numerical_polluted = True
+                        numerical_stop = True
+                if consecutive_nonfinite >= 3:
+                    numerical_stop = True
             scaler.update()
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -4425,14 +6587,52 @@ def main():
             )
 
             # 发散步不推进优化器或 LR schedule。
-            if grad_norm.isfinite():
+            finite_step = bool(
+                torch.isfinite(grad_norm)
+                & torch.isfinite(loss)
+            )
+
+            if finite_step:
                 optimizer.step()
                 scheduler.step()
+                consecutive_nonfinite = 0
             else:
+                nonfinite_events += 1
+                consecutive_nonfinite += 1
                 print(
-                    f"step {step + 1}: non-finite gradient; "
+                    f"step {step + 1}: non-finite loss/gradient; "
                     "optimizer and LR schedule skipped"
                 )
+                if nan_diagnosis is None:
+                    nan_diagnosis = diagnose_non_finite(
+                        model,
+                        optimizer,
+                        x,
+                        y,
+                        result,
+                        grad_norm,
+                        step=step + 1,
+                        lr=current_lr,
+                        amp_dtype=amp_dtype,
+                        scaler=scaler,
+                        vocab_size=cfg.vocab_size,
+                    )
+                    print_non_finite_report(nan_diagnosis)
+                    nan_record_pending = True
+                    nan_checks = nan_diagnosis.get("checks", {})
+                    if (
+                        nan_checks.get("parameters_nonfinite")
+                        or nan_checks.get(
+                            "optimizer_state_nonfinite_keys"
+                        )
+                    ):
+                        numerical_polluted = True
+                        numerical_stop = True
+                if consecutive_nonfinite >= 3:
+                    numerical_stop = True
+
+        # 本步已完成（无论是否推进了优化器）。
+        last_completed_step = step + 1
 
         # detach 后只保留标量值；三者均为 fp32，无需额外转换。
         pending_scalars.append(
@@ -4452,6 +6652,34 @@ def main():
             "lr": current_lr,
         })
 
+        # 首次非有限事件的排查报告附着到触发它的那一步，
+        # 保持 metrics.jsonl 的 step 顺序与证据链完整。
+        if nan_record_pending:
+            pending_records[-1]["extra"] = {
+                "nan_diagnosis": nan_diagnosis,
+            }
+            nan_record_pending = False
+
+        # 参数/优化器状态已被污染或连续非有限达到阈值时停止：
+        # 后续更新全部会被跳过，继续训练只会浪费算力。
+        if numerical_stop:
+            consecutive_text = (
+                "参数/优化器状态已被 NaN/Inf 污染"
+                if numerical_polluted
+                else "连续多次出现非有限损失/梯度"
+            )
+            print(
+                f"[nan] {consecutive_text}，在第 {step + 1} 步"
+                "停止训练；请按排查路径处理后从污染前的检查点"
+                "恢复（降低学习率、收紧 --grad-clip）。"
+                + (
+                    "本次不会用受污染的参数覆盖 last.pt。"
+                    if numerical_polluted
+                    else ""
+                )
+            )
+            break
+
         if (step + 1) % args.eval_interval == 0:
             eval_metrics = evaluate(
                 model,
@@ -4461,7 +6689,11 @@ def main():
                 device,
                 amp_dtype=amp_dtype,
             )
-            pending_records[-1]["extra"] = eval_metrics
+            # 同一步已有 nan_diagnosis 时合并而不是覆盖。
+            pending_records[-1].setdefault(
+                "extra",
+                {},
+            ).update(eval_metrics)
 
             last_eval_step = step + 1
             last_eval_metrics = eval_metrics
@@ -4470,6 +6702,44 @@ def main():
             print(records[-1])
             metrics_file.flush()
             model.train()
+
+            # 早停：验证损失连续无改善达到 patience 时提前结束。
+            # NaN/Inf 验证损失不计入「未改善」，避免故障顺带触发
+            # 早停而掩盖问题。
+            if args.early_stop_patience > 0:
+                val_loss = eval_metrics.get("val_loss")
+
+                if val_loss is None or not math.isfinite(
+                    float(val_loss)
+                ):
+                    pass
+                elif (
+                    best_val_loss is None
+                    or float(val_loss)
+                    < best_val_loss
+                    - args.early_stop_min_delta
+                ):
+                    best_val_loss = float(val_loss)
+                    best_val_step = step + 1
+                    evals_without_improvement = 0
+                else:
+                    evals_without_improvement += 1
+
+                if (
+                    evals_without_improvement
+                    >= args.early_stop_patience
+                ):
+                    early_stopped = True
+                    print(
+                        "[early-stop] 验证损失连续 "
+                        f"{evals_without_improvement} 次未改善"
+                        "（最优 "
+                        f"{best_val_loss:.4f} @ step "
+                        f"{best_val_step}），"
+                        f"在第 {step + 1} 步提前结束训练；"
+                        "如需继续训练可调大 --steps 后 resume。"
+                    )
+                    break
 
         if (step + 1) % args.save_interval == 0:
             # 存档不一定位于 eval 点上，先落盘保证顺序。
@@ -4490,11 +6760,12 @@ def main():
     # 先把暂存的逐步记录落盘，保持文件内 step 顺序。
     flush_records()
 
-    # 结尾存档的 step 取优化器真实前进到的步数；
-    # 循环未执行时（start_step >= args.steps）也取 start_step。
-    end_step = max(start_step, args.steps)
+    # 结尾存档的 step 取优化器真实前进到的步数：正常结束时等于
+    # args.steps，早停时等于提前结束的步数；循环未执行时
+    # （start_step >= args.steps）取 start_step。
+    end_step = last_completed_step
 
-    if last_saved_step != end_step:
+    if last_saved_step != end_step and not numerical_polluted:
         save_checkpoint(
             str(out_dir / "last.pt"),
             model,
@@ -4530,10 +6801,16 @@ def main():
     final_record = {
         "step": "final",
         **final_metrics,
+        "early_stopped": early_stopped,
+        "best_val_loss": best_val_loss,
+        "best_val_step": best_val_step,
+        "nonfinite_events": nonfinite_events,
+        "numerical_stop": numerical_stop,
+        "numerical_polluted": numerical_polluted,
     }
     metrics_file.write(
         json.dumps(
-            final_record,
+            _json_safe(final_record),
             ensure_ascii=False,
         )
         + "\n"
@@ -4542,10 +6819,103 @@ def main():
 
     print(
         json.dumps(
-            {"final": final_metrics},
+            _json_safe({"final": final_metrics}),
             ensure_ascii=False,
         )
     )
+
+    # --------------------------------------------------------
+    # 结果分析 1：训练曲线诊断（不能只看最终单个数值）。
+    # --------------------------------------------------------
+    curve_analysis = analyze_training_curve(
+        read_metrics_records(metrics_path),
+        baseline_loss=math.log(cfg.vocab_size),
+    )
+    metrics_file.write(
+        json.dumps(
+            _json_safe({
+                "step": "curve_analysis",
+                **curve_analysis,
+            }),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    metrics_file.flush()
+    print_curve_analysis(curve_analysis)
+
+    # --------------------------------------------------------
+    # 结果分析 2：坏案例分析（验证集，测试集保持尘封）。
+    # 错误的样本往往是新改进思路的最重要来源。
+    # --------------------------------------------------------
+    bad_cases_path = out_dir / "bad_cases.json"
+    bad_case_payload: Dict[str, object] = {}
+
+    if args.bad_cases > 0:
+        bad_case_report = analyze_bad_cases(
+            model,
+            dataset,
+            args.batch_size,
+            args.eval_batches,
+            device,
+            amp_dtype=amp_dtype,
+            split="val",
+            top_n=args.bad_cases,
+        )
+        print_bad_cases(bad_case_report)
+
+        bad_case_payload["val"] = bad_case_report
+        metrics_file.write(
+            json.dumps(
+                _json_safe({
+                    "step": "bad_cases",
+                    "split": "val",
+                    "tokens_evaluated": bad_case_report[
+                        "tokens_evaluated"
+                    ],
+                    "token_accuracy": bad_case_report[
+                        "token_accuracy"
+                    ],
+                    "category_counts": bad_case_report[
+                        "category_counts"
+                    ],
+                    "top_confusions": bad_case_report[
+                        "top_confusions"
+                    ],
+                    "top_cases": bad_case_report["top_cases"],
+                    "summary": bad_case_report["summary"],
+                }),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
+
+    # --------------------------------------------------------
+    # 结果分析 3：效率测量（参数量/计算量/延迟/显存）。
+    # 评价改进不能只看指标涨点，需要与付出的资源一起报告。
+    # --------------------------------------------------------
+    if not args.skip_efficiency:
+        efficiency = measure_efficiency(
+            model,
+            dataset,
+            device,
+            args.batch_size,
+            amp_dtype=amp_dtype,
+        )
+        update_run_config(out_dir, "efficiency", efficiency)
+        metrics_file.write(
+            json.dumps(
+                _json_safe({
+                    "step": "efficiency",
+                    **efficiency,
+                }),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
+        print_efficiency(efficiency)
 
     # 最终评估口径：上面的 final 记录始终是验证集口径。
     # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
@@ -4578,6 +6948,48 @@ def main():
                 split="test",
             )
 
+            # 坏案例分析随唯一一次解封一起做（val 分析照常）。
+            if args.bad_cases > 0:
+                test_bad_cases = analyze_bad_cases(
+                    model,
+                    dataset,
+                    args.batch_size,
+                    args.eval_batches,
+                    device,
+                    amp_dtype=amp_dtype,
+                    split="test",
+                    top_n=args.bad_cases,
+                )
+                print_bad_cases(test_bad_cases)
+                bad_case_payload["test"] = test_bad_cases
+                metrics_file.write(
+                    json.dumps(
+                        _json_safe({
+                            "step": "bad_cases",
+                            "split": "test",
+                            "tokens_evaluated": test_bad_cases[
+                                "tokens_evaluated"
+                            ],
+                            "token_accuracy": test_bad_cases[
+                                "token_accuracy"
+                            ],
+                            "category_counts": test_bad_cases[
+                                "category_counts"
+                            ],
+                            "top_confusions": test_bad_cases[
+                                "top_confusions"
+                            ],
+                            "top_cases": test_bad_cases[
+                                "top_cases"
+                            ],
+                            "summary": test_bad_cases["summary"],
+                        }),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                metrics_file.flush()
+
             test_record = {
                 "step": "test",
                 **test_metrics,
@@ -4585,7 +6997,7 @@ def main():
             }
             metrics_file.write(
                 json.dumps(
-                    test_record,
+                    _json_safe(test_record),
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -4594,7 +7006,7 @@ def main():
 
             print(
                 json.dumps(
-                    {"test": test_metrics},
+                    _json_safe({"test": test_metrics}),
                     ensure_ascii=False,
                 )
             )
@@ -4602,6 +7014,19 @@ def main():
                 "[test] 测试集已解封并完成唯一一次评估；"
                 "请不要根据该结果继续调参，否则测试集将退化为"
                 "隐式验证集。"
+            )
+
+    if bad_case_payload:
+        with open(
+            bad_cases_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                _json_safe(bad_case_payload),
+                f,
+                ensure_ascii=False,
+                indent=2,
             )
 
     metrics_file.close()
