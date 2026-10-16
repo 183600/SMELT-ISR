@@ -427,9 +427,12 @@ class SparseMoE(nn.Module):
 
         soft_load = router_probs.mean(dim=0)
 
-        aux_loss = self.n_experts * (
-            hard_load * soft_load
-        ).sum()
+        # 逐专家 f_i * P_i 之和用一维点积完成，省去乘积
+        # 中间张量。
+        aux_loss = self.n_experts * torch.dot(
+            hard_load,
+            soft_load,
+        )
 
         return (
             flat,
@@ -524,13 +527,11 @@ class SparseMoE(nn.Module):
 
         self._issue_counts_readback(counts)
 
-        # 按 expert id 做稳定排序：
-        # 每个专家的输入在排序后连续，按段切片分发；
-        # 稳定排序保持同一专家内 token 顺序不变。
-        perm = torch.argsort(
-            assignment_experts,
-            stable=True,
-        )
+        # 按 expert id 排序：每个专家的输入在排序后连续，
+        # 按段切片分发。同一专家内部的行序不影响结果
+        #（专家按行独立计算，散射下标互不重复），因此无需
+        # 稳定排序；torch.sort 在相同输入上是确定性的。
+        _, perm = torch.sort(assignment_experts)
 
         # 展平后的 assignment 下标 j 对应 token j // top_k；
         # top_k == 1 时排序下标本身就是 token 下标。
@@ -2248,6 +2249,14 @@ def build_lr_schedule(
 
 
 def main():
+    # 分配器配置必须在任何 CUDA 初始化之前生效；构造 parser 时
+    # 解析 --device 默认值就会调用 torch.cuda.is_available()，
+    # 因此放在最前。expandable_segments 降低碎片、压低峰值显存。
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True",
+    )
+
     parser = argparse.ArgumentParser(
         description="SMELT-ISR 训练入口",
     )
@@ -2327,12 +2336,6 @@ def main():
     device = torch.device(args.device)
 
     if device.type == "cuda":
-        # 需在首次 CUDA 分配之前设置。
-        os.environ.setdefault(
-            "PYTORCH_CUDA_ALLOC_CONF",
-            "expandable_segments:True",
-        )
-
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
