@@ -205,7 +205,7 @@ class _SwiGLU(torch.autograd.Function):
             return F.silu(gate).mul_(up)
 
         # 无需反向时 h 只是临时张量，SiLU 直接原地写入
-        # gate（h 的前半区），省去一份中间激活。
+        # gate（h 的前半区）。
         return F.silu(gate, inplace=True).mul_(up)
 
     @staticmethod
@@ -457,9 +457,7 @@ class SparseMoE(nn.Module):
             self._counts_event = torch.cuda.Event()
             self._counts_stream = torch.cuda.Stream(device=counts.device)
 
-        # D2H 拷贝只依赖 bincount 的结果。放到专用 stream 上，
-        # 与 compute stream 上随后的 argsort/gather 并行执行，
-        # 避免 64B 拷贝占用 compute stream 的执行间隙。
+        # D2H 拷贝只依赖 bincount 的结果，放到专用 stream 上执行。
         self._counts_stream.wait_stream(
             torch.cuda.current_stream(counts.device)
         )
@@ -467,8 +465,7 @@ class SparseMoE(nn.Module):
             self._counts_stage.copy_(counts, non_blocking=True)
             self._counts_event.record()
 
-        # 源张量分配于 compute stream，可能在拷贝完成前被缓存
-        # 分配器回收复用，需声明与拷贝 stream 的关联。
+        # 声明源张量与拷贝 stream 的关联。
         counts.record_stream(self._counts_stream)
 
     def _read_counts(self, counts: torch.Tensor) -> list:
@@ -655,9 +652,7 @@ class SparseMoE(nn.Module):
             if residual is not None:
                 flat_residual = residual.reshape(-1, dim)
 
-                # 缩放系数为 1 且 dtype 一致时，merged 缓冲在本次
-                # 调用后不再被其它节点引用，可直接原地累加残差；
-                # a + b 与 b + a 逐位相同。
+                # 缩放系数为 1 且 dtype 一致时直接原地累加残差。
                 if (
                     residual_scale == 1.0
                     and output.dtype == flat_residual.dtype
@@ -689,9 +684,9 @@ class SparseMoE(nn.Module):
         merged = merged.reshape(out_shape)
 
         if residual is not None:
-            # 同上：缩放系数为 1 且 dtype 一致时原地累加，
-            # 省去一份 […, dim] 激活；否则用 add(alpha=) 完成
-            # 「缩放 + 残差相加」，dtype 不匹配时由类型提升合并。
+            # 同上：缩放系数为 1 且 dtype 一致时原地累加；
+            # 否则用 add(alpha=) 完成「缩放 + 残差相加」，
+            # dtype 不匹配时由类型提升合并。
             if (
                 residual_scale == 1.0
                 and merged.dtype == residual.dtype
