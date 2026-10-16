@@ -52,6 +52,10 @@ class Config:
             raise ValueError("vocab_size 必须为正整数")
         if self.seq_len <= 0:
             raise ValueError("seq_len 必须为正整数")
+        if self.d_model <= 0:
+            raise ValueError("d_model 必须为正整数")
+        if self.expert_hidden <= 0:
+            raise ValueError("expert_hidden 必须为正整数")
         if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
             raise ValueError("d_model 必须能被正的 n_heads 整除")
         if self.n_layers < 4 or self.n_layers % 4 != 0:
@@ -2662,6 +2666,25 @@ def main():
                 "(验证窗口集合由 batch_size*eval_batches 决定)"
             )
             args.eval_batches = saved_eval_batches
+
+        # eval_interval 决定周期验证落在哪些训练步上，是验证
+        # 协议的一部分；resume 时按存档恢复，保证恢复训练写出的
+        # metrics.jsonl 与原始运行逐位对齐。
+        saved_eval_interval = rng_payload.get(
+            "args",
+            {},
+        ).get("eval_interval")
+
+        if (
+            saved_eval_interval is not None
+            and saved_eval_interval != args.eval_interval
+        ):
+            print(
+                "resume restored eval_interval "
+                f"{args.eval_interval} -> {saved_eval_interval} "
+                "(周期验证步点是验证协议的一部分)"
+            )
+            args.eval_interval = saved_eval_interval
 
     scheduler = build_lr_schedule(
         optimizer,
