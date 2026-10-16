@@ -1402,10 +1402,20 @@ class ByteDataset:
     """
     字节级语言模型数据集。
 
-    这是一个可复现的最小数据管线：
-    - token id 范围固定为 0..255；
-    - 训练/验证按原始字节流切分；
-    - 验证窗口固定，避免不同实验之间采样噪声过大。
+    数据协议（防止数据泄露）：
+    - 先划分、后处理：按原始字节流的时间先后顺序切成
+      train / val / test 三段，三个 split 在原语料中前后相邻、
+      互不重叠，切分全程不随机打乱（时序数据用过去训练、用未来
+      验证和测试）；训练阶段的批级 shuffle 由随机采样窗口起点
+      承担，不改变 split 边界；
+    - 训练期间 test 保持尘封：训练循环只访问 train，周期性验证
+      只访问 val，test 仅在最终评估（--evaluate-test）时访问一次；
+    - 本管线不做任何依赖全局统计量的预处理（标准化、归一化、
+      缺失值填充等）；若后续扩展为连续值特征，必须只在 train 上
+      fit，再 transform val/test，禁止在划分前用全量数据统计。
+
+    token id 范围固定为 0..255；验证/测试窗口固定，避免不同实验
+    之间采样噪声过大。
     """
 
     def __init__(
@@ -1413,9 +1423,22 @@ class ByteDataset:
         filename: str,
         seq_len: int,
         val_fraction: float = 0.05,
+        test_fraction: float = 0.05,
         device: Optional[torch.device] = None,
     ):
         data_path = Path(filename)
+
+        if not 0.0 <= val_fraction < 1.0:
+            raise ValueError("val_fraction 必须落在 [0, 1)")
+
+        if not 0.0 <= test_fraction < 1.0:
+            raise ValueError("test_fraction 必须落在 [0, 1)")
+
+        if val_fraction + test_fraction >= 1.0:
+            raise ValueError(
+                "val_fraction + test_fraction 必须小于 1"
+                "（训练集不能为空）"
+            )
 
         # 文件在读取期间被截断时按实际读入长度处理。
         buf = bytearray(data_path.stat().st_size)
@@ -1434,17 +1457,32 @@ class ByteDataset:
         self.data_sha256 = hashlib.sha256(buf).hexdigest()
         self.num_bytes = len(buf)
         self.val_fraction = val_fraction
+        self.test_fraction = test_fraction
 
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
+        # 数据审计（重复窗口扫描）直接读取原始字节；
+        # memoryview 零拷贝共享同一块缓冲区。
+        self._raw = memoryview(buf)
+
         _ = device
 
-        split = int(
-            len(tokens) * (1.0 - val_fraction)
-        )
+        # 仅做时间顺序上的连续切分，不计算统计量、不打乱：
+        # [0, n_train) 训练，[n_train, n_train + n_val) 验证，
+        # 其余为测试。
+        n_val = int(len(tokens) * val_fraction)
+        n_test = int(len(tokens) * test_fraction)
+        n_train = len(tokens) - n_val - n_test
 
-        self.train = tokens[:split]
-        self.val = tokens[split:]
+        self.split_bounds = {
+            "train": (0, n_train),
+            "val": (n_train, n_train + n_val),
+            "test": (n_train + n_val, len(tokens)),
+        }
+
+        self.train = tokens[:n_train]
+        self.val = tokens[n_train:n_train + n_val]
+        self.test = tokens[n_train + n_val:]
         self.seq_len = seq_len
 
         # 窗口暂存槽按调用方的 device 决定是否启用。
@@ -1452,30 +1490,54 @@ class ByteDataset:
         self._stage_index = 0
 
         # 每个 split 至少需要一个完整窗口，否则采样/验证
-        # 没有合法起点（fixed_val_batch 依赖 num_starts >= 1，
-        # evaluate 依赖至少一个验证 token 作分母）。
+        # 没有合法起点（fixed_eval_batch 依赖 num_starts >= 1，
+        # evaluate 依赖至少一个评估 token 作分母）。
         if len(self.train) < seq_len + 1:
             raise ValueError(
-                "训练集长度不足"
+                "训练集长度不足（检查 val/test fraction 或语料大小）"
             )
 
         if len(self.val) < seq_len + 1:
             raise ValueError(
-                "验证集长度不足"
+                "验证集长度不足（检查 val_fraction 或语料大小）"
+            )
+
+        if test_fraction > 0.0 and len(self.test) < seq_len + 1:
+            raise ValueError(
+                "测试集长度不足（检查 test_fraction 或语料大小）"
             )
 
         # unfold 产生 [num_windows, seq_len + 1] 的滑动窗口
         # 视图（stride 为 1），采样时按起点 index_select。
-        self._train_windows = self.train.unfold(
-            0,
-            seq_len + 1,
-            1,
-        )
-        self._val_windows = self.val.unfold(
-            0,
-            seq_len + 1,
-            1,
-        )
+        # 窗口只在各自 split 内部滑动，不跨越 split 边界。
+        self._windows = {
+            "train": self.train.unfold(
+                0,
+                seq_len + 1,
+                1,
+            ),
+            "val": self.val.unfold(
+                0,
+                seq_len + 1,
+                1,
+            ),
+        }
+        if len(self.test) >= seq_len + 1:
+            self._windows["test"] = self.test.unfold(
+                0,
+                seq_len + 1,
+                1,
+            )
+
+        # 固定评估起点缓存按 split 分开保存。
+        self._fixed_starts: Dict[str, Dict[str, object]] = {}
+
+    @property
+    def has_test(self) -> bool:
+        """
+        是否存在可用的测试 split（test_fraction > 0 且长度足够）。
+        """
+        return "test" in self._windows
 
     def _gather_windows(
         self,
@@ -1546,11 +1608,18 @@ class ByteDataset:
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if split == "train":
-            windows = self._train_windows
+            windows = self._windows["train"]
             data = self.train
         elif split == "val":
-            windows = self._val_windows
+            windows = self._windows["val"]
             data = self.val
+        elif split == "test":
+            # 训练期间的随机批次绝不能碰测试集，
+            # 否则测试集会在无感知的情况下被反复消费。
+            raise ValueError(
+                "测试集在最终评估前必须尘封，"
+                "不能通过 batch() 访问"
+            )
         else:
             raise ValueError(f"未知 split: {split}")
 
@@ -1577,44 +1646,74 @@ class ByteDataset:
 
         return x, y
 
-    def fixed_val_batch(
+    def _eval_windows(
         self,
+        split: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        取出指定评估 split 的窗口视图与底层 token 张量。
+
+        batch() 只允许 train/val；test 只能经此处的固定窗口评估
+        访问。
+        """
+        if split not in ("val", "test"):
+            raise ValueError(f"未知评估 split: {split}")
+
+        if split == "test" and not self.has_test:
+            raise ValueError(
+                "测试集不可用（test_fraction 为 0 或语料不足）"
+            )
+
+        windows = self._windows[split]
+        data = self.val if split == "val" else self.test
+        return windows, data
+
+    def fixed_eval_batch(
+        self,
+        split: str,
         batch_index: int,
         batches: int,
         batch_size: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        返回跨验证集均匀分布的固定窗口。
+        返回跨指定评估 split（val/test）均匀分布的固定窗口。
 
-        不用随机数，因此验证估计不随运行进程、CUDA 状态或
+        不用随机数，因此评估估计不随运行进程、CUDA 状态或
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合
         完全相同。请求窗口多于合法起点时仅取一遍无重复起点。
         """
-        # 合法起点共 len(val) - seq_len 个。
-        num_starts = len(self.val) - self.seq_len
+        windows, data = self._eval_windows(split)
+
+        # 合法起点共 len(data) - seq_len 个。
+        num_starts = len(data) - self.seq_len
         total_batches = min(
             batches * batch_size,
             num_starts,
         )
 
-        if getattr(self, "_starts_total", None) != total_batches:
-            # 均匀覆盖整个验证流。total_batches <= num_starts，
+        cache = self._fixed_starts.setdefault(
+            split,
+            {"total": None, "starts": None},
+        )
+
+        if cache["total"] != total_batches:
+            # 均匀覆盖整个评估流。total_batches <= num_starts，
             # linspace 的间距不小于 1，round 后不会重复。
-            self._starts = torch.linspace(
+            cache["starts"] = torch.linspace(
                 0,
                 num_starts - 1,
                 steps=total_batches,
                 dtype=torch.float64,
             ).round().long()
-            self._starts_total = total_batches
+            cache["total"] = total_batches
 
         begin = batch_index * batch_size
-        # _starts 为 CPU 张量，窗口收集与搬运与训练批一致。
-        starts = self._starts[begin:begin + batch_size]
+        # starts 为 CPU 张量，窗口收集与搬运与训练批一致。
+        starts = cache["starts"][begin:begin + batch_size]
 
         chunks = self._gather_windows(
-            self._val_windows,
+            windows,
             starts,
             device,
         )
@@ -1623,6 +1722,299 @@ class ByteDataset:
         y = chunks[:, 1:]
 
         return x, y
+
+    def fixed_val_batch(
+        self,
+        batch_index: int,
+        batches: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """fixed_eval_batch("val", ...) 的兼容包装。"""
+        return self.fixed_eval_batch(
+            "val",
+            batch_index,
+            batches,
+            batch_size,
+            device,
+        )
+
+
+# ============================================================
+# Data audit (leakage / distribution checks)
+# ============================================================
+
+# 重复窗口扫描的采样上限：窗口数超过该值时按等间距抽样，
+# 保证审计开销与语料大小无关。
+_AUDIT_MAX_WINDOWS = 100000
+
+# train/val(/test) 字节分布 JS 距离超过该值时报分布偏移警告。
+_AUDIT_SHIFT_WARN = 0.1
+
+# 单个字节占比超过该阈值时疑似填充/退化数据（异常值检查）。
+_AUDIT_TOP_BYTE_WARN = 0.5
+
+
+def _js_distance(
+    p: torch.Tensor,
+    q: torch.Tensor,
+) -> float:
+    """
+    两个离散分布之间的 Jensen-Shannon 距离
+    （JS 散度开方，取值 [0, 1]；0 表示分布相同）。
+    """
+    m = 0.5 * (p + q)
+
+    def _kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        mask = a > 0
+        return (a[mask] * (a[mask] / b[mask]).log()).sum()
+
+    js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+    return math.sqrt(max(0.0, float(js)))
+
+
+def _window_signature_scan(
+    raw: memoryview,
+    offset: int,
+    length: int,
+    window_len: int,
+    budget: int = _AUDIT_MAX_WINDOWS,
+) -> Dict[str, object]:
+    """
+    对 [offset, offset + length) 内的滑动窗口做有界签名扫描。
+
+    对每个采样窗口取 blake2b-128 摘要，用于发现跨 split 的重复
+    内容（数据泄露的常见来源）与 split 内部重复。窗口数超过
+    budget 时等间距抽样，返回实际采样规模，避免大语料上开销
+    不可控。该扫描只做数据审计，不参与特征计算或模型决策。
+    """
+    total = length - window_len + 1
+
+    if total <= 0:
+        return {
+            "sampled": 0,
+            "total": 0,
+            "stride": 1,
+            "within_duplicates": 0,
+            "signatures": {},
+        }
+
+    stride = max(1, math.ceil(total / budget))
+
+    signatures: Dict[bytes, List[int]] = {}
+    within_duplicates = 0
+    sampled = 0
+
+    for start in range(0, total, stride):
+        digest = hashlib.blake2b(
+            raw[
+                offset + start:
+                offset + start + window_len
+            ],
+            digest_size=16,
+        ).digest()
+        sampled += 1
+
+        bucket = signatures.get(digest)
+        if bucket is None:
+            signatures[digest] = [start]
+        else:
+            within_duplicates += 1
+            if len(bucket) < 4:
+                bucket.append(start)
+
+    return {
+        "sampled": sampled,
+        "total": total,
+        "stride": stride,
+        "within_duplicates": within_duplicates,
+        "signatures": signatures,
+    }
+
+
+def audit_data_splits(
+    dataset: ByteDataset,
+    include_test: bool = False,
+    max_windows: int = _AUDIT_MAX_WINDOWS,
+) -> Dict[str, object]:
+    """
+    数据审计：值域校验、分布偏移与重复窗口检测。
+
+    - 校验每个 split 的 token 值域（字节管线为 0..255；整数
+      token 中不存在 NaN/Inf，值域校验用于捕获上游 dtype 或
+      编码错误）；
+    - 统计每个 split 的字节直方图，并计算 train↔val（可选包含
+      train↔test、val↔test）之间的 JS 距离，用于发现分布偏移；
+    - 对滑动窗口做有界签名扫描，检测跨 split 重复内容与 split
+      内部重复。
+
+    test 只在 include_test=True（最终评估解封时）才参与统计，
+    训练期间默认只审计 train/val。审计只做诊断，不参与任何
+    特征计算或模型决策。
+    """
+    split_names = ["train", "val"]
+    if include_test and dataset.has_test:
+        split_names.append("test")
+
+    histograms: Dict[str, torch.Tensor] = {}
+    scans: Dict[str, Dict[str, object]] = {}
+    splits_report: Dict[str, object] = {}
+    warnings: List[str] = []
+
+    for split in split_names:
+        tokens = getattr(dataset, split)
+        tokens_long = tokens.to(torch.int64)
+
+        hist = torch.bincount(
+            tokens_long,
+            minlength=256,
+        ).to(torch.float64)
+        histograms[split] = hist / hist.sum()
+
+        top_share, top_byte = torch.topk(
+            histograms[split],
+            k=5,
+        )
+
+        invalid = int(
+            ((tokens_long < 0) | (tokens_long > 255)).sum()
+        )
+
+        begin, end = dataset.split_bounds[split]
+        scans[split] = _window_signature_scan(
+            dataset._raw,
+            begin,
+            end - begin,
+            dataset.seq_len + 1,
+            max_windows,
+        )
+
+        splits_report[split] = {
+            "bytes": end - begin,
+            "windows": scans[split]["total"],
+            "invalid_tokens": invalid,
+            "top_bytes": [
+                [int(byte), round(float(share), 6)]
+                for share, byte in zip(
+                    top_share.tolist(),
+                    top_byte.tolist(),
+                )
+            ],
+        }
+
+        if invalid > 0:
+            warnings.append(
+                f"{split}: 检测到 {invalid} 个越界 token"
+            )
+
+        top_byte_share = float(top_share[0])
+        if top_byte_share > _AUDIT_TOP_BYTE_WARN:
+            warnings.append(
+                f"{split}: 最高频字节占比 "
+                f"{top_byte_share:.3f}，疑似填充/退化数据"
+            )
+
+    distribution_shift: Dict[str, float] = {}
+
+    for left, right in (
+        ("train", "val"),
+        ("train", "test"),
+        ("val", "test"),
+    ):
+        if left not in histograms or right not in histograms:
+            continue
+
+        distance = _js_distance(
+            histograms[left],
+            histograms[right],
+        )
+        key = f"{left}_{right}"
+        distribution_shift[key] = round(distance, 6)
+
+        if distance > _AUDIT_SHIFT_WARN:
+            warnings.append(
+                f"{key}: 字节分布偏移较大"
+                f"（JS 距离 {distance:.4f}）"
+            )
+
+    duplicate_windows: Dict[str, object] = {}
+
+    for split, scan in scans.items():
+        duplicate_windows[split] = {
+            "sampled": scan["sampled"],
+            "total": scan["total"],
+            "stride": scan["stride"],
+            "within_duplicates": scan["within_duplicates"],
+        }
+
+        if scan["within_duplicates"] > 0:
+            warnings.append(
+                f"{split}: 采样窗口中有"
+                f"{scan['within_duplicates']}个 split 内部重复"
+            )
+
+    for left, right in (
+        ("train", "val"),
+        ("train", "test"),
+        ("val", "test"),
+    ):
+        if left not in scans or right not in scans:
+            continue
+
+        left_sigs = scans[left]["signatures"]
+        right_sigs = scans[right]["signatures"]
+        common = left_sigs.keys() & right_sigs.keys()
+
+        duplicate_windows[f"{left}_{right}"] = {
+            "shared_signatures": len(common),
+            "examples": [
+                [left_sigs[digest][0], right_sigs[digest][0]]
+                for digest in list(common)[:3]
+            ],
+        }
+
+        if common:
+            warnings.append(
+                f"{left}_{right}: 检测到重复窗口内容"
+                "（跨 split 泄露风险）"
+            )
+
+    return {
+        "max_windows": max_windows,
+        "splits": splits_report,
+        "distribution_shift": distribution_shift,
+        "duplicate_windows": duplicate_windows,
+        "warnings": warnings,
+    }
+
+
+def print_data_audit(report: Dict[str, object]) -> None:
+    """打印数据审计摘要与全部警告。"""
+    splits = report.get("splits", {})
+    parts = [
+        f"{name}={info['bytes']}B"
+        for name, info in splits.items()
+    ]
+    print("[data] 数据审计: " + ", ".join(parts))
+
+    for key, distance in report.get(
+        "distribution_shift",
+        {},
+    ).items():
+        print(f"[data]   {key} 字节分布 JS 距离 = {distance:.4f}")
+
+    for key, info in report.get(
+        "duplicate_windows",
+        {},
+    ).items():
+        if "shared_signatures" in info:
+            print(
+                f"[data]   {key} 共享窗口签名数 = "
+                f"{info['shared_signatures']}"
+            )
+
+    for warning in report.get("warnings", []):
+        print(f"[data] 警告: {warning}")
 
 
 # ============================================================
@@ -1638,7 +2030,15 @@ def evaluate(
     batches: int,
     device: torch.device,
     amp_dtype: Optional[torch.dtype] = None,
+    split: str = "val",
 ) -> Dict[str, float]:
+    """
+    在指定评估 split 上计算加权平均语言模型损失。
+
+    split 仅允许 val/test：val 用于训练期间的周期验证与选型，
+    test 只在最终评估时调用一次；返回指标键带 split 前缀
+    （val_loss/test_loss 等）。
+    """
     was_training = model.training
     model.eval()
 
@@ -1646,6 +2046,9 @@ def evaluate(
         amp_dtype is not None
         and device.type == "cuda"
     )
+
+    # split 仅允许 val/test：val 用于训练期间的周期验证与选型，
+    # test 只在最终评估时调用一次。
 
     # 按目标 token 数加权累加。
     total = torch.zeros(
@@ -1662,7 +2065,8 @@ def evaluate(
             enabled=use_amp,
         ):
             for batch_index in range(batches):
-                x, y = dataset.fixed_val_batch(
+                x, y = dataset.fixed_eval_batch(
+                    split,
                     batch_index,
                     batches,
                     batch_size,
@@ -1690,13 +2094,13 @@ def evaluate(
         # 无论评估是否中途出错，都恢复原来的训练模式。
         model.train(was_training)
 
-    # ByteDataset 保证至少有一个合法验证起点。
+    # ByteDataset 保证至少有一个合法评估起点。
     loss = (total / evaluated_tokens).item()
 
     return {
-        "val_loss": loss,
-        "val_ppl": math.exp(min(loss, 80.0)),
-        "val_bits_per_byte": loss / math.log(2.0),
+        f"{split}_loss": loss,
+        f"{split}_ppl": math.exp(min(loss, 80.0)),
+        f"{split}_bits_per_byte": loss / math.log(2.0),
     }
 
 
@@ -1937,10 +2341,12 @@ def write_run_config(
     n_params: int,
     run_metadata: Dict[str, object],
     sanity_result: Optional[Dict[str, object]],
+    data_audit: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     写出 config.json：结构配置、完整超参数、参数量、数据指纹、
-    代码版本/运行环境，以及 sanity check 结果。
+    数据划分与审计结果、代码版本/运行环境，以及 sanity check
+    结果。
     """
     payload = {
         "config": asdict(cfg),
@@ -1955,7 +2361,13 @@ def write_run_config(
                 "data_val_fraction",
                 None,
             ),
+            "test_fraction": getattr(
+                args,
+                "data_test_fraction",
+                None,
+            ),
         },
+        "data_audit": data_audit,
         "run_metadata": run_metadata,
         "sanity_check": sanity_result,
     }
@@ -1989,6 +2401,35 @@ def write_jsonl_record(
         f.write(
             json.dumps(record, ensure_ascii=False) + "\n"
         )
+
+
+def test_record_exists(path: Path) -> bool:
+    """
+    检查 metrics.jsonl 中是否已有 test 评估记录。
+
+    测试集在一次运行中只允许解封评估一次：恢复训练后重复传入
+    --evaluate-test 会被拒绝，避免测试集在反复查看中变成隐式
+    验证集。
+    """
+    if not path.exists():
+        return False
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(record, dict)
+                    and record.get("step") == "test"
+                ):
+                    return True
+    except OSError:
+        return False
+
+    return False
 
 
 def load_previous_sanity_result(
@@ -2478,7 +2919,8 @@ def run_self_test():
         out2[:, 1],
     )
 
-    # 验证窗口必须与全局随机数状态无关且逐次调用完全一致。
+    # 数据协议：按时间顺序先切成 train/val/test 三段再处理，
+    # 切分不随机打乱、互不重叠；训练期不允许访问 test。
     with tempfile.NamedTemporaryFile() as data_file:
         data_file.write(bytes(range(256)))
         data_file.flush()
@@ -2492,6 +2934,58 @@ def run_self_test():
         assert eval_dataset.data_sha256 == hashlib.sha256(
             bytes(range(256))
         ).hexdigest()
+
+        # train = [0, 232), val = [232, 244), test = [244, 256)。
+        assert len(eval_dataset.train) == 232
+        assert int(eval_dataset.train[0]) == 0
+        assert int(eval_dataset.train[-1]) == 231
+        assert int(eval_dataset.val[0]) == 232
+        assert int(eval_dataset.val[-1]) == 243
+        assert int(eval_dataset.test[0]) == 244
+        assert int(eval_dataset.test[-1]) == 255
+        assert eval_dataset.has_test
+
+        # batch() 是训练期唯一的数据入口，必须拒绝 test。
+        try:
+            eval_dataset.batch(
+                "test",
+                2,
+                torch.Generator().manual_seed(0),
+                eval_device,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "batch() 不允许访问测试集"
+            )
+
+        # 随机训练批只落在训练 split 内，且输入/标签按位对齐
+        # （下一 token 监督，无错位标签噪声）。
+        train_x, train_y = eval_dataset.batch(
+            "train",
+            4,
+            torch.Generator().manual_seed(7),
+            eval_device,
+        )
+        assert int(train_x.min()) >= 0
+        assert int(train_x.max()) <= 231
+        assert int(train_y.max()) <= 231
+        assert torch.equal(
+            train_x[:, 1:],
+            train_y[:, :-1].to(torch.int32),
+        )
+
+        # 测试集的固定评估窗口只能来自测试 split。
+        test_x, test_y = eval_dataset.fixed_eval_batch(
+            "test",
+            0,
+            1,
+            2,
+            eval_device,
+        )
+        assert int(test_x.min()) >= 244
+        assert int(test_y.max()) <= 255
 
         first = eval_dataset.fixed_val_batch(
             0,
@@ -2530,16 +3024,149 @@ def run_self_test():
         device=eval_device,
     )
 
+    val_starts = eval_dataset._fixed_starts["val"]["starts"]
     assert (
         len(overfull_first[1]) + len(overfull_last[1])
-        == len(eval_dataset._starts)
+        == len(val_starts)
     )
     assert torch.equal(
-        eval_dataset._starts.sort().values,
-        eval_dataset._starts.unique(sorted=True),
+        val_starts.sort().values,
+        val_starts.unique(sorted=True),
     )
     assert overfull_empty[0].numel() == 0
     assert overfull_empty[1].numel() == 0
+
+    # evaluate 的 split 参数：val 指标带 val_ 前缀，test 指标带
+    # test_ 前缀；两者窗口互不相同。
+    eval_model = LanguageModel(
+        Config(
+            **common,
+            mode="B",
+        )
+    ).eval()
+
+    val_metrics = evaluate(
+        eval_model,
+        eval_dataset,
+        2,
+        1,
+        eval_device,
+    )
+    assert "val_loss" in val_metrics
+    assert "val_ppl" in val_metrics
+
+    test_metrics = evaluate(
+        eval_model,
+        eval_dataset,
+        2,
+        1,
+        eval_device,
+        split="test",
+    )
+    assert "test_loss" in test_metrics
+    assert "val_loss" not in test_metrics
+
+    # 数据审计：顺序无重复语料不应报告跨 split 重复；
+    # 重复内容必须被捕获并给出警告。
+    clean_audit = audit_data_splits(
+        eval_dataset,
+        include_test=True,
+    )
+    assert (
+        clean_audit["duplicate_windows"]["train_val"][
+            "shared_signatures"
+        ]
+        == 0
+    )
+    assert (
+        clean_audit["duplicate_windows"]["train_test"][
+            "shared_signatures"
+        ]
+        == 0
+    )
+    assert not any(
+        "重复" in warning
+        for warning in clean_audit["warnings"]
+    )
+
+    with tempfile.NamedTemporaryFile() as repeated_file:
+        repeated_file.write(bytes(range(64)) * 4)
+        repeated_file.flush()
+
+        repeated_dataset = ByteDataset(
+            repeated_file.name,
+            seq_len=8,
+        )
+
+        repeated_audit = audit_data_splits(
+            repeated_dataset,
+            include_test=True,
+        )
+
+    assert (
+        repeated_audit["duplicate_windows"]["train_val"][
+            "shared_signatures"
+        ]
+        > 0
+    )
+    assert (
+        repeated_audit["duplicate_windows"]["train_test"][
+            "shared_signatures"
+        ]
+        > 0
+    )
+    assert any(
+        "重复" in warning
+        for warning in repeated_audit["warnings"]
+    )
+
+    # 单个字节占主导的退化语料必须被标记（异常值检查）。
+    with tempfile.NamedTemporaryFile() as padded_file:
+        padded_file.write(
+            b"\x00" * 220 + bytes(range(36))
+        )
+        padded_file.flush()
+
+        padded_dataset = ByteDataset(
+            padded_file.name,
+            seq_len=8,
+        )
+
+        padded_audit = audit_data_splits(
+            padded_dataset,
+            include_test=True,
+        )
+
+    assert any(
+        "退化" in warning
+        for warning in padded_audit["warnings"]
+    )
+
+    # 分布偏移统计量必须是 [0, 1] 的有限数。
+    for distance in clean_audit[
+        "distribution_shift"
+    ].values():
+        assert math.isfinite(distance)
+        assert 0.0 <= distance <= 1.0
+
+    # metrics.jsonl 中的测试记录只能出现一次：已有记录时必须
+    # 拒绝重复解封。
+    with tempfile.TemporaryDirectory() as metrics_dir:
+        metrics_file = Path(metrics_dir) / "metrics.jsonl"
+
+        assert not test_record_exists(metrics_file)
+
+        write_jsonl_record(
+            metrics_file,
+            {"step": "final", "val_loss": 1.0},
+        )
+        assert not test_record_exists(metrics_file)
+
+        write_jsonl_record(
+            metrics_file,
+            {"step": "test", "test_loss": 1.0},
+        )
+        assert test_record_exists(metrics_file)
 
     # 模拟 checkpoint/resume：恢复时先从 scheduler.base_lrs
     # 还原基准 lr，再加载 scheduler 状态。
@@ -2819,6 +3446,33 @@ def main():
     parser.add_argument("--out", type=str, required=True)
     parser.add_argument("--resume", type=str, default=None)
 
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "按时间顺序划给验证集的尾部比例（默认 0.05）；"
+            "划分不随机打乱"
+        ),
+    )
+    parser.add_argument(
+        "--test-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "按时间顺序划给测试集的尾部比例（默认 0.05）；"
+            "测试集训练期间尘封，仅在 --evaluate-test 时评估一次"
+        ),
+    )
+    parser.add_argument(
+        "--evaluate-test",
+        action="store_true",
+        help=(
+            "训练结束后在测试集上做唯一一次最终评估；"
+            "不设置时测试集完全不被访问"
+        ),
+    )
+
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -2921,6 +3575,11 @@ def main():
         parser.error(
             "--skip-sanity-check 与 --sanity-only 不能同时使用"
         )
+    if args.sanity_only and args.evaluate_test:
+        parser.error(
+            "--evaluate-test 需要完整训练后的模型，"
+            "不能与 --sanity-only 同时使用"
+        )
     if args.sanity_batch_size <= 0:
         parser.error("--sanity-batch-size 必须为正整数")
     if args.sanity_steps <= 0:
@@ -2937,6 +3596,21 @@ def main():
     if not 0.0 < args.sanity_acc_threshold <= 1.0:
         parser.error(
             "--sanity-acc-threshold 必须落在 (0, 1]"
+        )
+    if (
+        not math.isfinite(args.val_fraction)
+        or not 0.0 <= args.val_fraction < 1.0
+    ):
+        parser.error("--val-fraction 必须落在 [0, 1)")
+    if (
+        not math.isfinite(args.test_fraction)
+        or not 0.0 <= args.test_fraction < 1.0
+    ):
+        parser.error("--test-fraction 必须落在 [0, 1)")
+    if args.val_fraction + args.test_fraction >= 1.0:
+        parser.error(
+            "--val-fraction + --test-fraction 必须小于 1"
+            "（训练集不能为空）"
         )
 
     device = torch.device(args.device)
@@ -2967,6 +3641,8 @@ def main():
     start_step = 0
     rng_payload = None
     saved_data_sha256 = None
+    saved_data_val_fraction = None
+    saved_data_test_fraction = None
 
     if args.resume is not None:
         # 检查点先载入 CPU，再按目标设备分别搬运。
@@ -2974,10 +3650,14 @@ def main():
             args.resume,
             torch.device("cpu"),
         )
-        saved_data_sha256 = rng_payload.get(
-            "args",
-            {},
-        ).get("data_sha256")
+        saved_args = rng_payload.get("args", {})
+        saved_data_sha256 = saved_args.get("data_sha256")
+        saved_data_val_fraction = saved_args.get(
+            "data_val_fraction"
+        )
+        saved_data_test_fraction = saved_args.get(
+            "data_test_fraction"
+        )
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
         known_config_fields = {
@@ -3046,6 +3726,33 @@ def main():
                 + json.dumps(ignored, ensure_ascii=False)
             )
 
+        # 数据划分比例决定 train/val/test 的字节位置，是采样
+        # 轨迹的一部分；resume 时按存档恢复，避免数据管线换了
+        # 位置而检查点的 RNG 状态仍在旧轨迹上。
+        if (
+            saved_data_val_fraction is not None
+            and saved_data_val_fraction != args.val_fraction
+        ):
+            print(
+                "resume restored val_fraction "
+                f"{args.val_fraction} -> "
+                f"{saved_data_val_fraction} "
+                "(数据划分是采样轨迹的一部分)"
+            )
+            args.val_fraction = saved_data_val_fraction
+
+        if (
+            saved_data_test_fraction is not None
+            and saved_data_test_fraction != args.test_fraction
+        ):
+            print(
+                "resume restored test_fraction "
+                f"{args.test_fraction} -> "
+                f"{saved_data_test_fraction} "
+                "(数据划分是采样轨迹的一部分)"
+            )
+            args.test_fraction = saved_data_test_fraction
+
     cfg.validate()
 
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
@@ -3054,15 +3761,24 @@ def main():
     dataset = ByteDataset(
         args.data,
         cfg.seq_len,
+        val_fraction=args.val_fraction,
+        test_fraction=args.test_fraction,
         device=device,
     )
 
-    # 语料指纹/大小写入 args，随 config.json 与检查点一起存档；
-    # 恢复训练时若数据文件内容已变化，采样轨迹会与原运行不同，
-    # 这里明确提示而不是静默继续。
+    if args.evaluate_test and not dataset.has_test:
+        parser.error(
+            "--evaluate-test 需要有效的测试集："
+            "请设置正的 --test-fraction 且语料足够长"
+        )
+
+    # 语料指纹/大小/划分比例写入 args，随 config.json 与检查点
+    # 一起存档；恢复训练时若数据文件内容或划分位置已变化，采样
+    # 轨迹会与原运行不同，这里明确提示而不是静默继续。
     args.data_sha256 = dataset.data_sha256
     args.data_bytes = dataset.num_bytes
     args.data_val_fraction = dataset.val_fraction
+    args.data_test_fraction = dataset.test_fraction
 
     if (
         saved_data_sha256 is not None
@@ -3074,6 +3790,33 @@ def main():
             f"{dataset.data_sha256[:12]}...); "
             "采样轨迹与原运行不再一致"
         )
+    elif saved_data_sha256 is not None and (
+        saved_data_val_fraction is None
+        or saved_data_test_fraction is None
+    ):
+        print(
+            "resume checkpoint predates the train/val/test "
+            "split; 数据划分位置可能与原运行不同，"
+            "采样轨迹不再一致"
+        )
+    elif saved_data_sha256 is not None and (
+        saved_data_val_fraction != dataset.val_fraction
+        or saved_data_test_fraction != dataset.test_fraction
+    ):
+        print(
+            "resume data split fractions changed "
+            f"(val {saved_data_val_fraction} -> "
+            f"{dataset.val_fraction}, "
+            f"test {saved_data_test_fraction} -> "
+            f"{dataset.test_fraction}); "
+            "采样轨迹与原运行不再一致"
+        )
+
+    # 数据审计在训练之前完成：重复内容、分布偏移与 token 值域
+    # 问题会被记录并在发现风险时给出警告。test 此时保持尘封，
+    # 只在 --evaluate-test 的最终评估时参与审计。
+    data_audit = audit_data_splits(dataset, include_test=False)
+    print_data_audit(data_audit)
 
     # 全新训练默认先跑过拟合小批量 sanity check；恢复训练默认跳过
     # （可以用 --sanity-only 单独检查）。--skip-sanity-check 显式跳过。
@@ -3149,6 +3892,7 @@ def main():
             n_params=int(sanity_result["n_params"]),
             run_metadata=collect_run_metadata(device),
             sanity_result=sanity_result,
+            data_audit=data_audit,
         )
         write_jsonl_record(
             out_dir / "metrics.jsonl",
@@ -3482,7 +4226,8 @@ def main():
         )
 
     # config.json 记录完整实验追踪信息：结构配置、超参数、种子、
-    # 数据指纹、代码版本/运行环境与 sanity check 结果。
+    # 数据指纹与划分、数据审计、代码版本/运行环境与 sanity check
+    # 结果。
     write_run_config(
         out_dir,
         cfg,
@@ -3490,6 +4235,7 @@ def main():
         n_params,
         collect_run_metadata(device),
         config_sanity_result,
+        data_audit=data_audit,
     )
 
     metrics_path = out_dir / "metrics.jsonl"
@@ -3781,6 +4527,63 @@ def main():
             ensure_ascii=False,
         )
     )
+
+    # 最终评估口径：上面的 final 记录始终是验证集口径。
+    # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
+    # 完全结束后解封，且同一次运行只允许评估一次；重复传入也
+    # 不会让测试集变成隐式验证集，需要新的结论应使用全新目录。
+    if args.evaluate_test:
+        if test_record_exists(metrics_path):
+            print(
+                "[test] metrics.jsonl 中已有测试集评估记录；"
+                "测试集在该目录的运行中已解封过一次，拒绝重复评估。"
+                "如需新的最终结论，请使用全新的 --out 目录，"
+                "并在确认模型与超参数冻结后再加 --evaluate-test。"
+            )
+        else:
+            # 解封测试集：先做包含 test 的数据审计，再做唯一一次
+            # 最终评估。
+            test_audit = audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+            print_data_audit(test_audit)
+
+            test_metrics = evaluate(
+                model,
+                dataset,
+                args.batch_size,
+                args.eval_batches,
+                device,
+                amp_dtype=amp_dtype,
+                split="test",
+            )
+
+            test_record = {
+                "step": "test",
+                **test_metrics,
+                "data_audit": test_audit,
+            }
+            metrics_file.write(
+                json.dumps(
+                    test_record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            metrics_file.flush()
+
+            print(
+                json.dumps(
+                    {"test": test_metrics},
+                    ensure_ascii=False,
+                )
+            )
+            print(
+                "[test] 测试集已解封并完成唯一一次评估；"
+                "请不要根据该结果继续调参，否则测试集将退化为"
+                "隐式验证集。"
+            )
 
     metrics_file.close()
 

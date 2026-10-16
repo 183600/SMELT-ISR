@@ -33,6 +33,28 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   区分的 $1/r$ 缩放。跨模式实验应保持该系数一致；把全局系数设为 0.5
   并不等价于论文「仅循环区域 1/r」的口径。
 
+## 数据协议（防止数据泄露）
+
+- **先划分、后处理**：`ByteDataset` 按语料的时间先后顺序切分
+  `train` / `val` / `test`（默认 90% / 5% / 5%，`--val-fraction`、
+  `--test-fraction` 可调），三段连续、互不重叠，切分不随机打乱；
+  训练阶段的批级 shuffle 由随机窗口起点承担，不改变 split 边界。
+- **统计量口径**：当前字节级管线不做标准化、归一化或缺失值填充，
+  不计算任何全局统计量；若扩展为连续值特征，必须只在 train 上
+  `fit`，再 `transform` val/test，禁止用全量数据计算均值方差后再划分。
+- **测试集尘封**：训练循环只访问 train，周期性验证只访问 val；
+  `batch()` 显式拒绝 `"test"`。test 只在训练完全结束后、
+  显式传入 `--evaluate-test` 时解封评估一次
+  （`metrics.jsonl` 写入 `{"step": "test", ...}`）；同一输出目录中
+  已有 test 记录时会拒绝重复评估，防止测试集变成隐式验证集。
+- **数据审计**：训练前对 train/val 自动做值域校验、字节直方图
+  分布偏移（JS 距离）与滑窗重复内容扫描（有界采样），警告与统计
+  写入 `config.json` 的 `data_audit`；解封测试集时追加含 test 的
+  审计。恢复训练时若数据指纹或划分比例与存档不一致会明确提示。
+- **群组数据**：当前语料为单一字节流，不存在群组结构；若替换为
+  同一用户/物体产生多条样本的数据集，必须按群组整体划分，
+  train/val/test 任意两侧之间不得交叉。
+
 ## 代码组织
 
 - `Config`：模型结构与损失配置，在入口处校验。
@@ -40,11 +62,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `Expert`、`SparseMoE`：专家与稀疏路由，含 `route` / `dispatch` / `merge`。
 - `TransformerBlock`：注意力步骤、MoE 步骤，以及分支与两轮路由逻辑。
 - `LanguageModel`：按模式组装完整前向。
-- `ByteDataset`、`evaluate`：字节级数据管线与验证。
+- `ByteDataset`、`evaluate`：字节级数据管线与按 split 的固定窗口评估。
+- `audit_data_splits`、`_window_signature_scan`：数据审计（值域、
+  分布偏移、重复窗口）。
 - `run_sanity_overfit`：训练前的过拟合小批量 sanity check。
 - `save_checkpoint`、`load_checkpoint`：断点存档与恢复。
 - `collect_run_metadata`、`write_run_config`：实验追踪信息收集与落盘。
-- `run_self_test`：结构、梯度、因果性、模式等价性与 sanity check 判定自测。
+- `run_self_test`：结构、梯度、因果性、模式等价性、数据划分/
+  测试集封存与 sanity check 判定自测。
 
 ## 可复现性与实验追踪
 
@@ -74,4 +99,5 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--grad-clip`、`--eval-interval`、`--save-interval`、`--resume`、
 `--grad-checkpoint`、`--compile`、`--seed`、`--note`、`--sanity-only`、
 `--skip-sanity-check`、`--sanity-batch-size`、`--sanity-steps`、
-`--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`。
+`--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`、
+`--val-fraction`、`--test-fraction`、`--evaluate-test`。

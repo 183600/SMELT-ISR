@@ -44,7 +44,16 @@ python experiment.py --self-test
 ```
 
 ### 2. Prepare data
-The code defaults to a byte-level tokenizer for quick validation. Prepare a UTF-8 plain-text file (e.g., `corpus.txt`); the last 5% is automatically used as the validation set.
+The code defaults to a byte-level tokenizer for quick validation. Prepare a UTF-8 plain-text file (e.g., `corpus.txt`).
+
+The pipeline is strictly leakage-safe: **split first, then process**. The corpus is cut chronologically into `train` (first 90%) / `val` (next 5%) / `test` (last 5%): the three splits are contiguous, non-overlapping, and never randomly shuffled (time-series data must train on the past and validate/test on the future). Batch-level shuffling during training is provided by random window starts and never crosses split boundaries. The byte pipeline performs no standardization/normalization/imputation; if you extend it to continuous features, every statistic (mean, variance, min/max, ...) must be fitted on `train` only and applied to val/test via `transform`.
+
+`val` is used for periodic validation, hyperparameter selection and early stopping; `test` stays sealed for the whole training run and is evaluated exactly once after training, only when `--evaluate-test` is passed. Re-evaluation within the same run is refused. Fractions are configurable with `--val-fraction` / `--test-fraction`. Before training, a data audit (token range, duplicate windows, train↔val distribution shift) runs automatically and is stored in the `data_audit` field of `config.json`; unsealing the test set appends a test-inclusive audit.
+
+```bash
+# Run the single final test evaluation after training
+python experiment.py --data corpus.txt --mode B --out runs/B_seed42 --evaluate-test
+```
 *(Note: replace with your own tokenizer and data pipeline for real experiments.)*
 
 ### 3. Start training
@@ -133,7 +142,7 @@ python experiment.py \
 - **Compute accounting**: after round-1 branch creation, scheme B executes downstream attention and MoE at $k_1$× branch count; parameter-matched is not FLOPs-matched. When answering RQ1/RQ2, report both step-aligned and token/FLOPs-aligned comparisons to avoid misattributing extra compute to the routing mechanism.
 - **Residual-scaling convention**: `residual_scale` applies globally to every residual update in all regions (inside and outside the looped span). The SMELT paper scales residual updates within the looped span by $1/r$ (1/2 for two visits); this base does not implement region-specific $1/r$ scaling. Keep `residual_scale` equal across modes; a global 0.5 is not equivalent to the paper's convention.
 - **Load-balancing scale**: $f_i$ in the auxiliary loss is normalized by token count, not assignment count; under uniform routing $E \sum_i f_i P_i \approx k$, so balancing strength grows linearly with routing width. When comparing across $k_1/k_2/\text{top-}k$, scale the coefficient accordingly (keep `balance_coef × k` constant); otherwise routing width is confounded with balancing strength.
-- **Validation protocol**: each evaluation uses fixed windows evenly spaced across the validation set, independent of any RNG, bit-aligned across models and resumed runs; final results are appended to `metrics.jsonl`.
+- **Validation/test protocol**: each evaluation uses fixed windows evenly spaced across the corresponding evaluation split, independent of any RNG, bit-aligned across models and resumed runs; the `final` record is always validation-set based. The test split stays sealed for the entire training run and is evaluated exactly once when `--evaluate-test` is passed (`{"step": "test", ...}`); repeating the flag is refused, so the test set cannot silently become a validation set. All results are appended to `metrics.jsonl`.
 - **Determinism**: the training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN seeds; data sampling is driven by an explicit `torch.Generator` whose seed and state are checkpointed; `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic kernels (a warning is emitted if a CUDA kernel lacks a deterministic implementation). Small cross-hardware numeric differences from reduction order may remain.
 - **Experiment tracking**: each run automatically records the code revision (git commit / dirty flag), environment (Python / torch / CUDA / device), full hyperparameters and seeds, data fingerprint (SHA-256, byte count), training curves and final results in `config.json` and `metrics.jsonl` — no manual bookkeeping required.
 
@@ -143,7 +152,7 @@ Each run produces:
 ```text
 runs/<exp_name>/
 ├── config.json      # full config, parameter count, seeds, data fingerprint, code/env info, sanity-check result
-├── metrics.jsonl    # per-line train/val metrics and final eval (loss, ppl, lr, grad_norm, ...)
+├── metrics.jsonl    # per-line train/val metrics and final eval (loss, ppl, lr, grad_norm, ...); includes the single {"step": "test", ...} record when --evaluate-test is used
 └── last.pt          # weights, optimizer, LR scheduler and RNG states (atomic write)
 ```
 

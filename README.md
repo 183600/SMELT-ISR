@@ -44,7 +44,27 @@ python experiment.py --self-test
 ```
 
 ### 2. 准备数据
-代码默认使用字节级 tokenizer 以方便快速验证。你需要准备一个 UTF-8 编码的纯文本文件（如 `corpus.txt`），文件最后 5% 会自动划分为验证集。
+代码默认使用字节级 tokenizer 以方便快速验证。你需要准备一个 UTF-8 编码的纯文本文件（如 `corpus.txt`）。
+
+数据管线严格防止数据泄露：**先按时间先后顺序划分，再做任何处理**。
+语料默认切成 `train`（前 90%）/ `val`（随后 5%）/ `test`（最后 5%）
+三段，切分连续、互不重叠、全程不随机打乱（时序数据必须用过去训练、
+未来验证和测试）；训练阶段的批级 shuffle 由随机窗口起点承担，不改变
+split 边界。当前字节级管线不涉及标准化/归一化/缺失值填充，若扩展为
+连续值特征，所有统计量（均值、方差、最值等）必须只在 train 上
+`fit`，再 `transform` val/test。
+
+`val` 用于周期性验证、挑超参数与早停；`test` 训练期间全程尘封，
+只有显式传入 `--evaluate-test` 才会在训练完全结束后评估一次，且同一次
+运行拒绝重复评估。切分比例可用 `--val-fraction` / `--test-fraction`
+调整。每次运行在训练前都会自动做数据审计（token 值域、重复窗口、
+train↔val 分布偏移），结果与警告写入 `config.json` 的 `data_audit`
+字段；解封测试集时会追加包含 test 的审计结果。
+
+```bash
+# 训练结束后做唯一一次测试集评估
+python experiment.py --data corpus.txt --mode B --out runs/B_seed42 --evaluate-test
+```
 *(注：正式实验应替换为你的 tokenizer 和数据管线)*
 
 ### 3. 开始训练
@@ -129,7 +149,7 @@ python experiment.py \
 - **计算量口径**：方案 B 在第一轮分支创建后按 $k_1$ 倍分支数执行后续 Attention 与 MoE，等参数实验并不等价于等 FLOPs 实验。回答 RQ1/RQ2 时应同时报告按训练步数与按 token/FLOPs 对齐的对比，避免把额外计算误解释为路由机制本身的收益。
 - **残差缩放口径**：`residual_scale` 全局作用于所有区域、所有子层的残差更新（循环区域内/外一致）。SMELT 论文对循环区域内的子层残差更新按循环次数 $1/r$ 缩放（循环两次即 1/2）；本基座未实现按区域区分的 $1/r$ 缩放。跨模式对比应保持 `residual_scale` 一致，把全局系数设为 0.5 并不等价于论文口径。
 - **负载均衡尺度**：辅助损失中 $f_i$ 按 token 数归一化，而不是按 assignment 数归一化；均匀路由时 $E \sum_i f_i P_i \approx k$，均衡强度随路由宽度线性增大。跨 $k_1/k_2/\text{top-}k$ 比较实验时应按比例折算系数（保持 `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
-- **验证协议**：每次评估使用跨验证集等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；最终评估结果也会追加到 `metrics.jsonl`。
+- **验证/测试协议**：每次评估使用跨评估 split 等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；训练期间的 `final` 记录是验证集口径，测试集默认全程尘封，仅在显式传入 `--evaluate-test` 时解封评估一次（`{"step": "test", ...}`），重复传参会被拒绝，避免测试集变成隐式验证集。所有结果追加到 `metrics.jsonl`。
 - **确定性**：训练入口固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子，数据采样由显式 `torch.Generator` 承担（种子与状态随检查点存档），并设置 `CUBLAS_WORKSPACE_CONFIG`、要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。跨硬件架构仍可能因浮点归约顺序产生微小差异。
 - **实验追踪**：每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
 
@@ -139,7 +159,7 @@ python experiment.py \
 ```text
 runs/<exp_name>/
 ├── config.json      # 完整配置、参数量、随机种子、数据指纹、代码版本/环境、sanity check 结果
-├── metrics.jsonl    # 逐行记录训练/验证指标及最终评估 (loss, ppl, lr, grad_norm等)
+├── metrics.jsonl    # 逐行记录训练/验证指标及最终评估 (loss, ppl, lr, grad_norm等)，--evaluate-test 时含 {"step": "test", ...} 唯一一次测试集结果
 └── last.pt          # 模型权重、优化器、学习率调度器及随机种子状态（原子写入）
 ```
 
