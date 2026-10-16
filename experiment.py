@@ -2531,6 +2531,16 @@ def main():
         ):
             group["lr"] = base_lr
 
+        # 基础 lr 的实际数值来自检查点的调度状态；同步回
+        # args，保证 config.json 记录的是真正生效的值。
+        if args.lr != base_lrs[0]:
+            print(
+                "resume restored lr "
+                f"{args.lr} -> {base_lrs[0]} "
+                "(基础 lr 由检查点调度状态决定)"
+            )
+            args.lr = base_lrs[0]
+
     if rng_payload is not None:
         # batch-size 决定数据消费序列，是采样轨迹的一部分；
         # resume 时与 warmup_steps 一样按存档恢复并提示。
@@ -2549,6 +2559,21 @@ def main():
                 "(batch_size 决定采样轨迹)"
             )
             args.batch_size = saved_batch
+
+        # weight_decay 的实际数值来自优化器状态
+        #（load_state_dict 会替换 param group 选项）；同步回
+        # args，保证 config.json 记录的是真正生效的值。
+        effective_weight_decay = optimizer.param_groups[0][
+            "weight_decay"
+        ]
+
+        if args.weight_decay != effective_weight_decay:
+            print(
+                "resume restored weight_decay "
+                f"{args.weight_decay} -> {effective_weight_decay} "
+                "(weight_decay 由优化器状态决定)"
+            )
+            args.weight_decay = effective_weight_decay
 
         # warmup 段是 lr 调度定义的一部分，但不在 scheduler 的
         # state_dict 里；resume 时按存档恢复 warmup_steps，
@@ -2745,6 +2770,12 @@ def main():
 
         pending_records.clear()
         pending_scalars.clear()
+
+        # 记录只写进了 Python 缓冲；周期性存档与验证都依赖
+        # 这里真正落盘，否则进程在存档后退出时 metrics 会
+        # 永久缺少最后若干步（恢复训练从存档步继续，不会再
+        # 补写这些记录）。
+        metrics_file.flush()
 
         return records
 
