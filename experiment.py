@@ -2674,23 +2674,20 @@ def analyze_bad_cases(
                 logits = result["logits"].float()
                 del result
 
-                batch, length, width = logits.shape
-
-                loss_tokens = F.cross_entropy(
-                    logits.reshape(-1, width),
-                    y.reshape(-1),
-                    reduction="none",
-                ).view(batch, length)
-
-                probabilities = logits.softmax(dim=-1)
-                top2 = probabilities.topk(2, dim=-1)
-
-                predicted = top2.indices[..., 0]
-                confidence = top2.values[..., 0]
-                target_probability = probabilities.gather(
+                log_normalizer = torch.logsumexp(logits, dim=-1)
+                target_logits = logits.gather(
                     -1,
                     y.unsqueeze(-1).to(torch.int64),
                 ).squeeze(-1)
+                loss_tokens = log_normalizer - target_logits
+
+                top2 = logits.topk(2, dim=-1)
+
+                predicted = top2.indices[..., 0]
+                confidence = (top2.values[..., 0] - log_normalizer).exp()
+                target_probability = (
+                    target_logits - log_normalizer
+                ).exp()
 
                 # 还原完整窗口：x = tokens[:-1]，y = tokens[1:]。
                 window = torch.cat(
