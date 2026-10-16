@@ -2402,7 +2402,11 @@ def main():
         parser.error("--save-interval 必须为正整数")
     if args.warmup_steps < 0:
         parser.error("--warmup-steps 不能为负")
-    if args.grad_clip <= 0:
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr 必须是有限正数")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("--weight-decay 必须是有限非负数")
+    if not math.isfinite(args.grad_clip) or args.grad_clip <= 0:
         parser.error("--grad-clip 必须为正数")
 
     device = torch.device(args.device)
