@@ -645,7 +645,7 @@ class SparseMoE(nn.Module):
 
         # 对 expert_outputs / weights 保持 out-of-place：首个
         # slot 的加权乘产生输出缓冲，其余 slot 用 addcmul
-        # 原地累加，不产生 […, top_k, dim] 的中间张量。
+        # 原地累加。
         merged = expert_outputs.select(-2, 0).mul(
             weights.select(-1, 0).unsqueeze(-1)
         )
@@ -891,8 +891,7 @@ class TransformerBlock(nn.Module):
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：逐分支 mul + addcmul 累加，
-            # 对 branches / gates 保持 out-of-place，不产生
-            # […, k1, dim] 的中间张量。
+            # 对 branches / gates 保持 out-of-place。
             weights = gates.to(branches.dtype)
 
             x = branches.select(-2, 0).mul(
@@ -2771,10 +2770,7 @@ def main():
         pending_records.clear()
         pending_scalars.clear()
 
-        # 记录只写进了 Python 缓冲；周期性存档与验证都依赖
-        # 这里真正落盘，否则进程在存档后退出时 metrics 会
-        # 永久缺少最后若干步（恢复训练从存档步继续，不会再
-        # 补写这些记录）。
+        # 记录先写入 Python 缓冲，此处统一落盘。
         metrics_file.flush()
 
         return records
