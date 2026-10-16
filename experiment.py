@@ -787,7 +787,8 @@ class SparseMoE(nn.Module):
         加权和以逐 slot 的 mul + addcmul 累加实现，
         等价于广播乘后沿 top_k 维求和；dtype 不匹配
         （autocast 残差流精度更高）时同一路径靠类型提升
-        合并残差，语义不变。
+        合并残差，语义不变。所有路径均为 out-of-place，
+        不修改调用方传入的张量。
         """
         top_k = expert_outputs.size(-2)
         dim = expert_outputs.size(-1)
@@ -800,11 +801,12 @@ class SparseMoE(nn.Module):
             if residual is not None:
                 flat_residual = residual.reshape(-1, dim)
 
-                # dtype 一致时原地完成「缩放 + 残差相加」。
+                # dtype 一致时「缩放 + 残差相加」仍保持
+                # out-of-place：不修改调用方传入的张量。
                 if output.dtype == flat_residual.dtype:
                     if residual_scale != 1.0:
-                        output.mul_(residual_scale)
-                    return output.add_(flat_residual).view(out_shape)
+                        output = output.mul(residual_scale)
+                    return output.add(flat_residual).view(out_shape)
 
                 return torch.add(
                     flat_residual,
