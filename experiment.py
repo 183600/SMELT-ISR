@@ -68,14 +68,34 @@ class Config:
     k1: int = 2
     k2: int = 2
 
-    # smelt / local_base / A / B
+    # smelt / local_base / A / B / dense / ngram。
+    # dense：无 MoE、无循环的纯稠密 Transformer 基线；
+    # ngram：仅用于统计基线运行的配置标记，LanguageModel
+    # 不支持该模式。
     mode: str = "B"
+
+    # dense 模式的 FFN 隐藏宽度。None 时默认取 top_k * expert_hidden，
+    # 即与 MoE 模式单次前向激活的专家参数量对齐（等计算口径）；
+    # 要做等参数口径对比时可显式设为 n_experts * expert_hidden。
+    dense_fnn_hidden: Optional[int] = None
 
     balance_coef: float = 0.01
     residual_scale: float = 1.0
 
+    # LanguageModel 可以构建的模式；ngram 仅供统计基线运行写
+    # config.json 使用。
+    MODEL_MODES = {"smelt", "local_base", "A", "B", "dense"}
+    ALL_MODES = MODEL_MODES | {"ngram"}
+
+    @property
+    def effective_dense_fnn_hidden(self) -> int:
+        if self.dense_fnn_hidden is not None:
+            return self.dense_fnn_hidden
+        # 等计算口径：top_k 个专家的激活参数量。
+        return self.top_k * self.expert_hidden
+
     def validate(self):
-        if self.mode not in {"smelt", "local_base", "A", "B"}:
+        if self.mode not in self.ALL_MODES:
             raise ValueError(f"未知 mode: {self.mode}")
         if self.vocab_size <= 0:
             raise ValueError("vocab_size 必须为正整数")
@@ -99,6 +119,20 @@ class Config:
             raise ValueError("balance_coef 必须是有限非负数")
         if not math.isfinite(self.residual_scale) or self.residual_scale < 0.0:
             raise ValueError("residual_scale 必须是有限非负数")
+        if self.mode == "dense":
+            hidden = self.effective_dense_fnn_hidden
+            if hidden <= 0:
+                raise ValueError(
+                    "dense 模式的 FFN 隐藏宽度必须为正整数"
+                    f"（当前解析为 {hidden}）"
+                )
+        if self.dense_fnn_hidden is not None and (
+            not isinstance(self.dense_fnn_hidden, int)
+            or self.dense_fnn_hidden <= 0
+        ):
+            raise ValueError(
+                "dense_fnn_hidden 必须是正整数或 None"
+            )
 
     @property
     def middle_start(self) -> int:
@@ -882,7 +916,21 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(cfg)
 
         self.norm_moe = RMSNorm(cfg.d_model)
-        self.moe = SparseMoE(cfg)
+
+        # dense 基线模式：用单个稠密 SwiGLU FFN 替代 SparseMoE，
+        # 其余结构（注意力、残差、归一化）与 MoE 模式完全一致，
+        # 用于隔离「MoE + 中间层循环」本身带来的收益。
+        self.is_dense = cfg.mode == "dense"
+
+        if self.is_dense:
+            self.ffn = Expert(
+                cfg.d_model,
+                cfg.effective_dense_fnn_hidden,
+            )
+            self.moe = None
+        else:
+            self.ffn = None
+            self.moe = SparseMoE(cfg)
 
         self.residual_scale = cfg.residual_scale
 
@@ -917,6 +965,19 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # dense 基线：无路由，无辅助损失；top_k 参数被忽略，
+        # 保持与 MoE 模式一致的调用签名。
+        if self.is_dense:
+            y = self.ffn(self.norm_moe(x))
+            return (
+                torch.add(
+                    x,
+                    y,
+                    alpha=self.residual_scale,
+                ),
+                x.new_zeros(()),
+            )
+
         expert_outputs, top_weights, _, aux_loss = (
             self.moe.unmerged(
                 self.norm_moe(x),
@@ -1101,6 +1162,13 @@ class LanguageModel(nn.Module):
         super().__init__()
 
         cfg.validate()
+
+        if cfg.mode not in Config.MODEL_MODES:
+            raise ValueError(
+                f"LanguageModel 不支持 mode={cfg.mode}"
+                "（ngram 等统计基线不走本类）"
+            )
+
         self.cfg = cfg
 
         self.token_embedding = nn.Embedding(
@@ -1262,9 +1330,22 @@ class LanguageModel(nn.Module):
         middle = self.middle_blocks
 
         # ----------------------------------------------------
+        # Dense baseline: 纯稠密 Transformer，每个 Block 只
+        # 执行一次，无 MoE、无中间层循环。
+        # ----------------------------------------------------
+        if cfg.mode == "dense":
+            for index in range(cfg.n_layers):
+                x, aux = call(
+                    blocks[index],
+                    x,
+                    cfg.top_k,
+                )
+                aux_losses.append(aux)
+
+        # ----------------------------------------------------
         # Original SMELT
         # ----------------------------------------------------
-        if cfg.mode == "smelt":
+        elif cfg.mode == "smelt":
             for _ in range(2):
                 for block in middle:
                     x, aux = call(
@@ -2040,6 +2121,268 @@ def print_data_audit(report: Dict[str, object]) -> None:
 
 
 # ============================================================
+# Class-imbalance-aware metrics
+# ============================================================
+#
+# 指标口径说明（多分类、类别不平衡场景）：
+# - 下一 token 预测是 256 类单标签多分类问题，字节分布天然
+#   高度不平衡（空格/换行/常见字母 vs 罕见控制字节）；
+# - token accuracy 单独看会被高频字节抬高，必须与
+#   majority_accuracy（常数预测器参考）对照解读，并用
+#   macro / weighted F1 补充逐类视角；
+# - 单标签多分类下 micro-F1 数值恒等于 token accuracy，
+#   两者都保留是为了让键名明确交代「micro」口径；
+# - macro F1 只对评估 split 中出现过的类（support > 0）
+#   求平均，避免给从未出现的字节类记 0 分拉低均值；
+# - one-vs-rest 的 macro PR-AUC / ROC-AUC 只统计 support
+#   不小于 _AUC_MIN_SUPPORT 的类。极度不平衡时优先看
+#   PR-AUC：ROC-AUC 会因负样本基数巨大、FPR 增长缓慢而
+#   给出过于乐观的分数。
+
+# macro AUC 只纳入 support 达到该阈值的字节类。
+_AUC_MIN_SUPPORT = 20
+
+# AUC 计算最多保留的评估位置数（positions × 256 类的
+# 概率矩阵会随该上限线性增长；默认验证窗口约 8 万位置，
+# 不会触顶）。超出时按窗口顺序截断并在结果中注明。
+_AUC_MAX_TOKENS = 100_000
+
+
+def confusion_matrix_metrics(
+    confusion: torch.Tensor,
+) -> Dict[str, float]:
+    """
+    从 [n_classes, n_classes] 混淆矩阵（行 = 目标类，
+    列 = 预测类）计算 token accuracy 与 micro / macro /
+    weighted F1，以及多数类参考 accuracy。
+
+    返回键全部不带 split 前缀，由调用方加上
+    （val_ / test_），并保证口径在文档中显式说明：
+    - ``token_accuracy`` / ``micro_f1``：micro 口径
+      （单标签多分类下两者恒等）；
+    - ``macro_f1``：对 support > 0 的类求算术平均；
+    - ``weighted_f1``：按各类 support 加权平均；
+    - ``majority_accuracy``：把所有位置都预测成评估集
+      中最频繁字节时的 accuracy，是类别不平衡下
+      解读 accuracy 的下界参考。
+    """
+    confusion = confusion.double()
+    total = confusion.sum()
+
+    if float(total) <= 0.0:
+        return {
+            "token_accuracy": float("nan"),
+            "micro_f1": float("nan"),
+            "macro_f1": float("nan"),
+            "weighted_f1": float("nan"),
+            "majority_accuracy": float("nan"),
+            "classes_present": 0.0,
+        }
+
+    support = confusion.sum(dim=1)
+    predicted = confusion.sum(dim=0)
+    true_positive = confusion.diagonal()
+
+    precision = true_positive / predicted.clamp(min=1.0)
+    recall = true_positive / support.clamp(min=1.0)
+
+    denominator = precision + recall
+    f1 = torch.zeros_like(true_positive)
+    nonzero = denominator > 0.0
+    f1[nonzero] = (
+        2.0
+        * precision[nonzero]
+        * recall[nonzero]
+        / denominator[nonzero]
+    )
+
+    present = support > 0.0
+
+    return {
+        "token_accuracy": float(
+            true_positive.sum() / total
+        ),
+        "micro_f1": float(true_positive.sum() / total),
+        "macro_f1": float(f1[present].mean()),
+        "weighted_f1": float(
+            (f1 * support).sum() / total
+        ),
+        "majority_accuracy": float(
+            support.max() / total
+        ),
+        "classes_present": float(present.sum()),
+    }
+
+
+def _binary_roc_auc(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> Optional[float]:
+    """
+    精确处理并列分数的 Mann-Whitney ROC-AUC。
+
+    labels 为 0/1 的目标向量；正类或负类为空时返回
+    None（该类不计入 macro 平均）。
+    """
+    n = scores.numel()
+    n_pos = int(labels.sum())
+
+    if n_pos == 0 or n_pos == n:
+        return None
+
+    n_neg = n - n_pos
+
+    # 并列分数取平均秩，保证 AUC 与并列组内的随机排序
+    # 期望一致。
+    sorted_scores, order = torch.sort(scores)
+
+    change = torch.ones(n, dtype=torch.bool)
+    change[1:] = sorted_scores[1:] != sorted_scores[:-1]
+    group = torch.cumsum(change, 0) - 1
+
+    starts = torch.nonzero(change).squeeze(1)
+    ends = torch.cat(
+        [
+            starts[1:],
+            torch.tensor([n], dtype=starts.dtype),
+        ]
+    )
+
+    # 排序后第 i 个位置（0 基）的 1 基秩为 i+1；同组并列
+    # 分数共享平均秩 (start + end) / 2（1 基、右开）。
+    average_rank = (
+        starts[group] + 1 + ends[group]
+    ).float() / 2.0
+
+    positive_ranks = average_rank[
+        labels[order].bool()
+    ]
+
+    auc = (
+        positive_ranks.sum()
+        - n_pos * (n_pos + 1) / 2.0
+    ) / float(n_pos * n_neg)
+
+    return float(auc)
+
+
+def _binary_average_precision(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> Optional[float]:
+    """
+    单类 one-vs-rest 的 average precision（PR-AUC）。
+
+    按相异分数阈值分步累计（与 sklearn
+    average_precision_score 的阶梯式口径一致）；正类为空
+    时返回 None。
+    """
+    n_pos = int(labels.sum())
+
+    if n_pos == 0:
+        return None
+
+    order = torch.argsort(scores, descending=True)
+    sorted_labels = labels[order].double()
+    sorted_scores = scores[order]
+
+    n = labels.numel()
+    positions = torch.arange(
+        1,
+        n + 1,
+        dtype=torch.float64,
+    )
+
+    # 每个相异分数阈值组结束位置的累计真正例数。
+    hits = torch.cumsum(sorted_labels, 0)
+
+    # 组边界：分数变化处的下一个位置是该组的结束位置
+    # （1 基）；最后一组以 n 结束。
+    boundary = torch.ones(n, dtype=torch.bool)
+    boundary[:-1] = (
+        sorted_scores[1:] != sorted_scores[:-1]
+    )
+    boundary_indices = torch.nonzero(boundary).squeeze(1)
+
+    tp = hits[boundary_indices]
+    ranks = positions[boundary_indices]
+
+    precision = tp / ranks
+    recall = tp / float(n_pos)
+
+    # AP = Σ (R_i − R_{i−1}) × Precision_i。
+    recall_gain = torch.cat(
+        [
+            recall[:1],
+            recall[1:] - recall[:-1],
+        ]
+    )
+
+    return float((recall_gain * precision).sum())
+
+
+def macro_auc_metrics(
+    probabilities: torch.Tensor,
+    targets: torch.Tensor,
+    vocab_size: int,
+    min_support: int = _AUC_MIN_SUPPORT,
+) -> Dict[str, object]:
+    """
+    one-vs-rest 的 macro PR-AUC 与 ROC-AUC。
+
+    probabilities: [n_tokens, vocab] 的预测分布；
+    targets: [n_tokens] 的目标类。只统计 support 达到
+    min_support 的类，返回值同时记录纳入类数，保证
+    「macro」的口径（对哪些类求平均）可追溯。
+
+    极度不平衡时优先报告 PR-AUC：负样本基数巨大时
+    ROC-AUC 的 FPR 分母被拉大，同样的假阳性绝对数量下
+    分数增长缓慢，容易给出过于乐观的结论。
+    """
+    probabilities = probabilities.detach().cpu().float()
+    targets = targets.detach().cpu()
+
+    support = torch.bincount(
+        targets,
+        minlength=vocab_size,
+    )
+    eligible = torch.nonzero(
+        support >= min_support
+    ).squeeze(1)
+
+    pr_aucs: List[float] = []
+    roc_aucs: List[float] = []
+
+    for class_index in eligible.tolist():
+        labels = (targets == class_index).double()
+        scores = probabilities[:, class_index]
+
+        pr = _binary_average_precision(scores, labels)
+        if pr is not None:
+            pr_aucs.append(pr)
+
+        roc = _binary_roc_auc(scores, labels)
+        if roc is not None:
+            roc_aucs.append(roc)
+
+    return {
+        "pr_auc_macro": (
+            sum(pr_aucs) / len(pr_aucs)
+            if pr_aucs
+            else None
+        ),
+        "roc_auc_macro": (
+            sum(roc_aucs) / len(roc_aucs)
+            if roc_aucs
+            else None
+        ),
+        "auc_n_classes": len(roc_aucs),
+        "auc_min_support": min_support,
+        "auc_tokens_evaluated": int(targets.numel()),
+    }
+
+
+# ============================================================
 # Evaluation
 # ============================================================
 
@@ -2053,13 +2396,34 @@ def evaluate(
     device: torch.device,
     amp_dtype: Optional[torch.dtype] = None,
     split: str = "val",
+    compute_auc: bool = False,
 ) -> Dict[str, float]:
     """
-    在指定评估 split 上计算加权平均语言模型损失。
+    在指定评估 split 上计算加权平均语言模型损失与
+    类别不平衡感知的分类指标。
 
     split 仅允许 val/test：val 用于训练期间的周期验证与选型，
     test 只在最终评估时调用一次；返回指标键带 split 前缀
     （val_loss/test_loss 等）。
+
+    每次评估都基于同一批固定窗口累计混淆矩阵，并报告：
+
+    - ``{split}_loss`` / ``{split}_ppl`` /
+      ``{split}_bits_per_byte``：主指标（与 LM 研究目标
+      对齐的似然口径）；
+    - ``{split}_token_accuracy``（= micro 口径）与
+      ``{split}_micro_f1``：单标签多分类下两者恒等；
+    - ``{split}_macro_f1`` / ``{split}_weighted_f1``：
+      必须注明平均口径，macro 只对评估集中出现过的类
+      求平均；
+    - ``{split}_majority_accuracy``：常数预测器（永远
+      猜最高频字节）的 accuracy，类别不平衡下解读
+      accuracy 的参考下界。
+
+    compute_auc=True 时（最终/测试评估）额外计算
+    one-vs-rest 的 ``{split}_pr_auc_macro`` 与
+    ``{split}_roc_auc_macro``，只纳入 support 达到
+    _AUC_MIN_SUPPORT 的类；极度不平衡时优先看 PR-AUC。
     """
     was_training = model.training
     model.eval()
@@ -2072,6 +2436,8 @@ def evaluate(
     # split 仅允许 val/test：val 用于训练期间的周期验证与选型，
     # test 只在最终评估时调用一次。
 
+    vocab_size = _unwrap_model(model).cfg.vocab_size
+
     # 按目标 token 数加权累加。
     total = torch.zeros(
         (),
@@ -2079,6 +2445,19 @@ def evaluate(
         dtype=torch.float32,
     )
     evaluated_tokens = 0
+
+    # 混淆矩阵 [目标类, 预测类]，在评估设备上累积。
+    confusion = torch.zeros(
+        (vocab_size, vocab_size),
+        device=device,
+        dtype=torch.float64,
+    )
+
+    # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
+    # 并按 _AUC_MAX_TOKENS 封顶防止内存失控。
+    collected_probs: List[torch.Tensor] = []
+    collected_targets: List[torch.Tensor] = []
+    auc_tokens = 0
 
     try:
         with torch.autocast(
@@ -2101,8 +2480,42 @@ def evaluate(
 
                 result = model(x, y)
 
-                # logits 在前向返回后不再使用。
-                result.pop("logits", None)
+                # 混淆矩阵与 AUC 在 fp32 下统计，避免半精度
+                # argmax/softmax 的数值噪声影响逐类指标。
+                logits = result.pop(
+                    "logits",
+                ).float()
+
+                predicted = logits.argmax(dim=-1)
+                flat_target = y.reshape(-1).to(
+                    torch.int64
+                )
+                flat_predicted = predicted.reshape(-1)
+
+                confusion += torch.bincount(
+                    flat_target * vocab_size
+                    + flat_predicted,
+                    minlength=vocab_size ** 2,
+                ).view(
+                    vocab_size,
+                    vocab_size,
+                ).double()
+
+                if compute_auc and (
+                    auc_tokens < _AUC_MAX_TOKENS
+                ):
+                    probs = F.softmax(
+                        logits,
+                        dim=-1,
+                    ).reshape(
+                        -1,
+                        vocab_size,
+                    ).cpu()
+                    collected_probs.append(probs)
+                    collected_targets.append(
+                        flat_target.cpu()
+                    )
+                    auc_tokens += flat_target.numel()
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
                 # add_(alpha=) 完成「乘 token 数 + 累加」。
@@ -2111,7 +2524,7 @@ def evaluate(
                     alpha=float(y.numel()),
                 )
                 evaluated_tokens += y.numel()
-                del result, x, y
+                del result, logits, x, y
     finally:
         # 无论评估是否中途出错，都恢复原来的训练模式。
         model.train(was_training)
@@ -2119,11 +2532,978 @@ def evaluate(
     # ByteDataset 保证至少有一个合法评估起点。
     loss = (total / evaluated_tokens).item()
 
-    return {
+    metrics = {
         f"{split}_loss": loss,
         f"{split}_ppl": math.exp(min(loss, 80.0)),
         f"{split}_bits_per_byte": loss / math.log(2.0),
     }
+
+    class_metrics = confusion_matrix_metrics(confusion)
+
+    for key, value in class_metrics.items():
+        metrics[f"{split}_{key}"] = value
+
+    if compute_auc:
+        if collected_probs:
+            auc_metrics = macro_auc_metrics(
+                torch.cat(collected_probs),
+                torch.cat(collected_targets),
+                vocab_size,
+            )
+            for key, value in auc_metrics.items():
+                metrics[f"{split}_{key}"] = value
+        else:
+            # 空评估（理论上不可达）：显式记录而不是
+            # 静默缺键。
+            metrics[f"{split}_pr_auc_macro"] = None
+            metrics[f"{split}_roc_auc_macro"] = None
+            metrics[f"{split}_auc_n_classes"] = 0
+            metrics[f"{split}_auc_min_support"] = (
+                _AUC_MIN_SUPPORT
+            )
+            metrics[f"{split}_auc_tokens_evaluated"] = 0
+
+    return metrics
+
+
+# ============================================================
+# Trivial reference baselines (uniform / unigram)
+# ============================================================
+
+@torch.inference_mode()
+def compute_reference_baselines(
+    dataset: ByteDataset,
+    batch_size: int,
+    batches: int,
+    device: torch.device,
+    split: str = "val",
+) -> Dict[str, object]:
+    """
+    在与模型评估完全相同的固定窗口上计算两个「稻草人之下」
+    的参考基线，作为解读指标的坐标系：
+
+    - uniform：每个字节等概率 1/256，NLL = ln(256)，是
+      任何模型必须显著低于的绝对下限；
+    - unigram：只用 train split 的字节频率做无上下文预测
+      （Laplace 平滑，统计量只在 train 上 fit），对应
+      「类别不平衡下常数/多数类预测器」的视角——它的
+      token accuracy 已经有相当份额，单看 accuracy 无法
+      判断模型是否真的学到了上下文信息。
+
+    返回 uniform / unigram 在指定 split 上的 loss、
+    accuracy、micro/macro/weighted F1 与多数类参考
+    accuracy，随 config.json / metrics.jsonl 存档。
+    训练曲线诊断把「是否学到东西」的欠拟合参照从
+    uniform 换成更强的 unigram，避免只战胜稻草人。
+    """
+    # 字节级管线的词表固定为 256。
+    vocab_size = 256
+
+    # unigram 统计量只在 train 上 fit。
+    train_counts = torch.bincount(
+        dataset.train.to(torch.int64),
+        minlength=vocab_size,
+    ).double()
+    train_total = float(train_counts.sum())
+
+    unigram_probs = (
+        train_counts + 1.0
+    ) / (train_total + vocab_size)
+    uniform_probs = torch.full(
+        (vocab_size,),
+        1.0 / vocab_size,
+        dtype=torch.float64,
+    )
+
+    unigram_prediction = int(train_counts.argmax())
+
+    uniform_total = 0.0
+    unigram_total = 0.0
+    evaluated_tokens = 0
+
+    confusion = torch.zeros(
+        (vocab_size, vocab_size),
+        dtype=torch.float64,
+    )
+
+    for batch_index in range(batches):
+        x, y = dataset.fixed_eval_batch(
+            split,
+            batch_index,
+            batches,
+            batch_size,
+            device,
+        )
+
+        if x.size(0) == 0:
+            break
+
+        flat_target = y.reshape(-1).to(torch.int64)
+
+        uniform_total += float(
+            -uniform_probs[flat_target].log().sum()
+        )
+        unigram_total += float(
+            -unigram_probs[flat_target].log().sum()
+        )
+        evaluated_tokens += flat_target.numel()
+
+        # unigram 预测器对所有位置输出同一个字节。
+        predicted = torch.full_like(
+            flat_target,
+            unigram_prediction,
+        )
+        confusion += torch.bincount(
+            flat_target * vocab_size + predicted,
+            minlength=vocab_size ** 2,
+        ).view(vocab_size, vocab_size).double()
+
+    loss_uniform = uniform_total / evaluated_tokens
+    loss_unigram = unigram_total / evaluated_tokens
+
+    class_metrics = confusion_matrix_metrics(confusion)
+
+    return {
+        "split": split,
+        "tokens_evaluated": evaluated_tokens,
+        "uniform_loss": loss_uniform,
+        "unigram_loss": loss_unigram,
+        "unigram_train_bytes": int(train_total),
+        "majority_byte": unigram_prediction,
+        "unigram_token_accuracy": class_metrics[
+            "token_accuracy"
+        ],
+        "unigram_majority_accuracy": class_metrics[
+            "majority_accuracy"
+        ],
+        "unigram_macro_f1": class_metrics["macro_f1"],
+        "unigram_weighted_f1": class_metrics[
+            "weighted_f1"
+        ],
+    }
+
+
+# ============================================================
+# N-gram statistical baseline (最简基线，先于任何神经模型)
+# ============================================================
+#
+# 方法论要求：复杂模型必须显著战胜「精心调优过的简单基线」
+# 才有说服力。本节实现字节级 n-gram 统计基线：
+#
+# - 计数只在 train split 上做（无泄露），评估用与神经模型
+#   完全相同的固定窗口协议；
+# - 插值平滑 P_o(c|ctx) =
+#       (count(ctx,c) + α·P_{o-1}(c|ctx')) / (count(ctx) + α)，
+#   一路回退到 uniform；阶数 o 与平滑系数 α 在 val 上
+#   网格调优（简单基线同样要充分调优，而不是随便跑一档）；
+# - test 只在显式 --evaluate-test 时用 val 上选出的
+#   (o, α) 评估一次，绝不在 test 上调参。
+
+# 上下文 + 目标按字节精确打包进 int64，7 个字节（56 bit）
+# 是不越界的上限；更大的阶数需要哈希，超出即报错。
+_NGRAM_MAX_ORDER = 7
+
+# 每阶计数使用的最大训练窗口数；超过时按等距步长抽样，
+# 在大语料上控制计数内存与排序开销（抽样是确定性的）。
+_NGRAM_COUNT_CAP = 4_000_000
+
+
+class NgramBaseline:
+    """
+    字节级插值 n-gram 基线（含 unigram）。
+
+    每个阶 o 存三张有序表（torch.unique 保证升序）：
+    - pair_keys / pair_counts：(ctx, c) 对的键
+      （ctx*256 + c）与计数；
+    - ctx_uniq / ctx_counts：ctx 键与出现次数。
+
+    键按升序排列使得同一 ctx 的所有 (ctx, c) 对在
+    pair_keys 中连续，查询用 searchsorted 完成。
+    """
+
+    def __init__(
+        self,
+        train_bytes: torch.Tensor,
+        max_order: int,
+        count_cap: int = _NGRAM_COUNT_CAP,
+    ):
+        if not 1 <= max_order <= _NGRAM_MAX_ORDER:
+            raise ValueError(
+                "n-gram 阶数必须落在 "
+                f"[1, {_NGRAM_MAX_ORDER}]（字节精确打包"
+                "的 int64 上限）"
+            )
+
+        self.max_order = max_order
+        self.vocab_size = 256
+
+        data = train_bytes
+        n_train = data.numel()
+
+        self.levels: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        for order in range(1, max_order + 1):
+            if n_train < order:
+                # 语料比阶数还短：该阶没有可计数的窗口，
+                # 查询时自然回退到低阶。
+                self.levels[order] = {
+                    "pair_keys": torch.empty(
+                        0,
+                        dtype=torch.int64,
+                    ),
+                    "pair_counts": torch.empty(
+                        0,
+                        dtype=torch.int64,
+                    ),
+                    "ctx_uniq": torch.empty(
+                        0,
+                        dtype=torch.int64,
+                    ),
+                    "ctx_counts": torch.empty(
+                        0,
+                        dtype=torch.int64,
+                    ),
+                }
+                continue
+
+            num_windows = n_train - order + 1
+            stride = max(
+                1,
+                math.ceil(num_windows / count_cap),
+            )
+
+            # data.unfold(0, order, 1) 是 [num_windows, order]
+            # 的滑动窗口视图；按步长取行仍是视图，打包时
+            # 才产生 int64 张量。
+            windows = data.unfold(0, order, 1)[::stride]
+
+            keys = windows[:, 0].to(torch.int64)
+            for column in range(1, order):
+                keys = keys * 256 + windows[
+                    :, column
+                ].to(torch.int64)
+
+            pair_keys, pair_counts = torch.unique(
+                keys,
+                return_counts=True,
+            )
+
+            ctx_keys = pair_keys // 256
+
+            ctx_uniq, inverse = torch.unique(
+                ctx_keys,
+                return_inverse=True,
+            )
+            ctx_counts = torch.zeros(
+                ctx_uniq.numel(),
+                dtype=torch.int64,
+            ).scatter_add_(
+                0,
+                inverse,
+                pair_counts,
+            )
+
+            self.levels[order] = {
+                "pair_keys": pair_keys,
+                "pair_counts": pair_counts,
+                "ctx_uniq": ctx_uniq,
+                "ctx_counts": ctx_counts,
+            }
+
+        # unigram 总计数（level 1 的 ctx 计数），用于
+        # 参考/归一。
+        first = self.levels[1]
+        if first["ctx_uniq"].numel():
+            self.train_total = int(
+                first["ctx_counts"][0]
+            )
+        else:
+            self.train_total = 0
+
+    def _pack_context(
+        self,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        [n, ctx_len] 字节矩阵打包成 [n] 的 int64 键。
+        """
+        keys = context[:, 0].to(torch.int64)
+        for column in range(1, context.size(1)):
+            keys = keys * 256 + context[
+                :, column
+            ].to(torch.int64)
+        return keys
+
+    def _valid_contexts(
+        self,
+        windows: torch.Tensor,
+        order: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        """
+        返回给定阶数下每个有效位置的 (ctx 键, 扁平位置)。
+
+        目标 y[t] = w[t+1]；长度 order-1 的上下文需要
+        t+1-(order-1) >= 0，即 t >= order-2。
+        """
+        batch, total_len = windows.shape
+        seq_len = total_len - 1
+        n_positions = batch * seq_len
+
+        if order == 1:
+            return (
+                torch.zeros(
+                    n_positions,
+                    dtype=torch.int64,
+                ),
+                torch.arange(n_positions),
+                n_positions,
+            )
+
+        context_len = order - 1
+        t_min = context_len - 1
+        n_valid = seq_len - t_min
+
+        # windows.unfold(1, ctx_len, 1) 的第 j 列是
+        # w[:, j : j+ctx_len]；目标 t 对应 j = t+1-ctx_len，
+        # j 取值范围 [0, seq_len - ctx_len] = [0, n_valid-1]。
+        contexts = windows.unfold(
+            1,
+            context_len,
+            1,
+        )[:, :n_valid].reshape(-1, context_len)
+
+        batch_index = torch.arange(
+            batch,
+        ).repeat_interleave(n_valid)
+        offsets = (
+            torch.arange(n_valid) + t_min
+        ).repeat(batch)
+
+        positions = batch_index * seq_len + offsets
+
+        return (
+            self._pack_context(contexts),
+            positions,
+            n_valid,
+        )
+
+    @staticmethod
+    def _lookup(
+        sorted_keys: torch.Tensor,
+        values: torch.Tensor,
+        queries: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        在有序键值表中查询，未命中返回 0。
+        """
+        if sorted_keys.numel() == 0:
+            return torch.zeros_like(queries)
+
+        locations = torch.searchsorted(
+            sorted_keys,
+            queries,
+        )
+        locations = locations.clamp(
+            max=sorted_keys.numel() - 1,
+        )
+        found = sorted_keys[locations] == queries
+        return torch.where(
+            found,
+            values[locations],
+            torch.zeros_like(values[locations]),
+        )
+
+    def target_log_probs_per_level(
+        self,
+        windows: torch.Tensor,
+        alpha: float,
+    ) -> torch.Tensor:
+        """
+        对一批窗口 [batch, seq_len + 1] 计算每个阶数
+        （1..max_order）下目标字节的 log 概率。
+
+        返回 [max_order, batch*seq_len]：第 o-1 行是
+        「最高可用阶不超过 o」的回退模型在每个位置目标
+        字节的 log 概率——上下文不足或从未见过的位置
+        自动回退到低阶，供网格调优一次性拿到所有候选
+        阶数的损失。
+        """
+        batch, total_len = windows.shape
+        seq_len = total_len - 1
+        n_positions = batch * seq_len
+
+        targets = windows[
+            :, 1:
+        ].reshape(-1).to(torch.int64)
+
+        log_probs = torch.zeros(
+            (self.max_order, n_positions),
+            dtype=torch.float64,
+        )
+
+        # level 0 的目标概率：uniform。
+        probability = torch.full(
+            (n_positions,),
+            1.0 / self.vocab_size,
+            dtype=torch.float64,
+        )
+
+        for order in range(1, self.max_order + 1):
+            level = self.levels[order]
+
+            ctx_keys, positions, _ = (
+                self._valid_contexts(windows, order)
+            )
+
+            if positions.numel() == 0:
+                # 窗口比阶还短：整阶保持低阶回退值。
+                if order > 1:
+                    log_probs[order - 1] = log_probs[
+                        order - 2
+                    ]
+                continue
+
+            n_ctx = self._lookup(
+                level["ctx_uniq"],
+                level["ctx_counts"],
+                ctx_keys,
+            ).double()
+
+            pair_keys = ctx_keys * 256 + targets[
+                positions
+            ]
+            count_pair = self._lookup(
+                level["pair_keys"],
+                level["pair_counts"],
+                pair_keys,
+            ).double()
+
+            interpolated = (
+                count_pair
+                + alpha * probability[positions]
+            ) / (n_ctx + alpha)
+
+            row = log_probs[order - 1]
+            row[positions] = interpolated.log()
+
+            if order > 1:
+                # 上下文不足的位置保持低阶值。
+                mask = torch.ones(
+                    n_positions,
+                    dtype=torch.bool,
+                )
+                mask[positions] = False
+                row[mask] = log_probs[order - 2][mask]
+
+            probability = probability.clone()
+            probability[positions] = interpolated
+
+        return log_probs
+
+    def position_distributions(
+        self,
+        windows: torch.Tensor,
+        alpha: float,
+        order: int,
+    ) -> torch.Tensor:
+        """
+        返回「最高可用阶不超过 order」的回退模型在每个
+        位置的完整 [batch*seq_len, vocab] 概率分布，
+        用于最终评估的 argmax / F1 / AUC 指标。
+        """
+        batch, total_len = windows.shape
+        seq_len = total_len - 1
+        n_positions = batch * seq_len
+
+        probabilities = torch.full(
+            (n_positions, self.vocab_size),
+            1.0 / self.vocab_size,
+            dtype=torch.float64,
+        )
+
+        for current in range(1, order + 1):
+            level = self.levels[current]
+
+            ctx_keys, positions, _ = (
+                self._valid_contexts(
+                    windows,
+                    current,
+                )
+            )
+
+            if positions.numel() == 0:
+                continue
+
+            n_ctx = self._lookup(
+                level["ctx_uniq"],
+                level["ctx_counts"],
+                ctx_keys,
+            ).double()
+
+            if n_ctx.numel() and (
+                level["pair_keys"].numel() == 0
+            ):
+                # 该阶没有任何计数：分布保持低阶回退。
+                continue
+
+            denominator = n_ctx + alpha
+
+            updated = probabilities[
+                positions
+            ] * (alpha / denominator.unsqueeze(1))
+
+            # 同一 ctx 的 (ctx, c) 对在升序 pair_keys 中
+            # 连续：散射该 ctx 的全部非零计数行。
+            starts = torch.searchsorted(
+                level["pair_keys"],
+                ctx_keys * 256,
+            )
+            ends = torch.searchsorted(
+                level["pair_keys"],
+                (ctx_keys + 1) * 256,
+            )
+            lengths = (ends - starts).clamp(min=0)
+
+            total_nnz = int(lengths.sum())
+
+            if total_nnz > 0:
+                row_of = torch.repeat_interleave(
+                    torch.arange(
+                        positions.numel(),
+                        dtype=torch.int64,
+                    ),
+                    lengths,
+                )
+                offsets = torch.cumsum(lengths, 0) - (
+                    lengths
+                )
+                intra = torch.arange(total_nnz) - (
+                    offsets[row_of]
+                )
+                flat_index = starts[row_of] + intra
+
+                classes = level["pair_keys"][
+                    flat_index
+                ] % 256
+                counts = level["pair_counts"][
+                    flat_index
+                ].double()
+
+                updated.index_put_(
+                    (row_of, classes),
+                    counts
+                    / denominator[row_of],
+                    accumulate=True,
+                )
+
+            probabilities[positions] = updated
+
+        return probabilities
+
+
+def _ngram_eval_batches(
+    dataset: ByteDataset,
+    split: str,
+    batch_size: int,
+    batches: int,
+) -> List[torch.Tensor]:
+    """
+    收集指定评估 split 的全部固定窗口（CPU uint8，
+    [batch, seq_len + 1]），供 n-gram 评估复用。
+    """
+    cpu = torch.device("cpu")
+    windows: List[torch.Tensor] = []
+
+    for batch_index in range(batches):
+        x, y = dataset.fixed_eval_batch(
+            split,
+            batch_index,
+            batches,
+            batch_size,
+            cpu,
+        )
+
+        if x.size(0) == 0:
+            break
+
+        windows.append(
+            torch.cat(
+                [
+                    x[:, :1].to(torch.uint8),
+                    y,
+                ],
+                dim=1,
+            )
+        )
+
+    return windows
+
+
+def _ngram_extended_metrics(
+    model: NgramBaseline,
+    windows: List[torch.Tensor],
+    alpha: float,
+    order: int,
+    split: str,
+) -> Dict[str, object]:
+    """
+    用调优好的 (order, alpha) 在固定窗口上计算与神经模型
+    evaluate() 完全同口径的指标：loss / ppl / bits_per_byte、
+    token accuracy（micro）、macro / weighted F1、多数类
+    参考，以及 one-vs-rest 的 macro PR-AUC / ROC-AUC。
+    """
+    vocab_size = model.vocab_size
+
+    total_nll = 0.0
+    evaluated_tokens = 0
+
+    confusion = torch.zeros(
+        (vocab_size, vocab_size),
+        dtype=torch.float64,
+    )
+
+    collected_probs: List[torch.Tensor] = []
+    collected_targets: List[torch.Tensor] = []
+    auc_tokens = 0
+
+    for window in windows:
+        distributions = model.position_distributions(
+            window,
+            alpha,
+            order,
+        )
+
+        targets = window[:, 1:].reshape(-1).to(
+            torch.int64
+        )
+        probabilities = distributions
+
+        target_probs = probabilities[
+            torch.arange(targets.numel()),
+            targets,
+        ]
+
+        total_nll += float(
+            -target_probs.clamp_min(1e-300).log().sum()
+        )
+        evaluated_tokens += targets.numel()
+
+        predicted = probabilities.argmax(dim=1)
+
+        confusion += torch.bincount(
+            targets * vocab_size + predicted,
+            minlength=vocab_size ** 2,
+        ).view(vocab_size, vocab_size).double()
+
+        if auc_tokens < _AUC_MAX_TOKENS:
+            collected_probs.append(
+                probabilities.to(torch.float32)
+            )
+            collected_targets.append(targets)
+            auc_tokens += targets.numel()
+
+    loss = total_nll / evaluated_tokens
+
+    metrics: Dict[str, object] = {
+        f"{split}_loss": loss,
+        f"{split}_ppl": math.exp(min(loss, 80.0)),
+        f"{split}_bits_per_byte": loss / math.log(2.0),
+    }
+
+    class_metrics = confusion_matrix_metrics(confusion)
+
+    for key, value in class_metrics.items():
+        metrics[f"{split}_{key}"] = value
+
+    if collected_probs:
+        auc_metrics = macro_auc_metrics(
+            torch.cat(collected_probs),
+            torch.cat(collected_targets),
+            vocab_size,
+        )
+        for key, value in auc_metrics.items():
+            metrics[f"{split}_{key}"] = value
+
+    return metrics
+
+
+def run_statistical_baseline(
+    args: argparse.Namespace,
+    dataset: ByteDataset,
+    out_dir: Path,
+    device: torch.device,
+    data_audit: Optional[Dict[str, object]],
+) -> None:
+    """
+    统计基线入口：计数（train）→ val 网格调优
+    （阶数 × 平滑系数）→ 选出最优配置 → 与神经模型同口径
+    的 val（及一次性 test）指标，写入与训练运行相同结构的
+    config.json / metrics.jsonl，可直接进入 --compare。
+    """
+    del device  # n-gram 全部在 CPU 上完成。
+
+    alpha_grid: List[float] = list(args.ngram_alpha_grid)
+
+    print(
+        "[ngram] 在 train split 上计数 "
+        f"({dataset.train.numel():,} 字节, "
+        f"max_order={args.ngram_max_order}, "
+        f"count_cap={_NGRAM_COUNT_CAP:,})"
+    )
+
+    model = NgramBaseline(
+        dataset.train,
+        max_order=args.ngram_max_order,
+    )
+
+    val_windows = _ngram_eval_batches(
+        dataset,
+        "val",
+        args.batch_size,
+        args.eval_batches,
+    )
+
+    if not val_windows:
+        raise SystemExit(
+            "验证集固定窗口为空，无法调优统计基线"
+        )
+
+    # ---- 参考基线（uniform / unigram），与训练运行同款 ----
+    reference = compute_reference_baselines(
+        dataset,
+        args.batch_size,
+        args.eval_batches,
+        torch.device("cpu"),
+        split="val",
+    )
+
+    print(
+        "[ngram] 参考基线: uniform_loss="
+        f"{reference['uniform_loss']:.4f}, "
+        "unigram_loss="
+        f"{reference['unigram_loss']:.4f}"
+    )
+
+    metrics_path = out_dir / "metrics.jsonl"
+    metrics_file = open(
+        metrics_path,
+        "w",
+        encoding="utf-8",
+    )
+
+    def _write(record: Dict[str, object]) -> None:
+        metrics_file.write(
+            json.dumps(
+                _json_safe(record),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
+
+    _write({
+        "step": "reference_baselines",
+        **reference,
+    })
+
+    # ---- 网格调优：α 每档一遍窗口，同时拿到所有阶数损失 ----
+    candidates: List[Dict[str, object]] = []
+
+    for alpha in alpha_grid:
+        totals = torch.zeros(model.max_order)
+        tokens = 0
+
+        for window in val_windows:
+            log_probs = (
+                model.target_log_probs_per_level(
+                    window,
+                    alpha,
+                )
+            )
+            totals += -log_probs.sum(dim=1)
+            tokens += log_probs.size(1)
+
+        for order in range(1, model.max_order + 1):
+            val_loss = float(
+                totals[order - 1] / tokens
+            )
+            record = {
+                "step": "baseline_sweep",
+                "order": order,
+                "alpha": alpha,
+                "val_loss": val_loss,
+                "val_ppl": math.exp(
+                    min(val_loss, 80.0)
+                ),
+                "val_bits_per_byte": val_loss
+                / math.log(2.0),
+                "tokens_evaluated": tokens,
+            }
+            _write(record)
+            candidates.append(record)
+
+        print(
+            "[ngram] alpha="
+            f"{alpha:g}: "
+            + ", ".join(
+                f"order {row['order']}="
+                f"{row['val_loss']:.4f}"
+                for row in candidates[
+                    -model.max_order:
+                ]
+            )
+        )
+
+    # val 上选最优；并列时偏向更小的阶数与更小的 alpha
+    # （简单优先，避免在验证集上过拟合出复杂配置）。
+    best = min(
+        candidates,
+        key=lambda row: (
+            row["val_loss"],
+            row["order"],
+            row["alpha"],
+        ),
+    )
+
+    best_order = int(best["order"])
+    best_alpha = float(best["alpha"])
+
+    print(
+        "[ngram] val 调优结果: order="
+        f"{best_order}, alpha={best_alpha:g}, "
+        f"val_loss={best['val_loss']:.4f}"
+    )
+
+    # ---- 用调优好的配置算同口径完整指标 ----
+    final_metrics = _ngram_extended_metrics(
+        model,
+        val_windows,
+        best_alpha,
+        best_order,
+        split="val",
+    )
+
+    final_record = {
+        "step": "final",
+        "model": "ngram",
+        "ngram_order": best_order,
+        "ngram_alpha": best_alpha,
+        "ngram_max_order": args.ngram_max_order,
+        **final_metrics,
+    }
+
+    _write(final_record)
+    print(
+        json.dumps(
+            _json_safe({"final": final_record}),
+            ensure_ascii=False,
+        )
+    )
+
+    # ---- 一次性 test 评估（沿用训练运行同一封存协议）----
+    # 注意：本入口每次运行都会新建输出目录语义（metrics.jsonl
+    # 截断重写），test 只在显式 --evaluate-test 时评估一次，
+    # 且 (order, alpha) 完全沿用 val 上调优的结果，绝不在
+    # test 上二次调参。
+    if args.evaluate_test:
+        if not dataset.has_test:
+            raise SystemExit(
+                "--evaluate-test 需要有效的测试集："
+                "请设置正的 --test-fraction 且语料足够长"
+            )
+
+        test_audit = audit_data_splits(
+            dataset,
+            include_test=True,
+        )
+        print_data_audit(test_audit)
+
+        test_windows = _ngram_eval_batches(
+            dataset,
+            "test",
+            args.batch_size,
+            args.eval_batches,
+        )
+
+        test_metrics = _ngram_extended_metrics(
+            model,
+            test_windows,
+            best_alpha,
+            best_order,
+            split="test",
+        )
+
+        _write({
+            "step": "test",
+            "model": "ngram",
+            "ngram_order": best_order,
+            "ngram_alpha": best_alpha,
+            **test_metrics,
+            "data_audit": test_audit,
+        })
+
+        print(
+            json.dumps(
+                _json_safe({"test": test_metrics}),
+                ensure_ascii=False,
+            )
+        )
+
+    metrics_file.close()
+
+    # ---- config.json：与训练运行相同结构，可直接 --compare ----
+    payload = {
+        "config": {
+            "mode": "ngram",
+            "vocab_size": 256,
+            "seq_len": dataset.seq_len,
+            "ngram_max_order": args.ngram_max_order,
+            "ngram_alpha_grid": alpha_grid,
+            "ngram_order": best_order,
+            "ngram_alpha": best_alpha,
+        },
+        "args": {
+            key: value
+            for key, value in vars(args).items()
+            if key
+            not in {
+                "data_sha256",
+                "data_bytes",
+                "data_val_fraction",
+                "data_test_fraction",
+            }
+        },
+        "n_params": 0,
+        "data": {
+            "path": args.data,
+            "sha256": dataset.data_sha256,
+            "bytes": dataset.num_bytes,
+            "val_fraction": dataset.val_fraction,
+            "test_fraction": dataset.test_fraction,
+        },
+        "data_audit": data_audit,
+        "reference_baselines": reference,
+        "run_metadata": collect_run_metadata(
+            torch.device("cpu")
+        ),
+        "sanity_check": None,
+    }
+
+    with open(
+        out_dir / "config.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            _json_safe(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 # ============================================================
@@ -3670,6 +5050,26 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        row["val_bits_per_byte"] = (
+            final_record.get("val_bits_per_byte")
+            if final_record is not None
+            else None
+        )
+        row["val_token_accuracy"] = (
+            final_record.get("val_token_accuracy")
+            if final_record is not None
+            else None
+        )
+        row["val_macro_f1"] = (
+            final_record.get("val_macro_f1")
+            if final_record is not None
+            else None
+        )
+        row["val_pr_auc_macro"] = (
+            final_record.get("val_pr_auc_macro")
+            if final_record is not None
+            else None
+        )
         row["test_loss"] = (
             test_record.get("test_loss")
             if test_record is not None
@@ -3692,11 +5092,20 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
 
 
 def print_comparison(rows: List[Dict[str, object]]) -> None:
-    """以对齐表格打印多个运行的汇总指标。"""
+    """
+    以对齐表格打印多个运行的汇总指标。
+
+    除 val/test loss 外同时给出 token accuracy（micro 口径）
+    与 macro F1：字节分布高度不平衡时 accuracy 会被高频
+    字节抬高，必须两类指标一起看；完整口径（micro / macro /
+    weighted、PR-AUC 等）见各运行 metrics.jsonl。
+    """
     header = (
         f"{'run':<20} {'mode':<9} {'params':>9} "
-        f"{'val_loss':>9} {'test_loss':>9} {'lat(ms)':>9} "
-        f"{'GFLOPs':>8} {'mem(MB)':>9} {'curve':<18}"
+        f"{'val_loss':>9} {'val_bpb':>8} {'acc':>6} "
+        f"{'macroF1':>8} {'test_loss':>9} "
+        f"{'lat(ms)':>9} {'GFLOPs':>8} {'mem(MB)':>9} "
+        f"{'curve':<18}"
     )
     print(header)
     print("-" * len(header))
@@ -3718,6 +5127,9 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{str(row.get('mode'))[:8]:<9} "
             f"{str(row.get('n_params')):>9} "
             f"{_value(row.get('val_loss')):>9} "
+            f"{_value(row.get('val_bits_per_byte'), '.4f'):>8} "
+            f"{_value(row.get('val_token_accuracy'), '.4f'):>6} "
+            f"{_value(row.get('val_macro_f1'), '.4f'):>8} "
             f"{_value(row.get('test_loss')):>9} "
             f"{_value(row.get('latency_ms_per_forward'), '.4f'):>9} "
             f"{gflops:>8} "
@@ -3983,16 +5395,24 @@ def write_run_config(
     run_metadata: Dict[str, object],
     sanity_result: Optional[Dict[str, object]],
     data_audit: Optional[Dict[str, object]] = None,
+    reference_baselines: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     写出 config.json：结构配置、完整超参数、参数量、数据指纹、
-    数据划分与审计结果、代码版本/运行环境，以及 sanity check
-    结果。
+    数据划分与审计结果、代码版本/运行环境、sanity check 结果、
+    本轮实验的科学假设（--hypothesis/--rq）与参考基线
+    （uniform / unigram）。
     """
     payload = {
         "config": asdict(cfg),
         "args": vars(args),
         "n_params": n_params,
+        "hypothesis": args.hypothesis,
+        "research_question": args.rq,
+        "hypothesis_check_skipped": bool(
+            args.skip_hypothesis_check
+        ),
+        "reference_baselines": reference_baselines,
         "data": {
             "path": args.data,
             "sha256": getattr(args, "data_sha256", None),
@@ -4312,12 +5732,13 @@ def run_self_test():
         (2, 8),
     )
 
-    # 所有模式都必须可以前向和反向。
+    # 所有模式都必须可以前向和反向（含 dense 简单基线）。
     for mode in (
         "smelt",
         "local_base",
         "A",
         "B",
+        "dense",
     ):
         model = LanguageModel(
             Config(
@@ -4348,6 +5769,74 @@ def run_self_test():
 
         for grad in gradients:
             assert torch.isfinite(grad).all()
+
+    # dense 基线：无 MoE、无循环——每个 Block 的 attention
+    # 与 FFN 恰好各执行一次；smelt 的中间区域则执行两轮。
+    def _count_block_calls(cfg: Config) -> int:
+        probe_model = LanguageModel(cfg)
+        calls = [0]
+
+        for block in probe_model.blocks:
+            original_step = block.attention_step
+
+            def probe_attention_step(
+                inputs: torch.Tensor,
+                _original=original_step,
+            ) -> torch.Tensor:
+                calls[0] += 1
+                return _original(inputs)
+
+            block.attention_step = probe_attention_step
+
+        with torch.no_grad():
+            probe_model(x)
+
+        return calls[0]
+
+    n_layers = common["n_layers"]
+    middle_count = n_layers // 2
+
+    assert (
+        _count_block_calls(
+            Config(**common, mode="dense")
+        )
+        == n_layers
+    )
+    assert (
+        _count_block_calls(
+            Config(**common, mode="smelt")
+        )
+        == n_layers + middle_count
+    )
+
+    # dense 基线的默认 FFN 宽度 = top_k * expert_hidden
+    # （等计算口径），显式传参时以显式值为准。
+    dense_default = Config(**common, mode="dense")
+    assert (
+        dense_default.effective_dense_fnn_hidden
+        == common["top_k"] * common["expert_hidden"]
+    )
+    dense_explicit = Config(
+        **common,
+        mode="dense",
+        dense_fnn_hidden=123,
+    )
+    assert (
+        dense_explicit.effective_dense_fnn_hidden
+        == 123
+    )
+    try:
+        Config(
+            **common,
+            mode="dense",
+            dense_fnn_hidden=-1,
+        ).validate()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "非法 dense_fnn_hidden 必须被拒绝"
+        )
 
     # B 的第一轮全程使用 k1，第二轮使用 k2。
     class RouteWidthProbe(LanguageModel):
@@ -5476,6 +6965,42 @@ def run_self_test():
 # Training
 # ============================================================
 
+def hypothesis_check_error(
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """
+    假设纪律检查：全新训练必须带明确的科学假设。
+
+    返回错误消息（应交给 parser.error 报告）或 None。
+
+    --compare（只读对比）、--sanity-only（结构检查）、
+    --statistical-baseline（建立对照坐标系）与 --resume
+    （假设已记录在原运行 config.json）不受此约束；纯工程
+    目的的临时运行可用 --skip-hypothesis-check 显式跳过，
+    跳过本身会随 config.json 存档。
+    """
+    if (
+        args.compare is None
+        and not args.sanity_only
+        and not args.statistical_baseline
+        and args.resume is None
+        and not args.hypothesis.strip()
+        and not args.skip_hypothesis_check
+    ):
+        return (
+            "全新训练必须通过 --hypothesis 说明本轮实验"
+            "的科学假设（预期什么改动带来什么效果、依据"
+            "什么指标判定成败），并可用 --rq 关联研究问题；"
+            "例如：--hypothesis \"延迟合并让第二轮专家"
+            "组合独立于第一轮，验证损失相对调优 dense 基线"
+            "至少改善 2%\" --rq RQ1。"
+            "带着假设做实验，而不是排列组合超参数。"
+            "纯工程调试可用 --skip-hypothesis-check 跳过。"
+        )
+
+    return None
+
+
 def build_lr_schedule(
     optimizer: torch.optim.Optimizer,
     warmup_steps: int,
@@ -5529,7 +7054,79 @@ def main():
         "--mode",
         type=str,
         default="B",
-        choices=["smelt", "local_base", "A", "B"],
+        choices=["smelt", "local_base", "A", "B", "dense"],
+        help=(
+            "模型模式；dense 为无 MoE、无循环的纯稠密"
+            " Transformer 基线（先跑简单基线，再谈复杂模型）"
+        ),
+    )
+    parser.add_argument(
+        "--dense-fnn-hidden",
+        type=int,
+        default=None,
+        help=(
+            "dense 基线的 FFN 隐藏宽度；默认 top_k * "
+            "expert_hidden（与 MoE 单次前向激活参数量对齐"
+            "的等计算口径），等参数口径可设为 n_experts * "
+            "expert_hidden"
+        ),
+    )
+    parser.add_argument(
+        "--statistical-baseline",
+        action="store_true",
+        help=(
+            "不训练神经模型：在 train 上计数、在 val 上网格"
+            "调优（阶数 × 平滑系数）字节级插值 n-gram 统计"
+            "基线，并用与神经模型完全相同的固定窗口协议评估；"
+            "输出与训练运行同构的 config.json / metrics.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--ngram-max-order",
+        type=int,
+        default=5,
+        help=(
+            "n-gram 统计基线的最大阶数（字节精确打包上限 "
+            f"为 {_NGRAM_MAX_ORDER}）"
+        ),
+    )
+    parser.add_argument(
+        "--ngram-alpha-grid",
+        nargs="+",
+        type=float,
+        default=[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+        help=(
+            "n-gram 插值平滑系数的候选网格，全部在 val 上"
+            "调优后取最优（简单基线也必须充分调优）"
+        ),
+    )
+    parser.add_argument(
+        "--hypothesis",
+        type=str,
+        default="",
+        help=(
+            "本轮实验要验证的科学假设（必填，见 "
+            "docs/experiment_protocol.md）：写清楚「预期"
+            "什么改动带来什么效果、依据什么指标判定成败」，"
+            "带着假设做实验而不是排列组合超参数"
+        ),
+    )
+    parser.add_argument(
+        "--rq",
+        type=str,
+        default="",
+        help=(
+            "本 run 对应的研究问题标签（如 RQ1），"
+            "与 --hypothesis 一起写入 config.json"
+        ),
+    )
+    parser.add_argument(
+        "--skip-hypothesis-check",
+        action="store_true",
+        help=(
+            "显式跳过假设检查（只建议纯工程目的的临时运行"
+            "使用；跳过会被记录进 config.json）"
+        ),
     )
     parser.add_argument(
         "--out",
@@ -5761,6 +7358,34 @@ def main():
         )
     if args.bad_cases < 0:
         parser.error("--bad-cases 不能为负")
+    if args.dense_fnn_hidden is not None and (
+        args.dense_fnn_hidden <= 0
+    ):
+        parser.error("--dense-fnn-hidden 必须为正整数")
+    if not 1 <= args.ngram_max_order <= _NGRAM_MAX_ORDER:
+        parser.error(
+            "--ngram-max-order 必须落在 "
+            f"[1, {_NGRAM_MAX_ORDER}]"
+        )
+    for alpha in args.ngram_alpha_grid:
+        if not math.isfinite(alpha) or alpha <= 0:
+            parser.error(
+                "--ngram-alpha-grid 的每个取值必须是"
+                "有限正数（α→0 时未见的 (ctx,c) 对会得到"
+                "零概率与无穷损失）"
+            )
+    if not args.ngram_alpha_grid:
+        parser.error(
+            "--ngram-alpha-grid 至少需要一个候选值"
+        )
+
+    # 假设纪律：全新训练必须带明确的科学假设，避免
+    # 「盲目排列组合超参数」（详见 hypothesis_check_error
+    # 的说明与 docs/experiment_protocol.md）。
+    hypothesis_error = hypothesis_check_error(args)
+
+    if hypothesis_error is not None:
+        parser.error(hypothesis_error)
 
     # --compare 模式只读运行目录，不需要 --data / --out。
     if args.compare is not None:
@@ -5839,6 +7464,25 @@ def main():
             if key in known_config_fields
         })
     else:
+        # dense 基线的 FFN 宽度在构造 Config 时就解析成
+        # 显式数值，config.json / 检查点记录的是实际生效值。
+        dense_fnn_hidden = args.dense_fnn_hidden
+
+        if (
+            dense_fnn_hidden is None
+            and args.mode == "dense"
+        ):
+            dense_fnn_hidden = (
+                args.top_k * args.expert_hidden
+            )
+            print(
+                "dense 基线 FFN 隐藏宽度 = "
+                f"{dense_fnn_hidden}（等计算口径 "
+                "top_k * expert_hidden；等参数口径可用 "
+                "--dense-fnn-hidden 设为 n_experts * "
+                "expert_hidden）"
+            )
+
         cfg = Config(
             seq_len=args.seq_len,
             d_model=args.d_model,
@@ -5850,6 +7494,7 @@ def main():
             k1=args.k1,
             k2=args.k2,
             mode=args.mode,
+            dense_fnn_hidden=dense_fnn_hidden,
             balance_coef=args.balance_coef,
             residual_scale=args.residual_scale,
         )
@@ -5868,6 +7513,7 @@ def main():
             "k1",
             "k2",
             "mode",
+            "dense_fnn_hidden",
             "balance_coef",
             "residual_scale",
         }
@@ -5977,6 +7623,50 @@ def main():
     data_audit = audit_data_splits(dataset, include_test=False)
     print_data_audit(data_audit)
 
+    # 统计基线入口：计数、调优、评估、写盘后直接结束，
+    # 不进入神经模型训练流程。
+    if args.statistical_baseline:
+        run_statistical_baseline(
+            args,
+            dataset,
+            out_dir,
+            device,
+            data_audit,
+        )
+        return
+
+    # 参考基线（uniform / unigram）：与模型评估同一批固定窗口，
+    # 给「accuracy 被高频字节抬高多少」提供解读坐标系，也把
+    # 曲线诊断的「是否学到东西」参照从 uniform 稻草人换成
+    # 更公平的 unigram。
+    reference_baselines = compute_reference_baselines(
+        dataset,
+        args.batch_size,
+        args.eval_batches,
+        torch.device("cpu"),
+        split="val",
+    )
+
+    print(
+        "[reference] uniform val_loss="
+        f"{reference_baselines['uniform_loss']:.4f} "
+        "(= ln 256), unigram val_loss="
+        f"{reference_baselines['unigram_loss']:.4f}, "
+        "unigram token_accuracy="
+        f"{reference_baselines['unigram_token_accuracy']:.4f}"
+        "（类别不平衡下解读 accuracy 的参考下界）"
+    )
+
+    if args.hypothesis.strip():
+        print(
+            f"[hypothesis] {args.hypothesis.strip()}"
+            + (
+                f" (rq={args.rq.strip()})"
+                if args.rq.strip()
+                else ""
+            )
+        )
+
     # 全新训练默认先跑过拟合小批量 sanity check；恢复训练默认跳过
     # （可以用 --sanity-only 单独检查）。--skip-sanity-check 显式跳过。
     run_sanity = (
@@ -6052,11 +7742,23 @@ def main():
             run_metadata=collect_run_metadata(device),
             sanity_result=sanity_result,
             data_audit=data_audit,
+            reference_baselines=reference_baselines,
         )
+        if args.resume is None:
+            # 全新运行：参考基线记录是 metrics.jsonl 的首行；
+            # resume 时保留原运行记录，不重复追加。
+            write_jsonl_record(
+                out_dir / "metrics.jsonl",
+                {
+                    "step": "reference_baselines",
+                    **reference_baselines,
+                },
+                append=False,
+            )
         write_jsonl_record(
             out_dir / "metrics.jsonl",
             sanity_record,
-            append=args.resume is not None,
+            append=True,
         )
         print(
             json.dumps(
@@ -6384,8 +8086,8 @@ def main():
         )
 
     # config.json 记录完整实验追踪信息：结构配置、超参数、种子、
-    # 数据指纹与划分、数据审计、代码版本/运行环境与 sanity check
-    # 结果。
+    # 数据指纹与划分、数据审计、代码版本/运行环境、sanity check
+    # 结果、科学假设与参考基线。
     write_run_config(
         out_dir,
         cfg,
@@ -6394,6 +8096,7 @@ def main():
         collect_run_metadata(device),
         config_sanity_result,
         data_audit=data_audit,
+        reference_baselines=reference_baselines,
     )
 
     metrics_path = out_dir / "metrics.jsonl"
@@ -6433,6 +8136,21 @@ def main():
         "a" if args.resume is not None else "w",
         encoding="utf-8",
     )
+
+    if args.resume is None:
+        # 全新训练的首行：参考基线（uniform / unigram），
+        # 为后续所有指标提供解读坐标系。
+        metrics_file.write(
+            json.dumps(
+                _json_safe({
+                    "step": "reference_baselines",
+                    **reference_baselines,
+                }),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
 
     if sanity_record is not None:
         # sanity check 结果也进入训练曲线文件，便于统一追溯。
@@ -6833,18 +8551,18 @@ def main():
             args,
         )
 
-    # 参数自最近一次周期验证后未更新时复用其结果。
-    if last_eval_step == end_step and last_eval_metrics is not None:
-        final_metrics = last_eval_metrics
-    else:
-        final_metrics = evaluate(
-            model,
-            dataset,
-            args.batch_size,
-            args.eval_batches,
-            device,
-            amp_dtype=amp_dtype,
-        )
+    # 最终评估总是重新跑一遍：与周期验证不同，它还要计算
+    # one-vs-rest 的 macro PR-AUC / ROC-AUC（周期验证只算
+    # 混淆矩阵口径的轻量指标），不能直接复用上次周期结果。
+    final_metrics = evaluate(
+        model,
+        dataset,
+        args.batch_size,
+        args.eval_batches,
+        device,
+        amp_dtype=amp_dtype,
+        compute_auc=True,
+    )
 
     final_record = {
         "step": "final",
@@ -6874,15 +8592,24 @@ def main():
 
     # --------------------------------------------------------
     # 结果分析 1：训练曲线诊断（不能只看最终单个数值）。
+    # 「是否学到东西」的参照从 uniform（ln 256，稻草人）
+    # 升级为 train 拟合的 unigram：连字节边际分布都没打赢
+    # 才算欠拟合，避免「只比随机猜强」的虚假健康曲线。
     # --------------------------------------------------------
+    curve_baseline_loss = min(
+        math.log(cfg.vocab_size),
+        float(reference_baselines["unigram_loss"]),
+    )
+
     curve_analysis = analyze_training_curve(
         read_metrics_records(metrics_path),
-        baseline_loss=math.log(cfg.vocab_size),
+        baseline_loss=curve_baseline_loss,
     )
     metrics_file.write(
         json.dumps(
             _json_safe({
                 "step": "curve_analysis",
+                "reference_baseline_loss": curve_baseline_loss,
                 **curve_analysis,
             }),
             ensure_ascii=False,
@@ -6993,6 +8720,7 @@ def main():
                 device,
                 amp_dtype=amp_dtype,
                 split="test",
+                compute_auc=True,
             )
 
             # 坏案例分析随唯一一次解封一起做（val 分析照常）。
