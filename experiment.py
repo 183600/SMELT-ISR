@@ -4504,6 +4504,33 @@ def print_curve_analysis(analysis: Dict[str, object]) -> None:
     print(f"[curve] 建议: {analysis.get('recommendation')}")
 
 
+def monitor_training_curve(
+    records: List[Dict[str, object]],
+    baseline_loss: Optional[float],
+    previous_status: Optional[str],
+) -> Tuple[Dict[str, object], Optional[str]]:
+    """
+    训练期间的在线曲线监控：每个周期验证点复用
+    analyze_training_curve 的判定，只在状态发生变化时报告。
+
+    返回 ``(analysis, new_status)``；状态与上一次相同或验证点
+    还不足以判断（``insufficient_data``）时 ``new_status`` 为
+    None，表示不需要重复记录/打印。这样过拟合、欠拟合或发散
+    能在训练过程中就被发现并采取动作（加正则化、早停、调学习
+    率），而不是等训练全部结束后从最终数值里事后发现。
+    """
+    analysis = analyze_training_curve(
+        records,
+        baseline_loss=baseline_loss,
+    )
+    status = str(analysis.get("status"))
+
+    if status == "insufficient_data" or status == previous_status:
+        return analysis, None
+
+    return analysis, status
+
+
 def early_stop_state_from_records(
     records: List[Dict[str, object]],
     min_delta: float,
@@ -4853,10 +4880,79 @@ def analyze_bad_cases(
                 category_counts.get(key, 0) + 1
             )
 
+        # 全量错误 token 的类别归因（不只是 top_n 个最差样本）：
+        # 错误原因分布是提出新改进思路的最重要证据，必须按整个
+        # 评估 split 统计，避免「最高损失的几个样本正好都是同一
+        # 类」把结论带偏。分类规则与逐案例完全一致，优先级为
+        # ambiguous > systematic_confusion > label_noise_suspect
+        # > uncertain。
+        wrong_category_code = torch.full_like(target_all, 3)
+        wrong_category_code = torch.where(
+            (
+                (confidence_all >= _BAD_CASE_CONFIDENT)
+                & (
+                    target_share[target_all]
+                    < _BAD_CASE_RARE_TARGET_SHARE
+                )
+            ),
+            torch.full_like(wrong_category_code, 2),
+            wrong_category_code,
+        )
+        wrong_category_code = torch.where(
+            (
+                (confusion_count_by_token >= _BAD_CASE_SYSTEMATIC_COUNT)
+                & (confidence_all >= 0.5)
+            ),
+            torch.full_like(wrong_category_code, 1),
+            wrong_category_code,
+        )
+        wrong_category_code = torch.where(
+            margin_all < _BAD_CASE_AMBIGUOUS_MARGIN,
+            torch.full_like(wrong_category_code, 0),
+            wrong_category_code,
+        )
+        wrong_category_code = wrong_category_code[wrong_mask]
+
+        category_names = (
+            "ambiguous",
+            "systematic_confusion",
+            "label_noise_suspect",
+            "uncertain",
+        )
+        wrong_tokens = int(wrong_mask.sum())
+        error_category_counts = {
+            name: int((wrong_category_code == code).sum())
+            for code, name in enumerate(category_names)
+        }
+        error_category_shares = {
+            name: (
+                round(count / wrong_tokens, 6)
+                if wrong_tokens > 0
+                else None
+            )
+            for name, count in error_category_counts.items()
+        }
+
         top1 = top_cases[0] if top_cases else None
+        dominant_category = (
+            max(
+                error_category_counts,
+                key=lambda name: error_category_counts[name],
+            )
+            if wrong_tokens > 0
+            else None
+        )
         summary = (
             f"评估 {num_tokens} 个 token，token 准确率 "
-            f"{token_accuracy:.4f}；最差样本 "
+            f"{token_accuracy:.4f}（{wrong_tokens} 个错误）；"
+            + (
+                "全量错误归因以 "
+                f"{dominant_category}"
+                f"（{error_category_shares[dominant_category] * 100:.1f}%）"
+                "为主；最差样本 "
+                if dominant_category is not None
+                else "无错误 token；最差样本 "
+            )
             + (
                 "target="
                 f"'{_render_byte(int(top1['target']))}', "
@@ -4873,10 +4969,13 @@ def analyze_bad_cases(
             "split": split,
             "tokens_evaluated": int(num_tokens),
             "token_accuracy": round(token_accuracy, 6),
+            "wrong_tokens": wrong_tokens,
             "top_cases": top_cases,
             "top_confusions": top_confusions,
             "error_rate_by_target": error_rate_by_target,
             "category_counts": category_counts,
+            "error_category_counts": error_category_counts,
+            "error_category_shares": error_category_shares,
             "summary": summary,
         }
 
@@ -4918,11 +5017,30 @@ def print_bad_cases(report: Dict[str, object]) -> None:
 
     if report.get("category_counts"):
         print(
-            "[bad-case] 错误类别统计: "
+            "[bad-case] top-N 错误类别统计: "
             + json.dumps(
                 report["category_counts"],
                 ensure_ascii=False,
             )
+        )
+
+    if report.get("error_category_counts"):
+        shares = report.get("error_category_shares") or {}
+        detail = ", ".join(
+            f"{name}={count}"
+            + (
+                f"({float(shares[name]) * 100:.1f}%)"
+                if shares.get(name) is not None
+                else ""
+            )
+            for name, count in report[
+                "error_category_counts"
+            ].items()
+        )
+        print(
+            "[bad-case] 全量错误归因"
+            f"（共 {report.get('wrong_tokens')} 个错误 token）: "
+            f"{detail}"
         )
 
     print(f"[bad-case] 小结: {report.get('summary')}")
@@ -4934,6 +5052,13 @@ def print_bad_cases(report: Dict[str, object]) -> None:
 
 # 非有限损失/梯度的系统排查路径（顺序固定，先查证据更简单
 # 的环节，再查混合精度与优化环节）。
+# 诊断时保留的近期有限梯度范数窗口：用失败步之前的梯度水平
+# 判断「梯度爆炸/学习率过大」是否有证据。
+_NAN_GRAD_TREND_WINDOW = 50
+
+# 失败步梯度范数达到近期中位数的该倍数时，判定为梯度放大明显。
+_NAN_GRAD_EXPLOSION_RATIO = 5.0
+
 _NONFINITE_CHECKLIST = [
     "1) 数据：批次内是否存在 NaN/Inf 或越界 token"
     "（字节管线的整数 token 天然无 NaN，越界/负值可能来自"
@@ -5018,15 +5143,19 @@ def diagnose_non_finite(
     amp_dtype: Optional[torch.dtype] = None,
     scaler: Optional[object] = None,
     vocab_size: int = 256,
+    recent_grad_norms: Optional[List[Tuple[int, float]]] = None,
 ) -> Dict[str, object]:
     """
     非有限损失/梯度出现时的系统排查。
 
     按固定路径收集证据：数据值域与非有限元素 → logits/损失
     数值（log(0)、除零、softmax 溢出）→ 低精度上限 → 逐参数
-    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态。返回的
-    报告会附加到触发该步的 metrics 记录（nan_diagnosis 字段）
-    并打印，之后按报告中的 next_steps 逐项排除。
+    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态；并用
+    失败步之前的有限梯度范数（``recent_grad_norms``）判断
+    「梯度爆炸/学习率过大」是否有证据，还是更像前向/损失侧
+    问题。返回的报告会附加到触发该步的 metrics 记录
+    （nan_diagnosis 字段）并打印，之后按报告中的 next_steps
+    逐项排除。
     """
     findings: List[str] = []
     checks: Dict[str, object] = {}
@@ -5219,7 +5348,7 @@ def diagnose_non_finite(
             + "）已含 NaN/Inf：状态已被污染，需要从检查点恢复"
         )
 
-    # ---- 5) 学习率与梯度缩放 ----
+    # ---- 5) 学习率、梯度缩放与梯度趋势 ----
     checks["lr"] = lr
     if scaler is not None:
         try:
@@ -5228,6 +5357,50 @@ def diagnose_non_finite(
             )
         except Exception:
             checks["grad_scale"] = None
+
+    # 用失败步之前的有限梯度范数做对照：非有限通常是「梯度爆炸/
+    # 学习率过大」的特征；梯度水平正常则更像前向/损失侧问题，
+    # 避免把两类根因混在一起排查。
+    gradient_trend: Dict[str, object] = {}
+    history_values = [
+        float(value)
+        for _, value in (recent_grad_norms or [])
+        if math.isfinite(float(value))
+    ]
+    if history_values:
+        ordered = sorted(history_values)
+        median = ordered[len(ordered) // 2]
+        gradient_trend = {
+            "window": len(ordered),
+            "recent_median": round(median, 6),
+            "recent_max": round(ordered[-1], 6),
+            "fail_step_grad_norm": grad_norm_value,
+        }
+        if grad_norm_value is None:
+            findings.append(
+                f"失败步梯度范数非有限，而此前 {len(ordered)} 步"
+                f"梯度范数均为有限（中位 {median:.4g}）："
+                "符合梯度爆炸/学习率过大的特征，优先降低学习率、"
+                "收紧 --grad-clip 并从污染前的检查点恢复"
+            )
+        elif (
+            median > 0.0
+            and grad_norm_value
+            >= median * _NAN_GRAD_EXPLOSION_RATIO
+        ):
+            findings.append(
+                f"失败步梯度范数 {grad_norm_value:.4g} 约为近期"
+                f"中位数 {median:.4g} 的 "
+                f"{grad_norm_value / median:.1f} 倍：梯度放大明显，"
+                "符合梯度爆炸/学习率过大特征"
+            )
+        elif _finite(loss) is False:
+            findings.append(
+                "失败步梯度范数与近期水平相当：更像前向/损失侧"
+                "（数据、log(0)/除零或低精度溢出）问题，"
+                "而非梯度爆炸"
+            )
+    checks["gradient_trend"] = gradient_trend
 
     if not findings:
         findings.append(
@@ -5838,6 +6011,43 @@ _FACTOR_VALUE_ORDER = {
 _SIGNIFICANCE_LEVEL = 0.05
 _MIN_SEEDS_FOR_STATS = 2
 _RECOMMENDED_SEEDS = 3
+
+# 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量、
+# 计算量（FLOPs）、延迟与显存/内存占用；成本达到基线的该倍数
+# 时，即使统计显著也必须在结论中显式权衡「涨点是否值得」。
+_COST_RATIO_MATERIAL = 1.5
+
+# 参与成本权衡的效率字段（顺序即展示顺序）。
+_COST_FIELDS: Tuple[str, ...] = (
+    "n_params",
+    "flops_per_forward",
+    "latency_ms_per_forward",
+    "peak_memory_mb",
+)
+
+_COST_FIELD_LABELS = {
+    "n_params": "参数",
+    "flops_per_forward": "FLOPs",
+    "latency_ms_per_forward": "延迟",
+    "peak_memory_mb": "显存/内存",
+}
+
+
+def _cell_cost_mean(
+    cell: Dict[str, object],
+    field: str,
+) -> Optional[float]:
+    """取一个实验单元在某效率字段上的平均成本（缺失时 None）。"""
+    costs = cell.get("costs")
+    if not isinstance(costs, dict):
+        return None
+    entry = costs.get(field)
+    if not isinstance(entry, dict):
+        return None
+    mean = entry.get("mean")
+    if mean is None:
+        return None
+    return float(mean)
 
 
 def build_comparison_protocol(
@@ -6459,7 +6669,28 @@ def aggregate_runs(
                 if r.get("seed") is not None
             ],
             "samples": {},
+            "costs": {},
         }
+
+        # 效率成本（参数量 / FLOPs / 延迟 / 显存·内存）随精度指标
+        # 一起聚合：评价改进必须同时给出涨点与代价，否则微小的
+        # 涨点可能掩盖数量级的计算开销。
+        for field in _COST_FIELDS:
+            values = [
+                float(group_row[field])
+                for group_row in group_rows
+                if isinstance(
+                    group_row.get(field), (int, float)
+                )
+                and not isinstance(group_row.get(field), bool)
+                and math.isfinite(float(group_row[field]))
+            ]
+            field_mean = _mean(values)
+            if field_mean is not None:
+                aggregate["costs"][field] = {
+                    "mean": field_mean,
+                    "n": len(values),
+                }
 
         for metric in metric_keys:
             samples = _metric_samples(group_rows, metric)
@@ -6536,6 +6767,62 @@ def _contrast_test(
     result = _welch_t_test(values_a, values_b)
     result["n_pairs"] = 0
     return result
+
+
+def _cost_comparison(
+    cell_a: Dict[str, object],
+    cell_b: Dict[str, object],
+    verdict: str,
+    significant: bool,
+) -> Tuple[Dict[str, object], Optional[str]]:
+    """
+    变体（cell_b）相对基线（cell_a）的成本对比与权衡判定。
+
+    ``cost_verdict``：
+    - ``gain_with_cost``：指标显著改善，但成本达到基线的
+      ``_COST_RATIO_MATERIAL`` 倍以上，须评估性价比；
+    - ``gain_balanced``：显著改善且成本可控；
+    - ``gain_not_significant``：改善不显著（说服力有限）；
+    - ``dominated_regression``：指标变差且更贵，严格劣于基线；
+    - ``neutral``：其余（持平/缺失成本数据等）。
+    """
+    baseline_costs: Dict[str, float] = {}
+    variant_costs: Dict[str, float] = {}
+    cost_ratios: Dict[str, float] = {}
+
+    for field in _COST_FIELDS:
+        cost_a = _cell_cost_mean(cell_a, field)
+        cost_b = _cell_cost_mean(cell_b, field)
+        if cost_a is None or cost_b is None:
+            continue
+        baseline_costs[field] = cost_a
+        variant_costs[field] = cost_b
+        if cost_a > 0.0:
+            cost_ratios[field] = cost_b / cost_a
+
+    cost_verdict: Optional[str] = None
+    if cost_ratios and verdict != "missing_metric":
+        most_expensive = max(cost_ratios.values())
+        expensive = most_expensive >= _COST_RATIO_MATERIAL
+        if verdict == "regression" and most_expensive > 1.0:
+            cost_verdict = "dominated_regression"
+        elif verdict == "improvement" and significant:
+            cost_verdict = (
+                "gain_with_cost" if expensive else "gain_balanced"
+            )
+        elif verdict == "improvement":
+            cost_verdict = "gain_not_significant"
+        else:
+            cost_verdict = "neutral"
+
+    return (
+        {
+            "baseline": baseline_costs,
+            "variant": variant_costs,
+            "ratios": cost_ratios,
+        },
+        cost_verdict,
+    )
 
 
 def factor_contrasts(
@@ -6628,6 +6915,20 @@ def factor_contrasts(
                 else:
                     verdict = "tie"
 
+            # 效率与精度的权衡：给出变体相对基线的成本倍数，并
+            # 把「统计显著但更贵」「变差且更贵」单独标记，避免
+            # 只报涨点而不报代价。
+            significant = (
+                test.get("p_value") is not None
+                and float(test["p_value"]) <= _SIGNIFICANCE_LEVEL
+            )
+            cost, cost_verdict = _cost_comparison(
+                cell_a,
+                cell_b,
+                verdict,
+                significant,
+            )
+
             contrast.update({
                 "factor": factor,
                 "baseline": cell_a["label"],
@@ -6645,11 +6946,10 @@ def factor_contrasts(
                 "df": test.get("df"),
                 "p_value": test.get("p_value"),
                 "n_pairs": test.get("n_pairs", 0),
-                "significant": (
-                    test.get("p_value") is not None
-                    and float(test["p_value"]) <= _SIGNIFICANCE_LEVEL
-                ),
+                "significant": significant,
                 "verdict": verdict,
+                "cost": cost,
+                "cost_verdict": cost_verdict,
             })
             contrasts.append(contrast)
 
@@ -6732,10 +7032,33 @@ def _contrast_display(
     elif verdict == "改善" and test in ("paired_t", "welch_t"):
         caveat = "（未达显著水平，不能据此声称提升）"
 
+    # 效率与精度权衡：成本倍数必须与涨点一起展示；显著改善
+    # 但成本大幅上升、或指标变差且更贵时给出明确结论。
+    cost_verdict = contrast.get("cost_verdict")
+    if cost_verdict == "gain_with_cost":
+        caveat += "（改善伴随成本上升，须评估性价比）"
+    elif cost_verdict == "dominated_regression":
+        caveat += "（指标变差且成本更高，严格劣于基线）"
+
+    cost = contrast.get("cost")
+    ratios = cost.get("ratios") if isinstance(cost, dict) else None
+    cost_text = ""
+    if isinstance(ratios, dict) and ratios:
+        ratio_parts = []
+        for field in _COST_FIELDS:
+            if field not in ratios:
+                continue
+            ratio_parts.append(
+                f"{_COST_FIELD_LABELS[field]}"
+                f"×{float(ratios[field]):.2f}"
+            )
+        if ratio_parts:
+            cost_text = "  成本: " + " ".join(ratio_parts)
+
     return (
         f"{factor}: {baseline}→{variant}{context}  "
         f"{delta_text}  {verdict}  {test_text} "
-        f"{p_text}{star}{noise_text}{caveat}"
+        f"{p_text}{star}{noise_text}{cost_text}{caveat}"
     )
 
 
@@ -6782,6 +7105,28 @@ def compare_cells_to_baseline(
             and mean_variant is not None
             else None
         )
+        significant = (
+            result.get("p_value") is not None
+            and float(result["p_value"]) <= _SIGNIFICANCE_LEVEL
+        )
+        if delta is None:
+            verdict = "missing_metric"
+        elif (
+            (-delta if not metric_higher_is_better(metric) else delta)
+            > 0
+        ):
+            verdict = "improvement"
+        elif delta != 0.0:
+            verdict = "regression"
+        else:
+            verdict = "tie"
+        cost, cost_verdict = _cost_comparison(
+            reference,
+            aggregate,
+            verdict,
+            significant,
+        )
+
         contrasts.append({
             "factor": "mode",
             "baseline": reference["label"],
@@ -6799,23 +7144,10 @@ def compare_cells_to_baseline(
             "df": result.get("df"),
             "p_value": result.get("p_value"),
             "n_pairs": result.get("n_pairs", 0),
-            "significant": (
-                result.get("p_value") is not None
-                and float(result["p_value"])
-                <= _SIGNIFICANCE_LEVEL
-            ),
-            "verdict": (
-                "missing_metric"
-                if delta is None
-                else "improvement"
-                if (
-                    (-delta if not metric_higher_is_better(metric) else delta)
-                    > 0
-                )
-                else "regression"
-                if delta != 0.0
-                else "tie"
-            ),
+            "significant": significant,
+            "verdict": verdict,
+            "cost": cost,
+            "cost_verdict": cost_verdict,
         })
 
     return contrasts
@@ -7112,6 +7444,41 @@ def print_comparison_analysis(
     else:
         print("  无有效指标可聚合")
 
+    # 效率与精度权衡：涨点必须与参数量/计算量/延迟/内存一起看。
+    cost_rows = [
+        aggregate
+        for aggregate in aggregates
+        if aggregate.get("costs")
+    ]
+    if cost_rows:
+        print()
+        print(
+            "[efficiency] 各实验单元成本（运行结束时测量；"
+            "参数量/FLOPs 可跨环境比较，延迟与内存受硬件影响，"
+            "仅在同一环境内可比）"
+        )
+        cost_header = (
+            f"{'cell':<40} {'params':>10} {'GFLOPs':>9} "
+            f"{'lat(ms)':>9} {'mem(MB)':>9}"
+        )
+        print(cost_header)
+        print("-" * len(cost_header))
+
+        def _cost_text(aggregate, key, scale=1.0, spec=".3f") -> str:
+            entry = aggregate["costs"].get(key)
+            if not entry or entry.get("mean") is None:
+                return "-"
+            return format(float(entry["mean"]) * scale, spec)
+
+        for aggregate in cost_rows:
+            print(
+                f"{str(aggregate['label'])[:39]:<40} "
+                f"{_cost_text(aggregate, 'n_params', 1.0, '.0f'):>10} "
+                f"{_cost_text(aggregate, 'flops_per_forward', 1e-9):>9} "
+                f"{_cost_text(aggregate, 'latency_ms_per_forward'):>9} "
+                f"{_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}"
+            )
+
     print()
     direction = "越低越好" if not higher_is_better else "越高越好"
     print(
@@ -7133,6 +7500,31 @@ def print_comparison_analysis(
                 continue
             print(
                 "  " + _contrast_display(contrast, metric)
+            )
+
+        # 成本权衡汇总：显著涨点伴随数量级成本、或变差且更贵
+        # 的对比必须单独点名，不能只凭 Δ 下结论。
+        cost_flagged = [
+            contrast
+            for contrast in contrasts
+            if contrast.get("cost_verdict")
+            in ("gain_with_cost", "dominated_regression")
+        ]
+        if cost_flagged:
+            summaries = []
+            for contrast in cost_flagged:
+                reason = (
+                    "涨点但更贵"
+                    if contrast["cost_verdict"] == "gain_with_cost"
+                    else "变差且更贵"
+                )
+                summaries.append(
+                    f"{contrast['baseline']}→{contrast['variant']}"
+                    f"（{reason}）"
+                )
+            print(
+                "  [cost] 需按性价比权衡的对比: "
+                + "; ".join(summaries)
             )
 
     if baseline_mode:
@@ -9271,6 +9663,40 @@ def run_self_test():
     assert recovered_analysis["last_train_loss"] is None
     print_curve_analysis(recovered_analysis)
 
+    # 在线曲线监控：只在状态迁移时报告，重复状态与数据不足
+    # （不足 3 个验证点）都不应触发。
+    monitor_records = [
+        {"step": 10, "train_loss": 5.0, "val_loss": 5.10},
+        {"step": 20, "train_loss": 4.0, "val_loss": 4.50},
+        {"step": 30, "train_loss": 3.0, "val_loss": 4.40},
+        {"step": 40, "train_loss": 2.0, "val_loss": 4.60},
+        {"step": 50, "train_loss": 1.5, "val_loss": 4.90},
+    ]
+    monitored, monitored_status = monitor_training_curve(
+        monitor_records,
+        baseline,
+        None,
+    )
+    assert monitored_status == "overfitting", monitored
+    assert monitored["status"] == "overfitting"
+
+    _, repeated_status = monitor_training_curve(
+        monitor_records,
+        baseline,
+        "overfitting",
+    )
+    assert repeated_status is None
+
+    _, early_status = monitor_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
+            {"step": 20, "train_loss": 4.8, "val_loss": 4.9},
+        ],
+        baseline,
+        None,
+    )
+    assert early_status is None
+
     # 早停状态恢复：最优值与连续未改善次数必须与历史一致。
     (
         early_best,
@@ -9362,6 +9788,55 @@ def run_self_test():
         >= 1
     )
 
+    # 梯度趋势证据：失败步梯度范数非有限、而此前均有有限梯度
+    # 时，必须给出「梯度爆炸/学习率过大」的排查指引；失败步
+    # 梯度水平正常但损失非有限时，必须指向前向/损失侧问题，
+    # 避免把两类根因混在一起。
+    diag_model.zero_grad(set_to_none=True)
+    trend_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        diag_result,
+        torch.tensor(float("nan")),
+        step=2,
+        lr=1e-3,
+        amp_dtype=None,
+        vocab_size=256,
+        recent_grad_norms=[(1, 1.0), (2, 1.1), (3, 0.9)],
+    )
+    trend = trend_report["checks"]["gradient_trend"]
+    assert trend["recent_median"] == 1.0, trend
+    assert any(
+        "符合梯度爆炸" in finding
+        for finding in trend_report["findings"]
+    ), trend_report["findings"]
+
+    nan_loss_result = dict(diag_result)
+    nan_loss_result["loss"] = torch.tensor(float("nan"))
+    forward_side_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        nan_loss_result,
+        torch.tensor(2.0),
+        step=3,
+        lr=1e-3,
+        amp_dtype=None,
+        vocab_size=256,
+        recent_grad_norms=[(2, 1.0), (3, 1.1)],
+    )
+    assert any(
+        "损失侧" in finding
+        for finding in forward_side_report["findings"]
+    ), forward_side_report["findings"]
+    assert not any(
+        "符合梯度爆炸" in finding
+        for finding in forward_side_report["findings"]
+    ), forward_side_report["findings"]
+
     # 坏案例分析：结构完整、类别合法，且只使用 val 固定窗口。
     bad_case_model = LanguageModel(
         Config(
@@ -9406,6 +9881,24 @@ def run_self_test():
     assert set(
         bad_case_report["category_counts"].keys()
     ) <= valid_categories
+
+    # 全量错误归因：必须覆盖全部错误 token、类别合法，且份额
+    # 之和为 1；这与 top-N 统计是两套口径，不能互相替代。
+    error_counts = bad_case_report["error_category_counts"]
+    assert set(error_counts.keys()) == valid_categories
+    assert sum(error_counts.values()) == int(
+        bad_case_report["wrong_tokens"]
+    )
+    if bad_case_report["wrong_tokens"] > 0:
+        assert abs(
+            sum(
+                float(share)
+                for share in bad_case_report[
+                    "error_category_shares"
+                ].values()
+            )
+            - 1.0
+        ) < 1e-6
 
     # 效率测量：参数量与模型一致，各测量值有效或明确不可用。
     efficiency_model = LanguageModel(
@@ -9929,6 +10422,143 @@ def run_self_test():
         assert any(
             "计算量差异" in message
             for message in unrelated_coverage["advisories"]
+        )
+
+    # ---- 效率与精度权衡：涨点必须与成本倍数一起看 ----
+    def _write_cost_run(
+        base_dir: str,
+        name: str,
+        mode: str,
+        seed: int,
+        val_loss: float,
+        flops: float,
+    ) -> str:
+        run_dir = Path(base_dir) / name
+        run_dir.mkdir()
+        config_payload = {
+            "config": {
+                "mode": mode,
+                "top_k": 2,
+                "k1": 2,
+                "k2": 2,
+                "balance_coef": 0.01,
+                "dense_fnn_hidden": None,
+            },
+            "args": {"seed": seed},
+            "n_params": 100,
+            "efficiency": {
+                "flops_per_forward": flops,
+                "latency_ms_per_forward": flops / 1e9,
+                "training_peak_memory_mb": 100.0,
+            },
+        }
+        with open(
+            run_dir / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(config_payload, f)
+        write_jsonl_record(
+            run_dir / "metrics.jsonl",
+            {"step": "final", "val_loss": val_loss},
+        )
+        return str(run_dir)
+
+    with tempfile.TemporaryDirectory() as cost_dir:
+        cost_paths = [
+            _write_cost_run(
+                cost_dir, "local_base_seed42", "local_base", 42, 3.00, 1e9
+            ),
+            _write_cost_run(
+                cost_dir, "local_base_seed43", "local_base", 43, 3.10, 1e9
+            ),
+            _write_cost_run(
+                cost_dir, "local_base_seed44", "local_base", 44, 3.20, 1e9
+            ),
+            _write_cost_run(cost_dir, "A_seed42", "A", 42, 2.80, 2e9),
+            _write_cost_run(cost_dir, "A_seed43", "A", 43, 2.85, 2e9),
+            _write_cost_run(cost_dir, "A_seed44", "A", 44, 2.90, 2e9),
+        ]
+        cost_aggregates = aggregate_runs(
+            compare_runs(cost_paths),
+            ["mode"],
+        )
+        by_cost_label = {
+            aggregate["label"]: aggregate
+            for aggregate in cost_aggregates
+        }
+        base_costs = by_cost_label["mode=local_base"]["costs"]
+        assert base_costs["flops_per_forward"]["mean"] == 1e9
+
+        cost_contrasts = factor_contrasts(
+            cost_aggregates,
+            ["mode"],
+            "val_loss",
+        )
+        assert len(cost_contrasts) == 1
+        cost_contrast = cost_contrasts[0]
+        ratios = cost_contrast["cost"]["ratios"]
+        assert abs(ratios["flops_per_forward"] - 2.0) < 1e-9
+        assert abs(ratios["n_params"] - 1.0) < 1e-9
+        assert cost_contrast["cost_verdict"] == "gain_with_cost", (
+            cost_contrast
+        )
+        cost_display = _contrast_display(
+            cost_contrast,
+            "val_loss",
+        )
+        assert "成本:" in cost_display
+        assert "性价比" in cost_display
+
+    # 指标变差且更贵：严格劣于基线，必须显式点出。
+    with tempfile.TemporaryDirectory() as dominated_dir:
+        dominated_paths = [
+            _write_cost_run(
+                dominated_dir,
+                "local_base_seed42",
+                "local_base",
+                42,
+                3.00,
+                1e9,
+            ),
+            _write_cost_run(
+                dominated_dir,
+                "local_base_seed43",
+                "local_base",
+                43,
+                3.10,
+                1e9,
+            ),
+            _write_cost_run(
+                dominated_dir,
+                "local_base_seed44",
+                "local_base",
+                44,
+                3.20,
+                1e9,
+            ),
+            _write_cost_run(
+                dominated_dir, "A_seed42", "A", 42, 3.30, 2e9
+            ),
+            _write_cost_run(
+                dominated_dir, "A_seed43", "A", 43, 3.35, 2e9
+            ),
+            _write_cost_run(
+                dominated_dir, "A_seed44", "A", 44, 3.40, 2e9
+            ),
+        ]
+        dominated_contrast = factor_contrasts(
+            aggregate_runs(compare_runs(dominated_paths), ["mode"]),
+            ["mode"],
+            "val_loss",
+        )[0]
+        assert (
+            dominated_contrast["cost_verdict"]
+            == "dominated_regression"
+        ), dominated_contrast
+        assert "严格劣于基线" in _contrast_display(
+            dominated_contrast,
+            "val_loss",
         )
 
     # ---- 多种子 / 套件编排：计划与参数透传 ----
@@ -11621,6 +12251,37 @@ def main():
 
     metrics_path = out_dir / "metrics.jsonl"
 
+    # 曲线诊断的「是否学到东西」参照：从 uniform（ln 256，稻草人）
+    # 升级为 train 拟合的 unigram。在线监控与训练结束后的最终
+    # 诊断共用同一参照。
+    curve_baseline_loss = min(
+        math.log(cfg.vocab_size),
+        float(reference_baselines["unigram_loss"]),
+    )
+
+    # 训练期间的内存内 metrics 记录（resume 时先载入历史），
+    # 每个验证点在线复用 analyze_training_curve；只在状态变化时
+    # 打印/记录，训练中途即可发现过拟合、欠拟合或发散。
+    curve_records: List[Dict[str, object]] = (
+        read_metrics_records(metrics_path)
+        if args.resume is not None
+        else []
+    )
+    last_curve_status: Optional[str] = None
+    if curve_records:
+        prior_status = str(
+            analyze_training_curve(
+                curve_records,
+                baseline_loss=curve_baseline_loss,
+            ).get("status")
+        )
+        if prior_status != "insufficient_data":
+            last_curve_status = prior_status
+
+    # 近期有限梯度范数窗口：NaN/Inf 诊断用失败前的梯度水平
+    # 判断「梯度爆炸/学习率过大」是否有证据。
+    recent_grad_norms: List[Tuple[int, float]] = []
+
     # 验证集模型选择 + 早停状态：resume 时从原运行的
     # metrics.jsonl 恢复「最优验证损失 / 最优步 / 连续未改善
     # 次数」，保证早停判定与模型选择跨恢复一致；全新训练不读
@@ -11744,6 +12405,9 @@ def main():
         pending_records.clear()
         pending_scalars.clear()
 
+        # 在线曲线监控用的内存记录与落盘内容保持同步。
+        curve_records.extend(records)
+
         # 记录先写入 Python 缓冲，此处统一落盘。
         metrics_file.flush()
 
@@ -11848,6 +12512,7 @@ def main():
                         amp_dtype=amp_dtype,
                         scaler=scaler,
                         vocab_size=cfg.vocab_size,
+                        recent_grad_norms=recent_grad_norms,
                     )
                     print_non_finite_report(nan_diagnosis)
                     nan_record_pending = True
@@ -11901,6 +12566,7 @@ def main():
                         amp_dtype=amp_dtype,
                         scaler=scaler,
                         vocab_size=cfg.vocab_size,
+                        recent_grad_norms=recent_grad_norms,
                     )
                     print_non_finite_report(nan_diagnosis)
                     nan_record_pending = True
@@ -11915,6 +12581,13 @@ def main():
                         numerical_stop = True
                 if consecutive_nonfinite >= 3:
                     numerical_stop = True
+
+        # 记录近期有限梯度范数（滚动窗口），供非有限事件的
+        # 「梯度爆炸/学习率过大 vs 前向/损失侧」证据判断。
+        if bool(torch.isfinite(grad_norm)):
+            recent_grad_norms.append((step + 1, float(grad_norm)))
+            if len(recent_grad_norms) > _NAN_GRAD_TREND_WINDOW:
+                del recent_grad_norms[:-_NAN_GRAD_TREND_WINDOW]
 
         # 本步已完成（无论是否推进了优化器）。
         last_completed_step = step + 1
@@ -11984,6 +12657,34 @@ def main():
             print(records[-1])
             metrics_file.flush()
             model.train()
+
+            # 在线曲线监控：状态发生迁移（如 healthy→overfitting、
+            # 出现发散）时立即打印建议并写入一条 curve_monitor
+            # 记录，训练中途就能采取加正则化/早停/调学习率等动作。
+            live_analysis, live_status = monitor_training_curve(
+                curve_records,
+                curve_baseline_loss,
+                last_curve_status,
+            )
+            if live_status is not None:
+                previous_status = last_curve_status
+                last_curve_status = live_status
+                print_curve_analysis(live_analysis)
+                metrics_file.write(
+                    json.dumps(
+                        _json_safe({
+                            "step": "curve_monitor",
+                            "trigger": "status_change",
+                            "previous_status": previous_status,
+                            "reference_baseline_loss":
+                                curve_baseline_loss,
+                            **live_analysis,
+                        }),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                metrics_file.flush()
 
             # 验证集模型选择：无论是否启用早停，都记录最优验证
             # 点并把权重写入 best.pt；训练结束后的 final / test
@@ -12186,15 +12887,10 @@ def main():
 
     # --------------------------------------------------------
     # 结果分析 1：训练曲线诊断（不能只看最终单个数值）。
-    # 「是否学到东西」的参照从 uniform（ln 256，稻草人）
-    # 升级为 train 拟合的 unigram：连字节边际分布都没打赢
-    # 才算欠拟合，避免「只比随机猜强」的虚假健康曲线。
+    # 参照基准 curve_baseline_loss 在训练开始时已按
+    # min(uniform, train 拟合的 unigram) 计算，在线监控与
+    # 最终诊断共用同一参照。
     # --------------------------------------------------------
-    curve_baseline_loss = min(
-        math.log(cfg.vocab_size),
-        float(reference_baselines["unigram_loss"]),
-    )
-
     curve_analysis = analyze_training_curve(
         read_metrics_records(metrics_path),
         baseline_loss=curve_baseline_loss,
@@ -12245,8 +12941,17 @@ def main():
                     "token_accuracy": bad_case_report[
                         "token_accuracy"
                     ],
+                    "wrong_tokens": bad_case_report[
+                        "wrong_tokens"
+                    ],
                     "category_counts": bad_case_report[
                         "category_counts"
+                    ],
+                    "error_category_counts": bad_case_report[
+                        "error_category_counts"
+                    ],
+                    "error_category_shares": bad_case_report[
+                        "error_category_shares"
                     ],
                     "top_confusions": bad_case_report[
                         "top_confusions"
@@ -12365,9 +13070,20 @@ def main():
                                 "token_accuracy": test_bad_cases[
                                     "token_accuracy"
                                 ],
+                                "wrong_tokens": test_bad_cases[
+                                    "wrong_tokens"
+                                ],
                                 "category_counts": test_bad_cases[
                                     "category_counts"
                                 ],
+                                "error_category_counts":
+                                    test_bad_cases[
+                                        "error_category_counts"
+                                    ],
+                                "error_category_shares":
+                                    test_bad_cases[
+                                        "error_category_shares"
+                                    ],
                                 "top_confusions": test_bad_cases[
                                     "top_confusions"
                                 ],

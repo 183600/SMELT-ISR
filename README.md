@@ -175,6 +175,11 @@ python experiment.py \
 - **受控变量检查**：`config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、数据指纹、模型结构、评估协议与选型口径（新运行为验证集选型，无记录的旧运行标记为最后一步）。`--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数、或 final 指标口径不同，都会被明确列出，避免把调参收益误当成方法本身的收益。
 - **统计可靠性**：`--seeds 42 43 44` 对同一配置跑多个随机种子，自动汇报每个实验单元的 Mean ± Std（样本标准差）；种子集合相同用配对 t 检验、否则用 Welch t 检验，给出 p 值与噪声比（|Δ|/合并标准差）。种子数少于 3 会被标记为统计功效不足；只有 0.2% 的提升而种子间方差有 0.5% 时不会被当成有效提升。
 - **消融完整性**：`--suite-ablation` 运行「延迟合并 × 均衡损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前值），覆盖全部四个组合后才能支撑两个设计各自有用的结论；覆盖检查会列出缺失的组合。`--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
+- **结果分析（曲线 / NaN / 坏案例 / 效率）**：
+  - **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐。
+  - **NaN/Inf 系统排查**：按「数据 NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合精度溢出 → 梯度爆炸/学习率过大」路径收集证据；`nan_diagnosis` 记录失败步梯度范数与近期中位数的对比，区分梯度爆炸与前向/损失侧根因。
+  - **坏案例分析**：在与周期验证相同的固定窗口上打印损失最高的样本并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；同时对**全部错误 token**做类别归因（`error_category_counts` / `error_category_shares`），不只统计 top-N，作为提出新改进思路的证据。
+  - **效率与精度权衡**：`--compare` 汇总每个实验单元的参数量、FLOPs、推理延迟与显存/内存，并在单因子对比里标注成本倍数；显著涨点但成本 ≥1.5×、或指标变差且更贵的对比会被显式标记（须评估性价比 / 严格劣于基线），避免「涨 0.5% 但计算 ×10」被当成有效改进。
 
 ### 多随机种子与消融套件示例
 
