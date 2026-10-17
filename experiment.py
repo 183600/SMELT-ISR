@@ -3118,6 +3118,10 @@ def _binary_average_precision(
     由调用方统一计算并在 ROC-AUC 与 PR-AUC 之间复用；按
     相异分数阈值分步累计（与 sklearn average_precision_score
     的阶梯式口径一致）；正类为空时返回 None。
+
+    labels 为 0/1 目标向量（布尔或浮点）。累计真正例数在
+    整数/布尔下完成，除法则提升到 fp64，结果与先转 fp64
+    再累计逐位一致。
     """
     n_pos = int(labels.sum())
 
@@ -3128,7 +3132,7 @@ def _binary_average_precision(
     # 枚举顺序（分数从高到低）与组内顺序无关，结果不变。
     order = order.flip(0)
     sorted_scores = sorted_scores.flip(0)
-    sorted_labels = labels[order].double()
+    sorted_labels = labels[order]
 
     n = labels.numel()
     positions = torch.arange(
@@ -3152,7 +3156,7 @@ def _binary_average_precision(
     ranks = positions[boundary_indices]
 
     precision = tp / ranks
-    recall = tp / float(n_pos)
+    recall = tp.double() / float(n_pos)
 
     # AP = Σ (R_i − R_{i−1}) × Precision_i。
     recall_gain = torch.cat(
@@ -3205,7 +3209,7 @@ def macro_auc_metrics(
     prevalence_sum = 0.0
 
     for class_index in eligible.tolist():
-        labels = (targets == class_index).double()
+        labels = targets == class_index
         scores = probabilities[:, class_index]
 
         # ROC-AUC 与 PR-AUC 复用同一次排序结果。
@@ -3231,7 +3235,7 @@ def macro_auc_metrics(
         # prevalence（正类占比）；macro PR-AUC 的随机水平就是
         # 各纳入类 prevalence 的均值。PR-AUC 的绝对值在类别
         # 不平衡下不代表「好/坏」，必须与这个水平对照解读。
-        prevalence_sum += float(labels.mean())
+        prevalence_sum += int(labels.sum()) / labels.numel()
 
     n_prevalence = len(eligible)
 
@@ -3333,10 +3337,30 @@ def evaluate(
     )
 
     # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
-    # 并按 _AUC_MAX_TOKENS 封顶。
-    collected_probs: List[torch.Tensor] = []
-    collected_targets: List[torch.Tensor] = []
+    # 并按 _AUC_MAX_TOKENS 封顶。收集缓冲按固定窗口的实际
+    # 位置数预分配（不超过封顶值），逐批写入，避免收尾 cat
+    # 时同时保留两份完整数据。
+    auc_probs: Optional[torch.Tensor] = None
+    auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
+
+    if compute_auc:
+        _, eval_data = dataset._eval_windows(split)
+        num_starts = len(eval_data) - dataset.seq_len
+        auc_capacity = min(
+            _AUC_MAX_TOKENS,
+            min(batches * batch_size, num_starts)
+            * dataset.seq_len,
+        )
+        auc_probs = torch.empty(
+            auc_capacity,
+            vocab_size,
+            dtype=torch.float32,
+        )
+        auc_targets = torch.empty(
+            auc_capacity,
+            dtype=torch.int64,
+        )
 
     try:
         with torch.autocast(
@@ -3397,11 +3421,14 @@ def evaluate(
                         )[:remaining].float(),
                         dim=-1,
                     ).cpu()
-                    collected_probs.append(probs)
-                    collected_targets.append(
-                        flat_target[:remaining].cpu()
-                    )
-                    auc_tokens += probs.size(0)
+                    num_new = probs.size(0)
+                    auc_probs[
+                        auc_tokens:auc_tokens + num_new
+                    ].copy_(probs)
+                    auc_targets[
+                        auc_tokens:auc_tokens + num_new
+                    ].copy_(flat_target[:num_new])
+                    auc_tokens += num_new
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
                 # add_(alpha=) 完成「乘 token 数 + 累加」。
@@ -3430,10 +3457,10 @@ def evaluate(
         metrics[f"{split}_{key}"] = value
 
     if compute_auc:
-        if collected_probs:
+        if auc_tokens > 0:
             auc_metrics = macro_auc_metrics(
-                torch.cat(collected_probs),
-                torch.cat(collected_targets),
+                auc_probs[:auc_tokens],
+                auc_targets[:auc_tokens],
                 vocab_size,
             )
             for key, value in auc_metrics.items():
@@ -4107,8 +4134,25 @@ def _ngram_extended_metrics(
         dtype=torch.float64,
     )
 
-    collected_probs: List[torch.Tensor] = []
-    collected_targets: List[torch.Tensor] = []
+    # 与神经模型评估同口径：按窗口总位置数预分配收集缓冲
+    # （不超过封顶值），逐窗口写入，避免收尾 cat 时同时保留
+    # 两份完整数据。
+    auc_capacity = min(
+        _AUC_MAX_TOKENS,
+        sum(
+            int(window.size(0)) * (int(window.size(1)) - 1)
+            for window in windows
+        ),
+    )
+    auc_probs = torch.empty(
+        auc_capacity,
+        vocab_size,
+        dtype=torch.float32,
+    )
+    auc_targets = torch.empty(
+        auc_capacity,
+        dtype=torch.int64,
+    )
     auc_tokens = 0
 
     for window in windows:
@@ -4144,11 +4188,14 @@ def _ngram_extended_metrics(
             # 最后一个窗口可能超出封顶：按剩余上限截断，
             # 保证收集的 token 数严格不超过上限。
             remaining = _AUC_MAX_TOKENS - auc_tokens
-            collected_probs.append(
-                probabilities[:remaining].to(torch.float32)
-            )
-            collected_targets.append(targets[:remaining])
-            auc_tokens += min(targets.numel(), remaining)
+            num_new = min(targets.numel(), remaining)
+            auc_probs[
+                auc_tokens:auc_tokens + num_new
+            ].copy_(probabilities[:num_new])
+            auc_targets[
+                auc_tokens:auc_tokens + num_new
+            ].copy_(targets[:num_new])
+            auc_tokens += num_new
 
     loss = total_nll / evaluated_tokens
 
@@ -4163,10 +4210,10 @@ def _ngram_extended_metrics(
     for key, value in class_metrics.items():
         metrics[f"{split}_{key}"] = value
 
-    if collected_probs:
+    if auc_tokens > 0:
         auc_metrics = macro_auc_metrics(
-            torch.cat(collected_probs),
-            torch.cat(collected_targets),
+            auc_probs[:auc_tokens],
+            auc_targets[:auc_tokens],
             vocab_size,
         )
         for key, value in auc_metrics.items():
@@ -5104,10 +5151,12 @@ def analyze_bad_cases(
                 ).squeeze(-1)
                 loss_tokens = log_normalizer - target_logits
 
-                top2 = logits.topk(2, dim=-1)
-
-                predicted = top2.indices[..., 0]
-                confidence = (top2.values[..., 0] - log_normalizer).exp()
+                # 预测与置信度只取 top1，与 evaluate 的
+                # argmax 口径一致。
+                top_values, predicted = logits.max(dim=-1)
+                confidence = (
+                    top_values - log_normalizer
+                ).exp()
                 target_probability = (
                     target_logits - log_normalizer
                 ).exp()
