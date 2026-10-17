@@ -245,7 +245,7 @@ class RMSNorm(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._fused is not None and x.is_cuda:
+        if self._fused is not None and (x.is_cuda or x.dtype == torch.float32):
             return self._fused(
                 x,
                 self.weight.shape,
