@@ -558,6 +558,10 @@ class SparseMoE(nn.Module):
         self._counts_event = None
         self._counts_stream = None
 
+        # 路由诊断探针（RQ3/RQ4）：默认 None，训练/评估路径上只有
+        # 一次属性判空的开销；仅在 analyze_routing 的诊断前向中挂载。
+        self._routing_probe = None
+
         # 批量专家路径的权重 stack 缓存：键为 "gate_up" / "down"，
         # 值为 (参数版本签名, stack 缓冲)。参数在 forward 与
         # backward 之间不变，同一张图里的多次 MoE 调用可共用
@@ -690,6 +694,17 @@ class SparseMoE(nn.Module):
             )
         else:
             aux_loss = router_logits.new_zeros(())
+
+        # 路由诊断（RQ3/RQ4）：只在显式挂载探针的分析前向中记录，
+        # 训练路径上 _routing_probe 为 None，仅一次属性判空。
+        if self._routing_probe is not None:
+            self._routing_probe.record(
+                self,
+                x,
+                top_indices,
+                top_weights,
+                router_logits,
+            )
 
         return (
             flat,
@@ -5389,6 +5404,991 @@ def print_bad_cases(report: Dict[str, object]) -> None:
 
 
 # ============================================================
+# Routing diagnostics (RQ3 / RQ4)
+# ============================================================
+#
+# 研究问题 RQ3/RQ4 需要的不只是最终指标，而是训练后模型内部的
+# 路由行为证据：第二轮是否选中与第一轮不同的专家（专家重合度 /
+# Jaccard 相似度），以及专家负载分布与路由熵（专家专门化）。
+# 本节的诊断在验证集的同一批固定窗口上、在验证集选定模型上做
+# 一次无梯度前向，按 (Block, 轮次) 记录每次 route() 的 top-k
+# 专家下标、门控权重与完整路由分布，汇总为结构化报告。
+#
+# 口径（随报告落盘，避免事后各自解释）：
+# - 轮次 = 同一 Block 内 route() 的调用序号：第 1 次为第一轮，
+#   第 2 次为第二轮。smelt 的两次中间循环、A/local_base 的
+#   两阶段、B 的分支创建 + 第二轮完整中间区域都满足该顺序。
+# - 专家重合度在「同一 token、同一 Block」的两轮路由之间比较；
+#   分支结构（A/B）另外报告逐分支与 token 级（跨分支并集）口径。
+# - 只使用验证集固定窗口；测试集保持尘封，不参与路由诊断。
+# - 路由诊断只描述模型的内部行为，不参与模型选择、早停或任何
+#   指标优化，避免把诊断本身变成调参信号。
+
+
+def _routing_set_bool(
+    indices: torch.Tensor,
+    n_experts: int,
+) -> torch.Tensor:
+    """把 [N, k] 的专家下标转成 [N, n_experts] 的集合指示位。"""
+    indices = indices.to(torch.int64).clamp_(
+        min=0,
+        max=n_experts - 1,
+    )
+    out = torch.zeros(
+        indices.size(0),
+        n_experts,
+        dtype=torch.bool,
+    )
+    out.scatter_(1, indices, True)
+    return out
+
+
+def _routing_set_metrics_bool(
+    a_bool: torch.Tensor,
+    b_bool: torch.Tensor,
+) -> Optional[Dict[str, float]]:
+    """
+    两组 [N, E] 专家集合指示位的逐 token 重合指标。
+
+    - jaccard：|A∩B| / |A∪B|；
+    - exact_match：两轮集合完全相同的 token 占比；
+    - first_recall：|A∩B| / |A|，第一轮专家在第二轮复现的比例；
+    - second_unique_reuse：|A∩B| / |B|，第二轮独特专家来自
+      第一轮的比例。
+    """
+    if a_bool.numel() == 0 or b_bool.numel() == 0:
+        return None
+    if a_bool.size(0) != b_bool.size(0):
+        return None
+
+    intersection = (a_bool & b_bool).sum(dim=-1).float()
+    union = (a_bool | b_bool).sum(dim=-1).float()
+    r1_size = a_bool.sum(dim=-1).float()
+    r2_size = b_bool.sum(dim=-1).float()
+
+    return {
+        "units": int(a_bool.size(0)),
+        "second_round_jaccard_mean": float(
+            (intersection / union.clamp_min(1e-12)).mean()
+        ),
+        "second_round_exact_match_share": float(
+            (intersection == union).float().mean()
+        ),
+        "first_round_recall_mean": float(
+            (intersection / r1_size.clamp_min(1e-12)).mean()
+        ),
+        "second_round_unique_reuse_mean": float(
+            (intersection / r2_size.clamp_min(1e-12)).mean()
+        ),
+    }
+
+
+def _routing_set_metrics(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    n_experts: int,
+) -> Optional[Dict[str, float]]:
+    """[N, ka] / [N, kb] 专家下标对的集合重合指标（含 slot 口径）。"""
+    if a.numel() == 0 or b.numel() == 0:
+        return None
+    if a.size(0) != b.size(0):
+        return None
+
+    a_bool = _routing_set_bool(a, n_experts)
+    b_bool = _routing_set_bool(b, n_experts)
+    metrics = _routing_set_metrics_bool(a_bool, b_bool)
+    if metrics is None:
+        return None
+
+    # slot 口径：第二轮每个 assignment 的专家是否落在第一轮集合中
+    # （重复专家按 slot 各计一次，反映实际计算里的复用比例）。
+    b_slots = b.to(torch.int64).clamp_(min=0, max=n_experts - 1)
+    metrics["second_round_slot_reuse_mean"] = float(
+        a_bool.float().gather(1, b_slots).mean()
+    )
+    return metrics
+
+
+class RoutingProbe:
+    """
+    RQ3/RQ4 的路由探针：在分析前向中按调用顺序记录每次 route()。
+
+    只由 analyze_routing 挂载/卸载；route() 在探针为 None 时
+    只付出一次属性判空，训练路径不受影响。
+    """
+
+    def __init__(self, cfg: Config, batch_size: int):
+        self.cfg = cfg
+        self.batch_size = max(1, int(batch_size))
+        self.events: List[Dict[str, object]] = []
+        self._modules: List[SparseMoE] = []
+        self._block_index: Dict[int, int] = {}
+        self._call_counts: Dict[int, int] = {}
+        self._wrapped_model: Optional[nn.Module] = None
+        self._original_forward = None
+
+    def attach(self, model: nn.Module) -> None:
+        core = _unwrap_model(model)
+
+        # 轮次计数必须在每次前向开始时清零：第 1 次调用是
+        # 第一轮、第 2 次是第二轮。包装 model.forward（nn.Module
+        # 的 __call__ 会在实例上查找 forward），分析循环只通过
+        # core(x) 调用前向，因此每次前向都从干净计数开始。
+        self._wrapped_model = core
+        self._original_forward = core.forward
+        probe = self
+
+        def _forward_with_probe_reset(*args, **kwargs):
+            probe._call_counts.clear()
+            return probe._original_forward(*args, **kwargs)
+
+        core.forward = _forward_with_probe_reset
+
+        for index, block in enumerate(getattr(core, "blocks", [])):
+            moe = getattr(block, "moe", None)
+            if not isinstance(moe, SparseMoE):
+                continue
+            self._block_index[id(moe)] = index
+            self._modules.append(moe)
+            moe._routing_probe = self
+
+    def detach(self) -> None:
+        for moe in self._modules:
+            moe._routing_probe = None
+        self._modules.clear()
+        if self._wrapped_model is not None:
+            self._wrapped_model.forward = self._original_forward
+            self._wrapped_model = None
+            self._original_forward = None
+        self._call_counts.clear()
+
+    def _branch_cosine_stats(
+        self,
+        x: torch.Tensor,
+        branch_dim: int,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        分支表示的两两余弦相似度（mean 与最小 pair）。
+
+        余弦接近 1 说明分支轨迹几乎重合（延迟合并没有带来
+        独立计算）；明显小于 1 说明分支确实在分化。
+        """
+        branches = int(x.size(branch_dim))
+        if branches < 2:
+            return None, None
+
+        base = x.detach().float()
+        base = base / base.norm(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+        moved = base.movedim(branch_dim, 0).reshape(
+            branches,
+            -1,
+            base.size(-1),
+        )
+
+        pair_means: List[float] = []
+        for i in range(branches):
+            for j in range(i + 1, branches):
+                cosine = (moved[i] * moved[j]).sum(dim=-1)
+                pair_means.append(float(cosine.mean()))
+
+        return (
+            sum(pair_means) / len(pair_means),
+            min(pair_means),
+        )
+
+    def record(
+        self,
+        module: SparseMoE,
+        x: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> None:
+        block = self._block_index.get(id(module))
+        if block is None:
+            return
+
+        key = id(module)
+        call = self._call_counts.get(key, 0) + 1
+        self._call_counts[key] = call
+
+        with torch.no_grad():
+            indices = top_indices.detach().reshape(
+                -1,
+                top_indices.size(-1),
+            )
+            if indices.numel() == 0:
+                return
+
+            n_experts = int(module.n_experts)
+            flat_indices = indices.to(torch.int64).clamp_(
+                min=0,
+                max=n_experts - 1,
+            ).reshape(-1)
+            weights = top_weights.detach().float().reshape(-1)
+
+            usage = torch.bincount(
+                flat_indices,
+                minlength=n_experts,
+            )
+            total = int(usage.sum().item())
+            usage_share = usage.float() / max(1, total)
+
+            gate_mass = torch.zeros(
+                n_experts,
+                dtype=torch.float32,
+            )
+            gate_mass.scatter_add_(0, flat_indices, weights)
+
+            probs = router_logits.detach().float().softmax(dim=-1)
+            log_e = (
+                math.log(n_experts)
+                if n_experts > 1
+                else 0.0
+            )
+
+            if log_e > 0.0:
+                router_entropy = float(
+                    -(
+                        probs.clamp_min(1e-12).log()
+                        * probs
+                    ).sum(-1).mean()
+                    / log_e
+                )
+                nonzero = usage_share[usage_share > 0]
+                load_entropy = float(
+                    -(nonzero * nonzero.log()).sum() / log_e
+                )
+            else:
+                router_entropy = 0.0
+                load_entropy = 0.0
+
+            branch_mean: Optional[float] = None
+            branch_min: Optional[float] = None
+            cfg = self.cfg
+            shape = x.shape
+            is_middle = cfg.middle_start <= block < cfg.middle_end
+            branch_dim: Optional[int] = None
+
+            if cfg.mode == "A" and len(shape) == 4:
+                branch_dim = 2
+            elif (
+                cfg.mode == "B"
+                and is_middle
+                and cfg.k1 >= 2
+                and len(shape) == 3
+                and not (
+                    block == cfg.middle_start and call == 1
+                )
+                and shape[0] % cfg.k1 == 0
+            ):
+                rows = int(shape[0])
+                batch = rows // cfg.k1
+                if 0 < batch <= self.batch_size:
+                    x = x.reshape(
+                        batch,
+                        cfg.k1,
+                        shape[1],
+                        shape[2],
+                    )
+                    branch_dim = 1
+
+            if branch_dim is not None:
+                branch_mean, branch_min = (
+                    self._branch_cosine_stats(x, branch_dim)
+                )
+
+            self.events.append({
+                "block": block,
+                "round": call,
+                "top_k": int(indices.size(-1)),
+                "rows": int(indices.size(0)),
+                "input_shape": [int(size) for size in shape],
+                "usage": usage.to(torch.int64).tolist(),
+                "gate_mass": gate_mass.tolist(),
+                "load_entropy": load_entropy,
+                "load_max_share": float(usage_share.max()),
+                "dead_experts": int((usage == 0).sum()),
+                "router_entropy": router_entropy,
+                "router_max_prob": float(
+                    probs.max(-1).values.mean()
+                ),
+                "indices": indices.to(
+                    torch.int16
+                ).cpu(),
+                "branch_cosine_mean": branch_mean,
+                "branch_cosine_min_pair": branch_min,
+            })
+
+    @staticmethod
+    def _accumulate(
+        accumulator: Dict[str, object],
+        metrics: Optional[Dict[str, float]],
+    ) -> None:
+        if not metrics:
+            return
+        for name, value in metrics.items():
+            if name == "units":
+                accumulator[name] = (
+                    int(accumulator.get(name, 0)) + int(value)
+                )
+            else:
+                accumulator.setdefault(name, []).append(float(value))
+
+    @staticmethod
+    def _finalize(
+        accumulator: Dict[str, object],
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {}
+        for name, value in accumulator.items():
+            if name == "units":
+                result[name] = int(value)
+            else:
+                values = [float(v) for v in value]
+                result[name] = (
+                    sum(values) / len(values)
+                    if values
+                    else None
+                )
+        return result
+
+    def _round_summary(
+        self,
+        events: List[Dict[str, object]],
+        n_experts: int,
+    ) -> Optional[Dict[str, object]]:
+        if not events:
+            return None
+
+        usage = [0] * n_experts
+        gate = [0.0] * n_experts
+        token_count = 0
+        for event in events:
+            token_count += int(event["rows"])
+            for index, count in enumerate(event["usage"]):
+                usage[index] += int(count)
+            for index, mass in enumerate(event["gate_mass"]):
+                gate[index] += float(mass)
+
+        # usage 是 assignment 计数（token × top_k），token 数单独
+        # 记录，避免 token 量与 assignment 量混淆。
+        total = sum(usage)
+        usage_share = (
+            [count / total for count in usage]
+            if total > 0
+            else [0.0] * n_experts
+        )
+        gate_total = sum(gate)
+        gate_share = (
+            [mass / gate_total for mass in gate]
+            if gate_total > 0
+            else [0.0] * n_experts
+        )
+
+        shares = torch.tensor(usage_share, dtype=torch.float64)
+        log_e = (
+            math.log(n_experts)
+            if n_experts > 1
+            else 0.0
+        )
+        if log_e > 0.0 and total > 0:
+            nonzero = shares[shares > 0]
+            load_entropy = float(
+                -(nonzero * nonzero.log()).sum() / log_e
+            )
+        else:
+            load_entropy = 0.0
+
+        mean_share = (
+            sum(usage_share) / n_experts
+            if n_experts > 0
+            else 0.0
+        )
+        if mean_share > 0:
+            variance = sum(
+                (share - mean_share) ** 2
+                for share in usage_share
+            ) / n_experts
+            load_cv = math.sqrt(variance) / mean_share
+        else:
+            load_cv = 0.0
+
+        def _mean_events(field: str) -> Optional[float]:
+            values = [
+                float(event[field])
+                for event in events
+                if event.get(field) is not None
+            ]
+            return sum(values) / len(values) if values else None
+
+        return {
+            "events": len(events),
+            "tokens": token_count,
+            "assignments": total,
+            "expert_usage_share": [
+                round(share, 6) for share in usage_share
+            ],
+            "expert_gate_mass_share": [
+                round(share, 6) for share in gate_share
+            ],
+            "load_entropy": load_entropy,
+            "load_max_share": max(usage_share) if usage_share else 0.0,
+            "load_cv": load_cv,
+            "dead_experts": sum(1 for count in usage if count == 0),
+            "router_entropy_mean": _mean_events("router_entropy"),
+            "router_max_prob_mean": _mean_events("router_max_prob"),
+        }
+
+    def _pair_overlap(
+        self,
+        first: Dict[str, object],
+        second: Dict[str, object],
+        block: int,
+    ) -> Dict[str, object]:
+        """
+        一对（第一轮、第二轮）route 记录的重合指标。
+
+        返回 branch_level（逐分支对齐）与 token_level（跨分支
+        并集）两种口径；smelt/local_base 无分支结构，两者相同。
+        """
+        cfg = self.cfg
+        n_experts = cfg.n_experts
+        k1 = cfg.k1
+        k2 = cfg.k2
+
+        a = first["indices"].to(torch.int64)
+        b = second["indices"].to(torch.int64)
+        shape_first = list(first["input_shape"])
+        shape_second = list(second["input_shape"])
+
+        result: Dict[str, object] = {
+            "branch_level": None,
+            "token_level": None,
+            "branch_self_reuse_share": None,
+        }
+
+        if cfg.mode in ("smelt", "local_base"):
+            metrics = _routing_set_metrics(a, b, n_experts)
+            result["branch_level"] = metrics
+            result["token_level"] = (
+                dict(metrics) if metrics is not None else None
+            )
+            return result
+
+        if cfg.mode == "A":
+            # 第一轮 [B*T, k1]；第二轮 [B*T*k1, k2]，
+            # 行序为 (batch, time, branch)。
+            if len(shape_second) != 4 or a.size(0) * k1 != b.size(0):
+                return result
+            rows = a.size(0)
+            b_branch = b.reshape(rows, k1, k2)
+            a_expanded = a.repeat_interleave(k1, dim=0)
+            result["branch_level"] = _routing_set_metrics(
+                a_expanded,
+                b_branch.reshape(-1, k2).contiguous(),
+                n_experts,
+            )
+            a_bool = _routing_set_bool(a, n_experts)
+            b_bool = _routing_set_bool(
+                b,
+                n_experts,
+            ).reshape(rows, k1, n_experts).any(dim=1)
+            result["token_level"] = _routing_set_metrics_bool(
+                a_bool,
+                b_bool,
+            )
+            b_branch_bool = _routing_set_bool(
+                b,
+                n_experts,
+            ).reshape(rows, k1, n_experts)
+            own = b_branch_bool.gather(
+                2,
+                a.unsqueeze(2),
+            ).float()
+            result["branch_self_reuse_share"] = float(own.mean())
+            return result
+
+        if cfg.mode == "B" and block == cfg.middle_start:
+            # 分支创建：[B, T, k1]（第 j 个分支的专家）；第二轮
+            # 经 run_independent_blocks 把分支维并入批维后为
+            # [B*k1*T, k2]，行序为 (batch, branch, time)。
+            batch = int(shape_first[0])
+            time_steps = int(shape_first[1])
+            if batch * time_steps != a.size(0):
+                return result
+            if batch * k1 * time_steps != b.size(0):
+                return result
+            a_tokens = a.reshape(batch, time_steps, k1)
+            b_branch = b.reshape(
+                batch,
+                k1,
+                time_steps,
+                k2,
+            )
+            a_expanded = a_tokens.unsqueeze(1).expand(
+                batch,
+                k1,
+                time_steps,
+                k1,
+            ).reshape(-1, k1)
+            result["branch_level"] = _routing_set_metrics(
+                a_expanded,
+                b_branch.reshape(-1, k2).contiguous(),
+                n_experts,
+            )
+            b_bool = _routing_set_bool(
+                b_branch.reshape(-1, k2),
+                n_experts,
+            ).reshape(batch, k1, time_steps, n_experts).any(dim=1)
+            result["token_level"] = _routing_set_metrics_bool(
+                _routing_set_bool(
+                    a_tokens.reshape(batch * time_steps, k1),
+                    n_experts,
+                ),
+                b_bool.reshape(batch * time_steps, n_experts),
+            )
+            own = _routing_set_bool(
+                b_branch.reshape(-1, k2),
+                n_experts,
+            ).reshape(
+                batch,
+                k1,
+                time_steps,
+                n_experts,
+            ).gather(
+                3,
+                a_tokens.permute(0, 2, 1).unsqueeze(-1),
+            ).float()
+            result["branch_self_reuse_share"] = float(own.mean())
+            return result
+
+        if cfg.mode == "B":
+            # 第一轮其余 Block 与第二轮：x 为 [B*k1, T, D]，
+            # 行序为 (batch, branch)；两轮逐分支对齐。
+            time_steps = int(shape_first[1])
+            if time_steps <= 0:
+                return result
+            rows = a.size(0)
+            if rows % (k1 * time_steps) != 0:
+                return result
+            batch = rows // (k1 * time_steps)
+            if b.size(0) != rows:
+                return result
+            a_branch = a.reshape(batch, k1, time_steps, k1)
+            b_branch = b.reshape(batch, k1, time_steps, k2)
+            result["branch_level"] = _routing_set_metrics(
+                a_branch.reshape(-1, k1),
+                b_branch.reshape(-1, k2).contiguous(),
+                n_experts,
+            )
+            a_bool = _routing_set_bool(
+                a_branch.reshape(-1, k1),
+                n_experts,
+            ).reshape(
+                batch,
+                k1,
+                time_steps,
+                n_experts,
+            ).any(dim=1)
+            b_bool = _routing_set_bool(
+                b_branch.reshape(-1, k2),
+                n_experts,
+            ).reshape(
+                batch,
+                k1,
+                time_steps,
+                n_experts,
+            ).any(dim=1)
+            result["token_level"] = _routing_set_metrics_bool(
+                a_bool.reshape(batch * time_steps, n_experts),
+                b_bool.reshape(batch * time_steps, n_experts),
+            )
+            return result
+
+        return result
+
+    def build_report(self, split: str = "val") -> Dict[str, object]:
+        cfg = self.cfg
+        report: Dict[str, object] = {
+            "mode": cfg.mode,
+            "split": split,
+            "top_k": cfg.top_k,
+            "k1": cfg.k1,
+            "k2": cfg.k2,
+            "n_experts": cfg.n_experts,
+            "events": len(self.events),
+            "round_semantics": (
+                "round = 同一 Block 内 route() 的调用序号："
+                "1=第一轮，2=第二轮"
+            ),
+            "notes": [
+                "诊断只使用验证集固定窗口，测试集不参与。",
+                "路由诊断不参与模型选择、早停或指标优化。",
+                "重合度在同一 token、同一 Block 的两轮路由之间"
+                "比较；A/B 的分支结构另有逐分支与 token 级"
+                "（跨分支并集）口径。",
+            ],
+        }
+
+        if cfg.mode == "dense":
+            report["skipped"] = (
+                "dense 基线没有 MoE 路由，无 RQ3/RQ4 诊断"
+            )
+            return report
+
+        if not self.events:
+            report["skipped"] = (
+                "分析前向未记录到任何 route 调用"
+            )
+            return report
+
+        grouped: Dict[int, Dict[int, List[Dict[str, object]]]] = {}
+        for event in self.events:
+            grouped.setdefault(event["block"], {}).setdefault(
+                event["round"],
+                [],
+            ).append(event)
+
+        middle_blocks = list(
+            range(cfg.middle_start, cfg.middle_end)
+        )
+
+        per_block: Dict[str, object] = {}
+        rq3_summary_values: Dict[str, List[float]] = {}
+        rq4_round_values: Dict[str, Dict[str, List[float]]] = {
+            "round1": {},
+            "round2": {},
+        }
+        divergence_values: List[float] = []
+        tokens_total = 0
+
+        for block in middle_blocks:
+            rounds = grouped.get(block, {})
+            round1 = rounds.get(1, [])
+            round2 = rounds.get(2, [])
+
+            round1_summary = self._round_summary(
+                round1,
+                cfg.n_experts,
+            )
+            round2_summary = self._round_summary(
+                round2,
+                cfg.n_experts,
+            )
+            if round1_summary is not None:
+                tokens_total += int(round1_summary["tokens"])
+
+            overlap_accumulators: Dict[str, Dict[str, object]] = {
+                "branch_level": {},
+                "token_level": {},
+            }
+            self_reuse_values: List[float] = []
+            cosine_values: List[float] = []
+            cosine_min_values: List[float] = []
+
+            for first, second in zip(round1, round2):
+                overlap = self._pair_overlap(
+                    first,
+                    second,
+                    block,
+                )
+                self._accumulate(
+                    overlap_accumulators["branch_level"],
+                    overlap.get("branch_level"),
+                )
+                self._accumulate(
+                    overlap_accumulators["token_level"],
+                    overlap.get("token_level"),
+                )
+                if overlap.get("branch_self_reuse_share") is not None:
+                    self_reuse_values.append(
+                        float(overlap["branch_self_reuse_share"])
+                    )
+
+            for event in round1 + round2:
+                if event.get("branch_cosine_mean") is not None:
+                    cosine_values.append(
+                        float(event["branch_cosine_mean"])
+                    )
+                if event.get("branch_cosine_min_pair") is not None:
+                    cosine_min_values.append(
+                        float(event["branch_cosine_min_pair"])
+                    )
+
+            branch_metrics = self._finalize(
+                overlap_accumulators["branch_level"]
+            )
+            token_metrics = self._finalize(
+                overlap_accumulators["token_level"]
+            )
+
+            block_report: Dict[str, object] = {
+                "round1": round1_summary,
+                "round2": round2_summary,
+                "expert_overlap_branch_level": (
+                    branch_metrics or None
+                ),
+                "expert_overlap_token_level": (
+                    token_metrics or None
+                ),
+                "branch_self_reuse_share": (
+                    sum(self_reuse_values) / len(self_reuse_values)
+                    if self_reuse_values
+                    else None
+                ),
+                "branch_cosine_mean": (
+                    sum(cosine_values) / len(cosine_values)
+                    if cosine_values
+                    else None
+                ),
+                "branch_cosine_min_pair": (
+                    sum(cosine_min_values) / len(cosine_min_values)
+                    if cosine_min_values
+                    else None
+                ),
+            }
+            per_block[str(block)] = block_report
+
+            for name in (
+                "second_round_jaccard_mean",
+                "second_round_exact_match_share",
+                "second_round_slot_reuse_mean",
+                "first_round_recall_mean",
+                "second_round_unique_reuse_mean",
+            ):
+                value = branch_metrics.get(name)
+                if isinstance(value, (int, float)):
+                    rq3_summary_values.setdefault(
+                        name,
+                        [],
+                    ).append(float(value))
+                token_value = token_metrics.get(name)
+                if isinstance(token_value, (int, float)):
+                    rq3_summary_values.setdefault(
+                        f"token_{name}",
+                        [],
+                    ).append(float(token_value))
+            if self_reuse_values:
+                rq3_summary_values.setdefault(
+                    "branch_self_reuse_share",
+                    [],
+                ).append(
+                    sum(self_reuse_values) / len(self_reuse_values)
+                )
+
+            for round_name, summary in (
+                ("round1", round1_summary),
+                ("round2", round2_summary),
+            ):
+                if summary is None:
+                    continue
+                for field in (
+                    "load_entropy",
+                    "load_max_share",
+                    "dead_experts",
+                    "router_entropy_mean",
+                    "router_max_prob_mean",
+                ):
+                    value = summary.get(field)
+                    if isinstance(value, (int, float)):
+                        rq4_round_values[round_name].setdefault(
+                            field,
+                            [],
+                        ).append(float(value))
+
+            if cosine_values:
+                divergence_values.append(
+                    sum(cosine_values) / len(cosine_values)
+                )
+
+        rq3_summary = {
+            name: sum(values) / len(values)
+            for name, values in rq3_summary_values.items()
+            if values
+        }
+
+        rq4_summary = {}
+        for round_name, fields in rq4_round_values.items():
+            rq4_summary[round_name] = {
+                field: sum(values) / len(values)
+                for field, values in fields.items()
+                if values
+            }
+
+        report.update({
+            "tokens_evaluated": tokens_total,
+            "middle_blocks": middle_blocks,
+            "per_block": per_block,
+            "rq3_expert_overlap": {
+                "definition": (
+                    "第二轮相对第一轮的专家集合重合：jaccard = "
+                    "|A∩B|/|A∪B|；slot_reuse = 第二轮每个 "
+                    "assignment 的专家落在第一轮集合中的比例；"
+                    "branch 级 = 同一分支两轮对齐，token 级 = "
+                    "第二轮跨分支并集对第一轮集合"
+                ),
+                "summary": rq3_summary,
+            },
+            "rq4_load_and_entropy": {
+                "definition": (
+                    "专家负载分布与路由熵：load_entropy 为逐专家"
+                    "使用率香农熵（按 ln(n_experts) 归一，1=完全"
+                    "均匀）；router_entropy_mean 为路由 softmax "
+                    "分布熵；dead_experts 为无 assignment 的专家数"
+                ),
+                "summary": rq4_summary,
+            },
+            "branch_divergence": {
+                "definition": (
+                    "A/B 分支表示的跨分支平均余弦相似度：接近 1 "
+                    "说明分支轨迹几乎重合（延迟合并未产生独立"
+                    "计算），明显小于 1 说明分支在分化"
+                ),
+                "summary": {
+                    "branch_cosine_mean": (
+                        sum(divergence_values)
+                        / len(divergence_values)
+                        if divergence_values
+                        else None
+                    ),
+                    "blocks_with_branches": len(divergence_values),
+                },
+            },
+        })
+        return report
+
+
+def analyze_routing(
+    model: nn.Module,
+    dataset: ByteDataset,
+    batch_size: int,
+    batches: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype] = None,
+    split: str = "val",
+) -> Dict[str, object]:
+    """
+    在固定评估窗口上做一次无梯度前向，汇总 RQ3/RQ4 路由诊断。
+
+    split 只允许 val/test；调用方（训练入口）只传 val——路由
+    诊断不接触尘封的测试集。返回结构化报告，供 metrics.jsonl、
+    config.json 与 routing.json 落盘。
+    """
+    was_training = model.training
+    model.eval()
+
+    core = _unwrap_model(model)
+    cfg = core.cfg
+    probe = RoutingProbe(cfg, batch_size)
+    probe.attach(core)
+
+    use_amp = (
+        amp_dtype is not None
+        and device.type == "cuda"
+    )
+
+    try:
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            with torch.no_grad():
+                for batch_index in range(batches):
+                    x, _ = dataset.fixed_eval_batch(
+                        split,
+                        batch_index,
+                        batches,
+                        batch_size,
+                        device,
+                    )
+                    if x.size(0) == 0:
+                        break
+                    core(x)
+    finally:
+        probe.detach()
+        model.train(was_training)
+
+    report = probe.build_report(split=split)
+    report["batches_requested"] = batches
+    report["batch_size"] = batch_size
+    return report
+
+
+def print_routing_analysis(report: Dict[str, object]) -> None:
+    """打印 RQ3/RQ4 路由诊断摘要。"""
+    mode = report.get("mode")
+    if "skipped" in report:
+        print(
+            f"[routing] mode={mode} 跳过路由诊断: "
+            f"{report.get('skipped')}"
+        )
+        return
+
+    print(
+        f"[routing] mode={mode} split={report.get('split')} "
+        f"tokens={report.get('tokens_evaluated')} "
+        f"blocks={report.get('middle_blocks')}"
+    )
+
+    rq4 = report.get("rq4_load_and_entropy") or {}
+    for round_name in ("round1", "round2"):
+        summary = (rq4.get("summary") or {}).get(round_name) or {}
+        if not summary:
+            continue
+        print(
+            f"[routing] {round_name} 专家负载: "
+            f"load_entropy="
+            f"{summary.get('load_entropy', float('nan')):.4f} "
+            f"max_share="
+            f"{summary.get('load_max_share', float('nan')):.4f} "
+            f"dead={summary.get('dead_experts')} "
+            f"router_entropy="
+            f"{summary.get('router_entropy_mean', float('nan')):.4f}"
+        )
+
+    rq3 = (report.get("rq3_expert_overlap") or {}).get(
+        "summary"
+    ) or {}
+    if rq3:
+        def _show(name: str) -> str:
+            value = rq3.get(name)
+            return "n/a" if value is None else f"{float(value):.4f}"
+
+        print(
+            "[routing] RQ3 两轮专家重合（branch 级）："
+            f"jaccard={_show('second_round_jaccard_mean')} "
+            f"exact_match="
+            f"{_show('second_round_exact_match_share')} "
+            f"slot_reuse="
+            f"{_show('second_round_slot_reuse_mean')} | "
+            "token 级："
+            f"jaccard={_show('token_second_round_jaccard_mean')} "
+            f"exact_match="
+            f"{_show('token_second_round_exact_match_share')}"
+        )
+        if rq3.get("branch_self_reuse_share") is not None:
+            print(
+                "[routing] 分支自身专家在第二轮复现比例（A/B）: "
+                f"{float(rq3['branch_self_reuse_share']):.4f}"
+            )
+
+    divergence = (report.get("branch_divergence") or {}).get(
+        "summary"
+    ) or {}
+    if divergence.get("branch_cosine_mean") is not None:
+        print(
+            "[routing] 跨分支表示平均余弦相似度: "
+            f"{float(divergence['branch_cosine_mean']):.4f}"
+            f"（blocks_with_branches="
+            f"{divergence.get('blocks_with_branches')}）"
+        )
+
+
+# ============================================================
 # Non-finite (NaN/Inf) diagnosis
 # ============================================================
 
@@ -6148,6 +7148,54 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             reference if isinstance(reference, dict) else None
         )
 
+        # RQ3/RQ4 路由诊断（config.json 的 routing_analysis）：
+        # 汇总两轮专家重合度与专家负载/路由熵，供跨运行对比。
+        # 诊断只基于验证集固定窗口，测试集不参与；缺失时保持
+        # None，不虚报指标。
+        routing = config_payload.get("routing_analysis")
+        row["routing_available"] = isinstance(routing, dict)
+        for key in _ROUTING_ROW_FIELDS:
+            row[key] = None
+        if isinstance(routing, dict):
+            rq3 = (
+                routing.get("rq3_expert_overlap") or {}
+            ).get("summary") or {}
+            rq4 = (
+                routing.get("rq4_load_and_entropy") or {}
+            ).get("summary") or {}
+            divergence = (
+                routing.get("branch_divergence") or {}
+            ).get("summary") or {}
+            row["routing_jaccard_branch"] = rq3.get(
+                "second_round_jaccard_mean"
+            )
+            row["routing_slot_reuse_branch"] = rq3.get(
+                "second_round_slot_reuse_mean"
+            )
+            row["routing_jaccard_token"] = rq3.get(
+                "token_second_round_jaccard_mean"
+            )
+            row["routing_branch_self_reuse"] = rq3.get(
+                "branch_self_reuse_share"
+            )
+            round1 = rq4.get("round1") or {}
+            round2 = rq4.get("round2") or {}
+            row["routing_r1_load_entropy"] = round1.get(
+                "load_entropy"
+            )
+            row["routing_r2_load_entropy"] = round2.get(
+                "load_entropy"
+            )
+            row["routing_r2_dead_experts"] = round2.get(
+                "dead_experts"
+            )
+            row["routing_r2_router_entropy"] = round2.get(
+                "router_entropy_mean"
+            )
+            row["routing_branch_cosine"] = divergence.get(
+                "branch_cosine_mean"
+            )
+
         # 受控变量协议：对比分析用它检查「除声明因子外，
         # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
         row["protocol"] = experiment_protocol_from_payload(
@@ -6373,6 +7421,20 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_token_accuracy",
     "val_macro_f1",
     "val_pr_auc_macro",
+)
+
+# --compare 行级的 RQ3/RQ4 路由诊断字段（来自各运行 config.json
+# 的 routing_analysis；旧运行缺失时保持 None，不虚报指标）。
+_ROUTING_ROW_FIELDS: Tuple[str, ...] = (
+    "routing_jaccard_branch",
+    "routing_slot_reuse_branch",
+    "routing_jaccard_token",
+    "routing_branch_self_reuse",
+    "routing_r1_load_entropy",
+    "routing_r2_load_entropy",
+    "routing_r2_dead_experts",
+    "routing_r2_router_entropy",
+    "routing_branch_cosine",
 )
 
 _LOWER_IS_BETTER_METRICS = {
@@ -9739,6 +10801,254 @@ def run_self_test():
         atol=1e-6,
     )
 
+    # ---- RQ3/RQ4 路由诊断 ----
+    # 集合重合指标的口径必须精确：A={0,1}, B={1,2} 时
+    # jaccard=1/3、first_recall=1/2、slot_reuse=1/2。
+    overlap_metrics = _routing_set_metrics(
+        torch.tensor([[0, 1]]),
+        torch.tensor([[1, 2]]),
+        4,
+    )
+    assert overlap_metrics is not None
+    torch.testing.assert_close(
+        torch.tensor(overlap_metrics["second_round_jaccard_mean"]),
+        torch.tensor(1.0 / 3.0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert overlap_metrics["second_round_exact_match_share"] == 0.0
+    assert abs(
+        overlap_metrics["first_round_recall_mean"] - 0.5
+    ) < 1e-6
+    assert abs(
+        overlap_metrics["second_round_unique_reuse_mean"] - 0.5
+    ) < 1e-6
+    assert abs(
+        overlap_metrics["second_round_slot_reuse_mean"] - 0.5
+    ) < 1e-6
+
+    identical_metrics = _routing_set_metrics(
+        torch.tensor([[0, 1]]),
+        torch.tensor([[0, 1]]),
+        4,
+    )
+    assert identical_metrics is not None
+    for name in (
+        "second_round_jaccard_mean",
+        "second_round_exact_match_share",
+        "first_round_recall_mean",
+        "second_round_unique_reuse_mean",
+        "second_round_slot_reuse_mean",
+    ):
+        assert abs(identical_metrics[name] - 1.0) < 1e-6
+
+    # 端到端诊断：B/A/smelt 在固定 val 窗口上的报告结构、
+    # 轮次归属与分支口径；dense 无路由必须显式跳过。
+    with tempfile.NamedTemporaryFile() as routing_data:
+        routing_data.write(bytes(range(256)))
+        routing_data.flush()
+        routing_dataset = ByteDataset(
+            routing_data.name,
+            seq_len=8,
+        )
+        routing_device = torch.device("cpu")
+
+        routing_probe_model = LanguageModel(
+            Config(
+                **{
+                    **common,
+                    "n_experts": 4,
+                    "mode": "B",
+                    "k1": 2,
+                    "k2": 2,
+                }
+            )
+        )
+        probe = RoutingProbe(
+            routing_probe_model.cfg,
+            2,
+        )
+        probe.attach(routing_probe_model)
+
+        with torch.no_grad():
+            for batch_index in range(2):
+                probe_x, _ = routing_dataset.fixed_eval_batch(
+                    "val",
+                    batch_index,
+                    2,
+                    2,
+                    routing_device,
+                )
+                routing_probe_model(probe_x)
+
+        probe.detach()
+        assert all(
+            module._routing_probe is None
+            for module in routing_probe_model.modules()
+            if isinstance(module, SparseMoE)
+        )
+
+        middle_start = routing_probe_model.cfg.middle_start
+        middle_end = routing_probe_model.cfg.middle_end
+        events_by_block: Dict[int, Dict[int, List[Dict]]] = {}
+        for event in probe.events:
+            events_by_block.setdefault(
+                event["block"],
+                {},
+            ).setdefault(event["round"], []).append(event)
+
+        for block in range(middle_start, middle_end):
+            round1_events = events_by_block[block][1]
+            round2_events = events_by_block[block][2]
+            assert len(round1_events) == 2
+            assert len(round2_events) == 2
+            assert all(
+                event["top_k"] == 2 for event in round1_events
+            )
+            assert all(
+                event["top_k"] == 2 for event in round2_events
+            )
+            if block == middle_start:
+                # 分支创建后第二轮把分支维并入批维：
+                # 第一轮 [B, T, D]，第二轮 [B*k1, T, D]。
+                assert round1_events[0]["input_shape"] == [2, 8, 16]
+                assert round2_events[0]["input_shape"] == [4, 8, 16]
+            else:
+                # 其余中间 Block 两轮都是 [B*k1, T, D]。
+                assert round1_events[0]["input_shape"][0] == 4
+                assert round2_events[0]["input_shape"][0] == 4
+                assert len(round2_events[0]["input_shape"]) == 3
+
+        routing_report = analyze_routing(
+            routing_probe_model,
+            routing_dataset,
+            2,
+            1,
+            routing_device,
+            split="val",
+        )
+        assert routing_report["mode"] == "B"
+        assert routing_report["tokens_evaluated"] > 0
+        for block in range(middle_start, middle_end):
+            block_report = routing_report["per_block"][str(block)]
+            for name in (
+                "expert_overlap_branch_level",
+                "expert_overlap_token_level",
+            ):
+                metrics = block_report[name]
+                assert metrics is not None
+                assert (
+                    0.0
+                    <= metrics["second_round_jaccard_mean"]
+                    <= 1.0
+                )
+                assert (
+                    0.0
+                    <= metrics["second_round_unique_reuse_mean"]
+                    <= 1.0
+                )
+            assert (
+                0.0
+                <= block_report["expert_overlap_branch_level"][
+                    "second_round_slot_reuse_mean"
+                ]
+                <= 1.0
+            )
+            if block == middle_start:
+                # 只有分支创建处存在「分支自身专家」的定义。
+                assert (
+                    block_report["branch_self_reuse_share"]
+                    is not None
+                )
+                assert (
+                    0.0
+                    <= block_report["branch_self_reuse_share"]
+                    <= 1.0
+                )
+            assert block_report["branch_cosine_mean"] is not None
+            assert -1.0 <= block_report["branch_cosine_mean"] <= 1.0
+            assert block_report["round1"]["dead_experts"] is not None
+            assert block_report["round2"]["dead_experts"] is not None
+
+        # A 的逐分支口径：第一轮 [B*T, k1]、第二轮 [B*T*k1, k2]。
+        a_model = LanguageModel(
+            Config(
+                **{
+                    **common,
+                    "n_experts": 4,
+                    "mode": "A",
+                    "k1": 2,
+                    "k2": 2,
+                }
+            )
+        )
+        a_report = analyze_routing(
+            a_model,
+            routing_dataset,
+            2,
+            1,
+            routing_device,
+            split="val",
+        )
+        for block in range(middle_start, middle_end):
+            block_report = a_report["per_block"][str(block)]
+            assert (
+                block_report["expert_overlap_branch_level"]
+                is not None
+            )
+            assert (
+                0.0
+                <= block_report["branch_self_reuse_share"]
+                <= 1.0
+            )
+
+        # smelt 没有分支结构：分支相似度必须为 None，
+        # 重合度仍按同 token 两轮集合报告。
+        smelt_model = LanguageModel(
+            Config(
+                **{
+                    **common,
+                    "n_experts": 4,
+                    "mode": "smelt",
+                }
+            )
+        )
+        smelt_report = analyze_routing(
+            smelt_model,
+            routing_dataset,
+            2,
+            1,
+            routing_device,
+            split="val",
+        )
+        assert (
+            smelt_report["branch_divergence"]["summary"][
+                "branch_cosine_mean"
+            ]
+            is None
+        )
+        for block in range(middle_start, middle_end):
+            assert (
+                smelt_report["per_block"][str(block)][
+                    "expert_overlap_branch_level"
+                ]
+                is not None
+            )
+
+        # dense 基线没有 MoE 路由：显式跳过而不是虚报指标。
+        dense_model = LanguageModel(
+            Config(**common, mode="dense")
+        )
+        dense_report = analyze_routing(
+            dense_model,
+            routing_dataset,
+            2,
+            1,
+            routing_device,
+            split="val",
+        )
+        assert "skipped" in dense_report
+
     # 空段占位张量为 fp32，非空专家输出为 bf16；
     # 散射缓冲按非空专家的 dtype 分配。
     merge_perm = torch.tensor([1, 0, 2])
@@ -12668,6 +13978,16 @@ def main():
         help="跳过训练结束后的效率测量",
     )
     parser.add_argument(
+        "--skip-routing-analysis",
+        action="store_true",
+        help=(
+            "跳过训练结束后的 RQ3/RQ4 路由诊断（第二轮与第一轮"
+            "的专家重合度 / Jaccard、专家负载分布与路由熵、"
+            "A/B 分支表示相似度）；默认定性诊断在验证集固定"
+            "窗口、验证集选定模型上执行一次，测试集不参与"
+        ),
+    )
+    parser.add_argument(
         "--compare",
         nargs="+",
         default=None,
@@ -14493,6 +15813,66 @@ def main():
         )
         metrics_file.flush()
         print_efficiency(efficiency)
+
+    # --------------------------------------------------------
+    # 结果分析 4：RQ3/RQ4 路由诊断。
+    #
+    # 在验证集固定窗口、验证集选定模型上做一次无梯度前向，
+    # 记录两轮路由的专家集合与门控分布：第二轮与第一轮的
+    # 重合度 / Jaccard（RQ3）、专家负载分布与路由熵（RQ4）、
+    # A/B 分支表示相似度。只描述模型内部行为，不参与选型；
+    # 测试集保持尘封。
+    # --------------------------------------------------------
+    if numerical_polluted:
+        print(
+            "[routing] 参数/优化器状态已被 NaN/Inf 污染，"
+            "跳过路由诊断（输出不可信，诊断结果没有意义）。"
+        )
+    elif not args.skip_routing_analysis:
+        routing_report = analyze_routing(
+            model,
+            dataset,
+            args.batch_size,
+            args.eval_batches,
+            device,
+            amp_dtype=amp_dtype,
+            split="val",
+        )
+        routing_report["selected_model"] = selection_policy
+        routing_report["selected_step"] = (
+            best_val_step
+            if selection_policy == "best_val"
+            else end_step
+        )
+        print_routing_analysis(routing_report)
+
+        update_run_config(
+            out_dir,
+            "routing_analysis",
+            routing_report,
+        )
+        with open(
+            out_dir / "routing.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                _json_safe(routing_report),
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        metrics_file.write(
+            json.dumps(
+                _json_safe({
+                    "step": "routing",
+                    **routing_report,
+                }),
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        metrics_file.flush()
 
     # 最终评估口径：上面的 final 记录始终是验证集口径。
     # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
