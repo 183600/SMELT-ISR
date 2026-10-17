@@ -197,19 +197,40 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   在给出相对差值之外，还核对基线本身是否值得战胜：基线在
   主指标上必须真的优于无上下文 unigram 参考（各运行
   `config.json` 的 `reference_baselines`），不能劣于对比集合
-  里调优好的 n-gram 统计基线，且种子数应 ≥3；否则以
-  `[straw-man]` 明确标记「战胜这样的弱基线不能证明复杂模型
-  的收益，先把基线训练/调参到强于参考」。未指定基线或缺少
-  参考记录时给出提示而不是虚报通过——没调过参的弱基线只能
-  证明复杂模型比稻草人强。
+  里调优好的 n-gram 统计基线，种子数应 ≥3，且必须带有调参
+  证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线
+  自身在 val 上做过 阶数 × 平滑系数 网格调优，视为已调参）；
+  否则以 `[straw-man]` 明确标记「战胜没调过参的弱基线不能
+  证明复杂模型的收益，先用 `--suite-baseline-tuning` 把基线
+  调强」。调参依据的指标与当前对比指标不一致时单独提示
+  「指标未对齐」（调在 val_loss 上不能证明 macro F1 也强）。
+  未指定基线或缺少参考记录时给出提示而不是虚报通过。
+- **简单基线的调参协议**：`--suite-baseline-tuning`（配合
+  `--seeds`）对简单基线做预注册的学习率网格搜索
+  （`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`；
+  `--baseline-tuning-mode` 选模式）：候选之间只允许学习率
+  不同，steps/batch/数据/结构全部继承同一条命令行，保证调参
+  与「训练更久」不混杂；按 val 指标 Mean ± Std 选择 winner，
+  与 winner 差距落在种子波动内时明确提示「无法区分」并取更小
+  lr（更保守），报告写入 `<out>/baseline_tuning.json`。后续
+  基线训练用 `--baseline-tuning-from <报告>` 核对模式 / winner
+  lr / steps / 数据指纹一致，并把来源写入 `config.json` 的
+  `baseline_tuning` 字段——这是「基线被调过参」的唯一证据；
+  报告本身不是最终基线，test 集全程尘封。
 - **假设登记与指标口径提示**：对比分析按模式汇总每个运行在
   `--hypothesis`/`--rq` 登记的假设，缺失假设的运行被点名
   （统计基线除外），避免把排列组合超参数当成假设驱动的实验；
+  假设没写明判定指标（如「效果更好」而不提验证损失 / macro
+  F1 / PR-AUC / 召回率）同样无法与评估口径对齐，单独点名。
   同时基于 `val_majority_accuracy`（最高频类的 support 占比）
   提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值
   有限，占比 ≥90% 时 accuracy/micro 已被常数预测主导、必须
   看 macro F1 与 PR-AUC（此时 ROC-AUC 因负样本基数巨大、
-  FPR 增长缓慢而偏乐观）。三项检查的结构化结果
+  FPR 增长缓慢而偏乐观）；占比 ≥99.9%（约 1:1000 以上）按
+  极度不平衡单独分级——随机 PR-AUC 只有平均 prevalence
+  （≈0.001，评估时记录为 `val_pr_auc_macro_chance`），排序
+  判定必须报告 PR-AUC 高出该水平的 lift，而不能把 PR-AUC
+  绝对值当准确率读。四项检查的结构化结果
   （`hypothesis_registry`、`baseline_adequacy`、
   `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
@@ -281,5 +302,9 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 多种子 / 消融套件：`--seeds SEED [SEED ...]`、
 `--suite-modes MODE [MODE ...]`（配合 `--seeds` 做控变量的
 模式对比）、`--suite-ablation`（配合 `--seeds` 做 2×2 全因子
-消融）。套件逐进程调用自身，结束后自动输出完整对比分析并
-写入 `<out>/comparison_analysis.json`。
+消融）、`--suite-baseline-tuning`（配合 `--seeds` 做简单基线
+的学习率网格调参，`--baseline-tuning-lrs` 给候选、
+`--baseline-tuning-mode` 选模式）。套件逐进程调用自身，结束
+后自动输出完整对比分析并写入 `<out>/comparison_analysis.json`
+（调参套件写 `<out>/baseline_tuning.json`）。基线训练可用
+`--baseline-tuning-from <报告>` 核对并记录调参来源。

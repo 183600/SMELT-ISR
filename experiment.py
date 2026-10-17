@@ -9,6 +9,7 @@ import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -3185,6 +3186,12 @@ def macro_auc_metrics(
     极度不平衡时优先报告 PR-AUC：负样本基数巨大时
     ROC-AUC 的 FPR 分母被拉大，同样的假阳性绝对数量下
     分数增长缓慢，容易给出过于乐观的结论。
+
+    同时返回 ``pr_auc_macro_chance``：macro PR-AUC 的随机
+    水平（各纳入类 prevalence 的均值）。PR-AUC 本身随正类
+    比例缩放，脱离该水平看绝对值没有意义；1:1000 级别的
+    不平衡下随机 PR-AUC 只有约 0.001，而随机 ROC-AUC 仍
+    是 0.5，两者的「及格线」完全不同。
     """
     probabilities = probabilities.detach().cpu().float()
     targets = targets.detach().cpu()
@@ -3199,6 +3206,7 @@ def macro_auc_metrics(
 
     pr_aucs: List[float] = []
     roc_aucs: List[float] = []
+    prevalence_sum = 0.0
 
     for class_index in eligible.tolist():
         labels = (targets == class_index).double()
@@ -3223,10 +3231,23 @@ def macro_auc_metrics(
         if roc is not None:
             roc_aucs.append(roc)
 
+        # 随机打分器的单类 average precision 期望值 = 该类
+        # prevalence（正类占比）；macro PR-AUC 的随机水平就是
+        # 各纳入类 prevalence 的均值。PR-AUC 的绝对值在类别
+        # 不平衡下不代表「好/坏」，必须与这个水平对照解读。
+        prevalence_sum += float(labels.mean())
+
+    n_prevalence = len(eligible)
+
     return {
         "pr_auc_macro": (
             sum(pr_aucs) / len(pr_aucs)
             if pr_aucs
+            else None
+        ),
+        "pr_auc_macro_chance": (
+            prevalence_sum / n_prevalence
+            if n_prevalence
             else None
         ),
         "roc_auc_macro": (
@@ -3281,7 +3302,10 @@ def evaluate(
     compute_auc=True 时（最终/测试评估）额外计算
     one-vs-rest 的 ``{split}_pr_auc_macro`` 与
     ``{split}_roc_auc_macro``，只纳入 support 达到
-    _AUC_MIN_SUPPORT 的类；极度不平衡时优先看 PR-AUC。
+    _AUC_MIN_SUPPORT 的类；极度不平衡时优先看 PR-AUC，
+    并与 ``{split}_pr_auc_macro_chance``（随机水平 =
+    平均 prevalence）对照，而不是把 PR-AUC 绝对值当
+    「准确率」解读。
     """
     was_training = model.training
     model.eval()
@@ -3422,6 +3446,7 @@ def evaluate(
             # 空评估（理论上不可达）：显式记录而不是
             # 静默缺键。
             metrics[f"{split}_pr_auc_macro"] = None
+            metrics[f"{split}_pr_auc_macro_chance"] = None
             metrics[f"{split}_roc_auc_macro"] = None
             metrics[f"{split}_auc_n_classes"] = 0
             metrics[f"{split}_auc_min_support"] = (
@@ -7189,6 +7214,14 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             reference if isinstance(reference, dict) else None
         )
 
+        # 基线调参来源（--baseline-tuning-from 写入）：对比分析
+        # 用它核对「基线是否真的被充分调过参」，没有该记录且
+        # 又没有强于调优好的 n-gram 时，战胜基线说明不了问题。
+        tuning = config_payload.get("baseline_tuning")
+        row["baseline_tuning"] = (
+            tuning if isinstance(tuning, dict) else None
+        )
+
         # RQ3/RQ4 路由诊断（config.json 的 routing_analysis）：
         # 汇总两轮专家重合度与专家负载/路由熵，供跨运行对比。
         # 诊断只基于验证集固定窗口，测试集不参与；缺失时保持
@@ -7306,6 +7339,13 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         )
         row["val_pr_auc_macro"] = (
             final_record.get("val_pr_auc_macro")
+            if final_record is not None
+            else None
+        )
+        # PR-AUC 随机水平（纳入类平均 prevalence）：不平衡下
+        # PR-AUC 必须相对它解读，而不是当准确率看。
+        row["val_pr_auc_macro_chance"] = (
+            final_record.get("val_pr_auc_macro_chance")
             if final_record is not None
             else None
         )
@@ -7455,13 +7495,20 @@ DEFAULT_COMPARISON_FACTORS = (
 # 「在多个候选里挑 test 最好」会让测试集退化成隐式验证集
 # （多重比较 + 选择偏差）。因此 --compare 系列工具一律
 # 不读取、不聚合、不展示 test 指标。
+# F1 的三种平均口径分别列出：micro（单标签多分类下与
+# accuracy 恒等）、macro（对出现过的类等权平均，不平衡时
+# 最能暴露少数类退化）与 weighted（按 support 加权，介于
+# 两者之间）。名字即口径，跨运行对比时必须显式选择。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
     "val_ppl",
     "val_bits_per_byte",
     "val_token_accuracy",
+    "val_micro_f1",
     "val_macro_f1",
+    "val_weighted_f1",
     "val_pr_auc_macro",
+    "val_roc_auc_macro",
 )
 
 # --compare 行级的 RQ3/RQ4 路由诊断字段（来自各运行 config.json
@@ -9076,7 +9123,12 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
 
 # 类别不平衡提示阈值：最高频类的 support 占比达到第一个值时，
 # accuracy / micro 口径已被「永远预测多数类」的常数预测器
-# 主导；超过第二个值时 accuracy 的参考价值已经有限。
+# 主导；超过第二个值时 accuracy 的参考价值已经有限；达到
+# 第三个值（多数类 ≈ 99.9%，约 1:1000 以上的不平衡）时排序
+# 判定只能看 PR-AUC——ROC-AUC 的 FPR 分母由海量负样本决定，
+# 随机水平仍是 0.5，会显著高估可用性，而随机 PR-AUC 只有
+# 约 1/1000，两者不可直接比较。
+_IMBALANCE_EXTREME_MAJORITY = 0.999
 _IMBALANCE_DOMINANT_MAJORITY = 0.9
 _IMBALANCE_WEAK_MAJORITY = 0.5
 
@@ -9132,7 +9184,12 @@ def baseline_adequacy(
     2. 若对比集合里有调优好的字节级 n-gram 统计基线，而它在
        主指标上已不劣于所选神经基线，同样标记 ``[straw-man]``：
        应先把基线训练/调参到强于统计基线，再谈复杂模型；
-    3. 基线本身种子数不足时提示统计功效不足，避免把基线的
+    3. 神经基线必须有调参证据（--suite-baseline-tuning 产生
+       的调参报告 + --baseline-tuning-from 写入 config.json 的
+       baseline_tuning 来源记录），否则标记 ``[straw-man]``：
+       没调过参的弱基线只能证明复杂模型比稻草人强；调参口径
+       与当前对比指标不一致时单独提示（指标未对齐）；
+    4. 基线本身种子数不足时提示统计功效不足，避免把基线的
        种子波动误读成改进。
 
     返回结构化报告，随 comparison_analysis.json 落盘。
@@ -9145,6 +9202,10 @@ def baseline_adequacy(
         "checks": [],
         "straw_man": [],
         "advisories": [],
+        "tuned": None,
+        "tuned_runs": [],
+        "untuned": [],
+        "tuning_metric_mismatch": [],
         "ok": None,
     }
 
@@ -9256,6 +9317,7 @@ def baseline_adequacy(
         and not isinstance(row.get(metric), bool)
         and math.isfinite(float(row[metric]))
     ]
+    baseline_better_than_ngram: Optional[bool] = None
     if ngram_rows:
         ngram_mean = _mean(
             [float(row[metric]) for row in ngram_rows]
@@ -9265,6 +9327,7 @@ def baseline_adequacy(
             if higher_is_better
             else baseline_mean < float(ngram_mean)
         )
+        baseline_better_than_ngram = baseline_better
         if baseline_better:
             report["advisories"].append(
                 f"基线 {baseline_mode}（{baseline_mean:.4f}）"
@@ -9280,7 +9343,84 @@ def baseline_adequacy(
                 "复杂模型是否有收益"
             )
 
-    # 3) 基线本身的统计功效。
+    # 3) 基线调参证据：复杂模型必须战胜「精心调优过的基线」，
+    #    没调过参的弱基线只能证明复杂模型比稻草人强。神经基线
+    #    的调参来源由 --baseline-tuning-from 写入 config.json 的
+    #    baseline_tuning 字段；统计基线（ngram）自身就在 val 上
+    #    做过 阶数 × 平滑系数 网格调优，不做此检查。
+    if baseline_mode == "ngram":
+        report["tuned"] = True
+    else:
+        tuning_evidence = False
+        for row in baseline_rows:
+            record = row.get("baseline_tuning")
+            if not isinstance(record, dict):
+                continue
+            run_name = str(row.get("run"))
+            winner_lr = record.get("winner_lr")
+            if winner_lr is None:
+                winner = record.get("winner")
+                if isinstance(winner, dict):
+                    winner_lr = winner.get("lr")
+            if (
+                record.get("mode") != baseline_mode
+                or winner_lr is None
+            ):
+                report["advisories"].append(
+                    f"基线 {run_name} 的 baseline_tuning 记录"
+                    "不完整（缺 mode/winner.lr），无法核对"
+                    "调参来源"
+                )
+                continue
+
+            tuning_evidence = True
+            record_metric = record.get("metric")
+            report["tuned_runs"].append({
+                "run": run_name,
+                "tuning_metric": record_metric,
+                "winner_lr": winner_lr,
+                "n_candidates": record.get("n_candidates"),
+            })
+            if (
+                isinstance(record_metric, str)
+                and record_metric != metric
+            ):
+                message = (
+                    f"基线 {run_name} 的调参依据是 {record_metric}，"
+                    f"当前对比口径是 {metric}：指标未对齐，"
+                    "该调参不能证明基线在当前口径上也是强的"
+                )
+                report["tuning_metric_mismatch"].append(message)
+                report["advisories"].append(message)
+
+        report["tuned"] = tuning_evidence
+
+        if not tuning_evidence:
+            if baseline_better_than_ngram:
+                report["advisories"].append(
+                    "所选基线没有调参来源记录（config.json 无 "
+                    "baseline_tuning），但它在主指标上已强于"
+                    "调优好的 n-gram：可先视为强于一个简单基线；"
+                    "仍建议用 --suite-baseline-tuning 调参并用 "
+                    "--baseline-tuning-from 记录来源，"
+                    "排除「基线本身还有空间」的质疑"
+                )
+            else:
+                message = (
+                    f"所选基线 {baseline_mode} 没有任何调参证据"
+                    "（config.json 无 baseline_tuning 记录，"
+                    "对比集合里也没有它能战胜的调优好的 n-gram）："
+                    "没调过参的弱基线只能证明复杂模型比稻草人强，"
+                    "不能证明方法收益。请先运行 "
+                    "--suite-baseline-tuning 对基线做 val 调参，"
+                    "再用 --baseline-tuning-from 把调参来源"
+                    "写入后续基线训练（或先跑 --statistical-baseline "
+                    "得到调优好的 n-gram 作为对照）"
+                )
+                report["untuned"].append(message)
+                report["straw_man"].append(message)
+
+    # 4) 基线本身的统计功效。
     if len(baseline_rows) < _RECOMMENDED_SEEDS:
         report["advisories"].append(
             f"基线只有 {len(baseline_rows)} 个种子（建议 ≥"
@@ -9300,6 +9440,43 @@ def baseline_adequacy(
     return report
 
 
+# 假设「判定指标」的词表：假设必须写明用什么指标判定成败，
+# 否则无法与评估口径对齐（「验证损失改善 2%」可检验，
+# 「效果更好」不可检验）。中英文都覆盖，路由诊断类指标
+# （Jaccard/熵）同样算有效判定口径。
+_HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("loss", r"loss|损失|nll|负对数似然"),
+    ("ppl", r"ppl|perplexity|困惑度"),
+    ("bits_per_byte", r"bits[\s_-]?per[\s_-]?byte|bpb|每字节比特"),
+    ("accuracy", r"accuracy|acc\b|准确率|正确率"),
+    ("f1", r"f1|f-?score|f分数"),
+    ("pr_auc", r"pr[\s_-]?auc|average[\s_-]?precision|平?均精度|精确率-召回率"),
+    ("roc_auc", r"roc[\s_-]?auc|auroc"),
+    ("precision", r"precision|精确率|查准率"),
+    ("recall", r"recall|召回率|查全率"),
+    ("jaccard", r"jaccard|雅卡尔|重合度|重合率"),
+    ("entropy", r"entropy|熵"),
+    ("routing_load", r"负载|dead[\s_-]?expert|路由"),
+)
+
+
+def hypothesis_metric_mentions(text: str) -> List[str]:
+    """
+    返回假设文本中出现的判定指标（规范化名字列表）。
+
+    用于核对「假设 ↔ 评估口径」是否对齐：一个可检验的假设
+    必须写明依据什么指标判定成败（如「验证损失至少改善 2%」
+    或「macro F1 提升」），否则只能说「效果更好」，无法与
+    评估结果对照。
+    """
+    lowered = text.lower()
+    mentions: List[str] = []
+    for name, pattern in _HYPOTHESIS_METRIC_PATTERNS:
+        if re.search(pattern, lowered) and name not in mentions:
+            mentions.append(name)
+    return mentions
+
+
 def hypothesis_registry(
     rows: List[Dict[str, object]],
 ) -> Dict[str, object]:
@@ -9311,11 +9488,15 @@ def hypothesis_registry(
     登记的假设按模式汇总，并把缺失假设的运行单独列出——没有
     假设记录的对比与「排列组合超参数」无法区分。统计基线
     （ngram）不受假设纪律约束。
+
+    同时核对假设是否写明了判定指标：没写指标的假设无法与
+    评估口径对齐（「效果更好」不可检验），运行被单独点名。
     """
     cells: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
     missing_runs: List[str] = []
     skipped_runs: List[str] = []
+    hypotheses_without_metric: List[str] = []
 
     for row in rows:
         mode = str(row.get("mode"))
@@ -9325,6 +9506,8 @@ def hypothesis_registry(
                 "mode": mode,
                 "n_runs": 0,
                 "hypotheses": [],
+                "hypotheses_metric_mentions": [],
+                "hypotheses_without_metric_runs": [],
                 "research_questions": [],
                 "missing_hypothesis_runs": [],
                 "hypothesis_check_skipped_runs": [],
@@ -9341,8 +9524,24 @@ def hypothesis_registry(
             entry["research_questions"].append(rq_text)
 
         if hypothesis_text:
+            run_name = str(row.get("run"))
+            mentions = hypothesis_metric_mentions(hypothesis_text)
             if hypothesis_text not in entry["hypotheses"]:
                 entry["hypotheses"].append(hypothesis_text)
+            known = {
+                item["hypothesis"]: item
+                for item in entry["hypotheses_metric_mentions"]
+            }
+            if hypothesis_text not in known:
+                entry["hypotheses_metric_mentions"].append({
+                    "hypothesis": hypothesis_text,
+                    "metric_mentions": mentions,
+                })
+            if not mentions:
+                entry["hypotheses_without_metric_runs"].append(
+                    run_name
+                )
+                hypotheses_without_metric.append(run_name)
             continue
 
         if mode == "ngram":
@@ -9365,6 +9564,14 @@ def hypothesis_registry(
             + "。缺假设的对比无法与排列组合超参数区分，"
             "结论只能作为探索性结果"
         )
+    if hypotheses_without_metric:
+        advisories.append(
+            "以下运行的假设没有写明判定指标（如验证损失 / "
+            "macro F1 / PR-AUC / 召回率），无法与评估口径对齐："
+            + "; ".join(hypotheses_without_metric)
+            + "。可检验的假设应写出「依据什么指标、预期"
+            "改善多少」"
+        )
     if skipped_runs:
         advisories.append(
             "以下运行显式跳过了假设检查"
@@ -9375,6 +9582,7 @@ def hypothesis_registry(
     return {
         "cells": [cells[mode] for mode in order],
         "missing_hypothesis_runs": missing_runs,
+        "hypotheses_without_metric_runs": hypotheses_without_metric,
         "hypothesis_check_skipped_runs": skipped_runs,
         "advisories": advisories,
     }
@@ -9388,16 +9596,21 @@ def imbalance_metric_advisory(
     类别不平衡下的指标解读提示。
 
     类别不平衡时 accuracy / micro F1 会被高频类抬高；极度
-    不平衡时 ROC-AUC 的 FPR 分母由海量负样本决定，同样的假
-    阳性绝对数量下 FPR 增长缓慢，会给出过于乐观的分数，此时
-    应优先看 PR-AUC（macro 口径）。检查基于每个运行
+    不平衡（多数类 ≥99.9%，约 1:1000 以上）时 ROC-AUC 的
+    FPR 分母由海量负样本决定，随机水平仍是 0.5，而随机
+    PR-AUC 只有约正的 prevalence（1:1000 时 ≈0.001）：此时
+    排序判定只看 PR-AUC，且必须与 chance 水平对照，不能把
+    PR-AUC 的绝对值当「准确率」读。检查基于每个运行
     metrics.jsonl 记录的 val_majority_accuracy（最高频类的
-    support 占比，即常数预测器的 accuracy）。
+    support 占比）与 val_pr_auc_macro_chance（PR-AUC 随机
+    水平 = 纳入类平均 prevalence，有 AUC 记录时可用）。
     """
     report: Dict[str, object] = {
         "metric": metric,
         "max_majority_accuracy": None,
         "most_imbalanced_run": None,
+        "pr_auc_chance_mean": None,
+        "pr_auc_over_chance": None,
         "advisories": [],
     }
 
@@ -9415,6 +9628,23 @@ def imbalance_metric_advisory(
         )
     ]
 
+    # PR-AUC 随机水平：只统计记录了该字段的运行。
+    chances = [
+        float(row["val_pr_auc_macro_chance"])
+        for row in rows
+        if isinstance(
+            row.get("val_pr_auc_macro_chance"), (int, float)
+        )
+        and not isinstance(
+            row.get("val_pr_auc_macro_chance"), bool
+        )
+        and math.isfinite(
+            float(row["val_pr_auc_macro_chance"])
+        )
+    ]
+    chance_mean = _mean(chances)
+    report["pr_auc_chance_mean"] = chance_mean
+
     if not entries:
         return report
 
@@ -9425,7 +9655,23 @@ def imbalance_metric_advisory(
     report["max_majority_accuracy"] = max_majority
     report["most_imbalanced_run"] = most_imbalanced_run
 
-    if max_majority >= _IMBALANCE_DOMINANT_MAJORITY:
+    if max_majority >= _IMBALANCE_EXTREME_MAJORITY:
+        chance_text = (
+            f"，macro PR-AUC 的随机水平≈平均 prevalence"
+            f"≈{chance_mean:.4f}"
+            if chance_mean is not None
+            else ""
+        )
+        report["advisories"].append(
+            f"最高频类占比达 {max_majority:.2%}"
+            f"（{most_imbalanced_run}，val_majority_accuracy，"
+            "约 1:1000 以上的极度不平衡）：accuracy 与 micro "
+            "口径完全失效；排序判定只能看 PR-AUC——这里 "
+            "ROC-AUC 的随机水平仍是 0.5，会因负样本基数巨大、"
+            "FPR 增长缓慢而给出过于乐观的分数"
+            f"{chance_text}；PR-AUC 必须显著高于该随机水平"
+        )
+    elif max_majority >= _IMBALANCE_DOMINANT_MAJORITY:
         report["advisories"].append(
             f"最高频类占比达 {max_majority:.1%}"
             f"（{most_imbalanced_run}，val_majority_accuracy）："
@@ -9448,13 +9694,50 @@ def imbalance_metric_advisory(
             f"当前主指标 {metric} 受多数类主导："
             "建议改用 macro F1 或 PR-AUC 作为判定口径"
         )
+
+    # PR-AUC 自身必须相对随机水平解读：正类越稀疏，随机
+    # PR-AUC 越低，绝对值看起来「差」不代表模型无用。
+    pr_values = [
+        (str(row.get("run")), float(row[metric]))
+        for row in rows
+        if isinstance(row.get(metric), (int, float))
+        and not isinstance(row.get(metric), bool)
+        and math.isfinite(float(row[metric]))
+    ]
+    if metric == "val_pr_auc_macro" and pr_values:
+        best_run, best_value = min(pr_values, key=lambda item: item[1])
+        if chance_mean is not None:
+            report["pr_auc_over_chance"] = best_value - chance_mean
+            report["pr_auc_worst_run"] = best_run
+            report["advisories"].append(
+                f"PR-AUC 的随机水平不是 0 而是≈平均 prevalence"
+                f"（{chance_mean:.4f}）：当前最差运行 {best_run} "
+                f"的 {metric}={best_value:.4f}，高出随机水平 "
+                f"{best_value - chance_mean:+.4f}；"
+                "对比 PR-AUC 时应同时报告该差值（lift），"
+                "而不是只看绝对值"
+            )
+        else:
+            report["advisories"].append(
+                "运行记录缺少 val_pr_auc_macro_chance：无法"
+                "给出 PR-AUC 的随机水平参照；请用新版评估"
+                "（不断更新代码）重跑，或手工核对该水平"
+            )
     if (
         metric == "val_roc_auc_macro"
         and max_majority >= _IMBALANCE_WEAK_MAJORITY
     ):
+        extreme = max_majority >= _IMBALANCE_EXTREME_MAJORITY
         report["advisories"].append(
             "类别不平衡下 ROC-AUC 偏乐观（FPR 分母被负样本"
-            "基数拉大），优先看 PR-AUC"
+            "基数拉大"
+            + (
+                "，随机水平 0.5 与 PR-AUC 随机水平相差"
+                f"约 {max_majority:.0%} 量级的比例"
+                if extreme
+                else ""
+            )
+            + "），优先看 PR-AUC"
             "（--compare-metric val_pr_auc_macro）"
         )
 
@@ -9768,6 +10051,30 @@ def print_comparison_analysis(
                 "  OK：基线在主指标上强于无上下文 unigram "
                 "参考（核对依据：各运行 config.json 的 "
                 "reference_baselines）"
+            )
+        if adequacy.get("baseline_mode") == "ngram":
+            print(
+                "  OK：统计基线在 val 上做过 阶数 × 平滑系数 "
+                "网格调优（简单基线已充分调参）"
+            )
+        elif adequacy.get("tuned"):
+            tuned_runs = adequacy.get("tuned_runs") or []
+            details = "; ".join(
+                f"{item['run']}（调参口径="
+                f"{item.get('tuning_metric')}, winner lr="
+                f"{item.get('winner_lr')}）"
+                for item in tuned_runs
+            )
+            print(
+                "  OK：基线记录了调参来源（--baseline-tuning-from）"
+                + (f": {details}" if details else "")
+            )
+        elif adequacy["baseline_mode"] is not None:
+            print(
+                "  [untuned] 基线没有调参来源记录，也没有强于"
+                "调优好的 n-gram：没调过参的弱基线只能证明复杂"
+                "模型比稻草人强，先用 --suite-baseline-tuning 把"
+                "基线调强"
             )
         for message in adequacy["straw_man"]:
             print(f"  [straw-man] {message}")
@@ -10155,12 +10462,13 @@ def write_run_config(
     sanity_result: Optional[Dict[str, object]],
     data_audit: Optional[Dict[str, object]] = None,
     reference_baselines: Optional[Dict[str, object]] = None,
+    baseline_tuning: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     写出 config.json：结构配置、完整超参数、参数量、数据指纹、
     数据划分与审计结果、代码版本/运行环境、sanity check 结果、
-    本轮实验的科学假设（--hypothesis/--rq）与参考基线
-    （uniform / unigram）。
+    本轮实验的科学假设（--hypothesis/--rq）、参考基线
+    （uniform / unigram）与基线调参来源（--baseline-tuning-from）。
     """
     payload = {
         "config": asdict(cfg),
@@ -10175,6 +10483,7 @@ def write_run_config(
             args.skip_hypothesis_check
         ),
         "reference_baselines": reference_baselines,
+        "baseline_tuning": baseline_tuning,
         "data": {
             "path": args.data,
             "sha256": getattr(args, "data_sha256", None),
@@ -10215,6 +10524,17 @@ def write_run_config(
                     "efficiency",
                     previous["efficiency"],
                 )
+            # resume 重写 config.json 时保留原有的调参来源记录，
+            # 避免已声明的「调过参的基线」在续跑后丢失。
+            if (
+                payload.get("baseline_tuning") is None
+                and isinstance(
+                    previous.get("baseline_tuning"), dict
+                )
+            ):
+                payload["baseline_tuning"] = previous[
+                    "baseline_tuning"
+                ]
             # resume 通常不再重复传 --hypothesis/--rq；此时保留原
             # 运行记录的科学假设，避免重写 config.json 时丢失。
             if getattr(args, "resume", None) is not None:
@@ -12709,6 +13029,9 @@ def run_self_test():
             rq: str = "",
             reference: Optional[Dict[str, object]] = None,
             majority_accuracy: Optional[float] = None,
+            baseline_tuning: Optional[Dict[str, object]] = None,
+            pr_auc_chance: Optional[float] = None,
+            pr_auc: Optional[float] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -12758,6 +13081,7 @@ def run_self_test():
                 "hypothesis": hypothesis,
                 "research_question": rq,
                 "reference_baselines": reference,
+                "baseline_tuning": baseline_tuning,
                 "data": {"sha256": "deadbeef"},
                 "comparison_protocol": protocol,
             }
@@ -12776,6 +13100,12 @@ def run_self_test():
                 final_record[
                     "val_majority_accuracy"
                 ] = majority_accuracy
+            if pr_auc_chance is not None:
+                final_record[
+                    "val_pr_auc_macro_chance"
+                ] = pr_auc_chance
+            if pr_auc is not None:
+                final_record["val_pr_auc_macro"] = pr_auc
             write_jsonl_record(
                 run_dir / "metrics.jsonl",
                 final_record,
@@ -13111,6 +13441,18 @@ def run_self_test():
             "unigram_weighted_f1": 0.15,
         }
 
+        # 调参来源记录：基线必须证明自己被调过参，
+        # 否则「战胜基线」只能证明比稻草人强。
+        good_tuning = {
+            "comparison_family": "baseline_tuning",
+            "source": "baseline_tuning.json",
+            "mode": "smelt",
+            "metric": "val_loss",
+            "winner_lr": 3e-4,
+            "winner_mean": 4.5,
+            "n_candidates": 9,
+        }
+
         smelt_path = _write_analysis_run(
             "smelt_seed1",
             "smelt",
@@ -13122,6 +13464,7 @@ def run_self_test():
             hypothesis="SMELT 基线：判定延迟合并是否改善验证损失",
             rq="RQ1",
             reference=good_reference,
+            baseline_tuning=good_tuning,
         )
         a_hyp_path = _write_analysis_run(
             "A_seed1",
@@ -13178,7 +13521,8 @@ def run_self_test():
             for message in weak_adequacy["straw_man"]
         )
 
-        # 缺参考基线记录的运行不能静默放行：ok=None 且给出提示。
+        # 缺参考基线记录的运行不能静默放行：ok=None 且给出提示
+        # （调参来源已记录，只差 unigram 参考记录）。
         no_ref_path = _write_analysis_run(
             "noref_seed1",
             "smelt",
@@ -13187,6 +13531,7 @@ def run_self_test():
             100,
             0.01,
             4.0,
+            baseline_tuning=good_tuning,
         )
         no_ref_adequacy = baseline_adequacy(
             compare_runs([no_ref_path]),
@@ -13221,6 +13566,93 @@ def run_self_test():
             for message in ngram_adequacy["straw_man"]
         )
 
+        # 基线没有任何调参证据，且对比集合里也没有它能战胜的
+        # 调优好的 n-gram：必须标记 straw-man（没调过参的弱
+        # 基线只能证明复杂模型比稻草人强）。
+        untuned_path = _write_analysis_run(
+            "untuned_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+        )
+        untuned_adequacy = baseline_adequacy(
+            compare_runs([untuned_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert untuned_adequacy["tuned"] is False
+        assert untuned_adequacy["ok"] is False
+        assert untuned_adequacy["untuned"]
+        assert any(
+            "调参" in message
+            for message in untuned_adequacy["straw_man"]
+        )
+
+        # 有调参来源但调参口径与当前对比指标不一致：单独提示
+        # 指标未对齐（调在 val_loss 上不能证明 macro F1 也强）。
+        mismatch_tuning = dict(good_tuning)
+        mismatch_tuning["metric"] = "val_macro_f1"
+        mismatch_path = _write_analysis_run(
+            "mismatch_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+            baseline_tuning=mismatch_tuning,
+        )
+        mismatch_adequacy = baseline_adequacy(
+            compare_runs([mismatch_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert mismatch_adequacy["tuned"] is True
+        assert mismatch_adequacy["tuning_metric_mismatch"]
+        assert any(
+            "未对齐" in message
+            for message in mismatch_adequacy["advisories"]
+        )
+
+        # 没有调参记录、但已强于调优好的 n-gram：不标记
+        # straw-man，只提示仍应补调参来源（更强基线的证据）。
+        untuned_strong_path = _write_analysis_run(
+            "untuned_strong_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+        )
+        weak_ngram_path = _write_analysis_run(
+            "ngram_weak_val",
+            "ngram",
+            0,
+            3e-4,
+            100,
+            0.01,
+            4.80,
+        )
+        untuned_strong_adequacy = baseline_adequacy(
+            compare_runs([untuned_strong_path, weak_ngram_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert untuned_strong_adequacy["tuned"] is False
+        assert untuned_strong_adequacy["ok"] is True
+        assert not untuned_strong_adequacy["straw_man"]
+        assert any(
+            "调参" in message
+            for message in untuned_strong_adequacy["advisories"]
+        )
+
         # 未指定基线时给出建议而不是虚报通过。
         no_baseline = baseline_adequacy(hyp_rows, None, "val_loss")
         assert no_baseline["ok"] is None
@@ -13250,6 +13682,46 @@ def run_self_test():
             compare_runs([ngram_path])
         )
         assert not ngram_registry["missing_hypothesis_runs"]
+
+        # 假设必须写明判定指标：smelt/A 的假设含「验证损失」
+        # （loss），登记时不被点名；只写「效果更好」的假设无法
+        # 与评估口径对齐，必须单独提示。
+        smelt_mentions = registry_by_mode["smelt"][
+            "hypotheses_metric_mentions"
+        ]
+        assert smelt_mentions[0]["metric_mentions"] == ["loss"]
+        assert not registry["hypotheses_without_metric_runs"]
+        vague_path = _write_analysis_run(
+            "vague_seed1",
+            "A",
+            2,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            hypothesis="延迟合并的效果会更好",
+            rq="RQ1",
+        )
+        vague_registry = hypothesis_registry(
+            compare_runs([vague_path])
+        )
+        assert vague_registry[
+            "hypotheses_without_metric_runs"
+        ] == ["vague_seed1"]
+        assert any(
+            "判定指标" in message
+            for message in vague_registry["advisories"]
+        )
+        assert hypothesis_metric_mentions(
+            "验证损失至少改善 2%"
+        ) == ["loss"]
+        assert "f1" in hypothesis_metric_mentions(
+            "macro F1 提升且召回率不降"
+        )
+        assert "pr_auc" in hypothesis_metric_mentions(
+            "PR-AUC 上升"
+        )
+        assert hypothesis_metric_mentions("效果更好") == []
 
         # 类别不平衡：多数类占比 95% 时必须提示 accuracy/micro
         # 失效、优先 PR-AUC；ROC-AUC 口径额外提示其偏乐观。
@@ -13281,6 +13753,44 @@ def run_self_test():
             "ROC-AUC" in message
             for message in roc_report["advisories"]
         )
+        # 极度不平衡（多数类 ≥99.9%，约 1:1000）：单独分级；
+        # PR-AUC 随机水平≈平均 prevalence，判定必须与它对
+        # 照（lift），而不是把绝对值和 0.5/准确率混着读。
+        extreme_path = _write_analysis_run(
+            "extreme_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.0,
+            majority_accuracy=0.9995,
+            pr_auc_chance=0.001,
+            pr_auc=0.02,
+        )
+        extreme_rows = compare_runs([extreme_path])
+        extreme_roc = imbalance_metric_advisory(
+            extreme_rows,
+            "val_roc_auc_macro",
+        )
+        assert extreme_roc["max_majority_accuracy"] == 0.9995
+        assert extreme_roc["pr_auc_chance_mean"] == 0.001
+        assert any(
+            "1:1000" in message and "过于乐观" in message
+            for message in extreme_roc["advisories"]
+        )
+        extreme_pr = imbalance_metric_advisory(
+            extreme_rows,
+            "val_pr_auc_macro",
+        )
+        assert abs(
+            float(extreme_pr["pr_auc_over_chance"]) - 0.019
+        ) < 1e-12
+        assert extreme_pr["pr_auc_worst_run"] == "extreme_seed1"
+        assert any(
+            "随机水平" in message
+            for message in extreme_pr["advisories"]
+        )
         # 多数类不过半时不虚报提示。
         balanced_report = imbalance_metric_advisory(
             compare_runs([no_ref_path]),
@@ -13299,6 +13809,153 @@ def run_self_test():
         assert full_analysis["baseline_adequacy"]["ok"] is True
         assert full_analysis["hypothesis_registry"]["cells"]
         assert "imbalance_advisory" in full_analysis
+
+        # ---- 基线调参网格（--suite-baseline-tuning） ----
+        # 计划只允许学习率变化（steps/batch/数据继承同一命令行，
+        # 调参不能偷跑更多步）。
+        tuning_plan = build_baseline_tuning_plan(
+            [42, 43, 44], "dense", [1e-4, 3e-4], 0.0
+        )
+        assert len(tuning_plan) == 6
+        assert tuning_plan[0]["label"] == "lr0.0001_seed42"
+        assert tuning_plan[0]["mode"] == "dense"
+        assert tuning_plan[0]["lr"] == 1e-4
+        assert tuning_plan[0]["seed"] == 42
+
+        # lr=1e-4 均值 4.0；lr=3e-4 均值同为 4.0（最低越好）但
+        # 有种子波动：winner 取更保守的 1e-4，且提示无法区分。
+        tuning_paths = []
+        for seed, value in ((42, 4.0), (43, 4.0), (44, 4.0)):
+            tuning_paths.append(_write_analysis_run(
+                f"tune_lr1e-4_seed{seed}",
+                "dense",
+                seed,
+                1e-4,
+                100,
+                0.0,
+                value,
+            ))
+        for seed, value in ((42, 4.0), (43, 4.2), (44, 3.8)):
+            tuning_paths.append(_write_analysis_run(
+                f"tune_lr3e-4_seed{seed}",
+                "dense",
+                seed,
+                3e-4,
+                100,
+                0.0,
+                value,
+            ))
+        tuning_report = analyze_baseline_tuning(
+            compare_runs(tuning_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert (
+            tuning_report["comparison_family"]
+            == "baseline_tuning"
+        )
+        assert tuning_report["winner"]["lr"] == 1e-4
+        assert abs(
+            float(tuning_report["winner"]["metric_mean"]) - 4.0
+        ) < 1e-12
+        assert tuning_report["budget"]["total_steps"] == 100
+        assert any(
+            "无法在统计上区分" in issue
+            for issue in tuning_report["issues"]
+        )
+
+        # 候选之间训练预算不一致：调参结论无效，必须报 issue
+        # （否则「更优 lr」可能与「训练更久」混杂）。
+        budget_break_path = _write_analysis_run(
+            "tune_budgetbreak_seed42",
+            "dense",
+            42,
+            1e-4,
+            200,
+            0.01,
+            3.5,
+        )
+        budget_break_controlled = analyze_baseline_tuning(
+            compare_runs(tuning_paths + [budget_break_path]),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert any(
+            "训练预算" in issue
+            for issue in budget_break_controlled["issues"]
+        )
+
+        # 调参报告落盘 → 读回 → 来源核对：模式 / winner lr /
+        # steps / 数据指纹任一不一致都必须拒绝。
+        tuning_source = write_baseline_tuning_report(
+            Path(analysis_dir) / "tuning_out",
+            tuning_report,
+        )
+        tuning_payload = load_baseline_tuning(tuning_source)
+        assert tuning_payload["winner"]["lr"] == 1e-4
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "dense", 1e-4, 100, "deadbeef"
+            )
+            is None
+        )
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "smelt", 1e-4, 100, "deadbeef"
+            )
+            is not None
+        )
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "dense", 3e-4, 100, "deadbeef"
+            )
+            is not None
+        )
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "dense", 1e-4, 200, "deadbeef"
+            )
+            is not None
+        )
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "dense", 1e-4, 100, "cafebabe"
+            )
+            is not None
+        )
+        provenance_record = baseline_tuning_provenance_record(
+            tuning_payload, str(tuning_source)
+        )
+        assert provenance_record["winner_lr"] == 1e-4
+        assert provenance_record["metric"] == "val_loss"
+
+        # 没有 winner 的「调参报告」不能作为基线来源。
+        bogus_source = Path(analysis_dir) / "bogus_tuning.json"
+        bogus_source.write_text(
+            '{"comparison_family": "baseline_tuning",'
+            ' "mode": "dense", "metric": "val_loss"}',
+            encoding="utf-8",
+        )
+        try:
+            load_baseline_tuning(bogus_source)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "缺少 winner 的调参报告必须被拒绝"
+            )
+
+        # compare_runs 暴露调参来源记录，基线合理性检查据此
+        # 判断「基线是否被调过参」。
+        tuned_row = next(
+            row for row in compare_runs([smelt_path])
+            if row.get("run") == "smelt_seed1"
+        )
+        assert tuned_row["baseline_tuning"]["winner_lr"] == 3e-4
 
     # ---- 效率与精度权衡：涨点必须与效率倍率一起看 ----
     def _write_cost_run(
@@ -13624,9 +14281,24 @@ _SWEEP_SINGLE_VALUE_FLAGS = (
 _SWEEP_MULTI_VALUE_FLAGS = (
     "--seeds",
     "--suite-modes",
+    "--baseline-tuning-lrs",
 )
 _SWEEP_BOOL_FLAGS = (
     "--suite-ablation",
+    "--suite-baseline-tuning",
+)
+
+# 基线调参协议：简单基线（默认 dense）先在 val 上做预注册的
+# 学习率网格搜索，各候选训练预算（steps/batch/数据）完全一致，
+# 只允许学习率这一个轴变化。调参报告落盘为
+# <out>/baseline_tuning.json，后续基线训练用
+# --baseline-tuning-from 把「这条基线的超参数来自那次调参」
+# 写进 config.json，供基线合理性检查核对。
+_BASELINE_TUNING_FILENAME = "baseline_tuning.json"
+_DEFAULT_BASELINE_TUNING_LRS: Tuple[float, ...] = (
+    1e-4,
+    3e-4,
+    1e-3,
 )
 
 
@@ -13722,11 +14394,538 @@ def build_sweep_plan(
     return plan
 
 
+def build_baseline_tuning_plan(
+    seeds: List[int],
+    mode: str,
+    lrs: List[float],
+    balance_coef: float,
+) -> List[Dict[str, object]]:
+    """
+    基线调参网格的运行计划：学习率 × 随机种子。
+
+    候选之间只允许学习率不同，其余（steps/batch/数据/模型结构）
+    全部继承同一条命令行，保证调参比较是在固定训练预算下做的
+    「超参数搜索」，而不是偷跑更多步。
+    """
+    plan: List[Dict[str, object]] = []
+    for lr in lrs:
+        for seed in seeds:
+            plan.append({
+                "label": f"lr{format(lr, 'g')}_seed{seed}",
+                "mode": mode,
+                "lr": lr,
+                "balance_coef": balance_coef,
+                "seed": seed,
+            })
+    return plan
+
+
+def _execute_sweep_plan(
+    base_argv: List[str],
+    plan: List[Dict[str, object]],
+    out_root: Path,
+) -> List[str]:
+    """
+    逐运行以独立子进程执行计划中的每个条目；覆盖 --seed/--out
+    以及条目声明的 --mode/--balance-coef/--lr。任一运行失败即
+    停止并退出（可用 --compare 分析已完成的目录）。
+    """
+    run_paths: List[str] = []
+
+    for index, item in enumerate(plan, start=1):
+        run_out = out_root / str(item["label"])
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+        ] + base_argv
+        command += [
+            "--seed",
+            str(item["seed"]),
+            "--out",
+            str(run_out),
+        ]
+        if item.get("mode") is not None:
+            command += ["--mode", str(item["mode"])]
+        if item.get("balance_coef") is not None:
+            command += [
+                "--balance-coef",
+                format(float(item["balance_coef"]), "g"),
+            ]
+        if item.get("lr") is not None:
+            # repr 保证浮点值往返逐位一致（如 1e-4）。
+            command += ["--lr", repr(float(item["lr"]))]
+
+        print(
+            f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
+        )
+
+        completed = subprocess.run(command)
+
+        if completed.returncode != 0:
+            print(
+                f"[sweep] 运行 {item['label']} 失败 "
+                f"(exit={completed.returncode})；已停止后续"
+                "运行，可用 --compare 分析已完成的目录"
+            )
+            raise SystemExit(1)
+
+        run_paths.append(str(run_out))
+
+    return run_paths
+
+
+def analyze_baseline_tuning(
+    rows: List[Dict[str, object]],
+    metric: str,
+    mode: str,
+    lrs: List[float],
+    seeds: List[int],
+) -> Dict[str, object]:
+    """
+    汇总基线调参网格：按学习率聚合各候选的 val 指标
+    Mean ± Std，按方向选出 winner（并列时取更小的学习率，
+    更保守、更接近默认值）。
+
+    同时核对调参协议本身：每个候选的训练预算（steps /
+    batch_size / 数据指纹）必须完全一致，否则「调参」会
+    与「训练得更久」混杂；候选缺指标时显式记录 issue。
+    """
+    higher_is_better = metric_higher_is_better(metric)
+
+    report: Dict[str, object] = {
+        "comparison_family": "baseline_tuning",
+        "mode": mode,
+        "metric": metric,
+        "higher_is_better": higher_is_better,
+        "grid": [float(lr) for lr in lrs],
+        "seeds": [int(seed) for seed in seeds],
+        "n_candidates": len(lrs) * len(seeds),
+        "n_runs": len(rows),
+        "budget": {
+            "total_steps": None,
+            "batch_size": None,
+            "data_sha256": None,
+        },
+        "candidates": [],
+        "winner": None,
+        "selection_rule": (
+            "在 val 上按指标均值选择；均值并列（含噪声范围内"
+            "无法区分时）取更小的学习率"
+        ),
+        "issues": [],
+        "caveats": [
+            "调参只看 val：test 集全程尘封，不参与候选排序",
+            "各候选训练预算（steps/batch/数据）完全一致，"
+            "调参不会与「训练更久」混杂",
+            "调参后应固定 winner 配置训练最终基线，并用 "
+            "--baseline-tuning-from 记录来源；复杂模型必须"
+            "战胜这条调过参的基线才有意义",
+        ],
+    }
+
+    # 预算一致性：调参网格的受控变量。只统计有协议记录的
+    # 运行，缺失记录不能被当成「预算不同」虚报。
+    budget_values = set()
+    for row in rows:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            continue
+        budget_values.add((
+            protocol.get("total_steps"),
+            protocol.get("batch_size"),
+            protocol.get("data_sha256"),
+        ))
+    if len(budget_values) > 1:
+        report["issues"].append(
+            "候选之间的训练预算（total_steps / batch_size / "
+            "数据指纹）不一致，调参结果与「训练得更久或数据"
+            "不同」混杂，不可用于选择基线超参数"
+        )
+    elif budget_values:
+        total_steps, batch_size, data_sha256 = next(
+            iter(budget_values)
+        )
+        report["budget"] = {
+            "total_steps": total_steps,
+            "batch_size": batch_size,
+            "data_sha256": data_sha256,
+        }
+
+    def _row_lr(row: Dict[str, object]) -> Optional[float]:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            return None
+        value = protocol.get("lr")
+        if isinstance(value, (int, float)) and not isinstance(
+            value, bool
+        ):
+            return float(value)
+        return None
+
+    candidates: List[Dict[str, object]] = []
+    for lr in lrs:
+        lr_rows = [
+            row for row in rows if _row_lr(row) == float(lr)
+        ]
+        values = [
+            float(row[metric])
+            for row in lr_rows
+            if isinstance(row.get(metric), (int, float))
+            and not isinstance(row.get(metric), bool)
+            and math.isfinite(float(row[metric]))
+        ]
+        mean = _mean(values)
+        candidate = {
+            "lr": float(lr),
+            "n_runs": len(lr_rows),
+            "n_metric_runs": len(values),
+            "metric_mean": mean,
+            "metric_std": _sample_std(values),
+            "runs": [str(row.get("run")) for row in lr_rows],
+        }
+        if len(values) < len(lr_rows):
+            report["issues"].append(
+                f"lr={format(lr, 'g')} 有 "
+                f"{len(lr_rows) - len(values)} 个候选运行缺少 "
+                f"{metric}，未计入均值"
+            )
+        candidates.append(candidate)
+
+    report["candidates"] = candidates
+
+    usable = [
+        candidate
+        for candidate in candidates
+        if candidate["metric_mean"] is not None
+        and int(candidate["n_runs"]) > 0
+    ]
+    if not usable:
+        report["issues"].append(
+            f"没有任何候选提供可用的 {metric}，无法选出"
+            "基线学习率"
+        )
+        return report
+
+    def _rank(candidate: Dict[str, object]):
+        mean = float(candidate["metric_mean"])
+        # 并列/无法区分时选更小的学习率（更保守）。
+        return (
+            -mean if higher_is_better else mean,
+            float(candidate["lr"]),
+        )
+
+    winner = min(usable, key=_rank)
+    report["winner"] = {
+        "lr": float(winner["lr"]),
+        "metric": metric,
+        "metric_mean": float(winner["metric_mean"]),
+        "metric_std": winner["metric_std"],
+        "n_runs": int(winner["n_runs"]),
+        "runs": winner["runs"],
+    }
+
+    # 若多个候选与 winner 的均值差落在种子波动内，显式提示
+    # 「噪声范围内无法区分」，避免把偶然波动当成调参结论。
+    winner_mean = float(winner["metric_mean"])
+    winner_std = winner["metric_std"]
+    indistinguishable = []
+    for candidate in usable:
+        if candidate is winner:
+            continue
+        mean = float(candidate["metric_mean"])
+        gap = (
+            mean - winner_mean
+            if higher_is_better
+            else winner_mean - mean
+        )
+        noise = max(
+            float(winner_std or 0.0),
+            float(candidate["metric_std"] or 0.0),
+        )
+        if noise > 0.0 and gap < noise:
+            indistinguishable.append(float(candidate["lr"]))
+    if indistinguishable:
+        report["issues"].append(
+            "以下学习率候选与 winner 的差距小于种子波动"
+            "（无法在统计上区分，已按更小 lr 取保守解）: "
+            + ", ".join(
+                format(lr, "g") for lr in indistinguishable
+            )
+        )
+
+    return report
+
+
+def print_baseline_tuning_report(
+    report: Dict[str, object],
+    out_root: Path,
+) -> None:
+    """打印基线调参网格结果与后续使用方式。"""
+    metric = report["metric"]
+    direction = (
+        "越高越好"
+        if report.get("higher_is_better")
+        else "越低越好"
+    )
+    budget = report.get("budget") or {}
+
+    print()
+    print(
+        "[baseline-tuning] 简单基线学习率网格搜索（val，"
+        "test 集尘封不参与）"
+    )
+    print(
+        f"  模式: {report['mode']}；指标: {metric}（{direction}）；"
+        f"预算: steps={budget.get('total_steps')}, "
+        f"batch_size={budget.get('batch_size')}"
+    )
+    print(f"  {'lr':>10} {'n':>3} {'mean':>12} {'std':>12}")
+
+    def _fmt(value) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.6f}"
+
+    for candidate in report.get("candidates", []):
+        print(
+            f"  {format(float(candidate['lr']), 'g'):>10} "
+            f"{int(candidate['n_runs']):>3} "
+            f"{_fmt(candidate.get('metric_mean')):>12} "
+            f"{_fmt(candidate.get('metric_std')):>12}"
+        )
+
+    winner = report.get("winner")
+    if isinstance(winner, dict):
+        print(
+            f"  [winner] lr={format(float(winner['lr']), 'g')}, "
+            f"mean={_fmt(winner.get('metric_mean'))} "
+            f"(n={winner.get('n_runs')}, "
+            f"{metric}, {direction})"
+        )
+        print(
+            "  下一步：用 --suite-modes "
+            f"{report['mode']} --seeds ... --lr "
+            f"{format(float(winner['lr']), 'g')} 训练最终基线，"
+            "并加 --baseline-tuning-from "
+            f"{out_root / _BASELINE_TUNING_FILENAME} 记录调参来源；"
+            "复杂模型必须战胜这条调过参的基线"
+        )
+    for issue in report.get("issues", []):
+        print(f"  [warn] {issue}")
+    for caveat in report.get("caveats", []):
+        print(f"  [note] {caveat}")
+
+
+def write_baseline_tuning_report(
+    out_dir: Path,
+    report: Dict[str, object],
+) -> Path:
+    """把调参报告写入 out_dir/baseline_tuning.json。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / _BASELINE_TUNING_FILENAME
+
+    payload = {
+        "generated_at": datetime.datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        **report,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_safe(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(f"[report] 基线调参报告已写入 {path}")
+    return path
+
+
+def load_baseline_tuning(path: Path) -> Dict[str, object]:
+    """
+    读取并校验基线调参报告（--suite-baseline-tuning 的输出）。
+
+    校验失败抛 ValueError，由入口转为明确的参数错误。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except OSError as error:
+        raise ValueError(f"无法读取 {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"{path} 不是合法 JSON: {error}"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} 不是调参报告对象")
+    if payload.get("comparison_family") != "baseline_tuning":
+        raise ValueError(
+            f"{path} 不是 --suite-baseline-tuning 生成的报告"
+            "（缺少 comparison_family=baseline_tuning）"
+        )
+    if not isinstance(payload.get("mode"), str):
+        raise ValueError(f"{path} 缺少 mode 字段")
+    if not isinstance(payload.get("metric"), str):
+        raise ValueError(f"{path} 缺少 metric 字段")
+    winner = payload.get("winner")
+    if not isinstance(winner, dict) or not isinstance(
+        winner.get("lr"), (int, float)
+    ):
+        raise ValueError(
+            f"{path} 没有有效 winner（winner.lr 必须是数值）；"
+            "调参失败的报告不能作为基线来源"
+        )
+    if winner.get("metric_mean") is None:
+        raise ValueError(
+            f"{path} 的 winner 没有可用指标均值，"
+            "不能作为基线来源"
+        )
+    return payload
+
+
+def baseline_tuning_provenance_error(
+    payload: Dict[str, object],
+    mode: str,
+    lr: float,
+    steps: int,
+    data_sha256: Optional[str],
+) -> Optional[str]:
+    """
+    核对「当前基线训练」是否忠实复用了调参报告的 winner：
+    模式、学习率、训练步数与数据指纹都必须一致。返回错误
+    消息或 None。
+    """
+    record_mode = str(payload.get("mode"))
+    if mode != record_mode:
+        return (
+            f"调参报告的基线模式是 {record_mode}，当前训练是 "
+            f"{mode}：该报告不能证明当前模式的基线被调过参"
+        )
+
+    winner = payload.get("winner") or {}
+    winner_lr = float(winner.get("lr"))
+    if not math.isclose(lr, winner_lr, rel_tol=1e-9, abs_tol=1e-12):
+        return (
+            f"当前 --lr={format(lr, 'g')} 与调参 winner "
+            f"lr={format(winner_lr, 'g')} 不一致：调参来源"
+            "必须真实复用于基线训练，不能借用调参报告"
+        )
+
+    budget = payload.get("budget") or {}
+    record_steps = budget.get("total_steps")
+    if record_steps is not None and int(steps) != int(record_steps):
+        return (
+            f"当前 --steps={int(steps)} 与调参预算 "
+            f"steps={int(record_steps)} 不一致：学习率是在"
+            "原预算下调出来的，预算变了应重新调参"
+        )
+
+    record_sha = budget.get("data_sha256")
+    if (
+        isinstance(record_sha, str)
+        and record_sha
+        and data_sha256 is not None
+        and record_sha != data_sha256
+    ):
+        return (
+            "当前数据指纹与调参时的数据不一致：学习率是在"
+            "原数据上调出来的，换数据后应重新调参"
+        )
+
+    return None
+
+
+def baseline_tuning_provenance_record(
+    payload: Dict[str, object],
+    source: str,
+) -> Dict[str, object]:
+    """
+    生成写入 config.json 的紧凑调参来源记录（baseline_tuning
+    字段），供对比阶段的基线合理性检查核对。
+    """
+    winner = payload.get("winner") or {}
+    return {
+        "comparison_family": "baseline_tuning",
+        "source": str(source),
+        "mode": payload.get("mode"),
+        "metric": payload.get("metric"),
+        "winner_lr": winner.get("lr"),
+        "winner_mean": winner.get("metric_mean"),
+        "n_candidates": payload.get("n_candidates"),
+        "grid": payload.get("grid"),
+        "budget": payload.get("budget"),
+    }
+
+
+def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
+    """
+    --suite-baseline-tuning：对简单基线做预注册的学习率网格
+    搜索（val 选择，test 尘封），输出调参报告。调参只是把
+    基线调到「值得战胜」，报告本身不是最终基线。
+    """
+    metric = args.compare_metric
+    lrs = list(args.baseline_tuning_lrs)
+    seeds = list(args.seeds)
+
+    base_argv = strip_sweep_args(sys.argv[1:])
+    plan = build_baseline_tuning_plan(
+        seeds=seeds,
+        mode=args.baseline_tuning_mode,
+        lrs=lrs,
+        balance_coef=args.balance_coef,
+    )
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    print(
+        "[suite-baseline-tuning] 基线调参：mode="
+        f"{args.baseline_tuning_mode}, 学习率候选="
+        + ", ".join(format(lr, "g") for lr in lrs)
+        + f", seeds={seeds}, 指标={metric}（val 选择，"
+        "test 集不参与）"
+    )
+    if len(seeds) < _RECOMMENDED_SEEDS:
+        print(
+            "[suite-baseline-tuning] 提示：调参建议使用 "
+            f"3~5 个随机种子评估每个候选，当前只有 "
+            f"{len(seeds)} 个"
+        )
+
+    run_paths = _execute_sweep_plan(base_argv, plan, out_root)
+
+    rows = compare_runs(run_paths)
+    report = analyze_baseline_tuning(
+        rows,
+        metric,
+        args.baseline_tuning_mode,
+        lrs,
+        seeds,
+    )
+    print_baseline_tuning_report(report, out_root)
+    write_baseline_tuning_report(out_root, report)
+
+    if report.get("winner") is None:
+        raise SystemExit(
+            "基线调参没有选出 winner（见报告 issues），"
+            "不能产出「调过参的基线」；请检查失败原因后重跑"
+        )
+
+
 def run_experiment_sweep(args: argparse.Namespace) -> None:
     """
-    执行多随机种子 / 模式套件 / 全因子消融套件，并输出
-    受控变量检查 + Mean ± Std + 显著性检验 + 消融覆盖报告。
+    执行多随机种子 / 模式套件 / 全因子消融 / 基线调参套件，
+    并输出受控变量检查 + Mean ± Std + 显著性检验 + 消融
+    覆盖报告（基线调参套件输出调参报告）。
     """
+    if args.suite_baseline_tuning:
+        run_baseline_tuning_sweep(args)
+        return
+
     factors = parse_factor_spec(args.compare_factors)
 
     base_argv = strip_sweep_args(sys.argv[1:])
@@ -13752,44 +14951,7 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             f"{len(args.seeds)} 个"
         )
 
-    run_paths: List[str] = []
-
-    for index, item in enumerate(plan, start=1):
-        run_out = out_root / str(item["label"])
-
-        command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-        ] + base_argv
-        command += [
-            "--seed",
-            str(item["seed"]),
-            "--out",
-            str(run_out),
-        ]
-        if item["mode"] is not None:
-            command += ["--mode", str(item["mode"])]
-        if item["balance_coef"] is not None:
-            command += [
-                "--balance-coef",
-                format(float(item["balance_coef"]), "g"),
-            ]
-
-        print(
-            f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
-        )
-
-        completed = subprocess.run(command)
-
-        if completed.returncode != 0:
-            print(
-                f"[sweep] 运行 {item['label']} 失败 "
-                f"(exit={completed.returncode})；已停止后续"
-                "运行，可用 --compare 分析已完成的目录"
-            )
-            raise SystemExit(1)
-
-        run_paths.append(str(run_out))
+    run_paths = _execute_sweep_plan(base_argv, plan, out_root)
 
     rows = compare_runs(run_paths)
     analysis = print_comparison_analysis(
@@ -14110,6 +15272,53 @@ def main():
             "--balance-coef"
         ),
     )
+    parser.add_argument(
+        "--suite-baseline-tuning",
+        action="store_true",
+        help=(
+            "配合 --seeds：对简单基线（--baseline-tuning-mode）"
+            "做预注册的学习率网格搜索（--baseline-tuning-lrs，"
+            "训练预算固定），在 val 上选 winner 并写出 "
+            "baseline_tuning.json；没调过参的弱基线只能证明"
+            "复杂模型比稻草人强"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tuning-lrs",
+        nargs="+",
+        type=float,
+        default=list(_DEFAULT_BASELINE_TUNING_LRS),
+        help=(
+            "基线调参的学习率候选网格（默认 "
+            + " ".join(
+                format(lr, "g")
+                for lr in _DEFAULT_BASELINE_TUNING_LRS
+            )
+            + "）；候选之间只有学习率不同，其余设置逐项一致"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tuning-mode",
+        type=str,
+        default="dense",
+        choices=sorted(Config.MODEL_MODES),
+        help=(
+            "基线调参的模式（默认 dense：最简单的神经基线；"
+            "先调强简单基线，再谈复杂模型）"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tuning-from",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "把 --suite-baseline-tuning 生成的调参报告作为本次"
+            "基线训练的调参来源：核对模式/学习率/训练步数/数据"
+            "指纹与 winner 一致，并写入 config.json 的 "
+            "baseline_tuning 字段，供基线合理性检查核对"
+        ),
+    )
 
     parser.add_argument(
         "--skip-sanity-check",
@@ -14308,16 +15517,27 @@ def main():
             parser.error("--seeds 需要 --data")
         if args.out is None:
             parser.error("--seeds 需要 --out")
-    if (args.suite_modes or args.suite_ablation) and (
-        args.seeds is None
-    ):
+    if (
+        args.suite_modes
+        or args.suite_ablation
+        or args.suite_baseline_tuning
+    ) and args.seeds is None:
         parser.error(
-            "--suite-modes / --suite-ablation 必须配合 "
-            "--seeds 使用（关键实验至少 3~5 个种子）"
+            "--suite-modes / --suite-ablation / "
+            "--suite-baseline-tuning 必须配合 --seeds 使用"
+            "（关键实验至少 3~5 个种子）"
         )
-    if args.suite_modes and args.suite_ablation:
+    if sum(
+        bool(flag)
+        for flag in (
+            args.suite_modes,
+            args.suite_ablation,
+            args.suite_baseline_tuning,
+        )
+    ) > 1:
         parser.error(
-            "--suite-modes 与 --suite-ablation 不能同时使用"
+            "--suite-modes / --suite-ablation / "
+            "--suite-baseline-tuning 只能同时使用一个"
         )
     if args.suite_modes is not None and (
         len(set(args.suite_modes)) != len(args.suite_modes)
@@ -14334,6 +15554,50 @@ def main():
             "（统计基线没有可恢复的训练状态，"
             "检查点会被静默忽略）"
         )
+
+    # 基线调参网格必须合法：学习率是有限正数、候选不重复，
+    # 且至少两档（只有一档时「调参」没有任何意义）。
+    for lr in args.baseline_tuning_lrs:
+        if not math.isfinite(lr) or lr <= 0:
+            parser.error(
+                "--baseline-tuning-lrs 的每个候选必须是"
+                "有限正数"
+            )
+    if len(set(args.baseline_tuning_lrs)) != len(
+        args.baseline_tuning_lrs
+    ):
+        parser.error("--baseline-tuning-lrs 存在重复候选")
+    if args.suite_baseline_tuning and len(
+        set(args.baseline_tuning_lrs)
+    ) < 2:
+        parser.error(
+            "--suite-baseline-tuning 至少需要两个不同的"
+            "学习率候选（--baseline-tuning-lrs），"
+            "单档网格不构成调参"
+        )
+    if args.baseline_tuning_from is not None:
+        if args.suite_baseline_tuning:
+            parser.error(
+                "--baseline-tuning-from 不能在调参套件"
+                "（--suite-baseline-tuning）中使用：调参"
+                "结束时才会生成报告"
+            )
+        if args.statistical_baseline:
+            parser.error(
+                "--baseline-tuning-from 只适用于神经基线"
+                "训练，统计基线没有学习率"
+            )
+        if args.compare is not None:
+            parser.error(
+                "--baseline-tuning-from 需要训练基线，"
+                "不能与只读的 --compare 同时使用"
+            )
+        if args.resume is not None:
+            parser.error(
+                "--baseline-tuning-from 不能与 --resume "
+                "同时使用（恢复训练的学习率由检查点决定，"
+                "调参来源已记录在原运行的 config.json）"
+            )
 
     # 假设纪律：全新训练必须带明确的科学假设，避免
     # 「盲目排列组合超参数」（检查逻辑见
@@ -14643,6 +15907,43 @@ def main():
             "采样轨迹与原运行不再一致"
         )
 
+    # 基线调参来源（--baseline-tuning-from）：核对本次基线的
+    # 模式/学习率/训练步数/数据指纹确实复用了调参报告的 winner，
+    # 并把来源写入 config.json 的 baseline_tuning 字段。没有这步
+    # 核对，「调过参的基线」只是口头声明。
+    baseline_tuning_record: Optional[Dict[str, object]] = None
+    if args.baseline_tuning_from is not None:
+        tuning_path = Path(args.baseline_tuning_from)
+        try:
+            tuning_payload = load_baseline_tuning(tuning_path)
+        except ValueError as error:
+            parser.error(f"--baseline-tuning-from 无效: {error}")
+        provenance_error = baseline_tuning_provenance_error(
+            tuning_payload,
+            mode=cfg.mode,
+            lr=args.lr,
+            steps=args.steps,
+            data_sha256=dataset.data_sha256,
+        )
+        if provenance_error is not None:
+            parser.error(
+                "--baseline-tuning-from 与本次训练不一致: "
+                + provenance_error
+            )
+        baseline_tuning_record = (
+            baseline_tuning_provenance_record(
+                tuning_payload,
+                str(tuning_path),
+            )
+        )
+        print(
+            "[baseline-tuning] 基线调参来源已核对: "
+            f"mode={baseline_tuning_record['mode']}, "
+            "winner lr="
+            f"{format(float(baseline_tuning_record['winner_lr']), 'g')}, "
+            f"metric={baseline_tuning_record['metric']}"
+        )
+
     # 数据审计在训练之前完成：重复内容、分布偏移与 token 值域
     # 问题会被记录并在发现风险时给出警告。test 此时保持尘封，
     # 只在 --evaluate-test 的最终评估时参与审计。
@@ -14788,6 +16089,7 @@ def main():
             sanity_result=sanity_result,
             data_audit=data_audit,
             reference_baselines=reference_baselines,
+            baseline_tuning=baseline_tuning_record,
         )
         if args.resume is None:
             # 全新运行：参考基线记录是 metrics.jsonl 的首行；
@@ -15144,7 +16446,7 @@ def main():
 
     # config.json 记录完整实验追踪信息：结构配置、超参数、种子、
     # 数据指纹与划分、数据审计、代码版本/运行环境、sanity check
-    # 结果、科学假设与参考基线。
+    # 结果、科学假设、参考基线与基线调参来源。
     write_run_config(
         out_dir,
         cfg,
@@ -15154,6 +16456,7 @@ def main():
         config_sanity_result,
         data_audit=data_audit,
         reference_baselines=reference_baselines,
+        baseline_tuning=baseline_tuning_record,
     )
 
     metrics_path = out_dir / "metrics.jsonl"
