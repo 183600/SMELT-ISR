@@ -1988,13 +1988,16 @@ def audit_data_splits(
             invalid = 0
         else:
             tokens_long = tokens.to(torch.int64)
-            hist = torch.bincount(
-                tokens_long,
-                minlength=256,
-            ).to(torch.float64)
+            # 先统计越界，再对 clamp 后的值做直方图：
+            # bincount 不接受负值，且 clamp 保证直方图长度
+            # 恰为 256，跨 split 的 JS 距离形状一致。
             invalid = int(
                 ((tokens_long < 0) | (tokens_long > 255)).sum()
             )
+            hist = torch.bincount(
+                tokens_long.clamp(0, 255),
+                minlength=256,
+            ).to(torch.float64)
 
         histograms[split] = hist / hist.sum()
 
@@ -2540,18 +2543,23 @@ def evaluate(
                 if compute_auc and (
                     auc_tokens < _AUC_MAX_TOKENS
                 ):
+                    # 最后一批可能超出封顶：按剩余预算截断，
+                    # 保证收集的 token 数严格不超过上限。
+                    remaining = (
+                        _AUC_MAX_TOKENS - auc_tokens
+                    )
                     probs = F.softmax(
                         logits,
                         dim=-1,
                     ).reshape(
                         -1,
                         vocab_size,
-                    ).cpu()
+                    )[:remaining].cpu()
                     collected_probs.append(probs)
                     collected_targets.append(
-                        flat_target.cpu()
+                        flat_target[:remaining].cpu()
                     )
-                    auc_tokens += flat_target.numel()
+                    auc_tokens += probs.size(0)
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
                 # add_(alpha=) 完成「乘 token 数 + 累加」。
@@ -3244,11 +3252,14 @@ def _ngram_extended_metrics(
         ).view(vocab_size, vocab_size).double()
 
         if auc_tokens < _AUC_MAX_TOKENS:
+            # 最后一个窗口可能超出封顶：按剩余预算截断，
+            # 保证收集的 token 数严格不超过上限。
+            remaining = _AUC_MAX_TOKENS - auc_tokens
             collected_probs.append(
-                probabilities.to(torch.float32)
+                probabilities[:remaining].to(torch.float32)
             )
-            collected_targets.append(targets)
-            auc_tokens += targets.numel()
+            collected_targets.append(targets[:remaining])
+            auc_tokens += min(targets.numel(), remaining)
 
     loss = total_nll / evaluated_tokens
 
@@ -6302,6 +6313,7 @@ def ablation_coverage(
     modes_present: Dict[str, int] = {}
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
+    unknown_balance = False
 
     for row in rows:
         mode = str(_row_factor_value(row, "mode"))
@@ -6311,11 +6323,22 @@ def ablation_coverage(
             balance_by_mode.setdefault(mode, [])
             if balance not in balance_by_mode[mode]:
                 balance_by_mode[mode].append(balance)
+            if balance is None:
+                # 未记录的 balance_coef 不能算作开启/关闭任何
+                # 一档，否则 2×2 覆盖表会虚报组合存在。
+                unknown_balance = True
+                continue
             key = (
                 mode,
                 "off" if balance == 0 else "on",
             )
             merge_pair_cells[key] = merge_pair_cells.get(key, 0) + 1
+
+    if unknown_balance:
+        report["low_replicate_cells"].append(
+            "存在未记录 balance_coef 的 local_base/A 运行，"
+            "其消融单元格无法判定"
+        )
 
     if "B" in modes_present and "smelt" in modes_present:
         report["advisories"].append(
@@ -6325,7 +6348,7 @@ def ablation_coverage(
             "（或按 FLOPs 对齐比较）"
         )
 
-    if merge_pair_cells == {} and rows:
+    if rows and not ({"local_base", "A"} & set(modes_present)):
         # 运行集里没有 local_base/A：这不是「消融缺失」，而是
         # 当前对比与延迟合并消融无关（如 smelt 对比 B、统计
         # 基线对比），给出提醒但不虚报缺失组合。
@@ -6968,17 +6991,43 @@ def write_run_config(
                 previous["efficiency"],
             )
 
-    with open(
-        config_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            _json_safe(payload),
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    # config.json 是实验追踪的唯一来源，写入中途崩溃不能留下
+    # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
+    previous_mode = 0o644
+    if config_path.exists():
+        try:
+            previous_mode = config_path.stat().st_mode & 0o777
+        except OSError:
+            previous_mode = 0o644
+
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(out_dir),
+            prefix=".config.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            temp_path = Path(handle.name)
+
+        os.replace(temp_path, config_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    try:
+        os.chmod(config_path, previous_mode)
+    except OSError:
+        pass
 
 
 def update_run_config(out_dir: Path, key: str, value) -> None:
@@ -7009,23 +7058,29 @@ def update_run_config(out_dir: Path, key: str, value) -> None:
         except OSError:
             previous_mode = 0o644
 
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=str(out_dir),
-        prefix=".config.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        json.dump(
-            _json_safe(payload),
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
-        temp_path = Path(handle.name)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(out_dir),
+            prefix=".config.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            temp_path = Path(handle.name)
 
-    os.replace(temp_path, path)
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
     try:
         os.chmod(path, previous_mode)
@@ -7129,6 +7184,9 @@ def load_previous_sanity_result(
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
         return None
 
     result = payload.get("sanity_check")
@@ -9673,6 +9731,14 @@ def main():
             parser.error(
                 "--sanity-only 不能与 --seeds 同时使用"
             )
+        if args.evaluate_test:
+            parser.error(
+                "--evaluate-test 不能与 --seeds 同时使用"
+                "（多种子套件会对测试集重复解封，"
+                "让测试集退化为选择指标；请在模型与"
+                "超参数冻结后，改用全新目录对单个"
+                "最终运行评估一次测试集）"
+            )
         if args.data is None:
             parser.error("--seeds 需要 --data")
         if args.out is None:
@@ -9688,10 +9754,20 @@ def main():
         parser.error(
             "--suite-modes 与 --suite-ablation 不能同时使用"
         )
+    if args.suite_modes is not None and (
+        len(set(args.suite_modes)) != len(args.suite_modes)
+    ):
+        parser.error("--suite-modes 存在重复的模式")
     if args.suite_ablation and not args.balance_coef > 0:
         parser.error(
             "--suite-ablation 需要正的 --balance-coef 作为"
             "开启臂（关闭臂固定为 0）"
+        )
+    if args.statistical_baseline and args.resume is not None:
+        parser.error(
+            "--statistical-baseline 不能与 --resume 同时使用"
+            "（统计基线没有可恢复的训练状态，"
+            "检查点会被静默忽略）"
         )
 
     # 假设纪律：全新训练必须带明确的科学假设，避免
@@ -9749,6 +9825,20 @@ def main():
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 测试集尘封协议不只约束单次运行，也约束输出目录：
+    # 目录里已有 test 记录时，全新训练会把 metrics.jsonl
+    # 截断重写，使测试集在无感知的情况下被重复解封
+    # （旧记录被抹掉，之后可再次 --evaluate-test）。
+    # 直接拒绝复用该目录。
+    if args.resume is None and test_record_exists(
+        out_dir / "metrics.jsonl"
+    ):
+        parser.error(
+            "输出目录的 metrics.jsonl 中已有测试集评估记录："
+            "全新训练会截断重写该文件，使测试集被重复解封、"
+            "退化为隐式验证集。请换用全新的 --out 目录。"
+        )
 
     start_step = 0
     rng_payload = None
@@ -11016,7 +11106,17 @@ def main():
     # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
     # 完全结束后解封，且同一次运行只允许评估一次；重复传入也
     # 不会让测试集变成隐式验证集，需要新的结论应使用全新目录。
-    if args.evaluate_test:
+    if args.evaluate_test and numerical_polluted:
+        # 参数已被 NaN/Inf 污染时模型输出不可信，评估测试集只会
+        # 白白消耗该目录唯一一次解封名额；保持尘封，修复后从
+        # 污染前的检查点恢复或换全新目录再评估。
+        print(
+            "[test] 参数/优化器状态已被 NaN/Inf 污染，"
+            "本次不消耗唯一的测试集评估名额：测试集保持尘封。"
+            "请从污染前的检查点恢复并修复数值问题后，"
+            "再显式 --evaluate-test。"
+        )
+    elif args.evaluate_test:
         if test_record_exists(metrics_path):
             print(
                 "[test] metrics.jsonl 中已有测试集评估记录；"
