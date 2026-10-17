@@ -197,17 +197,31 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   的随机种子；`CUBLAS_WORKSPACE_CONFIG=:4096:8` 与
   `use_deterministic_algorithms(True, warn_only=True)` 配合使用。
   数据采样不使用 DataLoader worker，而由显式 `torch.Generator`
-  承担，其种子与状态随检查点存档。
+  承担，其种子与状态随检查点存档。所有入口统一调用 `set_seed`
+  （神经训练、统计基线、自测），没有只在部分入口固定种子的盲区。
+  `PYTHONHASHSEED` 只能影响之后启动的子进程，本进程的哈希种子在
+  启动时已定；进程启动时的实际值被捕获进运行元数据
+  （`pythonhashseed_at_start`），为 `null` 说明本进程的 hash
+  随机化未被固定，严格逐位复现应在启动命令行显式设置该变量。
 - 全新训练开始前默认运行过拟合小批量 sanity check：
   同一模型结构在固定小批次上训练，关闭辅助均衡损失、weight decay、
   梯度裁剪与 warmup，要求训练损失迅速趋近 0 或下一 token 准确率
-  接近 100%。检查内部固定种子并在结束后恢复 RNG 状态，不影响主训练
+  接近 100%。检查走与全量训练一致的前向/反向路径：主训练启用
+  `--grad-checkpoint` 时检查同样开启 activation checkpointing
+  （唯一会改写反传代码路径的开关，报告记录 `grad_checkpoint` 与
+  `amp_dtype`），`--compile` 只做内核融合不改写 autograd 语义、
+  不镜像。检查内部固定种子并在结束后恢复 RNG 状态，不影响主训练
   轨迹；失败时以非零状态码退出，不开始全量训练。这是必要不充分
   检查，通过后仍需核对中间结果。可用 `--sanity-only` 单独运行、
   `--skip-sanity-check` 跳过。
 - 每轮实验的代码版本、运行环境、超参数与随机种子、数据指纹、
   sanity check 结果写入 `config.json`；训练曲线与最终结果写入
-  `metrics.jsonl`，全程自动记录。
+  `metrics.jsonl`，全程自动记录。代码版本是三层记录：
+  git commit（仓库可用时）、`git_diff_sha256`（工作区脏时对
+  `git diff HEAD` 的指纹，区分同一 commit 的不同未提交状态）与
+  `script_sha256`（实验脚本自身的 SHA-256，单文件代码库下即完整
+  实验代码的指纹，不依赖 git，覆盖压缩包运行与脏工作区两种
+  commit 无法定位代码的场景）。
 
 ## 训练入口
 

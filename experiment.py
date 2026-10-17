@@ -45,6 +45,13 @@ os.environ.setdefault(
     ":4096:8",
 )
 
+# 进程启动时的 PYTHONHASHSEED（在 set_seed 里被 setdefault 之前
+# 捕获）：当前解释器的哈希种子在启动时已经确定，set_seed 事后
+# 设置的环境变量只影响之后启动的子进程。此处的捕获值随运行
+# 元数据存档，值为 None 说明本进程的 hash 随机化未被固定，
+# 严格逐位复现应在启动命令行显式设置该变量。
+_PYTHONHASHSEED_AT_START = os.environ.get("PYTHONHASHSEED")
+
 
 # ============================================================
 # Configuration
@@ -3884,6 +3891,12 @@ def run_statistical_baseline(
     config.json / metrics.jsonl，可直接进入 --compare。
     """
     del device  # n-gram 全部在 CPU 上完成。
+
+    # 统计基线当前不消耗任何随机性（计数与固定窗口评估都是
+    # 确定性的），但所有入口统一固定全部 RNG 种子：未来任何
+    # 采样/初始化改动不会让本入口在无感知的情况下失去
+    # 可复现性，config.json 里的种子也始终对应真实生效值。
+    set_seed(args.seed)
 
     alpha_grid: List[float] = list(args.ngram_alpha_grid)
 
@@ -7741,6 +7754,7 @@ def run_sanity_overfit(
     loss_threshold: float,
     acc_threshold: float,
     seed: int,
+    grad_checkpoint: bool = False,
 ) -> Dict[str, object]:
     """
     过拟合小批量数据的 sanity check。
@@ -7749,6 +7763,14 @@ def run_sanity_overfit(
     关闭负载均衡辅助损失、weight decay、梯度裁剪、warmup 等
     一切正则化（数据管线本身没有 dropout / 数据增强），要求训练
     损失迅速趋近 0 或下一 token 准确率接近 100%。
+
+    检查必须走与全量训练一致的前向/反向路径：主训练启用
+    --grad-checkpoint 时本检查同样开启 activation
+    checkpointing（其反向会对 Block 重算前向，是唯一会改变
+    反传代码路径的开关），避免「sanity check 验证了一条
+    路径、全量训练跑的是另一条路径」。--compile 只做内核
+    融合不改写 autograd 语义，且会显著拉长每次运行的启动
+    时间，不镜像。
 
     这是必要不充分的检查：连小批量都无法过拟合，通常意味着
     梯度没有正确反传、损失计算错误、优化器配置错误等严重缺陷；
@@ -7766,6 +7788,7 @@ def run_sanity_overfit(
         # balance_coef=0：关闭辅助负载均衡损失（正则项）。
         sanity_cfg = replace(cfg, balance_coef=0.0)
         model = LanguageModel(sanity_cfg).to(device)
+        model.grad_checkpoint = grad_checkpoint
         model.train()
 
         n_params = sum(
@@ -7859,6 +7882,10 @@ def run_sanity_overfit(
             "batch_size": batch_size,
             "lr": lr,
             "seed": seed,
+            "grad_checkpoint": grad_checkpoint,
+            "amp_dtype": (
+                str(amp_dtype) if amp_dtype is not None else None
+            ),
             "initial_lm_loss": initial_loss,
             "final_lm_loss": final_loss,
             "final_token_accuracy": final_acc,
@@ -7898,14 +7925,50 @@ def _git_output(*args: str) -> Optional[str]:
     return result.stdout.strip()
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _script_sha256() -> Optional[str]:
+    """
+    实验脚本自身的 SHA-256 指纹。
+
+    本项目是单文件代码库，脚本指纹即完整实验代码的指纹：
+    git 不可用（如压缩包直接运行）时它是唯一的代码版本记录，
+    工作区有未提交修改时它能把「同一 commit 的不同脏状态」
+    区分开——只有 commit + dirty 布尔位做不到这一点。
+    """
+    try:
+        source = Path(__file__).resolve().read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(source).hexdigest()
+
+
 def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     """
     收集本轮实验的代码版本与运行环境信息，写入 config.json，
     保证实验可追溯：代码版本 + 环境 + 超参数 + 种子 +
     数据指纹（args.data_sha256）+ 训练曲线（metrics.jsonl）。
+
+    代码版本有三层记录：git commit（仓库可用时）、
+    git_diff_sha256（工作区脏时对 git diff HEAD 的指纹，
+    用于区分同一 commit 的不同未提交状态）与
+    script_sha256（脚本文件本身的指纹，不依赖 git，
+    覆盖压缩包运行与脏工作区两种 commit 无法定位代码的场景）。
     """
     commit = _git_output("rev-parse", "HEAD")
     status = _git_output("status", "--porcelain")
+
+    git_dirty = bool(status) if status is not None else None
+
+    # 脏工作区的 diff 指纹：两个运行同 commit 但 diff 指纹不同，
+    # 说明跑的不是同一份代码，对比结论不可信。
+    git_diff_sha256: Optional[str] = None
+    if git_dirty:
+        diff = _git_output("diff", "HEAD")
+        if diff is not None:
+            git_diff_sha256 = _sha256_text(diff)
 
     device_name = None
     if device.type == "cuda" and torch.cuda.is_available():
@@ -7938,9 +8001,13 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         ),
         "device_name": device_name,
         "git_commit": commit,
-        "git_dirty": (
-            bool(status) if status is not None else None
-        ),
+        "git_dirty": git_dirty,
+        "git_diff_sha256": git_diff_sha256,
+        "script_sha256": _script_sha256(),
+        # 进程启动时的实际值：None 说明本进程的 hash 随机化
+        # 未被固定（set_seed 的 setdefault 只对之后的子进程
+        # 生效），严格逐位复现应在启动命令行显式设置。
+        "pythonhashseed_at_start": _PYTHONHASHSEED_AT_START,
         "deterministic_algorithms": (
             torch.are_deterministic_algorithms_enabled()
         ),
@@ -9626,7 +9693,9 @@ def run_self_test():
         assert first_draw[2] == second_draw[2]
 
     # sanity check 必须能在小批量上过拟合，且结束后恢复调用前的
-    # RNG 状态（不影响主训练轨迹）。
+    # RNG 状态（不影响主训练轨迹）。启用 grad_checkpoint 跑通
+    # 检查：主训练带 --grad-checkpoint 时，sanity check 必须
+    # 验证同一条 checkpointed 反传路径，而不是只验证直连路径。
     sanity_cfg = Config(
         **common,
         mode="B",
@@ -9646,9 +9715,12 @@ def run_self_test():
         loss_threshold=0.5,
         acc_threshold=0.9,
         seed=321,
+        grad_checkpoint=True,
     )
 
     assert sanity_metrics["passed"], sanity_metrics
+    assert sanity_metrics["grad_checkpoint"] is True
+    assert "amp_dtype" in sanity_metrics
     assert torch.equal(
         torch.get_rng_state(),
         rng_before,
@@ -9670,6 +9742,7 @@ def run_self_test():
     )
 
     assert not failed_metrics["passed"]
+    assert failed_metrics["grad_checkpoint"] is False
 
     # 运行元数据必须包含代码版本与随机种子相关的追踪字段。
     metadata = collect_run_metadata(torch.device("cpu"))
@@ -9677,6 +9750,22 @@ def run_self_test():
     assert "git_commit" in metadata
     assert "torch_version" in metadata
     assert "deterministic_algorithms" in metadata
+    # 代码指纹三层记录：script_sha256 不依赖 git（压缩包运行
+    # / 脏工作区时它是唯一能定位代码版本的记录），且必须与
+    # 当前脚本文件的实际内容一致。
+    assert metadata["script_sha256"] == hashlib.sha256(
+        Path(__file__).resolve().read_bytes()
+    ).hexdigest()
+    assert "git_diff_sha256" in metadata
+    if metadata["git_dirty"]:
+        assert metadata["git_diff_sha256"]
+    # 进程启动时的 PYTHONHASHSEED 必须被原样记录（None 表示
+    # 本进程 hash 随机化未固定，set_seed 的 setdefault 无法
+    # 追溯地固定它）。
+    assert (
+        metadata["pythonhashseed_at_start"]
+        == _PYTHONHASHSEED_AT_START
+    )
 
     # ---- 结果分析工具自测 ----
     # NaN/Inf 写盘前必须转成 null，保证 JSON 严格可解析。
@@ -11977,6 +12066,7 @@ def main():
             f"batch_size={args.sanity_batch_size}, "
             f"steps={args.sanity_steps}, "
             f"lr={args.sanity_lr}, "
+            f"grad_checkpoint={args.grad_checkpoint}, "
             f"loss<={args.sanity_loss_threshold} "
             f"或 acc>={args.sanity_acc_threshold}"
         )
@@ -11992,6 +12082,7 @@ def main():
             loss_threshold=args.sanity_loss_threshold,
             acc_threshold=args.sanity_acc_threshold,
             seed=args.seed,
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         sanity_record = {
