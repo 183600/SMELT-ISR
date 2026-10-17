@@ -30,8 +30,7 @@ except ImportError:
 
 
 # 分配器与 cuBLAS 确定性工作区配置必须在任何 CUDA 上下文创建
-# 之前生效（设备属性查询、内存分配都会创建上下文）。放在模块
-# 导入时设置，训练入口与自测入口都覆盖到。
+# 之前生效。放在模块导入时设置，训练入口与自测入口都覆盖到。
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "expandable_segments:True",
@@ -435,9 +434,9 @@ class _StackedExpertWeights(torch.autograd.Function):
 
     专家权重 stack（[n_experts, ...]）在同一参数版本下被
     多次 MoE 调用复用（见 SparseMoE._cached_weight_stack），
-    因此 forward 原样返回模块缓存的普通张量，不建立 torch.stack
-    节点；backward 按专家把上游梯度切成逐专家切片返回，
-    与 torch.stack 反向的语义一致，但不物化拼接后的梯度张量。
+    forward 原样返回模块缓存的普通张量；backward 按专家把
+    上游梯度切成逐专家切片返回，与 torch.stack 反向的语义
+    一致。
     """
 
     @staticmethod
@@ -706,7 +705,7 @@ class SparseMoE(nn.Module):
     ) -> torch.Tensor:
         """
         CUDA autocast 下把张量转换为 autocast dtype；其余情况
-        原样返回（dtype 一致时 to 也是无拷贝的空操作）。
+        原样返回。
         """
         if not tensor.is_cuda or not torch.is_autocast_enabled():
             return tensor
@@ -829,8 +828,7 @@ class SparseMoE(nn.Module):
         total = gathered.size(0)
         device = gathered.device
 
-        # 各专家段在排序序列中的起始行（设备侧 cumsum，
-        # 不引入额外同步）。
+        # 各专家段在排序序列中的起始行。
         starts = torch.cumsum(counts_tensor, dim=0) - (
             counts_tensor
         )
@@ -860,8 +858,7 @@ class SparseMoE(nn.Module):
         # 收集回原始 assignment 顺序：先把「排序位置 → padded
         # 位置」的映射反转为「原始位置 → padded 位置」
         #（dest_by_original[perm[j]] = dest[j]），再一次
-        # index_select 完成收集；相比「gather 到临时缓冲再
-        # 散射」少一次 total × dim 的行搬运与一次分配。
+        # index_select 完成收集。
         dest_by_original = torch.scatter(
             torch.empty_like(dest),
             0,
@@ -2058,8 +2055,7 @@ class ByteDataset:
 
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
-        # 数据审计（重复窗口扫描）直接读取原始字节；
-        # memoryview 零拷贝共享同一块缓冲区。
+        # 数据审计（重复窗口扫描）直接读取原始字节缓冲区。
         self._raw = memoryview(buf)
 
         _ = device
@@ -5456,15 +5452,12 @@ def _check_batch_integrity(
                 info[f"{name}_max"] = float(
                     finite_values.max()
                 )
-            # NaN/Inf 已在上面单独计数；值域检查只看有限元素，
-            # 避免 NaN→int64 的未定义转换被重复计为越界。
+            # NaN/Inf 已在上面单独计数；值域检查只看有限元素。
             comparison = finite_values.to(torch.int64)
         else:
             info[f"{name}_min"] = int(tensor.min())
             info[f"{name}_max"] = int(tensor.max())
-            # uint8 与 Python 整数比较会按 uint8 回绕（如
-            # 255 >= 256 会溢出成 255 >= 0 而误报），先提升到
-            # int64 再判值域。
+            # 值域比较前统一提升到 int64。
             comparison = tensor.to(torch.int64)
 
         info["out_of_range_elements"] = int(
@@ -5534,8 +5527,8 @@ def diagnose_non_finite(
     lm_loss = result.get("lm_loss")
     aux_loss = result.get("aux_loss")
 
-    # 训练循环在反向之前就释放了 logits；诊断时补跑一次前向，
-    # 否则前向数值检查拿不到证据。只在确认出错后执行一次。
+    # 训练循环在反向之前就释放了 logits；诊断时补跑一次前向。
+    # 只在确认出错后执行一次。
     probe_source = "training result"
     if logits is None and isinstance(model, LanguageModel):
         was_training = model.training
@@ -10975,7 +10968,6 @@ def run_self_test():
     )
     assert not bad_data_check["ok"]
 
-    # uint8 与 Python 整数比较会回绕（255 >= 256 误判为越界），
     # 上限内的 uint8 token 必须判定为合法。
     uint8_range_check = _check_batch_integrity(
         torch.tensor([[0, 255]], dtype=torch.uint8),
@@ -14034,7 +14026,6 @@ def main():
 
         # 损失与梯度范数都必须有限才推进优化器：任一非有限
         # 都意味着这一步的参数更新不可信。
-        # 两个标量合并成一次设备→主机传输（单次同步）。
         grad_norm_value, loss_value = torch.stack(
             (grad_norm.detach(), loss.detach()),
         ).tolist()
