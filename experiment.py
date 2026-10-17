@@ -436,17 +436,27 @@ class _StackedExpertWeights(torch.autograd.Function):
     多次 MoE 调用复用（见 SparseMoE._cached_weight_stack），
     forward 原样返回模块缓存的普通张量；backward 按专家把
     上游梯度切成逐专家切片返回，与 torch.stack 反向的语义
-    一致。
+    一致。autocast 下缓存 stack 为 autocast dtype（bf16/fp16），
+    反向先把上游梯度一次转换回参数 dtype 再切分，与
+    「参数 -> 转换 -> stack」计算图中转换节点反向的数值
+    完全一致（半精度升到 fp32 是精确转换）。
     """
 
     @staticmethod
     def forward(ctx, stacked: torch.Tensor, *weights: torch.Tensor):
         # 逐专家切片的形状；stack 要求各专家权重同形。
         ctx.shapes = [weight.shape for weight in weights]
+        # 参数 dtype；stack 可能已按 autocast dtype 缓存。
+        ctx.weight_dtype = (
+            weights[0].dtype if weights else stacked.dtype
+        )
         return stacked
 
     @staticmethod
     def backward(ctx, grad_stacked: torch.Tensor) -> tuple:
+        if grad_stacked.dtype != ctx.weight_dtype:
+            grad_stacked = grad_stacked.to(ctx.weight_dtype)
+
         return (None,) + tuple(
             grad_stacked[index].reshape(shape)
             for index, shape in enumerate(ctx.shapes)
@@ -584,15 +594,27 @@ class SparseMoE(nn.Module):
         """
         返回 [n_experts, ...] 的专家权重 stack，跨调用复用。
 
-        缓存以 (版本号, 数据指针) 为签名：任何原地更新（优化器
-        更新、加载检查点）都会推进版本号并触发重建；参数张量被
-        替换时由 _apply 清空缓存兜底。需要反向时经
-        _StackedExpertWeights 把梯度按专家散回参数，与
-        torch.stack + bmm 的计算图语义相同。
+        缓存以 (autocast dtype, 版本号, 数据指针) 为签名：任何
+        原地更新（优化器更新、加载检查点）都会推进版本号并触发
+        重建；参数张量被替换时由 _apply 清空缓存兜底。CUDA
+        autocast 下直接缓存 autocast dtype 的 stack：bmm 的
+        autocast 包装本来就要在每次调用前把 fp32 权重转成
+        autocast dtype，缓存后同一参数版本只需转换一次，同时
+        省去每次 bmm 前的临时转换缓冲（显存减半）。需要反向时
+        经 _StackedExpertWeights 把梯度按专家散回参数，与
+        「torch.stack + bmm」在 autocast 下的计算图语义相同。
         """
-        signature = tuple(
-            (weight._version, weight.data_ptr())
-            for weight in weights
+        first = weights[0]
+        target_dtype = self._autocast_target_dtype(first)
+        if target_dtype is None:
+            target_dtype = first.dtype
+
+        signature = (
+            target_dtype,
+            *(
+                (weight._version, weight.data_ptr())
+                for weight in weights
+            ),
         )
 
         cached = self._weight_stacks.get(key)
@@ -607,7 +629,15 @@ class SparseMoE(nn.Module):
             stacked = cached[1]
         else:
             with torch.no_grad():
-                stacked = torch.stack(weights)
+                # 直接写入目标 dtype 缓冲，不物化 fp32 中间
+                # stack（转换语义与 stack 后 .to() 相同）。
+                stacked = torch.empty(
+                    (len(weights), *first.shape),
+                    dtype=target_dtype,
+                    device=first.device,
+                )
+                for index, weight in enumerate(weights):
+                    stacked[index].copy_(weight)
             self._weight_stacks[key] = (signature, stacked)
 
         if not torch.is_grad_enabled() or not any(
@@ -714,6 +744,22 @@ class SparseMoE(nn.Module):
             aux_loss,
         )
 
+    def _autocast_target_dtype(
+        self,
+        tensor: torch.Tensor,
+    ) -> Optional[torch.dtype]:
+        """
+        CUDA autocast 下返回该张量应转换到的 autocast dtype；
+        其余情况返回 None（无需转换）。
+        """
+        if not tensor.is_cuda or not torch.is_autocast_enabled():
+            return None
+
+        try:
+            return torch.get_autocast_dtype("cuda")
+        except AttributeError:
+            return torch.get_autocast_gpu_dtype()
+
     def _cast_for_autocast(
         self,
         tensor: torch.Tensor,
@@ -722,14 +768,9 @@ class SparseMoE(nn.Module):
         CUDA autocast 下把张量转换为 autocast dtype；其余情况
         原样返回。
         """
-        if not tensor.is_cuda or not torch.is_autocast_enabled():
+        dtype = self._autocast_target_dtype(tensor)
+        if dtype is None:
             return tensor
-
-        try:
-            dtype = torch.get_autocast_dtype("cuda")
-        except AttributeError:
-            dtype = torch.get_autocast_gpu_dtype()
-
         return tensor.to(dtype)
 
     def _issue_counts_readback(self, counts: torch.Tensor) -> None:
