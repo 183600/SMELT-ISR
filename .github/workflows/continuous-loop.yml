@@ -159,10 +159,10 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
-          # ================= 模型策略：80% opencode 免费 deepseek / 20% NVIDIA GLM =================
-          # 主力（80%）：opencode 自带的免费 deepseek —— Zen 网关 deepseek-v4.1-flash-free，
+          # ================= 模型策略：50% opencode 免费 deepseek / 50% NVIDIA GLM =================
+          # 主力（50%）：opencode 自带的免费 deepseek —— Zen 网关 deepseek-v4.1-flash-free，
           #             在 opencode 客户端内调用免鉴权，支持 tool call 与 reasoning effort；
-          # 副选（20%）：https://integrate.api.nvidia.com/v1 的 glm-5.3（目录中不存在时
+          # 副选（50%）：https://integrate.api.nvidia.com/v1 的 glm-5.3（目录中不存在时
           #             自动改用 glm-5-3-flash），需要仓库 secret NVIDIA_API_KEY；
           # NVIDIA 不可用（无 key / 端点失效 / 无 GLM 模型）时自然回落免费 deepseek。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
@@ -170,7 +170,7 @@ jobs:
           # ⭐ 兜底：免费 deepseek-v4.1-flash-free 不可用（限流/下线/调用失败）时，
           #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
           PICKLE_MODEL="opencode/big-pickle"
-          NVIDIA_PROB=20
+          NVIDIA_PROB=50
           NVIDIA_MODEL=""
           CURRENT_PROVIDER=""
           PROVIDER_BROKEN=""
@@ -277,7 +277,7 @@ jobs:
             CURRENT_PROVIDER="$1"
           }
 
-          # ---------- 每次调用按 80/20 抽样选 provider，失效自动换边 ----------
+          # ---------- 每次调用按 50/50 抽样选 provider，失效自动换边 ----------
           pick_provider() {
             local roll=$((RANDOM % 100))
             if [ "$roll" -lt "$NVIDIA_PROB" ]; then
@@ -342,7 +342,7 @@ jobs:
             NONE)     VARIANT="" ;;
             *)        VARIANT="max" ;;
           esac
-          echo "[info] 免费deepseek=$FREE_MODEL (80%) | NVIDIA glm-5.3 (${NVIDIA_PROB}%) | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] 免费deepseek=$FREE_MODEL ($((100-NVIDIA_PROB))%) | NVIDIA glm-5.3 (${NVIDIA_PROB}%) | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
 
           i=0
 
@@ -413,7 +413,7 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（80/20 抽样选 provider，失效自动换边，反复重试） ----------
+          # ---------- 单阶段执行（50/50 抽样选 provider，失效自动换边，反复重试） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
