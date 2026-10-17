@@ -6794,6 +6794,8 @@ def _paired_t_test(
                 "df": float(n - 1),
                 "p_value": 1.0,
                 "note": "zero_variance",
+                "effect": 0.0,
+                "se": 0.0,
             }
         return {
             "test": "paired_t",
@@ -6801,6 +6803,8 @@ def _paired_t_test(
             "df": float(n - 1),
             "p_value": 0.0,
             "note": "noise_free_separation",
+            "effect": mean,
+            "se": 0.0,
         }
 
     t = mean / (std / math.sqrt(n))
@@ -6809,6 +6813,8 @@ def _paired_t_test(
         "t": t,
         "df": float(n - 1),
         "p_value": _two_sided_t_p_value(abs(t), float(n - 1)),
+        "effect": mean,
+        "se": std / math.sqrt(n),
     }
 
 
@@ -6840,6 +6846,8 @@ def _welch_t_test(
                 "df": None,
                 "p_value": 1.0,
                 "note": "zero_variance",
+                "effect": 0.0,
+                "se": 0.0,
             }
         return {
             "test": "welch_t",
@@ -6847,6 +6855,8 @@ def _welch_t_test(
             "df": None,
             "p_value": 0.0,
             "note": "noise_free_separation",
+            "effect": delta,
+            "se": 0.0,
         }
 
     t = delta / math.sqrt(se_squared)
@@ -6859,7 +6869,138 @@ def _welch_t_test(
         "t": t,
         "df": df,
         "p_value": _two_sided_t_p_value(abs(t), df),
+        "effect": delta,
+        "se": math.sqrt(se_squared),
     }
+
+
+def _t_critical(
+    df: float,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Optional[float]:
+    """
+    Student t 分布在显著性水平 alpha（双侧）下的临界值
+    t_{1-alpha/2}：对 p 值函数做二分求根，仍然不依赖 SciPy。
+    """
+    if df <= 0.0 or not math.isfinite(df):
+        return None
+
+    low = 0.0
+    high = 1.0
+    while True:
+        p_high = _two_sided_t_p_value(high, df)
+        if p_high is None:
+            return None
+        if p_high <= alpha:
+            break
+        high *= 2.0
+        if high > 1.0e6:
+            return None
+
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        p_mid = _two_sided_t_p_value(mid, df)
+        if p_mid is None:
+            return None
+        if p_mid > alpha:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def _contrast_interval(
+    test: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    由 t 检验结果计算效应量的 95% 置信区间。
+
+    区间不包含 0 与 p <= 0.05 在数学上等价（同一个 t 检验），
+    但 CI 直接给出效应量的可行范围：极宽的区间说明现有种子数
+    只能排除「差异为 0」，还不足以定位效应大小。
+    """
+    effect = test.get("effect")
+    se = test.get("se")
+    df = test.get("df")
+    if effect is None or se is None or df is None:
+        return {}
+
+    critical = _t_critical(float(df))
+    if critical is None:
+        return {}
+
+    low = float(effect) - critical * float(se)
+    high = float(effect) + critical * float(se)
+    return {
+        "effect": float(effect),
+        "se": float(se),
+        "t_critical": critical,
+        "ci95_low": low,
+        "ci95_high": high,
+        "ci95_excludes_zero": (low > 0.0) or (high < 0.0),
+    }
+
+
+def _holm_bonferroni(
+    p_values: List[Optional[float]],
+) -> List[Optional[float]]:
+    """
+    Holm step-down 法校正 p 值（控制族错误率 FWER）。
+
+    第 i 小（0 起）的 p 值乘以 m - i 并做单调化；None
+    （未执行检验，如种子不足）不参与家族计数。
+    """
+    total = sum(1 for p in p_values if p is not None)
+    adjusted: List[Optional[float]] = [None] * len(p_values)
+    if total == 0:
+        return adjusted
+
+    ranked = sorted(
+        (index for index, p in enumerate(p_values) if p is not None),
+        key=lambda index: float(p_values[index]),
+    )
+
+    running = 0.0
+    for position, index in enumerate(ranked):
+        candidate = min(
+            1.0,
+            float(p_values[index]) * (total - position),
+        )
+        running = max(running, candidate)
+        adjusted[index] = running
+    return adjusted
+
+
+def _benjamini_hochberg(
+    p_values: List[Optional[float]],
+) -> List[Optional[float]]:
+    """
+    Benjamini-Hochberg 法校正 p 值（控制错误发现率 FDR）。
+
+    比 Holm 更有功效，适合探索性解读；结论性的显著性判定
+    以 Holm（FWER）为准，BH 值随报告给出以标明「更宽松的
+    口径下也不显著」的稳健性。
+    """
+    total = sum(1 for p in p_values if p is not None)
+    adjusted: List[Optional[float]] = [None] * len(p_values)
+    if total == 0:
+        return adjusted
+
+    ranked = sorted(
+        (index for index, p in enumerate(p_values) if p is not None),
+        key=lambda index: float(p_values[index]),
+    )
+
+    running = 1.0
+    for position in range(len(ranked) - 1, -1, -1):
+        index = ranked[position]
+        candidate = min(
+            1.0,
+            float(p_values[index]) * total / (position + 1),
+        )
+        running = min(running, candidate)
+        adjusted[index] = running
+    return adjusted
 
 
 def _metric_samples(
@@ -7038,14 +7179,15 @@ def _contrast_test(
     return result
 
 
-def _cost_comparison(
-    cell_a: Dict[str, object],
-    cell_b: Dict[str, object],
+def _cost_verdict_from_ratios(
+    cost_ratios: Dict[str, float],
     verdict: str,
     significant: bool,
-) -> Tuple[Dict[str, object], Optional[str]]:
+) -> Optional[str]:
     """
-    变体（cell_b）相对基线（cell_a）的成本对比与权衡判定。
+    由成本倍数与显著性给出权衡判定，供对比创建时与多重比较
+    校正后重算共用（校正可能把显著翻转为不显著，成本结论
+    必须同步降级为 ``gain_not_significant``）。
 
     ``cost_verdict``：
     - ``gain_with_cost``：指标显著改善，但成本达到基线的
@@ -7054,6 +7196,30 @@ def _cost_comparison(
     - ``gain_not_significant``：改善不显著（说服力有限）；
     - ``dominated_regression``：指标变差且更贵，严格劣于基线；
     - ``neutral``：其余（持平/缺失成本数据等）。
+    """
+    if not cost_ratios or verdict == "missing_metric":
+        return None
+
+    most_expensive = max(cost_ratios.values())
+    expensive = most_expensive >= _COST_RATIO_MATERIAL
+    if verdict == "regression" and most_expensive > 1.0:
+        return "dominated_regression"
+    if verdict == "improvement" and significant:
+        return "gain_with_cost" if expensive else "gain_balanced"
+    if verdict == "improvement":
+        return "gain_not_significant"
+    return "neutral"
+
+
+def _cost_comparison(
+    cell_a: Dict[str, object],
+    cell_b: Dict[str, object],
+    verdict: str,
+    significant: bool,
+) -> Tuple[Dict[str, object], Optional[str]]:
+    """
+    变体（cell_b）相对基线（cell_a）的成本对比与权衡判定，
+    判定逻辑见 ``_cost_verdict_from_ratios``。
     """
     baseline_costs: Dict[str, float] = {}
     variant_costs: Dict[str, float] = {}
@@ -7069,20 +7235,11 @@ def _cost_comparison(
         if cost_a > 0.0:
             cost_ratios[field] = cost_b / cost_a
 
-    cost_verdict: Optional[str] = None
-    if cost_ratios and verdict != "missing_metric":
-        most_expensive = max(cost_ratios.values())
-        expensive = most_expensive >= _COST_RATIO_MATERIAL
-        if verdict == "regression" and most_expensive > 1.0:
-            cost_verdict = "dominated_regression"
-        elif verdict == "improvement" and significant:
-            cost_verdict = (
-                "gain_with_cost" if expensive else "gain_balanced"
-            )
-        elif verdict == "improvement":
-            cost_verdict = "gain_not_significant"
-        else:
-            cost_verdict = "neutral"
+    cost_verdict = _cost_verdict_from_ratios(
+        cost_ratios,
+        verdict,
+        significant,
+    )
 
     return (
         {
@@ -7094,6 +7251,66 @@ def _cost_comparison(
     )
 
 
+def _apply_multiple_comparison_correction(
+    contrasts: List[Dict[str, object]],
+) -> None:
+    """
+    对同一分析家族内的全部显著性检验做多重比较校正。
+
+    家族 = 一次分析里实际执行的检验（单因子对比集合，或
+    ``--compare-baseline`` 直接对比集合）；同一家族的 p 值
+    共享校正，未执行的检验（种子不足、缺指标）不参与家族
+    计数。每个对比记录：
+
+    - ``p_value_holm`` / ``p_value_bh``：Holm（FWER）与
+      BH（FDR）校正后的 p 值；
+    - ``significant_raw``：未校正判定（留档，可追溯「校正
+      前后结论翻转」）；
+    - ``significant``：以 Holm 校正为准的最终判定；成本的
+      权衡结论（``cost_verdict``）同步按该判定重算。
+
+    不校正的风险：跑 6 个两两对比，即使每个都用 alpha=0.05，
+    至少出现一个假阳性的概率约 26%。只有校正后的显著性才是
+    可以在结论中主张的显著性。
+    """
+    eligible = [
+        contrast
+        for contrast in contrasts
+        if contrast.get("p_value") is not None
+    ]
+    p_values = [float(contrast["p_value"]) for contrast in eligible]
+    holm_values = _holm_bonferroni(p_values)
+    bh_values = _benjamini_hochberg(p_values)
+
+    for contrast, holm_p, bh_p in zip(
+        eligible,
+        holm_values,
+        bh_values,
+    ):
+        contrast["p_value_holm"] = holm_p
+        contrast["p_value_bh"] = bh_p
+        # 幂等：重复调用时保留首次记录的未校正判定，
+        # 不会把校正结果当成「原始」值再记一遍。
+        if "significant_raw" not in contrast:
+            contrast["significant_raw"] = bool(
+                contrast.get("significant")
+            )
+        corrected = (
+            holm_p is not None
+            and float(holm_p) <= _SIGNIFICANCE_LEVEL
+        )
+        contrast["significant"] = corrected
+
+        cost = contrast.get("cost")
+        if isinstance(cost, dict):
+            ratios = cost.get("ratios")
+            contrast["cost_verdict"] = _cost_verdict_from_ratios(
+                ratios if isinstance(ratios, dict) else {},
+                str(contrast.get("verdict")),
+                corrected,
+            )
+
+
 def factor_contrasts(
     aggregates: List[Dict[str, object]],
     group_keys: List[str],
@@ -7103,7 +7320,8 @@ def factor_contrasts(
     单因子对比：只有恰好一个因子取值不同的两个实验单元之间
     做统计检验。全因子消融的每个因子主效应（以及交互）都由
     若干这样的单因子对比给出；一次变化多个因子的组合被标记
-    为混杂对比，结论无法归因。
+    为混杂对比，结论无法归因。返回前对家族内全部检验做
+    Holm（FWER）/ BH（FDR）多重比较校正并附效应量 95% CI。
     """
     contrasts: List[Dict[str, object]] = []
     higher_is_better = metric_higher_is_better(metric)
@@ -7220,7 +7438,12 @@ def factor_contrasts(
                 "cost": cost,
                 "cost_verdict": cost_verdict,
             })
+            contrast.update(_contrast_interval(test))
             contrasts.append(contrast)
+
+    # 家族的显著性判定必须在全部对比都生成后统一校正，
+    # 否则先创建的对比不知道家族里还有多少检验。
+    _apply_multiple_comparison_correction(contrasts)
 
     return contrasts
 
@@ -7239,6 +7462,7 @@ def _contrast_display(
     )
     delta = contrast.get("delta")
     p_value = contrast.get("p_value")
+    p_holm = contrast.get("p_value_holm")
     test = contrast.get("test")
     n_pairs = contrast.get("n_pairs", 0)
 
@@ -7258,6 +7482,13 @@ def _contrast_display(
         p_text = "p=NA"
     else:
         p_text = f"p={float(p_value):.4f}"
+        # 家族内做了多重比较校正时，展示校正后的 p 值；
+        # 单检验家族（或未参与校正）时两者相同，不重复。
+        if (
+            p_holm is not None
+            and abs(float(p_holm) - float(p_value)) > 1e-9
+        ):
+            p_text += f"(Holm {float(p_holm):.4f})"
 
     star = "*" if contrast.get("significant") else ""
 
@@ -7265,6 +7496,14 @@ def _contrast_display(
     noise_text = (
         f" 噪声比={float(noise):.2f}"
         if noise is not None
+        else ""
+    )
+
+    ci_low = contrast.get("ci95_low")
+    ci_high = contrast.get("ci95_high")
+    ci_text = (
+        f" 95%CI=[{float(ci_low):+.4f},{float(ci_high):+.4f}]"
+        if ci_low is not None and ci_high is not None
         else ""
     )
 
@@ -7293,11 +7532,18 @@ def _contrast_display(
     )
 
     # 统计显著性与实际意义分开：显著但差值小于种子波动
-    # （噪声比 < 1）时提示谨慎解读；不显著时禁止声称提升。
+    # （噪声比 < 1）时提示谨慎解读；校正后不显著时禁止
+    # 声称提升，并区分「本来就不显著」与「校正后翻转」。
     caveat = ""
     if contrast.get("significant"):
         if noise is not None and float(noise) < 1.0:
             caveat = "（差值小于典型种子波动，实际意义存疑）"
+    elif (
+        contrast.get("significant_raw")
+        and verdict == "改善"
+        and test in ("paired_t", "welch_t")
+    ):
+        caveat = "（多重比较校正后不显著，不能据此声称提升）"
     elif verdict == "改善" and test in ("paired_t", "welch_t"):
         caveat = "（未达显著水平，不能据此声称提升）"
 
@@ -7327,7 +7573,7 @@ def _contrast_display(
     return (
         f"{factor}: {baseline}→{variant}{context}  "
         f"{delta_text}  {verdict}  {test_text} "
-        f"{p_text}{star}{noise_text}{cost_text}{caveat}"
+        f"{p_text}{star}{noise_text}{ci_text}{cost_text}{caveat}"
     )
 
 
@@ -7339,7 +7585,8 @@ def compare_cells_to_baseline(
     """
     指定基线模式（--compare-baseline），把每个实验单元与
     基线单元直接对比。基线模式有多个单元（如 balance_coef
-    不同）时选运行数最多的一个。
+    不同）时选运行数最多的一个。直接对比构成自己的检验
+    家族，同样做多重比较校正并附效应量 95% CI。
     """
     if not baseline_mode:
         return []
@@ -7396,7 +7643,7 @@ def compare_cells_to_baseline(
             significant,
         )
 
-        contrasts.append({
+        entry = {
             "factor": "mode",
             "baseline": reference["label"],
             "variant": aggregate["label"],
@@ -7417,7 +7664,13 @@ def compare_cells_to_baseline(
             "verdict": verdict,
             "cost": cost,
             "cost_verdict": cost_verdict,
-        })
+        }
+        entry.update(_contrast_interval(result))
+        contrasts.append(entry)
+
+    # 与单因子对比同理：--compare-baseline 的直接对比构成
+    # 自己的检验家族，统一做多重比较校正。
+    _apply_multiple_comparison_correction(contrasts)
 
     return contrasts
 
@@ -7589,7 +7842,8 @@ def print_comparison_analysis(
 ) -> Dict[str, object]:
     """
     打印完整的对比分析：受控变量检查、按种子聚合的
-    Mean ± Std、单因子显著性检验与消融覆盖检查。
+    Mean ± Std、单因子显著性检验（含多重比较校正与效应量
+    95% 置信区间）与消融覆盖检查。
 
     返回结构化结果，供写入汇总报告。
     """
@@ -7752,7 +8006,8 @@ def print_comparison_analysis(
     direction = "越低越好" if not higher_is_better else "越高越好"
     print(
         f"[stats] 指标 {metric}（{direction}）；单因子对比"
-        "（每个对比只改变一个因子）"
+        "（每个对比只改变一个因子；p 为原始值，显著性判定用"
+        "家族内 Holm 校正后的 p）"
     )
 
     if not contrasts:
@@ -7810,8 +8065,10 @@ def print_comparison_analysis(
             )
 
     print(
-        "  注：未做多重比较校正，p 值仅作参考；"
-        "结论以预设的关键对比为准，且种子数应 ≥"
+        "  注：同一检验家族内已做多重比较校正——显著性判定以 "
+        "Holm-Bonferroni（FWER）校正后为准，BH（FDR）校正值"
+        "与 95% 置信区间写在对比报告里；结论以预设的关键对比"
+        "为准，且种子数应 ≥"
         f"{_RECOMMENDED_SEEDS}"
     )
 
@@ -10411,6 +10668,82 @@ def run_self_test():
         - (_two_sided_t_p_value(-2.0, 7.0) or 0.0)
     ) < 1e-12
 
+    # ---- 对比分析：多重比较校正与置信区间 ----
+    # Holm step-down（FWER）：m=3 时最小的两个 p 值分别乘以
+    # 3、2 并做单调化；BH（FDR）从大 p 值一侧做单调化，结果
+    # 永不强于 Holm。
+    holm_values = _holm_bonferroni([0.03, 0.04, 0.5])
+    assert abs(float(holm_values[0]) - 0.09) < 1e-12
+    assert abs(float(holm_values[1]) - 0.09) < 1e-12
+    assert float(holm_values[2]) == 0.5
+    bh_values = _benjamini_hochberg([0.03, 0.04, 0.5])
+    assert abs(float(bh_values[0]) - 0.06) < 1e-12
+    assert abs(float(bh_values[1]) - 0.06) < 1e-12
+    assert float(bh_values[2]) == 0.5
+    assert all(
+        float(b) <= float(h) + 1e-12
+        for h, b in zip(holm_values, bh_values)
+    )
+    # 单检验家族校正不改变 p 值；None（未执行检验）不参与
+    # 家族计数，也不被校正。
+    assert _holm_bonferroni([0.02]) == [0.02]
+    assert _benjamini_hochberg([0.02]) == [0.02]
+    assert _holm_bonferroni([None, 0.01]) == [None, 0.01]
+    assert _benjamini_hochberg([None, 0.01]) == [None, 0.01]
+
+    # t 临界值应回归到 t 表：df=4 双侧 alpha=0.05 为
+    # 2.776445，df=2 为 4.302653。
+    critical_4 = _t_critical(4.0)
+    assert critical_4 is not None
+    assert abs(critical_4 - 2.7764451051977987) < 1e-6
+    critical_2 = _t_critical(2.0)
+    assert critical_2 is not None
+    assert abs(critical_2 - 4.302652729911275) < 1e-6
+
+    # 家族校正会翻转显著性：原始 p=0.03/0.04 都显著，Holm
+    # 校正后都不显著；significant_raw 必须留档，成本结论
+    # （gain_with_cost）同步降级为 gain_not_significant。
+    synthetic_contrasts = [
+        {
+            "p_value": 0.03,
+            "significant": True,
+            "verdict": "improvement",
+            "cost": {"ratios": {"n_params": 2.0}},
+            "cost_verdict": "gain_with_cost",
+        },
+        {
+            "p_value": 0.04,
+            "significant": True,
+            "verdict": "improvement",
+        },
+        {
+            "p_value": 0.5,
+            "significant": False,
+            "verdict": "tie",
+        },
+        {
+            "confounded": True,
+            "differing_factors": ["mode", "k1"],
+            "cells": ["x", "y"],
+        },
+    ]
+    _apply_multiple_comparison_correction(synthetic_contrasts)
+    first, second, third = synthetic_contrasts[:3]
+    assert first["significant_raw"] is True
+    assert not first["significant"]
+    assert abs(float(first["p_value_holm"]) - 0.09) < 1e-12
+    assert first["cost_verdict"] == "gain_not_significant"
+    assert second["significant_raw"] is True
+    assert not second["significant"]
+    assert abs(float(second["p_value_holm"]) - 0.09) < 1e-12
+    assert not third["significant"]
+    # 混杂对比不携带检验，不参与家族校正也不应被写入校正字段。
+    assert "p_value_holm" not in synthetic_contrasts[3]
+    # 校正可幂等重算：significant_raw 保留首次的未校正判定。
+    _apply_multiple_comparison_correction(synthetic_contrasts)
+    assert first["significant_raw"] is True
+    assert not first["significant"]
+
     # ---- 对比分析：受控变量 / 聚合 / 显著性 / 消融覆盖 ----
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
@@ -10604,6 +10937,19 @@ def run_self_test():
             contrast["p_value"] is not None
             and 0.005 < float(contrast["p_value"]) < 0.05
         )
+        # 单检验家族的 Holm/BH 校正等于原始 p 值，显著性判定
+        # 不变（校正只在家族里有多个检验时收紧）。
+        assert contrast["p_value_holm"] == contrast["p_value"]
+        assert contrast["p_value_bh"] == contrast["p_value"]
+        assert contrast["significant_raw"] is True
+        # 95% CI 必须包含点估计且不包含 0（与 p<0.05 等价）。
+        assert (
+            contrast["ci95_low"]
+            < contrast["effect"]
+            < contrast["ci95_high"]
+        )
+        assert contrast["ci95_excludes_zero"]
+        assert "95%CI" in _contrast_display(contrast, "val_loss")
 
         # 尘封协议：test 指标绝不能作为跨运行对比口径，
         # 否则「挑 test 最好」会让测试集退化成隐式验证集。

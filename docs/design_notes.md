@@ -112,6 +112,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `aggregate_runs`、`factor_contrasts`、`_paired_t_test`、
   `_welch_t_test`、`_two_sided_t_p_value`：按实验单元聚合
   Mean ± Std、单因子显著性检验（无 SciPy 依赖的 t 分布 p 值）。
+- `_holm_bonferroni`、`_benjamini_hochberg`、`_t_critical`、
+  `_contrast_interval`、`_apply_multiple_comparison_correction`：
+  检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
+  t 临界值与效应量 95% 置信区间；显著性判定与成本权衡结论
+  以 Holm 校正后为准。
 - `ablation_coverage`：2×2 全因子消融覆盖检查。
 - `print_comparison_analysis`、`write_comparison_report`：
   完整的对比分析输出与 `comparison_analysis.json` 落盘。
@@ -149,7 +154,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   在相同数据上的指标；跨运行对比只使用 val 口径指标，test 结果
   只在单个运行自身的 `metrics.jsonl` 中报告，避免「挑 test 最好」
   的隐式测试集调参。同时输出受控变量检查、按实验单元聚合的
-  Mean ± Std、单因子显著性检验与消融覆盖报告（见下节）。
+  Mean ± Std、单因子显著性检验（含 Holm 多重比较校正与
+  95% 置信区间）与消融覆盖报告（见下节）。
 
 ## 对比实验与消融协议
 
@@ -176,9 +182,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   随机种子，输出写入 `<out>/seed<SEED>`，结束后自动给出每个
   实验单元的 Mean ± Std（样本标准差）与单因子对比检验：种子
   集合相同用配对 t 检验（同种子 = 配对重复），否则用 Welch
-  t 检验，并汇报 p 值与「噪声比」（|Δ|/合并标准差）。种子数
-  少于 3 的实验单元会被标记为统计可靠性不足；p 值仅供参照，
-  关键结论应基于预设对比且种子数 3~5。
+  t 检验，并汇报 p 值、「噪声比」（|Δ|/合并标准差）与 Δ 的
+  95% 置信区间（t 分布临界值；区间极宽说明现有种子数只能
+  排除「差异为 0」，还不足以定位效应大小）。同一检验家族内
+  的全部对比（一次分析的单因子对比集合，或 `--compare-baseline`
+  的直接对比集合）统一做多重比较校正：显著性判定与成本权衡
+  结论以 Holm-Bonferroni（FWER）校正后的 p 值为准，BH（FDR）
+  校正值随报告给出供探索性解读；未校正判定保留在
+  `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两
+  对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
+  会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
+  3~5。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
   损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前
   值），四个组合都覆盖后才能同时给出两个创新点各自的主效应
