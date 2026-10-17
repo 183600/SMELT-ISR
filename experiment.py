@@ -494,6 +494,7 @@ class SparseMoE(nn.Module):
         super().__init__()
 
         self.n_experts = cfg.n_experts
+        self.balance_coef = cfg.balance_coef
         self.router = nn.Linear(
             cfg.d_model,
             cfg.n_experts,
@@ -532,7 +533,19 @@ class SparseMoE(nn.Module):
             flat,
             self.router.weight,
         ).float()
-        router_probs = router_logits.softmax(dim=-1)
+
+        # 辅助负载均衡项只在 balance_coef > 0 且梯度开启时
+        # 参与总损失；其余情况下（balance_coef=0 的消融臂、
+        # 评估与 sanity check）不必为其建图与保存中间量，
+        # 在 no_grad 下计算同一数值即可。
+        if (
+            self.balance_coef > 0.0
+            and torch.is_grad_enabled()
+        ):
+            router_probs = router_logits.softmax(dim=-1)
+        else:
+            with torch.no_grad():
+                router_probs = router_logits.softmax(dim=-1)
 
         top_values, top_indices = router_logits.topk(
             top_k,
@@ -2222,16 +2235,19 @@ def confusion_matrix_metrics(
 
 
 def _binary_roc_auc(
-    scores: torch.Tensor,
+    sorted_scores: torch.Tensor,
+    order: torch.Tensor,
     labels: torch.Tensor,
 ) -> Optional[float]:
     """
     精确处理并列分数的 Mann-Whitney ROC-AUC。
 
+    sorted_scores / order 是 scores 的升序排序结果及其索引，
+    由调用方统一计算并在 ROC-AUC 与 PR-AUC 之间复用；
     labels 为 0/1 的目标向量；正类或负类为空时返回
     None（该类不计入 macro 平均）。
     """
-    n = scores.numel()
+    n = sorted_scores.numel()
     n_pos = int(labels.sum())
 
     if n_pos == 0 or n_pos == n:
@@ -2241,8 +2257,6 @@ def _binary_roc_auc(
 
     # 并列分数取平均秩，保证 AUC 与并列组内的随机排序
     # 期望一致。
-    sorted_scores, order = torch.sort(scores)
-
     change = torch.ones(n, dtype=torch.bool)
     change[1:] = sorted_scores[1:] != sorted_scores[:-1]
     group = torch.cumsum(change, 0) - 1
@@ -2274,24 +2288,28 @@ def _binary_roc_auc(
 
 
 def _binary_average_precision(
-    scores: torch.Tensor,
+    sorted_scores: torch.Tensor,
+    order: torch.Tensor,
     labels: torch.Tensor,
 ) -> Optional[float]:
     """
     单类 one-vs-rest 的 average precision（PR-AUC）。
 
-    按相异分数阈值分步累计（与 sklearn
-    average_precision_score 的阶梯式口径一致）；正类为空
-    时返回 None。
+    sorted_scores / order 是 scores 的升序排序结果及其索引，
+    由调用方统一计算并在 ROC-AUC 与 PR-AUC 之间复用；按
+    相异分数阈值分步累计（与 sklearn average_precision_score
+    的阶梯式口径一致）；正类为空时返回 None。
     """
     n_pos = int(labels.sum())
 
     if n_pos == 0:
         return None
 
-    order = torch.argsort(scores, descending=True)
+    # 升序排序翻转即降序；并列组仍然连续，且阈值组的
+    # 枚举顺序（分数从高到低）与组内顺序无关，结果不变。
+    order = order.flip(0)
+    sorted_scores = sorted_scores.flip(0)
     sorted_labels = labels[order].double()
-    sorted_scores = scores[order]
 
     n = labels.numel()
     positions = torch.arange(
@@ -2364,11 +2382,22 @@ def macro_auc_metrics(
         labels = (targets == class_index).double()
         scores = probabilities[:, class_index]
 
-        pr = _binary_average_precision(scores, labels)
+        # ROC-AUC 与 PR-AUC 复用同一次排序结果。
+        sorted_scores, order = torch.sort(scores)
+
+        pr = _binary_average_precision(
+            sorted_scores,
+            order,
+            labels,
+        )
         if pr is not None:
             pr_aucs.append(pr)
 
-        roc = _binary_roc_auc(scores, labels)
+        roc = _binary_roc_auc(
+            sorted_scores,
+            order,
+            labels,
+        )
         if roc is not None:
             roc_aucs.append(roc)
 
@@ -4868,7 +4897,9 @@ def measure_efficiency(
     try:
         model.eval()
 
-        with torch.no_grad(), autocast:
+        # 纯推理测量不回流训练图，与 evaluate 一致使用
+        # inference_mode（去掉 autograd 元数据开销）。
+        with torch.inference_mode(), autocast:
             for _ in range(max(0, warmup)):
                 model(x, y)
 
@@ -4876,7 +4907,7 @@ def measure_efficiency(
             torch.cuda.synchronize(device)
 
         timings: List[float] = []
-        with torch.no_grad(), autocast:
+        with torch.inference_mode(), autocast:
             for _ in range(max(1, iters)):
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -4905,7 +4936,7 @@ def measure_efficiency(
             model.zero_grad(set_to_none=True)
 
             torch.cuda.reset_peak_memory_stats(device)
-            with torch.no_grad(), autocast:
+            with torch.inference_mode(), autocast:
                 model(x, y)
             inference_peak_mb = round(
                 torch.cuda.max_memory_allocated(device)
