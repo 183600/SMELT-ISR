@@ -1753,6 +1753,11 @@ def _snap_group_split(
     return best[1], best[2]
 
 
+# 固定评估批设备侧缓存的总字节上限：窗口集合跨评估逐位
+# 相同，缓存后周期验证不再重复收集与搬运；超限退回逐次收集。
+_EVAL_BATCH_CACHE_BUDGET = 64 * 1024 * 1024
+
+
 class ByteDataset:
     """
     字节级语言模型数据集。
@@ -1944,6 +1949,14 @@ class ByteDataset:
         # 固定评估起点缓存按 split 分开保存。
         self._fixed_starts: Dict[str, Dict[str, object]] = {}
 
+        # 固定评估批的结果缓存（设备侧）：键为
+        # (split, batches, batch_size, batch_index, device)，
+        # 值为 (x, y)；累计字节受 _EVAL_BATCH_CACHE_BUDGET 封顶。
+        self._fixed_batch_cache: Dict[
+            tuple, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._fixed_batch_cache_bytes = 0
+
     @property
     def has_test(self) -> bool:
         """
@@ -2094,6 +2107,12 @@ class ByteDataset:
         不用随机数，因此评估估计不随运行进程、CUDA 状态或
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合
         完全相同。请求窗口多于合法起点时仅取一遍无重复起点。
+
+        固定窗口在多次评估间逐位相同，结果张量在设备侧缓存
+        复用：周期验证、坏案例分析等重复调用不再反复收集与
+        搬运同一批窗口。缓存总量受 _EVAL_BATCH_CACHE_BUDGET
+        封顶，超限时退回逐次收集路径。所有调用方只读返回的
+        x/y，不修改缓存内容。
         """
         windows, data = self._eval_windows(split)
 
@@ -2120,6 +2139,17 @@ class ByteDataset:
             ).round().long()
             cache["total"] = total_batches
 
+        cache_key = (
+            split,
+            batches,
+            batch_size,
+            batch_index,
+            str(device),
+        )
+        cached = self._fixed_batch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         begin = batch_index * batch_size
         # starts 为 CPU 张量，窗口收集与搬运与训练批一致。
         starts = cache["starts"][begin:begin + batch_size]
@@ -2132,6 +2162,17 @@ class ByteDataset:
 
         x = chunks[:, :-1].to(torch.int32)
         y = chunks[:, 1:]
+
+        batch_bytes = (
+            x.numel() * x.element_size()
+            + y.numel() * y.element_size()
+        )
+        if (
+            self._fixed_batch_cache_bytes + batch_bytes
+            <= _EVAL_BATCH_CACHE_BUDGET
+        ):
+            self._fixed_batch_cache[cache_key] = (x, y)
+            self._fixed_batch_cache_bytes += batch_bytes
 
         return x, y
 
@@ -3466,40 +3507,25 @@ class NgramBaseline:
             torch.zeros_like(values[locations]),
         )
 
-    def target_log_probs_per_level(
+    def _per_level_tables(
         self,
         windows: torch.Tensor,
-        alpha: float,
-    ) -> torch.Tensor:
+    ) -> List[Optional[Dict[str, torch.Tensor]]]:
         """
-        对一批窗口 [batch, seq_len + 1] 计算每个阶数
-        （1..max_order）下目标字节的 log 概率。
+        逐阶的 alpha 无关查表结果（ctx 计数与 (ctx, c) 对计数）。
 
-        返回 [max_order, batch*seq_len]：第 o-1 行是
-        「最高可用阶不超过 o」的回退模型在每个位置目标
-        字节的 log 概率——上下文不足或从未见过的位置
-        自动回退到低阶，供网格调优一次性拿到所有候选
-        阶数的损失。
+        网格调优中这些查表只依赖窗口与训练计数，与平滑系数
+        alpha 无关，跨 alpha 档位预计算一次即可复用；positions
+        为空（窗口比阶还短）的阶记为 None，由插值阶段整阶
+        保持低阶回退值。
         """
-        batch, total_len = windows.shape
-        seq_len = total_len - 1
-        n_positions = batch * seq_len
-
         targets = windows[
             :, 1:
         ].reshape(-1).to(torch.int64)
 
-        log_probs = torch.zeros(
-            (self.max_order, n_positions),
-            dtype=torch.float64,
-        )
-
-        # level 0 的目标概率：uniform。
-        probability = torch.full(
-            (n_positions,),
-            1.0 / self.vocab_size,
-            dtype=torch.float64,
-        )
+        tables: List[
+            Optional[Dict[str, torch.Tensor]]
+        ] = []
 
         for order in range(1, self.max_order + 1):
             level = self.levels[order]
@@ -3509,11 +3535,7 @@ class NgramBaseline:
             )
 
             if positions.numel() == 0:
-                # 窗口比阶还短：整阶保持低阶回退值。
-                if order > 1:
-                    log_probs[order - 1] = log_probs[
-                        order - 2
-                    ]
+                tables.append(None)
                 continue
 
             n_ctx = self._lookup(
@@ -3531,27 +3553,92 @@ class NgramBaseline:
                 pair_keys,
             ).double()
 
-            interpolated = (
-                count_pair
-                + alpha * probability[positions]
-            ) / (n_ctx + alpha)
+            tables.append({
+                "positions": positions,
+                "n_ctx": n_ctx,
+                "count_pair": count_pair,
+            })
+
+        return tables
+
+    def _interpolate_log_probs(
+        self,
+        windows: torch.Tensor,
+        tables: List[
+            Optional[Dict[str, torch.Tensor]]
+        ],
+        alpha: float,
+    ) -> torch.Tensor:
+        """
+        用 _per_level_tables 的查表结果按指定 alpha 计算逐阶
+        目标 log 概率，语义与逐次查表版本完全一致。
+        """
+        batch, total_len = windows.shape
+        seq_len = total_len - 1
+        n_positions = batch * seq_len
+
+        log_probs = torch.zeros(
+            (self.max_order, n_positions),
+            dtype=torch.float64,
+        )
+
+        # level 0 的目标概率：uniform。
+        probability = torch.full(
+            (n_positions,),
+            1.0 / self.vocab_size,
+            dtype=torch.float64,
+        )
+
+        for order in range(1, self.max_order + 1):
+            table = tables[order - 1]
 
             row = log_probs[order - 1]
-            row[positions] = interpolated.log()
+
+            if table is None:
+                # 窗口比阶还短：整阶保持低阶回退值。
+                if order > 1:
+                    row.copy_(log_probs[order - 2])
+                continue
+
+            positions = table["positions"]
 
             if order > 1:
-                # 上下文不足的位置保持低阶值。
-                mask = torch.ones(
-                    n_positions,
-                    dtype=torch.bool,
-                )
-                mask[positions] = False
-                row[mask] = log_probs[order - 2][mask]
+                # 上下文不足的位置保持低阶值：
+                # 先整行复制，再覆写本阶的有效位置，
+                # 与「按掩码只复制无效位置」结果一致。
+                row.copy_(log_probs[order - 2])
 
-            probability = probability.clone()
+            interpolated = (
+                table["count_pair"]
+                + alpha * probability[positions]
+            ) / (table["n_ctx"] + alpha)
+
+            row[positions] = interpolated.log()
+
             probability[positions] = interpolated
 
         return log_probs
+
+    def target_log_probs_per_level(
+        self,
+        windows: torch.Tensor,
+        alpha: float,
+    ) -> torch.Tensor:
+        """
+        对一批窗口 [batch, seq_len + 1] 计算每个阶数
+        （1..max_order）下目标字节的 log 概率。
+
+        返回 [max_order, batch*seq_len]：第 o-1 行是
+        「最高可用阶不超过 o」的回退模型在每个位置目标
+        字节的 log 概率——上下文不足或从未见过的位置
+        自动回退到低阶，供网格调优一次性拿到所有候选
+        阶数的损失。
+        """
+        return self._interpolate_log_probs(
+            windows,
+            self._per_level_tables(windows),
+            alpha,
+        )
 
     def position_distributions(
         self,
@@ -3863,16 +3950,27 @@ def run_statistical_baseline(
     })
 
     # ---- 网格调优：α 每档一遍窗口，同时拿到所有阶数损失 ----
+    # 逐阶查表只依赖窗口与训练计数，与 α 无关：
+    # 每个窗口预计算一次，全部 α 档位复用。
+    val_tables = [
+        model._per_level_tables(window)
+        for window in val_windows
+    ]
+
     candidates: List[Dict[str, object]] = []
 
     for alpha in alpha_grid:
         totals = torch.zeros(model.max_order)
         tokens = 0
 
-        for window in val_windows:
+        for window, tables in zip(
+            val_windows,
+            val_tables,
+        ):
             log_probs = (
-                model.target_log_probs_per_level(
+                model._interpolate_log_probs(
                     window,
+                    tables,
                     alpha,
                 )
             )
@@ -12371,14 +12469,15 @@ def main():
         if not pending_scalars:
             return []
 
-        # 暂存项按 [lm, aux, grad_norm] 逐组平铺，堆叠后
-        # reshape 成 [N, 3] 行。
+        # 暂存项按 [lm, aux] 逐组平铺，堆叠后 reshape 成
+        # [N, 2] 行；grad_norm 已在循环内随合并传输取回，
+        # 由 pending_records 的元数据携带。
         values = torch.stack(
             pending_scalars
-        ).view(-1, 3).tolist()
+        ).view(-1, 2).tolist()
 
         records = []
-        for meta, (lm, aux, grad_norm) in zip(
+        for meta, (lm, aux) in zip(
             pending_records,
             values,
         ):
@@ -12389,9 +12488,7 @@ def main():
                 "train_loss": lm if math.isfinite(lm) else None,
                 "aux_loss": aux if math.isfinite(aux) else None,
                 "lr": meta["lr"],
-                "grad_norm": (
-                    grad_norm if math.isfinite(grad_norm) else None
-                ),
+                "grad_norm": meta["grad_norm"],
             }
             extra = meta.get("extra")
             if extra is not None:
@@ -12473,137 +12570,95 @@ def main():
 
         if scaler is not None:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
         else:
             loss.backward()
 
-        if scaler is not None:
-            scaler.unscale_(optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            train_params,
+            args.grad_clip,
+        )
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                train_params,
-                args.grad_clip,
-            )
+        # 损失与梯度范数都必须有限才推进优化器：任一非有限
+        # 都意味着这一步的参数更新不可信。
+        # 两个标量合并成一次设备→主机传输（单次同步），
+        # 避免逐标量 isfinite/float 各自触发一次同步。
+        grad_norm_value, loss_value = torch.stack(
+            (grad_norm.detach(), loss.detach()),
+        ).tolist()
+        finite_grad = math.isfinite(grad_norm_value)
+        finite_step = (
+            finite_grad and math.isfinite(loss_value)
+        )
 
-            # 损失与梯度范数都必须有限才推进优化器：任一非有限
-            # 都意味着这一步的参数更新不可信。
-            finite_step = bool(
-                torch.isfinite(grad_norm)
-                & torch.isfinite(loss)
-            )
-
-            if finite_step:
+        if finite_step:
+            if scaler is not None:
                 scaler.step(optimizer)
-                scheduler.step()
-                consecutive_nonfinite = 0
             else:
-                nonfinite_events += 1
-                consecutive_nonfinite += 1
-                print(
-                    f"step {step + 1}: non-finite loss/gradient; "
-                    "optimizer and LR schedule skipped"
-                )
-                if nan_diagnosis is None:
-                    nan_diagnosis = diagnose_non_finite(
-                        model,
-                        optimizer,
-                        x,
-                        y,
-                        result,
-                        grad_norm,
-                        step=step + 1,
-                        lr=current_lr,
-                        amp_dtype=amp_dtype,
-                        scaler=scaler,
-                        vocab_size=cfg.vocab_size,
-                        recent_grad_norms=recent_grad_norms,
-                    )
-                    print_non_finite_report(nan_diagnosis)
-                    nan_record_pending = True
-                    nan_checks = nan_diagnosis.get("checks", {})
-                    if (
-                        nan_checks.get("parameters_nonfinite")
-                        or nan_checks.get(
-                            "optimizer_state_nonfinite_keys"
-                        )
-                    ):
-                        # 参数/优化器状态已被污染，继续训练毫无
-                        # 意义（每次更新都被跳过）。
-                        numerical_polluted = True
-                        numerical_stop = True
-                if consecutive_nonfinite >= 3:
-                    numerical_stop = True
-            scaler.update()
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                train_params,
-                args.grad_clip,
-            )
-
-            # 发散步不推进优化器或 LR schedule。
-            finite_step = bool(
-                torch.isfinite(grad_norm)
-                & torch.isfinite(loss)
-            )
-
-            if finite_step:
                 optimizer.step()
-                scheduler.step()
-                consecutive_nonfinite = 0
-            else:
-                nonfinite_events += 1
-                consecutive_nonfinite += 1
-                print(
-                    f"step {step + 1}: non-finite loss/gradient; "
-                    "optimizer and LR schedule skipped"
+            scheduler.step()
+            consecutive_nonfinite = 0
+        else:
+            nonfinite_events += 1
+            consecutive_nonfinite += 1
+            print(
+                f"step {step + 1}: non-finite loss/gradient; "
+                "optimizer and LR schedule skipped"
+            )
+            if nan_diagnosis is None:
+                nan_diagnosis = diagnose_non_finite(
+                    model,
+                    optimizer,
+                    x,
+                    y,
+                    result,
+                    grad_norm,
+                    step=step + 1,
+                    lr=current_lr,
+                    amp_dtype=amp_dtype,
+                    scaler=scaler,
+                    vocab_size=cfg.vocab_size,
+                    recent_grad_norms=recent_grad_norms,
                 )
-                if nan_diagnosis is None:
-                    nan_diagnosis = diagnose_non_finite(
-                        model,
-                        optimizer,
-                        x,
-                        y,
-                        result,
-                        grad_norm,
-                        step=step + 1,
-                        lr=current_lr,
-                        amp_dtype=amp_dtype,
-                        scaler=scaler,
-                        vocab_size=cfg.vocab_size,
-                        recent_grad_norms=recent_grad_norms,
+                print_non_finite_report(nan_diagnosis)
+                nan_record_pending = True
+                nan_checks = nan_diagnosis.get("checks", {})
+                if (
+                    nan_checks.get("parameters_nonfinite")
+                    or nan_checks.get(
+                        "optimizer_state_nonfinite_keys"
                     )
-                    print_non_finite_report(nan_diagnosis)
-                    nan_record_pending = True
-                    nan_checks = nan_diagnosis.get("checks", {})
-                    if (
-                        nan_checks.get("parameters_nonfinite")
-                        or nan_checks.get(
-                            "optimizer_state_nonfinite_keys"
-                        )
-                    ):
-                        numerical_polluted = True
-                        numerical_stop = True
-                if consecutive_nonfinite >= 3:
+                ):
+                    # 参数/优化器状态已被污染，继续训练毫无
+                    # 意义（每次更新都被跳过）。
+                    numerical_polluted = True
                     numerical_stop = True
+            if consecutive_nonfinite >= 3:
+                numerical_stop = True
+
+        if scaler is not None:
+            # 发散步同样需要推进缩放状态（与原实现一致）。
+            scaler.update()
 
         # 记录近期有限梯度范数（滚动窗口），供非有限事件的
         # 「梯度爆炸/学习率过大 vs 前向/损失侧」证据判断。
-        if bool(torch.isfinite(grad_norm)):
-            recent_grad_norms.append((step + 1, float(grad_norm)))
+        if finite_grad:
+            recent_grad_norms.append(
+                (step + 1, grad_norm_value)
+            )
             if len(recent_grad_norms) > _NAN_GRAD_TREND_WINDOW:
                 del recent_grad_norms[:-_NAN_GRAD_TREND_WINDOW]
 
         # 本步已完成（无论是否推进了优化器）。
         last_completed_step = step + 1
 
-        # detach 后只保留标量值；三者均为 fp32，无需额外转换。
+        # detach 后只保留标量值；lm/aux 均为 fp32，
+        # grad_norm 已随上面的合并传输取回，直接入记录。
         pending_scalars.append(
             result["lm_loss"].detach()
         )
         pending_scalars.append(
             result["aux_loss"].detach()
-        )
-        pending_scalars.append(
-            grad_norm.detach()
         )
 
         del result, loss, x, y
@@ -12611,6 +12666,9 @@ def main():
         pending_records.append({
             "step": step + 1,
             "lr": current_lr,
+            "grad_norm": (
+                grad_norm_value if finite_grad else None
+            ),
         })
 
         # 首次非有限事件的排查报告附着到触发它的那一步，
