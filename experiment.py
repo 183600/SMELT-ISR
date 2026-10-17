@@ -369,12 +369,18 @@ class Expert(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # gate 与 up 的融合输出直接进入 SwiGLU。
-        return F.linear(
-            _SwiGLU.apply(
-                F.linear(x, self.gate_up.weight)
-            ),
-            self.down.weight,
-        )
+        gate_up = F.linear(x, self.gate_up.weight)
+
+        # 无反向需求（no_grad/inference_mode 下的评估路径）时
+        # 直接原地计算，跳过 autograd.Function 的调度开销；
+        # 数值上与 _SwiGLU 的无反向分支完全一致。
+        if gate_up.requires_grad:
+            hidden = _SwiGLU.apply(gate_up)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden = F.silu(gate, inplace=True).mul_(up)
+
+        return F.linear(hidden, self.down.weight)
 
     def _load_from_state_dict(
         self,
@@ -2972,11 +2978,12 @@ def evaluate(
     )
     evaluated_tokens = 0
 
-    # 混淆矩阵 [目标类, 预测类]，在评估设备上累积。
+    # 混淆矩阵 [目标类, 预测类]，在评估设备上以 int64 累积
+    #（逐批只做整数加法），收尾时一次性转 fp64。
     confusion = torch.zeros(
         (vocab_size, vocab_size),
         device=device,
-        dtype=torch.float64,
+        dtype=torch.int64,
     )
 
     # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
@@ -3006,13 +3013,13 @@ def evaluate(
 
                 result = model(x, y)
 
-                # 混淆矩阵与 AUC 在 fp32 下统计，避免半精度
-                # argmax/softmax 的数值噪声影响逐类指标。
-                logits = result.pop(
-                    "logits",
-                ).float()
+                # argmax 直接取模型输出 dtype（bf16/fp16 -> fp32
+                # 是精确升位，不改变数值与并列顺序），避免整批
+                # logits 的 fp32 临时副本；AUC 的 softmax 仍在
+                # fp32 下统计，避免半精度数值噪声影响逐类指标。
+                raw_logits = result.pop("logits")
 
-                predicted = logits.argmax(dim=-1)
+                predicted = raw_logits.argmax(dim=-1)
                 flat_target = y.reshape(-1).to(
                     torch.int64
                 )
@@ -3025,7 +3032,7 @@ def evaluate(
                 ).view(
                     vocab_size,
                     vocab_size,
-                ).double()
+                )
 
                 if compute_auc and (
                     auc_tokens < _AUC_MAX_TOKENS
@@ -3036,7 +3043,7 @@ def evaluate(
                         _AUC_MAX_TOKENS - auc_tokens
                     )
                     probs = F.softmax(
-                        logits,
+                        raw_logits.float(),
                         dim=-1,
                     ).reshape(
                         -1,
@@ -3055,7 +3062,7 @@ def evaluate(
                     alpha=float(y.numel()),
                 )
                 evaluated_tokens += y.numel()
-                del result, logits, x, y
+                del result, raw_logits, x, y
     finally:
         # 无论评估是否中途出错，都恢复原来的训练模式。
         model.train(was_training)
@@ -3069,7 +3076,7 @@ def evaluate(
         f"{split}_bits_per_byte": loss / math.log(2.0),
     }
 
-    class_metrics = confusion_matrix_metrics(confusion)
+    class_metrics = confusion_matrix_metrics(confusion.double())
 
     for key, value in class_metrics.items():
         metrics[f"{split}_{key}"] = value
