@@ -55,12 +55,18 @@ split 边界。当前字节级管线不涉及标准化/归一化/缺失值填充
 连续值特征，所有统计量（均值、方差、最值等）必须只在 train 上
 `fit`，再 `transform` val/test。
 
-`val` 用于周期性验证、挑超参数与早停；`test` 训练期间全程尘封，
-只有显式传入 `--evaluate-test` 才会在训练完全结束后评估一次，且同一次
-运行拒绝重复评估。切分比例可用 `--val-fraction` / `--test-fraction`
-调整。每次运行在训练前都会自动做数据审计（token 值域、重复窗口、
-train↔val 分布偏移），结果与警告写入 `config.json` 的 `data_audit`
-字段；解封测试集时会追加包含 test 的审计结果。
+`val` 用于周期性验证、挑超参数、早停与模型选型；`test` 训练期间全程
+尘封，只有显式传入 `--evaluate-test` 才会在训练完全结束后评估一次，且
+同一次运行拒绝重复评估。切分比例可用 `--val-fraction` / `--test-fraction`
+调整。每次运行在训练前都会自动做数据审计（token 值域、无法 UTF-8 解码
+的字节与 NUL 字节等文本完整性/标签噪声检查、重复窗口、train↔val 分布
+偏移），结果与警告写入 `config.json` 的 `data_audit` 字段；解封测试集
+时会追加包含 test 的审计结果。
+
+训练期间每次刷新最优验证损失都会把权重写入 `best.pt`。训练结束后的
+`final` 与唯一一次测试集评估都在这份「验证集选定」的模型上进行
+（`config.json` 的 `model_selection` 记录选型口径）；若 `best.pt` 缺失
+（如从旧检查点恢复），会明确提示并回退到最后一步参数。
 
 ```bash
 # 训练结束后做唯一一次测试集评估
@@ -150,10 +156,10 @@ python experiment.py \
 - **计算量口径**：方案 B 在第一轮分支创建后按 $k_1$ 倍分支数执行后续 Attention 与 MoE，等参数实验并不等价于等 FLOPs 实验。回答 RQ1/RQ2 时应同时报告按训练步数与按 token/FLOPs 对齐的对比，避免把额外计算误解释为路由机制本身的收益。
 - **残差缩放口径**：`residual_scale` 全局作用于所有区域、所有子层的残差更新（循环区域内/外一致）。SMELT 论文对循环区域内的子层残差更新按循环次数 $1/r$ 缩放（循环两次即 1/2）；本基座未实现按区域区分的 $1/r$ 缩放。跨模式对比应保持 `residual_scale` 一致，把全局系数设为 0.5 并不等价于论文口径。
 - **负载均衡尺度**：辅助损失中 $f_i$ 按 token 数归一化，而不是按 assignment 数归一化；均匀路由时 $E \sum_i f_i P_i \approx k$，均衡强度随路由宽度线性增大。跨 $k_1/k_2/\text{top-}k$ 比较实验时应按比例折算系数（保持 `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
-- **验证/测试协议**：每次评估使用跨评估 split 等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；训练期间的 `final` 记录是验证集口径，测试集默认全程尘封，仅在显式传入 `--evaluate-test` 时解封评估一次（`{"step": "test", ...}`），重复传参会被拒绝，避免测试集变成隐式验证集。所有结果追加到 `metrics.jsonl`。
+- **验证/测试协议**：每次评估使用跨评估 split 等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；训练期间每次刷新最优验证损失都保存 `best.pt`，训练结束后的 `final` 记录与唯一一次测试集评估都在这份验证集选定的模型上进行（`model_selection` 字段记录选型口径；`best.pt` 不可用时明确提示并回退到最后一步）。测试集默认全程尘封，仅在显式传入 `--evaluate-test` 时解封评估一次（`{"step": "test", ...}`），重复传参会被拒绝，避免测试集变成隐式验证集。所有结果追加到 `metrics.jsonl`。
 - **确定性**：训练入口固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子，数据采样由显式 `torch.Generator` 承担（种子与状态随检查点存档），并设置 `CUBLAS_WORKSPACE_CONFIG`、要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。跨硬件架构仍可能因浮点归约顺序产生微小差异。
 - **实验追踪**：每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
-- **受控变量检查**：`config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、数据指纹、模型结构与评估协议。`--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数会被明确列出，避免把调参收益误当成方法本身的收益。
+- **受控变量检查**：`config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、数据指纹、模型结构、评估协议与选型口径（新运行为验证集选型，无记录的旧运行标记为最后一步）。`--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数、或 final 指标口径不同，都会被明确列出，避免把调参收益误当成方法本身的收益。
 - **统计可靠性**：`--seeds 42 43 44` 对同一配置跑多个随机种子，自动汇报每个实验单元的 Mean ± Std（样本标准差）；种子集合相同用配对 t 检验、否则用 Welch t 检验，给出 p 值与噪声比（|Δ|/合并标准差）。种子数少于 3 会被标记为统计功效不足；只有 0.2% 的提升而种子间方差有 0.5% 时不会被当成有效提升。
 - **消融完整性**：`--suite-ablation` 运行「延迟合并 × 均衡损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前值），覆盖全部四个组合后才能支撑两个设计各自有用的结论；覆盖检查会列出缺失的组合。`--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
 
@@ -180,9 +186,10 @@ python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
 每次实验运行会生成以下目录结构：
 ```text
 runs/<exp_name>/
-├── config.json      # 完整配置、参数量、随机种子、数据指纹、代码版本/环境、sanity check 结果
+├── config.json      # 完整配置、参数量、随机种子、数据指纹、数据审计、选型口径、代码版本/环境、sanity check 结果
 ├── metrics.jsonl    # 逐行记录训练/验证指标及最终评估 (loss, ppl, lr, grad_norm等)，--evaluate-test 时含 {"step": "test", ...} 唯一一次测试集结果
-└── last.pt          # 模型权重、优化器、学习率调度器及随机种子状态（原子写入）
+├── best.pt          # 验证集选定的模型权重（final / test 评估使用；原子写入）
+└── last.pt          # 模型权重、优化器、学习率调度器及随机种子状态（断点恢复用；原子写入）
 ```
 
 ## 📝 注意事项与免责声明

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import datetime
 import hashlib
 import json
@@ -1858,6 +1859,15 @@ _AUDIT_SHIFT_WARN = 0.1
 # 单个字节占比超过该阈值时疑似填充/退化数据（异常值检查）。
 _AUDIT_TOP_BYTE_WARN = 0.5
 
+# UTF-8 解码失败（替换字符）占比超过该阈值时报语料损坏警告：
+# 字节级语言模型直接以字节为标签，无法解码的字节就是
+# 「标签噪声」的语料来源，必须先发现再决定是否清洗。
+_AUDIT_UTF8_REPLACE_WARN = 1e-3
+
+# NUL 字节占比超过该阈值时报二进制/填充污染警告
+# （文本语料中 NUL 基本只来自错误编码或文件拼接损坏）。
+_AUDIT_NUL_WARN = 1e-4
+
 
 def _js_distance(
     p: torch.Tensor,
@@ -1936,17 +1946,61 @@ def _window_signature_scan(
     }
 
 
+def _scan_text_integrity(
+    raw: memoryview,
+    offset: int,
+    length: int,
+    chunk: int = 1 << 20,
+) -> Dict[str, int]:
+    """
+    扫描一个 split 的文本完整性（数据清洗的标签噪声检查）。
+
+    字节级语言模型的标签就是原始字节，损坏字节等价于标签
+    噪声，必须在训练前可见：
+
+    - utf8_replacements：以 ``errors="replace"`` 增量解码时产生
+      的 U+FFFD 数量，即无法按 UTF-8 解码的字节序列数；
+    - nul_bytes：NUL（0x00）字节数量，文本语料中出现即疑似
+      二进制污染或文件拼接错误。
+
+    分块解码保证内存占用有界；只做诊断，不修改任何数据。
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(
+        errors="replace"
+    )
+
+    replacements = 0
+    nul_bytes = 0
+    position = offset
+    end = offset + length
+
+    while position < end:
+        stop = min(position + chunk, end)
+        block = bytes(raw[position:stop])
+        text = decoder.decode(block, final=stop >= end)
+        replacements += text.count("\ufffd")
+        nul_bytes += block.count(0)
+        position = stop
+
+    return {
+        "utf8_replacements": replacements,
+        "nul_bytes": nul_bytes,
+    }
+
+
 def audit_data_splits(
     dataset: ByteDataset,
     include_test: bool = False,
     max_windows: int = _AUDIT_MAX_WINDOWS,
 ) -> Dict[str, object]:
     """
-    数据审计：值域校验、分布偏移与重复窗口检测。
+    数据审计：值域校验、文本完整性、分布偏移与重复窗口检测。
 
     - 校验每个 split 的 token 值域（字节管线为 0..255；整数
       token 中不存在 NaN/Inf，值域校验用于捕获上游 dtype 或
       编码错误）；
+    - 扫描文本完整性（无法 UTF-8 解码的字节序列、NUL 字节），
+      作为字节级标签噪声与语料损坏的清洗检查；
     - 统计每个 split 的字节直方图，并计算 train↔val（可选包含
       train↔test、val↔test）之间的 JS 距离，用于发现分布偏移；
     - 对滑动窗口做有界签名扫描，检测跨 split 重复内容与 split
@@ -2014,11 +2068,18 @@ def audit_data_splits(
             dataset.seq_len + 1,
             max_windows,
         )
+        integrity = _scan_text_integrity(
+            dataset._raw,
+            begin,
+            end - begin,
+        )
 
         splits_report[split] = {
             "bytes": end - begin,
             "windows": scans[split]["total"],
             "invalid_tokens": invalid,
+            "utf8_replacements": integrity["utf8_replacements"],
+            "nul_bytes": integrity["nul_bytes"],
             "top_bytes": [
                 [int(byte), round(float(share), 6)]
                 for share, byte in zip(
@@ -2031,6 +2092,33 @@ def audit_data_splits(
         if invalid > 0:
             warnings.append(
                 f"{split}: 检测到 {invalid} 个越界 token"
+            )
+
+        split_bytes = max(1, end - begin)
+        replacement_share = (
+            integrity["utf8_replacements"] / split_bytes
+        )
+        if (
+            integrity["utf8_replacements"] > 0
+            and replacement_share > _AUDIT_UTF8_REPLACE_WARN
+        ):
+            warnings.append(
+                f"{split}: 检测到 "
+                f"{integrity['utf8_replacements']} 处无法按"
+                "UTF-8 解码的字节序列"
+                f"（占比 {replacement_share:.4f}），"
+                "疑似语料损坏（字节级标签噪声）"
+            )
+
+        nul_share = integrity["nul_bytes"] / split_bytes
+        if (
+            integrity["nul_bytes"] > 0
+            and nul_share > _AUDIT_NUL_WARN
+        ):
+            warnings.append(
+                f"{split}: 检测到 {integrity['nul_bytes']} 个"
+                f"NUL 字节（占比 {nul_share:.4f}），"
+                "疑似二进制/填充污染"
             )
 
         top_byte_share = float(top_share[0])
@@ -5050,8 +5138,11 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
     汇总多个运行目录的 config 与最终指标。
 
     读取每个目录的 config.json（结构、参数量、efficiency）与
-    metrics.jsonl（final/test/curve_analysis），输出统一口径的
-    行。
+    metrics.jsonl（final/curve_analysis），输出统一口径的行。
+
+    只汇总 val 口径指标：test 只在单个运行内解封评估一次，
+    不进入跨运行对比（否则会诱发「挑 test 最好」的隐式
+    测试集调参）。
     """
     rows: List[Dict[str, object]] = []
 
@@ -5119,15 +5210,12 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             run_dir / "metrics.jsonl"
         )
         final_record = None
-        test_record = None
         curve_record = None
 
         for record in records:
             step = record.get("step")
             if step == "final":
                 final_record = record
-            elif step == "test":
-                test_record = record
             elif step == "curve_analysis":
                 curve_record = record
 
@@ -5161,11 +5249,6 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
-        row["test_loss"] = (
-            test_record.get("test_loss")
-            if test_record is not None
-            else None
-        )
         row["curve_status"] = (
             curve_record.get("status")
             if curve_record is not None
@@ -5186,15 +5269,17 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
     """
     以对齐表格打印多个运行的汇总指标。
 
-    除 val/test loss 外同时给出 token accuracy（micro 口径）
-    与 macro F1：字节分布高度不平衡时 accuracy 会被高频
-    字节抬高，必须两类指标一起看；完整口径（micro / macro /
-    weighted、PR-AUC 等）见各运行 metrics.jsonl。
+    只展示 val 口径指标（尘封协议：test 结果只随单个运行的
+    metrics.jsonl 报告，绝不并排对比）；除 val loss 外同时
+    给出 token accuracy（micro 口径）与 macro F1：字节分布
+    高度不平衡时 accuracy 会被高频字节抬高，必须两类指标
+    一起看；完整口径（micro / macro / weighted、PR-AUC 等）
+    见各运行 metrics.jsonl。
     """
     header = (
         f"{'run':<20} {'mode':<9} {'params':>9} "
         f"{'val_loss':>9} {'val_bpb':>8} {'acc':>6} "
-        f"{'macroF1':>8} {'test_loss':>9} "
+        f"{'macroF1':>8} "
         f"{'lat(ms)':>9} {'GFLOPs':>8} {'mem(MB)':>9} "
         f"{'curve':<18}"
     )
@@ -5221,7 +5306,6 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{_value(row.get('val_bits_per_byte'), '.4f'):>8} "
             f"{_value(row.get('val_token_accuracy'), '.4f'):>6} "
             f"{_value(row.get('val_macro_f1'), '.4f'):>8} "
-            f"{_value(row.get('test_loss')):>9} "
             f"{_value(row.get('latency_ms_per_forward'), '.4f'):>9} "
             f"{gflops:>8} "
             f"{_value(row.get('peak_memory_mb'), '.1f'):>9} "
@@ -5265,6 +5349,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "eval_interval",
     "eval_batches",
     "data_sha256",
+    # final/test 评估所用模型的选型口径：旧运行（无记录）是
+    # 最后一步参数，新运行是验证集选中的最优验证点；两者混在
+    # 一起对比不是同一口径，必须被检查发现。
+    "model_selection",
 )
 
 # 允许声明为实验因子（跨运行允许不同）的键：行级字段 +
@@ -5281,6 +5369,13 @@ DEFAULT_COMPARISON_FACTORS = (
 )
 
 # 聚合与显著性检验使用的指标。
+#
+# 尘封协议：这里只允许 val 口径的指标。测试集在每个运行中
+# 只解封评估一次，其结果只能随该运行自身的 metrics.jsonl
+# 报告；如果把 test 指标纳入跨运行对比/排序/显著性检验，
+# 「在多个候选里挑 test 最好」会让测试集退化成隐式验证集
+# （多重比较 + 选择偏差）。因此 --compare 系列工具一律
+# 不读取、不聚合、不展示 test 指标。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
     "val_ppl",
@@ -5288,14 +5383,12 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_token_accuracy",
     "val_macro_f1",
     "val_pr_auc_macro",
-    "test_loss",
 )
 
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
     "val_ppl",
     "val_bits_per_byte",
-    "test_loss",
 }
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
@@ -5358,6 +5451,9 @@ def build_comparison_protocol(
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
+        # 选型协议：final/test 都在验证集选中的模型上评估
+        # （best.pt 不可用时回退到最后一步并明确提示）。
+        "model_selection": "best_val_with_last_fallback",
     }
 
 
@@ -5439,6 +5535,14 @@ def experiment_protocol_from_payload(
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
         "data_sha256": data.get("sha256"),
+        # 旧运行没有选型记录，其 final/test 一律基于最后一步
+        # 参数；显式回退为 "last_step"，与新版选型协议混用时
+        # 会被受控变量检查标记出来。
+        "model_selection": (
+            "last_step"
+            if run_args.get("lr") is not None
+            else None
+        ),
     }
 
 
@@ -6530,9 +6634,10 @@ def print_comparison_analysis(
     )
 
     if aggregates:
+        # 聚合表只展示 val 口径：test 指标不参与跨运行
+        # 对比（尘封协议）。
         header = (
-            f"{'cell':<40} {'n':>3} {'val_loss':>18} "
-            f"{'test_loss':>18}"
+            f"{'cell':<40} {'n':>3} {'val_loss':>18}"
         )
         print(header)
         print("-" * len(header))
@@ -6550,8 +6655,7 @@ def print_comparison_analysis(
             print(
                 f"{str(aggregate['label'])[:39]:<40} "
                 f"{int(aggregate['n_runs']):>3} "
-                f"{_stat(aggregate, 'val_loss'):>18} "
-                f"{_stat(aggregate, 'test_loss'):>18}"
+                f"{_stat(aggregate, 'val_loss'):>18}"
             )
 
         underpowered = [
@@ -7257,6 +7361,88 @@ def load_checkpoint(
     )
 
 
+# 验证集选中的权重存档名（与断点恢复用的 last.pt 分离：
+# last.pt 是「继续训练」的完整状态，best.pt 是「最终评估/
+# 测试」应使用的模型，两者语义不同，不能混用）。
+_SELECTED_MODEL_FILENAME = "best.pt"
+
+
+def save_selected_model(
+    filename: str,
+    model: LanguageModel,
+    step: int,
+    val_loss: float,
+    args: argparse.Namespace,
+) -> None:
+    """
+    保存「验证集选定」的模型权重（不含优化器状态）。
+
+    每次周期验证刷新最优验证损失时覆盖写入。最终评估与唯一
+    一次测试集评估都在该模型上进行，保证测试集看到的是经
+    验证集选择的模型，而不是训练结束时恰好排在上一步的参数。
+    与 save_checkpoint 一样先写临时文件再原子替换。
+    """
+    raw_model = getattr(model, "_orig_mod", model)
+
+    payload = {
+        "config": asdict(raw_model.cfg),
+        "model": raw_model.state_dict(),
+        "step": step,
+        "val_loss": float(val_loss),
+        "args": vars(args),
+    }
+
+    path = Path(filename)
+    temporary = path.with_name(
+        path.name + ".tmp"
+    )
+
+    try:
+        # 先写完整临时文件再原子替换。
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_selected_model(
+    filename: str,
+    device: torch.device,
+) -> Optional[dict]:
+    """
+    读取 best.pt；缺失或损坏时返回 None（调用方回退到最后
+    一步参数并明确提示）。
+    """
+    path = Path(filename)
+
+    if not path.exists():
+        return None
+
+    try:
+        payload = torch.load(
+            path,
+            map_location=device,
+        )
+    except Exception:
+        # best.pt 损坏时回退到最后一步参数，不能中断训练。
+        return None
+
+    if not isinstance(payload, dict) or "model" not in payload:
+        return None
+
+    return payload
+
+
+def restore_selected_weights(
+    model: LanguageModel,
+    payload: dict,
+) -> None:
+    """把 best.pt 中的权重加载回模型（兼容 torch.compile 包装）。"""
+    raw_model = getattr(model, "_orig_mod", model)
+    raw_model.load_state_dict(payload["model"])
+
+
 # ============================================================
 # Tests
 # ============================================================
@@ -7955,6 +8141,41 @@ def run_self_test():
         assert math.isfinite(distance)
         assert 0.0 <= distance <= 1.0
 
+    # 文本完整性审计：无法 UTF-8 解码的字节（标签噪声来源）与
+    # NUL 字节必须被检测到并给出警告。
+    with tempfile.NamedTemporaryFile() as corrupt_file:
+        corrupt_file.write(
+            b"valid utf-8 text " * 30
+            + b"\xff\xfe"
+            + b"\x00" * 4
+            + b"tail text " * 30
+        )
+        corrupt_file.flush()
+
+        corrupt_dataset = ByteDataset(
+            corrupt_file.name,
+            seq_len=8,
+        )
+
+        corrupt_audit = audit_data_splits(
+            corrupt_dataset,
+            include_test=True,
+        )
+
+    assert (
+        corrupt_audit["splits"]["train"]["utf8_replacements"]
+        > 0
+    )
+    assert corrupt_audit["splits"]["train"]["nul_bytes"] == 4
+    assert any(
+        "UTF-8" in warning
+        for warning in corrupt_audit["warnings"]
+    )
+    assert any(
+        "NUL" in warning
+        for warning in corrupt_audit["warnings"]
+    )
+
     # metrics.jsonl 中的测试记录只能出现一次：已有记录时必须
     # 拒绝重复解封。
     with tempfile.TemporaryDirectory() as metrics_dir:
@@ -7973,6 +8194,86 @@ def run_self_test():
             {"step": "test", "test_loss": 1.0},
         )
         assert test_record_exists(metrics_file)
+
+    # 验证集选中的模型存档：保存 / 读取 / 恢复必须逐位一致；
+    # best.pt 缺失时安全返回 None（调用方回退到最后一步并提示）。
+    with tempfile.TemporaryDirectory() as selected_dir:
+        selected_path = Path(selected_dir) / "best.pt"
+
+        selection_model = LanguageModel(
+            Config(**common, mode="B")
+        )
+        with torch.no_grad():
+            for parameter in selection_model.parameters():
+                parameter.add_(0.25)
+
+        expected_state = {
+            key: value.clone()
+            for key, value in selection_model.state_dict().items()
+        }
+
+        selected_args = argparse.Namespace(seed=1, mode="B")
+        save_selected_model(
+            str(selected_path),
+            selection_model,
+            7,
+            1.25,
+            selected_args,
+        )
+
+        assert selected_path.exists()
+        assert not selected_path.with_name(
+            selected_path.name + ".tmp"
+        ).exists()
+
+        with torch.no_grad():
+            for parameter in selection_model.parameters():
+                parameter.zero_()
+
+        selected_payload = load_selected_model(
+            selected_path,
+            torch.device("cpu"),
+        )
+        assert selected_payload is not None
+        assert int(selected_payload["step"]) == 7
+        assert abs(
+            float(selected_payload["val_loss"]) - 1.25
+        ) < 1e-12
+
+        restore_selected_weights(
+            selection_model,
+            selected_payload,
+        )
+
+        restored_state = selection_model.state_dict()
+        assert all(
+            torch.equal(expected_state[key], restored_state[key])
+            for key in expected_state
+        )
+
+        assert (
+            load_selected_model(
+                Path(selected_dir) / "missing.pt",
+                torch.device("cpu"),
+            )
+            is None
+        )
+
+        # 损坏的 best.pt（截断/非存档内容）同样安全返回 None，
+        # 由调用方回退到最后一步参数。
+        corrupt_selected_path = (
+            Path(selected_dir) / "corrupt.pt"
+        )
+        corrupt_selected_path.write_bytes(
+            b"\x00\x01not a torch archive"
+        )
+        assert (
+            load_selected_model(
+                corrupt_selected_path,
+                torch.device("cpu"),
+            )
+            is None
+        )
 
     # 模拟 checkpoint/resume：恢复时先从 scheduler.base_lrs
     # 还原基准 lr，再加载 scheduler 状态。
@@ -8566,7 +8867,6 @@ def run_self_test():
             steps: int,
             balance: float,
             val_loss: float,
-            test_loss: Optional[float] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -8627,8 +8927,6 @@ def run_self_test():
                 "step": "final",
                 "val_loss": val_loss,
             }
-            if test_loss is not None:
-                final_record["test_loss"] = test_loss
             write_jsonl_record(
                 run_dir / "metrics.jsonl",
                 final_record,
@@ -8752,6 +9050,26 @@ def run_self_test():
             contrast["p_value"] is not None
             and 0.005 < float(contrast["p_value"]) < 0.05
         )
+
+        # 尘封协议：test 指标绝不能作为跨运行对比口径，
+        # 否则「挑 test 最好」会让测试集退化成隐式验证集。
+        assert "test_loss" not in COMPARISON_METRIC_KEYS
+        assert all(
+            "test_loss" not in row for row in analysis_rows
+        ), "对比行不允许携带 test 指标"
+        try:
+            print_comparison_analysis(
+                analysis_rows,
+                factors=factors,
+                metric="test_loss",
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "test_loss 必须被拒绝作为对比指标"
+                "（测试集不参与跨运行选择）"
+            )
 
         # 显著且差值远大于种子波动时不加额外警告；显著但
         # 差值小于噪声比 1 时提示谨慎解读；不显著时禁止
@@ -9518,7 +9836,10 @@ def main():
         default="val_loss",
         help=(
             "显著性检验使用的指标（默认 val_loss）；"
-            "可选: " + ", ".join(COMPARISON_METRIC_KEYS)
+            "只允许 val 口径指标（测试集尘封协议：test "
+            "指标不参与跨运行对比与选择，只在单个运行的"
+            "最终评估中出现）；可选: "
+            + ", ".join(COMPARISON_METRIC_KEYS)
         ),
     )
 
@@ -10519,17 +10840,15 @@ def main():
 
     metrics_path = out_dir / "metrics.jsonl"
 
-    # 早停状态：resume 时从原运行的 metrics.jsonl 恢复「最优验证
-    # 损失 / 最优步 / 连续未改善次数」，保证早停判定跨恢复一致；
-    # 全新训练不读旧文件（文件会被截断重写）。
+    # 验证集模型选择 + 早停状态：resume 时从原运行的
+    # metrics.jsonl 恢复「最优验证损失 / 最优步 / 连续未改善
+    # 次数」，保证早停判定与模型选择跨恢复一致；全新训练不读
+    # 旧文件（文件会被截断重写）。
     best_val_loss: Optional[float] = None
     best_val_step: Optional[int] = None
     evals_without_improvement = 0
 
-    if (
-        args.early_stop_patience > 0
-        and args.resume is not None
-    ):
+    if args.resume is not None:
         (
             best_val_loss,
             best_val_step,
@@ -10538,6 +10857,11 @@ def main():
             read_metrics_records(metrics_path),
             args.early_stop_min_delta,
         )
+
+    # 训练期间每个刷新最优验证损失的评估点覆盖写入 best.pt；
+    # 训练结束后用它做 final / test 评估（test 只在这一份
+    # 经验证集选择的模型上解封一次）。
+    selected_model_path = out_dir / _SELECTED_MODEL_FILENAME
 
     early_stopped = False
     nonfinite_events = 0
@@ -10880,43 +11204,53 @@ def main():
             metrics_file.flush()
             model.train()
 
+            # 验证集模型选择：无论是否启用早停，都记录最优验证
+            # 点并把权重写入 best.pt；训练结束后的 final / test
+            # 评估使用该模型（验证集用于选型，测试集只在选定的
+            # 模型上解封一次）。NaN/Inf 验证损失不作数，避免故障
+            # 顺带触发早停或污染选型。
+            val_loss = eval_metrics.get("val_loss")
+
+            if val_loss is None or not math.isfinite(
+                float(val_loss)
+            ):
+                pass
+            elif (
+                best_val_loss is None
+                or float(val_loss)
+                < best_val_loss
+                - args.early_stop_min_delta
+            ):
+                best_val_loss = float(val_loss)
+                best_val_step = step + 1
+                evals_without_improvement = 0
+                save_selected_model(
+                    str(selected_model_path),
+                    model,
+                    step + 1,
+                    best_val_loss,
+                    args,
+                )
+            else:
+                evals_without_improvement += 1
+
             # 早停：验证损失连续无改善达到 patience 时提前结束。
-            # NaN/Inf 验证损失不计入「未改善」，避免故障顺带触发
-            # 早停而掩盖问题。
-            if args.early_stop_patience > 0:
-                val_loss = eval_metrics.get("val_loss")
-
-                if val_loss is None or not math.isfinite(
-                    float(val_loss)
-                ):
-                    pass
-                elif (
-                    best_val_loss is None
-                    or float(val_loss)
-                    < best_val_loss
-                    - args.early_stop_min_delta
-                ):
-                    best_val_loss = float(val_loss)
-                    best_val_step = step + 1
-                    evals_without_improvement = 0
-                else:
-                    evals_without_improvement += 1
-
-                if (
-                    evals_without_improvement
-                    >= args.early_stop_patience
-                ):
-                    early_stopped = True
-                    print(
-                        "[early-stop] 验证损失连续 "
-                        f"{evals_without_improvement} 次未改善"
-                        "（最优 "
-                        f"{best_val_loss:.4f} @ step "
-                        f"{best_val_step}），"
-                        f"在第 {step + 1} 步提前结束训练；"
-                        "如需继续训练可调大 --steps 后 resume。"
-                    )
-                    break
+            if (
+                args.early_stop_patience > 0
+                and evals_without_improvement
+                >= args.early_stop_patience
+            ):
+                early_stopped = True
+                print(
+                    "[early-stop] 验证损失连续 "
+                    f"{evals_without_improvement} 次未改善"
+                    "（最优 "
+                    f"{best_val_loss:.4f} @ step "
+                    f"{best_val_step}），"
+                    f"在第 {step + 1} 步提前结束训练；"
+                    "如需继续训练可调大 --steps 后 resume。"
+                )
+                break
 
         if (step + 1) % args.save_interval == 0:
             # 存档不一定位于 eval 点上，先落盘保证顺序。
@@ -10962,6 +11296,38 @@ def main():
             args,
         )
 
+    # 按验证集选定模型：final / test 评估之前，把权重恢复为
+    # best.pt（验证损失最优的评估点）。这样「最终模型」由
+    # 验证集决定，而不是由最后一步恰好停在哪里决定；测试集
+    # 也只在这份模型上解封一次。
+    selection_policy = "last"
+    selection_note: Optional[str] = None
+
+    if best_val_step is not None:
+        selected_payload = load_selected_model(
+            str(selected_model_path),
+            torch.device("cpu"),
+        )
+
+        if (
+            selected_payload is not None
+            and int(selected_payload.get("step", -1)) == best_val_step
+        ):
+            restore_selected_weights(model, selected_payload)
+            selection_policy = "best_val"
+            print(
+                "[select] 使用验证集选中的模型做最终评估："
+                f"step={best_val_step}, "
+                f"val_loss={float(best_val_loss):.4f}"
+            )
+        else:
+            selection_note = (
+                "best.pt 缺失或与验证记录不一致"
+                "（如从旧检查点恢复）；最终评估回退到"
+                "最后一步参数，模型未经验证集选择"
+            )
+            print(f"[select] {selection_note}")
+
     # 最终评估总是重新跑一遍：与周期验证不同，它还要计算
     # one-vs-rest 的 macro PR-AUC / ROC-AUC（周期验证只算
     # 混淆矩阵口径的轻量指标），不能直接复用上次周期结果。
@@ -10981,6 +11347,18 @@ def main():
         "early_stopped": early_stopped,
         "best_val_loss": best_val_loss,
         "best_val_step": best_val_step,
+        "selected_model": selection_policy,
+        "selected_step": (
+            best_val_step
+            if selection_policy == "best_val"
+            else end_step
+        ),
+        "selected_val_loss": (
+            best_val_loss
+            if selection_policy == "best_val"
+            else None
+        ),
+        "selection_note": selection_note,
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
         "numerical_polluted": numerical_polluted,
@@ -10999,6 +11377,30 @@ def main():
             _json_safe({"final": final_metrics}),
             ensure_ascii=False,
         )
+    )
+
+    # 选型协议写入 config.json：最终模型由验证集选定（best_val）
+    # 或回退到最后一步（last），以及是否用于测试集评估。
+    update_run_config(
+        out_dir,
+        "model_selection",
+        {
+            "policy": selection_policy,
+            "selected_step": (
+                best_val_step
+                if selection_policy == "best_val"
+                else end_step
+            ),
+            "selected_val_loss": (
+                best_val_loss
+                if selection_policy == "best_val"
+                else None
+            ),
+            "note": selection_note,
+            "evaluate_test_requested": bool(
+                args.evaluate_test
+            ),
+        },
     )
 
     # --------------------------------------------------------

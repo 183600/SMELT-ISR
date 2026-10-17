@@ -47,10 +47,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   显式传入 `--evaluate-test` 时解封评估一次
   （`metrics.jsonl` 写入 `{"step": "test", ...}`）；同一输出目录中
   已有 test 记录时会拒绝重复评估，防止测试集变成隐式验证集。
-- **数据审计**：训练前对 train/val 自动做值域校验、字节直方图
-  分布偏移（JS 距离）与滑窗重复内容扫描（有界采样），警告与统计
-  写入 `config.json` 的 `data_audit`；解封测试集时追加含 test 的
-  审计。恢复训练时若数据指纹或划分比例与存档不一致会明确提示。
+- **验证集选型**：训练期间每次刷新最优验证损失（判据与早停一致）
+  就把权重原子写入 `best.pt`；训练结束后的 `final` 评估与唯一一次
+  test 评估都在这份验证集选定的模型上进行，而不是训练最后一步的
+  参数。选型口径写入 `metrics.jsonl` 的 `final` 记录与 `config.json`
+  的 `model_selection` 字段；`best.pt` 缺失或与记录不一致时明确
+  提示并回退到最后一步（`last.pt` 仍是断点恢复用的完整状态）。
+- **数据审计**：训练前对 train/val 自动做值域校验、文本完整性
+  （无法 UTF-8 解码的字节序列与 NUL 字节，即字节级标签噪声/语料
+  损坏检查）、字节直方图分布偏移（JS 距离）与滑窗重复内容扫描
+  （有界采样），警告与统计写入 `config.json` 的 `data_audit`；解封
+  测试集时追加含 test 的审计。恢复训练时若数据指纹或划分比例与
+  存档不一致会明确提示。
 - **群组数据**：当前语料为单一字节流，不存在群组结构；若替换为
   同一用户/物体产生多条样本的数据集，必须按群组整体划分，
   train/val/test 任意两侧之间不得交叉。
@@ -63,10 +71,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `TransformerBlock`：注意力步骤、MoE 步骤，以及分支与两轮路由逻辑。
 - `LanguageModel`：按模式组装完整前向。
 - `ByteDataset`、`evaluate`：字节级数据管线与按 split 的固定窗口评估。
-- `audit_data_splits`、`_window_signature_scan`：数据审计（值域、
-  分布偏移、重复窗口）。
+- `audit_data_splits`、`_window_signature_scan`、`_scan_text_integrity`：
+  数据审计（值域、文本完整性/标签噪声、分布偏移、重复窗口）。
 - `run_sanity_overfit`：训练前的过拟合小批量 sanity check。
 - `save_checkpoint`、`load_checkpoint`：断点存档与恢复。
+- `save_selected_model`、`load_selected_model`、`restore_selected_weights`：
+  验证集选定权重（`best.pt`）的存档、读取与恢复（final/test 评估用）。
 - `collect_run_metadata`、`write_run_config`：实验追踪信息收集与落盘。
 - `run_self_test`：结构、梯度、因果性、模式等价性、数据划分/
   测试集封存与 sanity check 判定自测。
@@ -117,10 +127,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **效率口径**：FLOPs 线性层部分用 `FlopCounterMode` 实测，
   注意力按 4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层
   执行两轮，按真实执行次数累计）。
-- **早停**：`--early-stop-patience` 启用；NaN 验证损失不算「改善」；
-  `--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑语义一致。
+- **早停与选型**：`--early-stop-patience` 启用；NaN 验证损失不算
+  「改善」；`--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑
+  语义一致。最优验证点同时是模型选择依据（`best.pt`），final/test
+  评估都在该模型上进行。
 - **运行对比**：`--compare RUN_DIR...` 只读运行目录，汇总各模式
-  在相同数据上的指标；同时输出受控变量检查、按实验单元聚合的
+  在相同数据上的指标；跨运行对比只使用 val 口径指标，test 结果
+  只在单个运行自身的 `metrics.jsonl` 中报告，避免「挑 test 最好」
+  的隐式测试集调参。同时输出受控变量检查、按实验单元聚合的
   Mean ± Std、单因子显著性检验与消融覆盖报告（见下节）。
 
 ## 对比实验与消融协议
@@ -131,11 +145,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **受控变量协议**：每次训练把优化器（AdamW 及 betas/eps）、
   学习率与调度、warmup、训练步数、weight decay、梯度裁剪、
   batch size、数据增强（当前为无增强，显式记录）、数据指纹、
-  模型结构与评估协议写入 `config.json` 的
-  `comparison_protocol` 字段。`--compare` 默认要求这些协议项
-  在声明因子之外逐项一致；不一致会以 `[violation]` 明确列出
-  （如某个运行换了优化器、调了学习率或训练轮数），提示结论
-  无法归因到方法本身。
+  模型结构、评估协议与选型口径（`model_selection`，新运行为
+  验证集选型、无记录的旧运行回退标记为最后一步）写入
+  `config.json` 的 `comparison_protocol` 字段。`--compare`
+  默认要求这些协议项在声明因子之外逐项一致；不一致会以
+  `[violation]` 明确列出（如某个运行换了优化器、调了学习率、
+  训练轮数，或 final 指标口径不同），提示结论无法归因到
+  方法本身。
 - **声明因子**：`--compare-factors`（默认
   `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）显式声明哪些
   键允许跨运行不同；其余一律按受控变量核对。因子拼写错误会
