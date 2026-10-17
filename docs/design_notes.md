@@ -115,7 +115,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `_holm_bonferroni`、`_benjamini_hochberg`、`_t_critical`、
   `_contrast_interval`、`_apply_multiple_comparison_correction`：
   检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
-  t 临界值与效应量 95% 置信区间；显著性判定与成本权衡结论
+  t 临界值与效应量 95% 置信区间；显著性判定与权衡结论
   以 Holm 校正后为准。
 - `ablation_coverage`：2×2 全因子消融覆盖检查。
 - `print_comparison_analysis`、`write_comparison_report`：
@@ -186,7 +186,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   95% 置信区间（t 分布临界值；区间极宽说明现有种子数只能
   排除「差异为 0」，还不足以定位效应大小）。同一检验家族内
   的全部对比（一次分析的单因子对比集合，或 `--compare-baseline`
-  的直接对比集合）统一做多重比较校正：显著性判定与成本权衡
+  的直接对比集合）统一做多重比较校正：显著性判定与权衡
   结论以 Holm-Bonferroni（FWER）校正后的 p 值为准，BH（FDR）
   校正值随报告给出供探索性解读；未校正判定保留在
   `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两

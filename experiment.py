@@ -422,13 +422,11 @@ class Expert(nn.Module):
 # Sparse MoE
 # ============================================================
 
-# 批量专家路径的填充浪费上限：padded 行数（n_experts *
+# 批量专家路径的填充上限：padded 行数（n_experts *
 # max(counts)）超过 assignment 总数的该倍数时，退回逐专家
-# 循环路径。均衡路由下浪费通常只有百分之几；路由坍缩
-#（如 balance_coef=0 的消融臂）时避免按 n_experts 倍
-# 放大计算量与激活显存。阈值判定只依赖确定性的 counts，
-# 相同数据始终选择同一路径。
-_MOE_PAD_WASTE_LIMIT = 1.25
+# 循环路径。阈值判定只依赖确定性的 counts，相同数据始终
+# 选择同一路径。
+_MOE_PAD_RATIO_LIMIT = 1.25
 
 
 class _MergeExpertOutputs(torch.autograd.Function):
@@ -600,9 +598,7 @@ class SparseMoE(nn.Module):
                     router_probs = router_logits.softmax(dim=-1)
 
             # counts 显式转 fp32，与 soft_load（router_logits 已
-            # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
-            # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
-            # torch.dot 报错。归一化就地完成。
+            # .float()）保持同一 dtype；归一化就地完成。
             hard_load = counts.float()
             hard_load.div_(flat.size(0))
 
@@ -683,10 +679,10 @@ class SparseMoE(nn.Module):
         """
         对 [n_experts, rows, dim] 的批量输入执行全部专家计算。
 
-        各专家权重 stack 成批量矩阵后用 bmm 一次完成两层
-        GEMM，替代逐专家的小 GEMM 循环；stack 的反向按
-        切片把梯度散回各专家参数，参数与检查点格式不变。
-        SwiGLU 语义与 Expert.forward 完全一致。
+        各专家权重 stack 成批量矩阵后用 bmm 完成两层 GEMM；
+        stack 的反向按切片把梯度散回各专家参数，参数与
+        检查点格式不变。SwiGLU 语义与 Expert.forward 完全
+        一致。
         """
         gate_up_weight = torch.stack(
             [
@@ -883,12 +879,11 @@ class SparseMoE(nn.Module):
         counts_list = self._read_counts(counts)
         max_count = max(counts_list)
 
-        # 填充浪费受 _MOE_PAD_WASTE_LIMIT 封顶时走批量
-        # bmm 路径：把逐专家小 GEMM 循环合并为两次批量
-        # GEMM，显著减少算子派发与 autograd 节点数量。
+        # 填充比例受 _MOE_PAD_RATIO_LIMIT 限制时走批量
+        # bmm 路径。
         if (
             self.n_experts * max_count
-            <= _MOE_PAD_WASTE_LIMIT * gathered.size(0)
+            <= _MOE_PAD_RATIO_LIMIT * gathered.size(0)
         ):
             return self._dispatch_batched(
                 counts,
@@ -3600,8 +3595,8 @@ class NgramBaseline:
 
         if context_len > seq_len:
             # 阶数高于窗口可提供的最大上下文长度：没有任何
-            # 有效位置，调用方将整阶回退到低阶模型。此处直接
-            # 返回空结果，避免 unfold 的 size 越界报错。
+            # 有效位置，调用方将整阶回退到低阶模型；此处直接
+            # 返回空结果。
             empty = torch.empty(0, dtype=torch.int64)
             return empty, empty, 0
 
@@ -6306,7 +6301,7 @@ def _cell_cost_mean(
     cell: Dict[str, object],
     field: str,
 ) -> Optional[float]:
-    """取一个实验单元在某效率字段上的平均成本（缺失时 None）。"""
+    """取一个实验单元在某效率字段上的平均值（缺失时 None）。"""
     costs = cell.get("costs")
     if not isinstance(costs, dict):
         return None
@@ -7083,8 +7078,8 @@ def aggregate_runs(
         }
 
         # 效率指标（参数量 / FLOPs / 延迟 / 峰值内存）随精度指标
-        # 一起聚合：评价改进必须同时给出涨点与代价，否则微小的
-        # 涨点可能掩盖数量级的开销差异。
+        # 一起聚合：评价改进必须同时给出涨点与效率指标，否则
+        # 微小的涨点可能掩盖数量级的差异。
         for field in _COST_FIELDS:
             values = [
                 float(group_row[field])
@@ -7185,17 +7180,18 @@ def _cost_verdict_from_ratios(
     significant: bool,
 ) -> Optional[str]:
     """
-    由成本倍数与显著性给出权衡判定，供对比创建时与多重比较
-    校正后重算共用（校正可能把显著翻转为不显著，成本结论
+    由效率倍率与显著性给出权衡判定，供对比创建时与多重比较
+    校正后重算共用（校正可能把显著翻转为不显著，权衡结论
     必须同步降级为 ``gain_not_significant``）。
 
     ``cost_verdict``：
-    - ``gain_with_cost``：指标显著改善，但成本达到基线的
-      ``_COST_RATIO_MATERIAL`` 倍以上，须评估性价比；
-    - ``gain_balanced``：显著改善且成本可控；
+    - ``gain_with_cost``：指标显著改善，但效率倍率达到基线的
+      ``_COST_RATIO_MATERIAL`` 倍以上，须评估取舍；
+    - ``gain_balanced``：显著改善且效率倍率可控；
     - ``gain_not_significant``：改善不显著（说服力有限）；
-    - ``dominated_regression``：指标变差且更贵，严格劣于基线；
-    - ``neutral``：其余（持平/缺失成本数据等）。
+    - ``dominated_regression``：指标变差且效率倍率更高，
+      严格劣于基线；
+    - ``neutral``：其余（持平/缺失效率数据等）。
     """
     if not cost_ratios or verdict == "missing_metric":
         return None
@@ -7218,7 +7214,7 @@ def _cost_comparison(
     significant: bool,
 ) -> Tuple[Dict[str, object], Optional[str]]:
     """
-    变体（cell_b）相对基线（cell_a）的成本对比与权衡判定，
+    变体（cell_b）相对基线（cell_a）的效率对比与权衡判定，
     判定逻辑见 ``_cost_verdict_from_ratios``。
     """
     baseline_costs: Dict[str, float] = {}
@@ -7266,7 +7262,7 @@ def _apply_multiple_comparison_correction(
       BH（FDR）校正后的 p 值；
     - ``significant_raw``：未校正判定（留档，可追溯「校正
       前后结论翻转」）；
-    - ``significant``：以 Holm 校正为准的最终判定；成本的
+    - ``significant``：以 Holm 校正为准的最终判定；效率的
       权衡结论（``cost_verdict``）同步按该判定重算。
 
     不校正的风险：跑 6 个两两对比，即使每个都用 alpha=0.05，
@@ -7402,9 +7398,9 @@ def factor_contrasts(
                 else:
                     verdict = "tie"
 
-            # 效率与精度的权衡：给出变体相对基线的成本倍数，并
-            # 把「统计显著但更贵」「变差且更贵」单独标记，避免
-            # 只报涨点而不报代价。
+            # 效率与精度的权衡：给出变体相对基线的效率倍率，并
+            # 把「统计显著但效率更低」「变差且效率更低」单独
+            # 标记，避免只报涨点而不报效率变化。
             significant = (
                 test.get("p_value") is not None
                 and float(test["p_value"]) <= _SIGNIFICANCE_LEVEL
@@ -7547,13 +7543,14 @@ def _contrast_display(
     elif verdict == "改善" and test in ("paired_t", "welch_t"):
         caveat = "（未达显著水平，不能据此声称提升）"
 
-    # 效率与精度权衡：成本倍数必须与涨点一起展示；显著改善
-    # 但成本大幅上升、或指标变差且更贵时给出明确结论。
+    # 效率与精度权衡：效率倍率必须与涨点一起展示；显著改善
+    # 但效率倍率大幅上升、或指标变差且效率倍率更高时给出
+    # 明确结论。
     cost_verdict = contrast.get("cost_verdict")
     if cost_verdict == "gain_with_cost":
-        caveat += "（改善伴随成本上升，须评估性价比）"
+        caveat += "（改善伴随效率倍率上升，须评估取舍）"
     elif cost_verdict == "dominated_regression":
-        caveat += "（指标变差且成本更高，严格劣于基线）"
+        caveat += "（指标变差且效率倍率更高，严格劣于基线）"
 
     cost = contrast.get("cost")
     ratios = cost.get("ratios") if isinstance(cost, dict) else None
@@ -7568,7 +7565,7 @@ def _contrast_display(
                 f"×{float(ratios[field]):.2f}"
             )
         if ratio_parts:
-            cost_text = "  成本: " + " ".join(ratio_parts)
+            cost_text = "  效率倍率: " + " ".join(ratio_parts)
 
     return (
         f"{factor}: {baseline}→{variant}{context}  "
@@ -7976,7 +7973,7 @@ def print_comparison_analysis(
     if cost_rows:
         print()
         print(
-            "[efficiency] 各实验单元成本（运行结束时测量；"
+            "[efficiency] 各实验单元效率（运行结束时测量；"
             "参数量/FLOPs 可跨环境比较，延迟与内存受硬件影响，"
             "仅在同一环境内可比）"
         )
@@ -8026,8 +8023,9 @@ def print_comparison_analysis(
                 "  " + _contrast_display(contrast, metric)
             )
 
-        # 成本权衡汇总：显著涨点伴随数量级成本、或变差且更贵
-        # 的对比必须单独点名，不能只凭 Δ 下结论。
+        # 效率权衡汇总：显著涨点伴随数量级效率差异、或指标
+        # 变差且效率更低时，这些对比必须单独点名，不能只凭
+        # Δ 下结论。
         cost_flagged = [
             contrast
             for contrast in contrasts
@@ -8038,16 +8036,16 @@ def print_comparison_analysis(
             summaries = []
             for contrast in cost_flagged:
                 reason = (
-                    "涨点但更贵"
+                    "涨点但效率更低"
                     if contrast["cost_verdict"] == "gain_with_cost"
-                    else "变差且更贵"
+                    else "变差且效率更低"
                 )
                 summaries.append(
                     f"{contrast['baseline']}→{contrast['variant']}"
                     f"（{reason}）"
                 )
             print(
-                "  [cost] 需按性价比权衡的对比: "
+                "  [cost] 需按效率权衡的对比: "
                 + "; ".join(summaries)
             )
 
@@ -8170,8 +8168,7 @@ def run_sanity_overfit(
     checkpointing（其反向会对 Block 重算前向，是唯一会改变
     反传代码路径的开关），避免「sanity check 验证了一条
     路径、全量训练跑的是另一条路径」。--compile 只做内核
-    融合不改写 autograd 语义，且会显著拉长每次运行的启动
-    时间，不镜像。
+    融合、不改写 autograd 语义，不镜像。
 
     这是必要不充分的检查：连小批量都无法过拟合，通常意味着
     梯度没有正确反传、损失计算错误、优化器配置错误等严重缺陷；
@@ -10701,7 +10698,7 @@ def run_self_test():
     assert abs(critical_2 - 4.302652729911275) < 1e-6
 
     # 家族校正会翻转显著性：原始 p=0.03/0.04 都显著，Holm
-    # 校正后都不显著；significant_raw 必须留档，成本结论
+    # 校正后都不显著；significant_raw 必须留档，权衡结论
     # （gain_with_cost）同步降级为 gain_not_significant。
     synthetic_contrasts = [
         {
@@ -11140,7 +11137,7 @@ def run_self_test():
             for message in unrelated_coverage["advisories"]
         )
 
-    # ---- 效率与精度权衡：涨点必须与成本倍数一起看 ----
+    # ---- 效率与精度权衡：涨点必须与效率倍率一起看 ----
     def _write_cost_run(
         base_dir: str,
         name: str,
@@ -11223,10 +11220,10 @@ def run_self_test():
             cost_contrast,
             "val_loss",
         )
-        assert "成本:" in cost_display
-        assert "性价比" in cost_display
+        assert "效率倍率:" in cost_display
+        assert "取舍" in cost_display
 
-    # 指标变差且更贵：严格劣于基线，必须显式点出。
+    # 指标变差且效率更低：严格劣于基线，必须显式点出。
     with tempfile.TemporaryDirectory() as dominated_dir:
         dominated_paths = [
             _write_cost_run(
