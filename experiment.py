@@ -1963,7 +1963,7 @@ def _scan_text_integrity(
     - nul_bytes：NUL（0x00）字节数量，文本语料中出现即疑似
       二进制污染或文件拼接错误。
 
-    分块解码保证内存占用有界；只做诊断，不修改任何数据。
+    分块解码；只做诊断，不修改任何数据。
     """
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="replace"
@@ -2581,7 +2581,7 @@ def evaluate(
     )
 
     # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
-    # 并按 _AUC_MAX_TOKENS 封顶防止内存失控。
+    # 并按 _AUC_MAX_TOKENS 封顶。
     collected_probs: List[torch.Tensor] = []
     collected_targets: List[torch.Tensor] = []
     auc_tokens = 0
@@ -2631,7 +2631,7 @@ def evaluate(
                 if compute_auc and (
                     auc_tokens < _AUC_MAX_TOKENS
                 ):
-                    # 最后一批可能超出封顶：按剩余预算截断，
+                    # 最后一批可能超出封顶：按剩余上限截断，
                     # 保证收集的 token 数严格不超过上限。
                     remaining = (
                         _AUC_MAX_TOKENS - auc_tokens
@@ -2835,8 +2835,8 @@ def compute_reference_baselines(
 # 是不越界的上限；更大的阶数需要哈希，超出即报错。
 _NGRAM_MAX_ORDER = 7
 
-# 每阶计数使用的最大训练窗口数；超过时按等距步长抽样，
-# 在大语料上控制计数内存与排序开销（抽样是确定性的）。
+# 每阶计数使用的最大训练窗口数；超过时按等距步长抽样
+#（抽样是确定性的）。
 _NGRAM_COUNT_CAP = 4_000_000
 
 
@@ -3340,7 +3340,7 @@ def _ngram_extended_metrics(
         ).view(vocab_size, vocab_size).double()
 
         if auc_tokens < _AUC_MAX_TOKENS:
-            # 最后一个窗口可能超出封顶：按剩余预算截断，
+            # 最后一个窗口可能超出封顶：按剩余上限截断，
             # 保证收集的 token 数严格不超过上限。
             remaining = _AUC_MAX_TOKENS - auc_tokens
             collected_probs.append(
@@ -4997,7 +4997,7 @@ def measure_efficiency(
         model.eval()
 
         # 纯推理测量不回流训练图，与 evaluate 一致使用
-        # inference_mode（去掉 autograd 元数据开销）。
+        # inference_mode。
         with torch.inference_mode(), autocast:
             for _ in range(max(0, warmup)):
                 model(x, y)
@@ -11165,7 +11165,7 @@ def main():
             nan_record_pending = False
 
         # 参数/优化器状态已被污染或连续非有限达到阈值时停止：
-        # 后续更新全部会被跳过，继续训练只会浪费算力。
+        # 后续更新全部会被跳过，继续训练没有意义。
         if numerical_stop:
             consecutive_text = (
                 "参数/优化器状态已被 NaN/Inf 污染"
