@@ -160,11 +160,11 @@ jobs:
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
           # ================= 模型策略：独立双家族（失效只在家族内级联，不跨家族） =================
-          # NVIDIA 家族（50%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
+          # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
           #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1，
           #             需要仓库 secret NVIDIA_API_KEY）；两者都不可用时保持本家族重试，
           #             绝不切换到 opencode 家族。
-          # opencode 家族（50%）：opencode 自带的免费 deepseek（Zen 网关
+          # opencode 家族（80%）：opencode 自带的免费 deepseek（Zen 网关
           #             deepseek-v4.1-flash-free，客户端内免鉴权，支持 tool call 与
           #             reasoning effort）→ big-pickle；两者都不可用时保持本家族重试，
           #             绝不切换到 NVIDIA 家族。
@@ -174,7 +174,7 @@ jobs:
           # opencode 家族内兜底：免费 deepseek 不可用（限流/下线/调用失败）时，
           #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
           PICKLE_MODEL="opencode/big-pickle"
-          NVIDIA_PROB=50
+          NVIDIA_PROB=20
           NVIDIA_MODEL=""
           NVIDIA_FLASH_MODEL=""
           CURRENT_PROVIDER=""
