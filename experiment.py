@@ -1504,6 +1504,249 @@ class LanguageModel(nn.Module):
 # Dataset
 # ============================================================
 
+# 群组分隔符允许的反斜杠转义：\n / \t / \r / \0 / \\ / \xHH / \uXXXX。
+_GROUP_SEPARATOR_SIMPLE_ESCAPES = {
+    "n": 10,
+    "t": 9,
+    "r": 13,
+    "0": 0,
+    "\\": 92,
+    "'": 39,
+    '"': 34,
+}
+
+
+def parse_group_separator(text: str) -> bytes:
+    """
+    把命令行传入的群组分隔符解析为字节序列。
+
+    支持常见反斜杠转义（\\n、\\t、\\r、\\0、\\\\、\\xHH、\\uXXXX），
+    其余字符按 UTF-8 编码；解析结果不能为空。分隔符用于把语料
+    切成「群组」（如同一文档/同一用户的一段内容），群组是划分
+    的最小单位，绝不允许跨 train/val/test 边界。
+    """
+    result = bytearray()
+    index = 0
+    length = len(text)
+
+    while index < length:
+        char = text[index]
+
+        if char != "\\":
+            result.extend(char.encode("utf-8"))
+            index += 1
+            continue
+
+        if index + 1 >= length:
+            raise ValueError("分隔符不能以单个反斜杠结尾")
+
+        escape = text[index + 1]
+
+        if escape in _GROUP_SEPARATOR_SIMPLE_ESCAPES:
+            result.append(_GROUP_SEPARATOR_SIMPLE_ESCAPES[escape])
+            index += 2
+            continue
+
+        if escape in ("x", "u"):
+            digits = 2 if escape == "x" else 4
+            hex_part = text[index + 2:index + 2 + digits]
+            if (
+                len(hex_part) != digits
+                or any(
+                    digit not in "0123456789abcdefABCDEF"
+                    for digit in hex_part
+                )
+            ):
+                raise ValueError(
+                    f"\\{escape} 转义需要 {digits} 位十六进制数字"
+                )
+            codepoint = int(hex_part, 16)
+            if escape == "u":
+                result.extend(chr(codepoint).encode("utf-8"))
+            else:
+                result.append(codepoint)
+            index += 2 + digits
+            continue
+
+        raise ValueError(
+            f"不支持的分隔符转义: \\{escape}"
+        )
+
+    if not result:
+        raise ValueError("群组分隔符不能为空")
+
+    return bytes(result)
+
+
+def _iter_group_boundaries(
+    buf: bytearray,
+    separator: bytes,
+    start: int = 0,
+):
+    """
+    依次产出群组边界位置（每个分隔符之后的字节位置）与文件末尾。
+
+    边界是群的起始字节；文件末尾 N 永远是一个合法边界。
+    只产出 > start 的边界。
+    """
+    position = start
+
+    while True:
+        found = buf.find(separator, position)
+        if found < 0:
+            break
+        end = found + len(separator)
+        if start < end < len(buf):
+            yield end
+        position = end
+
+    if len(buf) > start:
+        yield len(buf)
+
+
+def _count_groups(
+    buf: bytearray,
+    separator: bytes,
+    cuts: List[int],
+) -> List[int]:
+    """
+    统计每个 split 内部的完整群组数量（cuts 必须落在群组边界上）。
+
+    群组起点集合 = {0} ∪ {分隔符之后 < N 的边界}；[a, b) 内的
+    群组数 = 该区间内的群组起点数。cuts 本身是群组起点：
+    恰好等于切分点的边界计入右侧 split 的基础 1，不能再重复
+    计入左侧。
+    """
+    total = len(buf)
+    first, second = cuts[0], cuts[-1]
+    counts = [1, 1, 1]
+
+    for end in _iter_group_boundaries(buf, separator, 0):
+        if end >= total:
+            break
+        if end < first:
+            counts[0] += 1
+        elif end == first or end == second:
+            # 切分点本身：作为右侧 split 的起始群组计入基础 1。
+            continue
+        elif end < second:
+            counts[1] += 1
+        else:
+            counts[2] += 1
+
+    if second >= total:
+        # test split 为空（test_fraction = 0 时 val 右端即文件末尾）。
+        counts[2] = 0
+
+    return counts
+
+
+def _snap_group_boundary(
+    buf: bytearray,
+    separator: bytes,
+    target: int,
+    lower: int,
+) -> List[int]:
+    """
+    返回 > lower 的、离 target 最近的左右两个群组边界候选。
+    """
+    left: Optional[int] = None
+    right: Optional[int] = None
+
+    for end in _iter_group_boundaries(buf, separator, lower):
+        if end <= lower:
+            continue
+        if end <= target:
+            left = end
+        else:
+            right = end
+            break
+
+    candidates = [
+        candidate
+        for candidate in (left, right)
+        if candidate is not None
+    ]
+    return candidates
+
+
+def _snap_group_split(
+    buf: bytearray,
+    separator: bytes,
+    nominal_train: int,
+    nominal_val_end: int,
+    min_len: int,
+    has_test: bool,
+) -> Tuple[int, int]:
+    """
+    把名义切分位置吸附到群组边界：train/val/test 的分界点都是
+    某个群组的起始字节，任何群组整体落在一个 split 内。
+
+    在邻近候选边界中穷举所有可行组合（每个目标左右各一个候选），
+    取偏离名义位置总和最小的一组；找不到合法组合时抛出
+    ValueError（宁可报错，也不产生一个拆散群组的划分）。
+    """
+    if buf.find(separator) < 0:
+        raise ValueError(
+            "语料中没有出现群组分隔符，无法按群组划分；"
+            "请检查 --group-separator 是否正确"
+        )
+
+    train_candidates = _snap_group_boundary(
+        buf,
+        separator,
+        nominal_train,
+        0,
+    )
+
+    if not train_candidates:
+        raise ValueError(
+            "语料中没有可用的群组边界，无法按群组划分；"
+            "请检查 --group-separator 是否正确"
+        )
+
+    best: Optional[Tuple[int, int, int]] = None
+
+    for cut_train in sorted(
+        train_candidates,
+        key=lambda end: (abs(end - nominal_train), end),
+    ):
+        if cut_train < min_len:
+            continue
+
+        val_candidates = _snap_group_boundary(
+            buf,
+            separator,
+            nominal_val_end,
+            cut_train,
+        )
+
+        for cut_val in sorted(
+            val_candidates,
+            key=lambda end: (abs(end - nominal_val_end), end),
+        ):
+            if cut_val - cut_train < min_len:
+                continue
+            if has_test and len(buf) - cut_val < min_len:
+                continue
+
+            score = abs(cut_train - nominal_train) + abs(
+                cut_val - nominal_val_end
+            )
+            if best is None or score < best[0]:
+                best = (score, cut_train, cut_val)
+
+    if best is None:
+        raise ValueError(
+            "语料按群组分隔符划分后，无法同时保证 train/val/test "
+            f"各自至少 {min_len} 字节（seq_len + 1）；"
+            "请调整 --val-fraction / --test-fraction、减小 "
+            "--seq-len、检查分隔符，或合并过小的群组"
+        )
+
+    return best[1], best[2]
+
+
 class ByteDataset:
     """
     字节级语言模型数据集。
@@ -1514,6 +1757,9 @@ class ByteDataset:
       互不重叠，切分全程不随机打乱（时序数据用过去训练、用未来
       验证和测试）；训练阶段的批级 shuffle 由随机采样窗口起点
       承担，不改变 split 边界；
+    - 群组整体不跨界：传入 group_separator 时，切分位置吸附到
+      群组边界（同一文档/同一用户的内容不会被拆到两个 split），
+      train/val/test 任意两侧之间都不共享半个群组；
     - 训练期间 test 保持尘封：训练循环只访问 train，周期性验证
       只访问 val，test 仅在最终评估（--evaluate-test）时访问一次；
     - 本管线不做任何依赖全局统计量的预处理（标准化、归一化、
@@ -1531,6 +1777,7 @@ class ByteDataset:
         val_fraction: float = 0.05,
         test_fraction: float = 0.05,
         device: Optional[torch.device] = None,
+        group_separator: Optional[bytes] = None,
     ):
         data_path = Path(filename)
 
@@ -1573,22 +1820,75 @@ class ByteDataset:
 
         _ = device
 
+        if group_separator is not None and len(group_separator) == 0:
+            raise ValueError("group_separator 不能为空字节串")
+
+        self.group_separator = group_separator
+        self.group_cuts: Optional[Dict[str, int]] = None
+        self.groups_per_split: Optional[Dict[str, int]] = None
+
         # 仅做时间顺序上的连续切分，不计算统计量、不打乱：
         # [0, n_train) 训练，[n_train, n_train + n_val) 验证，
         # 其余为测试。
         n_val = int(len(tokens) * val_fraction)
         n_test = int(len(tokens) * test_fraction)
         n_train = len(tokens) - n_val - n_test
+        n_val_end = n_train + n_val
+
+        if group_separator is not None:
+            # 群组数据的防泄露协议：切分位置吸附到群组边界，
+            # 同一群组的全部字节整体落在同一个 split，任何两侧
+            # 之间都不交叉。吸附后会验证三段长度，宁可在划分
+            # 阶段显式报错（避免无法对齐的评估协议）。
+            cut_train, cut_val = _snap_group_split(
+                buf,
+                group_separator,
+                n_train,
+                n_val_end,
+                min_len=seq_len + 1,
+                has_test=test_fraction > 0.0,
+            )
+            n_train = cut_train
+            n_val_end = cut_val
+            self.group_cuts = {
+                "train": cut_train,
+                "val": cut_val,
+            }
+            self.groups_per_split = dict(
+                zip(
+                    ("train", "val", "test"),
+                    _count_groups(
+                        buf,
+                        group_separator,
+                        [cut_train, cut_val],
+                    ),
+                )
+            )
+            # 群组完整性由构造保证：分界点要么是分隔符之后的群组
+            # 起始字节，要么是文件末尾（仅在 test_fraction=0 时
+            # 作为 val 的右端）。这里再做一次防御性断言，任何
+            # 重构错误的划界都会在数据加载阶段立刻暴露，而不是
+            # 悄悄泄露。
+            for cut in (cut_train, cut_val):
+                if 0 < cut < len(buf):
+                    if (
+                        buf[cut - len(group_separator):cut]
+                        != group_separator
+                    ):
+                        raise AssertionError(
+                            "群组切分边界不在分隔符之后："
+                            "内部错误，拒绝继续"
+                        )
 
         self.split_bounds = {
             "train": (0, n_train),
-            "val": (n_train, n_train + n_val),
-            "test": (n_train + n_val, len(tokens)),
+            "val": (n_train, n_val_end),
+            "test": (n_val_end, len(tokens)),
         }
 
         self.train = tokens[:n_train]
-        self.val = tokens[n_train:n_train + n_val]
-        self.test = tokens[n_train + n_val:]
+        self.val = tokens[n_train:n_val_end]
+        self.test = tokens[n_val_end:]
         self.seq_len = seq_len
 
         # 窗口暂存槽按调用方的 device 决定是否启用。
@@ -1951,6 +2251,7 @@ def _scan_text_integrity(
     offset: int,
     length: int,
     chunk: int = 1 << 20,
+    final: bool = False,
 ) -> Dict[str, int]:
     """
     扫描一个 split 的文本完整性（数据清洗的标签噪声检查）。
@@ -1963,11 +2264,26 @@ def _scan_text_integrity(
     - nul_bytes：NUL（0x00）字节数量，文本语料中出现即疑似
       二进制污染或文件拼接错误。
 
-    分块解码；只做诊断，不修改任何数据。
+    分块解码保证内存占用有界；只做诊断，不修改任何数据。
+
+    切分边界处不制造假阳性：切分点之前最多 3 个字节先喂给
+    解码器做状态预热（多字节 UTF-8 字符可以横跨 split 边界，
+    文件整体仍然完全合法）；``final`` 只在扫描的是文件真正
+    的末尾时为 True，否则末尾不完整的多字节序列留给下一个
+    split 续接（其解码计数落在后续扫描里）。
     """
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="replace"
     )
+
+    # 预热：把解码器带到「从 offset 前几个字节开始」的状态。
+    # 预热输出（可能包含边界前的字符或无效序列）全部丢弃，
+    # 不计入任何统计。
+    if offset > 0:
+        decoder.decode(
+            bytes(raw[max(0, offset - 3):offset]),
+            final=False,
+        )
 
     replacements = 0
     nul_bytes = 0
@@ -1977,7 +2293,10 @@ def _scan_text_integrity(
     while position < end:
         stop = min(position + chunk, end)
         block = bytes(raw[position:stop])
-        text = decoder.decode(block, final=stop >= end)
+        text = decoder.decode(
+            block,
+            final=final and stop >= end,
+        )
         replacements += text.count("\ufffd")
         nul_bytes += block.count(0)
         position = stop
@@ -2004,7 +2323,14 @@ def audit_data_splits(
     - 统计每个 split 的字节直方图，并计算 train↔val（可选包含
       train↔test、val↔test）之间的 JS 距离，用于发现分布偏移；
     - 对滑动窗口做有界签名扫描，检测跨 split 重复内容与 split
-      内部重复。
+      内部重复；
+    - 群组划分（传入 group_separator 时）报告每个 split 的完整
+      群组数与分隔符，供追踪「群组整体不跨界」的协议。
+
+    返回的 ``warnings`` 是全部提醒；``violations`` 是其中会
+    被 ``--strict-data-audit`` 视为致命的问题（越界 token、
+    跨 split 重复内容、超出阈值的 UTF-8/NUL 损坏）——这些
+    问题直接对应数据泄露或标签噪声，严格模式下拒绝训练。
 
     test 只在 include_test=True（最终评估解封时）才参与统计，
     训练期间默认只审计 train/val。审计只做诊断，不参与任何
@@ -2018,6 +2344,7 @@ def audit_data_splits(
     scans: Dict[str, Dict[str, object]] = {}
     splits_report: Dict[str, object] = {}
     warnings: List[str] = []
+    violations: List[str] = []
 
     for split in split_names:
         tokens = getattr(dataset, split)
@@ -2072,6 +2399,7 @@ def audit_data_splits(
             dataset._raw,
             begin,
             end - begin,
+            final=(end == dataset.num_bytes),
         )
 
         splits_report[split] = {
@@ -2090,9 +2418,9 @@ def audit_data_splits(
         }
 
         if invalid > 0:
-            warnings.append(
-                f"{split}: 检测到 {invalid} 个越界 token"
-            )
+            message = f"{split}: 检测到 {invalid} 个越界 token"
+            warnings.append(message)
+            violations.append(message)
 
         split_bytes = max(1, end - begin)
         replacement_share = (
@@ -2102,24 +2430,28 @@ def audit_data_splits(
             integrity["utf8_replacements"] > 0
             and replacement_share > _AUDIT_UTF8_REPLACE_WARN
         ):
-            warnings.append(
+            message = (
                 f"{split}: 检测到 "
                 f"{integrity['utf8_replacements']} 处无法按"
                 "UTF-8 解码的字节序列"
                 f"（占比 {replacement_share:.4f}），"
                 "疑似语料损坏（字节级标签噪声）"
             )
+            warnings.append(message)
+            violations.append(message)
 
         nul_share = integrity["nul_bytes"] / split_bytes
         if (
             integrity["nul_bytes"] > 0
             and nul_share > _AUDIT_NUL_WARN
         ):
-            warnings.append(
+            message = (
                 f"{split}: 检测到 {integrity['nul_bytes']} 个"
                 f"NUL 字节（占比 {nul_share:.4f}），"
                 "疑似二进制/填充污染"
             )
+            warnings.append(message)
+            violations.append(message)
 
         top_byte_share = float(top_share[0])
         if top_byte_share > _AUDIT_TOP_BYTE_WARN:
@@ -2188,18 +2520,65 @@ def audit_data_splits(
         }
 
         if common:
-            warnings.append(
-                f"{left}_{right}: 检测到重复窗口内容"
+            message = (
+                f"{left}_{right}: 检测到"
+                f"{len(common)} 个重复窗口内容"
                 "（跨 split 泄露风险）"
             )
+            warnings.append(message)
+            violations.append(message)
+
+    groups_report: Optional[Dict[str, object]] = None
+
+    if dataset.group_separator is not None:
+        # 群组划分协议：分界点都是群组起始字节，因此每个群组
+        # 整体落在一个 split 内；这里把群组规模写进审计，供
+        # 事后核对（数据集构造时还做了防御性断言）。
+        groups_report = {
+            "separator_hex": dataset.group_separator.hex(),
+            "separator_length": len(dataset.group_separator),
+            "cuts": dataset.group_cuts,
+            "groups_per_split": dataset.groups_per_split,
+            "groups_total": (
+                sum(dataset.groups_per_split.values())
+                if dataset.groups_per_split is not None
+                else None
+            ),
+        }
 
     return {
         "max_windows": max_windows,
         "splits": splits_report,
         "distribution_shift": distribution_shift,
         "duplicate_windows": duplicate_windows,
+        "groups": groups_report,
         "warnings": warnings,
+        "violations": violations,
     }
+
+
+def enforce_strict_data_audit(
+    report: Dict[str, object],
+    context: str = "",
+) -> bool:
+    """
+    严格数据审计：报告中存在致命问题（数据泄露/标签噪声）时
+    打印明细并返回 False，否则返回 True。
+
+    调用方据此拒绝开始训练或拒绝解封测试集：宁可停在这一步，
+    也不在已泄露的数据上产出「看起来有效」的结论。
+    """
+    violations = report.get("violations") or []
+
+    if not violations:
+        return True
+
+    where = f"（{context}）" if context else ""
+    print(f"[data] 严格数据审计未通过{where}：")
+    for violation in violations:
+        print(f"[data]   严重: {violation}")
+
+    return False
 
 
 def print_data_audit(report: Dict[str, object]) -> None:
@@ -2210,6 +2589,19 @@ def print_data_audit(report: Dict[str, object]) -> None:
         for name, info in splits.items()
     ]
     print("[data] 数据审计: " + ", ".join(parts))
+
+    groups = report.get("groups")
+    if isinstance(groups, dict):
+        per_split = groups.get("groups_per_split") or {}
+        print(
+            "[data]   群组划分: 分隔符长度 "
+            f"{groups.get('separator_length')}B, "
+            "groups="
+            + ", ".join(
+                f"{name}:{count}"
+                for name, count in per_split.items()
+            )
+        )
 
     for key, distance in report.get(
         "distribution_shift",
@@ -2227,8 +2619,15 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 f"{info['shared_signatures']}"
             )
 
+    violation_set = set(report.get("violations", []))
+
     for warning in report.get("warnings", []):
-        print(f"[data] 警告: {warning}")
+        # 致命问题在下面以「严重」单独打印，避免重复两遍。
+        if warning not in violation_set:
+            print(f"[data] 警告: {warning}")
+
+    for violation in report.get("violations", []):
+        print(f"[data] 严重: {violation}")
 
 
 # ============================================================
@@ -3565,36 +3964,50 @@ def run_statistical_baseline(
         )
         print_data_audit(test_audit)
 
-        test_windows = _ngram_eval_batches(
-            dataset,
+        if args.strict_data_audit and not enforce_strict_data_audit(
+            test_audit,
             "test",
-            args.batch_size,
-            args.eval_batches,
-        )
-
-        test_metrics = _ngram_extended_metrics(
-            model,
-            test_windows,
-            best_alpha,
-            best_order,
-            split="test",
-        )
-
-        _write({
-            "step": "test",
-            "model": "ngram",
-            "ngram_order": best_order,
-            "ngram_alpha": best_alpha,
-            **test_metrics,
-            "data_audit": test_audit,
-        })
-
-        print(
-            json.dumps(
-                _json_safe({"test": test_metrics}),
-                ensure_ascii=False,
+        ):
+            # 统计基线同样不能在泄露/损坏的测试集上报告指标；
+            # 不写 test 记录，名额未消耗。
+            print(
+                "[test] 严格数据审计在测试集上发现泄露/损坏"
+                "问题：拒绝解封测试集（不写入 test 记录）。"
+                "请先清洗数据后重跑。"
             )
-        )
+            test_windows = None
+        else:
+            test_windows = _ngram_eval_batches(
+                dataset,
+                "test",
+                args.batch_size,
+                args.eval_batches,
+            )
+
+        if test_windows is not None:
+            test_metrics = _ngram_extended_metrics(
+                model,
+                test_windows,
+                best_alpha,
+                best_order,
+                split="test",
+            )
+
+            _write({
+                "step": "test",
+                "model": "ngram",
+                "ngram_order": best_order,
+                "ngram_alpha": best_alpha,
+                **test_metrics,
+                "data_audit": test_audit,
+            })
+
+            print(
+                json.dumps(
+                    _json_safe({"test": test_metrics}),
+                    ensure_ascii=False,
+                )
+            )
 
     metrics_file.close()
 
@@ -3625,6 +4038,7 @@ def run_statistical_baseline(
             "seq_len": dataset.seq_len,
             "val_fraction": dataset.val_fraction,
             "test_fraction": dataset.test_fraction,
+            "group_separator": getattr(args, "group_separator", None),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
             "data_sha256": dataset.data_sha256,
@@ -3647,6 +4061,7 @@ def run_statistical_baseline(
             "bytes": dataset.num_bytes,
             "val_fraction": dataset.val_fraction,
             "test_fraction": dataset.test_fraction,
+            "group_separator": getattr(args, "group_separator", None),
         },
         "data_audit": data_audit,
         "reference_baselines": reference,
@@ -5346,6 +5761,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "residual_scale",
     "val_fraction",
     "test_fraction",
+    "group_separator",
     "eval_interval",
     "eval_batches",
     "data_sha256",
@@ -5448,6 +5864,9 @@ def build_comparison_protocol(
         "residual_scale": cfg.residual_scale,
         "val_fraction": getattr(args, "val_fraction", None),
         "test_fraction": getattr(args, "test_fraction", None),
+        # 群组分隔符决定切分位置（同一文件 + 不同分隔符 =
+        # 不同的数据划分），必须作为受控变量核对。
+        "group_separator": getattr(args, "group_separator", None),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
@@ -5531,6 +5950,10 @@ def experiment_protocol_from_payload(
         "test_fraction": _pick(
             data.get("test_fraction"),
             run_args.get("test_fraction"),
+        ),
+        "group_separator": _pick(
+            data.get("group_separator"),
+            run_args.get("group_separator"),
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
@@ -7074,6 +7497,11 @@ def write_run_config(
                 "data_test_fraction",
                 None,
             ),
+            "group_separator": getattr(
+                args,
+                "group_separator",
+                None,
+            ),
         },
         "data_audit": data_audit,
         "run_metadata": run_metadata,
@@ -8080,6 +8508,9 @@ def run_self_test():
         "重复" in warning
         for warning in clean_audit["warnings"]
     )
+    # 这份合成语料覆盖 0..255 全部字节值（含大量非 UTF-8
+    # 字节），严格审计会把它标记为标签噪声来源；这不影响
+    # 上面的重复检测断言。
 
     with tempfile.NamedTemporaryFile() as repeated_file:
         repeated_file.write(bytes(range(64)) * 4)
@@ -8111,6 +8542,14 @@ def run_self_test():
         "重复" in warning
         for warning in repeated_audit["warnings"]
     )
+    # 跨 split 重复内容是泄露级问题：严格审计必须失败，
+    # 且条目进入 violations 而不是只有 warnings。
+    assert repeated_audit["violations"]
+    assert any(
+        "重复" in violation
+        for violation in repeated_audit["violations"]
+    )
+    assert not enforce_strict_data_audit(repeated_audit)
 
     # 单个字节占主导的退化语料必须被标记（异常值检查）。
     with tempfile.NamedTemporaryFile() as padded_file:
@@ -8175,6 +8614,207 @@ def run_self_test():
         "NUL" in warning
         for warning in corrupt_audit["warnings"]
     )
+    assert corrupt_audit["violations"]
+    assert not enforce_strict_data_audit(corrupt_audit)
+
+    # 多字节 UTF-8 字符横跨 split 边界不能产生假阳性「标签
+    # 噪声」：文件整体合法，切分只是诊断视角。字符「€」的
+    # 三个字节中，前两个落在 train 末尾、最后一个落在 val 开头。
+    boundary_payload = (
+        b"a" * 161 + "\u20ac".encode("utf-8") + b"b" * 16
+    )
+    assert len(boundary_payload) == 180
+
+    with tempfile.NamedTemporaryFile() as boundary_file:
+        boundary_file.write(boundary_payload)
+        boundary_file.flush()
+
+        # val = [162, 171)，train/val 边界正好落在「€」中间。
+        boundary_dataset = ByteDataset(
+            boundary_file.name,
+            seq_len=8,
+        )
+        assert boundary_dataset.split_bounds["train"] == (0, 162)
+        assert boundary_dataset.split_bounds["val"] == (162, 171)
+
+        boundary_audit = audit_data_splits(
+            boundary_dataset,
+            include_test=True,
+        )
+
+    for split_name in ("train", "val", "test"):
+        assert (
+            boundary_audit["splits"][split_name][
+                "utf8_replacements"
+            ]
+            == 0
+        )
+    assert not any(
+        "UTF-8" in warning
+        for warning in boundary_audit["warnings"]
+    )
+    # 合法 UTF-8、无重复的语料没有任何严格级别的致命问题。
+    assert boundary_audit["violations"] == []
+    assert enforce_strict_data_audit(boundary_audit)
+
+    # 群组分隔符解析：转义、字面量、Unicode 与非法输入。
+    assert parse_group_separator("\\n\\n") == b"\n\n"
+    assert parse_group_separator("<|end|>") == b"<|end|>"
+    assert parse_group_separator("\\x00") == b"\x00"
+    assert parse_group_separator("\\u2028") == "\u2028".encode(
+        "utf-8"
+    )
+    assert parse_group_separator("\\\\n") == b"\\n"
+
+    for invalid in ("", "\\", "\\x1", "\\q"):
+        try:
+            parse_group_separator(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"非法群组分隔符必须报错: {invalid!r}"
+            )
+
+    # 群组数据协议：切分位置吸附到群组边界，任何群组都整体
+    # 落在同一个 split 内，train/val/test 之间不交叉。
+    separator = b"\n\n"
+    groups = [
+        bytes([97 + index]) * 10 for index in range(5)
+    ]
+    grouped_payload = separator.join(groups) + separator
+    assert len(grouped_payload) == 5 * 12
+
+    with tempfile.NamedTemporaryFile() as grouped_file:
+        grouped_file.write(grouped_payload)
+        grouped_file.flush()
+
+        grouped_dataset = ByteDataset(
+            grouped_file.name,
+            seq_len=8,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            group_separator=separator,
+        )
+
+        # 名义位置 (36, 48) 恰好是群组边界，无需吸附。
+        assert grouped_dataset.split_bounds["train"] == (0, 36)
+        assert grouped_dataset.split_bounds["val"] == (36, 48)
+        assert grouped_dataset.split_bounds["test"] == (48, 60)
+        assert grouped_dataset.groups_per_split == {
+            "train": 3,
+            "val": 1,
+            "test": 1,
+        }
+
+        # 每个 split 自身都以完整的群组为单位：train 以分隔符
+        # 结尾，val/test 是完整群组的字节。
+        assert bytes(grouped_dataset.train[-2:]) == separator
+        assert bytes(grouped_dataset.val) == groups[3] + separator
+        assert bytes(grouped_dataset.test) == groups[4] + separator
+
+        # 训练批只来自训练群组（内容字节 97、98、99 与分隔符
+        # 0x0a），不会出现 val/test 群组的内容字节 100/101；
+        # val 的固定窗口只来自 val 群组。
+        grouped_x, grouped_y = grouped_dataset.batch(
+            "train",
+            4,
+            torch.Generator().manual_seed(3),
+            eval_device,
+        )
+        assert int(grouped_x.min()) >= 10
+        assert int(grouped_x.max()) <= 99
+        assert int(grouped_y.max()) <= 99
+
+        grouped_val = grouped_dataset.fixed_eval_batch(
+            "val",
+            0,
+            1,
+            2,
+            eval_device,
+        )[0]
+        assert int(grouped_val.min()) == 10
+        assert int(grouped_val.max()) == 100
+
+        grouped_audit = audit_data_splits(
+            grouped_dataset,
+            include_test=True,
+        )
+
+    assert grouped_audit["groups"]["groups_total"] == 5
+    assert grouped_audit["groups"]["groups_per_split"] == {
+        "train": 3,
+        "val": 1,
+        "test": 1,
+    }
+    assert grouped_audit["violations"] == []
+
+    # 名义位置不落在边界上时必须吸附到最近的群组边界。
+    separator_five = b"<END>"
+    groups_five = [
+        bytes([65 + index * 5]) * 15 for index in range(4)
+    ]
+    aligned_payload = separator_five.join(groups_five) + separator_five
+    assert len(aligned_payload) == 80
+
+    with tempfile.NamedTemporaryFile() as aligned_file:
+        aligned_file.write(aligned_payload)
+        aligned_file.flush()
+
+        aligned_dataset = ByteDataset(
+            aligned_file.name,
+            seq_len=8,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            group_separator=separator_five,
+        )
+
+    # 名义 (48, 64) → 吸附到 (40, 60)：2 / 1 / 1 个群组。
+    assert aligned_dataset.split_bounds["train"] == (0, 40)
+    assert aligned_dataset.split_bounds["val"] == (40, 60)
+    assert aligned_dataset.split_bounds["test"] == (60, 80)
+    assert aligned_dataset.groups_per_split == {
+        "train": 2,
+        "val": 1,
+        "test": 1,
+    }
+
+    # 群组过大、无法在保证每段最小长度的情况下整体划分：
+    # 必须显式报错，而不是拆分群组或产生空 split。
+    with tempfile.NamedTemporaryFile() as oversized_file:
+        oversized_file.write(b"x" * 100 + b"SEP" + b"y" * 5)
+        oversized_file.flush()
+
+        try:
+            ByteDataset(
+                oversized_file.name,
+                seq_len=8,
+                group_separator=b"SEP",
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "群组无法整体划分时必须报错"
+            )
+
+    # 语料中根本没有分隔符时也要显式报错。
+    with tempfile.NamedTemporaryFile() as no_sep_file:
+        no_sep_file.write(b"z" * 120)
+        no_sep_file.flush()
+
+        try:
+            ByteDataset(
+                no_sep_file.name,
+                seq_len=8,
+                group_separator=b"<MISSING>",
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "分隔符不存在时必须报错"
+            )
 
     # metrics.jsonl 中的测试记录只能出现一次：已有记录时必须
     # 拒绝重复解封。
@@ -9729,6 +10369,29 @@ def main():
             "不设置时测试集完全不被访问"
         ),
     )
+    parser.add_argument(
+        "--group-separator",
+        type=str,
+        default=None,
+        help=(
+            "群组数据协议：把语料按该分隔符切成「群组」"
+            "（如文档/用户记录分隔符，支持 \\n、\\xHH 等转义），"
+            "train/val/test 的切分位置吸附到群组边界，"
+            "任何群组都不会跨 split（防止同一群组的信息"
+            "同时出现在训练与验证/测试两侧）；不设置时按"
+            "单一字节流在名义位置连续切分"
+        ),
+    )
+    parser.add_argument(
+        "--strict-data-audit",
+        action="store_true",
+        help=(
+            "严格数据审计：训练前的 train/val 审计或解封测试集"
+            "时的审计只要发现越界 token、跨 split 重复内容、"
+            "超阈值的 UTF-8/NUL 损坏，就拒绝开始训练/拒绝"
+            "解封测试集（默认只警告并照常继续）"
+        ),
+    )
 
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=128)
@@ -9983,6 +10646,17 @@ def main():
             "--val-fraction + --test-fraction 必须小于 1"
             "（训练集不能为空）"
         )
+
+    # 群组分隔符在解析阶段就转成字节；非法转义直接报错，
+    # 而不是等到切分阶段才失败。
+    group_separator_bytes: Optional[bytes] = None
+    if args.group_separator is not None:
+        try:
+            group_separator_bytes = parse_group_separator(
+                args.group_separator
+            )
+        except ValueError as error:
+            parser.error(f"--group-separator 无效: {error}")
     if args.early_stop_patience < 0:
         parser.error("--early-stop-patience 不能为负")
     if (
@@ -10297,18 +10971,61 @@ def main():
             )
             args.test_fraction = saved_data_test_fraction
 
+        # 群组分隔符决定吸附后的实际切分位置，与划分比例一样
+        # 是数据划分协议的一部分；resume 时按存档恢复。
+        saved_group_separator = saved_args.get(
+            "group_separator"
+        )
+
+        if (
+            saved_group_separator is not None
+            and saved_group_separator != args.group_separator
+        ):
+            print(
+                "resume restored group_separator "
+                f"{args.group_separator!r} -> "
+                f"{saved_group_separator!r} "
+                "(群组切分是数据划分的一部分)"
+            )
+            args.group_separator = saved_group_separator
+        elif (
+            saved_group_separator is None
+            and args.group_separator is not None
+        ):
+            print(
+                "resume checkpoint predates --group-separator; "
+                "当前按群组切分，train/val/test 位置可能与"
+                "原运行不同"
+            )
+
     cfg.validate()
+
+    # resume 可能把 group_separator 恢复成存档值，
+    # 统一在构造数据管线前重新解析。
+    if args.group_separator is not None:
+        try:
+            group_separator_bytes = parse_group_separator(
+                args.group_separator
+            )
+        except ValueError as error:
+            parser.error(
+                f"--group-separator 无效: {error}"
+            )
 
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
-    dataset = ByteDataset(
-        args.data,
-        cfg.seq_len,
-        val_fraction=args.val_fraction,
-        test_fraction=args.test_fraction,
-        device=device,
-    )
+    try:
+        dataset = ByteDataset(
+            args.data,
+            cfg.seq_len,
+            val_fraction=args.val_fraction,
+            test_fraction=args.test_fraction,
+            device=device,
+            group_separator=group_separator_bytes,
+        )
+    except ValueError as error:
+        parser.error(f"数据管线初始化失败: {error}")
 
     if args.evaluate_test and not dataset.has_test:
         parser.error(
@@ -10361,6 +11078,19 @@ def main():
     # 只在 --evaluate-test 的最终评估时参与审计。
     data_audit = audit_data_splits(dataset, include_test=False)
     print_data_audit(data_audit)
+
+    # 严格数据审计：发现泄露/标签噪声时拒绝开始训练。检查放在
+    # 所有入口（神经训练与统计基线）之前，两种运行都不能在
+    # 已泄露的数据上产出结论。
+    if args.strict_data_audit and not enforce_strict_data_audit(
+        data_audit,
+        "train/val",
+    ):
+        raise SystemExit(
+            "严格数据审计未通过：请先清洗/修复数据"
+            "（去重、修编码、修正群组划分），或去掉 "
+            "--strict-data-audit 仅保留警告。"
+        )
 
     # 统计基线入口：计数、调优、评估、写盘后直接结束，
     # 不进入神经模型训练流程。
@@ -11535,20 +12265,20 @@ def main():
             )
             print_data_audit(test_audit)
 
-            test_metrics = evaluate(
-                model,
-                dataset,
-                args.batch_size,
-                args.eval_batches,
-                device,
-                amp_dtype=amp_dtype,
-                split="test",
-                compute_auc=True,
-            )
-
-            # 坏案例分析随唯一一次解封一起做（val 分析照常）。
-            if args.bad_cases > 0:
-                test_bad_cases = analyze_bad_cases(
+            if args.strict_data_audit and not enforce_strict_data_audit(
+                test_audit,
+                "test",
+            ):
+                # 在已泄露/损坏的测试集上报告指标毫无意义，还会
+                # 留下唯一的 test 记录；直接拒绝解封。
+                print(
+                    "[test] 严格数据审计在测试集上发现泄露/"
+                    "损坏问题：为避免在污染数据上产出最终结论，"
+                    "本次拒绝解封测试集（不写入 test 记录，"
+                    "名额未消耗）。请先清洗数据后重跑。"
+                )
+            else:
+                test_metrics = evaluate(
                     model,
                     dataset,
                     args.batch_size,
@@ -11556,63 +12286,76 @@ def main():
                     device,
                     amp_dtype=amp_dtype,
                     split="test",
-                    top_n=args.bad_cases,
+                    compute_auc=True,
                 )
-                print_bad_cases(test_bad_cases)
-                bad_case_payload["test"] = test_bad_cases
+
+                # 坏案例分析随唯一一次解封一起做（val 分析照常）。
+                if args.bad_cases > 0:
+                    test_bad_cases = analyze_bad_cases(
+                        model,
+                        dataset,
+                        args.batch_size,
+                        args.eval_batches,
+                        device,
+                        amp_dtype=amp_dtype,
+                        split="test",
+                        top_n=args.bad_cases,
+                    )
+                    print_bad_cases(test_bad_cases)
+                    bad_case_payload["test"] = test_bad_cases
+                    metrics_file.write(
+                        json.dumps(
+                            _json_safe({
+                                "step": "bad_cases",
+                                "split": "test",
+                                "tokens_evaluated": test_bad_cases[
+                                    "tokens_evaluated"
+                                ],
+                                "token_accuracy": test_bad_cases[
+                                    "token_accuracy"
+                                ],
+                                "category_counts": test_bad_cases[
+                                    "category_counts"
+                                ],
+                                "top_confusions": test_bad_cases[
+                                    "top_confusions"
+                                ],
+                                "top_cases": test_bad_cases[
+                                    "top_cases"
+                                ],
+                                "summary": test_bad_cases["summary"],
+                            }),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    metrics_file.flush()
+
+                test_record = {
+                    "step": "test",
+                    **test_metrics,
+                    "data_audit": test_audit,
+                }
                 metrics_file.write(
                     json.dumps(
-                        _json_safe({
-                            "step": "bad_cases",
-                            "split": "test",
-                            "tokens_evaluated": test_bad_cases[
-                                "tokens_evaluated"
-                            ],
-                            "token_accuracy": test_bad_cases[
-                                "token_accuracy"
-                            ],
-                            "category_counts": test_bad_cases[
-                                "category_counts"
-                            ],
-                            "top_confusions": test_bad_cases[
-                                "top_confusions"
-                            ],
-                            "top_cases": test_bad_cases[
-                                "top_cases"
-                            ],
-                            "summary": test_bad_cases["summary"],
-                        }),
+                        _json_safe(test_record),
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
                 metrics_file.flush()
 
-            test_record = {
-                "step": "test",
-                **test_metrics,
-                "data_audit": test_audit,
-            }
-            metrics_file.write(
-                json.dumps(
-                    _json_safe(test_record),
-                    ensure_ascii=False,
+                print(
+                    json.dumps(
+                        _json_safe({"test": test_metrics}),
+                        ensure_ascii=False,
+                    )
                 )
-                + "\n"
-            )
-            metrics_file.flush()
-
-            print(
-                json.dumps(
-                    _json_safe({"test": test_metrics}),
-                    ensure_ascii=False,
+                print(
+                    "[test] 测试集已解封并完成唯一一次评估；"
+                    "请不要根据该结果继续调参，否则测试集将退化为"
+                    "隐式验证集。"
                 )
-            )
-            print(
-                "[test] 测试集已解封并完成唯一一次评估；"
-                "请不要根据该结果继续调参，否则测试集将退化为"
-                "隐式验证集。"
-            )
 
     if bad_case_payload:
         with open(

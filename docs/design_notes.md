@@ -57,11 +57,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   （无法 UTF-8 解码的字节序列与 NUL 字节，即字节级标签噪声/语料
   损坏检查）、字节直方图分布偏移（JS 距离）与滑窗重复内容扫描
   （有界采样），警告与统计写入 `config.json` 的 `data_audit`；解封
-  测试集时追加含 test 的审计。恢复训练时若数据指纹或划分比例与
-  存档不一致会明确提示。
-- **群组数据**：当前语料为单一字节流，不存在群组结构；若替换为
-  同一用户/物体产生多条样本的数据集，必须按群组整体划分，
-  train/val/test 任意两侧之间不得交叉。
+  测试集时追加含 test 的审计。恢复训练时若数据指纹、划分比例或
+  群组分隔符与存档不一致会明确提示。文本完整性扫描在 split 边界
+  处先做解码器状态预热，多字节 UTF-8 字符横跨切分点不会被误报为
+  标签噪声；`final` 只在文件真正末尾置 True，截断字符才会报
+  U+FFFD。
+- **群组数据**：传入 `--group-separator` 时，语料按分隔符切成
+  「群组」（同一文档/用户/物体产生的内容），train/val/test 的切分
+  位置吸附到群组边界：任何群组整体落在同一个 split，两侧之间零
+  交叉（构造时另有防御性断言）。吸附后若无法保证每段至少
+  `seq_len + 1` 字节（如单个群组过大）则显式报错，不拆分群组。
+  `data_audit.groups` 记录分隔符与每个 split 的完整群组数；
+  `comparison_protocol.group_separator` 把分隔符纳入受控变量。
+- **严格审计**：`--strict-data-audit` 把泄露级问题（跨 split 重复
+  窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
+  训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
+  解封且不写 test 记录。默认只警告，便于先诊断再清洗。
 
 ## 代码组织
 
@@ -71,8 +82,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `TransformerBlock`：注意力步骤、MoE 步骤，以及分支与两轮路由逻辑。
 - `LanguageModel`：按模式组装完整前向。
 - `ByteDataset`、`evaluate`：字节级数据管线与按 split 的固定窗口评估。
-- `audit_data_splits`、`_window_signature_scan`、`_scan_text_integrity`：
-  数据审计（值域、文本完整性/标签噪声、分布偏移、重复窗口）。
+- `parse_group_separator`、`_snap_group_split`、`_count_groups`：
+  群组分隔符解析与「群组整体不跨界」的切分位置吸附。
+- `audit_data_splits`、`_window_signature_scan`、`_scan_text_integrity`、
+  `enforce_strict_data_audit`：数据审计（值域、文本完整性/标签噪声、
+  分布偏移、重复窗口）与严格模式下的泄露拦截。
 - `run_sanity_overfit`：训练前的过拟合小批量 sanity check。
 - `save_checkpoint`、`load_checkpoint`：断点存档与恢复。
 - `save_selected_model`、`load_selected_model`、`restore_selected_weights`：
@@ -206,7 +220,9 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--grad-checkpoint`、`--compile`、`--seed`、`--note`、`--sanity-only`、
 `--skip-sanity-check`、`--sanity-batch-size`、`--sanity-steps`、
 `--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`、
-`--val-fraction`、`--test-fraction`、`--evaluate-test`。
+`--val-fraction`、`--test-fraction`、`--evaluate-test`、
+`--group-separator`（群组整体划分）、`--strict-data-audit`
+（泄露级审计问题拒绝训练/拒绝解封测试集）。
 
 结果分析相关参数：`--early-stop-patience`（默认 0，关闭早停）、
 `--early-stop-min-delta`、`--bad-cases`（默认 10，0 关闭）、
