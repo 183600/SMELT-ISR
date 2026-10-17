@@ -540,19 +540,6 @@ class SparseMoE(nn.Module):
             self.router.weight,
         ).float()
 
-        # 辅助负载均衡项只在 balance_coef > 0 且梯度开启时
-        # 参与总损失；其余情况下（balance_coef=0 的消融臂、
-        # 评估与 sanity check）不必为其建图与保存中间量，
-        # 在 no_grad 下计算同一数值即可。
-        if (
-            self.balance_coef > 0.0
-            and torch.is_grad_enabled()
-        ):
-            router_probs = router_logits.softmax(dim=-1)
-        else:
-            with torch.no_grad():
-                router_probs = router_logits.softmax(dim=-1)
-
         top_values, top_indices = router_logits.topk(
             top_k,
             dim=-1,
@@ -584,20 +571,34 @@ class SparseMoE(nn.Module):
         ):
             self._issue_counts_readback(counts)
 
-        # counts 显式转 fp32，与 soft_load（router_logits 已
-        # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
-        # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
-        # torch.dot 报错。归一化就地完成。
-        hard_load = counts.float()
-        hard_load.div_(flat.size(0))
+        # 辅助负载均衡项只在梯度开启时可能被消费（总损失、
+        # 训练指标）；评估/推理路径（evaluate、measure_efficiency、
+        # no_grad 自测）不读取该标量，直接返回零，省去 softmax /
+        # mean / dot 的计算与显存。balance_coef=0 的消融臂仍在
+        # no_grad 下计算同一数值，保持与训练指标一致。
+        if torch.is_grad_enabled():
+            if self.balance_coef > 0.0:
+                router_probs = router_logits.softmax(dim=-1)
+            else:
+                with torch.no_grad():
+                    router_probs = router_logits.softmax(dim=-1)
 
-        soft_load = router_probs.mean(dim=0)
+            # counts 显式转 fp32，与 soft_load（router_logits 已
+            # .float()）保持同一 dtype；int64 / int 的隐式提升跟随
+            # 全局默认 dtype，非 fp32 时会与 soft_load 不一致导致
+            # torch.dot 报错。归一化就地完成。
+            hard_load = counts.float()
+            hard_load.div_(flat.size(0))
 
-        # 逐专家 f_i * P_i 求和。
-        aux_loss = self.n_experts * torch.dot(
-            hard_load,
-            soft_load,
-        )
+            soft_load = router_probs.mean(dim=0)
+
+            # 逐专家 f_i * P_i 求和。
+            aux_loss = self.n_experts * torch.dot(
+                hard_load,
+                soft_load,
+            )
+        else:
+            aux_loss = router_logits.new_zeros(())
 
         return (
             flat,
@@ -3038,16 +3039,19 @@ def evaluate(
                 ):
                     # 最后一批可能超出封顶：按剩余上限截断，
                     # 保证收集的 token 数严格不超过上限。
+                    # 先按行截断再转 fp32 求 softmax：逐行结果
+                    # 与整批 softmax 后截断逐位一致，但避免为
+                    # 封顶外的行分配 fp32 概率缓冲。
                     remaining = (
                         _AUC_MAX_TOKENS - auc_tokens
                     )
                     probs = F.softmax(
-                        raw_logits.float(),
+                        raw_logits.reshape(
+                            -1,
+                            vocab_size,
+                        )[:remaining].float(),
                         dim=-1,
-                    ).reshape(
-                        -1,
-                        vocab_size,
-                    )[:remaining].cpu()
+                    ).cpu()
                     collected_probs.append(probs)
                     collected_targets.append(
                         flat_target[:remaining].cpu()
