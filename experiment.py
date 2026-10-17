@@ -569,8 +569,8 @@ class SparseMoE(nn.Module):
         self._counts_event = None
         self._counts_stream = None
 
-        # 路由诊断探针（RQ3/RQ4）：默认 None，训练/评估路径上只有
-        # 一次属性判空的开销；仅在 analyze_routing 的诊断前向中挂载。
+        # 路由诊断探针（RQ3/RQ4）：默认 None，仅在
+        # analyze_routing 的诊断前向中挂载。
         self._routing_probe = None
 
         # 批量专家路径的权重 stack 缓存：键为 "gate_up" / "down"，
@@ -598,10 +598,7 @@ class SparseMoE(nn.Module):
         缓存以 (autocast dtype, 版本号, 数据指针) 为签名：任何
         原地更新（优化器更新、加载检查点）都会推进版本号并触发
         重建；参数张量被替换时由 _apply 清空缓存兜底。CUDA
-        autocast 下直接缓存 autocast dtype 的 stack：bmm 的
-        autocast 包装本来就要在每次调用前把 fp32 权重转成
-        autocast dtype，缓存后同一参数版本只需转换一次，同时
-        省去每次 bmm 前的临时转换缓冲（显存减半）。需要反向时
+        autocast 下缓存 autocast dtype 的 stack。需要反向时
         经 _StackedExpertWeights 把梯度按专家散回参数，与
         「torch.stack + bmm」在 autocast 下的计算图语义相同。
         """
@@ -630,8 +627,7 @@ class SparseMoE(nn.Module):
             stacked = cached[1]
         else:
             with torch.no_grad():
-                # 直接写入目标 dtype 缓冲，不物化 fp32 中间
-                # stack（转换语义与 stack 后 .to() 相同）。
+                # 转换语义与 stack 后 .to() 相同。
                 stacked = torch.empty(
                     (len(weights), *first.shape),
                     dtype=target_dtype,
@@ -13860,16 +13856,16 @@ def run_self_test():
         assert abs(
             float(tuning_report["winner"]["metric_mean"]) - 4.0
         ) < 1e-12
-        assert tuning_report["budget"]["total_steps"] == 100
+        assert tuning_report["training_config"]["total_steps"] == 100
         assert any(
             "无法在统计上区分" in issue
             for issue in tuning_report["issues"]
         )
 
-        # 候选之间训练预算不一致：调参结论无效，必须报 issue
+        # 候选之间训练配置不一致：调参结论无效，必须报 issue
         # （否则「更优 lr」可能与「训练更久」混杂）。
-        budget_break_path = _write_analysis_run(
-            "tune_budgetbreak_seed42",
+        config_break_path = _write_analysis_run(
+            "tune_configbreak_seed42",
             "dense",
             42,
             1e-4,
@@ -13877,16 +13873,16 @@ def run_self_test():
             0.01,
             3.5,
         )
-        budget_break_controlled = analyze_baseline_tuning(
-            compare_runs(tuning_paths + [budget_break_path]),
+        config_break_controlled = analyze_baseline_tuning(
+            compare_runs(tuning_paths + [config_break_path]),
             "val_loss",
             "dense",
             [1e-4, 3e-4],
             [42, 43, 44],
         )
         assert any(
-            "训练预算" in issue
-            for issue in budget_break_controlled["issues"]
+            "训练配置" in issue
+            for issue in config_break_controlled["issues"]
         )
 
         # 调参报告落盘 → 读回 → 来源核对：模式 / winner lr /
@@ -14289,7 +14285,7 @@ _SWEEP_BOOL_FLAGS = (
 )
 
 # 基线调参协议：简单基线（默认 dense）先在 val 上做预注册的
-# 学习率网格搜索，各候选训练预算（steps/batch/数据）完全一致，
+# 学习率网格搜索，各候选训练配置（steps/batch/数据）完全一致，
 # 只允许学习率这一个轴变化。调参报告落盘为
 # <out>/baseline_tuning.json，后续基线训练用
 # --baseline-tuning-from 把「这条基线的超参数来自那次调参」
@@ -14404,7 +14400,7 @@ def build_baseline_tuning_plan(
     基线调参网格的运行计划：学习率 × 随机种子。
 
     候选之间只允许学习率不同，其余（steps/batch/数据/模型结构）
-    全部继承同一条命令行，保证调参比较是在固定训练预算下做的
+    全部继承同一条命令行，保证调参比较是在固定训练配置下做的
     「超参数搜索」，而不是偷跑更多步。
     """
     plan: List[Dict[str, object]] = []
@@ -14487,7 +14483,7 @@ def analyze_baseline_tuning(
     Mean ± Std，按方向选出 winner（并列时取更小的学习率，
     更保守、更接近默认值）。
 
-    同时核对调参协议本身：每个候选的训练预算（steps /
+    同时核对调参协议本身：每个候选的训练配置（steps /
     batch_size / 数据指纹）必须完全一致，否则「调参」会
     与「训练得更久」混杂；候选缺指标时显式记录 issue。
     """
@@ -14502,7 +14498,7 @@ def analyze_baseline_tuning(
         "seeds": [int(seed) for seed in seeds],
         "n_candidates": len(lrs) * len(seeds),
         "n_runs": len(rows),
-        "budget": {
+        "training_config": {
             "total_steps": None,
             "batch_size": None,
             "data_sha256": None,
@@ -14516,7 +14512,7 @@ def analyze_baseline_tuning(
         "issues": [],
         "caveats": [
             "调参只看 val：test 集全程尘封，不参与候选排序",
-            "各候选训练预算（steps/batch/数据）完全一致，"
+            "各候选训练配置（steps/batch/数据）完全一致，"
             "调参不会与「训练更久」混杂",
             "调参后应固定 winner 配置训练最终基线，并用 "
             "--baseline-tuning-from 记录来源；复杂模型必须"
@@ -14524,29 +14520,29 @@ def analyze_baseline_tuning(
         ],
     }
 
-    # 预算一致性：调参网格的受控变量。只统计有协议记录的
-    # 运行，缺失记录不能被当成「预算不同」虚报。
-    budget_values = set()
+    # 训练配置一致性：调参网格的受控变量。只统计有协议记录的
+    # 运行，缺失记录不能被当成「训练配置不同」虚报。
+    config_values = set()
     for row in rows:
         protocol = row.get("protocol")
         if not isinstance(protocol, dict):
             continue
-        budget_values.add((
+        config_values.add((
             protocol.get("total_steps"),
             protocol.get("batch_size"),
             protocol.get("data_sha256"),
         ))
-    if len(budget_values) > 1:
+    if len(config_values) > 1:
         report["issues"].append(
-            "候选之间的训练预算（total_steps / batch_size / "
+            "候选之间的训练配置（total_steps / batch_size / "
             "数据指纹）不一致，调参结果与「训练得更久或数据"
             "不同」混杂，不可用于选择基线超参数"
         )
-    elif budget_values:
+    elif config_values:
         total_steps, batch_size, data_sha256 = next(
-            iter(budget_values)
+            iter(config_values)
         )
-        report["budget"] = {
+        report["training_config"] = {
             "total_steps": total_steps,
             "batch_size": batch_size,
             "data_sha256": data_sha256,
@@ -14668,7 +14664,7 @@ def print_baseline_tuning_report(
         if report.get("higher_is_better")
         else "越低越好"
     )
-    budget = report.get("budget") or {}
+    config = report.get("training_config") or {}
 
     print()
     print(
@@ -14677,8 +14673,8 @@ def print_baseline_tuning_report(
     )
     print(
         f"  模式: {report['mode']}；指标: {metric}（{direction}）；"
-        f"预算: steps={budget.get('total_steps')}, "
-        f"batch_size={budget.get('batch_size')}"
+        f"训练配置: steps={config.get('total_steps')}, "
+        f"batch_size={config.get('batch_size')}"
     )
     print(f"  {'lr':>10} {'n':>3} {'mean':>12} {'std':>12}")
 
@@ -14815,16 +14811,16 @@ def baseline_tuning_provenance_error(
             "必须真实复用于基线训练，不能借用调参报告"
         )
 
-    budget = payload.get("budget") or {}
-    record_steps = budget.get("total_steps")
+    config = payload.get("training_config") or {}
+    record_steps = config.get("total_steps")
     if record_steps is not None and int(steps) != int(record_steps):
         return (
-            f"当前 --steps={int(steps)} 与调参预算 "
+            f"当前 --steps={int(steps)} 与调参训练配置 "
             f"steps={int(record_steps)} 不一致：学习率是在"
-            "原预算下调出来的，预算变了应重新调参"
+            "原训练配置下调出来的，训练配置变了应重新调参"
         )
 
-    record_sha = budget.get("data_sha256")
+    record_sha = config.get("data_sha256")
     if (
         isinstance(record_sha, str)
         and record_sha
@@ -14857,7 +14853,7 @@ def baseline_tuning_provenance_record(
         "winner_mean": winner.get("metric_mean"),
         "n_candidates": payload.get("n_candidates"),
         "grid": payload.get("grid"),
-        "budget": payload.get("budget"),
+        "training_config": payload.get("training_config"),
     }
 
 
@@ -15278,7 +15274,7 @@ def main():
         help=(
             "配合 --seeds：对简单基线（--baseline-tuning-mode）"
             "做预注册的学习率网格搜索（--baseline-tuning-lrs，"
-            "训练预算固定），在 val 上选 winner 并写出 "
+            "训练配置固定），在 val 上选 winner 并写出 "
             "baseline_tuning.json；没调过参的弱基线只能证明"
             "复杂模型比稻草人强"
         ),
