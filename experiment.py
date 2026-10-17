@@ -422,6 +422,15 @@ class Expert(nn.Module):
 # Sparse MoE
 # ============================================================
 
+# 批量专家路径的填充浪费上限：padded 行数（n_experts *
+# max(counts)）超过 assignment 总数的该倍数时，退回逐专家
+# 循环路径。均衡路由下浪费通常只有百分之几；路由坍缩
+#（如 balance_coef=0 的消融臂）时避免按 n_experts 倍
+# 放大计算量与激活显存。阈值判定只依赖确定性的 counts，
+# 相同数据始终选择同一路径。
+_MOE_PAD_WASTE_LIMIT = 1.25
+
+
 class _MergeExpertOutputs(torch.autograd.Function):
     """
     dispatch 的输出侧：把各专家输出散射回原始 assignment 顺序。
@@ -667,6 +676,121 @@ class SparseMoE(nn.Module):
             return self._counts_stage.tolist()
         return counts.tolist()
 
+    def _batched_experts_forward(
+        self,
+        inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        对 [n_experts, rows, dim] 的批量输入执行全部专家计算。
+
+        各专家权重 stack 成批量矩阵后用 bmm 一次完成两层
+        GEMM，替代逐专家的小 GEMM 循环；stack 的反向按
+        切片把梯度散回各专家参数，参数与检查点格式不变。
+        SwiGLU 语义与 Expert.forward 完全一致。
+        """
+        gate_up_weight = torch.stack(
+            [
+                expert.gate_up.weight
+                for expert in self.experts
+            ]
+        )
+
+        gate_up = torch.bmm(
+            inputs,
+            gate_up_weight.transpose(1, 2),
+        )
+
+        if gate_up.requires_grad:
+            hidden = _SwiGLU.apply(gate_up)
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            hidden = F.silu(gate, inplace=True).mul_(up)
+
+        down_weight = torch.stack(
+            [
+                expert.down.weight
+                for expert in self.experts
+            ]
+        )
+
+        return torch.bmm(
+            hidden,
+            down_weight.transpose(1, 2),
+        )
+
+    def _dispatch_batched(
+        self,
+        counts_tensor: torch.Tensor,
+        gathered: torch.Tensor,
+        perm: torch.Tensor,
+        assignment_experts: torch.Tensor,
+        counts: List[int],
+        max_count: int,
+        num_tokens: int,
+        top_k: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """
+        零填充 + 批量 bmm 的专家计算路径。
+
+        排序后的各专家段被散射进 [n_experts, max_count, dim]
+        的零填充缓冲，逐专家 GEMM 合并为两次 bmm。填充行的
+        输入是精确的 0：其前向输出为 0，对权重梯度的贡献
+        也恒为精确的 0（0 与任何浮点值相乘得 0.0），因此
+        与逐专家循环路径的数值语义一致。
+
+        行布局由 dest 完整描述：gathered 的第 j 行写入
+        padded 展平缓冲的 dest[j] 位置；输出侧
+        outputs[perm[j]] <- out[dest[j]]。dest 互不重复
+        且并集只差填充行，index_add_ 反传在每个位置至多
+        累加一个梯度项，顺序无关。
+        """
+        n_experts = self.n_experts
+        total = gathered.size(0)
+        device = gathered.device
+
+        # 各专家段在排序序列中的起始行（设备侧 cumsum，
+        # 不引入额外同步）。
+        starts = torch.cumsum(counts_tensor, dim=0) - (
+            counts_tensor
+        )
+
+        # 排序后第 j 行所属专家。
+        seg_id = assignment_experts.index_select(0, perm)
+
+        # 排序后第 j 行写入 padded 展平缓冲的目标位置。
+        dest = (
+            torch.arange(total, device=device)
+            - starts[seg_id]
+            + seg_id * max_count
+        )
+
+        padded = gathered.new_zeros(
+            n_experts * max_count,
+            dim,
+        )
+        padded.index_copy_(0, dest, gathered)
+        padded = padded.view(n_experts, max_count, dim)
+
+        out = self._batched_experts_forward(padded).view(
+            n_experts * max_count,
+            dim,
+        )
+
+        # 散射回原始 assignment 顺序。
+        outputs = torch.empty(
+            total,
+            dim,
+            dtype=out.dtype,
+            device=device,
+        )
+        outputs.index_copy_(
+            0,
+            perm,
+            out.index_select(0, dest),
+        )
+        return outputs.view(num_tokens, top_k, dim)
+
     def dispatch(
         self,
         flat: torch.Tensor,
@@ -702,19 +826,19 @@ class SparseMoE(nn.Module):
             )
 
         # 稠密路由（top_k == n_experts）：每个 token 被分配给
-        # 所有专家。每位专家处理完整输入，再按路由下标
+        # 所有专家。所有专家共用同一份输入，expand 出
+        # 批量维后一次 bmm 完成全部专家计算，再按路由下标
         # gather 回 [token, slot] 位置。
         if top_k == self.n_experts:
-            # 所有专家共用同一份输入副本。
             expert_flat = self._cast_for_autocast(flat)
 
-            per_expert = torch.stack(
-                [
-                    expert.forward(expert_flat)
-                    for expert in self.experts
-                ],
-                dim=1,
-            )
+            per_expert = self._batched_experts_forward(
+                expert_flat.unsqueeze(0).expand(
+                    self.n_experts,
+                    num_tokens,
+                    dim,
+                )
+            ).transpose(0, 1)
             gather_index = top_indices.unsqueeze(-1).expand(
                 num_tokens,
                 top_k,
@@ -756,8 +880,29 @@ class SparseMoE(nn.Module):
         gather_source = self._cast_for_autocast(flat)
         gathered = gather_source.index_select(0, sorted_token_ids)
 
-        counts = self._read_counts(counts)
-        segments = gathered.split(counts, dim=0)
+        counts_list = self._read_counts(counts)
+        max_count = max(counts_list)
+
+        # 填充浪费受 _MOE_PAD_WASTE_LIMIT 封顶时走批量
+        # bmm 路径：把逐专家小 GEMM 循环合并为两次批量
+        # GEMM，显著减少算子派发与 autograd 节点数量。
+        if (
+            self.n_experts * max_count
+            <= _MOE_PAD_WASTE_LIMIT * gathered.size(0)
+        ):
+            return self._dispatch_batched(
+                counts,
+                gathered,
+                perm,
+                assignment_experts,
+                counts_list,
+                max_count,
+                num_tokens,
+                top_k,
+                dim,
+            )
+
+        segments = gathered.split(counts_list, dim=0)
 
         # 逐专家计算其连续输入段；空段原样占位，不产生
         # 专家调用。
@@ -769,7 +914,7 @@ class SparseMoE(nn.Module):
                 else segment
             )
             for count, expert, segment in zip(
-                counts,
+                counts_list,
                 experts,
                 segments,
             )
@@ -780,7 +925,7 @@ class SparseMoE(nn.Module):
         # 空缓冲区会被完整写入。
         return _MergeExpertOutputs.apply(
             perm,
-            counts,
+            counts_list,
             *expert_outputs,
         ).view(
             num_tokens,
