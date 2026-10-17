@@ -4317,7 +4317,14 @@ def analyze_training_curve(
 
         val_loss = record.get("val_loss")
 
-        if val_loss is None:
+        # 盘上记录里的 NaN/Inf 会被 _json_safe 写成 null，但内存中
+        # 的在线记录保留原值；两者都按非有限事件处理，避免 NaN
+        # 流入 _sparkline 的 int() 转换导致崩溃。
+        if (
+            val_loss is None
+            or not isinstance(val_loss, (int, float))
+            or not math.isfinite(float(val_loss))
+        ):
             if (
                 not nonfinite_steps
                 or nonfinite_steps[-1] != step
@@ -5203,21 +5210,25 @@ def _check_batch_integrity(
             info["nonfinite_elements"] = int(
                 info["nonfinite_elements"]
             ) + int((~finite_mask).sum())
-            if bool(finite_mask.any()):
-                finite_values = tensor[finite_mask]
+            finite_values = tensor[finite_mask]
+            if finite_values.numel() > 0:
                 info[f"{name}_min"] = float(
                     finite_values.min()
                 )
                 info[f"{name}_max"] = float(
                     finite_values.max()
                 )
+            # NaN/Inf 已在上面单独计数；值域检查只看有限元素，
+            # 避免 NaN→int64 的未定义转换被重复计为越界。
+            comparison = finite_values.to(torch.int64)
         else:
             info[f"{name}_min"] = int(tensor.min())
             info[f"{name}_max"] = int(tensor.max())
+            # uint8 与 Python 整数比较会按 uint8 回绕（如
+            # 255 >= 256 会溢出成 255 >= 0 而误报），先提升到
+            # int64 再判值域。
+            comparison = tensor.to(torch.int64)
 
-        # uint8 与 Python 整数比较会按 uint8 回绕（如 255 >= 256
-        # 会溢出成 255 >= 0 而误报），先提升到 int64 再判值域。
-        comparison = tensor.to(torch.int64)
         info["out_of_range_elements"] = int(
             info["out_of_range_elements"]
         ) + int(
@@ -7127,8 +7138,8 @@ def _contrast_display(
     # 统计显著性与实际意义分开：显著但差值小于种子波动
     # （噪声比 < 1）时提示谨慎解读；不显著时禁止声称提升。
     caveat = ""
-    if contrast.get("significant") and noise is not None:
-        if float(noise) < 1.0:
+    if contrast.get("significant"):
+        if noise is not None and float(noise) < 1.0:
             caveat = "（差值小于典型种子波动，实际意义存疑）"
     elif verdict == "改善" and test in ("paired_t", "welch_t"):
         caveat = "（未达显著水平，不能据此声称提升）"
@@ -8026,11 +8037,28 @@ def write_run_config(
                 previous = json.load(f)
         except (OSError, json.JSONDecodeError):
             previous = None
-        if isinstance(previous, dict) and "efficiency" in previous:
-            payload.setdefault(
-                "efficiency",
-                previous["efficiency"],
-            )
+        if isinstance(previous, dict):
+            if "efficiency" in previous:
+                payload.setdefault(
+                    "efficiency",
+                    previous["efficiency"],
+                )
+            # resume 通常不再重复传 --hypothesis/--rq；此时保留原
+            # 运行记录的科学假设，避免重写 config.json 时丢失。
+            if getattr(args, "resume", None) is not None:
+                for key in ("hypothesis", "research_question"):
+                    previous_value = previous.get(key)
+                    if (
+                        not str(payload.get(key) or "").strip()
+                        and isinstance(previous_value, str)
+                        and previous_value.strip()
+                    ):
+                        payload[key] = previous_value
+                if (
+                    previous.get("hypothesis_check_skipped")
+                    and not payload["hypothesis_check_skipped"]
+                ):
+                    payload["hypothesis_check_skipped"] = True
 
     # config.json 是实验追踪的唯一来源，写入中途崩溃不能留下
     # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
@@ -8051,13 +8079,15 @@ def write_run_config(
             suffix=".tmp",
             delete=False,
         ) as handle:
+            # 先记录临时文件路径再写内容：json.dump 中途失败时
+            # finally 才能清理掉半截文件。
+            temp_path = Path(handle.name)
             json.dump(
                 _json_safe(payload),
                 handle,
                 ensure_ascii=False,
                 indent=2,
             )
-            temp_path = Path(handle.name)
 
         os.replace(temp_path, config_path)
         temp_path = None
@@ -8109,13 +8139,15 @@ def update_run_config(out_dir: Path, key: str, value) -> None:
             suffix=".tmp",
             delete=False,
         ) as handle:
+            # 先记录临时文件路径再写内容：json.dump 中途失败时
+            # finally 才能清理掉半截文件。
+            temp_path = Path(handle.name)
             json.dump(
                 _json_safe(payload),
                 handle,
                 ensure_ascii=False,
                 indent=2,
             )
-            temp_path = Path(handle.name)
 
         os.replace(temp_path, path)
         temp_path = None
@@ -8196,9 +8228,13 @@ def test_record_exists(path: Path) -> bool:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if (
-                    isinstance(record, dict)
-                    and record.get("step") == "test"
+                if not isinstance(record, dict):
+                    continue
+                # test 的坏案例记录先于 test 汇总记录写出；中断在
+                # 两者之间时测试集实际已被评估过，同样视为已解封。
+                if record.get("step") == "test" or (
+                    record.get("step") == "bad_cases"
+                    and record.get("split") == "test"
                 ):
                     return True
     except OSError:
@@ -11897,6 +11933,10 @@ def main():
         torch.device("cpu"),
         split="val",
     )
+    # 计算参考基线所用的窗口参数；resume 恢复存档的 batch_size /
+    # eval_batches 后若与命令行不同，需要按恢复值重算（见写
+    # config.json 之前），保证参考基线与模型评估用同一批窗口。
+    reference_window = (args.batch_size, args.eval_batches)
 
     print(
         "[reference] uniform val_loss="
@@ -12311,6 +12351,18 @@ def main():
 
     if rng_payload is not None:
         del rng_payload
+
+    # resume 可能按存档恢复 batch_size / eval_batches（两者都是
+    # 采样与验证轨迹的一部分）；参考基线必须与模型评估使用同一
+    # 批固定窗口，与命令行不同时按恢复后的参数重算。
+    if reference_window != (args.batch_size, args.eval_batches):
+        reference_baselines = compute_reference_baselines(
+            dataset,
+            args.batch_size,
+            args.eval_batches,
+            torch.device("cpu"),
+            split="val",
+        )
 
     train_generator = torch.Generator().manual_seed(
         args.seed
