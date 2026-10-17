@@ -83,6 +83,16 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   （线性层实测 + 注意力估计）。
 - `compare_runs`、`print_comparison`：汇总多个运行目录的
   config 与最终指标。
+- `build_comparison_protocol`、`check_controlled_variables`：
+  受控变量协议记录与一致性检查。
+- `aggregate_runs`、`factor_contrasts`、`_paired_t_test`、
+  `_welch_t_test`、`_two_sided_t_p_value`：按实验单元聚合
+  Mean ± Std、单因子显著性检验（无 SciPy 依赖的 t 分布 p 值）。
+- `ablation_coverage`：2×2 全因子消融覆盖检查。
+- `print_comparison_analysis`、`write_comparison_report`：
+  完整的对比分析输出与 `comparison_analysis.json` 落盘。
+- `strip_sweep_args`、`build_sweep_plan`、`run_experiment_sweep`：
+  多种子 / 模式套件 / 全因子消融的逐进程编排。
 
 ## 结果分析方法
 
@@ -110,7 +120,46 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **早停**：`--early-stop-patience` 启用；NaN 验证损失不算「改善」；
   `--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑语义一致。
 - **运行对比**：`--compare RUN_DIR...` 只读运行目录，汇总各模式
-  在相同数据上的指标。
+  在相同数据上的指标；同时输出受控变量检查、按实验单元聚合的
+  Mean ± Std、单因子显著性检验与消融覆盖报告（见下节）。
+
+## 对比实验与消融协议
+
+对比结论只有在「除待验证模块外，其余设置完全一致」时才可信。
+本项目把这一纪律落到代码里：
+
+- **受控变量协议**：每次训练把优化器（AdamW 及 betas/eps）、
+  学习率与调度、warmup、训练步数、weight decay、梯度裁剪、
+  batch size、数据增强（当前为无增强，显式记录）、数据指纹、
+  模型结构与评估协议写入 `config.json` 的
+  `comparison_protocol` 字段。`--compare` 默认要求这些协议项
+  在声明因子之外逐项一致；不一致会以 `[violation]` 明确列出
+  （如某个运行换了优化器、调了学习率或训练轮数），提示结论
+  无法归因到方法本身。
+- **声明因子**：`--compare-factors`（默认
+  `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）显式声明哪些
+  键允许跨运行不同；其余一律按受控变量核对。因子拼写错误会
+  直接报错，不会静默关闭检查。统计基线（ngram）没有优化器与
+  训练轮数，单独记为 `comparison_family=statistical`，不参与
+  受控变量检查。
+- **统计可靠性**：`--seeds 42 43 44` 对同一命令行配置跑多个
+  随机种子，输出写入 `<out>/seed<SEED>`，结束后自动给出每个
+  实验单元的 Mean ± Std（样本标准差）与单因子对比检验：种子
+  集合相同用配对 t 检验（同种子 = 配对重复），否则用 Welch
+  t 检验，并汇报 p 值与「噪声比」（|Δ|/合并标准差）。种子数
+  少于 3 的实验单元会被标记为统计可靠性不足；p 值仅供参照，
+  关键结论应基于预设对比且种子数 3~5。
+- **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
+  损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前
+  值），四个组合都覆盖后才能同时给出两个创新点各自的主效应
+  与交互；`--suite-modes` 把同一套受控设置应用到多个模式
+  （如 `smelt local_base A B`），保证跨模式对比除模式外所有
+  设置逐项一致。两个套件都自动执行消融覆盖检查，缺失的组合
+  会以 `[missing]` 列出（只报告部分组合不能支撑「各自都有用」
+  的结论）；一次变化多个因子的对比标记为 `[confounded]`。
+- **汇总报告**：套件运行结束后把受控变量检查、聚合统计、
+  单因子对比与消融覆盖写入 `<out>/comparison_analysis.json`；
+  `--compare` 只读运行目录、不写文件。
 
 ## 可复现性与实验追踪
 
@@ -146,4 +195,12 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 结果分析相关参数：`--early-stop-patience`（默认 0，关闭早停）、
 `--early-stop-min-delta`、`--bad-cases`（默认 10，0 关闭）、
 `--skip-efficiency`（跳过结束时的效率测量）、
-`--compare RUN_DIR...`（只读对比多个运行目录，不训练）。
+`--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
+变量检查、Mean ± Std 与显著性检验）、`--compare-factors`、
+`--compare-baseline MODE`、`--compare-metric`。
+
+多种子 / 消融套件：`--seeds SEED [SEED ...]`、
+`--suite-modes MODE [MODE ...]`（配合 `--seeds` 做控变量的
+模式对比）、`--suite-ablation`（配合 `--seeds` 做 2×2 全因子
+消融）。套件逐进程调用自身，结束后自动输出完整对比分析并
+写入 `<out>/comparison_analysis.json`。

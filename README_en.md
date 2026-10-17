@@ -25,6 +25,7 @@ This structure explores whether delayed merging improves the expressiveness of e
   - `local_base`: an immediate-merge control for scheme A, isolating the benefit of delayed merging itself.
 - **Rigorous self-test module**: verifies gradient flow, autoregressive causality, information isolation between branches, and mathematical equivalence at boundary conditions (e.g., scheme B equals SMELT when $k=1$).
 - **Complete training foundation**: resume from checkpoints, gradient clipping, load-balancing loss, LR scheduling, and detailed experiment metrics.
+- **Controlled comparisons and statistical reliability**: every run records a comparison protocol (optimizer, LR schedule, training steps, data augmentation, data fingerprint, ...); `--compare` verifies that everything except the declared experimental factors is identical; `--seeds` runs multiple random seeds and reports Mean ± Std with significance tests; `--suite-ablation` runs the 2×2 full-factorial ablation and checks coverage automatically.
 
 ## 🛠️ Requirements
 
@@ -145,6 +146,27 @@ python experiment.py \
 - **Validation/test protocol**: each evaluation uses fixed windows evenly spaced across the corresponding evaluation split, independent of any RNG, bit-aligned across models and resumed runs; the `final` record is always validation-set based. The test split stays sealed for the entire training run and is evaluated exactly once when `--evaluate-test` is passed (`{"step": "test", ...}`); repeating the flag is refused, so the test set cannot silently become a validation set. All results are appended to `metrics.jsonl`.
 - **Determinism**: the training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN seeds; data sampling is driven by an explicit `torch.Generator` whose seed and state are checkpointed; `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic kernels (a warning is emitted if a CUDA kernel lacks a deterministic implementation). Small cross-hardware numeric differences from reduction order may remain.
 - **Experiment tracking**: each run automatically records the code revision (git commit / dirty flag), environment (Python / torch / CUDA / device), full hyperparameters and seeds, data fingerprint (SHA-256, byte count), training curves and final results in `config.json` and `metrics.jsonl` — no manual bookkeeping required.
+- **Controlled-variable checking**: `config.json` stores a `comparison_protocol` field (optimizer AdamW with betas/eps, LR and schedule, warmup, total steps, weight decay, gradient clipping, batch size, data augmentation, data fingerprint, model architecture and evaluation protocol). `--compare` requires all of these to match exactly unless declared as a factor via `--compare-factors` (default `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`); a run that silently changed optimizer, LR or step count is reported as a violation, so tuning gains cannot be misattributed to a method.
+- **Statistical reliability**: `--seeds 42 43 44` trains the same configuration for multiple seeds and reports Mean ± Std (sample std) per experimental cell. Shared seed sets use a paired t-test, otherwise Welch's t-test; p-values and the |Δ|/pooled-std noise ratio are shown. Cells with fewer than 3 seeds are flagged as underpowered, and an apparent +0.2% gain with 0.5% seed variance is not treated as real.
+- **Ablation completeness**: `--suite-ablation` runs the 2×2 full factorial of delayed merge × balance loss (`local_base`/`A` × `balance_coef`=0/current), covering all four cells needed to show that each design choice helps on its own; the coverage check lists any missing cell. `--suite-modes` runs multiple modes under one controlled setting (e.g. `smelt local_base A B`). Suite runs write the full analysis to `<out>/comparison_analysis.json`.
+
+### Multi-seed and ablation suite examples
+
+```bash
+# RQ1: compare smelt / local_base / A / B under identical settings, 3 seeds each
+python experiment.py --data corpus.txt --out runs/rq1 \
+  --seeds 42 43 44 --suite-modes smelt local_base A B \
+  --steps 2000 --hypothesis "delayed merge improves val loss" --rq RQ1
+
+# 2x2 full-factorial ablation: local_base/A x balance_coef=0/0.01
+python experiment.py --data corpus.txt --out runs/ablation \
+  --seeds 42 43 44 --suite-ablation \
+  --steps 2000 --hypothesis "each design choice helps" --rq RQ1
+
+# Read-only summary of finished runs: controlled-variable check + Mean ± Std + tests
+python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
+  runs/ablation/A_bal0_seed42 --compare-baseline smelt
+```
 
 ## 📂 Output layout
 

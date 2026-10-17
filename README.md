@@ -25,6 +25,7 @@ SMELT-ISR 是基于 [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Tra
   - `local_base`: 方案 A 的立即合并对照组，用于隔离“延迟合并”本身带来的收益。
 - **严谨的自测模块**：验证梯度流通、自回归因果性、分支间的信息隔离，以及边界条件下的数学等价性（如 $k=1$ 时方案 B 与 SMELT 等价）。
 - **完整训练基座**：支持断点恢复、梯度裁剪、负载均衡损失、学习率调度和详细的实验指标记录。
+- **控变量对比与统计可靠性**：每轮训练记录受控变量协议（优化器、学习率策略、训练步数、数据增强、数据指纹等），`--compare` 自动核对「除声明因子外设置是否完全一致」；`--seeds` 支持多随机种子运行并汇报 Mean ± Std 与显著性检验，`--suite-ablation` 提供 2×2 全因子消融，自动检查消融组合是否完整。
 
 ## 🛠️ 环境依赖
 
@@ -152,6 +153,27 @@ python experiment.py \
 - **验证/测试协议**：每次评估使用跨评估 split 等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐；训练期间的 `final` 记录是验证集口径，测试集默认全程尘封，仅在显式传入 `--evaluate-test` 时解封评估一次（`{"step": "test", ...}`），重复传参会被拒绝，避免测试集变成隐式验证集。所有结果追加到 `metrics.jsonl`。
 - **确定性**：训练入口固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子，数据采样由显式 `torch.Generator` 承担（种子与状态随检查点存档），并设置 `CUBLAS_WORKSPACE_CONFIG`、要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。跨硬件架构仍可能因浮点归约顺序产生微小差异。
 - **实验追踪**：每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
+- **受控变量检查**：`config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、数据指纹、模型结构与评估协议。`--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数会被明确列出，避免把调参收益误当成方法本身的收益。
+- **统计可靠性**：`--seeds 42 43 44` 对同一配置跑多个随机种子，自动汇报每个实验单元的 Mean ± Std（样本标准差）；种子集合相同用配对 t 检验、否则用 Welch t 检验，给出 p 值与噪声比（|Δ|/合并标准差）。种子数少于 3 会被标记为统计功效不足；只有 0.2% 的提升而种子间方差有 0.5% 时不会被当成有效提升。
+- **消融完整性**：`--suite-ablation` 运行「延迟合并 × 均衡损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前值），覆盖全部四个组合后才能支撑两个设计各自有用的结论；覆盖检查会列出缺失的组合。`--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
+
+### 多随机种子与消融套件示例
+
+```bash
+# RQ1：同一套受控设置下比较 smelt / local_base / A / B，每个 3 个种子
+python experiment.py --data corpus.txt --out runs/rq1 \
+  --seeds 42 43 44 --suite-modes smelt local_base A B \
+  --steps 2000 --hypothesis "延迟合并改善验证损失" --rq RQ1
+
+# 2×2 全因子消融：local_base/A × balance_coef=0/0.01
+python experiment.py --data corpus.txt --out runs/ablation \
+  --seeds 42 43 44 --suite-ablation \
+  --steps 2000 --hypothesis "两个设计各自有用" --rq RQ1
+
+# 只读汇总已完成运行：受控变量检查 + Mean ± Std + 显著性检验
+python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
+  runs/ablation/A_bal0_seed42 --compare-baseline smelt
+```
 
 ## 📂 输出结构
 

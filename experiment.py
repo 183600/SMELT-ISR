@@ -3481,6 +3481,26 @@ def run_statistical_baseline(
             "ngram_order": best_order,
             "ngram_alpha": best_alpha,
         },
+        # 统计基线没有优化器与训练轮数；comparison_family 让
+        # 受控变量检查只在神经网络运行之间进行。
+        "comparison_protocol": {
+            "comparison_family": "statistical",
+            "optimizer": "none",
+            "lr": None,
+            "lr_schedule": "none",
+            "warmup_steps": None,
+            "total_steps": None,
+            "weight_decay": None,
+            "grad_clip": None,
+            "batch_size": args.batch_size,
+            "data_augmentation": "none",
+            "seq_len": dataset.seq_len,
+            "val_fraction": dataset.val_fraction,
+            "test_fraction": dataset.test_fraction,
+            "eval_interval": None,
+            "eval_batches": args.eval_batches,
+            "data_sha256": dataset.data_sha256,
+        },
         "args": {
             key: value
             for key, value in vars(args).items()
@@ -5020,6 +5040,20 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["top_k"] = run_config.get("top_k")
             row["k1"] = run_config.get("k1")
             row["k2"] = run_config.get("k2")
+            row["balance_coef"] = run_config.get("balance_coef")
+            row["dense_fnn_hidden"] = run_config.get(
+                "dense_fnn_hidden"
+            )
+
+        run_args = config_payload.get("args") or {}
+        if isinstance(run_args, dict):
+            row["seed"] = run_args.get("seed")
+
+        # 受控变量协议：对比分析用它检查「除声明因子外，
+        # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
+        row["protocol"] = experiment_protocol_from_payload(
+            config_payload
+        )
 
         row["n_params"] = config_payload.get("n_params")
 
@@ -5151,6 +5185,1443 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{_value(row.get('peak_memory_mb'), '.1f'):>9} "
             f"{str(row.get('curve_status')):<18}"
         )
+
+
+# ============================================================
+# Comparison analysis: controlled variables / seeds / statistics
+# ============================================================
+
+# 受控变量协议：对比 A 方法与 B 方法时，除声明为实验因子的
+# 模块外，这些设置必须完全一致。每轮训练把这些值写进
+# config.json 的 comparison_protocol 字段；--compare 逐项核对。
+#
+# comparison_family 把「神经网络运行」与「统计基线运行」
+# （ngram，无优化器、无训练轮数）分开：受控变量检查只在
+# 同一 family 内部进行。
+COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
+    "optimizer",
+    "optimizer_betas",
+    "optimizer_eps",
+    "lr",
+    "lr_schedule",
+    "warmup_steps",
+    "total_steps",
+    "weight_decay",
+    "grad_clip",
+    "batch_size",
+    "data_augmentation",
+    "seq_len",
+    "d_model",
+    "n_heads",
+    "n_layers",
+    "n_experts",
+    "expert_hidden",
+    "top_k",
+    "residual_scale",
+    "val_fraction",
+    "test_fraction",
+    "eval_interval",
+    "eval_batches",
+    "data_sha256",
+)
+
+# 允许声明为实验因子（跨运行允许不同）的键：行级字段 +
+# 全部协议键。默认因子覆盖本项目的结构差异（模式、k1/k2、
+# 分支宽度、balance 系数、种子）；学习率、训练步数、数据增强、
+# 数据指纹等不在其中，因此默认就会被当作受控变量检查。
+DEFAULT_COMPARISON_FACTORS = (
+    "mode",
+    "k1",
+    "k2",
+    "balance_coef",
+    "seed",
+    "dense_fnn_hidden",
+)
+
+# 聚合与显著性检验使用的指标。
+COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "val_token_accuracy",
+    "val_macro_f1",
+    "val_pr_auc_macro",
+    "test_loss",
+)
+
+_LOWER_IS_BETTER_METRICS = {
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "test_loss",
+}
+
+# 因子的自然排序（立即合并对照在前，延迟合并在后），
+# 用于让「基线→改进」的差值符号可解释。
+_FACTOR_VALUE_ORDER = {
+    "smelt": 0,
+    "local_base": 1,
+    "A": 2,
+    "B": 3,
+    "dense": 4,
+    "ngram": 5,
+}
+
+# 显著性与统计功效的判定阈值。
+_SIGNIFICANCE_LEVEL = 0.05
+_MIN_SEEDS_FOR_STATS = 2
+_RECOMMENDED_SEEDS = 3
+
+
+def build_comparison_protocol(
+    cfg: Config,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    """
+    汇总一条运行的全部「受控变量」，写入 config.json。
+
+    优化器（AdamW）及其 betas/eps、学习率与调度、训练步数、
+    weight decay、梯度裁剪、batch size、数据增强、数据指纹、
+    模型结构与评估协议全部显式记录；--compare 时默认要求
+    这些值在声明因子之外逐项一致，避免把「换了优化器或调了
+    学习率」误当成方法本身的收益。
+    """
+    return {
+        "comparison_family": "neural",
+        # 优化器固定为 AdamW（betas/eps 使用 PyTorch 默认值），
+        # 显式记录以便未来更换优化器时立即被对比检查发现。
+        "optimizer": "AdamW",
+        "optimizer_betas": [0.9, 0.999],
+        "optimizer_eps": 1e-8,
+        "lr": args.lr,
+        "lr_schedule": "linear_warmup_cosine_to_10pct",
+        "warmup_steps": args.warmup_steps,
+        "total_steps": args.steps,
+        "weight_decay": args.weight_decay,
+        "grad_clip": args.grad_clip,
+        "batch_size": args.batch_size,
+        # 当前字节级管线不做数据增强；显式记录空操作，
+        # 未来加入增强后不同运行会立刻被对比检查发现。
+        "data_augmentation": "none",
+        "seq_len": cfg.seq_len,
+        "d_model": cfg.d_model,
+        "n_heads": cfg.n_heads,
+        "n_layers": cfg.n_layers,
+        "n_experts": cfg.n_experts,
+        "expert_hidden": cfg.expert_hidden,
+        "top_k": cfg.top_k,
+        "residual_scale": cfg.residual_scale,
+        "val_fraction": getattr(args, "val_fraction", None),
+        "test_fraction": getattr(args, "test_fraction", None),
+        "eval_interval": getattr(args, "eval_interval", None),
+        "eval_batches": getattr(args, "eval_batches", None),
+        "data_sha256": getattr(args, "data_sha256", None),
+    }
+
+
+def experiment_protocol_from_payload(
+    payload: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    从 config.json 读取受控变量协议；旧运行没有
+    comparison_protocol 字段时按 args/config/data 尽力回退
+    （能唯一确定的设置才回退，无法确定的留 None，由检查器
+    标记为「缺记录」而不是静默视为一致）。
+    """
+    protocol = payload.get("comparison_protocol")
+    if isinstance(protocol, dict):
+        result = dict(protocol)
+        result.setdefault("comparison_family", "neural")
+        return result
+
+    cfg = payload.get("config") or {}
+    run_args = payload.get("args") or {}
+    data = payload.get("data") or {}
+
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if not isinstance(run_args, dict):
+        run_args = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    def _pick(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    has_training = run_args.get("lr") is not None
+
+    return {
+        "comparison_family": (
+            "statistical"
+            if cfg.get("mode") == "ngram"
+            else "neural"
+        ),
+        # 代码历史上只有一种优化器与一种调度，能唯一确定时
+        # 回退；否则留 None。
+        "optimizer": "AdamW" if has_training else None,
+        "optimizer_betas": (
+            [0.9, 0.999] if has_training else None
+        ),
+        "optimizer_eps": 1e-8 if has_training else None,
+        "lr_schedule": (
+            "linear_warmup_cosine_to_10pct"
+            if has_training
+            else None
+        ),
+        "lr": run_args.get("lr"),
+        "warmup_steps": run_args.get("warmup_steps"),
+        "total_steps": run_args.get("steps"),
+        "weight_decay": run_args.get("weight_decay"),
+        "grad_clip": run_args.get("grad_clip"),
+        "batch_size": run_args.get("batch_size"),
+        "data_augmentation": "none" if has_training else None,
+        "seq_len": cfg.get("seq_len"),
+        "d_model": cfg.get("d_model"),
+        "n_heads": cfg.get("n_heads"),
+        "n_layers": cfg.get("n_layers"),
+        "n_experts": cfg.get("n_experts"),
+        "expert_hidden": cfg.get("expert_hidden"),
+        "top_k": cfg.get("top_k"),
+        "residual_scale": cfg.get("residual_scale"),
+        "val_fraction": _pick(
+            data.get("val_fraction"),
+            run_args.get("val_fraction"),
+        ),
+        "test_fraction": _pick(
+            data.get("test_fraction"),
+            run_args.get("test_fraction"),
+        ),
+        "eval_interval": run_args.get("eval_interval"),
+        "eval_batches": run_args.get("eval_batches"),
+        "data_sha256": data.get("sha256"),
+    }
+
+
+def parse_factor_spec(spec: str) -> List[str]:
+    """
+    解析 --compare-factors 的逗号分隔列表；未知键显式报错，
+    避免拼写错误静默关闭受控变量检查。
+    """
+    keys: List[str] = []
+    for token in spec.split(","):
+        key = token.strip()
+        if key and key not in keys:
+            keys.append(key)
+
+    if not keys:
+        raise ValueError("对比因子列表不能为空")
+
+    candidates = set(COMPARISON_PROTOCOL_KEYS) | {
+        "mode",
+        "k1",
+        "k2",
+        "top_k",
+        "balance_coef",
+        "dense_fnn_hidden",
+        "seed",
+    }
+
+    unknown = [key for key in keys if key not in candidates]
+    if unknown:
+        raise ValueError(
+            "未知的对比因子: "
+            + ", ".join(unknown)
+            + "（可用: "
+            + ", ".join(sorted(candidates))
+            + "）"
+        )
+
+    return keys
+
+
+def _stable_factor_key(value):
+    """
+    把因子值转换成可哈希、可比较的稳定表示。
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(_stable_factor_key(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (key, _stable_factor_key(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (int, float)):
+        return ("number", float(value))
+    return ("value", value)
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, (int, float)):
+        return (0, float(value), "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+def _row_factor_value(
+    row: Dict[str, object],
+    key: str,
+):
+    """
+    读取因子值：优先行级字段（mode/k1/k2/seed/...），
+    回退到受控变量协议（lr/batch_size/...）。
+    """
+    if key in row:
+        return row.get(key)
+
+    protocol = row.get("protocol") or {}
+    if isinstance(protocol, dict):
+        return protocol.get(key)
+
+    return None
+
+
+def _format_factor_value(value) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def check_controlled_variables(
+    rows: List[Dict[str, object]],
+    factors: List[str],
+) -> Dict[str, object]:
+    """
+    受控变量检查：声明为因子的键允许跨运行不同，其余协议项
+    必须逐项一致。
+
+    返回:
+        {
+          "factors": [...],
+          "checked_keys": [...],
+          "violations": [{"key", "values": {run: value}, "missing_runs": [...]}],
+          "n_neural_runs": int,
+          "statistical_runs": [run, ...],
+          "ok": bool,
+        }
+    """
+    factor_set = set(factors)
+
+    neural: List[Dict[str, object]] = []
+    statistical: List[str] = []
+
+    for row in rows:
+        protocol = row.get("protocol") or {}
+        family = "neural"
+        if isinstance(protocol, dict):
+            family = protocol.get("comparison_family") or "neural"
+        if family == "statistical":
+            statistical.append(str(row.get("run")))
+        else:
+            neural.append(row)
+
+    checked: List[str] = []
+    violations: List[Dict[str, object]] = []
+
+    for key in COMPARISON_PROTOCOL_KEYS:
+        if key in factor_set:
+            continue
+
+        values = [
+            (
+                str(row.get("run")),
+                row.get("protocol", {}).get(key)
+                if isinstance(row.get("protocol"), dict)
+                else None,
+            )
+            for row in neural
+        ]
+
+        present = [
+            (name, value)
+            for name, value in values
+            if value is not None
+        ]
+        missing_runs = [
+            name for name, value in values if value is None
+        ]
+
+        if not present:
+            # 所有运行都缺记录：无法判定，不计入检查也不报违规。
+            continue
+
+        checked.append(key)
+
+        distinct = {
+            repr(_stable_factor_key(value))
+            for _, value in present
+        }
+
+        if len(distinct) > 1 or missing_runs:
+            violations.append({
+                "key": key,
+                "values": {
+                    name: value for name, value in values
+                },
+                "missing_runs": missing_runs,
+            })
+
+    return {
+        "factors": list(factors),
+        "checked_keys": checked,
+        "violations": violations,
+        "n_neural_runs": len(neural),
+        "statistical_runs": statistical,
+        "ok": not violations,
+    }
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _sample_std(values: List[float]) -> Optional[float]:
+    """
+    样本标准差（ddof=1）；少于 2 个观测时返回 None。
+    """
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum(
+        (value - mean) ** 2 for value in values
+    ) / (len(values) - 1)
+    return math.sqrt(variance)
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """
+    正则化不完全 Beta 函数的连分式（Lentz 算法），
+    用于无 SciPy 依赖地计算 t 分布 p 值。
+    """
+    max_iterations = 200
+    epsilon = 3.0e-12
+    fpmin = 1.0e-300
+
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < fpmin:
+        d = fpmin
+    d = 1.0 / d
+    h = d
+
+    for iteration in range(1, max_iterations + 1):
+        twice = 2 * iteration
+
+        numerator = (
+            iteration
+            * (b - iteration)
+            * x
+            / ((qam + twice) * (a + twice))
+        )
+        d = 1.0 + numerator * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + numerator / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        h *= d * c
+
+        numerator = (
+            -(a + iteration)
+            * (qab + iteration)
+            * x
+            / ((a + twice) * (qap + twice))
+        )
+        d = 1.0 + numerator * d
+        if abs(d) < fpmin:
+            d = fpmin
+        c = 1.0 + numerator / c
+        if abs(c) < fpmin:
+            c = fpmin
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+
+        if abs(delta - 1.0) < epsilon:
+            break
+
+    return h
+
+
+def _regularized_incomplete_beta(
+    x: float,
+    a: float,
+    b: float,
+) -> float:
+    """
+    I_x(a, b)：正则化不完全 Beta 函数。
+    """
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+
+    log_beta = (
+        math.lgamma(a + b)
+        - math.lgamma(a)
+        - math.lgamma(b)
+    )
+    front = math.exp(
+        log_beta + a * math.log(x) + b * math.log1p(-x)
+    )
+
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
+    """
+    Student t 分布的双侧 p 值 P(|T| >= |t|)。
+    """
+    if df <= 0.0:
+        return None
+    if not math.isfinite(t):
+        return 0.0
+
+    x = df / (df + t * t)
+    return _regularized_incomplete_beta(x, df / 2.0, 0.5)
+
+
+def _paired_t_test(
+    differences: List[float],
+) -> Dict[str, object]:
+    """
+    配对 t 检验（同一组种子上的差值）：检验均值是否为 0。
+    """
+    n = len(differences)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {"test": "insufficient_seeds"}
+
+    mean = sum(differences) / n
+    std = _sample_std(differences)
+
+    if std == 0.0:
+        if mean == 0.0:
+            return {
+                "test": "paired_t",
+                "t": 0.0,
+                "df": float(n - 1),
+                "p_value": 1.0,
+                "note": "zero_variance",
+            }
+        return {
+            "test": "paired_t",
+            "t": None,
+            "df": float(n - 1),
+            "p_value": 0.0,
+            "note": "noise_free_separation",
+        }
+
+    t = mean / (std / math.sqrt(n))
+    return {
+        "test": "paired_t",
+        "t": t,
+        "df": float(n - 1),
+        "p_value": _two_sided_t_p_value(abs(t), float(n - 1)),
+    }
+
+
+def _welch_t_test(
+    values_a: List[float],
+    values_b: List[float],
+) -> Dict[str, object]:
+    """
+    Welch t 检验（种子不重叠或数量不等时使用，不假设等方差）。
+    """
+    n_a = len(values_a)
+    n_b = len(values_b)
+    if n_a < _MIN_SEEDS_FOR_STATS or n_b < _MIN_SEEDS_FOR_STATS:
+        return {"test": "insufficient_seeds"}
+
+    mean_a = sum(values_a) / n_a
+    mean_b = sum(values_b) / n_b
+    var_a = _sample_std(values_a) ** 2
+    var_b = _sample_std(values_b) ** 2
+
+    se_squared = var_a / n_a + var_b / n_b
+    delta = mean_b - mean_a
+
+    if se_squared == 0.0:
+        if delta == 0.0:
+            return {
+                "test": "welch_t",
+                "t": 0.0,
+                "df": None,
+                "p_value": 1.0,
+                "note": "zero_variance",
+            }
+        return {
+            "test": "welch_t",
+            "t": None,
+            "df": None,
+            "p_value": 0.0,
+            "note": "noise_free_separation",
+        }
+
+    t = delta / math.sqrt(se_squared)
+    df = se_squared ** 2 / (
+        (var_a / n_a) ** 2 / (n_a - 1)
+        + (var_b / n_b) ** 2 / (n_b - 1)
+    )
+    return {
+        "test": "welch_t",
+        "t": t,
+        "df": df,
+        "p_value": _two_sided_t_p_value(abs(t), df),
+    }
+
+
+def _metric_samples(
+    group_rows: List[Dict[str, object]],
+    metric: str,
+) -> List[Dict[str, object]]:
+    """
+    提取一组运行在某指标上的 (seed, run, value) 样本。
+    """
+    samples: List[Dict[str, object]] = []
+    for row in group_rows:
+        value = row.get(metric)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            samples.append({
+                "seed": row.get("seed"),
+                "run": row.get("run"),
+                "value": float(value),
+            })
+    return samples
+
+
+def aggregate_runs(
+    rows: List[Dict[str, object]],
+    group_keys: List[str],
+    metric_keys: Tuple[str, ...] = COMPARISON_METRIC_KEYS,
+) -> List[Dict[str, object]]:
+    """
+    按因子组合分桶，汇报 Mean ± Std（样本标准差）。
+
+    每个桶 = 一个实验单元（cell），桶内不同随机种子是
+    重复实验；std 反映种子间方差。桶内只有 1 个种子时 std
+    为 None，分析阶段会提示统计可靠性不足。
+    """
+    groups: Dict[tuple, List[Dict[str, object]]] = {}
+    order: List[tuple] = []
+
+    for row in rows:
+        key = tuple(
+            _stable_factor_key(_row_factor_value(row, name))
+            for name in group_keys
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    aggregates: List[Dict[str, object]] = []
+
+    for key in order:
+        group_rows = groups[key]
+        factor_values = [
+            _row_factor_value(group_rows[0], name)
+            for name in group_keys
+        ]
+
+        if group_keys:
+            label = ", ".join(
+                f"{name}={_format_factor_value(value)}"
+                for name, value in zip(group_keys, factor_values)
+            )
+        else:
+            label = "(全部运行)"
+
+        aggregate: Dict[str, object] = {
+            "label": label,
+            "keys": dict(zip(group_keys, factor_values)),
+            "n_runs": len(group_rows),
+            "runs": [str(r.get("run")) for r in group_rows],
+            "seeds": [
+                r.get("seed")
+                for r in group_rows
+                if r.get("seed") is not None
+            ],
+            "samples": {},
+        }
+
+        for metric in metric_keys:
+            samples = _metric_samples(group_rows, metric)
+            values = [float(s["value"]) for s in samples]
+            mean = _mean(values)
+            std = _sample_std(values)
+
+            aggregate[f"{metric}_mean"] = mean
+            aggregate[f"{metric}_std"] = std
+            aggregate[f"{metric}_n"] = len(values)
+            aggregate["samples"][metric] = samples
+
+            # 没有样本的指标从 JSON 报告中省略，避免大量 null。
+            if mean is None:
+                aggregate.pop(f"{metric}_mean", None)
+                aggregate.pop(f"{metric}_std", None)
+                aggregate.pop(f"{metric}_n", None)
+                aggregate["samples"].pop(metric, None)
+
+        aggregates.append(aggregate)
+
+    aggregates.sort(
+        key=lambda aggregate: [
+            _factor_sort_rank(aggregate["keys"].get(name))
+            for name in group_keys
+        ]
+    )
+
+    return aggregates
+
+
+def metric_higher_is_better(metric: str) -> bool:
+    return metric not in _LOWER_IS_BETTER_METRICS
+
+
+def _contrast_test(
+    samples_a: List[Dict[str, object]],
+    samples_b: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    对比两个实验单元的指标样本：种子集合完全相同时用配对
+    t 检验（同种子 = 配对重复），否则用 Welch t 检验。
+    """
+    by_seed_a = {
+        sample["seed"]: float(sample["value"])
+        for sample in samples_a
+        if sample["seed"] is not None
+    }
+    by_seed_b = {
+        sample["seed"]: float(sample["value"])
+        for sample in samples_b
+        if sample["seed"] is not None
+    }
+
+    common_seeds = sorted(set(by_seed_a) & set(by_seed_b))
+
+    paired = (
+        len(common_seeds) >= _MIN_SEEDS_FOR_STATS
+        and len(common_seeds) == len(by_seed_a)
+        and len(common_seeds) == len(by_seed_b)
+    )
+
+    if paired:
+        differences = [
+            by_seed_b[seed] - by_seed_a[seed]
+            for seed in common_seeds
+        ]
+        result = _paired_t_test(differences)
+        result["n_pairs"] = len(common_seeds)
+        return result
+
+    values_a = [float(sample["value"]) for sample in samples_a]
+    values_b = [float(sample["value"]) for sample in samples_b]
+    result = _welch_t_test(values_a, values_b)
+    result["n_pairs"] = 0
+    return result
+
+
+def factor_contrasts(
+    aggregates: List[Dict[str, object]],
+    group_keys: List[str],
+    metric: str,
+) -> List[Dict[str, object]]:
+    """
+    单因子对比：只有恰好一个因子取值不同的两个实验单元之间
+    做统计检验。全因子消融的每个因子主效应（以及交互）都由
+    若干这样的单因子对比给出；一次变化多个因子的组合被标记
+    为混杂对比，结论无法归因。
+    """
+    contrasts: List[Dict[str, object]] = []
+    higher_is_better = metric_higher_is_better(metric)
+
+    for index_a in range(len(aggregates)):
+        for index_b in range(index_a + 1, len(aggregates)):
+            cell_a = aggregates[index_a]
+            cell_b = aggregates[index_b]
+
+            differing = [
+                name
+                for name in group_keys
+                if cell_a["keys"].get(name)
+                != cell_b["keys"].get(name)
+            ]
+
+            if not differing:
+                continue
+
+            contrast: Dict[str, object] = {
+                "cells": [cell_a["label"], cell_b["label"]],
+                "differing_factors": differing,
+                "confounded": len(differing) > 1,
+            }
+
+            if len(differing) != 1:
+                contrasts.append(contrast)
+                continue
+
+            factor = differing[0]
+
+            # 让「基线值 → 新值」的方向与自然顺序一致，
+            # delta = mean(新) - mean(基线)。
+            rank_a = _factor_sort_rank(
+                cell_a["keys"].get(factor)
+            )
+            rank_b = _factor_sort_rank(
+                cell_b["keys"].get(factor)
+            )
+            if rank_a > rank_b:
+                cell_a, cell_b = cell_b, cell_a
+
+            samples_a = cell_a["samples"].get(metric, [])
+            samples_b = cell_b["samples"].get(metric, [])
+            mean_a = cell_a.get(f"{metric}_mean")
+            mean_b = cell_b.get(f"{metric}_mean")
+            std_a = cell_a.get(f"{metric}_std")
+            std_b = cell_b.get(f"{metric}_std")
+
+            delta = (
+                float(mean_b) - float(mean_a)
+                if mean_a is not None and mean_b is not None
+                else None
+            )
+
+            pooled_std = None
+            if std_a is not None and std_b is not None:
+                pooled_std = math.sqrt(
+                    (float(std_a) ** 2 + float(std_b) ** 2) / 2.0
+                )
+
+            noise_ratio = None
+            if delta is not None and pooled_std:
+                noise_ratio = abs(delta) / pooled_std
+
+            test = _contrast_test(samples_a, samples_b)
+
+            if delta is None:
+                verdict = "missing_metric"
+            else:
+                improvement = (
+                    -delta if not higher_is_better else delta
+                )
+                if improvement > 0:
+                    verdict = "improvement"
+                elif improvement < 0:
+                    verdict = "regression"
+                else:
+                    verdict = "tie"
+
+            contrast.update({
+                "factor": factor,
+                "baseline": cell_a["label"],
+                "variant": cell_b["label"],
+                "baseline_value": cell_a["keys"].get(factor),
+                "variant_value": cell_b["keys"].get(factor),
+                "mean_baseline": mean_a,
+                "mean_variant": mean_b,
+                "std_baseline": std_a,
+                "std_variant": std_b,
+                "delta": delta,
+                "delta_over_noise": noise_ratio,
+                "test": test.get("test"),
+                "t": test.get("t"),
+                "df": test.get("df"),
+                "p_value": test.get("p_value"),
+                "n_pairs": test.get("n_pairs", 0),
+                "significant": (
+                    test.get("p_value") is not None
+                    and float(test["p_value"]) <= _SIGNIFICANCE_LEVEL
+                ),
+                "verdict": verdict,
+            })
+            contrasts.append(contrast)
+
+    return contrasts
+
+
+def _contrast_display(
+    contrast: Dict[str, object],
+    metric: str,
+) -> str:
+    "\"local_base→A\" 等因子变化的人类可读描述。"
+    factor = contrast.get("factor")
+    baseline = _format_factor_value(
+        contrast.get("baseline_value")
+    )
+    variant = _format_factor_value(
+        contrast.get("variant_value")
+    )
+    delta = contrast.get("delta")
+    p_value = contrast.get("p_value")
+    test = contrast.get("test")
+    n_pairs = contrast.get("n_pairs", 0)
+
+    if delta is None:
+        delta_text = "Δ=NA"
+    else:
+        delta_text = f"Δ={float(delta):+.4f}"
+
+    if test == "paired_t":
+        test_text = f"配对 t (n={n_pairs})"
+    elif test == "welch_t":
+        test_text = "Welch t"
+    else:
+        test_text = "种子不足"
+
+    if p_value is None:
+        p_text = "p=NA"
+    else:
+        p_text = f"p={float(p_value):.4f}"
+
+    star = "*" if contrast.get("significant") else ""
+
+    noise = contrast.get("delta_over_noise")
+    noise_text = (
+        f" 噪声比={float(noise):.2f}"
+        if noise is not None
+        else ""
+    )
+
+    verdict_map = {
+        "improvement": "改善",
+        "regression": "变差",
+        "tie": "持平",
+        "missing_metric": "缺指标",
+    }
+    verdict = verdict_map.get(
+        str(contrast.get("verdict")),
+        "",
+    )
+
+    # 同一因子的多个单因子对比（固定其余因子取不同水平）
+    # 用「在 … 下」标注上下文，避免重复行无法区分。
+    context_parts = [
+        part
+        for part in str(contrast.get("baseline", "")).split(", ")
+        if part and not part.startswith(f"{factor}=")
+    ]
+    context = (
+        "（在 " + ", ".join(context_parts) + " 下）"
+        if context_parts
+        else ""
+    )
+
+    # 统计显著性与实际意义分开：显著但差值小于种子波动
+    # （噪声比 < 1）时提示谨慎解读；不显著时禁止声称提升。
+    caveat = ""
+    if contrast.get("significant") and noise is not None:
+        if float(noise) < 1.0:
+            caveat = "（差值小于典型种子波动，实际意义存疑）"
+    elif verdict == "改善" and test in ("paired_t", "welch_t"):
+        caveat = "（未达显著水平，不能据此声称提升）"
+
+    return (
+        f"{factor}: {baseline}→{variant}{context}  "
+        f"{delta_text}  {verdict}  {test_text} "
+        f"{p_text}{star}{noise_text}{caveat}"
+    )
+
+
+def compare_cells_to_baseline(
+    aggregates: List[Dict[str, object]],
+    baseline_mode: Optional[str],
+    metric: str,
+) -> List[Dict[str, object]]:
+    """
+    指定基线模式（--compare-baseline），把每个实验单元与
+    基线单元直接对比。基线模式有多个单元（如 balance_coef
+    不同）时选运行数最多的一个。
+    """
+    if not baseline_mode:
+        return []
+
+    matching = [
+        aggregate
+        for aggregate in aggregates
+        if str(aggregate["keys"].get("mode")) == baseline_mode
+    ]
+    if not matching:
+        return []
+
+    reference = max(
+        matching,
+        key=lambda aggregate: int(aggregate.get("n_runs", 0)),
+    )
+
+    contrasts: List[Dict[str, object]] = []
+
+    for aggregate in aggregates:
+        if aggregate is reference:
+            continue
+        result = _contrast_test(
+            reference["samples"].get(metric, []),
+            aggregate["samples"].get(metric, []),
+        )
+        mean_reference = reference.get(f"{metric}_mean")
+        mean_variant = aggregate.get(f"{metric}_mean")
+        delta = (
+            float(mean_variant) - float(mean_reference)
+            if mean_reference is not None
+            and mean_variant is not None
+            else None
+        )
+        contrasts.append({
+            "factor": "mode",
+            "baseline": reference["label"],
+            "variant": aggregate["label"],
+            "baseline_value": baseline_mode,
+            "variant_value": aggregate["keys"].get("mode"),
+            "mean_baseline": mean_reference,
+            "mean_variant": mean_variant,
+            "std_baseline": reference.get(f"{metric}_std"),
+            "std_variant": aggregate.get(f"{metric}_std"),
+            "delta": delta,
+            "delta_over_noise": None,
+            "test": result.get("test"),
+            "t": result.get("t"),
+            "df": result.get("df"),
+            "p_value": result.get("p_value"),
+            "n_pairs": result.get("n_pairs", 0),
+            "significant": (
+                result.get("p_value") is not None
+                and float(result["p_value"])
+                <= _SIGNIFICANCE_LEVEL
+            ),
+            "verdict": (
+                "missing_metric"
+                if delta is None
+                else "improvement"
+                if (
+                    (-delta if not metric_higher_is_better(metric) else delta)
+                    > 0
+                )
+                else "regression"
+                if delta != 0.0
+                else "tie"
+            ),
+        })
+
+    return contrasts
+
+
+def ablation_coverage(
+    rows: List[Dict[str, object]],
+    factors: List[str],
+) -> Dict[str, object]:
+    """
+    消融完整性检查：延迟合并（local_base→A）与负载均衡损失
+    （balance_coef 开/关）构成 2×2 全因子。报告缺失的组合、
+    种子数不足的单元，以及「B 与 smelt 计算量不等价」这类
+    会把额外计算误解释为方法收益的提醒。
+    """
+    factor_set = set(factors)
+    legend = "local_base/b=off, local_base/b=on, A/b=off, A/b=on"
+
+    report: Dict[str, object] = {
+        "legend": legend,
+        "applicable": (
+            "mode" in factor_set or "balance_coef" in factor_set
+        ),
+        "present_cells": [],
+        "missing_cells": [],
+        "low_replicate_cells": [],
+        "advisories": [],
+        "n_rows": len(rows),
+    }
+
+    if not report["applicable"]:
+        report["advisories"].append(
+            "对比因子未包含 mode/balance_coef，"
+            "无法检查延迟合并与均衡损失的消融覆盖"
+        )
+        return report
+
+    modes_present: Dict[str, int] = {}
+    balance_by_mode: Dict[str, List[object]] = {}
+    merge_pair_cells: Dict[tuple, int] = {}
+
+    for row in rows:
+        mode = str(_row_factor_value(row, "mode"))
+        balance = _row_factor_value(row, "balance_coef")
+        modes_present[mode] = modes_present.get(mode, 0) + 1
+        if mode in {"local_base", "A"}:
+            balance_by_mode.setdefault(mode, [])
+            if balance not in balance_by_mode[mode]:
+                balance_by_mode[mode].append(balance)
+            key = (
+                mode,
+                "off" if balance == 0 else "on",
+            )
+            merge_pair_cells[key] = merge_pair_cells.get(key, 0) + 1
+
+    if "B" in modes_present and "smelt" in modes_present:
+        report["advisories"].append(
+            "B 在第一轮按 k1 个分支执行后续 Attention/MoE，"
+            "与 smelt 直接比较会把计算量差异混入路由机制："
+            "应同时报告等计算的 A vs local_base 对照"
+            "（或按 FLOPs 对齐比较）"
+        )
+
+    if merge_pair_cells == {} and rows:
+        # 运行集里没有 local_base/A：这不是「消融缺失」，而是
+        # 当前对比与延迟合并消融无关（如 smelt 对比 B、统计
+        # 基线对比），给出提醒但不虚报缺失组合。
+        report["advisories"].append(
+            "当前运行集不含 local_base/A，2×2 消融覆盖不适用；"
+            "若要验证延迟合并，需补充立即合并对照 "
+            "local_base 与延迟合并 A（全因子另加 balance "
+            "开关两档）"
+        )
+        return report
+
+    if "mode" in factor_set:
+        if "local_base" not in modes_present:
+            report["missing_cells"].append(
+                "缺少立即合并对照模式 local_base："
+                "无法隔离延迟合并本身带来的收益"
+            )
+        if "A" not in modes_present:
+            report["missing_cells"].append(
+                "缺少局部延迟合并模式 A"
+            )
+
+    if (
+        "balance_coef" in factor_set
+        and "mode" in factor_set
+    ):
+        # 2×2 四个格子的存在性（两轴都在因子中时）。
+        for mode in ("local_base", "A"):
+            for level in ("off", "on"):
+                key = (mode, level)
+                if key not in merge_pair_cells:
+                    report["missing_cells"].append(
+                        f"缺少全因子组合 {mode}/b={level}"
+                        "（无法证明各创新点各自有用）"
+                    )
+    elif "balance_coef" in factor_set:
+        # 只有 balance_coef 是因子：按本项目的合并模式检查
+        # 开启臂 / 关闭臂。
+        for mode in ("local_base", "A"):
+            if mode not in modes_present:
+                continue
+            balances = balance_by_mode.get(mode, [])
+            known = [b for b in balances if b is not None]
+            if not known:
+                report["low_replicate_cells"].append(
+                    f"{mode} 未记录 balance_coef"
+                )
+                continue
+            if 0 not in known:
+                report["missing_cells"].append(
+                    f"{mode} 缺少 balance_coef=0 的关闭臂："
+                    "无法证明均衡损失各自有用"
+                )
+            if not any(
+                isinstance(b, (int, float))
+                and not isinstance(b, bool)
+                and b > 0
+                for b in known
+            ):
+                report["missing_cells"].append(
+                    f"{mode} 缺少 balance_coef>0 的开启臂"
+                )
+
+    for (mode, level), count in sorted(merge_pair_cells.items()):
+        label = f"{mode}/b={level}"
+        report["present_cells"].append({
+            "cell": label,
+            "n_runs": count,
+        })
+        if count < _RECOMMENDED_SEEDS:
+            report["low_replicate_cells"].append(
+                f"{label} 只有 {count} 个种子"
+                f"（建议 ≥{_RECOMMENDED_SEEDS}）"
+            )
+
+    if (
+        "balance_coef" in factor_set
+        and len(merge_pair_cells) == 4
+        and not report["missing_cells"]
+    ):
+        report["advisories"].append(
+            "2×2 全因子组合齐全："
+            "可同时给出延迟合并与均衡损失的主效应及交互"
+        )
+
+    return report
+
+
+def print_comparison_analysis(
+    rows: List[Dict[str, object]],
+    factors: Optional[List[str]] = None,
+    baseline_mode: Optional[str] = None,
+    metric: str = "val_loss",
+) -> Dict[str, object]:
+    """
+    打印完整的对比分析：受控变量检查、按种子聚合的
+    Mean ± Std、单因子显著性检验与消融覆盖检查。
+
+    返回结构化结果，供写入汇总报告。
+    """
+    if factors is None:
+        factors = list(DEFAULT_COMPARISON_FACTORS)
+
+    if metric not in COMPARISON_METRIC_KEYS:
+        raise ValueError(
+            f"未知的对比指标: {metric}（可用: "
+            + ", ".join(COMPARISON_METRIC_KEYS)
+            + "）"
+        )
+
+    controlled = check_controlled_variables(rows, factors)
+
+    # 只有实际跨运行变化的因子才定义实验单元；恒定因子
+    # （例如所有运行都是 k1=2）不参与分组，cell 标签保持
+    # 简洁可读。seed 是重复实验维度，不进分组。
+    group_keys = []
+    for key in factors:
+        if key == "seed":
+            continue
+        distinct = {
+            repr(_stable_factor_key(_row_factor_value(row, key)))
+            for row in rows
+        }
+        if len(distinct) > 1:
+            group_keys.append(key)
+
+    aggregates = aggregate_runs(rows, group_keys)
+    contrasts = factor_contrasts(aggregates, group_keys, metric)
+    reference = compare_cells_to_baseline(
+        aggregates,
+        baseline_mode,
+        metric,
+    )
+    coverage = ablation_coverage(rows, factors)
+
+    higher_is_better = metric_higher_is_better(metric)
+
+    print()
+    print(
+        "[controlled] 受控变量检查：除声明因子外，"
+        "优化器 / 学习率 / 训练轮数 / 数据增强等协议项"
+        "必须逐项一致"
+    )
+    print("  声明因子: " + ", ".join(factors))
+
+    if controlled["statistical_runs"]:
+        print(
+            "  统计基线（ngram，无优化器与训练轮数）"
+            "不参与受控变量检查: "
+            + ", ".join(controlled["statistical_runs"])
+        )
+
+    if not rows:
+        print("  无运行目录可分析")
+    elif not controlled["violations"]:
+        print(
+            f"  OK：{len(controlled['checked_keys'])} 项协议"
+            "在声明因子之外完全一致"
+        )
+    else:
+        for violation in controlled["violations"]:
+            values_text = ", ".join(
+                f"{run}={_format_factor_value(value)}"
+                for run, value in violation["values"].items()
+            )
+            print(
+                f"  [violation] {violation['key']}: {values_text}"
+            )
+        print(
+            "  以上差异会使对比结论无法归因到待验证模块；"
+            "请统一这些设置后重跑，或在 --compare-factors 中"
+            "显式声明为因子"
+        )
+
+    print()
+    print(
+        "[aggregate] 按实验单元聚合（Mean ± Std，样本标准差；"
+        "std 反映不同随机种子的方差）"
+    )
+
+    if aggregates:
+        header = (
+            f"{'cell':<40} {'n':>3} {'val_loss':>18} "
+            f"{'test_loss':>18}"
+        )
+        print(header)
+        print("-" * len(header))
+
+        def _stat(aggregate, base_metric: str) -> str:
+            mean = aggregate.get(f"{base_metric}_mean")
+            if mean is None:
+                return "-"
+            std = aggregate.get(f"{base_metric}_std")
+            if std is None:
+                return f"{float(mean):.4f}"
+            return f"{float(mean):.4f}±{float(std):.4f}"
+
+        for aggregate in aggregates:
+            print(
+                f"{str(aggregate['label'])[:39]:<40} "
+                f"{int(aggregate['n_runs']):>3} "
+                f"{_stat(aggregate, 'val_loss'):>18} "
+                f"{_stat(aggregate, 'test_loss'):>18}"
+            )
+
+        underpowered = [
+            aggregate["label"]
+            for aggregate in aggregates
+            if int(aggregate["n_runs"]) < _RECOMMENDED_SEEDS
+        ]
+        if underpowered:
+            print(
+                "  统计可靠性不足：以下实验单元种子数 < "
+                f"{_RECOMMENDED_SEEDS}（建议 3~5 个不同随机"
+                "种子并汇报 Mean ± Std）: "
+                + "; ".join(underpowered)
+            )
+    else:
+        print("  无有效指标可聚合")
+
+    print()
+    direction = "越低越好" if not higher_is_better else "越高越好"
+    print(
+        f"[stats] 指标 {metric}（{direction}）；单因子对比"
+        "（每个对比只改变一个因子）"
+    )
+
+    if not contrasts:
+        print("  无单因子对比（至少需要两个不同的实验单元）")
+    else:
+        for contrast in contrasts:
+            if contrast.get("confounded"):
+                print(
+                    f"  [confounded] {contrast['cells'][0]} vs "
+                    f"{contrast['cells'][1]}: 同时改变了 "
+                    + ", ".join(contrast["differing_factors"])
+                    + "，结论无法归因"
+                )
+                continue
+            print(
+                "  " + _contrast_display(contrast, metric)
+            )
+
+    if baseline_mode:
+        print(
+            f"  指定基线 mode={baseline_mode} 的直接对比:"
+        )
+        if not reference:
+            print(
+                f"    未找到 mode={baseline_mode} 的运行"
+            )
+        for contrast in reference:
+            print(
+                "    " + _contrast_display(contrast, metric)
+            )
+
+    print(
+        "  注：未做多重比较校正，p 值仅作参考；"
+        "结论以预设的关键对比为准，且种子数应 ≥"
+        f"{_RECOMMENDED_SEEDS}"
+    )
+
+    print()
+    print(
+        "[ablation] 消融覆盖检查（延迟合并 × 均衡损失 2×2："
+        f"{coverage['legend']}）"
+    )
+    if coverage["missing_cells"]:
+        for message in coverage["missing_cells"]:
+            print(f"  [missing] {message}")
+    if coverage["present_cells"]:
+        present = ", ".join(
+            f"{cell['cell']}(n={cell['n_runs']})"
+            for cell in coverage["present_cells"]
+        )
+        print(f"  已覆盖组合: {present}")
+    if coverage["low_replicate_cells"]:
+        for message in coverage["low_replicate_cells"]:
+            print(f"  [warn] {message}")
+    for advisory in coverage["advisories"]:
+        print(f"  [note] {advisory}")
+    if (
+        not coverage["missing_cells"]
+        and coverage["present_cells"]
+        and not coverage["low_replicate_cells"]
+    ):
+        print("  OK：2×2 全因子组合齐全且种子数达标")
+
+    return {
+        "factors": factors,
+        "metric": metric,
+        "controlled": controlled,
+        "aggregates": aggregates,
+        "contrasts": contrasts,
+        "reference_contrasts": reference,
+        "ablation_coverage": coverage,
+        "n_runs": len(rows),
+    }
+
+
+def write_comparison_report(
+    out_dir: Path,
+    analysis: Dict[str, object],
+) -> Path:
+    """
+    把对比分析写入 out_dir/comparison_analysis.json。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "comparison_analysis.json"
+
+    payload = {
+        "generated_at": datetime.datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        **analysis,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_safe(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(f"[report] 对比分析已写入 {path}")
+    return path
 
 
 # ============================================================
@@ -5421,6 +6892,9 @@ def write_run_config(
     payload = {
         "config": asdict(cfg),
         "args": vars(args),
+        # 受控变量协议：--compare 用它核对「除声明因子外，
+        # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
+        "comparison_protocol": build_comparison_protocol(cfg, args),
         "n_params": n_params,
         "hypothesis": args.hypothesis,
         "research_question": args.rq,
@@ -6973,6 +8447,484 @@ def run_self_test():
         "latency_ms_per_forward"
     ] == 1.5
 
+    # ---- 对比分析：t 分布 p 值（无 SciPy 依赖） ----
+    # 已知分位点：df=4 时 t_{0.975}=2.776445 对应双侧 p=0.05，
+    # t_{0.995}=4.604095 对应 p=0.01。
+    p_at_050 = _two_sided_t_p_value(2.7764451051977987, 4.0)
+    p_at_010 = _two_sided_t_p_value(4.604094871349996, 4.0)
+    assert p_at_050 is not None
+    assert abs(p_at_050 - 0.05) < 1e-6, p_at_050
+    assert p_at_010 is not None
+    assert abs(p_at_010 - 0.01) < 1e-6, p_at_010
+    assert _two_sided_t_p_value(0.0, 4.0) == 1.0
+    # I_x(1,1) 是均匀分布的 CDF，应等于 x。
+    assert abs(
+        _regularized_incomplete_beta(0.3, 1.0, 1.0) - 0.3
+    ) < 1e-9
+    # 对称性：P(|T|>=t) 在 t 与 -t 上相同。
+    assert abs(
+        (_two_sided_t_p_value(2.0, 7.0) or 0.0)
+        - (_two_sided_t_p_value(-2.0, 7.0) or 0.0)
+    ) < 1e-12
+
+    # ---- 对比分析：受控变量 / 聚合 / 显著性 / 消融覆盖 ----
+    with tempfile.TemporaryDirectory() as analysis_dir:
+        def _write_analysis_run(
+            name: str,
+            mode: str,
+            seed: int,
+            lr: float,
+            steps: int,
+            balance: float,
+            val_loss: float,
+            test_loss: Optional[float] = None,
+        ) -> str:
+            run_dir = Path(analysis_dir) / name
+            run_dir.mkdir()
+            protocol = {
+                "comparison_family": "neural",
+                "optimizer": "AdamW",
+                "optimizer_betas": [0.9, 0.999],
+                "optimizer_eps": 1e-8,
+                "lr": lr,
+                "lr_schedule": "linear_warmup_cosine_to_10pct",
+                "warmup_steps": 10,
+                "total_steps": steps,
+                "weight_decay": 0.1,
+                "grad_clip": 1.0,
+                "batch_size": 8,
+                "data_augmentation": "none",
+                "seq_len": 8,
+                "d_model": 16,
+                "n_heads": 4,
+                "n_layers": 4,
+                "n_experts": 3,
+                "expert_hidden": 24,
+                "top_k": 2,
+                "residual_scale": 1.0,
+                "val_fraction": 0.05,
+                "test_fraction": 0.05,
+                "eval_interval": 10,
+                "eval_batches": 2,
+                "data_sha256": "deadbeef",
+            }
+            config_payload = {
+                "config": {
+                    "mode": mode,
+                    "top_k": 2,
+                    "k1": 2,
+                    "k2": 2,
+                    "balance_coef": balance,
+                    "dense_fnn_hidden": None,
+                    "seq_len": 8,
+                    "d_model": 16,
+                },
+                "args": {
+                    "seed": seed,
+                    "lr": lr,
+                    "steps": steps,
+                },
+                "data": {"sha256": "deadbeef"},
+                "comparison_protocol": protocol,
+            }
+            with open(
+                run_dir / "config.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(config_payload, f)
+
+            final_record: Dict[str, object] = {
+                "step": "final",
+                "val_loss": val_loss,
+            }
+            if test_loss is not None:
+                final_record["test_loss"] = test_loss
+            write_jsonl_record(
+                run_dir / "metrics.jsonl",
+                final_record,
+            )
+            return str(run_dir)
+
+        run_paths = [
+            _write_analysis_run(
+                "local_base_seed42",
+                "local_base",
+                42,
+                3e-4,
+                100,
+                0.01,
+                3.00,
+            ),
+            _write_analysis_run(
+                "local_base_seed43",
+                "local_base",
+                43,
+                3e-4,
+                100,
+                0.01,
+                3.10,
+            ),
+            _write_analysis_run(
+                "local_base_seed44",
+                "local_base",
+                44,
+                3e-4,
+                100,
+                0.01,
+                3.20,
+            ),
+            _write_analysis_run(
+                "A_seed42",
+                "A",
+                42,
+                3e-4,
+                100,
+                0.01,
+                2.80,
+            ),
+            _write_analysis_run(
+                "A_seed43",
+                "A",
+                43,
+                3e-4,
+                100,
+                0.01,
+                2.85,
+            ),
+            _write_analysis_run(
+                "A_seed44",
+                "A",
+                44,
+                3e-4,
+                100,
+                0.01,
+                2.90,
+            ),
+        ]
+
+        factors = parse_factor_spec(
+            "mode,k1,k2,balance_coef,seed,dense_fnn_hidden"
+        )
+        analysis_rows = compare_runs(run_paths)
+
+        assert analysis_rows[0]["seed"] == 42
+        assert analysis_rows[0]["balance_coef"] == 0.01
+        assert analysis_rows[0]["protocol"]["optimizer"] == "AdamW"
+
+        controlled = check_controlled_variables(
+            analysis_rows,
+            factors,
+        )
+        assert controlled["ok"], controlled["violations"]
+        assert "lr" in controlled["checked_keys"]
+
+        aggregates = aggregate_runs(analysis_rows, ["mode"])
+        assert len(aggregates) == 2
+
+        by_label = {
+            aggregate["label"]: aggregate
+            for aggregate in aggregates
+        }
+        local_base_cell = by_label["mode=local_base"]
+        a_cell = by_label["mode=A"]
+        assert local_base_cell["n_runs"] == 3
+        assert (
+            abs(
+                local_base_cell["val_loss_mean"]
+                - 3.10
+            ) < 1e-9
+        )
+        assert (
+            abs(
+                local_base_cell["val_loss_std"] - 0.10
+            ) < 1e-9
+        )
+        assert abs(a_cell["val_loss_mean"] - 2.85) < 1e-9
+        assert abs(a_cell["val_loss_std"] - 0.05) < 1e-9
+
+        contrasts = factor_contrasts(
+            aggregates,
+            ["mode"],
+            "val_loss",
+        )
+        assert len(contrasts) == 1
+        contrast = contrasts[0]
+        assert contrast["test"] == "paired_t"
+        assert contrast["n_pairs"] == 3
+        assert contrast["factor"] == "mode"
+        assert contrast["baseline_value"] == "local_base"
+        assert contrast["variant_value"] == "A"
+        # delta = mean(A) - mean(local_base) = -0.25（越低越好）。
+        assert abs(contrast["delta"] - (-0.25)) < 1e-9
+        assert contrast["verdict"] == "improvement"
+        assert contrast["significant"]
+        assert (
+            contrast["p_value"] is not None
+            and 0.005 < float(contrast["p_value"]) < 0.05
+        )
+
+        # 显著且差值远大于种子波动时不加额外警告；显著但
+        # 差值小于噪声比 1 时提示谨慎解读；不显著时禁止
+        # 声称提升。
+        display = _contrast_display(contrast, "val_loss")
+        assert "存疑" not in display
+        assert "不能据此声称" not in display
+
+        weak_display = _contrast_display(
+            {
+                "factor": "mode",
+                "baseline_value": "local_base",
+                "variant_value": "A",
+                "baseline": "mode=local_base",
+                "delta": -0.001,
+                "p_value": 0.60,
+                "test": "paired_t",
+                "n_pairs": 3,
+                "verdict": "improvement",
+                "significant": False,
+                "delta_over_noise": 0.10,
+            },
+            "val_loss",
+        )
+        assert "不能据此声称提升" in weak_display
+
+        small_effect_display = _contrast_display(
+            {
+                "factor": "mode",
+                "baseline_value": "local_base",
+                "variant_value": "A",
+                "baseline": "mode=local_base",
+                "delta": -0.001,
+                "p_value": 0.01,
+                "test": "paired_t",
+                "n_pairs": 3,
+                "verdict": "improvement",
+                "significant": True,
+                "delta_over_noise": 0.30,
+            },
+            "val_loss",
+        )
+        assert "实际意义存疑" in small_effect_display
+
+        # 学习率不同必须被受控变量检查抓住；声明为因子后
+        # 则不再报违规。
+        bad_path = _write_analysis_run(
+            "A_seed45_badlr",
+            "A",
+            45,
+            1e-3,
+            100,
+            0.01,
+            2.50,
+        )
+        bad_controlled = check_controlled_variables(
+            compare_runs(run_paths + [bad_path]),
+            factors,
+        )
+        assert not bad_controlled["ok"]
+        assert any(
+            violation["key"] == "lr"
+            for violation in bad_controlled["violations"]
+        )
+        declared = check_controlled_variables(
+            compare_runs(run_paths + [bad_path]),
+            factors + ["lr"],
+        )
+        assert all(
+            violation["key"] != "lr"
+            for violation in declared["violations"]
+        )
+
+        # 训练步数不同同样必须被抓住（训练轮数是受控变量）。
+        steps_path = _write_analysis_run(
+            "A_seed46_badsteps",
+            "A",
+            46,
+            3e-4,
+            200,
+            0.01,
+            2.60,
+        )
+        steps_controlled = check_controlled_variables(
+            compare_runs(run_paths + [steps_path]),
+            factors,
+        )
+        assert any(
+            violation["key"] == "total_steps"
+            for violation in steps_controlled["violations"]
+        )
+
+        # 消融覆盖：只跑了 balance=0.01 的开启臂，缺 2×2 的
+        # 关闭臂组合，必须被标记为缺失。
+        coverage = ablation_coverage(analysis_rows, factors)
+        assert coverage["applicable"]
+        assert len(coverage["missing_cells"]) == 2, coverage
+        assert any(
+            "b=off" in message
+            for message in coverage["missing_cells"]
+        )
+
+        # 补齐 balance=0 的两格后，2×2 组合齐全（但种子
+        # 数不足会被单独提示，不会误报为缺失）。
+        full_paths = run_paths + [
+            _write_analysis_run(
+                "local_base_bal0_seed42",
+                "local_base",
+                42,
+                3e-4,
+                100,
+                0.0,
+                3.05,
+            ),
+            _write_analysis_run(
+                "A_bal0_seed42",
+                "A",
+                42,
+                3e-4,
+                100,
+                0.0,
+                2.95,
+            ),
+        ]
+        full_coverage = ablation_coverage(
+            compare_runs(full_paths),
+            factors,
+        )
+        assert not full_coverage["missing_cells"], full_coverage
+        assert any(
+            "只有 1 个种子" in message
+            for message in full_coverage["low_replicate_cells"]
+        )
+
+        # 与延迟合并无关的对比（smelt vs B）不虚报消融缺失，
+        # 只提示需补 local_base/A 并给出计算量提醒。
+        unrelated = [
+            _write_analysis_run(
+                "smelt_s1",
+                "smelt",
+                1,
+                3e-4,
+                100,
+                0.01,
+                3.00,
+            ),
+            _write_analysis_run(
+                "B_s1",
+                "B",
+                1,
+                3e-4,
+                100,
+                0.01,
+                2.90,
+            ),
+        ]
+        unrelated_coverage = ablation_coverage(
+            compare_runs(unrelated),
+            factors,
+        )
+        assert not unrelated_coverage["missing_cells"]
+        assert any(
+            "2×2 消融覆盖不适用" in message
+            for message in unrelated_coverage["advisories"]
+        )
+        assert any(
+            "计算量差异" in message
+            for message in unrelated_coverage["advisories"]
+        )
+
+    # ---- 多种子 / 套件编排：计划与参数透传 ----
+    seed_plan = build_sweep_plan(
+        seeds=[1, 2],
+        modes=None,
+        ablation=False,
+        balance_coef=0.01,
+        default_mode="B",
+    )
+    assert [item["label"] for item in seed_plan] == [
+        "seed1",
+        "seed2",
+    ]
+    assert {item["mode"] for item in seed_plan} == {"B"}
+    assert {item["balance_coef"] for item in seed_plan} == {0.01}
+
+    mode_plan = build_sweep_plan(
+        seeds=[7],
+        modes=["local_base", "A"],
+        ablation=False,
+        balance_coef=0.01,
+        default_mode="B",
+    )
+    assert [item["label"] for item in mode_plan] == [
+        "local_base_seed7",
+        "A_seed7",
+    ]
+
+    ablation_plan = build_sweep_plan(
+        seeds=[7],
+        modes=None,
+        ablation=True,
+        balance_coef=0.01,
+        default_mode="B",
+    )
+    assert [item["label"] for item in ablation_plan] == [
+        "local_base_bal0_seed7",
+        "local_base_bal0.01_seed7",
+        "A_bal0_seed7",
+        "A_bal0.01_seed7",
+    ]
+    assert [
+        item["balance_coef"] for item in ablation_plan
+    ] == [0.0, 0.01, 0.0, 0.01]
+
+    stripped = strip_sweep_args([
+        "--data",
+        "corpus.txt",
+        "--out",
+        "runs/rq1",
+        "--mode",
+        "B",
+        "--seeds",
+        "1",
+        "2",
+        "3",
+        "--suite-ablation",
+        "--steps",
+        "10",
+        "--balance-coef",
+        "0.02",
+        "--skip-sanity-check",
+    ])
+    assert stripped == [
+        "--data",
+        "corpus.txt",
+        "--steps",
+        "10",
+        "--skip-sanity-check",
+    ]
+
+    stripped_modes = strip_sweep_args([
+        "--suite-modes",
+        "A",
+        "B",
+        "--out=runs/x",
+        "--seed=5",
+        "--k1",
+        "2",
+    ])
+    assert stripped_modes == ["--k1", "2"]
+
+    for unknown_spec in ("", "mode,not_a_factor"):
+        try:
+            parse_factor_spec(unknown_spec)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "非法对比因子必须被拒绝: "
+                + repr(unknown_spec)
+            )
+
     print("self-test passed")
 
 
@@ -7050,6 +9002,199 @@ def build_lr_schedule(
         # 断点恢复时直接同步到 start_step。
         last_epoch=start_step - 1,
     )
+
+
+# ============================================================
+# Multi-seed / ablation sweeps
+# ============================================================
+
+# 多随机种子与消融套件由父进程逐个调用自身完成：每次运行都是
+# 独立进程，避免跨运行的 RNG / CUDA 缓存 / 优化器状态耦合，
+# 同时复用现有的断点、早停与追踪基础设施。
+_SWEEP_SINGLE_VALUE_FLAGS = (
+    "--out",
+    "--seed",
+    "--mode",
+    "--balance-coef",
+)
+_SWEEP_MULTI_VALUE_FLAGS = (
+    "--seeds",
+    "--suite-modes",
+)
+_SWEEP_BOOL_FLAGS = (
+    "--suite-ablation",
+)
+
+
+def strip_sweep_args(argv: List[str]) -> List[str]:
+    """
+    从子命令参数中移除由套件逐运行覆盖的参数
+    （--out/--seed/--mode/--balance-coef 与套件开关本身），
+    其余参数原样透传，保证各次运行的受控设置完全一致。
+    """
+    result: List[str] = []
+    index = 0
+
+    while index < len(argv):
+        token = argv[index]
+        name = token.split("=", 1)[0]
+
+        if name in _SWEEP_BOOL_FLAGS:
+            index += 1
+            continue
+
+        if name in _SWEEP_MULTI_VALUE_FLAGS:
+            index += 1
+            while (
+                index < len(argv)
+                and not argv[index].startswith("--")
+            ):
+                index += 1
+            continue
+
+        if name in _SWEEP_SINGLE_VALUE_FLAGS:
+            index += 1 if "=" in token else 2
+            continue
+
+        result.append(token)
+        index += 1
+
+    return result
+
+
+def build_sweep_plan(
+    seeds: List[int],
+    modes: Optional[List[str]],
+    ablation: bool,
+    balance_coef: float,
+    default_mode: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    """
+    构造运行计划。每个条目包含输出子目录名与逐运行覆盖的
+    参数；其余设置全部继承同一条命令行。
+
+    - 普通多种子：seed{S}
+    - 模式套件：{mode}_seed{S}
+    - 2×2 消融：{mode}_bal{coef}_seed{S}
+      （{local_base, A} × {0, balance_coef}）
+    """
+    plan: List[Dict[str, object]] = []
+
+    if ablation:
+        for mode in ("local_base", "A"):
+            for coefficient in (0.0, balance_coef):
+                label_coefficient = format(coefficient, "g")
+                for seed in seeds:
+                    plan.append({
+                        "label": (
+                            f"{mode}_bal{label_coefficient}"
+                            f"_seed{seed}"
+                        ),
+                        "mode": mode,
+                        "balance_coef": coefficient,
+                        "seed": seed,
+                    })
+        return plan
+
+    if modes:
+        for mode in modes:
+            for seed in seeds:
+                plan.append({
+                    "label": f"{mode}_seed{seed}",
+                    "mode": mode,
+                    "balance_coef": balance_coef,
+                    "seed": seed,
+                })
+        return plan
+
+    for seed in seeds:
+        plan.append({
+            "label": f"seed{seed}",
+            "mode": default_mode,
+            "balance_coef": balance_coef,
+            "seed": seed,
+        })
+
+    return plan
+
+
+def run_experiment_sweep(args: argparse.Namespace) -> None:
+    """
+    执行多随机种子 / 模式套件 / 全因子消融套件，并输出
+    受控变量检查 + Mean ± Std + 显著性检验 + 消融覆盖报告。
+    """
+    factors = parse_factor_spec(args.compare_factors)
+
+    base_argv = strip_sweep_args(sys.argv[1:])
+    plan = build_sweep_plan(
+        seeds=list(args.seeds),
+        modes=(
+            list(args.suite_modes)
+            if args.suite_modes
+            else None
+        ),
+        ablation=bool(args.suite_ablation),
+        balance_coef=args.balance_coef,
+        default_mode=args.mode,
+    )
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    if len(args.seeds) < _RECOMMENDED_SEEDS:
+        print(
+            "[sweep] 提示：关键实验建议使用 3~5 个不同随机"
+            f"种子并汇报 Mean ± Std，当前只有 "
+            f"{len(args.seeds)} 个"
+        )
+
+    run_paths: List[str] = []
+
+    for index, item in enumerate(plan, start=1):
+        run_out = out_root / str(item["label"])
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+        ] + base_argv
+        command += [
+            "--seed",
+            str(item["seed"]),
+            "--out",
+            str(run_out),
+        ]
+        if item["mode"] is not None:
+            command += ["--mode", str(item["mode"])]
+        if item["balance_coef"] is not None:
+            command += [
+                "--balance-coef",
+                format(float(item["balance_coef"]), "g"),
+            ]
+
+        print(
+            f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
+        )
+
+        completed = subprocess.run(command)
+
+        if completed.returncode != 0:
+            print(
+                f"[sweep] 运行 {item['label']} 失败 "
+                f"(exit={completed.returncode})；已停止后续"
+                "运行，可用 --compare 分析已完成的目录"
+            )
+            raise SystemExit(1)
+
+        run_paths.append(str(run_out))
+
+    rows = compare_runs(run_paths)
+    analysis = print_comparison_analysis(
+        rows,
+        factors=factors,
+        baseline_mode=args.compare_baseline,
+        metric=args.compare_metric,
+    )
+    write_comparison_report(out_root, analysis)
 
 
 def main():
@@ -7253,7 +9398,73 @@ def main():
         metavar="RUN_DIR",
         help=(
             "不训练，直接对比多个运行目录的指标"
-            "后退出"
+            "后退出（含受控变量检查、按种子聚合的 "
+            "Mean ± Std 与单因子显著性检验）"
+        ),
+    )
+    parser.add_argument(
+        "--compare-factors",
+        type=str,
+        default=",".join(DEFAULT_COMPARISON_FACTORS),
+        help=(
+            "对比时允许跨运行不同的实验因子（逗号分隔）；"
+            "其余协议项（优化器/学习率/训练步数/数据增强/"
+            "数据指纹等）必须完全一致，否则报警。"
+            "默认: " + ",".join(DEFAULT_COMPARISON_FACTORS)
+        ),
+    )
+    parser.add_argument(
+        "--compare-baseline",
+        type=str,
+        default=None,
+        metavar="MODE",
+        help=(
+            "以指定模式作为基线，在统计报告中给出其余"
+            "实验单元相对基线的差值（如 smelt 或 local_base）"
+        ),
+    )
+    parser.add_argument(
+        "--compare-metric",
+        type=str,
+        default="val_loss",
+        help=(
+            "显著性检验使用的指标（默认 val_loss）；"
+            "可选: " + ", ".join(COMPARISON_METRIC_KEYS)
+        ),
+    )
+
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help=(
+            "多随机种子运行：每个种子训练一次到 "
+            "<out>/seed<SEED>，结束后自动给出 Mean ± Std "
+            "与显著性检验（关键实验建议 3~5 个种子）"
+        ),
+    )
+    parser.add_argument(
+        "--suite-modes",
+        nargs="+",
+        choices=sorted(Config.MODEL_MODES),
+        default=None,
+        metavar="MODE",
+        help=(
+            "配合 --seeds：把同一套受控设置依次应用到多个"
+            "模式（输出 <out>/<mode>_seed<SEED>），用于"
+            "严格控变量的模式对比"
+        ),
+    )
+    parser.add_argument(
+        "--suite-ablation",
+        action="store_true",
+        help=(
+            "配合 --seeds：运行「延迟合并 × 均衡损失」的 "
+            "2×2 全因子消融（local_base/A × balance_coef="
+            "0/当前值）；balance 关闭臂为 0，开启臂取 "
+            "--balance-coef"
         ),
     )
 
@@ -7394,6 +9605,64 @@ def main():
             "--ngram-alpha-grid 至少需要一个候选值"
         )
 
+    # 对比因子与对比指标必须显式合法，避免拼写错误静默
+    # 关闭受控变量检查。
+    try:
+        parse_factor_spec(args.compare_factors)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.compare_metric not in COMPARISON_METRIC_KEYS:
+        parser.error(
+            "--compare-metric 必须是以下之一: "
+            + ", ".join(COMPARISON_METRIC_KEYS)
+        )
+
+    # 多种子 / 套件参数组合校验。
+    if args.seeds is not None:
+        if len(set(args.seeds)) != len(args.seeds):
+            parser.error("--seeds 存在重复的随机种子")
+        if any(seed < 0 for seed in args.seeds):
+            parser.error("--seeds 必须是非负整数")
+        if args.compare is not None:
+            parser.error(
+                "--seeds 不能与 --compare 同时使用"
+                "（对比已完成的运行请直接用 --compare）"
+            )
+        if args.resume is not None:
+            parser.error(
+                "--seeds 不能与 --resume 同时使用"
+                "（每个种子都必须是独立的全新训练）"
+            )
+        if args.statistical_baseline:
+            parser.error(
+                "--statistical-baseline 是确定性统计基线，"
+                "不受随机种子影响，不能与 --seeds 同时使用"
+            )
+        if args.sanity_only:
+            parser.error(
+                "--sanity-only 不能与 --seeds 同时使用"
+            )
+        if args.data is None:
+            parser.error("--seeds 需要 --data")
+        if args.out is None:
+            parser.error("--seeds 需要 --out")
+    if (args.suite_modes or args.suite_ablation) and (
+        args.seeds is None
+    ):
+        parser.error(
+            "--suite-modes / --suite-ablation 必须配合 "
+            "--seeds 使用（关键实验至少 3~5 个种子）"
+        )
+    if args.suite_modes and args.suite_ablation:
+        parser.error(
+            "--suite-modes 与 --suite-ablation 不能同时使用"
+        )
+    if args.suite_ablation and not args.balance_coef > 0:
+        parser.error(
+            "--suite-ablation 需要正的 --balance-coef 作为"
+            "开启臂（关闭臂固定为 0）"
+        )
+
     # 假设纪律：全新训练必须带明确的科学假设，避免
     # 「盲目排列组合超参数」（检查逻辑见
     # hypothesis_check_error）。
@@ -7404,13 +9673,26 @@ def main():
 
     # --compare 模式只读运行目录，不需要 --data / --out。
     if args.compare is not None:
-        print_comparison(compare_runs(args.compare))
+        compare_rows = compare_runs(args.compare)
+        print_comparison(compare_rows)
+        print_comparison_analysis(
+            compare_rows,
+            factors=parse_factor_spec(args.compare_factors),
+            baseline_mode=args.compare_baseline,
+            metric=args.compare_metric,
+        )
         return
 
     if args.data is None:
         parser.error("--data 必填（除非使用 --compare）")
     if args.out is None:
         parser.error("--out 必填（除非使用 --compare）")
+
+    # 多种子 / 套件运行：父进程逐个调用自身完成每次训练，
+    # 结束后自动做受控变量检查、Mean ± Std 与显著性检验。
+    if args.seeds is not None:
+        run_experiment_sweep(args)
+        return
 
     device = torch.device(args.device)
 
