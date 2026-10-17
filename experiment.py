@@ -429,6 +429,31 @@ class Expert(nn.Module):
 _MOE_PAD_RATIO_LIMIT = 1.25
 
 
+class _StackedExpertWeights(torch.autograd.Function):
+    """
+    缓存的专家权重 stack 的梯度出口。
+
+    专家权重 stack（[n_experts, ...]）在同一参数版本下被
+    多次 MoE 调用复用（见 SparseMoE._cached_weight_stack），
+    因此 forward 原样返回模块缓存的普通张量，不建立 torch.stack
+    节点；backward 按专家把上游梯度切成逐专家切片返回，
+    与 torch.stack 反向的语义一致，但不物化拼接后的梯度张量。
+    """
+
+    @staticmethod
+    def forward(ctx, stacked: torch.Tensor, *weights: torch.Tensor):
+        # 逐专家切片的形状；stack 要求各专家权重同形。
+        ctx.shapes = [weight.shape for weight in weights]
+        return stacked
+
+    @staticmethod
+    def backward(ctx, grad_stacked: torch.Tensor) -> tuple:
+        return (None,) + tuple(
+            grad_stacked[index].reshape(shape)
+            for index, shape in enumerate(ctx.shapes)
+        )
+
+
 class _MergeExpertOutputs(torch.autograd.Function):
     """
     dispatch 的输出侧：把各专家输出散射回原始 assignment 顺序。
@@ -533,6 +558,61 @@ class SparseMoE(nn.Module):
         self._counts_stage = None
         self._counts_event = None
         self._counts_stream = None
+
+        # 批量专家路径的权重 stack 缓存：键为 "gate_up" / "down"，
+        # 值为 (参数版本签名, stack 缓冲)。参数在 forward 与
+        # backward 之间不变，同一张图里的多次 MoE 调用可共用
+        # 同一份 stack；参数被更新（版本号变化）后自动重建。
+        self._weight_stacks: Dict[
+            str, Tuple[tuple, torch.Tensor]
+        ] = {}
+
+    def _apply(self, fn, recurse=True):
+        # .to() / .float() 等可能整体替换参数张量（版本号不递增），
+        # 权重 stack 缓存必须随之失效。
+        self._weight_stacks.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def _cached_weight_stack(
+        self,
+        key: str,
+        weights: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        返回 [n_experts, ...] 的专家权重 stack，跨调用复用。
+
+        缓存以 (版本号, 数据指针) 为签名：任何原地更新（优化器
+        更新、加载检查点）都会推进版本号并触发重建；参数张量被
+        替换时由 _apply 清空缓存兜底。需要反向时经
+        _StackedExpertWeights 把梯度按专家散回参数，与
+        torch.stack + bmm 的计算图语义相同。
+        """
+        signature = tuple(
+            (weight._version, weight.data_ptr())
+            for weight in weights
+        )
+
+        cached = self._weight_stacks.get(key)
+        # 反向路径不能使用 inference_mode 下创建的张量（不能
+        # 作为保存张量入图），需要时重建。
+        reusable = cached is not None and cached[0] == signature and (
+            not torch.is_grad_enabled()
+            or not torch.is_inference(cached[1])
+        )
+
+        if reusable:
+            stacked = cached[1]
+        else:
+            with torch.no_grad():
+                stacked = torch.stack(weights)
+            self._weight_stacks[key] = (signature, stacked)
+
+        if not torch.is_grad_enabled() or not any(
+            weight.requires_grad for weight in weights
+        ):
+            return stacked
+
+        return _StackedExpertWeights.apply(stacked, *weights)
 
     def route(
         self,
@@ -680,15 +760,17 @@ class SparseMoE(nn.Module):
         对 [n_experts, rows, dim] 的批量输入执行全部专家计算。
 
         各专家权重 stack 成批量矩阵后用 bmm 完成两层 GEMM；
-        stack 的反向按切片把梯度散回各专家参数，参数与
-        检查点格式不变。SwiGLU 语义与 Expert.forward 完全
-        一致。
+        stack 缓冲按参数版本跨调用复用（见
+        _cached_weight_stack），反向按切片把梯度散回各专家
+        参数，参数与检查点格式不变。SwiGLU 语义与
+        Expert.forward 完全一致。
         """
-        gate_up_weight = torch.stack(
+        gate_up_weight = self._cached_weight_stack(
+            "gate_up",
             [
                 expert.gate_up.weight
                 for expert in self.experts
-            ]
+            ],
         )
 
         gate_up = torch.bmm(
@@ -702,11 +784,12 @@ class SparseMoE(nn.Module):
             gate, up = gate_up.chunk(2, dim=-1)
             hidden = F.silu(gate, inplace=True).mul_(up)
 
-        down_weight = torch.stack(
+        down_weight = self._cached_weight_stack(
+            "down",
             [
                 expert.down.weight
                 for expert in self.experts
-            ]
+            ],
         )
 
         return torch.bmm(
@@ -736,10 +819,11 @@ class SparseMoE(nn.Module):
         与逐专家循环路径的数值语义一致。
 
         行布局由 dest 完整描述：gathered 的第 j 行写入
-        padded 展平缓冲的 dest[j] 位置；输出侧
-        outputs[perm[j]] <- out[dest[j]]。dest 互不重复
-        且并集只差填充行，index_add_ 反传在每个位置至多
-        累加一个梯度项，顺序无关。
+        padded 展平缓冲的 dest[j] 位置（j 为排序后行号）；
+        输出侧 outputs[perm[j]] <- out[dest[j]]，先求逆映射
+        dest_by_original[perm[j]] = dest[j]，再一次
+        index_select 完成收集。dest 互不重复且并集只差
+        填充行，逐位置至多对应一个梯度项，顺序无关。
         """
         n_experts = self.n_experts
         total = gathered.size(0)
@@ -773,19 +857,21 @@ class SparseMoE(nn.Module):
             dim,
         )
 
-        # 散射回原始 assignment 顺序。
-        outputs = torch.empty(
-            total,
-            dim,
-            dtype=out.dtype,
-            device=device,
-        )
-        outputs.index_copy_(
+        # 收集回原始 assignment 顺序：先把「排序位置 → padded
+        # 位置」的映射反转为「原始位置 → padded 位置」
+        #（dest_by_original[perm[j]] = dest[j]），再一次
+        # index_select 完成收集；相比「gather 到临时缓冲再
+        # 散射」少一次 total × dim 的行搬运与一次分配。
+        dest_by_original = torch.scatter(
+            torch.empty_like(dest),
             0,
             perm,
-            out.index_select(0, dest),
+            dest,
         )
-        return outputs.view(num_tokens, top_k, dim)
+        return out.index_select(
+            0,
+            dest_by_original,
+        ).view(num_tokens, top_k, dim)
 
     def dispatch(
         self,
