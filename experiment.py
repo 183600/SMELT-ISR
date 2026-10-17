@@ -580,9 +580,9 @@ class SparseMoE(nn.Module):
 
         # 辅助负载均衡项只在梯度开启时可能被消费（总损失、
         # 训练指标）；评估/推理路径（evaluate、measure_efficiency、
-        # no_grad 自测）不读取该标量，直接返回零，省去 softmax /
-        # mean / dot 的计算与显存。balance_coef=0 的消融臂仍在
-        # no_grad 下计算同一数值，保持与训练指标一致。
+        # no_grad 自测）不读取该标量，直接返回零。
+        # balance_coef=0 的消融臂仍在 no_grad 下计算同一数值，
+        # 保持与训练指标一致。
         if torch.is_grad_enabled():
             if self.balance_coef > 0.0:
                 router_probs = router_logits.softmax(dim=-1)
@@ -1761,8 +1761,8 @@ def _snap_group_split(
 
 
 # 固定评估批设备侧缓存的总字节上限：窗口集合跨评估逐位
-# 相同，缓存后周期验证不再重复收集与搬运；超限退回逐次收集。
-_EVAL_BATCH_CACHE_BUDGET = 64 * 1024 * 1024
+# 相同；超限退回逐次收集。
+_EVAL_BATCH_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 class ByteDataset:
@@ -1958,7 +1958,8 @@ class ByteDataset:
 
         # 固定评估批的结果缓存（设备侧）：键为
         # (split, batches, batch_size, batch_index, device)，
-        # 值为 (x, y)；累计字节受 _EVAL_BATCH_CACHE_BUDGET 封顶。
+        # 值为 (x, y)；累计字节受 _EVAL_BATCH_CACHE_MAX_BYTES
+        # 封顶。
         self._fixed_batch_cache: Dict[
             tuple, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -2116,9 +2117,8 @@ class ByteDataset:
         完全相同。请求窗口多于合法起点时仅取一遍无重复起点。
 
         固定窗口在多次评估间逐位相同，结果张量在设备侧缓存
-        复用：周期验证、坏案例分析等重复调用不再反复收集与
-        搬运同一批窗口。缓存总量受 _EVAL_BATCH_CACHE_BUDGET
-        封顶，超限时退回逐次收集路径。所有调用方只读返回的
+        复用；缓存总量受 _EVAL_BATCH_CACHE_MAX_BYTES 封顶，
+        超限时退回逐次收集路径。所有调用方只读返回的
         x/y，不修改缓存内容。
         """
         windows, data = self._eval_windows(split)
@@ -2176,7 +2176,7 @@ class ByteDataset:
         )
         if (
             self._fixed_batch_cache_bytes + batch_bytes
-            <= _EVAL_BATCH_CACHE_BUDGET
+            <= _EVAL_BATCH_CACHE_MAX_BYTES
         ):
             self._fixed_batch_cache[cache_key] = (x, y)
             self._fixed_batch_cache_bytes += batch_bytes
@@ -3088,8 +3088,7 @@ def evaluate(
                     # 最后一批可能超出封顶：按剩余上限截断，
                     # 保证收集的 token 数严格不超过上限。
                     # 先按行截断再转 fp32 求 softmax：逐行结果
-                    # 与整批 softmax 后截断逐位一致，但避免为
-                    # 封顶外的行分配 fp32 概率缓冲。
+                    # 与整批 softmax 后截断逐位一致。
                     remaining = (
                         _AUC_MAX_TOKENS - auc_tokens
                     )
@@ -4330,9 +4329,9 @@ def analyze_training_curve(
 
         val_loss = record.get("val_loss")
 
-        # 盘上记录里的 NaN/Inf 会被 _json_safe 写成 null，但内存中
-        # 的在线记录保留原值；两者都按非有限事件处理，避免 NaN
-        # 流入 _sparkline 的 int() 转换导致崩溃。
+        # 盘上记录里的 NaN/Inf 会被 _json_safe 写成 null，在线
+        # 记录保留原值；两者都按非有限事件处理，避免 NaN
+        # 流入 _sparkline 的 int() 转换。
         if (
             val_loss is None
             or not isinstance(val_loss, (int, float))
@@ -8127,7 +8126,7 @@ def write_run_config(
                 ):
                     payload["hypothesis_check_skipped"] = True
 
-    # config.json 是实验追踪的唯一来源，写入中途崩溃不能留下
+    # config.json 是实验追踪的唯一来源，写入中途失败不能留下
     # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
     previous_mode = 0o644
     if config_path.exists():
@@ -12724,8 +12723,7 @@ def main():
 
         # 损失与梯度范数都必须有限才推进优化器：任一非有限
         # 都意味着这一步的参数更新不可信。
-        # 两个标量合并成一次设备→主机传输（单次同步），
-        # 避免逐标量 isfinite/float 各自触发一次同步。
+        # 两个标量合并成一次设备→主机传输（单次同步）。
         grad_norm_value, loss_value = torch.stack(
             (grad_norm.detach(), loss.detach()),
         ).tolist()
