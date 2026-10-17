@@ -4467,6 +4467,15 @@ def print_curve_analysis(analysis: Dict[str, object]) -> None:
     )
 
     if analysis.get("best_val_loss") is not None:
+        # 最后一个验证点之前可能一个有限训练损失都没有（早期
+        # NaN/Inf 后恢复的运行），此时 last_train_loss 为 None，
+        # 与其它字段一致按缺失值打印而不是 float(None) 崩溃。
+        last_train_loss = analysis.get("last_train_loss")
+        last_train_text = (
+            f"{float(last_train_loss):.4f}"
+            if last_train_loss is not None
+            else "-"
+        )
         print(
             "[curve] 最优验证损失 "
             f"{float(analysis['best_val_loss']):.4f} @ step "
@@ -4476,7 +4485,7 @@ def print_curve_analysis(analysis: Dict[str, object]) -> None:
             "（相对最优回升 "
             f"{float(analysis.get('val_regression_from_best') or 0.0) * 100:.1f}%），"
             "最终训练损失 "
-            f"{float(analysis['last_train_loss']):.4f}"
+            f"{last_train_text}"
         )
 
     if analysis.get("curve_sparkline_train"):
@@ -9226,6 +9235,41 @@ def run_self_test():
         diverged_analysis
     )
     assert diverged_analysis["n_nonfinite_events"] == 2
+
+    # 早期全部非有限、之后恢复且有验证点的运行：最后一个验证点
+    # 之前没有任何有限训练损失（last_train_loss 为 None），但后续
+    # 有限训练步使 recent_nonfinite 判定为 False、不判发散。打印
+    # 该诊断必须容忍缺失的最终训练损失（曾触发 float(None)）。
+    recovered_analysis = analyze_training_curve(
+        [
+            {
+                "step": 5,
+                "train_loss": None,
+                "grad_norm": None,
+                "val_loss": 5.0,
+            },
+            {
+                "step": 6,
+                "train_loss": None,
+                "grad_norm": None,
+                "val_loss": 4.5,
+            },
+            {
+                "step": 7,
+                "train_loss": None,
+                "grad_norm": None,
+                "val_loss": 4.0,
+            },
+            {"step": 8, "train_loss": 3.5, "grad_norm": 1.0},
+            {"step": 9, "train_loss": 3.4, "grad_norm": 1.0},
+        ],
+        baseline_loss=baseline,
+    )
+    assert recovered_analysis["status"] == "healthy", (
+        recovered_analysis
+    )
+    assert recovered_analysis["last_train_loss"] is None
+    print_curve_analysis(recovered_analysis)
 
     # 早停状态恢复：最优值与连续未改善次数必须与历史一致。
     (
