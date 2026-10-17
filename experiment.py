@@ -372,8 +372,7 @@ class Expert(nn.Module):
         gate_up = F.linear(x, self.gate_up.weight)
 
         # 无反向需求（no_grad/inference_mode 下的评估路径）时
-        # 直接原地计算，跳过 autograd.Function 的调度开销；
-        # 数值上与 _SwiGLU 的无反向分支完全一致。
+        # 直接原地计算，数值上与 _SwiGLU 的无反向分支完全一致。
         if gate_up.requires_grad:
             hidden = _SwiGLU.apply(gate_up)
         else:
@@ -3014,9 +3013,9 @@ def evaluate(
                 result = model(x, y)
 
                 # argmax 直接取模型输出 dtype（bf16/fp16 -> fp32
-                # 是精确升位，不改变数值与并列顺序），避免整批
-                # logits 的 fp32 临时副本；AUC 的 softmax 仍在
-                # fp32 下统计，避免半精度数值噪声影响逐类指标。
+                # 是精确升位，不改变数值与并列顺序）；AUC 的
+                # softmax 仍在 fp32 下统计，避免半精度数值噪声
+                # 影响逐类指标。
                 raw_logits = result.pop("logits")
 
                 predicted = raw_logits.argmax(dim=-1)
@@ -4469,7 +4468,7 @@ def print_curve_analysis(analysis: Dict[str, object]) -> None:
     if analysis.get("best_val_loss") is not None:
         # 最后一个验证点之前可能一个有限训练损失都没有（早期
         # NaN/Inf 后恢复的运行），此时 last_train_loss 为 None，
-        # 与其它字段一致按缺失值打印而不是 float(None) 崩溃。
+        # 与其它字段一致按缺失值打印。
         last_train_loss = analysis.get("last_train_loss")
         last_train_text = (
             f"{float(last_train_loss):.4f}"
@@ -6013,11 +6012,11 @@ _MIN_SEEDS_FOR_STATS = 2
 _RECOMMENDED_SEEDS = 3
 
 # 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量、
-# 计算量（FLOPs）、延迟与显存/内存占用；成本达到基线的该倍数
+# 计算量（FLOPs）、延迟与峰值内存；效率倍率达到基线的该阈值
 # 时，即使统计显著也必须在结论中显式权衡「涨点是否值得」。
 _COST_RATIO_MATERIAL = 1.5
 
-# 参与成本权衡的效率字段（顺序即展示顺序）。
+# 参与效率权衡的字段（顺序即展示顺序）。
 _COST_FIELDS: Tuple[str, ...] = (
     "n_params",
     "flops_per_forward",
@@ -6029,7 +6028,7 @@ _COST_FIELD_LABELS = {
     "n_params": "参数",
     "flops_per_forward": "FLOPs",
     "latency_ms_per_forward": "延迟",
-    "peak_memory_mb": "显存/内存",
+    "peak_memory_mb": "峰值内存",
 }
 
 
@@ -6672,9 +6671,9 @@ def aggregate_runs(
             "costs": {},
         }
 
-        # 效率成本（参数量 / FLOPs / 延迟 / 显存·内存）随精度指标
+        # 效率指标（参数量 / FLOPs / 延迟 / 峰值内存）随精度指标
         # 一起聚合：评价改进必须同时给出涨点与代价，否则微小的
-        # 涨点可能掩盖数量级的计算开销。
+        # 涨点可能掩盖数量级的开销差异。
         for field in _COST_FIELDS:
             values = [
                 float(group_row[field])
@@ -9631,7 +9630,7 @@ def run_self_test():
     # 早期全部非有限、之后恢复且有验证点的运行：最后一个验证点
     # 之前没有任何有限训练损失（last_train_loss 为 None），但后续
     # 有限训练步使 recent_nonfinite 判定为 False、不判发散。打印
-    # 该诊断必须容忍缺失的最终训练损失（曾触发 float(None)）。
+    # 该诊断必须容忍缺失的最终训练损失。
     recovered_analysis = analyze_training_curve(
         [
             {
@@ -11768,7 +11767,7 @@ def main():
         "train/val",
     ):
         raise SystemExit(
-            "严格数据审计未通过：请先清洗/修复数据"
+            "严格数据审计未通过：请先清洗数据"
             "（去重、修编码、修正群组划分），或去掉 "
             "--strict-data-audit 仅保留警告。"
         )
@@ -12996,12 +12995,12 @@ def main():
     # 不会让测试集变成隐式验证集，需要新的结论应使用全新目录。
     if args.evaluate_test and numerical_polluted:
         # 参数已被 NaN/Inf 污染时模型输出不可信，评估测试集只会
-        # 白白消耗该目录唯一一次解封名额；保持尘封，修复后从
-        # 污染前的检查点恢复或换全新目录再评估。
+        # 白白消耗该目录唯一一次解封名额；保持尘封，数值问题
+        # 处理后再从污染前的检查点恢复或换全新目录评估。
         print(
             "[test] 参数/优化器状态已被 NaN/Inf 污染，"
             "本次不消耗唯一的测试集评估名额：测试集保持尘封。"
-            "请从污染前的检查点恢复并修复数值问题后，"
+            "请从污染前的检查点恢复并处理数值问题后，"
             "再显式 --evaluate-test。"
         )
     elif args.evaluate_test:
