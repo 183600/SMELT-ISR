@@ -193,6 +193,25 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
   会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
   3~5。
+- **基线合理性（稻草人守卫）**：`--compare-baseline MODE`
+  在给出相对差值之外，还核对基线本身是否值得战胜：基线在
+  主指标上必须真的优于无上下文 unigram 参考（各运行
+  `config.json` 的 `reference_baselines`），不能劣于对比集合
+  里调优好的 n-gram 统计基线，且种子数应 ≥3；否则以
+  `[straw-man]` 明确标记「战胜这样的弱基线不能证明复杂模型
+  的收益，先把基线训练/调参到强于参考」。未指定基线或缺少
+  参考记录时给出提示而不是虚报通过——没调过参的弱基线只能
+  证明复杂模型比稻草人强。
+- **假设登记与指标口径提示**：对比分析按模式汇总每个运行在
+  `--hypothesis`/`--rq` 登记的假设，缺失假设的运行被点名
+  （统计基线除外），避免把排列组合超参数当成假设驱动的实验；
+  同时基于 `val_majority_accuracy`（最高频类的 support 占比）
+  提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值
+  有限，占比 ≥90% 时 accuracy/micro 已被常数预测主导、必须
+  看 macro F1 与 PR-AUC（此时 ROC-AUC 因负样本基数巨大、
+  FPR 增长缓慢而偏乐观）。三项检查的结构化结果
+  （`hypothesis_registry`、`baseline_adequacy`、
+  `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
   损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前
   值），四个组合都覆盖后才能同时给出两个创新点各自的主效应

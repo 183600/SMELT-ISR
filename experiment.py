@@ -6136,6 +6136,25 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         if isinstance(run_args, dict):
             row["seed"] = run_args.get("seed")
 
+        # 假设纪律：对比分析要能展示每个运行登记的科学假设，
+        # 并把缺失假设（旧运行或显式跳过）单独标记出来，避免
+        # 把「排列组合超参数」当成假设驱动的实验。
+        row["hypothesis"] = config_payload.get("hypothesis")
+        row["research_question"] = config_payload.get(
+            "research_question"
+        )
+        row["hypothesis_check_skipped"] = bool(
+            config_payload.get("hypothesis_check_skipped")
+        )
+
+        # 参考基线（uniform / unigram 在 val 上的同口径指标）：
+        # 对比分析用它核对「所声明的基线是否真的强于无上下文
+        # 预测器」，否则复杂模型战胜的只是稻草人。
+        reference = config_payload.get("reference_baselines")
+        row["reference_baselines"] = (
+            reference if isinstance(reference, dict) else None
+        )
+
         # 受控变量协议：对比分析用它检查「除声明因子外，
         # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
         row["protocol"] = experiment_protocol_from_payload(
@@ -6198,8 +6217,31 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        row["val_weighted_f1"] = (
+            final_record.get("val_weighted_f1")
+            if final_record is not None
+            else None
+        )
         row["val_pr_auc_macro"] = (
             final_record.get("val_pr_auc_macro")
+            if final_record is not None
+            else None
+        )
+        row["val_roc_auc_macro"] = (
+            final_record.get("val_roc_auc_macro")
+            if final_record is not None
+            else None
+        )
+        # 多数类参考 accuracy（= 评估集中最高频类的 support 占比）：
+        # 类别不平衡提示用，判断 accuracy/micro 口径是否被常数
+        # 预测主导。
+        row["val_majority_accuracy"] = (
+            final_record.get("val_majority_accuracy")
+            if final_record is not None
+            else None
+        )
+        row["val_classes_present"] = (
+            final_record.get("val_classes_present")
             if final_record is not None
             else None
         )
@@ -7917,6 +7959,412 @@ def ablation_coverage(
     return report
 
 
+# ------------------------------------------------------------
+# 基线合理性与假设纪律检查（对比分析阶段）
+# ------------------------------------------------------------
+
+# 无上下文参考基线（unigram）在各对比指标上的对应字段名。
+# 它们由每个运行在训练开始时用 train 统计量在 val 固定窗口上
+# 算出并随 config.json 的 reference_baselines 存档，用于核对
+# 「所声明的基线是否真的强于无上下文预测器」。没有对应参考的
+# 指标（如 PR-AUC / ROC-AUC）只提示无法核对，不虚报通过。
+_TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
+    "val_loss": "unigram_loss",
+    "val_ppl": "unigram_loss",
+    "val_bits_per_byte": "unigram_loss",
+    "val_token_accuracy": "unigram_token_accuracy",
+    "val_micro_f1": "unigram_token_accuracy",
+    "val_macro_f1": "unigram_macro_f1",
+    "val_weighted_f1": "unigram_weighted_f1",
+}
+
+# 类别不平衡提示阈值：最高频类的 support 占比达到第一个值时，
+# accuracy / micro 口径已被「永远预测多数类」的常数预测器
+# 主导；超过第二个值时 accuracy 的参考价值已经有限。
+_IMBALANCE_DOMINANT_MAJORITY = 0.9
+_IMBALANCE_WEAK_MAJORITY = 0.5
+
+
+def _trivial_reference_value(
+    metric: str,
+    reference: Optional[Dict[str, object]],
+) -> Optional[float]:
+    """
+    取 unigram 参考基线在指定指标上的同口径值，供「基线是否
+    强于稻草人」的核对使用；没有对应参考口径、参考缺失或
+    非有限时返回 None。
+    """
+    if not isinstance(reference, dict):
+        return None
+
+    field = _TRIVIAL_REFERENCE_FIELDS.get(metric)
+    if field is None:
+        return None
+
+    value = reference.get(field)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+
+    # unigram_loss 换算到其他口径时与 evaluate / 曲线诊断一致。
+    if metric == "val_ppl":
+        return math.exp(min(value, 80.0))
+    if metric == "val_bits_per_byte":
+        return value / math.log(2.0)
+    return value
+
+
+def baseline_adequacy(
+    rows: List[Dict[str, object]],
+    baseline_mode: Optional[str],
+    metric: str = "val_loss",
+) -> Dict[str, object]:
+    """
+    基线合理性检查（稻草人守卫）。
+
+    复杂模型的涨点只有相对「精心调优过的基线」才有意义：
+    没调过参的弱基线只能证明复杂模型比稻草人强。本检查在
+    对比阶段核对 ``--compare-baseline`` 指定的基线：
+
+    1. 基线在同口径下必须真的优于无上下文 unigram 参考
+       （其值随运行 config.json 的 reference_baselines 存档）；
+       否则标记 ``[straw-man]``——战胜这样的基线不能证明
+       复杂模型的收益；
+    2. 若对比集合里有调优好的字节级 n-gram 统计基线，而它在
+       主指标上已不劣于所选神经基线，同样标记 ``[straw-man]``：
+       应先把基线训练/调参到强于统计基线，再谈复杂模型；
+    3. 基线本身种子数不足时提示统计功效不足，避免把基线的
+       种子波动误读成改进。
+
+    返回结构化报告，随 comparison_analysis.json 落盘。
+    """
+    report: Dict[str, object] = {
+        "baseline_mode": baseline_mode,
+        "metric": metric,
+        "n_baseline_runs": 0,
+        "baseline_mean": None,
+        "checks": [],
+        "straw_man": [],
+        "advisories": [],
+        "ok": None,
+    }
+
+    if not baseline_mode:
+        report["advisories"].append(
+            "未指定 --compare-baseline：无法定位基线并核对它"
+            "是否强于无上下文参考；建议显式指定（如 "
+            "--compare-baseline smelt）"
+        )
+        return report
+
+    baseline_rows = [
+        row
+        for row in rows
+        if str(row.get("mode")) == baseline_mode
+    ]
+
+    if not baseline_rows:
+        report["straw_man"].append(
+            f"未找到 mode={baseline_mode} 的基线运行，"
+            "无法核对基线合理性"
+        )
+        report["ok"] = False
+        return report
+
+    report["n_baseline_runs"] = len(baseline_rows)
+
+    baseline_values = [
+        float(row[metric])
+        for row in baseline_rows
+        if isinstance(row.get(metric), (int, float))
+        and not isinstance(row.get(metric), bool)
+        and math.isfinite(float(row[metric]))
+    ]
+    baseline_mean = _mean(baseline_values)
+    report["baseline_mean"] = baseline_mean
+
+    if baseline_mean is None:
+        report["straw_man"].append(
+            f"基线运行没有可用的 {metric} 指标，无法核对"
+        )
+        report["ok"] = False
+        return report
+
+    higher_is_better = metric_higher_is_better(metric)
+    reference_supported = metric in _TRIVIAL_REFERENCE_FIELDS
+
+    # 1) 基线 vs 无上下文 unigram 参考。
+    checked = 0
+    missing_reference = 0
+
+    if not reference_supported:
+        report["advisories"].append(
+            f"指标 {metric} 没有无上下文参考口径，"
+            "跳过「基线强于稻草人」的核对"
+        )
+    else:
+        for row in baseline_rows:
+            value = row.get(metric)
+            if not (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            ):
+                continue
+
+            reference_value = _trivial_reference_value(
+                metric,
+                row.get("reference_baselines"),
+            )
+            if reference_value is None:
+                missing_reference += 1
+                continue
+
+            checked += 1
+            better = (
+                float(value) > reference_value
+                if higher_is_better
+                else float(value) < reference_value
+            )
+            report["checks"].append({
+                "run": row.get("run"),
+                "value": float(value),
+                "trivial_reference": reference_value,
+                "better_than_trivial": better,
+            })
+            if not better:
+                report["straw_man"].append(
+                    f"基线 {row.get('run')} 的 {metric}="
+                    f"{float(value):.4f} 没有优于无上下文 "
+                    f"unigram 参考 {reference_value:.4f}："
+                    "战胜这样的弱基线不能证明复杂模型的收益，"
+                    "请先把基线训练/调参到强于参考"
+                )
+
+        if missing_reference:
+            report["advisories"].append(
+                f"{missing_reference} 个基线运行缺少参考基线记录"
+                "（旧运行或统计基线），无法核对是否强于"
+                "无上下文参考"
+            )
+
+    # 2) 基线 vs 调优好的 n-gram 统计基线（若在对比集合中）。
+    ngram_rows = [
+        row
+        for row in rows
+        if str(row.get("mode")) == "ngram"
+        and isinstance(row.get(metric), (int, float))
+        and not isinstance(row.get(metric), bool)
+        and math.isfinite(float(row[metric]))
+    ]
+    if ngram_rows:
+        ngram_mean = _mean(
+            [float(row[metric]) for row in ngram_rows]
+        )
+        baseline_better = (
+            baseline_mean > float(ngram_mean)
+            if higher_is_better
+            else baseline_mean < float(ngram_mean)
+        )
+        if baseline_better:
+            report["advisories"].append(
+                f"基线 {baseline_mode}（{baseline_mean:.4f}）"
+                f"优于调优好的 n-gram（{float(ngram_mean):.4f}）"
+                "：这是一个值得战胜的基线"
+            )
+        else:
+            report["straw_man"].append(
+                f"调优好的字节级 n-gram 统计基线在 {metric} 上"
+                f"（{float(ngram_mean):.4f}）已不劣于所选基线 "
+                f"{baseline_mode}（{baseline_mean:.4f}）：先对基线"
+                "充分调参（学习率/模型宽度/训练步数），再比较"
+                "复杂模型是否有收益"
+            )
+
+    # 3) 基线本身的统计功效。
+    if len(baseline_rows) < _RECOMMENDED_SEEDS:
+        report["advisories"].append(
+            f"基线只有 {len(baseline_rows)} 个种子（建议 ≥"
+            f"{_RECOMMENDED_SEEDS}）：基线自身的种子噪声可能"
+            "主导改进结论"
+        )
+
+    if report["straw_man"]:
+        report["ok"] = False
+    elif (
+        reference_supported
+        and checked == len(baseline_values)
+        and missing_reference == 0
+    ):
+        report["ok"] = True
+
+    return report
+
+
+def hypothesis_registry(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    每个实验单元登记的科学假设汇总。
+
+    全新训练必须通过 --hypothesis 说明「预期什么改动带来什么
+    效果、依据什么指标判定成败」（入口已强制），此处把各运行
+    登记的假设按模式汇总，并把缺失假设的运行单独列出——没有
+    假设记录的对比与「排列组合超参数」无法区分。统计基线
+    （ngram）不受假设纪律约束。
+    """
+    cells: Dict[str, Dict[str, object]] = {}
+    order: List[str] = []
+    missing_runs: List[str] = []
+    skipped_runs: List[str] = []
+
+    for row in rows:
+        mode = str(row.get("mode"))
+        entry = cells.get(mode)
+        if entry is None:
+            entry = {
+                "mode": mode,
+                "n_runs": 0,
+                "hypotheses": [],
+                "research_questions": [],
+                "missing_hypothesis_runs": [],
+                "hypothesis_check_skipped_runs": [],
+            }
+            cells[mode] = entry
+            order.append(mode)
+
+        entry["n_runs"] += 1
+
+        hypothesis_text = str(row.get("hypothesis") or "").strip()
+        rq_text = str(row.get("research_question") or "").strip()
+
+        if rq_text and rq_text not in entry["research_questions"]:
+            entry["research_questions"].append(rq_text)
+
+        if hypothesis_text:
+            if hypothesis_text not in entry["hypotheses"]:
+                entry["hypotheses"].append(hypothesis_text)
+            continue
+
+        if mode == "ngram":
+            continue
+
+        run_name = str(row.get("run"))
+        entry["missing_hypothesis_runs"].append(run_name)
+        missing_runs.append(run_name)
+        if row.get("hypothesis_check_skipped"):
+            entry["hypothesis_check_skipped_runs"].append(
+                run_name
+            )
+            skipped_runs.append(run_name)
+
+    advisories: List[str] = []
+    if missing_runs:
+        advisories.append(
+            "以下运行没有登记科学假设（旧运行或显式跳过检查）："
+            + "; ".join(missing_runs)
+            + "。缺假设的对比无法与排列组合超参数区分，"
+            "结论只能作为探索性结果"
+        )
+    if skipped_runs:
+        advisories.append(
+            "以下运行显式跳过了假设检查"
+            "（--skip-hypothesis-check）："
+            + "; ".join(skipped_runs)
+        )
+
+    return {
+        "cells": [cells[mode] for mode in order],
+        "missing_hypothesis_runs": missing_runs,
+        "hypothesis_check_skipped_runs": skipped_runs,
+        "advisories": advisories,
+    }
+
+
+def imbalance_metric_advisory(
+    rows: List[Dict[str, object]],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    类别不平衡下的指标解读提示。
+
+    类别不平衡时 accuracy / micro F1 会被高频类抬高；极度
+    不平衡时 ROC-AUC 的 FPR 分母由海量负样本决定，同样的假
+    阳性绝对数量下 FPR 增长缓慢，会给出过于乐观的分数，此时
+    应优先看 PR-AUC（macro 口径）。检查基于每个运行
+    metrics.jsonl 记录的 val_majority_accuracy（最高频类的
+    support 占比，即常数预测器的 accuracy）。
+    """
+    report: Dict[str, object] = {
+        "metric": metric,
+        "max_majority_accuracy": None,
+        "most_imbalanced_run": None,
+        "advisories": [],
+    }
+
+    entries = [
+        (str(row.get("run")), float(row["val_majority_accuracy"]))
+        for row in rows
+        if isinstance(
+            row.get("val_majority_accuracy"), (int, float)
+        )
+        and not isinstance(
+            row.get("val_majority_accuracy"), bool
+        )
+        and math.isfinite(
+            float(row["val_majority_accuracy"])
+        )
+    ]
+
+    if not entries:
+        return report
+
+    most_imbalanced_run, max_majority = max(
+        entries,
+        key=lambda item: item[1],
+    )
+    report["max_majority_accuracy"] = max_majority
+    report["most_imbalanced_run"] = most_imbalanced_run
+
+    if max_majority >= _IMBALANCE_DOMINANT_MAJORITY:
+        report["advisories"].append(
+            f"最高频类占比达 {max_majority:.1%}"
+            f"（{most_imbalanced_run}，val_majority_accuracy）："
+            "accuracy 与 micro 口径已被常数预测主导，必须看 "
+            "macro F1 与 PR-AUC；此时 ROC-AUC 会因负样本基数大"
+            "而过于乐观"
+        )
+    elif max_majority >= _IMBALANCE_WEAK_MAJORITY:
+        report["advisories"].append(
+            f"最高频类占比达 {max_majority:.1%}"
+            f"（{most_imbalanced_run}）：accuracy/micro 口径"
+            "参考价值有限，应同时报告 macro F1"
+        )
+
+    if (
+        metric in ("val_token_accuracy", "val_micro_f1")
+        and max_majority >= _IMBALANCE_WEAK_MAJORITY
+    ):
+        report["advisories"].append(
+            f"当前主指标 {metric} 受多数类主导："
+            "建议改用 macro F1 或 PR-AUC 作为判定口径"
+        )
+    if (
+        metric == "val_roc_auc_macro"
+        and max_majority >= _IMBALANCE_WEAK_MAJORITY
+    ):
+        report["advisories"].append(
+            "类别不平衡下 ROC-AUC 偏乐观（FPR 分母被负样本"
+            "基数拉大），优先看 PR-AUC"
+            "（--compare-metric val_pr_auc_macro）"
+        )
+
+    return report
+
+
 def print_comparison_analysis(
     rows: List[Dict[str, object]],
     factors: Optional[List[str]] = None,
@@ -7964,6 +8412,9 @@ def print_comparison_analysis(
         metric,
     )
     coverage = ablation_coverage(rows, factors)
+    hypotheses = hypothesis_registry(rows)
+    adequacy = baseline_adequacy(rows, baseline_mode, metric)
+    imbalance = imbalance_metric_advisory(rows, metric)
 
     higher_is_better = metric_higher_is_better(metric)
 
@@ -8003,6 +8454,33 @@ def print_comparison_analysis(
             "请统一这些设置后重跑，或在 --compare-factors 中"
             "显式声明为因子"
         )
+
+    print()
+    print(
+        "[hypothesis] 科学假设登记（每个改动前写明预期效果与"
+        "判定指标；缺假设的对比与排列组合超参数无法区分）"
+    )
+    if not hypotheses["cells"]:
+        print("  无运行可检查")
+    for cell in hypotheses["cells"]:
+        rq_text = (
+            " / ".join(cell["research_questions"])
+            if cell["research_questions"]
+            else "-"
+        )
+        if cell["hypotheses"]:
+            print(
+                f"  {cell['mode']}"
+                f"（{cell['n_runs']} 个运行, RQ: {rq_text}）: "
+                + " | ".join(cell["hypotheses"])
+            )
+        else:
+            print(
+                f"  {cell['mode']}（{cell['n_runs']} 个运行）: "
+                "未登记假设"
+            )
+    for message in hypotheses["advisories"]:
+        print(f"  [warn] {message}")
 
     print()
     print(
@@ -8049,6 +8527,18 @@ def print_comparison_analysis(
             )
     else:
         print("  无有效指标可聚合")
+
+    # 类别不平衡提示：accuracy/micro 会被高频类抬高；极度
+    # 不平衡时 ROC-AUC 偏乐观，应优先看 macro F1 与 PR-AUC。
+    print()
+    print("[metrics] 类别不平衡与指标口径提示")
+    if not imbalance["advisories"]:
+        print(
+            "  OK：未发现多数类占比过半的运行，"
+            "accuracy/micro 与 macro/PR-AUC 口径可对照解读"
+        )
+    for message in imbalance["advisories"]:
+        print(f"  [note] {message}")
 
     # 效率与精度权衡：涨点必须与参数量/计算量/延迟/内存一起看。
     cost_rows = [
@@ -8156,6 +8646,38 @@ def print_comparison_analysis(
         f"{_RECOMMENDED_SEEDS}"
     )
 
+    # 基线合理性：复杂模型必须战胜精心调优过的基线，
+    # 战胜稻草人说明不了任何问题（详见 baseline_adequacy）。
+    print()
+    print(
+        "[baseline] 基线合理性检查（复杂模型必须战胜精心"
+        "调优过的基线；战胜稻草人说明不了问题）"
+    )
+    if adequacy["baseline_mode"] is None:
+        for message in adequacy["advisories"]:
+            print(f"  [note] {message}")
+    else:
+        baseline_mean = adequacy.get("baseline_mean")
+        print(
+            f"  基线 mode={adequacy['baseline_mode']}"
+            f"（{adequacy['n_baseline_runs']} 个运行）"
+            + (
+                f"，{metric} 均值 {float(baseline_mean):.4f}"
+                if baseline_mean is not None
+                else ""
+            )
+        )
+        if adequacy["ok"] is True:
+            print(
+                "  OK：基线在主指标上强于无上下文 unigram "
+                "参考（核对依据：各运行 config.json 的 "
+                "reference_baselines）"
+            )
+        for message in adequacy["straw_man"]:
+            print(f"  [straw-man] {message}")
+        for message in adequacy["advisories"]:
+            print(f"  [note] {message}")
+
     print()
     print(
         "[ablation] 消融覆盖检查（延迟合并 × 均衡损失 2×2："
@@ -8186,9 +8708,12 @@ def print_comparison_analysis(
         "factors": factors,
         "metric": metric,
         "controlled": controlled,
+        "hypothesis_registry": hypotheses,
         "aggregates": aggregates,
         "contrasts": contrasts,
         "reference_contrasts": reference,
+        "baseline_adequacy": adequacy,
+        "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
         "n_runs": len(rows),
     }
@@ -10837,6 +11362,10 @@ def run_self_test():
             steps: int,
             balance: float,
             val_loss: float,
+            hypothesis: str = "",
+            rq: str = "",
+            reference: Optional[Dict[str, object]] = None,
+            majority_accuracy: Optional[float] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -10883,6 +11412,9 @@ def run_self_test():
                     "lr": lr,
                     "steps": steps,
                 },
+                "hypothesis": hypothesis,
+                "research_question": rq,
+                "reference_baselines": reference,
                 "data": {"sha256": "deadbeef"},
                 "comparison_protocol": protocol,
             }
@@ -10897,6 +11429,10 @@ def run_self_test():
                 "step": "final",
                 "val_loss": val_loss,
             }
+            if majority_accuracy is not None:
+                final_record[
+                    "val_majority_accuracy"
+                ] = majority_accuracy
             write_jsonl_record(
                 run_dir / "metrics.jsonl",
                 final_record,
@@ -11222,6 +11758,204 @@ def run_self_test():
             "计算量差异" in message
             for message in unrelated_coverage["advisories"]
         )
+
+        # ---- 基线合理性检查（稻草人守卫） ----
+        good_reference = {
+            "unigram_loss": 5.0,
+            "uniform_loss": 5.545,
+            "unigram_token_accuracy": 0.20,
+            "unigram_macro_f1": 0.01,
+            "unigram_weighted_f1": 0.15,
+        }
+
+        smelt_path = _write_analysis_run(
+            "smelt_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.50,
+            hypothesis="SMELT 基线：判定延迟合并是否改善验证损失",
+            rq="RQ1",
+            reference=good_reference,
+        )
+        a_hyp_path = _write_analysis_run(
+            "A_seed1",
+            "A",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.40,
+            hypothesis="延迟合并使第二轮组合独立，验证损失至少改善 2%",
+            rq="RQ1",
+            reference=good_reference,
+        )
+        legacy_path = _write_analysis_run(
+            "legacy_seed1",
+            "smelt",
+            9,
+            3e-4,
+            100,
+            0.01,
+            4.60,
+            reference=good_reference,
+        )
+        hyp_rows = compare_runs(
+            [smelt_path, a_hyp_path, legacy_path]
+        )
+
+        adequacy_ok = baseline_adequacy(
+            hyp_rows, "smelt", "val_loss"
+        )
+        assert adequacy_ok["ok"] is True, adequacy_ok
+        assert not adequacy_ok["straw_man"]
+
+        # 基线没有优于 unigram 参考（稻草人）：必须被标记，
+        # 且 ok=False。5.20 > 5.0（越低越好）。
+        weak_path = _write_analysis_run(
+            "weak_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            5.20,
+            reference=good_reference,
+        )
+        weak_adequacy = baseline_adequacy(
+            compare_runs([weak_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert weak_adequacy["ok"] is False
+        assert any(
+            "unigram" in message
+            for message in weak_adequacy["straw_man"]
+        )
+
+        # 缺参考基线记录的运行不能静默放行：ok=None 且给出提示。
+        no_ref_path = _write_analysis_run(
+            "noref_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.0,
+        )
+        no_ref_adequacy = baseline_adequacy(
+            compare_runs([no_ref_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert no_ref_adequacy["ok"] is None
+        assert any(
+            "缺少参考基线" in message
+            for message in no_ref_adequacy["advisories"]
+        )
+
+        # 调优好的 n-gram 已不劣于所选神经基线：同样标记
+        # straw-man（4.30 < 4.50，越低越好）。
+        ngram_path = _write_analysis_run(
+            "ngram_val",
+            "ngram",
+            0,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+        )
+        ngram_adequacy = baseline_adequacy(
+            compare_runs([smelt_path, ngram_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert ngram_adequacy["ok"] is False
+        assert any(
+            "n-gram" in message
+            for message in ngram_adequacy["straw_man"]
+        )
+
+        # 未指定基线时给出建议而不是虚报通过。
+        no_baseline = baseline_adequacy(hyp_rows, None, "val_loss")
+        assert no_baseline["ok"] is None
+        assert any(
+            "--compare-baseline" in message
+            for message in no_baseline["advisories"]
+        )
+
+        # 假设登记：有假设的运行按模式汇总，无假设的运行被点名；
+        # 统计基线（ngram）不受假设纪律约束。
+        registry = hypothesis_registry(hyp_rows)
+        registry_by_mode = {
+            cell["mode"]: cell
+            for cell in registry["cells"]
+        }
+        assert registry_by_mode["smelt"]["n_runs"] == 2
+        assert len(
+            registry_by_mode["smelt"]["hypotheses"]
+        ) == 1
+        assert registry_by_mode["smelt"][
+            "research_questions"
+        ] == ["RQ1"]
+        assert "legacy_seed1" in (
+            registry["missing_hypothesis_runs"]
+        )
+        ngram_registry = hypothesis_registry(
+            compare_runs([ngram_path])
+        )
+        assert not ngram_registry["missing_hypothesis_runs"]
+
+        # 类别不平衡：多数类占比 95% 时必须提示 accuracy/micro
+        # 失效、优先 PR-AUC；ROC-AUC 口径额外提示其偏乐观。
+        imbalanced_path = _write_analysis_run(
+            "imb_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.0,
+            majority_accuracy=0.95,
+        )
+        imb_rows = compare_runs([imbalanced_path])
+        imb_report = imbalance_metric_advisory(
+            imb_rows,
+            "val_token_accuracy",
+        )
+        assert imb_report["max_majority_accuracy"] == 0.95
+        assert any(
+            "PR-AUC" in message
+            for message in imb_report["advisories"]
+        )
+        roc_report = imbalance_metric_advisory(
+            imb_rows,
+            "val_roc_auc_macro",
+        )
+        assert any(
+            "ROC-AUC" in message
+            for message in roc_report["advisories"]
+        )
+        # 多数类不过半时不虚报提示。
+        balanced_report = imbalance_metric_advisory(
+            compare_runs([no_ref_path]),
+            "val_loss",
+        )
+        assert not balanced_report["advisories"]
+
+        # print_comparison_analysis 必须携带三个新检查的结构化
+        # 结果（随 comparison_analysis.json 落盘）。
+        full_analysis = print_comparison_analysis(
+            hyp_rows,
+            factors=factors,
+            baseline_mode="smelt",
+            metric="val_loss",
+        )
+        assert full_analysis["baseline_adequacy"]["ok"] is True
+        assert full_analysis["hypothesis_registry"]["cells"]
+        assert "imbalance_advisory" in full_analysis
 
     # ---- 效率与精度权衡：涨点必须与效率倍率一起看 ----
     def _write_cost_run(
@@ -11970,7 +12704,10 @@ def main():
         metavar="MODE",
         help=(
             "以指定模式作为基线，在统计报告中给出其余"
-            "实验单元相对基线的差值（如 smelt 或 local_base）"
+            "实验单元相对基线的差值（如 smelt 或 local_base）；"
+            "同时核对基线是否真的强于无上下文 unigram 参考与"
+            "调优好的 n-gram（稻草人守卫：战胜弱基线不能证明"
+            "复杂模型的收益）"
         ),
     )
     parser.add_argument(
