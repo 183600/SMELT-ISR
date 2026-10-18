@@ -1843,9 +1843,16 @@ class _BlockCheckpoint(torch.autograd.Function):
             *(arg for arg in args if torch.is_tensor(arg))
         )
 
-        with torch.autograd.graph.saved_tensors_hooks(
-            _checkpoint_discard,
-            _checkpoint_restore,
+        # autograd.Function.forward 默认在 no_grad 下执行；Block
+        # 内存在依赖梯度状态的算子（route 的辅助负载均衡损失
+        # 按 torch.is_grad_enabled() 分支返回零），必须显式开启
+        # 梯度，否则前向数值与被记录的训练损失和直接调用不一致
+        #（torch.utils.checkpoint(use_reentrant=False) 同样如此）。
+        with torch.enable_grad(), (
+            torch.autograd.graph.saved_tensors_hooks(
+                _checkpoint_discard,
+                _checkpoint_restore,
+            )
         ):
             outputs = fn(*args)
 
@@ -5665,8 +5672,11 @@ _BAD_CASE_RARE_TARGET_SHARE = 0.005
 # 同一 (target, predicted) 混淆对在错误列表中出现该次数以上时，
 # 视为系统性混淆（模型盲区），而不是孤立个例。
 _BAD_CASE_SYSTEMATIC_COUNT = 3
+# 坏案例统计的 token 数上限与抽样种子：超过上限时按固定
+# 种子随机下采样，避免在超大评估集上做全量 topk，同时保证
+# 报告可复现且不消耗全局 RNG。
 _BAD_CASE_MAX_TOKENS = 100_000
-_BAD_CASE_TOP_N = 50
+_BAD_CASE_SUBSAMPLE_SEED = 20240601
 
 
 def _render_byte(value: int) -> str:
@@ -5816,7 +5826,15 @@ def analyze_bad_cases(
         window_all = torch.cat(windows)
         max_bad = _BAD_CASE_MAX_TOKENS
         if loss_all.numel() > max_bad:
-            idx = torch.randperm(loss_all.numel(), device=loss_all.device)[:max_bad]
+            # 固定局部生成器：抽样不消耗全局 RNG，坏案例报告
+            # 在相同运行之间逐位可复现。
+            subsample_generator = torch.Generator().manual_seed(
+                _BAD_CASE_SUBSAMPLE_SEED
+            )
+            idx = torch.randperm(
+                loss_all.numel(),
+                generator=subsample_generator,
+            )[:max_bad]
             loss_all = loss_all[idx]
             target_all = target_all[idx]
             predicted_all = predicted_all[idx]
@@ -18633,6 +18651,12 @@ def main():
         # 训练循环不再使用 logits。
         del result["logits"]
 
+        # 记录本步存档应保存的 generator 状态，对应
+        # 「从 step+1 恢复」的采样起点。必须在预取下一批
+        # 之前捕获，否则存档状态已消费掉下一批，resume
+        # 会跳过一批、采样轨迹与不中断训练不一致。
+        checkpoint_gen_state = train_generator.get_state()
+
         # 采样下一批并搬运到设备；采样顺序不变。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
@@ -18654,22 +18678,15 @@ def main():
         )
 
         # 损失与梯度范数都必须有限才推进优化器：任一非有限
-        # 都意味着这一步的参数更新不可信。
-        if scaler is not None and scaler._found_inf_per_device:
-            found_inf = None
-            for v in scaler._found_inf_per_device.values():
-                if isinstance(v, torch.Tensor) and v.any():
-                    finite_step = False
-                    break
-            else:
-                # no inf found by scaler; fall back to grad norm check
-                grad_norm_value = grad_norm.item()
-                loss_value = loss.item()
-                finite_step = math.isfinite(grad_norm_value) and math.isfinite(loss_value)
-        else:
-            grad_norm_value = grad_norm.item()
-            loss_value = loss.item()
-            finite_step = math.isfinite(grad_norm_value) and math.isfinite(loss_value)
+        # 都意味着这一步的参数更新不可信。grad_norm 与 loss 的
+        # 标量取回合并为一次设备同步。
+        grad_norm_value, loss_value = torch.stack(
+            (grad_norm.detach(), loss.detach()),
+        ).tolist()
+        finite_grad = math.isfinite(grad_norm_value)
+        finite_step = (
+            finite_grad and math.isfinite(loss_value)
+        )
 
         if finite_step:
             if scaler is not None:
@@ -18743,9 +18760,6 @@ def main():
         pending_scalars.append(
             result["aux_loss"].detach()
         )
-        # defer generator state capture to checkpoint time to avoid
-        # copying RNG state on every training step
-        checkpoint_gen_state = None
 
         del result, loss, x, y
 
@@ -18892,7 +18906,7 @@ def main():
                 scheduler,
                 step + 1,
                 # 本步存档应记录的采样起点（见循环顶部的注释）。
-                train_generator.get_state(),
+                checkpoint_gen_state,
                 args,
             )
             last_saved_step = step + 1
@@ -18917,7 +18931,11 @@ def main():
             # 「从 end_step 恢复」的采样起点；
             # 循环未执行时（start_step >= steps）没有
             # 任何采样发生，直接取当前状态。
-            train_generator.get_state(),
+            (
+                checkpoint_gen_state
+                if checkpoint_gen_state is not None
+                else train_generator.get_state()
+            ),
             args,
         )
 
