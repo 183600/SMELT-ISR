@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import codecs
+from collections import deque
+import contextlib
 import datetime
 import hashlib
 import json
@@ -1831,6 +1833,61 @@ def _checkpoint_restore(packed):
     )
 
 
+def _autocast_snapshot() -> List[Tuple[str, bool, torch.dtype, bool]]:
+    """
+    记录当前进程的 autocast 状态（CUDA / CPU 各一份）。
+
+    _BlockCheckpoint 的前向可能在外层 autocast 上下文中执行，
+    而反向重算发生在 loss.backward()（autocast 上下文之外）。
+    必须按前向时记录的状态重入 autocast，否则 AMP 训练开启
+    grad checkpoint 后，重算图走了 fp32 的 dtype 路径，梯度与
+    不开启 checkpoint 的同一训练不同（torch.utils.checkpoint
+    的非重入实现同样保存并恢复 autocast 状态）。
+    """
+    states: List[Tuple[str, bool, torch.dtype, bool]] = []
+
+    for device_type in ("cuda", "cpu"):
+        try:
+            available = torch.amp.is_autocast_available(device_type)
+        except AttributeError:
+            # 旧版 torch 没有 torch.amp.is_autocast_available。
+            available = (
+                device_type == "cpu" or torch.cuda.is_available()
+            )
+        if not available:
+            continue
+
+        try:
+            enabled = torch.is_autocast_enabled(device_type)
+        except TypeError:
+            # 旧版 torch 的 is_autocast_enabled 不接受设备参数。
+            enabled = (
+                torch.is_autocast_cpu_enabled()
+                if device_type == "cpu"
+                else torch.is_autocast_enabled()
+            )
+
+        try:
+            dtype = torch.get_autocast_dtype(device_type)
+        except AttributeError:
+            dtype = (
+                torch.get_autocast_cpu_dtype()
+                if device_type == "cpu"
+                else torch.get_autocast_gpu_dtype()
+            )
+
+        states.append(
+            (
+                device_type,
+                enabled,
+                dtype,
+                torch.is_autocast_cache_enabled(),
+            )
+        )
+
+    return states
+
+
 class _BlockCheckpoint(torch.autograd.Function):
     """
     Block 前向的轻量非重入 activation checkpointing。
@@ -1853,6 +1910,7 @@ class _BlockCheckpoint(torch.autograd.Function):
     def forward(ctx, fn, *args):
         ctx.fn = fn
         ctx.args = args
+        ctx.autocast_states = _autocast_snapshot()
         ctx.save_for_backward(
             *(arg for arg in args if torch.is_tensor(arg))
         )
@@ -1906,9 +1964,31 @@ class _BlockCheckpoint(torch.autograd.Function):
                 grad_flags.append(False)
             rebuilt.append(tensor)
 
-        with torch.enable_grad():
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(torch.enable_grad())
+            # 恢复前向时的 autocast 状态：AMP 下重算图的 dtype
+            # 路径必须与前向一致，梯度才与不开启 checkpoint 的
+            # 同一训练相同。
+            for (
+                device_type,
+                enabled,
+                dtype,
+                cache_enabled,
+            ) in ctx.autocast_states:
+                stack.enter_context(
+                    torch.autocast(
+                        device_type=device_type,
+                        dtype=dtype,
+                        enabled=enabled,
+                        cache_enabled=cache_enabled,
+                    )
+                )
             recomputed = ctx.fn(*rebuilt)
 
+        # 反传放在 autocast 上下文之外：与直接调用路径一致
+        # （训练循环的 loss.backward() 就在 autocast 之外执行），
+        # 也与 torch.utils.checkpoint 的非重入实现一致——重算在
+        # autocast 内、重算图的反向在 autocast 外。
         if not isinstance(recomputed, tuple):
             recomputed = (recomputed,)
 
@@ -2377,6 +2457,32 @@ def _iter_group_boundaries(
         yield len(buf)
 
 
+def _iter_group_spans(
+    buf: bytearray,
+    separator: bytes,
+    start: int,
+    end: int,
+):
+    """
+    依次产出 [start, end) 内每个群组的内容区间（不含分隔符本身）。
+
+    与 _iter_group_boundaries 同一口径：群组以分隔符之后的位置
+    为起点（首个群组为 start），以分隔符起点或 end 为终点；空
+    群组不产出区间。文本完整性审计用它把用户显式配置的群组
+    分隔符（可能是 NUL 或非 UTF-8 字节）排除在损坏统计之外。
+    """
+    position = start
+
+    while position < end:
+        found = buf.find(separator, position, end)
+        if found < 0:
+            yield position, end
+            return
+        if found > position:
+            yield position, found
+        position = found + len(separator)
+
+
 def _count_groups(
     buf: bytearray,
     separator: bytes,
@@ -2414,35 +2520,6 @@ def _count_groups(
     return counts
 
 
-def _snap_group_boundary(
-    buf: bytearray,
-    separator: bytes,
-    target: int,
-    lower: int,
-) -> List[int]:
-    """
-    返回 > lower 的、离 target 最近的左右两个群组边界候选。
-    """
-    left: Optional[int] = None
-    right: Optional[int] = None
-
-    for end in _iter_group_boundaries(buf, separator, lower):
-        if end <= lower:
-            continue
-        if end <= target:
-            left = end
-        else:
-            right = end
-            break
-
-    candidates = [
-        candidate
-        for candidate in (left, right)
-        if candidate is not None
-    ]
-    return candidates
-
-
 def _snap_group_split(
     buf: bytearray,
     separator: bytes,
@@ -2455,9 +2532,20 @@ def _snap_group_split(
     把名义切分位置吸附到群组边界：train/val/test 的分界点都是
     某个群组的起始字节，任何群组整体落在一个 split 内。
 
-    在邻近候选边界中穷举所有可行组合（每个目标左右各一个候选），
-    取偏离名义位置总和最小的一组；找不到合法组合时抛出
-    ValueError（宁可报错，也不产生一个拆散群组的划分）。
+    在全部群组边界上求全局最优的可行组合（目标为
+    |cut_train - nominal_train| + |cut_val - nominal_val_end|），
+    找不到合法组合时抛出 ValueError（宁可报错，也不产生一个
+    拆散群组的划分）。
+
+    实现为单次流式扫描：外层枚举 val 右端，滑动窗口保存尚不能
+    作为 train 右端的边界（cut_val - min_len 之后的边界），窗口
+    大小受 min_len 限制（边界至少相隔 1 字节），因此额外空间是
+    O(seq_len) 而不是 O(群组数)。每个 cut_val 只需比较窗口之外
+    「nominal_train 左右最近的边界」与「窗口外最右边界」三个
+    候选，即可取到该 cut_val 下最优的 train 右端；对候选组合按
+    偏离量取全局最小。相比只尝试名义位置左右各一个候选的旧
+    实现，不会再漏掉其他可行组合而误报划分失败，也不会选出
+    偏离更大的次优划分。
     """
     if buf.find(separator) < 0:
         raise ValueError(
@@ -2465,49 +2553,79 @@ def _snap_group_split(
             "请检查 --group-separator 是否正确"
         )
 
-    train_candidates = _snap_group_boundary(
-        buf,
-        separator,
-        nominal_train,
-        0,
-    )
+    total = len(buf)
 
-    if not train_candidates:
-        raise ValueError(
-            "语料中没有可用的群组边界，无法按群组划分；"
-            "请检查 --group-separator 是否正确"
+    # val 右端上界：有 test 时 test 也要至少 min_len 字节；
+    # 无 test 时 val 延伸到文件末尾（cut_val = total 是离
+    # nominal_val_end = total 最近的边界）。
+    upper_val = total if not has_test else total - min_len
+
+    best: Optional[Tuple[int, int]] = None
+    best_key: Optional[Tuple[int, int, int, int, int]] = None
+
+    # 窗口内是「> 当前 cut_val - min_len」的边界；被移出窗口的
+    # 边界里，最后一个 >= min_len 的可作 train 右端。
+    window: deque = deque()
+    trailing: Optional[int] = None
+    left_candidate: Optional[int] = None
+    right_candidate: Optional[int] = None
+
+    def _consider(cut_val: int) -> None:
+        nonlocal best, best_key
+
+        if cut_val > upper_val:
+            return
+
+        lower = cut_val - min_len
+        candidates: List[int] = []
+
+        for candidate in (left_candidate, right_candidate):
+            if candidate is not None and candidate <= lower:
+                candidates.append(candidate)
+
+        if trailing is not None:
+            candidates.append(trailing)
+
+        if not candidates:
+            return
+
+        cut_train = min(
+            candidates,
+            key=lambda cut: (abs(cut - nominal_train), cut),
         )
-
-    best: Optional[Tuple[int, int, int]] = None
-
-    for cut_train in sorted(
-        train_candidates,
-        key=lambda end: (abs(end - nominal_train), end),
-    ):
-        if cut_train < min_len:
-            continue
-
-        val_candidates = _snap_group_boundary(
-            buf,
-            separator,
-            nominal_val_end,
+        deviation_train = abs(cut_train - nominal_train)
+        deviation_val = abs(cut_val - nominal_val_end)
+        key = (
+            deviation_train + deviation_val,
+            deviation_train,
             cut_train,
+            deviation_val,
+            cut_val,
         )
 
-        for cut_val in sorted(
-            val_candidates,
-            key=lambda end: (abs(end - nominal_val_end), end),
-        ):
-            if cut_val - cut_train < min_len:
-                continue
-            if has_test and len(buf) - cut_val < min_len:
-                continue
+        if best_key is None or key < best_key:
+            best_key = key
+            best = (cut_train, cut_val)
 
-            score = abs(cut_train - nominal_train) + abs(
-                cut_val - nominal_val_end
-            )
-            if best is None or score < best[0]:
-                best = (score, cut_train, cut_val)
+    for boundary in _iter_group_boundaries(buf, separator, 0):
+        # 先把已进入「cut_val - min_len」之内的边界移出窗口；
+        # 最后一个移出的边界就是当前 cut_val 下最右的可行
+        # 左侧 train 右端。
+        while window and window[0] <= boundary - min_len:
+            popped = window.popleft()
+            if popped >= min_len:
+                trailing = popped
+
+        _consider(boundary)
+
+        # 该边界之后可作 train 右端（需要 >= min_len）。
+        if boundary >= min_len:
+            if boundary <= nominal_train:
+                left_candidate = boundary
+            elif right_candidate is None:
+                right_candidate = boundary
+
+        window.append(boundary)
 
     if best is None:
         raise ValueError(
@@ -2517,7 +2635,7 @@ def _snap_group_split(
             "--seq-len、检查分隔符，或合并过小的群组"
         )
 
-    return best[1], best[2]
+    return best
 
 
 # 固定评估批设备侧缓存的总字节上限：窗口集合跨评估逐位
@@ -2559,8 +2677,11 @@ class ByteDataset:
     ):
         data_path = Path(filename)
 
-        if not 0.0 <= val_fraction < 1.0:
-            raise ValueError("val_fraction 必须落在 [0, 1)")
+        if not 0.0 < val_fraction < 1.0:
+            raise ValueError(
+                "val_fraction 必须落在 (0, 1)（验证集用于"
+                "选型/早停，不能为空）"
+            )
 
         if not 0.0 <= test_fraction < 1.0:
             raise ValueError("test_fraction 必须落在 [0, 1)")
@@ -2592,8 +2713,11 @@ class ByteDataset:
 
         tokens = torch.frombuffer(buf, dtype=torch.uint8)
 
-        # 数据审计（重复窗口扫描）直接读取原始字节缓冲区。
+        # 数据审计（重复窗口扫描）直接读取原始字节缓冲区；
+        # _raw_buffer 保留 bytearray 本身，供按分隔符切段扫描
+        #（memoryview 不提供 find）。
         self._raw = memoryview(buf)
+        self._raw_buffer = buf
 
         _ = device
 
@@ -2988,13 +3112,16 @@ def _js_distance(
 ) -> float:
     """
     两个离散分布之间的 Jensen-Shannon 距离
-    （JS 散度开方，取值 [0, 1]；0 表示分布相同）。
+    （JS 散度开方，log 以 2 为底，取值 [0, 1]；0 表示分布相同）。
     """
     m = 0.5 * (p + q)
 
     def _kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         mask = a > 0
-        return (a[mask] * (a[mask] / b[mask]).log()).sum()
+        # log2 才能让 JS 散度上界为 1 bit、距离落在 [0, 1]
+        #（自然对数下上界是 ln 2，距离最大 sqrt(ln 2)≈0.83，
+        # 与审计阈值按 [0, 1] 标定的口径不一致）。
+        return (a[mask] * (a[mask] / b[mask]).log2()).sum()
 
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
     return math.sqrt(max(0.0, float(js)))
@@ -3065,6 +3192,7 @@ def _scan_text_integrity(
     length: int,
     chunk: int = 1 << 20,
     final: bool = False,
+    warmup: bool = True,
 ) -> Dict[str, int]:
     """
     扫描一个 split 的文本完整性（数据清洗的标签噪声检查）。
@@ -3084,6 +3212,9 @@ def _scan_text_integrity(
     文件整体仍然完全合法）；``final`` 只在扫描的是文件真正
     的末尾时为 True，否则末尾不完整的多字节序列留给下一个
     split 续接（其解码计数落在后续扫描里）。
+
+    ``warmup=False`` 供逐群组扫描使用：每个群组按独立文本
+    解码，不从前一段（分隔符）借状态。
     """
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="replace"
@@ -3092,7 +3223,7 @@ def _scan_text_integrity(
     # 预热：把解码器带到「从 offset 前几个字节开始」的状态。
     # 预热输出（可能包含边界前的字符或无效序列）全部丢弃，
     # 不计入任何统计。
-    if offset > 0:
+    if warmup and offset > 0:
         decoder.decode(
             bytes(raw[max(0, offset - 3):offset]),
             final=False,
@@ -3208,12 +3339,40 @@ def audit_data_splits(
             dataset.seq_len + 1,
             max_windows,
         )
-        integrity = _scan_text_integrity(
-            dataset._raw,
-            begin,
-            end - begin,
-            final=(end == dataset.num_bytes),
-        )
+        if dataset.group_separator is None:
+            integrity = _scan_text_integrity(
+                dataset._raw,
+                begin,
+                end - begin,
+                final=(end == dataset.num_bytes),
+            )
+        else:
+            # 群组分隔符是用户显式声明的数据结构（可能含 NUL 或
+            # 非 UTF-8 字节，如 --group-separator '\x00'），不能
+            # 计入损坏统计，否则严格审计会把合法配置当成语料
+            # 损坏而拒绝训练。逐群组扫描：每个群组按独立文本
+            # 解码，组尾不完整的多字节序列计入该组。
+            integrity = {
+                "utf8_replacements": 0,
+                "nul_bytes": 0,
+            }
+            for span_start, span_end in _iter_group_spans(
+                dataset._raw_buffer,
+                dataset.group_separator,
+                begin,
+                end,
+            ):
+                part = _scan_text_integrity(
+                    dataset._raw,
+                    span_start,
+                    span_end - span_start,
+                    final=True,
+                    warmup=False,
+                )
+                integrity["utf8_replacements"] += part[
+                    "utf8_replacements"
+                ]
+                integrity["nul_bytes"] += part["nul_bytes"]
 
         splits_report[split] = {
             "bytes": end - begin,
@@ -4836,7 +4995,11 @@ def run_statistical_baseline(
     candidates: List[Dict[str, object]] = []
 
     for alpha in alpha_grid:
-        totals = torch.zeros(model.max_order)
+        # log_probs 是 float64（见 _interpolate_log_probs）；累加器
+        # 必须同 dtype，否则 += 会把双精度的逐窗口损失静默降为
+        # float32，val_loss 与 _ngram_extended_metrics 的 float64
+        # 同口径值不一致，还可能改变 (order, alpha) 的选优结果。
+        totals = torch.zeros(model.max_order, dtype=torch.float64)
         tokens = 0
 
         for window, tables in zip(
@@ -8469,6 +8632,23 @@ _SIGNIFICANCE_LEVEL = 0.05
 _MIN_SEEDS_FOR_STATS = 3
 _RECOMMENDED_SEEDS = 3
 
+
+def _independent_seed_count(
+    n_runs: int,
+    seeds: List[object],
+) -> int:
+    """
+    实验单元的有效独立种子数。
+
+    同一随机种子出现多次的运行是伪重复（复制的同一运行），
+    不能算作独立重复实验：记录的种子按去重计数；未记录种子的
+    运行无法判断彼此是否重复，按独立计入（只扣除确定的
+    伪重复，不虚增种子数）。
+    """
+    recorded = len(seeds)
+    unique = len({_stable_factor_key(seed) for seed in seeds})
+    return unique + max(0, int(n_runs) - recorded)
+
 # 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量与
 # 计算量（FLOPs）等模型规模指标；效率倍率达到基线的该阈值
 # 时，即使统计显著也必须在结论中显式权衡「涨点是否值得」。
@@ -8752,6 +8932,23 @@ def experiment_protocol_from_payload(
     if isinstance(protocol, dict):
         result = dict(fallback)
         result.update(protocol)
+
+        # 记录过的协议里 model_selection 是常量
+        # "best_val_with_last_fallback"（说明支持回退），但训练
+        # 结束写入的顶层 model_selection.policy 才是实际选型结果：
+        # best.pt 缺失/不一致时 final/test 指标来自未经验证集选择
+        # 的最后一步参数，必须与正常选型区分，否则受控变量检查
+        # 无法发现两类运行被混在一起比较。
+        selection = payload.get("model_selection")
+        if isinstance(selection, dict):
+            policy = selection.get("policy")
+            if policy == "last":
+                result["model_selection"] = "last_step"
+            elif policy == "best_val":
+                result["model_selection"] = (
+                    "best_val_with_last_fallback"
+                )
+
         result.setdefault("comparison_family", "neural")
         return result
 
@@ -10138,6 +10335,7 @@ def ablation_coverage(
     modes_present: Dict[str, int] = {}
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
+    merge_pair_seeds: Dict[tuple, List[object]] = {}
     structural_signatures: Dict[str, int] = {}
     balance_values_on: set = set()
     unknown_balance = False
@@ -10170,6 +10368,9 @@ def ablation_coverage(
                 "off" if balance == 0 else "on",
             )
             merge_pair_cells[key] = merge_pair_cells.get(key, 0) + 1
+            seed = _row_factor_value(row, "seed")
+            if seed is not None:
+                merge_pair_seeds.setdefault(key, []).append(seed)
             if balance != 0:
                 balance_values_on.add(_stable_factor_key(balance))
 
@@ -10316,9 +10517,13 @@ def ablation_coverage(
             "cell": label,
             "n_runs": count,
         })
-        if count < _RECOMMENDED_SEEDS:
+        independent = _independent_seed_count(
+            count,
+            merge_pair_seeds.get((mode, level), []),
+        )
+        if independent < _RECOMMENDED_SEEDS:
             report["low_replicate_cells"].append(
-                f"{label} 只有 {count} 个种子"
+                f"{label} 只有 {independent} 个种子"
                 f"（建议 ≥{_RECOMMENDED_SEEDS}）"
             )
 
@@ -10661,12 +10866,21 @@ def baseline_adequacy(
                 report["untuned"].append(message)
                 report["straw_man"].append(message)
 
-    # 4) 基线本身的统计功效。
-    if len(baseline_rows) < _RECOMMENDED_SEEDS:
+    # 4) 基线本身的统计功效（按独立种子数，伪重复不计入）。
+    baseline_seeds = [
+        row.get("seed")
+        for row in baseline_rows
+        if row.get("seed") is not None
+    ]
+    baseline_independent_seeds = _independent_seed_count(
+        len(baseline_rows),
+        baseline_seeds,
+    )
+    if baseline_independent_seeds < _RECOMMENDED_SEEDS:
         report["advisories"].append(
-            f"基线只有 {len(baseline_rows)} 个种子（建议 ≥"
-            f"{_RECOMMENDED_SEEDS}）：基线自身的种子噪声可能"
-            "主导改进结论"
+            f"基线只有 {baseline_independent_seeds} 个种子"
+            f"（建议 ≥{_RECOMMENDED_SEEDS}）：基线自身的种子"
+            "噪声可能主导改进结论"
         )
 
     if report["straw_man"]:
@@ -11153,7 +11367,10 @@ def print_comparison_analysis(
         underpowered = [
             aggregate["label"]
             for aggregate in aggregates
-            if int(aggregate["n_runs"]) < _RECOMMENDED_SEEDS
+            if _independent_seed_count(
+                int(aggregate["n_runs"]),
+                list(aggregate.get("seeds") or []),
+            ) < _RECOMMENDED_SEEDS
         ]
         if underpowered:
             print(
@@ -17531,9 +17748,12 @@ def main():
         )
     if (
         not math.isfinite(args.val_fraction)
-        or not 0.0 <= args.val_fraction < 1.0
+        or not 0.0 < args.val_fraction < 1.0
     ):
-        parser.error("--val-fraction 必须落在 [0, 1)")
+        parser.error(
+            "--val-fraction 必须落在 (0, 1)（验证集用于"
+            "选型/早停，不能为空）"
+        )
     if (
         not math.isfinite(args.test_fraction)
         or not 0.0 <= args.test_fraction < 1.0
