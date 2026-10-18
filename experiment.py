@@ -553,7 +553,7 @@ class Expert(nn.Module):
 # ============================================================
 
 # 推理路径零填充缓冲缓存的总字节上限：窗口集合跨评估逐位
-# 相同、形状重复出现，超限的缓冲不回入缓存（退回逐次分配）。
+# 相同，超限的缓冲不回入缓存（退回逐次分配）。
 _MOE_PADDED_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -697,10 +697,10 @@ class SparseMoE(nn.Module):
         self._routing_probe = None
 
         # 推理路径的零填充缓冲缓存：grad 关闭时按
-        # (device, dtype, rows, dim) 复用填充缓冲，避免每次
-        # MoE 前向重新分配；总量受 _MOE_PADDED_CACHE_MAX_BYTES
-        # 封顶，超限时不缓存。训练（grad 开启）时填充缓冲会
-        # 经 bmm 进入计算图，必须每次新建，不使用该缓存。
+        # (device, dtype, rows, dim) 复用填充缓冲；总量受
+        # _MOE_PADDED_CACHE_MAX_BYTES 封顶，超限时不缓存。
+        # 训练（grad 开启）时填充缓冲会经 bmm 进入计算图，
+        # 必须每次新建，不使用该缓存。
         self._padded_buffers: Dict[tuple, torch.Tensor] = {}
         self._padded_buffer_bytes = 0
 
@@ -740,9 +740,9 @@ class SparseMoE(nn.Module):
         但 fused AdamW 的原地更新不会推进版本号，因此训练循环
         在 optimizer.step() 后经 invalidate_weight_cache 递增
         失效代数，首次使用时把新参数写回既有缓冲。缓冲的形状/
-        dtype/设备不变时复用既有缓冲（原地 copy_，不再重新
-        分配）；参数张量被替换或迁移设备时由 _apply 清空缓存
-        兜底。CUDA autocast 下缓存 autocast dtype 的 stack。
+        dtype/设备不变时原地写回既有缓冲；参数张量被替换或
+        迁移设备时由 _apply 清空缓存兜底。CUDA autocast 下
+        缓存 autocast dtype 的 stack。
         需要反向时经 _StackedExpertWeights 把梯度按专家散回
         参数，与「torch.stack + bmm」在 autocast 下的计算图
         语义相同。
@@ -1036,8 +1036,7 @@ class SparseMoE(nn.Module):
         [n_experts, cap, dim] 的零填充缓冲，一次 bmm 完成
         容量内的全部专家；超出容量的 assignment 由对应专家的
         2D 前向单独计算。容量只依赖 assignment 总数、不依赖
-        counts 的分布，因此整个分发无需把 counts 取回到 host，
-        也就没有按层的设备同步；语义与逐专家循环一致（容量内
+        counts 的分布；语义与逐专家循环一致（容量内
         为 bmm、溢出为逐专家线性层，均为精确结果）。
 
         返回:
@@ -1123,10 +1122,9 @@ class SparseMoE(nn.Module):
         device = gathered.device
         n_experts = self.n_experts
 
-        # 静态容量只依赖 assignment 总数（不依赖各专家计数），
-        # 无需把 counts 回读到 host。总数能被专家数整除时容量
-        # 恰为各专家计数之和的均值上界；填充行数是 n_experts
-        # 的取整余量。
+        # 静态容量只依赖 assignment 总数（不依赖各专家计数）。
+        # 总数能被专家数整除时容量恰为各专家计数之和的均值
+        # 上界；填充行数是 n_experts 的取整余量。
         cap = -(-total // n_experts)
 
         # 各专家段在排序序列中的起始行，以及排序后第 j 行
@@ -2843,8 +2841,7 @@ class ByteDataset:
         释放固定评估批的设备侧缓存。
 
         缓存跨评估逐位复用、总量受 _EVAL_BATCH_CACHE_MAX_BYTES
-        封顶；评估协议结束后（最终/测试评估完成）显式清空，
-        避免大 batch_size 下常驻一份额外的评估显存。
+        封顶；评估协议结束后（最终/测试评估完成）显式清空。
         评估起点缓存（_fixed_starts）只是 CPU 索引，保留。
         """
         self._fixed_batch_cache.clear()
@@ -3771,8 +3768,8 @@ def evaluate(
 
     routing_probe 非 None 时，本次评估前向同时充当路由
     诊断的采样前向（探针在评估期间挂载、退出时卸载）：
-    调用方在返回后用同一探针 build_report()，即可省掉
-    analyze_routing 的重复前向；诊断只在 val 上使用。
+    调用方在返回后用同一探针 build_report()；诊断只在
+    val 上使用。
     """
     was_training = model.training
     model.eval()
@@ -3990,8 +3987,7 @@ def compute_reference_baselines(
 
     # unigram 统计量只在 train 上 fit。字节管线为 uint8 时直接
     # 统计（bincount 在旧版本 torch 上只接受 int64，失败才转换，
-    # 与 audit_data_splits 的口径一致），避免为全部训练字节复制
-    # 一份 8 倍大小、用完即弃的 int64 张量。
+    # 与 audit_data_splits 的口径一致）。
     try:
         train_counts = torch.bincount(
             dataset.train,
@@ -5822,8 +5818,7 @@ def analyze_bad_cases(
     # target uint8 + predicted int16 + confidence/margin fp16，
     # 约 10 字节/token），不对评估窗口做全量物化；统计口径与
     # evaluate 的固定窗口评估完全一致。缓冲按固定窗口的实际
-    # 位置数一次预分配、逐批写入，避免「先逐批 list 再 cat」
-    # 带来的双份峰值。
+    # 位置数一次预分配、逐批写入。
     _, eval_data = dataset._eval_windows(split)
     num_starts = len(eval_data) - sequence_length
     capacity = min(batches * batch_size, num_starts) * sequence_length
@@ -20252,8 +20247,7 @@ def main():
     #
     # 路由诊断（RQ3/RQ4）与这次最终评估共享同一批固定窗口的
     # 前向：探针在最终评估期间挂载，评估结束后用同一探针
-    # build_report()，不再为诊断单独再跑一遍全量前向。参数
-    # 被污染或显式跳过诊断时不挂探针（行为与原来一致）。
+    # build_report()。参数被污染或显式跳过诊断时不挂探针。
     routing_probe: Optional[RoutingProbe] = None
     if (not numerical_polluted) and (
         not args.skip_routing_analysis
@@ -20512,7 +20506,7 @@ def main():
     # 不会让测试集变成隐式验证集，需要新的结论应使用全新目录。
     if args.evaluate_test and numerical_polluted:
         # 参数已被 NaN/Inf 污染时模型输出不可信，评估测试集只会
-        # 白白消耗该目录唯一一次解封名额；保持尘封，数值问题
+        # 消耗该目录唯一一次解封名额；保持尘封，数值问题
         # 处理后再从污染前的检查点恢复或换全新目录评估。
         print(
             "[test] 参数/优化器状态已被 NaN/Inf 污染，"
@@ -20656,7 +20650,7 @@ def main():
     metrics_file.close()
 
     # 所有评估（最终验证、坏案例、效率、路由诊断与可选的测试集）
-    # 都已结束，显式释放固定评估批的设备侧缓存，避免额外常驻。
+    # 都已结束，显式释放固定评估批的设备侧缓存。
     dataset.clear_eval_batch_cache()
 
 
