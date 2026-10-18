@@ -552,24 +552,9 @@ class Expert(nn.Module):
 # Sparse MoE
 # ============================================================
 
-# 批量专家路径的填充上限：padded 行数（n_experts *
-# max(counts)）超过 assignment 总数的该倍数时，退回逐专家
-# 循环路径。阈值判定只依赖确定性的 counts 与设备类型，
-# 相同数据始终选择同一路径。GPU 的填充上限为 1.25 倍；
-# CPU 更保守，填充不超过 assignment 总数（<= 1.0 倍）
-# 时才走批量路径。
-_MOE_PAD_RATIO_LIMIT = 1.25
-_CPU_MOE_PAD_RATIO_LIMIT = 1.0
-
-
-def _moe_pad_ratio_limit(device: torch.device) -> float:
-    """
-    批量专家路径的填充上限按设备类型取值：GPU 用
-    _MOE_PAD_RATIO_LIMIT，CPU 用 _CPU_MOE_PAD_RATIO_LIMIT。
-    """
-    if device.type == "cpu":
-        return _CPU_MOE_PAD_RATIO_LIMIT
-    return _MOE_PAD_RATIO_LIMIT
+# 推理路径零填充缓冲缓存的总字节上限：窗口集合跨评估逐位
+# 相同、形状重复出现，超限的缓冲不回入缓存（退回逐次分配）。
+_MOE_PADDED_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 class _StackedExpertWeights(torch.autograd.Function):
@@ -707,22 +692,30 @@ class SparseMoE(nn.Module):
             for _ in range(cfg.n_experts)
         ])
 
-        # counts 回读的暂存、完成事件与专用 stream。
-        self._counts_stage = None
-        self._counts_event = None
-        self._counts_stream = None
-
         # 路由诊断探针（RQ3/RQ4）：默认 None，仅在
         # analyze_routing 的诊断前向中挂载。
         self._routing_probe = None
 
+        # 推理路径的零填充缓冲缓存：grad 关闭时按
+        # (device, dtype, rows, dim) 复用填充缓冲，避免每次
+        # MoE 前向重新分配；总量受 _MOE_PADDED_CACHE_MAX_BYTES
+        # 封顶，超限时不缓存。训练（grad 开启）时填充缓冲会
+        # 经 bmm 进入计算图，必须每次新建，不使用该缓存。
+        self._padded_buffers: Dict[tuple, torch.Tensor] = {}
+        self._padded_buffer_bytes = 0
+
         # 批量专家路径的权重 stack 缓存：键为 "gate_up" / "down"，
-        # 值为 (参数版本签名, stack 缓冲)。参数在 forward 与
-        # backward 之间不变，同一张图里的多次 MoE 调用可共用
-        # 同一份 stack；参数被更新（版本号变化）后自动重建。
+        # 值为 (参数版本签名, 失效代数, stack 缓冲)。参数在
+        # forward 与 backward 之间不变，同一张图里的多次 MoE 调用
+        # 可共用同一份 stack；参数被更新后于首次使用时刷新。
         self._weight_stacks: Dict[
-            str, Tuple[tuple, torch.Tensor]
+            str, Tuple[tuple, int, torch.Tensor]
         ] = {}
+
+        # 失效代数：invalidate_weight_cache 每次递增。缓存的代数
+        # 落后于当前代数时说明参数已被原地更新（fused AdamW 不
+        # 推进版本号），需要把新参数写回既有缓冲。
+        self._weight_cache_generation = 0
 
     def _apply(self, fn, recurse=True):
         # .to() / .float() 等可能整体替换参数张量（版本号不递增），
@@ -731,8 +724,8 @@ class SparseMoE(nn.Module):
         return super()._apply(fn, recurse=recurse)
 
     def invalidate_weight_cache(self) -> None:
-        """清空缓存，确保后续前向使用当前参数。"""
-        self._weight_stacks.clear()
+        """声明缓存的 stack 已过期，后续前向在首次使用时刷新。"""
+        self._weight_cache_generation += 1
 
     def _cached_weight_stack(
         self,
@@ -743,19 +736,23 @@ class SparseMoE(nn.Module):
         返回 [n_experts, ...] 的专家权重 stack，跨调用复用。
 
         缓存以 (autocast dtype, 版本号, 数据指针) 为签名：普通
-        原地更新（如 load_state_dict）会推进版本号并触发重建；
+        原地更新（如 load_state_dict）会推进版本号并触发刷新；
         但 fused AdamW 的原地更新不会推进版本号，因此训练循环
-        在 optimizer.step() 后显式清空缓存。参数张量被替换时
-        由 _apply 清空缓存兜底。CUDA autocast 下缓存 autocast
-        dtype 的 stack。需要反向时经 _StackedExpertWeights 把
-        梯度按专家散回参数，与「torch.stack + bmm」在 autocast
-        下的计算图语义相同。
+        在 optimizer.step() 后经 invalidate_weight_cache 递增
+        失效代数，首次使用时把新参数写回既有缓冲。缓冲的形状/
+        dtype/设备不变时复用既有缓冲（原地 copy_，不再重新
+        分配）；参数张量被替换或迁移设备时由 _apply 清空缓存
+        兜底。CUDA autocast 下缓存 autocast dtype 的 stack。
+        需要反向时经 _StackedExpertWeights 把梯度按专家散回
+        参数，与「torch.stack + bmm」在 autocast 下的计算图
+        语义相同。
         """
         first = weights[0]
         target_dtype = self._autocast_target_dtype(first)
         if target_dtype is None:
             target_dtype = first.dtype
 
+        shape = (len(weights), *first.shape)
         signature = (
             target_dtype,
             *(
@@ -764,27 +761,50 @@ class SparseMoE(nn.Module):
             ),
         )
 
+        generation = self._weight_cache_generation
         cached = self._weight_stacks.get(key)
+
         # 反向路径不能使用 inference_mode 下创建的张量（不能
         # 作为保存张量入图），需要时重建。
-        reusable = cached is not None and cached[0] == signature and (
+        reusable_buffer = cached is not None and (
             not torch.is_grad_enabled()
-            or not torch.is_inference(cached[1])
+            or not torch.is_inference(cached[2])
         )
 
-        if reusable:
-            stacked = cached[1]
+        if (
+            reusable_buffer
+            and cached[0] == signature
+            and cached[1] == generation
+        ):
+            stacked = cached[2]
         else:
-            with torch.no_grad():
+            refreshable = (
+                reusable_buffer
+                and cached[2].shape == shape
+                and cached[2].dtype == target_dtype
+                and cached[2].device == first.device
+            )
+
+            # inference_mode(False) 保证缓冲不携带 inference 标记，
+            # 之后可在 no_grad 与训练路径上原地刷新。
+            with torch.inference_mode(False), torch.no_grad():
+                if refreshable:
+                    stacked = cached[2]
+                else:
+                    stacked = torch.empty(
+                        shape,
+                        dtype=target_dtype,
+                        device=first.device,
+                    )
                 # 转换语义与 stack 后 .to() 相同。
-                stacked = torch.empty(
-                    (len(weights), *first.shape),
-                    dtype=target_dtype,
-                    device=first.device,
-                )
                 for index, weight in enumerate(weights):
                     stacked[index].copy_(weight)
-            self._weight_stacks[key] = (signature, stacked)
+
+            self._weight_stacks[key] = (
+                signature,
+                generation,
+                stacked,
+            )
 
         if not torch.is_grad_enabled() or not any(
             weight.requires_grad for weight in weights
@@ -835,14 +855,6 @@ class SparseMoE(nn.Module):
             top_indices.reshape(-1),
             minlength=self.n_experts,
         )
-
-        # 与 dispatch 的一般路径一致时发起 counts 回读。
-        if (
-            counts.is_cuda
-            and self.n_experts > 1
-            and top_k != self.n_experts
-        ):
-            self._issue_counts_readback(counts)
 
         # 辅助负载均衡项只在梯度开启时可能被消费（总损失、
         # 训练指标）；评估/推理路径（evaluate、measure_efficiency、
@@ -919,44 +931,52 @@ class SparseMoE(nn.Module):
             return tensor
         return tensor.to(dtype)
 
-    def _issue_counts_readback(self, counts: torch.Tensor) -> None:
+    def _padded_buffer(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+        rows: int,
+        dim: int,
+    ) -> Optional[torch.Tensor]:
         """
-        启动 counts 回读：在专用 stream 上拷入暂存并记录完成
-        事件，到需要逐专家计数时再读取；与 _read_counts 配对使用。
+        grad 关闭时返回可复用的置零填充缓冲（按形状缓存），
+        否则返回 None（训练时填充缓冲会进入计算图，必须新建）。
         """
-        if not counts.is_cuda:
-            return
+        if torch.is_grad_enabled():
+            return None
 
-        if self._counts_stage is None:
-            with torch.inference_mode(False):
-                self._counts_stage = torch.empty(
-                    self.n_experts,
-                    dtype=counts.dtype,
-                    pin_memory=True,
-                )
-            self._counts_event = torch.cuda.Event()
-            self._counts_stream = torch.cuda.Stream(device=counts.device)
+        key = (device, dtype, rows, dim)
+        buffer = self._padded_buffers.get(key)
+        if buffer is not None:
+            buffer.zero_()
+            return buffer
 
-        self._counts_stream.wait_stream(
-            torch.cuda.current_stream(counts.device)
+        bytes_needed = (
+            rows * dim * torch.empty(0, dtype=dtype).element_size()
         )
-        with torch.cuda.stream(self._counts_stream):
-            self._counts_stage.copy_(counts, non_blocking=True)
-            self._counts_event.record()
+        if (
+            self._padded_buffer_bytes + bytes_needed
+            > _MOE_PADDED_CACHE_MAX_BYTES
+        ):
+            return None
 
-        # 声明源张量与拷贝 stream 的关联。
-        counts.record_stream(self._counts_stream)
+        # inference_mode(False) 保证缓冲不携带 inference 标记，
+        # 之后可在 inference_mode 与 no_grad 下原地复用。
+        with torch.inference_mode(False), torch.no_grad():
+            buffer = torch.zeros(
+                rows,
+                dim,
+                dtype=dtype,
+                device=device,
+            )
 
-    def _read_counts(self, counts: torch.Tensor) -> list:
-        if counts.is_cuda:
-            self._counts_event.synchronize()
-            return self._counts_stage.tolist()
-        return counts.tolist()
+        self._padded_buffers[key] = buffer
+        self._padded_buffer_bytes += bytes_needed
+        return buffer
 
     def _batched_experts_forward(
         self,
         inputs: torch.Tensor,
-        expert_range: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         对 [n_experts, rows, dim] 的批量输入执行专家计算。
@@ -965,12 +985,8 @@ class SparseMoE(nn.Module):
         stack 缓冲按参数版本跨调用复用（见
         _cached_weight_stack），反向按切片把梯度散回各专家
         参数，参数与检查点格式不变。SwiGLU 语义与
-        Expert.forward 完全一致。
-
-        expert_range 给定时只计算 [begin, end]（闭区间）的
-        连续专家子集：权重 stack 直接按切片复用（切片的
-        反向会把子集外的梯度补零后再散回参数），用于
-        _dispatch_grouped 的分组 bmm。
+        Expert.forward 完全一致。填充行的输入是精确的 0：
+        其前向输出为 0，对权重梯度的贡献也恒为精确的 0。
         """
         gate_up_weight = self._cached_weight_stack(
             "gate_up",
@@ -979,11 +995,6 @@ class SparseMoE(nn.Module):
                 for expert in self.experts
             ],
         )
-
-        if expert_range is not None:
-            gate_up_weight = gate_up_weight[
-                expert_range[0]:expert_range[1] + 1
-            ]
 
         gate_up = torch.bmm(
             inputs,
@@ -998,11 +1009,6 @@ class SparseMoE(nn.Module):
             ],
         )
 
-        if expert_range is not None:
-            down_weight = down_weight[
-                expert_range[0]:expert_range[1] + 1
-            ]
-
         if gate_up.requires_grad:
             # SwiGLU 与下投影的组合节点。
             return _SwiGLUDown.apply(gate_up, down_weight)
@@ -1015,245 +1021,6 @@ class SparseMoE(nn.Module):
             down_weight.transpose(1, 2),
         )
 
-    def _dispatch_batched(
-        self,
-        counts_tensor: torch.Tensor,
-        gathered: torch.Tensor,
-        perm: torch.Tensor,
-        assignment_experts: torch.Tensor,
-        counts: List[int],
-        max_count: int,
-        num_tokens: int,
-        top_k: int,
-        dim: int,
-    ) -> torch.Tensor:
-        """
-        零填充 + 批量 bmm 的专家计算路径。
-
-        排序后的各专家段被散射进 [n_experts, max_count, dim]
-        的零填充缓冲，逐专家 GEMM 合并为两次 bmm。填充行的
-        输入是精确的 0：其前向输出为 0，对权重梯度的贡献
-        也恒为精确的 0（0 与任何浮点值相乘得 0.0），因此
-        与逐专家循环路径的数值语义一致。
-
-        行布局由 dest 完整描述：gathered 的第 j 行写入
-        padded 展平缓冲的 dest[j] 位置（j 为排序后行号）；
-        输出侧 outputs[perm[j]] <- out[dest[j]]，先求逆映射
-        dest_by_original[perm[j]] = dest[j]，再一次
-        index_select 完成收集。dest 互不重复且并集只差
-        填充行，逐位置至多对应一个梯度项，顺序无关。
-        """
-        n_experts = self.n_experts
-        total = gathered.size(0)
-        device = gathered.device
-
-        # 各专家段在排序序列中的起始行。
-        starts = torch.cumsum(counts_tensor, dim=0) - (
-            counts_tensor
-        )
-
-        # 排序后第 j 行所属专家。
-        seg_id = assignment_experts.index_select(0, perm)
-
-        # 排序后第 j 行写入 padded 展平缓冲的目标位置。
-        dest = (
-            torch.arange(total, device=device)
-            - starts[seg_id]
-            + seg_id * max_count
-        )
-
-        padded = gathered.new_zeros(
-            n_experts * max_count,
-            dim,
-        )
-        padded.index_copy_(0, dest, gathered)
-        padded = padded.view(n_experts, max_count, dim)
-
-        out = self._batched_experts_forward(padded).view(
-            n_experts * max_count,
-            dim,
-        )
-
-        # 收集回原始 assignment 顺序：先把「排序位置 → padded
-        # 位置」的映射反转为「原始位置 → padded 位置」
-        #（dest_by_original[perm[j]] = dest[j]），再一次
-        # index_select 完成收集。
-        dest_by_original = torch.scatter(
-            torch.empty_like(dest),
-            0,
-            perm,
-            dest,
-        )
-        return out.index_select(
-            0,
-            dest_by_original,
-        ).view(num_tokens, top_k, dim)
-
-    def _plan_expert_groups(
-        self,
-        counts: List[int],
-        limit: float,
-    ) -> List[Tuple[int, int]]:
-        """
-        把非空专家按 id 顺序贪心分组（闭区间），使每组
-        「专家数 × 组内最大计数」不超过组内实际 assignment
-        总数的 limit 倍（limit 由 _moe_pad_ratio_limit 按设备
-        类型给出）。
-
-        零计数专家不进入任何组；相邻组之间允许存在零计数
-        专家，组内各专家的段在按 id 排序后的序列中仍然连续。
-        分组只依赖确定性的 counts 与设备类型，相同数据始终
-        得到相同的分组。
-        """
-        groups: List[Tuple[int, int]] = []
-        total = len(counts)
-        index = 0
-
-        while index < total:
-            if counts[index] == 0:
-                index += 1
-                continue
-
-            end = index
-            rows = 0
-            peak = 0
-
-            while end < total and counts[end] > 0:
-                candidate_peak = max(peak, counts[end])
-                candidate_rows = rows + counts[end]
-                width = end - index + 1
-
-                # 单专家组永远可接受。
-                if (
-                    width == 1
-                    or width * candidate_peak
-                    <= limit * candidate_rows
-                ):
-                    peak = candidate_peak
-                    rows = candidate_rows
-                    end += 1
-                else:
-                    break
-
-            groups.append((index, end - 1))
-            index = end
-
-        return groups
-
-    def _dispatch_grouped(
-        self,
-        counts_tensor: torch.Tensor,
-        counts: List[int],
-        prefix: List[int],
-        gathered: torch.Tensor,
-        perm: torch.Tensor,
-        assignment_experts: torch.Tensor,
-        groups: List[Tuple[int, int]],
-        num_tokens: int,
-        top_k: int,
-        dim: int,
-    ) -> torch.Tensor:
-        """
-        分组填充 + 批量 bmm 的专家计算路径。
-
-        整批填充比例超过设备对应的填充上限（路由不均衡）
-        时使用：多专家组把组内各专家的段散射进
-        [组内专家数, 组内最大计数, dim] 的零填充缓冲，一次
-        bmm 完成组内全部专家。填充行的输入是精确的 0：其前向
-        输出为 0，对权重梯度的贡献也恒为精确的 0，因此与
-        逐专家循环路径的数值语义一致。
-
-        只有 1 个专家的组无需填充：段内排序行序即局部行序，
-        dest 恒为恒等映射，直接对该专家的连续输入段走与
-        逐专家循环路径相同的 2D 线性计算（Expert.forward），
-        无需构造排序位置到填充布局的下标。
-
-        dest 由排序后行号 j 所属专家与局部行号给出；每个
-        排序位置至多写入一次且并集只差填充行，逐专家输出
-        按 id 顺序交给 _MergeExpertOutputs 散射回原始
-        assignment 顺序。
-        """
-        device = gathered.device
-        total = gathered.size(0)
-
-        # 零计数专家用空切片占位，保持与 counts 一一对应。
-        expert_outputs: List[Optional[torch.Tensor]] = [
-            gathered[:0] if count == 0 else None
-            for count in counts
-        ]
-
-        # 排序后第 j 行所属专家，及该行在其专家段内的局部
-        # 行号；仅多专家组需要，首次遇到时再计算。
-        seg_id: Optional[torch.Tensor] = None
-        seg_local: Optional[torch.Tensor] = None
-
-        for begin, end in groups:
-            group_counts = counts[begin:end + 1]
-            group_rows = sum(group_counts)
-            offset = prefix[begin]
-
-            # 单专家组：连续输入段直接进入该专家的 2D 线性
-            # 前向，不构造零填充缓冲。
-            if begin == end:
-                expert_outputs[begin] = self.experts[
-                    begin
-                ].forward(
-                    gathered[offset:offset + group_rows]
-                )
-                continue
-
-            if seg_id is None:
-                starts = torch.cumsum(
-                    counts_tensor,
-                    dim=0,
-                ) - counts_tensor
-                seg_id = assignment_experts.index_select(
-                    0,
-                    perm,
-                )
-                seg_local = (
-                    torch.arange(total, device=device)
-                    - starts[seg_id]
-                )
-
-            peak = max(group_counts)
-            sub_seg = seg_id[offset:offset + group_rows]
-            sub_local = seg_local[offset:offset + group_rows]
-            dest = (sub_seg - begin) * peak + sub_local
-
-            padded = gathered.new_zeros(
-                len(group_counts) * peak,
-                dim,
-            )
-            padded.index_copy_(
-                0,
-                dest,
-                gathered[offset:offset + group_rows],
-            )
-
-            out = self._batched_experts_forward(
-                padded.view(len(group_counts), peak, dim),
-                (begin, end),
-            ).view(len(group_counts) * peak, dim)
-
-            for slot, count in enumerate(group_counts):
-                start = slot * peak
-                expert_outputs[begin + slot] = out[
-                    start:start + count
-                ]
-
-        # 各专家输出由单个自定义节点散射回原始（未排序）
-        # 位置；与逐专家循环路径共用同一出口。
-        return _MergeExpertOutputs.apply(
-            perm,
-            counts,
-            *expert_outputs,
-        ).view(
-            num_tokens,
-            top_k,
-            dim,
-        )
-
     def dispatch(
         self,
         flat: torch.Tensor,
@@ -1262,6 +1029,16 @@ class SparseMoE(nn.Module):
     ) -> torch.Tensor:
         """
         对每个 token-expert assignment 执行专家计算。
+
+        一般路径（n_experts > 1 且 top_k != n_experts）按
+        assignment 总数给出静态每专家容量
+        cap = ceil(total / n_experts)：排序后的专家段散射进
+        [n_experts, cap, dim] 的零填充缓冲，一次 bmm 完成
+        容量内的全部专家；超出容量的 assignment 由对应专家的
+        2D 前向单独计算。容量只依赖 assignment 总数、不依赖
+        counts 的分布，因此整个分发无需把 counts 取回到 host，
+        也就没有按层的设备同步；语义与逐专家循环一致（容量内
+        为 bmm、溢出为逐专家线性层，均为精确结果）。
 
         返回:
             [num_tokens, top_k, dim]
@@ -1337,86 +1114,81 @@ class SparseMoE(nn.Module):
                 rounding_mode="floor",
             )
 
-        # 按排序下标收集输入，随后回读 counts。autocast 下
-        # 先转换再收集：收集结果直接就是目标 dtype，与收集后
-        # 转换的取值一致。
+        # 按排序下标收集输入。autocast 下先转换再收集：
+        # 收集结果直接就是目标 dtype，与收集后转换的取值一致。
         gather_source = self._cast_for_autocast(flat)
         gathered = gather_source.index_select(0, sorted_token_ids)
 
-        counts_list = self._read_counts(counts)
-        max_count = max(counts_list)
-        limit = _moe_pad_ratio_limit(gathered.device)
+        total = gathered.size(0)
+        device = gathered.device
+        n_experts = self.n_experts
 
-        # 填充比例受设备对应的填充上限约束时走批量
-        # bmm 路径。
-        if (
-            self.n_experts * max_count
-            <= limit * gathered.size(0)
-        ):
-            return self._dispatch_batched(
-                counts,
-                gathered,
-                perm,
-                assignment_experts,
-                counts_list,
-                max_count,
-                num_tokens,
-                top_k,
-                dim,
-            )
+        # 静态容量只依赖 assignment 总数（不依赖各专家计数），
+        # 无需把 counts 回读到 host。总数能被专家数整除时容量
+        # 恰为各专家计数之和的均值上界；填充行数是 n_experts
+        # 的取整余量。
+        cap = -(-total // n_experts)
 
-        # 整批填充比例超过填充上限时按专家分组，组内
-        # 填充比例仍受该上限约束。
-        groups = self._plan_expert_groups(counts_list, limit)
+        # 各专家段在排序序列中的起始行，以及排序后第 j 行
+        # 所属专家与其段内局部行号。
+        starts = torch.cumsum(counts, dim=0) - counts
+        seg_id = assignment_experts.index_select(0, perm)
+        local = torch.arange(total, device=device) - starts[seg_id]
 
-        if any(begin < end for begin, end in groups):
-            prefix = [0]
-            for count in counts_list:
-                prefix.append(prefix[-1] + count)
+        # 容量内的行散射进填充缓冲；溢出行的目标位置被夹紧，
+        # 只参与裁剪后的 index_copy_（不写入填充缓冲）。
+        in_cap = local < cap
+        dest = seg_id * cap + local.clamp(max=cap - 1)
 
-            return self._dispatch_grouped(
-                counts,
-                counts_list,
-                prefix,
-                gathered,
-                perm,
-                assignment_experts,
-                groups,
-                num_tokens,
-                top_k,
-                dim,
-            )
-
-        segments = gathered.split(counts_list, dim=0)
-
-        # 逐专家计算其连续输入段；空段原样占位，不产生
-        # 专家调用。
-        experts = self.experts
-        expert_outputs = [
-            (
-                expert.forward(segment)
-                if count > 0
-                else segment
-            )
-            for count, expert, segment in zip(
-                counts_list,
-                experts,
-                segments,
-            )
-        ]
-
-        # 各专家输出由单个自定义节点散射回原始（未排序）
-        # 位置；各段互不重叠且并集恰好覆盖全部 assignment，
-        # 空缓冲区会被完整写入。
-        return _MergeExpertOutputs.apply(
-            perm,
-            counts_list,
-            *expert_outputs,
-        ).view(
-            num_tokens,
-            top_k,
+        padded = self._padded_buffer(
+            gathered.dtype,
+            device,
+            n_experts * cap,
             dim,
         )
+        if padded is None:
+            padded = gathered.new_zeros(n_experts * cap, dim)
+        padded.index_copy_(0, dest[in_cap], gathered[in_cap])
+
+        out = self._batched_experts_forward(
+            padded.view(n_experts, cap, dim)
+        ).view(n_experts * cap, dim)
+
+        # 容量内的行按「排序行号 → 填充位置」收集回排序布局；
+        # 溢出行由对应专家的 2D 前向计算后写入同一缓冲，
+        # 两部分行号互不重叠。
+        positions = torch.arange(total, device=device)
+        sorted_out = out.new_empty(total, dim)
+        sorted_out.index_copy_(
+            0,
+            positions[in_cap],
+            out.index_select(0, dest[in_cap]),
+        )
+
+        overflow = in_cap.logical_not()
+        experts = self.experts
+        for expert_index in range(n_experts):
+            rows = overflow & (seg_id == expert_index)
+            sorted_out.index_copy_(
+                0,
+                positions[rows],
+                experts[expert_index].forward(gathered[rows]),
+            )
+
+        # 散射回原始（未排序）assignment 顺序：求
+        #「排序位置 → 原始位置」映射的逆
+        #（sorted_pos[perm[j]] = j），再一次 index_select
+        # 完成收集。perm 是置换，每个位置恰好写入一次。
+        sorted_pos = torch.scatter(
+            torch.empty_like(perm),
+            0,
+            perm,
+            positions,
+        )
+        return sorted_out.index_select(
+            0,
+            sorted_pos,
+        ).view(num_tokens, top_k, dim)
 
     def unmerged(
         self,
@@ -2114,8 +1886,8 @@ class LanguageModel(nn.Module):
 
         fused AdamW 原地更新参数时不会推进张量的版本号，
         _cached_weight_stack 的版本签名无法感知更新，因此
-        optimizer.step() 后必须显式清空，否则后续前向会复用
-        更新前的专家权重。
+        optimizer.step() 后必须显式声明失效，否则后续前向会
+        复用更新前的专家权重。
         """
         for block in self.blocks:
             if block.moe is not None:
@@ -3066,6 +2838,18 @@ class ByteDataset:
 
         return x, y
 
+    def clear_eval_batch_cache(self) -> None:
+        """
+        释放固定评估批的设备侧缓存。
+
+        缓存跨评估逐位复用、总量受 _EVAL_BATCH_CACHE_MAX_BYTES
+        封顶；评估协议结束后（最终/测试评估完成）显式清空，
+        避免大 batch_size 下常驻一份额外的评估显存。
+        评估起点缓存（_fixed_starts）只是 CPU 索引，保留。
+        """
+        self._fixed_batch_cache.clear()
+        self._fixed_batch_cache_bytes = 0
+
     def fixed_val_batch(
         self,
         batch_index: int,
@@ -3953,6 +3737,7 @@ def evaluate(
     amp_dtype: Optional[torch.dtype] = None,
     split: str = "val",
     compute_auc: bool = False,
+    routing_probe: Optional["RoutingProbe"] = None,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -3983,9 +3768,19 @@ def evaluate(
     并与 ``{split}_pr_auc_macro_chance``（随机水平 =
     平均 prevalence）对照，而不是把 PR-AUC 绝对值当
     「准确率」解读。
+
+    routing_probe 非 None 时，本次评估前向同时充当路由
+    诊断的采样前向（探针在评估期间挂载、退出时卸载）：
+    调用方在返回后用同一探针 build_report()，即可省掉
+    analyze_routing 的重复前向；诊断只在 val 上使用。
     """
     was_training = model.training
     model.eval()
+
+    probe_attached = False
+    if routing_probe is not None:
+        routing_probe.attach(_unwrap_model(model))
+        probe_attached = True
 
     use_amp = (
         amp_dtype is not None
@@ -4115,7 +3910,9 @@ def evaluate(
                 evaluated_tokens += y.numel()
                 del result, raw_logits, x, y
     finally:
-        # 无论评估是否中途出错，都恢复原来的训练模式。
+        # 无论评估是否中途出错，都卸载探针并恢复原来的训练模式。
+        if probe_attached:
+            routing_probe.detach()
         model.train(was_training)
 
     # ByteDataset 保证至少有一个合法评估起点。
@@ -4191,11 +3988,20 @@ def compute_reference_baselines(
     # 字节级管线的词表固定为 256。
     vocab_size = 256
 
-    # unigram 统计量只在 train 上 fit。
-    train_counts = torch.bincount(
-        dataset.train.to(torch.int64),
-        minlength=vocab_size,
-    ).double()
+    # unigram 统计量只在 train 上 fit。字节管线为 uint8 时直接
+    # 统计（bincount 在旧版本 torch 上只接受 int64，失败才转换，
+    # 与 audit_data_splits 的口径一致），避免为全部训练字节复制
+    # 一份 8 倍大小、用完即弃的 int64 张量。
+    try:
+        train_counts = torch.bincount(
+            dataset.train,
+            minlength=vocab_size,
+        ).double()
+    except RuntimeError:
+        train_counts = torch.bincount(
+            dataset.train.to(torch.int64),
+            minlength=vocab_size,
+        ).double()
     train_total = float(train_counts.sum())
 
     unigram_probs = (
@@ -6013,14 +5819,20 @@ def analyze_bad_cases(
     sequence_length = dataset.seq_len
 
     # 全量统计缓冲：每个 token 只保留紧凑标量（loss fp32 +
-    # target/predicted uint8 + confidence/margin fp16，约 10
-    # 字节/token），不对评估窗口做全量物化；统计口径与
-    # evaluate 的固定窗口评估完全一致。
-    losses: List[torch.Tensor] = []
-    targets: List[torch.Tensor] = []
-    predictions: List[torch.Tensor] = []
-    confidences: List[torch.Tensor] = []
-    margins: List[torch.Tensor] = []
+    # target uint8 + predicted int16 + confidence/margin fp16，
+    # 约 10 字节/token），不对评估窗口做全量物化；统计口径与
+    # evaluate 的固定窗口评估完全一致。缓冲按固定窗口的实际
+    # 位置数一次预分配、逐批写入，避免「先逐批 list 再 cat」
+    # 带来的双份峰值。
+    _, eval_data = dataset._eval_windows(split)
+    num_starts = len(eval_data) - sequence_length
+    capacity = min(batches * batch_size, num_starts) * sequence_length
+    loss_buffer = torch.empty(capacity, dtype=torch.float32)
+    target_buffer = torch.empty(capacity, dtype=torch.uint8)
+    predicted_buffer = torch.empty(capacity, dtype=torch.int16)
+    confidence_buffer = torch.empty(capacity, dtype=torch.float16)
+    margin_buffer = torch.empty(capacity, dtype=torch.float16)
+    written = 0
 
     # 全局 top-N 最差 token：每批先取本批 top-N 候选再跨批截断
     #（全局 top-N 必然在各自批次的 top-N 内），窗口只为入选
@@ -6089,17 +5901,24 @@ def analyze_bad_cases(
                     confidence - target_probability
                 ).reshape(-1)
 
-                losses.append(batch_loss.cpu())
-                targets.append(batch_target.cpu())
-                predictions.append(
+                batch_rows = batch_loss.numel()
+                batch_end = written + batch_rows
+                loss_buffer[written:batch_end].copy_(
+                    batch_loss.cpu()
+                )
+                target_buffer[written:batch_end].copy_(
+                    batch_target.cpu()
+                )
+                predicted_buffer[written:batch_end].copy_(
                     batch_predicted.to(torch.int16).cpu()
                 )
-                confidences.append(
+                confidence_buffer[written:batch_end].copy_(
                     batch_confidence.to(torch.float16).cpu()
                 )
-                margins.append(
+                margin_buffer[written:batch_end].copy_(
                     batch_margin.to(torch.float16).cpu()
                 )
+                written = batch_end
 
                 # 本批的 top-N 候选（全局 top-N 必在其中）。
                 if top_n > 0 and batch_loss.numel() > 0:
@@ -6138,7 +5957,7 @@ def analyze_bad_cases(
                         )
                         del top_candidates[top_n:]
 
-        if not losses:
+        if written == 0:
             return {
                 "split": split,
                 "tokens_evaluated": 0,
@@ -6150,11 +5969,11 @@ def analyze_bad_cases(
                 "summary": "评估窗口为空，未生成坏案例。",
             }
 
-        loss_all = torch.cat(losses)
-        target_all = torch.cat(targets).to(torch.int64)
-        predicted_all = torch.cat(predictions).to(torch.int64)
-        confidence_all = torch.cat(confidences).float()
-        margin_all = torch.cat(margins).float()
+        loss_all = loss_buffer[:written]
+        target_all = target_buffer[:written].to(torch.int64)
+        predicted_all = predicted_buffer[:written].to(torch.int64)
+        confidence_all = confidence_buffer[:written].float()
+        margin_all = margin_buffer[:written].float()
 
         num_tokens = loss_all.numel()
 
@@ -20430,6 +20249,20 @@ def main():
     # 最终评估总是重新跑一遍：与周期验证不同，它还要计算
     # one-vs-rest 的 macro PR-AUC / ROC-AUC（周期验证只算
     # 混淆矩阵口径的轻量指标），不能直接复用上次周期结果。
+    #
+    # 路由诊断（RQ3/RQ4）与这次最终评估共享同一批固定窗口的
+    # 前向：探针在最终评估期间挂载，评估结束后用同一探针
+    # build_report()，不再为诊断单独再跑一遍全量前向。参数
+    # 被污染或显式跳过诊断时不挂探针（行为与原来一致）。
+    routing_probe: Optional[RoutingProbe] = None
+    if (not numerical_polluted) and (
+        not args.skip_routing_analysis
+    ):
+        routing_probe = RoutingProbe(
+            _unwrap_model(model).cfg,
+            args.batch_size,
+        )
+
     final_metrics = evaluate(
         model,
         dataset,
@@ -20438,6 +20271,7 @@ def main():
         device,
         amp_dtype=amp_dtype,
         compute_auc=True,
+        routing_probe=routing_probe,
     )
 
     final_record = {
@@ -20631,15 +20465,11 @@ def main():
             "跳过路由诊断（输出不可信，诊断结果没有意义）。"
         )
     elif not args.skip_routing_analysis:
-        routing_report = analyze_routing(
-            model,
-            dataset,
-            args.batch_size,
-            args.eval_batches,
-            device,
-            amp_dtype=amp_dtype,
-            split="val",
-        )
+        # 报告直接来自最终评估挂载的探针（同一批固定窗口、
+        # 同一前向），与 analyze_routing 的报告结构一致。
+        routing_report = routing_probe.build_report(split="val")
+        routing_report["batches_requested"] = args.eval_batches
+        routing_report["batch_size"] = args.batch_size
         routing_report["selected_model"] = selection_policy
         routing_report["selected_step"] = (
             best_val_step
@@ -20824,6 +20654,10 @@ def main():
             )
 
     metrics_file.close()
+
+    # 所有评估（最终验证、坏案例、效率、路由诊断与可选的测试集）
+    # 都已结束，显式释放固定评估批的设备侧缓存，避免额外常驻。
+    dataset.clear_eval_batch_cache()
 
 
 if __name__ == "__main__":
