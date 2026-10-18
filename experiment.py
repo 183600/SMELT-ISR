@@ -7953,6 +7953,19 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "grad_clip",
     "batch_size",
     "data_augmentation",
+    # 早停设置决定「实际训练轮数」：total_steps 相同但早停
+    # patience 不同时，某个运行可能提前结束，与「训练同样久」
+    # 不是同一口径，必须作为受控变量核对。
+    "early_stop_patience",
+    "early_stop_min_delta",
+    # 数值条件与实现开关：混合精度 dtype 与设备类型会改变
+    # 浮点归约/精度（同一方法在 CPU 与 GPU 上不是同一数值
+    # 环境），activation checkpointing 与 torch.compile 会
+    # 改写反传/内核路径，跨运行对比时应完全一致。
+    "amp_dtype",
+    "device_type",
+    "grad_checkpoint",
+    "compile",
     "seq_len",
     "d_model",
     "n_heads",
@@ -8121,6 +8134,24 @@ def _cell_cost_mean(
     return float(mean)
 
 
+def _device_type_of(value) -> Optional[str]:
+    """
+    把 --device 归一化成设备类型（"cuda:0" → "cuda"），
+    供受控变量核对；设备索引不同不代表数值环境不同，但
+    CPU / CUDA / MPS 之间浮点行为不同，跨类型对比不可归因。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("cuda"):
+        return "cuda"
+    if text.startswith("mps"):
+        return "mps"
+    return text.split(":", 1)[0]
+
+
 def build_comparison_protocol(
     cfg: Config,
     args: argparse.Namespace,
@@ -8129,10 +8160,12 @@ def build_comparison_protocol(
     汇总一条运行的全部「受控变量」，写入 config.json。
 
     优化器（AdamW）及其 betas/eps、学习率与调度、训练步数、
-    weight decay、梯度裁剪、batch size、数据增强、数据指纹、
-    模型结构与评估协议全部显式记录；--compare 时默认要求
-    这些值在声明因子之外逐项一致，避免把「换了优化器或调了
-    学习率」误当成方法本身的收益。
+    早停（实际训练轮数）、weight decay、梯度裁剪、batch size、
+    数据增强、数值环境（设备类型 / 混合精度）与实现开关
+    （grad checkpoint / compile）、数据指纹、模型结构与评估
+    协议全部显式记录；--compare 时默认要求这些值在声明因子
+    之外逐项一致，避免把「换了优化器、调了学习率或训练更久」
+    误当成方法本身的收益。
     """
     return {
         "comparison_family": "neural",
@@ -8151,6 +8184,22 @@ def build_comparison_protocol(
         # 当前字节级管线不做数据增强；显式记录空操作，
         # 未来加入增强后不同运行会立刻被对比检查发现。
         "data_augmentation": "none",
+        # 早停决定有效训练轮数；数值环境与实现开关决定
+        # 浮点行为与反传路径。
+        "early_stop_patience": getattr(
+            args, "early_stop_patience", None
+        ),
+        "early_stop_min_delta": getattr(
+            args, "early_stop_min_delta", None
+        ),
+        "amp_dtype": getattr(args, "amp_dtype", None),
+        "device_type": _device_type_of(
+            getattr(args, "device", None)
+        ),
+        "grad_checkpoint": bool(
+            getattr(args, "grad_checkpoint", False)
+        ),
+        "compile": bool(getattr(args, "compile", False)),
         "seq_len": cfg.seq_len,
         "d_model": cfg.d_model,
         "n_heads": cfg.n_heads,
@@ -8237,6 +8286,29 @@ def experiment_protocol_from_payload(
         "grad_clip": run_args.get("grad_clip"),
         "batch_size": run_args.get("batch_size"),
         "data_augmentation": "none" if has_training else None,
+        # 早停 / 数值环境 / 实现开关：旧运行的 args 里已记录
+        # 的部分直接回填（无法唯一确定的留 None 由检查器标记
+        # 缺记录，例如旧版本未记录 amp_dtype）。
+        "early_stop_patience": (
+            run_args.get("early_stop_patience")
+            if has_training
+            else None
+        ),
+        "early_stop_min_delta": (
+            run_args.get("early_stop_min_delta")
+            if has_training
+            else None
+        ),
+        "amp_dtype": run_args.get("amp_dtype"),
+        "device_type": _device_type_of(run_args.get("device")),
+        "grad_checkpoint": (
+            run_args.get("grad_checkpoint")
+            if has_training
+            else None
+        ),
+        "compile": (
+            run_args.get("compile") if has_training else None
+        ),
         "seq_len": cfg.get("seq_len"),
         "d_model": cfg.get("d_model"),
         "n_heads": cfg.get("n_heads"),
@@ -8888,16 +8960,31 @@ def aggregate_runs(
         else:
             label = "(全部运行)"
 
+        seed_values = [
+            r.get("seed")
+            for r in group_rows
+            if r.get("seed") is not None
+        ]
+        seed_counts: Dict[object, int] = {}
+        for seed in seed_values:
+            seed_counts[seed] = seed_counts.get(seed, 0) + 1
+        # 伪重复检测：同一实验单元里同一随机种子出现多次
+        # （如重复目录、复制运行）会被当成独立重复实验参与
+        # 均值/方差/配对检验，种子间方差被低估。这里显式记录，
+        # 统计与展示层据此拒绝把伪重复当重复实验。
+        duplicate_seeds = sorted(
+            seed
+            for seed, count in seed_counts.items()
+            if count > 1
+        )
+
         aggregate: Dict[str, object] = {
             "label": label,
             "keys": dict(zip(group_keys, factor_values)),
             "n_runs": len(group_rows),
             "runs": [str(r.get("run")) for r in group_rows],
-            "seeds": [
-                r.get("seed")
-                for r in group_rows
-                if r.get("seed") is not None
-            ],
+            "seeds": seed_values,
+            "duplicate_seeds": duplicate_seeds,
             "samples": {},
             "costs": {},
         }
@@ -8963,7 +9050,27 @@ def _contrast_test(
     """
     对比两个实验单元的指标样本：种子集合完全相同时用配对
     t 检验（同种子 = 配对重复），否则用 Welch t 检验。
+
+    同一单元里出现重复随机种子（伪重复）时不能做配对检验：
+    字典会静默丢掉重复样本，把「复制的同一个运行」当成独立
+    重复。检测到伪重复时退回 Welch（每个运行各算一个样本）
+    并在结果里记录 ``duplicate_seeds``，展示层据此提示。
     """
+    seeds_a = [
+        sample["seed"]
+        for sample in samples_a
+        if sample["seed"] is not None
+    ]
+    seeds_b = [
+        sample["seed"]
+        for sample in samples_b
+        if sample["seed"] is not None
+    ]
+    duplicate_seeds = (
+        len(seeds_a) != len(set(seeds_a))
+        or len(seeds_b) != len(set(seeds_b))
+    )
+
     by_seed_a = {
         sample["seed"]: float(sample["value"])
         for sample in samples_a
@@ -8978,7 +9085,8 @@ def _contrast_test(
     common_seeds = sorted(set(by_seed_a) & set(by_seed_b))
 
     paired = (
-        len(common_seeds) >= _MIN_SEEDS_FOR_STATS
+        not duplicate_seeds
+        and len(common_seeds) >= _MIN_SEEDS_FOR_STATS
         and len(common_seeds) == len(by_seed_a)
         and len(common_seeds) == len(by_seed_b)
     )
@@ -8996,6 +9104,8 @@ def _contrast_test(
     values_b = [float(sample["value"]) for sample in samples_b]
     result = _welch_t_test(values_a, values_b)
     result["n_pairs"] = 0
+    if duplicate_seeds:
+        result["duplicate_seeds"] = True
     return result
 
 
@@ -9262,6 +9372,9 @@ def factor_contrasts(
                 "df": test.get("df"),
                 "p_value": test.get("p_value"),
                 "n_pairs": test.get("n_pairs", 0),
+                "duplicate_seeds": bool(
+                    test.get("duplicate_seeds")
+                ),
                 "significant": significant,
                 "verdict": verdict,
                 "cost": cost,
@@ -9379,6 +9492,14 @@ def _contrast_display(
         caveat = (
             "（种子数不足，未做显著性检验，"
             "不能据此声称差异）"
+        )
+
+    # 伪重复：同一单元里同一随机种子出现多次（复制的运行）
+    # 不是独立重复实验，配对检验不可用，结论的统计功效存疑。
+    if contrast.get("duplicate_seeds"):
+        caveat += (
+            "（实验单元含重复随机种子，按非配对 Welch 处理，"
+            "重复运行不能算独立重复）"
         )
 
     # 效率与精度权衡：效率倍率必须与涨点一起展示；显著改善
@@ -9510,6 +9631,9 @@ def compare_cells_to_baseline(
             "df": result.get("df"),
             "p_value": result.get("p_value"),
             "n_pairs": result.get("n_pairs", 0),
+            "duplicate_seeds": bool(
+                result.get("duplicate_seeds")
+            ),
             "significant": significant,
             "verdict": verdict,
             "cost": cost,
@@ -9525,7 +9649,13 @@ def compare_cells_to_baseline(
     return contrasts
 
 
-# 2×2 消融（延迟合并 × 均衡损失）中除两个消融轴之外必须保持
+# 延迟合并方案：A（局部延迟合并）与 B（全局延迟合并）。项目
+# 对两者都声明了「延迟合并提高专家组合表达能力」这一创新点，
+# 因此每个方案都必须能证明各自有用——消融覆盖按实际声明的
+# 方案逐个核对，不能只报告 A 的组合而漏掉 B。
+_DELAYED_MERGE_MODES: Tuple[str, ...] = ("A", "B")
+
+# 消融（延迟合并 × 均衡损失）中除两个消融轴之外必须保持
 # 恒定的结构设置：分支几何（k1/k2）、路由宽度（top_k）与残差
 # 缩放。它们跨消融单元不一致时，主效应会被结构差异混杂。
 _ABLATION_STRUCTURAL_KEYS: Tuple[str, ...] = (
@@ -9539,22 +9669,47 @@ _ABLATION_STRUCTURAL_KEYS: Tuple[str, ...] = (
 def ablation_coverage(
     rows: List[Dict[str, object]],
     factors: List[str],
+    ablation_modes: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """
-    消融完整性检查：延迟合并（local_base→A）与负载均衡损失
-    （balance_coef 开/关）构成 2×2 全因子：
-    无 = local_base/b=off、仅延迟合并 = A/b=off、
-    仅均衡损失 = local_base/b=on、两者 = A/b=on。
+    消融完整性检查：延迟合并（立即合并对照 local_base → 各延迟
+    合并方案 A/B）与负载均衡损失（balance_coef 开/关）构成
+    (1 + N) × 2 全因子（N = 声明的延迟合并方案数）。每个方案
+    的两档均衡臂与立即合并对照都必须覆盖，才能支撑「各创新点
+    各自有用」；只报告部分组合（例如漏掉 B 或漏掉 balance=0
+    的关闭臂）会被显式列为缺失。
+
+    预期覆盖的方案由 ``ablation_modes`` 显式声明
+    （--suite-ablation --ablation-modes）；未声明（只读
+    --compare）时按运行集中实际出现的延迟合并方案推断。
+
     报告缺失的组合、种子数不足的单元、会让主效应无法归因的
     结构混杂（各单元之间 k1/k2/top_k/residual_scale 不一致
-    时，「延迟合并」的收益混入了分支几何/路由宽度/残差缩放），
+    时，「延迟合并」的收益混入了分支几何/路由宽度/残差缩放；
+    开启臂使用了不同的 balance 取值时主效应混入均衡强度），
     以及「B 与 smelt 计算量不等价」这类会把额外计算误解释为
     方法收益的提醒。
     """
     factor_set = set(factors)
+
+    declared: Optional[List[str]] = None
+    if ablation_modes is not None:
+        declared = []
+        for mode in ablation_modes:
+            if mode not in _DELAYED_MERGE_MODES:
+                raise ValueError(
+                    "未知的延迟合并方案: "
+                    + str(mode)
+                    + "（可用: "
+                    + ", ".join(_DELAYED_MERGE_MODES)
+                    + "）"
+                )
+            if mode not in declared:
+                declared.append(mode)
+
     legend = (
-        "无=local_base/b=off, 仅延迟合并=A/b=off, "
-        "仅均衡损失=local_base/b=on, 两者=A/b=on"
+        "无=local_base/b=off, 仅延迟合并=A|B/b=off, "
+        "仅均衡损失=local_base/b=on, 两者=A|B/b=on"
     )
 
     report: Dict[str, object] = {
@@ -9562,6 +9717,8 @@ def ablation_coverage(
         "applicable": (
             "mode" in factor_set or "balance_coef" in factor_set
         ),
+        "expected_delayed_modes": [],
+        "expected_cells": [],
         "present_cells": [],
         "missing_cells": [],
         "low_replicate_cells": [],
@@ -9581,13 +9738,16 @@ def ablation_coverage(
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
     structural_signatures: Dict[str, int] = {}
+    balance_values_on: set = set()
     unknown_balance = False
+
+    ablation_related = {"local_base", *_DELAYED_MERGE_MODES}
 
     for row in rows:
         mode = str(_row_factor_value(row, "mode"))
         balance = _row_factor_value(row, "balance_coef")
         modes_present[mode] = modes_present.get(mode, 0) + 1
-        if mode in {"local_base", "A"}:
+        if mode in ablation_related:
             structural_label = ", ".join(
                 f"{name}="
                 f"{_format_factor_value(_row_factor_value(row, name))}"
@@ -9601,7 +9761,7 @@ def ablation_coverage(
                 balance_by_mode[mode].append(balance)
             if balance is None:
                 # 未记录的 balance_coef 不能算作开启/关闭任何
-                # 一档，否则 2×2 覆盖表会虚报组合存在。
+                # 一档，否则消融覆盖表会虚报组合存在。
                 unknown_balance = True
                 continue
             key = (
@@ -9609,17 +9769,19 @@ def ablation_coverage(
                 "off" if balance == 0 else "on",
             )
             merge_pair_cells[key] = merge_pair_cells.get(key, 0) + 1
+            if balance != 0:
+                balance_values_on.add(_stable_factor_key(balance))
 
     if unknown_balance:
         report["low_replicate_cells"].append(
-            "存在未记录 balance_coef 的 local_base/A 运行，"
+            "存在未记录 balance_coef 的 local_base/A/B 运行，"
             "其消融单元格无法判定"
         )
 
-    # 消融的受控变量纪律：2×2 的两个轴（延迟合并、均衡损失）
-    # 是唯一允许变化的设置。k1/k2/top_k/residual_scale 不一致
-    # 时，主效应与分支几何/路由宽度/残差缩放混杂，组合覆盖再
-    # 齐全也不能支撑「各设计各自有用」。
+    # 消融的受控变量纪律：延迟合并与均衡损失两轴之外，
+    # k1/k2/top_k/residual_scale 必须保持恒定。不一致时主效应
+    # 与分支几何/路由宽度/残差缩放混杂，组合覆盖再齐全也不能
+    # 支撑「各设计各自有用」。
     if len(structural_signatures) > 1:
         report["structural_confounds"].append(
             "消融单元之间 "
@@ -9635,6 +9797,21 @@ def ablation_coverage(
             "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
         )
 
+    # 均衡损失轴自身必须只有一档开启值：A 与 B 的开启臂若用了
+    # 不同 balance_coef，方案比较会混入均衡强度差异。
+    if len(balance_values_on) > 1:
+        report["structural_confounds"].append(
+            "均衡损失开启臂使用了不同的 balance_coef 取值（"
+            + ", ".join(
+                sorted(
+                    str(value)
+                    for value in balance_values_on
+                )
+            )
+            + "）：各消融单元之间的比较混杂了均衡强度差异，"
+            "方案收益无法与均衡损失强度分离"
+        )
+
     if "B" in modes_present and "smelt" in modes_present:
         report["advisories"].append(
             "B 在第一轮按 k1 个分支执行后续 Attention/MoE，"
@@ -9643,15 +9820,31 @@ def ablation_coverage(
             "（或按 FLOPs 对齐比较）"
         )
 
-    if rows and not ({"local_base", "A"} & set(modes_present)):
-        # 运行集里没有 local_base/A：这不是「消融缺失」，而是
-        # 当前对比与延迟合并消融无关（如 smelt 对比 B、统计
-        # 基线对比），给出提醒但不虚报缺失组合。
+    if declared is not None:
+        expected_delayed = list(declared)
+    else:
+        expected_delayed = [
+            mode
+            for mode in _DELAYED_MERGE_MODES
+            if mode in modes_present
+        ]
+
+    report["expected_delayed_modes"] = expected_delayed
+
+    if (
+        rows
+        and declared is None
+        and "local_base" not in modes_present
+        and not expected_delayed
+    ):
+        # 运行集里没有任何延迟合并相关模式（无 local_base/A/B）：
+        # 这不是「消融缺失」，而是当前对比与延迟合并消融无关
+        # （如 smelt 对比统计基线），给出提醒但不虚报缺失组合。
         report["advisories"].append(
-            "当前运行集不含 local_base/A，2×2 消融覆盖不适用；"
+            "当前运行集不含 local_base/A/B，消融覆盖不适用；"
             "若要验证延迟合并，需补充立即合并对照 "
-            "local_base 与延迟合并 A（全因子另加 balance "
-            "开关两档）"
+            "local_base 与延迟合并方案 A/B（全因子另加 "
+            "balance 开关两档）"
         )
         return report
 
@@ -9661,17 +9854,26 @@ def ablation_coverage(
                 "缺少立即合并对照模式 local_base："
                 "无法隔离延迟合并本身带来的收益"
             )
-        if "A" not in modes_present:
-            report["missing_cells"].append(
-                "缺少局部延迟合并模式 A"
-            )
+        for mode in expected_delayed:
+            if mode not in modes_present:
+                report["missing_cells"].append(
+                    f"缺少延迟合并方案 {mode} 的运行："
+                    "无法证明该方案各自有用"
+                )
+
+    expected_cells = [
+        f"{mode}/b={level}"
+        for mode in ("local_base", *expected_delayed)
+        for level in ("off", "on")
+    ]
+    report["expected_cells"] = expected_cells
 
     if (
         "balance_coef" in factor_set
         and "mode" in factor_set
     ):
-        # 2×2 四个格子的存在性（两轴都在因子中时）。
-        for mode in ("local_base", "A"):
+        # (1 + N)×2 全部格子的存在性（两轴都在因子中时）。
+        for mode in ("local_base", *expected_delayed):
             for level in ("off", "on"):
                 key = (mode, level)
                 if key not in merge_pair_cells:
@@ -9680,9 +9882,9 @@ def ablation_coverage(
                         "（无法证明各创新点各自有用）"
                     )
     elif "balance_coef" in factor_set:
-        # 只有 balance_coef 是因子：按本项目的合并模式检查
-        # 开启臂 / 关闭臂。
-        for mode in ("local_base", "A"):
+        # 只有 balance_coef 是因子：按本项目的延迟合并模式
+        # 检查开启臂 / 关闭臂。
+        for mode in ("local_base", *expected_delayed):
             if mode not in modes_present:
                 continue
             balances = balance_by_mode.get(mode, [])
@@ -9719,15 +9921,18 @@ def ablation_coverage(
                 f"（建议 ≥{_RECOMMENDED_SEEDS}）"
             )
 
+    expected_cell_count = 2 * (1 + len(expected_delayed))
     if (
         "balance_coef" in factor_set
-        and len(merge_pair_cells) == 4
+        and "mode" in factor_set
+        and len(merge_pair_cells) == expected_cell_count
         and not report["missing_cells"]
         and not report["structural_confounds"]
     ):
         report["advisories"].append(
-            "2×2 全因子组合齐全且结构设置一致："
-            "可同时给出延迟合并与均衡损失的主效应及交互"
+            f"{1 + len(expected_delayed)}×2 全因子组合齐全且"
+            "结构设置一致：可同时给出各延迟合并方案与均衡损失"
+            "的主效应及交互"
         )
 
     return report
@@ -10380,11 +10585,16 @@ def print_comparison_analysis(
     factors: Optional[List[str]] = None,
     baseline_mode: Optional[str] = None,
     metric: str = "val_loss",
+    ablation_modes: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """
     打印完整的对比分析：受控变量检查、按种子聚合的
     Mean ± Std、单因子显著性检验（含多重比较校正与效应量
     95% 置信区间）与消融覆盖检查。
+
+    ``ablation_modes`` 声明本轮消融必须覆盖的延迟合并方案
+    （--suite-ablation --ablation-modes）；为 None 时按运行
+    集中实际出现的方案推断。
 
     返回结构化结果，供写入汇总报告。
     """
@@ -10421,7 +10631,19 @@ def print_comparison_analysis(
         baseline_mode,
         metric,
     )
-    coverage = ablation_coverage(rows, factors)
+    coverage = ablation_coverage(rows, factors, ablation_modes)
+    # 伪重复：同一实验单元里同一随机种子出现多次（如复制运行
+    # 目录）不是独立重复实验，必须点名，不能让它悄悄抬高样本数、
+    # 压低种子间方差。
+    duplicate_seed_cells = [
+        {
+            "cell": aggregate["label"],
+            "n_runs": aggregate["n_runs"],
+            "duplicate_seeds": aggregate["duplicate_seeds"],
+        }
+        for aggregate in aggregates
+        if aggregate.get("duplicate_seeds")
+    ]
     hypotheses = hypothesis_registry(rows)
     adequacy = baseline_adequacy(rows, baseline_mode, metric)
     imbalance = imbalance_metric_advisory(rows, metric)
@@ -10534,6 +10756,22 @@ def print_comparison_analysis(
                 f"{_RECOMMENDED_SEEDS}（建议 3~5 个不同随机"
                 "种子并汇报 Mean ± Std）: "
                 + "; ".join(underpowered)
+            )
+        if duplicate_seed_cells:
+            details = "; ".join(
+                f"{cell['cell']}（种子 "
+                + ", ".join(
+                    str(seed)
+                    for seed in cell["duplicate_seeds"]
+                )
+                + f" 各出现多次，共 {cell['n_runs']} 个运行）"
+                for cell in duplicate_seed_cells
+            )
+            print(
+                "  [warn] 伪重复：以下实验单元含重复随机种子"
+                "（复制的同一运行不是独立重复实验，"
+                "种子间方差被低估、配对检验不可用）: "
+                + details
             )
     else:
         print("  无有效指标可聚合")
@@ -10765,6 +11003,7 @@ def print_comparison_analysis(
         "controlled": controlled,
         "hypothesis_registry": hypotheses,
         "aggregates": aggregates,
+        "duplicate_seed_cells": duplicate_seed_cells,
         "contrasts": contrasts,
         "reference_contrasts": reference,
         "baseline_adequacy": adequacy,
@@ -14000,10 +14239,11 @@ def run_self_test():
             pr_auc: Optional[float] = None,
             k1: int = 2,
             k2: int = 2,
+            protocol_overrides: Optional[Dict[str, object]] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
-            protocol = {
+            protocol: Dict[str, object] = {
                 "comparison_family": "neural",
                 "optimizer": "AdamW",
                 "optimizer_betas": [0.9, 0.999],
@@ -14029,7 +14269,15 @@ def run_self_test():
                 "eval_interval": 10,
                 "eval_batches": 2,
                 "data_sha256": "deadbeef",
+                "early_stop_patience": 0,
+                "early_stop_min_delta": 0.0,
+                "amp_dtype": "float32",
+                "device_type": "cpu",
+                "grad_checkpoint": False,
+                "compile": False,
             }
+            if protocol_overrides:
+                protocol.update(protocol_overrides)
             config_payload = {
                 "config": {
                     "mode": mode,
@@ -14152,6 +14400,69 @@ def run_self_test():
         )
         assert controlled["ok"], controlled["violations"]
         assert "lr" in controlled["checked_keys"]
+        # 有效训练长度与数值设置也必须是受控变量：中止触发
+        # （early stop 容忍度）与 AMP/设备/梯度检查点/编译在
+        # 两臂间不同会让「方法收益」混入训练过程差异。
+        assert "early_stop_patience" in controlled["checked_keys"]
+        assert "amp_dtype" in controlled["checked_keys"]
+        assert "device_type" in controlled["checked_keys"]
+
+        stale_stop_path = _write_analysis_run(
+            "A_seed42_stale_stop",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.01,
+            2.85,
+            protocol_overrides={"early_stop_patience": 5},
+        )
+        stale_stop_controlled = check_controlled_variables(
+            compare_runs(run_paths + [stale_stop_path]),
+            factors,
+        )
+        assert any(
+            violation["key"] == "early_stop_patience"
+            for violation in stale_stop_controlled["violations"]
+        ), stale_stop_controlled["violations"]
+
+        amp_mismatch_path = _write_analysis_run(
+            "A_seed42_amp",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.01,
+            2.85,
+            protocol_overrides={"amp_dtype": "bfloat16"},
+        )
+        amp_mismatch_controlled = check_controlled_variables(
+            compare_runs(run_paths + [amp_mismatch_path]),
+            factors,
+        )
+        assert any(
+            violation["key"] == "amp_dtype"
+            for violation in amp_mismatch_controlled["violations"]
+        ), amp_mismatch_controlled["violations"]
+
+        device_mismatch_path = _write_analysis_run(
+            "A_seed42_device",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.01,
+            2.85,
+            protocol_overrides={"device_type": "cuda"},
+        )
+        device_mismatch_controlled = check_controlled_variables(
+            compare_runs(run_paths + [device_mismatch_path]),
+            factors,
+        )
+        assert any(
+            violation["key"] == "device_type"
+            for violation in device_mismatch_controlled["violations"]
+        ), device_mismatch_controlled["violations"]
 
         aggregates = aggregate_runs(analysis_rows, ["mode"])
         assert len(aggregates) == 2
@@ -14210,6 +14521,65 @@ def run_self_test():
         )
         assert contrast["ci95_excludes_zero"]
         assert "95%CI" in _contrast_display(contrast, "val_loss")
+
+        # 伪重复：同一单元里同一个种子被复制成多个运行（目录
+        # 复制的常见事故）不是独立重复实验。必须点名重复种子、
+        # 禁止配对检验（按种子配对会静默丢样本）、退回 Welch，
+        # 且展示层给出警告。
+        duplicate_path = _write_analysis_run(
+            "A_seed42_duplicate",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.01,
+            2.82,
+        )
+        duplicate_rows = compare_runs(
+            run_paths + [duplicate_path]
+        )
+        duplicate_aggregates = aggregate_runs(
+            duplicate_rows, ["mode"]
+        )
+        duplicate_by_label = {
+            aggregate["label"]: aggregate
+            for aggregate in duplicate_aggregates
+        }
+        assert (
+            duplicate_by_label["mode=A"]["duplicate_seeds"]
+            == [42]
+        )
+        assert (
+            duplicate_by_label["mode=local_base"][
+                "duplicate_seeds"
+            ]
+            == []
+        )
+        duplicate_contrast = factor_contrasts(
+            duplicate_aggregates,
+            ["mode"],
+            "val_loss",
+        )[0]
+        assert duplicate_contrast["duplicate_seeds"]
+        assert duplicate_contrast["test"] == "welch_t"
+        assert duplicate_contrast["n_pairs"] == 0
+        assert (
+            "重复随机种子"
+            in _contrast_display(duplicate_contrast, "val_loss")
+        )
+
+        # 覆盖检查的展示层（print_comparison_analysis）也必须
+        # 把伪重复单元列进结构化结果，不能只在检验内部悄悄处理。
+        duplicate_analysis = print_comparison_analysis(
+            duplicate_rows,
+            factors=factors,
+            metric="val_loss",
+        )
+        assert any(
+            cell["cell"] == "mode=A"
+            and cell["duplicate_seeds"] == [42]
+            for cell in duplicate_analysis["duplicate_seed_cells"]
+        ), duplicate_analysis["duplicate_seed_cells"]
 
         # 尘封协议：test 指标绝不能作为跨运行对比口径，
         # 否则「挑 test 最好」会让测试集退化成隐式验证集。
@@ -14462,8 +14832,72 @@ def run_self_test():
             for message in confounded_coverage["advisories"]
         )
 
-        # 与延迟合并无关的对比（smelt vs B）不虚报消融缺失，
-        # 只提示需补 local_base/A 并给出计算量提醒。
+        # 该项目的两个延迟合并方案 A 与 B 都必须各自可用：
+        # 只跑 A 的消融不能支撑 B 的结论。补上 B 的开启臂但
+        # 缺关闭臂时，必须点名 B/b=off，而不是把 B 当无关模式。
+        b_missing_paths = full_paths + [
+            _write_analysis_run(
+                "B_bal0.01_seed42",
+                "B",
+                42,
+                3e-4,
+                100,
+                0.01,
+                2.70,
+            ),
+        ]
+        b_missing_coverage = ablation_coverage(
+            compare_runs(b_missing_paths),
+            factors,
+        )
+        assert b_missing_coverage["expected_delayed_modes"] == [
+            "A",
+            "B",
+        ]
+        assert any(
+            "B/b=off" in message
+            for message in b_missing_coverage["missing_cells"]
+        ), b_missing_coverage["missing_cells"]
+
+        # 显式声明（--ablation-modes A B）时必须覆盖 B：运行集
+        # 里只有 A 也要把「缺少方案 B」列为缺失。
+        declared_b_coverage = ablation_coverage(
+            analysis_rows,
+            factors,
+            ["A", "B"],
+        )
+        assert any(
+            "缺少延迟合并方案 B" in message
+            for message in declared_b_coverage["missing_cells"]
+        ), declared_b_coverage["missing_cells"]
+
+        # 补齐 local_base/A/B 各自的 off/on 六格后，(1+N)×2
+        # 全因子齐全，给出可解释主效应与交互的结论。
+        b_full_paths = b_missing_paths + [
+            _write_analysis_run(
+                "B_bal0_seed42",
+                "B",
+                42,
+                3e-4,
+                100,
+                0.0,
+                2.75,
+            ),
+        ]
+        b_full_coverage = ablation_coverage(
+            compare_runs(b_full_paths),
+            factors,
+        )
+        assert not b_full_coverage["missing_cells"], b_full_coverage
+        assert any(
+            "3×2 全因子组合齐全" in message
+            for message in b_full_coverage["advisories"]
+        ), b_full_coverage["advisories"]
+
+        # smelt vs B 一旦出现 B，就不能当「与消融无关」：缺
+        # 立即合并对照与关闭臂时必须点名，并给出计算量提醒
+        # （B 与 smelt 不等计算，直接比较会把 FLOPs 差异混入
+        # 路由机制）。
         unrelated = [
             _write_analysis_run(
                 "smelt_s1",
@@ -14488,14 +14922,49 @@ def run_self_test():
             compare_runs(unrelated),
             factors,
         )
-        assert not unrelated_coverage["missing_cells"]
         assert any(
-            "2×2 消融覆盖不适用" in message
-            for message in unrelated_coverage["advisories"]
-        )
+            "缺少立即合并对照模式 local_base" in message
+            for message in unrelated_coverage["missing_cells"]
+        ), unrelated_coverage["missing_cells"]
+        assert any(
+            "B/b=off" in message
+            for message in unrelated_coverage["missing_cells"]
+        ), unrelated_coverage["missing_cells"]
         assert any(
             "计算量差异" in message
             for message in unrelated_coverage["advisories"]
+        )
+
+        # 完全不涉及 local_base/A/B 的对比（smelt vs dense_fnn）
+        # 才是不适用：不虚报缺失，只提示消融覆盖不适用。
+        irrelevant = [
+            _write_analysis_run(
+                "smelt_only_s1",
+                "smelt",
+                1,
+                3e-4,
+                100,
+                0.01,
+                3.00,
+            ),
+            _write_analysis_run(
+                "dense_fnn_only_s1",
+                "dense_fnn",
+                1,
+                3e-4,
+                100,
+                0.01,
+                3.10,
+            ),
+        ]
+        irrelevant_coverage = ablation_coverage(
+            compare_runs(irrelevant),
+            factors,
+        )
+        assert not irrelevant_coverage["missing_cells"]
+        assert any(
+            "消融覆盖不适用" in message
+            for message in irrelevant_coverage["advisories"]
         )
 
         # ---- 基线合理性检查（稻草人守卫） ----
@@ -15194,15 +15663,34 @@ def run_self_test():
         balance_coef=0.01,
         default_mode="B",
     )
+    # 默认覆盖全部已提出的延迟合并方案 A 与 B（(1+N)×2）：
+    # 只跑 A 的组合不足以支撑 B 的结论。
     assert [item["label"] for item in ablation_plan] == [
         "local_base_bal0_seed7",
         "local_base_bal0.01_seed7",
         "A_bal0_seed7",
         "A_bal0.01_seed7",
+        "B_bal0_seed7",
+        "B_bal0.01_seed7",
     ]
     assert [
         item["balance_coef"] for item in ablation_plan
-    ] == [0.0, 0.01, 0.0, 0.01]
+    ] == [0.0, 0.01, 0.0, 0.01, 0.0, 0.01]
+
+    ablation_plan_a_only = build_sweep_plan(
+        seeds=[7],
+        modes=None,
+        ablation=True,
+        balance_coef=0.01,
+        default_mode="B",
+        ablation_modes=["A"],
+    )
+    assert [item["mode"] for item in ablation_plan_a_only] == [
+        "local_base",
+        "local_base",
+        "A",
+        "A",
+    ]
 
     stripped = strip_sweep_args([
         "--data",
@@ -15216,6 +15704,10 @@ def run_self_test():
         "2",
         "3",
         "--suite-ablation",
+        "--ablation-modes",
+        "A",
+        "B",
+        "--allow-underpowered",
         "--steps",
         "10",
         "--balance-coef",
@@ -15348,10 +15840,12 @@ _SWEEP_MULTI_VALUE_FLAGS = (
     "--seeds",
     "--suite-modes",
     "--baseline-tuning-lrs",
+    "--ablation-modes",
 )
 _SWEEP_BOOL_FLAGS = (
     "--suite-ablation",
     "--suite-baseline-tuning",
+    "--allow-underpowered",
 )
 
 # 基线调参协议：简单基线（默认 dense）先在 val 上做预注册的
@@ -15410,6 +15904,7 @@ def build_sweep_plan(
     ablation: bool,
     balance_coef: float,
     default_mode: Optional[str] = None,
+    ablation_modes: Optional[List[str]] = None,
 ) -> List[Dict[str, object]]:
     """
     构造运行计划。每个条目包含输出子目录名与逐运行覆盖的
@@ -15417,13 +15912,20 @@ def build_sweep_plan(
 
     - 普通多种子：seed{S}
     - 模式套件：{mode}_seed{S}
-    - 2×2 消融：{mode}_bal{coef}_seed{S}
-      （{local_base, A} × {0, balance_coef}）
+    - (1+N)×2 消融：{mode}_bal{coef}_seed{S}
+      （{local_base} ∪ 延迟合并方案 × {0, balance_coef}）
+      延迟合并方案默认覆盖全部已提出的实现 A 与 B；每个创新
+      点都必须证明各自有用，只跑 A 的组合不足以支撑 B 的结论。
     """
     plan: List[Dict[str, object]] = []
 
     if ablation:
-        for mode in ("local_base", "A"):
+        delayed_modes = (
+            list(ablation_modes)
+            if ablation_modes
+            else list(_DELAYED_MERGE_MODES)
+        )
+        for mode in ("local_base", *delayed_modes):
             for coefficient in (0.0, balance_coef):
                 label_coefficient = format(coefficient, "g")
                 for seed in seeds:
@@ -15972,6 +16474,21 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
         lrs,
         seeds,
     )
+    report["seed_plan"] = {
+        "seeds": [int(seed) for seed in seeds],
+        "n_seeds": len(seeds),
+        "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
+        "underpowered_override": bool(
+            args.allow_underpowered
+            and len(seeds) < _MIN_SEEDS_FOR_STATS
+        ),
+    }
+    if len(seeds) < _MIN_SEEDS_FOR_STATS:
+        report["issues"].append(
+            f"每个候选只有 {len(seeds)} 个种子"
+            f"（< {_MIN_SEEDS_FOR_STATS}）：winner 可能只是"
+            "种子噪声的产物，调参结果不具统计功效"
+        )
     print_baseline_tuning_report(report, out_root)
     write_baseline_tuning_report(out_root, report)
 
@@ -16005,6 +16522,11 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         ablation=bool(args.suite_ablation),
         balance_coef=args.balance_coef,
         default_mode=args.mode,
+        ablation_modes=(
+            list(args.ablation_modes)
+            if args.suite_ablation and args.ablation_modes
+            else None
+        ),
     )
 
     out_root = Path(args.out)
@@ -16016,6 +16538,14 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             f"种子并汇报 Mean ± Std，当前只有 "
             f"{len(args.seeds)} 个"
         )
+        if args.allow_underpowered:
+            print(
+                "[sweep] [warn] 已通过 --allow-underpowered "
+                "显式允许低统计功效运行：种子数 "
+                f"{len(args.seeds)} < {_MIN_SEEDS_FOR_STATS}，"
+                "本轮结论不得作为显著性主张（记录在 "
+                "comparison_analysis.json 的 seed_plan）"
+            )
 
     run_paths = _execute_sweep_plan(base_argv, plan, out_root)
 
@@ -16025,7 +16555,23 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         factors=factors,
         baseline_mode=args.compare_baseline,
         metric=args.compare_metric,
+        ablation_modes=(
+            list(args.ablation_modes)
+            if args.suite_ablation and args.ablation_modes
+            else None
+        ),
     )
+    # 种子计划随报告落盘：事后能核对本轮结论是在几个种子上
+    # 得出的、是否使用了低统计功效豁免。
+    analysis["seed_plan"] = {
+        "seeds": [int(seed) for seed in args.seeds],
+        "n_seeds": len(args.seeds),
+        "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
+        "underpowered_override": bool(
+            args.allow_underpowered
+            and len(args.seeds) < _MIN_SEEDS_FOR_STATS
+        ),
+    }
     write_comparison_report(out_root, analysis)
 
 
@@ -16332,10 +16878,32 @@ def main():
         "--suite-ablation",
         action="store_true",
         help=(
-            "配合 --seeds：运行「延迟合并 × 均衡损失」的 "
-            "2×2 全因子消融（local_base/A × balance_coef="
-            "0/当前值）；balance 关闭臂为 0，开启臂取 "
-            "--balance-coef"
+            "配合 --seeds：运行「延迟合并 × 均衡损失」全因子"
+            "消融（立即合并对照 local_base 与各延迟合并方案 "
+            "A/B × balance_coef=0/当前值）；balance 关闭臂为 "
+            "0，开启臂取 --balance-coef。每个创新点都必须"
+            "证明各自有用，默认覆盖 A 与 B 两个方案"
+        ),
+    )
+    parser.add_argument(
+        "--ablation-modes",
+        nargs="+",
+        choices=sorted(_DELAYED_MERGE_MODES),
+        default=None,
+        metavar="MODE",
+        help=(
+            "配合 --suite-ablation：声明本轮消融必须覆盖的"
+            "延迟合并方案（默认 A B）；只跑部分方案时结论"
+            "只能覆盖已跑方案，覆盖检查会按声明核对"
+        ),
+    )
+    parser.add_argument(
+        "--allow-underpowered",
+        action="store_true",
+        help=(
+            "显式允许套件在少于 3 个随机种子下运行"
+            "（低统计功效，仅用于冒烟/调试；关键结论不得"
+            "据此做显著性主张，豁免会记录进报告）"
         ),
     )
     parser.add_argument(
@@ -16614,6 +17182,40 @@ def main():
             "--suite-ablation 需要正的 --balance-coef 作为"
             "开启臂（关闭臂固定为 0）"
         )
+    if args.ablation_modes is not None and not args.suite_ablation:
+        parser.error(
+            "--ablation-modes 只适用于 --suite-ablation"
+            "（用于声明本轮必须覆盖哪些延迟合并方案）"
+        )
+    if args.allow_underpowered and not (
+        args.suite_modes
+        or args.suite_ablation
+        or args.suite_baseline_tuning
+    ):
+        parser.error(
+            "--allow-underpowered 只适用于种子套件"
+            "（--suite-modes / --suite-ablation / "
+            "--suite-baseline-tuning）"
+        )
+    if (
+        args.seeds is not None
+        and (
+            args.suite_modes
+            or args.suite_ablation
+            or args.suite_baseline_tuning
+        )
+        and len(args.seeds) < _MIN_SEEDS_FOR_STATS
+        and not args.allow_underpowered
+    ):
+        parser.error(
+            "关键套件（--suite-modes / --suite-ablation / "
+            "--suite-baseline-tuning）至少需要 "
+            f"{_MIN_SEEDS_FOR_STATS} 个不同随机种子才能"
+            "支撑统计结论；种子太少时 Mean ± Std 与显著性"
+            "检验不可信。冒烟/调试请显式加 "
+            "--allow-underpowered（豁免会记录进报告），"
+            "正式实验请用 3~5 个种子"
+        )
     if args.statistical_baseline and args.resume is not None:
         parser.error(
             "--statistical-baseline 不能与 --resume 同时使用"
@@ -16733,6 +17335,13 @@ def main():
     else:
         amp_dtype = None
         scaler = None
+
+    # 混合精度 dtype 是数值环境的一部分：写入 args（随
+    # config.json 的 args 与 comparison_protocol 一起存档），
+    # --compare 才能核对各运行是否真的在相同数值环境下训练。
+    args.amp_dtype = (
+        str(amp_dtype) if amp_dtype is not None else None
+    )
 
     out_dir = Path(args.out)
     # 输出路径不可用（已存在同名文件、无写权限等）与其他

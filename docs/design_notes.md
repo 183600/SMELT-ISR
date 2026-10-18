@@ -121,8 +121,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
   t 临界值与效应量 95% 置信区间；显著性判定与权衡结论
   以 Holm 校正后为准。
-- `ablation_coverage`：2×2 全因子消融覆盖检查（含消融单元
-  之间 `k1/k2/top_k/residual_scale` 结构一致性的混杂检查）。
+- `ablation_coverage`：(1+N)×2 全因子消融覆盖检查（默认
+  N=A/B 两个延迟合并方案；含消融单元之间
+  `k1/k2/top_k/residual_scale` 结构一致性与均衡强度一致性
+  的混杂检查）。
 - `print_comparison_analysis`、`write_comparison_report`：
   完整的对比分析输出与 `comparison_analysis.json` 落盘。
 - `strip_sweep_args`、`build_sweep_plan`、`run_experiment_sweep`：
@@ -173,7 +175,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   模型结构（含分支几何 `k1/k2`、路由宽度 `top_k`、均衡损失
   系数 `balance_coef`、`dense_fnn_hidden`、`residual_scale`）、
   评估协议与选型口径（`model_selection`，新运行为验证集选型、
-  无记录的旧运行回退标记为最后一步）写入 `config.json` 的
+  无记录的旧运行回退标记为最后一步），以及有效训练长度与
+  数值设置（早停容忍度 `early_stop_patience`/
+  `early_stop_min_delta`、AMP 精度 `amp_dtype`、设备类型
+  `device_type`、梯度检查点 `grad_checkpoint`、
+  `compile`：两臂的 AMP/设备/早停不同会让「方法收益」混入
+  训练过程差异）写入 `config.json` 的
   `comparison_protocol` 字段。这些键即使没有出现在
   `--compare-factors`（默认因子包含 `k1/k2/balance_coef/`
   `dense_fnn_hidden`）里，也会退化为受控变量逐项核对——把
@@ -209,7 +216,16 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两
   对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
   会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
-  3~5。
+  3~5。**伪重复检测**：同一实验单元里同一随机种子出现多次
+  （复制运行目录、重复登记同一运行）会被按种子配对时的字典
+  静默合并、虚增样本数并低估种子间方差；聚合层显式记录
+  `duplicate_seeds`，展示层点名重复种子，检验层禁用配对检验
+  并退回 Welch（每个运行各算一个样本），`comparison_analysis.json`
+  的 `duplicate_seed_cells` 列出全部伪重复单元。关键套件
+  （`--suite-modes`/`--suite-ablation`/`--suite-baseline-tuning`）
+  在少于 3 个不同随机种子时直接拒绝运行，冒烟/调试需显式
+  加 `--allow-underpowered`；豁免与种子计划（`seed_plan`）
+  随报告落盘，避免低功效运行被当作正式结论。
 - **基线合理性（稻草人守卫）**：`--compare-baseline MODE`
   在给出相对差值之外，还核对基线本身是否值得战胜：基线在
   主指标上必须真的优于无上下文 unigram 参考（各运行
@@ -251,19 +267,26 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   （`hypothesis_registry`、`baseline_adequacy`、
   `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
-  损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前
-  值；四个组合分别对应「无 / 仅延迟合并 / 仅均衡损失 /
-  两者」），四个组合都覆盖后才能同时给出两个创新点各自的
-  主效应与交互；`--suite-modes` 把同一套受控设置应用到多个
-  模式（如 `smelt local_base A B`），保证跨模式对比除模式外
-  所有设置逐项一致。两个套件都自动执行消融覆盖检查，缺失的
-  组合会以 `[missing]` 列出（只报告部分组合不能支撑「各自
-  都有用」的结论）；一次变化多个因子的对比标记为
-  `[confounded]`。消融覆盖检查还会核对各单元之间
-  `k1/k2/top_k/residual_scale` 是否一致：组合齐全但结构设置
-  不同（如某个单元悄悄用了更大的 `k1`）时主效应会与分支几何、
-  路由宽度或残差缩放混杂，同样以 `[confounded]` 标出且不
-  声明「全因子齐全」。
+  损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`
+  =0/当前值；(1+N)×2 格分别对应「无 / 仅延迟合并 / 仅均衡
+  损失 / 两者」）。默认覆盖项目提出的全部延迟合并方案
+  （A 与 B，共 3×2=6 格）：每个创新点都必须证明各自有用，
+  只跑 A 的组合不足以支撑 B 的结论；只声明部分方案时用
+  `--ablation-modes A|B`（声明后覆盖检查按声明核对，未声明
+  时按运行集中实际出现的方案推断）。全部组合覆盖后才能同时
+  给出各方案与均衡损失的主效应及交互；`--suite-modes` 把同一
+  套受控设置应用到多个模式（如 `smelt local_base A B`），
+  保证跨模式对比除模式外所有设置逐项一致。两个套件都自动
+  执行消融覆盖检查，缺失的组合会以 `[missing]` 列出（只报告
+  部分组合不能支撑「各自都有用」的结论）；一次变化多个因子
+  的对比标记为 `[confounded]`。消融覆盖检查还会核对各单元
+  之间 `k1/k2/top_k/residual_scale` 与均衡开启臂的
+  `balance_coef` 是否一致：组合齐全但结构设置或均衡强度不同
+  （如某个单元悄悄用了更大的 `k1`、A 与 B 的开启臂用了不同
+  balance）时主效应会与分支几何、路由宽度、残差缩放或均衡
+  强度混杂，同样以 `[confounded]` 标出且不声明「全因子齐全」。
+  出现 B 时还会提示与 smelt 的计算量不等价，要求同时报告
+  等计算对照。
 - **汇总报告**：套件运行结束后把受控变量检查、聚合统计、
   单因子对比与消融覆盖写入 `<out>/comparison_analysis.json`；
   `--compare` 只读运行目录、不写文件。
@@ -333,10 +356,16 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 
 多种子 / 消融套件：`--seeds SEED [SEED ...]`、
 `--suite-modes MODE [MODE ...]`（配合 `--seeds` 做控变量的
-模式对比）、`--suite-ablation`（配合 `--seeds` 做 2×2 全因子
-消融）、`--suite-baseline-tuning`（配合 `--seeds` 做简单基线
+模式对比）、`--suite-ablation`（配合 `--seeds` 做 (1+N)×2
+全因子消融）、`--ablation-modes A [B ...]`（配合
+`--suite-ablation` 声明本轮必须覆盖的延迟合并方案，缺省
+A B）、`--allow-underpowered`（显式允许套件在 <3 个种子下
+运行，豁免随报告落盘，仅限冒烟/调试）、
+`--suite-baseline-tuning`（配合 `--seeds` 做简单基线
 的学习率网格调参，`--baseline-tuning-lrs` 给候选、
-`--baseline-tuning-mode` 选模式）。套件逐进程调用自身，结束
-后自动输出完整对比分析并写入 `<out>/comparison_analysis.json`
-（调参套件写 `<out>/baseline_tuning.json`）。基线训练可用
+`--baseline-tuning-mode` 选模式）。关键套件至少需要 3 个
+不同随机种子，否则直接报错要求改用 3~5 个种子或显式豁免。
+套件逐进程调用自身，结束后自动输出完整对比分析并写入
+`<out>/comparison_analysis.json`（调参套件写
+`<out>/baseline_tuning.json`）。基线训练可用
 `--baseline-tuning-from <报告>` 核对并记录调参来源。
