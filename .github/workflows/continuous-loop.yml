@@ -472,6 +472,7 @@ jobs:
             git checkout HEAD -- .github 2>/dev/null || true
             git clean -fdq .github 2>/dev/null || true
             ensure_readme
+            rm -f .opencode_issues.md
             git add -A || true
             git commit -m "auto: iteration $1$(model_tag)" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
@@ -483,6 +484,7 @@ jobs:
             git checkout HEAD -- .github 2>/dev/null || true
             git clean -fdq .github 2>/dev/null || true
             ensure_readme
+            rm -f .opencode_issues.md
             git add -A || true
             if ! git diff --cached --quiet; then
               git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
@@ -588,6 +590,42 @@ jobs:
             return 1
           }
 
+          # ================= 两段式阶段：先检测、再修复 =================
+          # 需要两段式的阶段（perf / bug / sci，按仓库实际阶段）各拆成两次 opencode 调用：
+          #   1) detect：只检测问题，把清单写入临时 .md（不改代码）；
+          #   2) fix：读取清单，修复全部问题，然后删除该 .md。
+          # 临时文件用后即删，不会进入提交。
+          ISSUES_FILE=".opencode_issues.md"
+          DETECT_DIVISOR=4          # 检测预算约占阶段的 1/4（至少 8 分钟）
+          make_detect_prompt() {
+            printf '本次只做检测，绝对不要修改任何代码或文件（唯一允许写入的是临时问题清单 `%s`）。\n\n阶段任务如下（其中所有“修改/修复/改进”动作都留到第二步，本次一律不执行）：\n%s\n\n要求：\n1. 通读相关代码、配置、测试与实验脚本，尽可能具体地定位问题（尽量给出 `文件:行号`）。\n2. 把发现的问题按严重程度从高到低写入 `%s`；每条包含位置、问题描述、为什么是问题、建议的修复方向。\n3. 即使没有发现问题，也要在文件里写明“未发现问题”；该清单是流程要求的临时中间文件，不属于任务中禁止的“报告”。\n4. 除该清单外，不要修改、删除或移动任何文件（尤其 .github/、LICENSE、README*、PLAN.md、测试与数据文件），不要 git add/commit/push，不要运行会改变仓库状态的命令。\n5. 再次强调：本次只输出问题清单，不要动手修复。\n' "$ISSUES_FILE" "$1" "$ISSUES_FILE"
+          }
+          make_fix_prompt() {
+            printf '本阶段分两步执行：第一步（检测）已经完成或因剩余时间不足而跳过，问题清单保存在 `%s`。\n第二步（现在执行）：先读取该清单，逐条修复其中列出的全部问题，不要遗漏；若清单不存在、为空或明显不完整，则自行重新检查并修复。修复完成后必须删除 `%s`，并确认仓库中不再残留该文件；该清单是流程要求的临时中间文件，不属于任务中禁止的“报告”。\n\n下面是本阶段原本的任务与约束：\n%s\n' "$ISSUES_FILE" "$ISSUES_FILE" "$1"
+          }
+          run_phase_2step() {
+            local phase="$1" base_prompt="$2" budget="$3"
+            local remain=$(( DEADLINE - $(date +%s) ))
+            if [ "$remain" -lt 1500 ]; then
+              echo "[info] phase=$phase 剩余时间不足两段式，直接执行修复（修复步骤会自动补检）"
+              rm -f "$ISSUES_FILE"
+              run_phase "${phase}-fix" "$(make_fix_prompt "$base_prompt")" "$budget"
+              rm -f "$ISSUES_FILE"
+              return 0
+            fi
+            local detect_budget=$(( budget / DETECT_DIVISOR ))
+            [ "$detect_budget" -lt 480 ] && detect_budget=480
+            local t0=$(date +%s)
+            rm -f "$ISSUES_FILE"
+            echo "[info] phase=$phase 两段式：先检测（预算 ${detect_budget}s），再修复"
+            run_phase "${phase}-detect" "$(make_detect_prompt "$base_prompt")" "$detect_budget"
+            local fix_budget=$(( budget - ( $(date +%s) - t0 ) ))
+            [ "$fix_budget" -lt 600 ] && fix_budget=600
+            echo "[info] phase=$phase 两段式：开始修复（预算 ${fix_budget}s）"
+            run_phase "${phase}-fix" "$(make_fix_prompt "$base_prompt")" "$fix_budget"
+            rm -f "$ISSUES_FILE"
+          }
+
           # ================= 主循环 =================
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
@@ -632,7 +670,10 @@ jobs:
               if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
 
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
-              run_phase "$phase" "$P" "$T"
+              case "$phase" in
+                perf|bug|sci) run_phase_2step "$phase" "$P" "$T" ;;
+                *)            run_phase "$phase" "$P" "$T" ;;
+              esac
 
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
@@ -645,6 +686,7 @@ jobs:
         if: always()
         run: |
           set +e
+          rm -f .opencode_issues.md
           rm -f opencode.json opencode.jsonc .opencode.json 2>/dev/null
           find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
           find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
