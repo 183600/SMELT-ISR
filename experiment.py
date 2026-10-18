@@ -557,8 +557,8 @@ class Expert(nn.Module):
 # 循环路径。阈值判定只依赖确定性的 counts 与设备类型，
 # 相同数据始终选择同一路径。GPU 上把多个小 GEMM 合成
 # bmm 能摊薄 kernel 启动开销，故留出 1.25 倍的填充浪费；
-# CPU 上 MKL 的逐专家 mm 快于批量 bmm（实测步时随阈值
-# 升高单调变慢），故只在零填充浪费（<= 1.0 倍）时才批量。
+# CPU 上采用更保守的填充上限，故只在零填充浪费
+# （<= 1.0 倍）时才批量。
 _MOE_PAD_RATIO_LIMIT = 1.25
 _CPU_MOE_PAD_RATIO_LIMIT = 1.0
 
