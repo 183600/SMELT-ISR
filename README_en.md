@@ -39,7 +39,7 @@ pip install "torch>=2.2"
 ## 📦 Usage
 
 ### 1. Run structural self-tests
-Before experimenting, run the built-in self-tests to verify structural correctness, branch independence and equivalence:
+Before experimenting, run the built-in self-tests to verify structural correctness, branch independence and equivalence. The self-test also includes a bitwise same-seed double-run reproducibility check and negative-case validation of the gradient probe:
 ```bash
 python experiment.py --self-test
 ```
@@ -108,6 +108,15 @@ with a non-zero status instead of blindly starting full training, since failing
 to overfit even a tiny batch usually indicates broken gradients, a wrong loss,
 or an optimizer/LR misconfiguration.
 
+After the first backward pass a gradient probe runs first: the loss must be
+attached to the autograd graph, every gradient must be finite, at least one
+parameter must receive a non-zero gradient, and no non-expert parameter may be
+missing a gradient (expert parameters may legitimately be missing/zero when no
+token is routed to them in the batch). A probe failure stops the check
+immediately with troubleshooting hints instead of wasting the remaining steps;
+the probe result is recorded as `sanity_check.grad_probe` in `config.json` and
+in `metrics.jsonl`.
+
 Note this is a **necessary but not sufficient** check: passing it does not prove
 the code is fully correct — bugs in data augmentation, feature alignment or
 label mapping can still slip through, so intermediate-result inspection is
@@ -150,7 +159,7 @@ python experiment.py \
 - **Residual-scaling convention**: `residual_scale` applies globally to every residual update in all regions (inside and outside the looped span). The SMELT paper scales residual updates within the looped span by $1/r$ (1/2 for two visits); this base does not implement region-specific $1/r$ scaling. Keep `residual_scale` equal across modes; a global 0.5 is not equivalent to the paper's convention.
 - **Load-balancing scale**: $f_i$ in the auxiliary loss is normalized by token count, not assignment count; under uniform routing $E \sum_i f_i P_i \approx k$, so balancing strength grows linearly with routing width. When comparing across $k_1/k_2/\text{top-}k$, scale the coefficient accordingly (keep `balance_coef × k` constant); otherwise routing width is confounded with balancing strength.
 - **Validation/test protocol**: each evaluation uses fixed windows evenly spaced across the corresponding evaluation split, independent of any RNG, bit-aligned across models and resumed runs. Every new best validation loss is snapshotted to `best.pt`, and both the `final` record and the single test evaluation run on this validation-selected model (the `model_selection` field records the policy; when `best.pt` is unavailable the script reports it and falls back to the last-step parameters). The test split stays sealed for the entire training run and is evaluated exactly once when `--evaluate-test` is passed (`{"step": "test", ...}`); repeating the flag is refused, so the test set cannot silently become a validation set. All results are appended to `metrics.jsonl`.
-- **Determinism**: the training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN seeds; data sampling is driven by an explicit `torch.Generator` whose seed and state are checkpointed; `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic kernels (a warning is emitted if a CUDA kernel lacks a deterministic implementation). Small cross-hardware numeric differences from reduction order may remain.
+- **Determinism**: the training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN seeds; data sampling is driven by an explicit `torch.Generator` whose seed and state are checkpointed; the Python / torch / CUDA / NumPy RNG states are all stored in `last.pt` and restored bit-for-bit on `--resume`; `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic kernels (a warning is emitted if a CUDA kernel lacks a deterministic implementation). `PYTHONHASHSEED` can only be fixed before interpreter start, so a one-time hint is printed when it was not set on the command line; prefix `PYTHONHASHSEED=<seed>` for strict bitwise reproducibility. Small cross-hardware numeric differences from reduction order may remain; on the same machine, same-seed runs should be bitwise identical (`--self-test` double-checks this).
 - **Experiment tracking**: each run automatically records the code revision (git commit / dirty flag), environment (Python / torch / CUDA / device), full hyperparameters and seeds, data fingerprint (SHA-256, byte count), training curves and final results in `config.json` and `metrics.jsonl` — no manual bookkeeping required.
 - **Controlled-variable checking**: `config.json` stores a `comparison_protocol` field (optimizer AdamW with betas/eps, LR and schedule, warmup, total steps, weight decay, gradient clipping, batch size, data augmentation, data fingerprint, model architecture, evaluation protocol and model-selection policy — new runs select on validation, legacy runs without a record are marked as last-step). `--compare` requires all of these to match exactly unless declared as a factor via `--compare-factors` (default `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`); a run that silently changed optimizer, LR, step count, or the `final` measurement basis is reported as a violation, so tuning gains cannot be misattributed to a method.
 - **Statistical reliability**: `--seeds 42 43 44` trains the same configuration for multiple seeds and reports Mean ± Std (sample std) per experimental cell. Shared seed sets use a paired t-test, otherwise Welch's t-test; p-values and the |Δ|/pooled-std noise ratio are shown. Cells with fewer than 3 seeds are flagged as underpowered, and an apparent +0.2% gain with 0.5% seed variance is not treated as real.

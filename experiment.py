@@ -52,6 +52,9 @@ os.environ.setdefault(
 # 严格逐位复现应在启动命令行显式设置该变量。
 _PYTHONHASHSEED_AT_START = os.environ.get("PYTHONHASHSEED")
 
+# set_seed 里的一次性提示标志：避免每个进程重复打印。
+_PYTHONHASHSEED_WARNED = False
+
 
 # ============================================================
 # Configuration
@@ -183,6 +186,20 @@ def set_seed(seed: int):
     # 需要严格复现时应在命令行显式设置该环境变量。
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
 
+    global _PYTHONHASHSEED_WARNED
+    if (
+        _PYTHONHASHSEED_AT_START is None
+        and not _PYTHONHASHSEED_WARNED
+    ):
+        _PYTHONHASHSEED_WARNED = True
+        print(
+            "[repro] 提示: 进程启动时未设置 PYTHONHASHSEED，当前"
+            "解释器的 hash 随机化未被固定（只影响依赖 hash() "
+            "的代码与之后启动的子进程，其余随机流已按 --seed "
+            "固定）。严格逐位复现可在命令前加 "
+            f"PYTHONHASHSEED={seed}。"
+        )
+
     # 要求 PyTorch 优先选用确定性实现。bincount、attention
     # 反向等 CUDA 算子若不存在确定性实现会明确告警，而不是
     # 静默产生跨重启不可复现的微小差异。
@@ -226,6 +243,46 @@ def _restore_rng_state(state: Dict[str, object]) -> None:
     numpy_state = state.get("numpy")
     if numpy_state is not None and np is not None:
         np.random.set_state(numpy_state)
+
+
+def _numpy_rng_state_payload() -> Optional[Dict[str, object]]:
+    """
+    把 NumPy 全局随机状态转成只含基本类型的可存档形式。
+
+    检查点经 torch.load 读取；新版 PyTorch 默认
+    weights_only=True，直接存 numpy ndarray 会被拒绝，因此
+    key 数组转成 int 列表（恢复时按 uint32 重建）。
+    """
+    if np is None:
+        return None
+
+    name, keys, pos, has_gauss, cached = np.random.get_state()
+
+    return {
+        "name": str(name),
+        "keys": [int(value) for value in keys.tolist()],
+        "pos": int(pos),
+        "has_gauss": int(has_gauss),
+        "cached_gaussian": float(cached),
+    }
+
+
+def _restore_numpy_rng_state(
+    payload: Optional[Dict[str, object]],
+) -> None:
+    if payload is None or np is None:
+        return
+
+    np.random.set_state((
+        str(payload.get("name", "MT19937")),
+        np.asarray(
+            payload.get("keys", []),
+            dtype=np.uint32,
+        ),
+        int(payload.get("pos", 0)),
+        int(payload.get("has_gauss", 0)),
+        float(payload.get("cached_gaussian", 0.0)),
+    ))
 
 
 # ============================================================
@@ -10200,6 +10257,129 @@ def write_comparison_report(
 # Sanity overfit check
 # ============================================================
 
+def _expert_parameter_ids(model: nn.Module) -> set:
+    """
+    收集 MoE 专家参数的 id 集合。
+
+    专家参数是本模型里唯一可能因「本批次没有 token 路由到该
+    专家」而合法缺失/零梯度的参数；其余参数（embedding /
+    attention / router / norm / lm_head）在任何输入下都必须
+    收到梯度，缺失即说明计算图断链。
+    """
+    expert_ids = set()
+
+    for module in model.modules():
+        if isinstance(module, SparseMoE):
+            for expert in module.experts:
+                for parameter in expert.parameters():
+                    expert_ids.add(id(parameter))
+
+    return expert_ids
+
+
+def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
+    """
+    在第一次反向后检查梯度是否健康。
+
+    比「能否过拟合」更早、更直接地定位严重 bug：
+    - 至少一个参数收到非零梯度（梯度未反传、参数未进入优化器
+      会让训练空转）；
+    - 全部梯度必须有限（NaN/Inf 会静默污染所有参数）；
+    - 非专家参数不允许缺失梯度（detach、意外 no_grad、分支
+      写死等造成的计算图断链）。
+
+    专家参数允许因本批次未路由到而缺失或为零梯度。调用方需在
+    反向之后、优化器 step 之前调用（AMP 下先手动
+    scaler.unscale_）；返回的 failures 列表为空才视为通过。
+    """
+    expert_ids = _expert_parameter_ids(model)
+
+    probe: Dict[str, object] = {
+        "n_params": 0,
+        "n_with_grad": 0,
+        "n_missing_grad": 0,
+        "n_zero_grad": 0,
+        "n_nonfinite_grad": 0,
+        "missing_non_expert_params": [],
+        "nonfinite_params": [],
+        "grad_norm": None,
+        "failures": [],
+    }
+
+    missing_non_expert: List[str] = probe[
+        "missing_non_expert_params"
+    ]  # type: ignore[assignment]
+    nonfinite: List[str] = probe[
+        "nonfinite_params"
+    ]  # type: ignore[assignment]
+
+    total_sq = 0.0
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+
+        probe["n_params"] = int(probe["n_params"]) + 1
+        grad = parameter.grad
+
+        if grad is None:
+            probe["n_missing_grad"] = (
+                int(probe["n_missing_grad"]) + 1
+            )
+            if id(parameter) not in expert_ids:
+                missing_non_expert.append(name)
+            continue
+
+        probe["n_with_grad"] = int(probe["n_with_grad"]) + 1
+
+        if not bool(torch.isfinite(grad).all()):
+            probe["n_nonfinite_grad"] = (
+                int(probe["n_nonfinite_grad"]) + 1
+            )
+            nonfinite.append(name)
+            continue
+
+        squared = float(grad.detach().double().pow(2).sum())
+        total_sq += squared
+
+        if squared == 0.0:
+            probe["n_zero_grad"] = int(probe["n_zero_grad"]) + 1
+
+    probe["grad_norm"] = math.sqrt(total_sq)
+
+    failures: List[str] = probe["failures"]  # type: ignore[assignment]
+
+    if int(probe["n_nonfinite_grad"]) > 0:
+        failures.append("nonfinite_gradients")
+    if int(probe["n_with_grad"]) == 0 or total_sq == 0.0:
+        failures.append("no_nonzero_gradient")
+    if missing_non_expert:
+        failures.append("missing_non_expert_gradients")
+
+    return probe
+
+
+# 梯度探针失败原因到排查建议的映射。
+_GRADIENT_FAILURE_HINTS = {
+    "loss_not_connected": (
+        "损失未连入计算图（requires_grad=False 或 grad_fn 为空）："
+        "检查是否误用 torch.no_grad / detach / 原地操作改写 logits"
+    ),
+    "nonfinite_gradients": (
+        "梯度含 NaN/Inf：检查损失计算中的 log(0)/除零/softmax "
+        "溢出，再查混合精度与学习率/梯度爆炸"
+    ),
+    "no_nonzero_gradient": (
+        "没有任何参数收到非零梯度：检查损失是否用错了输出、"
+        "参数是否被 detach，或优化器是否拿到的不是模型参数"
+    ),
+    "missing_non_expert_gradients": (
+        "非专家参数缺失梯度：计算图在这些模块处断链"
+        "（detach / no_grad / 条件分支未执行）"
+    ),
+}
+
+
 def run_sanity_overfit(
     cfg: Config,
     dataset: ByteDataset,
@@ -10221,6 +10401,11 @@ def run_sanity_overfit(
     关闭负载均衡辅助损失、weight decay、梯度裁剪、warmup 等
     一切正则化（数据管线本身没有 dropout / 数据增强），要求训练
     损失迅速趋近 0 或下一 token 准确率接近 100%。
+
+    第一步反向之后还会先做梯度探针（见 _probe_gradient_flow）：
+    损失必须连在计算图上、梯度必须有限、至少一个参数收到非零
+    梯度、非专家参数不得缺失梯度；探针失败时立即停止并给出
+    排查提示，不等 300 步训练「碰运气」。
 
     检查必须走与全量训练一致的前向/反向路径：主训练启用
     --grad-checkpoint 时本检查同样开启 activation
@@ -10284,6 +10469,7 @@ def run_sanity_overfit(
         initial_loss: Optional[float] = None
         final_loss = float("nan")
         final_acc = float("nan")
+        grad_probe: Optional[Dict[str, object]] = None
 
         with torch.autocast(
             device_type="cuda",
@@ -10296,12 +10482,49 @@ def run_sanity_overfit(
                 result = model(x, y)
                 loss = result["lm_loss"]
 
+                # 损失必须连在计算图上；否则 backward 必然失败
+                # 或训练空转，直接停下，不浪费后面的步数。
+                loss_connected = True
+                if step == 1 and (
+                    not loss.requires_grad
+                    or loss.grad_fn is None
+                ):
+                    loss_connected = False
+                    grad_probe = {
+                        "n_params": None,
+                        "n_with_grad": 0,
+                        "n_missing_grad": None,
+                        "n_zero_grad": None,
+                        "n_nonfinite_grad": None,
+                        "missing_non_expert_params": [],
+                        "nonfinite_params": [],
+                        "grad_norm": None,
+                        "failures": ["loss_not_connected"],
+                    }
+
                 if scaler is not None:
-                    scaler.scale(loss).backward()
+                    if loss_connected:
+                        scaler.scale(loss).backward()
+
+                        if step == 1:
+                            # 手动反缩放后再检查梯度；随后
+                            # scaler.step 不会重复反缩放。
+                            scaler.unscale_(optimizer)
+                            grad_probe = _probe_gradient_flow(
+                                model
+                            )
+
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss.backward()
+                    if loss_connected:
+                        loss.backward()
+
+                        if step == 1:
+                            grad_probe = _probe_gradient_flow(
+                                model
+                            )
+
                     optimizer.step()
 
                 # 仅在需要报告或收尾的步取回标量，取值来源
@@ -10327,10 +10550,47 @@ def run_sanity_overfit(
                         f"token_acc={final_acc:.4f}"
                     )
 
+                # 探针失败：立即停止训练并给出排查提示，避免
+                # 在不断重复的坏梯度上白白跑完所有步。
+                if step == 1 and (
+                    grad_probe is not None
+                    and grad_probe["failures"]
+                ):
+                    print(
+                        "[sanity] 梯度检查失败: "
+                        + "; ".join(
+                            _GRADIENT_FAILURE_HINTS.get(
+                                failure, failure
+                            )
+                            for failure in grad_probe["failures"]
+                        )
+                    )
+                    break
+
         passed = (
             final_loss <= loss_threshold
             or final_acc >= acc_threshold
         )
+
+        if grad_probe is not None:
+            if grad_probe["failures"]:
+                passed = False
+
+            print(
+                "[sanity] 梯度检查: "
+                f"grad_norm={grad_probe['grad_norm']}, "
+                f"missing_grad="
+                f"{grad_probe['n_missing_grad']}, "
+                f"zero_grad={grad_probe['n_zero_grad']}, "
+                f"nonfinite_grad="
+                f"{grad_probe['n_nonfinite_grad']}"
+                + (
+                    ", failures="
+                    + ",".join(grad_probe["failures"])
+                    if grad_probe["failures"]
+                    else ""
+                )
+            )
 
         return {
             "passed": passed,
@@ -10348,6 +10608,11 @@ def run_sanity_overfit(
             "final_token_accuracy": final_acc,
             "loss_threshold": loss_threshold,
             "acc_threshold": acc_threshold,
+            "gradient_flow_ok": (
+                grad_probe is not None
+                and not grad_probe["failures"]
+            ),
+            "grad_probe": grad_probe,
         }
     finally:
         # 恢复调用前的 RNG 状态：sanity check 不改变主训练轨迹。
@@ -10844,6 +11109,9 @@ def save_checkpoint(
             if torch.cuda.is_available()
             else None
         ),
+        # NumPy 全局随机状态：只含基本类型，torch.load 在
+        # weights_only=True 下也能安全读取。
+        "numpy_rng_state": _numpy_rng_state_payload(),
         "args": vars(args),
     }
 
@@ -12444,6 +12712,101 @@ def run_self_test():
         rng_before,
     )
     assert random.getstate() == python_rng_before
+
+    # 梯度探针：健康模型必须通过，且全局梯度范数为正。
+    assert sanity_metrics["gradient_flow_ok"] is True
+    grad_probe = sanity_metrics["grad_probe"]
+    assert not grad_probe["failures"], grad_probe
+    assert grad_probe["grad_norm"] > 0.0
+    assert grad_probe["n_with_grad"] > 0
+
+    # 同一台机器、同一随机种子重复运行：最终损失/准确率必须
+    # 逐位一致（端到端可复现性，包含模型初始化、数据采样与
+    # 优化器轨迹）。
+    repeated_metrics = run_sanity_overfit(
+        sanity_cfg,
+        eval_dataset,
+        eval_device,
+        amp_dtype=None,
+        batch_size=2,
+        steps=200,
+        lr=1e-2,
+        loss_threshold=0.5,
+        acc_threshold=0.9,
+        seed=321,
+        grad_checkpoint=True,
+    )
+    assert (
+        repeated_metrics["final_lm_loss"]
+        == sanity_metrics["final_lm_loss"]
+    ), (repeated_metrics["final_lm_loss"], sanity_metrics["final_lm_loss"])
+    assert (
+        repeated_metrics["final_token_accuracy"]
+        == sanity_metrics["final_token_accuracy"]
+    )
+    assert (
+        repeated_metrics["initial_lm_loss"]
+        == sanity_metrics["initial_lm_loss"]
+    )
+    assert (
+        repeated_metrics["grad_probe"]["grad_norm"]
+        == grad_probe["grad_norm"]
+    )
+
+    # 人为破坏梯度（非专家参数 grad 置 None）时探针必须报错，
+    # 确认梯度检查不是恒真。
+    probe_model = LanguageModel(
+        Config(**common, mode="B")
+    )
+    probe_result = probe_model(x, y)
+    probe_result["loss"].backward()
+
+    healthy_probe = _probe_gradient_flow(probe_model)
+    assert not healthy_probe["failures"], healthy_probe
+
+    expert_ids = _expert_parameter_ids(probe_model)
+    broken_name = None
+    for name, parameter in probe_model.named_parameters():
+        if (
+            id(parameter) not in expert_ids
+            and parameter.grad is not None
+        ):
+            parameter.grad = None
+            broken_name = name
+            break
+    assert broken_name is not None
+
+    broken_probe = _probe_gradient_flow(probe_model)
+    assert (
+        "missing_non_expert_gradients"
+        in broken_probe["failures"]
+    ), broken_probe
+    assert broken_name in broken_probe[
+        "missing_non_expert_params"
+    ]
+
+    # NumPy 全局随机状态必须可存档并逐位恢复；存档载荷只含
+    # 基本类型，能在 weights_only=True 的 torch.load 下读取。
+    if np is not None:
+        np.random.seed(123)
+        np.random.rand(3)
+        numpy_payload = _numpy_rng_state_payload()
+        expected_next = float(np.random.rand())
+
+        _restore_numpy_rng_state(numpy_payload)
+        assert float(np.random.rand()) == expected_next
+
+        with tempfile.TemporaryDirectory() as rng_dir:
+            rng_path = Path(rng_dir) / "rng.pt"
+            torch.save(
+                {"numpy_rng_state": numpy_payload},
+                rng_path,
+            )
+            loaded_payload = torch.load(rng_path)
+        _restore_numpy_rng_state(
+            loaded_payload["numpy_rng_state"]
+        )
+        assert float(np.random.rand()) == expected_next
 
     # 学习率极小时不应通过，确认判定逻辑不是恒真。
     failed_metrics = run_sanity_overfit(
@@ -16270,6 +16633,11 @@ def main():
                     for state in cuda_rng_state
                 ]
             )
+
+        # NumPy 全局随机状态：旧检查点没有该字段时跳过。
+        _restore_numpy_rng_state(
+            rng_payload.get("numpy_rng_state")
+        )
     else:
         train_generator_state = None
 

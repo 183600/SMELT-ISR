@@ -87,13 +87,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `audit_data_splits`、`_window_signature_scan`、`_scan_text_integrity`、
   `enforce_strict_data_audit`：数据审计（值域、文本完整性/标签噪声、
   分布偏移、重复窗口）与严格模式下的泄露拦截。
-- `run_sanity_overfit`：训练前的过拟合小批量 sanity check。
-- `save_checkpoint`、`load_checkpoint`：断点存档与恢复。
+- `run_sanity_overfit`、`_probe_gradient_flow`、`_expert_parameter_ids`：
+  训练前的过拟合小批量 sanity check 与第一步梯度探针（损失连通性、
+  有限性、非零梯度、非专家参数缺失梯度）。
+- `save_checkpoint`、`load_checkpoint`：断点存档与恢复
+  （Python/torch/CUDA/NumPy RNG 状态一并存档并逐位恢复）。
 - `save_selected_model`、`load_selected_model`、`restore_selected_weights`：
   验证集选定权重（`best.pt`）的存档、读取与恢复（final/test 评估用）。
 - `collect_run_metadata`、`write_run_config`：实验追踪信息收集与落盘。
 - `run_self_test`：结构、梯度、因果性、模式等价性、数据划分/
-  测试集封存与 sanity check 判定自测。
+  测试集封存、sanity check 判定与「同种子两次运行逐位一致」
+  的端到端可复现性自测。
 - `analyze_training_curve`、`print_curve_analysis`：从 `metrics.jsonl`
   重建训练/验证曲线并给出过拟合、欠拟合、未收敛、发散等判定。
 - `early_stop_state_from_records`：恢复训练时从历史验证点重建早停
@@ -253,10 +257,15 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   数据采样不使用 DataLoader worker，而由显式 `torch.Generator`
   承担，其种子与状态随检查点存档。所有入口统一调用 `set_seed`
   （神经训练、统计基线、自测），没有只在部分入口固定种子的盲区。
-  `PYTHONHASHSEED` 只能影响之后启动的子进程，本进程的哈希种子在
-  启动时已定；进程启动时的实际值被捕获进运行元数据
-  （`pythonhashseed_at_start`），为 `null` 说明本进程的 hash
-  随机化未被固定，严格逐位复现应在启动命令行显式设置该变量。
+  Python / torch / CUDA / NumPy 的 RNG 状态全部随 `last.pt` 存档，
+  `--resume` 时逐位恢复（NumPy 状态以只含基本类型的载荷存放，
+  兼容 `torch.load(weights_only=True)`），恢复训练不会因随机流
+  错位而偏离原轨迹。`PYTHONHASHSEED` 只能影响之后启动的子进程，
+  本进程的哈希种子在启动时已定；进程启动时的实际值被捕获进运行
+  元数据（`pythonhashseed_at_start`），为 `null` 时 `set_seed`
+  会打印一次性提示，严格逐位复现应在启动命令行显式设置该变量。
+  自测内对同一配置做两次同种子的 sanity 检查并要求最终损失/准确率
+  逐位相等，作为「同一台机器上结果稳定」的端到端证据。
 - 全新训练开始前默认运行过拟合小批量 sanity check：
   同一模型结构在固定小批次上训练，关闭辅助均衡损失、weight decay、
   梯度裁剪与 warmup，要求训练损失迅速趋近 0 或下一 token 准确率
@@ -264,10 +273,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `--grad-checkpoint` 时检查同样开启 activation checkpointing
   （唯一会改写反传代码路径的开关，报告记录 `grad_checkpoint` 与
   `amp_dtype`），`--compile` 只做内核融合不改写 autograd 语义、
-  不镜像。检查内部固定种子并在结束后恢复 RNG 状态，不影响主训练
-  轨迹；失败时以非零状态码退出，不开始全量训练。这是必要不充分
-  检查，通过后仍需核对中间结果。可用 `--sanity-only` 单独运行、
-  `--skip-sanity-check` 跳过。
+  不镜像。第一步反向之后先跑梯度探针（`grad_probe`）：损失必须
+  连在计算图上（否则立即停止）、全部梯度必须有限、至少一个参数
+  收到非零梯度、非专家参数不得缺失梯度（专家参数允许因本批次未
+  路由到而缺失/零梯度）；探针失败立即停止并给出排查提示，不等
+  完整步数跑完。检查内部固定种子并在结束后恢复 RNG 状态，不影响
+  主训练轨迹；失败时以非零状态码退出，不开始全量训练。这是必要
+  不充分检查，通过后仍需核对中间结果。可用 `--sanity-only` 单独
+  运行、`--skip-sanity-check` 跳过。
 - 每轮实验的代码版本、运行环境、超参数与随机种子、数据指纹、
   sanity check 结果写入 `config.json`；训练曲线与最终结果写入
   `metrics.jsonl`，全程自动记录。代码版本是三层记录：
