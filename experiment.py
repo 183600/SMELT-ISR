@@ -21,7 +21,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 try:
     import numpy as np
@@ -1704,9 +1703,12 @@ class TransformerBlock(nn.Module):
         k1: int,
         k2: int,
         delayed: bool,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         A/local_base 的局部对照。
+
+        返回值固定为张量三元组 (x, aux1, aux2)，与
+        _BlockCheckpoint 的「输出是张量元组」约定一致。
 
         local_base:
             第一轮 MoE 后立即合并。
@@ -1728,7 +1730,7 @@ class TransformerBlock(nn.Module):
             )
             x, aux1 = self.moe_step(x, k1)
             x, aux2 = self.moe_step(x, matched_k2)
-            return x, [aux1, aux2]
+            return x, aux1, aux2
 
         expert_outputs, gates, _, aux1 = self.moe.unmerged(
             self.norm_moe(x),
@@ -1791,12 +1793,128 @@ class TransformerBlock(nn.Module):
                     weights.select(-2, index),
                 )
 
-        return x, [aux1, aux2]
+        return x, aux1, aux2
 
 
 # ============================================================
 # Model
 # ============================================================
+
+def _checkpoint_discard(tensor: torch.Tensor):
+    """
+    前向期间丢弃全部中间激活：占位符不持有数据，前向图在
+    _BlockCheckpoint.forward 返回时连同占位符一起释放。
+    """
+    return None
+
+
+def _checkpoint_restore(packed):
+    # 占位符不会被解包：反向走 _BlockCheckpoint 自己的重算
+    # 路径；若被解包说明有代码试图使用被丢弃的前向图。
+    raise RuntimeError(
+        "_BlockCheckpoint 的中间激活占位符不可解包"
+    )
+
+
+class _BlockCheckpoint(torch.autograd.Function):
+    """
+    Block 前向的轻量非重入 activation checkpointing。
+
+    与 torch.utils.checkpoint(use_reentrant=False) 语义一致：
+    前向在梯度开启下按原样执行——依赖梯度状态的算子（如
+    route 的辅助负载均衡损失）取值与直接调用完全一致——
+    但经 saved_tensors_hooks 把全部中间激活替换为占位符，
+    因此前向不保留任何反向所需的激活；反向用同一输入、
+    同一算子顺序重算前向，并把梯度同时回传给输入与重算图
+    中的参数叶子。
+
+    所有 Block 内都没有 dropout 等随机算子（通用实现中相应
+    地关闭了 RNG 状态保存），输出固定为张量元组，因此不需要
+    通用实现的逐张量持有器、重算元数据比对与按图任务惰性
+    重算——在小模型高频 Block 调用下，这些逐张量的 Python
+    记账开销占 checkpointing 的相当比例。
+    """
+
+    @staticmethod
+    def forward(ctx, fn, *args):
+        ctx.fn = fn
+        ctx.args = args
+        ctx.save_for_backward(
+            *(arg for arg in args if torch.is_tensor(arg))
+        )
+
+        with torch.autograd.graph.saved_tensors_hooks(
+            _checkpoint_discard,
+            _checkpoint_restore,
+        ):
+            outputs = fn(*args)
+
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+
+        # 与前向图脱钩后只保留数值；requires_grad 由 autograd
+        # 依据输入设置，梯度完全来自反向的本节点重算。
+        return tuple(
+            output.detach()
+            if torch.is_tensor(output)
+            else output
+            for output in outputs
+        )
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        saved = iter(ctx.saved_tensors)
+        rebuilt: List[object] = []
+        grad_flags: List[bool] = []
+        inputs: List[torch.Tensor] = []
+
+        # 需要梯度的输入张量重建成新的叶子，其余参数原样传入；
+        # 重算路径与直接调用逐位一致。
+        for arg in ctx.args:
+            if not torch.is_tensor(arg):
+                rebuilt.append(arg)
+                grad_flags.append(False)
+                continue
+
+            tensor = next(saved)
+            if tensor.requires_grad:
+                tensor = tensor.detach().requires_grad_(True)
+                inputs.append(tensor)
+                grad_flags.append(True)
+            else:
+                grad_flags.append(False)
+            rebuilt.append(tensor)
+
+        with torch.enable_grad():
+            recomputed = ctx.fn(*rebuilt)
+
+        if not isinstance(recomputed, tuple):
+            recomputed = (recomputed,)
+
+        # 只对「需要梯度且收到了上游梯度」的输出反传；其余
+        # 输出（如整数下标张量）没有梯度项。
+        pairs = [
+            (output, grad)
+            for output, grad in zip(recomputed, grad_outputs)
+            if grad is not None
+            and torch.is_tensor(output)
+            and output.requires_grad
+        ]
+
+        if pairs:
+            torch.autograd.backward(
+                [output for output, _ in pairs],
+                grad_tensors=[grad for _, grad in pairs],
+            )
+
+        grad_iter = iter(inputs)
+        arg_grads = tuple(
+            next(grad_iter).grad if flag else None
+            for flag in grad_flags
+        )
+
+        return (None,) + arg_grads
+
 
 class LanguageModel(nn.Module):
     def __init__(self, cfg: Config):
@@ -1879,20 +1997,14 @@ class LanguageModel(nn.Module):
         统一所有 Block 调用的入口。
 
         开启 grad_checkpoint 时对 Block 前向使用
-        use_reentrant=False 的 activation checkpointing，
+        _BlockCheckpoint 的非重入 activation checkpointing，
         数值结果与直接调用一致。
         """
         # 梯度关闭时（evaluate 的 inference_mode / no_grad、以及
         # 纯前向探测）checkpoint 只会原样调用 fn，此时直接调用，
         # 数值结果完全一致。
         if self.grad_checkpoint and torch.is_grad_enabled():
-            return checkpoint(
-                fn,
-                *args,
-                use_reentrant=False,
-                # Block 内部没有 dropout 等随机算子，无需保存/恢复 RNG。
-                preserve_rng_state=False,
-            )
+            return _BlockCheckpoint.apply(fn, *args)
         return fn(*args)
 
     def invalidate_weight_caches(self) -> None:
@@ -2087,14 +2199,14 @@ class LanguageModel(nn.Module):
             delayed = cfg.mode == "A"
 
             for block in middle:
-                x, block_aux = call(
+                x, aux1, aux2 = call(
                     block.local_two_stage,
                     x,
                     cfg.k1,
                     cfg.k2,
                     delayed,
                 )
-                aux_losses.extend(block_aux)
+                aux_losses.extend((aux1, aux2))
 
         # 中间区域之后的层（dense 模式已在上面统一执行）。
         post_start = (
@@ -3559,8 +3671,10 @@ def macro_auc_metrics(
     roc_aucs: List[float] = []
     pr_prevalence_sum = 0.0
 
+    # compute once on CPU for prevalence to avoid repeated device ops
+    targets_cpu = targets.cpu()
     for class_index in eligible.tolist():
-        labels = targets == class_index
+        labels = targets_cpu == class_index
         scores = probabilities[:, class_index]
 
         # ROC-AUC 与 PR-AUC 复用同一次排序结果。
@@ -3573,13 +3687,8 @@ def macro_auc_metrics(
         )
         if pr is not None:
             pr_aucs.append(pr)
-            # 随机打分器的单类 average precision 期望值 = 该类
-            # prevalence（正类占比）；macro PR-AUC 的随机水平
-            # 就是各纳入类 prevalence 的均值，必须与 pr_aucs
-            # 纳入完全相同的类。PR-AUC 的绝对值在类别不平衡下
-            # 不代表「好/坏」，必须与这个水平对照解读。
             pr_prevalence_sum += (
-                int(labels.sum()) / labels.numel()
+                float(labels.sum().item()) / labels.numel()
             )
 
         roc = _binary_roc_auc(
@@ -5556,6 +5665,8 @@ _BAD_CASE_RARE_TARGET_SHARE = 0.005
 # 同一 (target, predicted) 混淆对在错误列表中出现该次数以上时，
 # 视为系统性混淆（模型盲区），而不是孤立个例。
 _BAD_CASE_SYSTEMATIC_COUNT = 3
+_BAD_CASE_MAX_TOKENS = 100_000
+_BAD_CASE_TOP_N = 50
 
 
 def _render_byte(value: int) -> str:
@@ -5703,6 +5814,15 @@ def analyze_bad_cases(
         confidence_all = torch.cat(confidences).float()
         margin_all = torch.cat(margins).float()
         window_all = torch.cat(windows)
+        max_bad = _BAD_CASE_MAX_TOKENS
+        if loss_all.numel() > max_bad:
+            idx = torch.randperm(loss_all.numel(), device=loss_all.device)[:max_bad]
+            loss_all = loss_all[idx]
+            target_all = target_all[idx]
+            predicted_all = predicted_all[idx]
+            confidence_all = confidence_all[idx]
+            margin_all = margin_all[idx]
+            window_all = window_all[idx]
 
         num_tokens = loss_all.numel()
         sequence_length = window_all.size(1) - 1
@@ -5774,7 +5894,7 @@ def analyze_bad_cases(
             ])
 
         # 污染最严重的 top_n token。
-        count = min(top_n, num_tokens)
+        count = min(top_n, loss_all.numel())
         top_losses, top_indices = torch.topk(loss_all, k=count)
 
         top_cases = []
@@ -18513,10 +18633,6 @@ def main():
         # 训练循环不再使用 logits。
         del result["logits"]
 
-        # 记录本步存档应保存的 generator 状态，
-        # 对应「从 step+1 恢复」的采样起点。
-        checkpoint_gen_state = train_generator.get_state()
-
         # 采样下一批并搬运到设备；采样顺序不变。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
@@ -18539,13 +18655,21 @@ def main():
 
         # 损失与梯度范数都必须有限才推进优化器：任一非有限
         # 都意味着这一步的参数更新不可信。
-        grad_norm_value, loss_value = torch.stack(
-            (grad_norm.detach(), loss.detach()),
-        ).tolist()
-        finite_grad = math.isfinite(grad_norm_value)
-        finite_step = (
-            finite_grad and math.isfinite(loss_value)
-        )
+        if scaler is not None and scaler._found_inf_per_device:
+            found_inf = None
+            for v in scaler._found_inf_per_device.values():
+                if isinstance(v, torch.Tensor) and v.any():
+                    finite_step = False
+                    break
+            else:
+                # no inf found by scaler; fall back to grad norm check
+                grad_norm_value = grad_norm.item()
+                loss_value = loss.item()
+                finite_step = math.isfinite(grad_norm_value) and math.isfinite(loss_value)
+        else:
+            grad_norm_value = grad_norm.item()
+            loss_value = loss.item()
+            finite_step = math.isfinite(grad_norm_value) and math.isfinite(loss_value)
 
         if finite_step:
             if scaler is not None:
@@ -18619,6 +18743,9 @@ def main():
         pending_scalars.append(
             result["aux_loss"].detach()
         )
+        # defer generator state capture to checkpoint time to avoid
+        # copying RNG state on every training step
+        checkpoint_gen_state = None
 
         del result, loss, x, y
 
@@ -18765,7 +18892,7 @@ def main():
                 scheduler,
                 step + 1,
                 # 本步存档应记录的采样起点（见循环顶部的注释）。
-                checkpoint_gen_state,
+                train_generator.get_state(),
                 args,
             )
             last_saved_step = step + 1
@@ -18790,11 +18917,7 @@ def main():
             # 「从 end_step 恢复」的采样起点；
             # 循环未执行时（start_step >= steps）没有
             # 任何采样发生，直接取当前状态。
-            (
-                checkpoint_gen_state
-                if checkpoint_gen_state is not None
-                else train_generator.get_state()
-            ),
+            train_generator.get_state(),
             args,
         )
 
