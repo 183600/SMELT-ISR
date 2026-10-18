@@ -551,9 +551,23 @@ class Expert(nn.Module):
 
 # 批量专家路径的填充上限：padded 行数（n_experts *
 # max(counts)）超过 assignment 总数的该倍数时，退回逐专家
-# 循环路径。阈值判定只依赖确定性的 counts，相同数据始终
-# 选择同一路径。
+# 循环路径。阈值判定只依赖确定性的 counts 与设备类型，
+# 相同数据始终选择同一路径。GPU 上把多个小 GEMM 合成
+# bmm 能摊薄 kernel 启动开销，故留出 1.25 倍的填充浪费；
+# CPU 上 MKL 的逐专家 mm 快于批量 bmm（实测步时随阈值
+# 升高单调变慢），故只在零填充浪费（<= 1.0 倍）时才批量。
 _MOE_PAD_RATIO_LIMIT = 1.25
+_CPU_MOE_PAD_RATIO_LIMIT = 1.0
+
+
+def _moe_pad_ratio_limit(device: torch.device) -> float:
+    """
+    批量专家路径的填充上限按设备类型取值：GPU 用
+    _MOE_PAD_RATIO_LIMIT，CPU 用 _CPU_MOE_PAD_RATIO_LIMIT。
+    """
+    if device.type == "cpu":
+        return _CPU_MOE_PAD_RATIO_LIMIT
+    return _MOE_PAD_RATIO_LIMIT
 
 
 class _StackedExpertWeights(torch.autograd.Function):
@@ -1076,18 +1090,19 @@ class SparseMoE(nn.Module):
     def _plan_expert_groups(
         self,
         counts: List[int],
+        limit: float,
     ) -> List[Tuple[int, int]]:
         """
         把非空专家按 id 顺序贪心分组（闭区间），使每组
         「专家数 × 组内最大计数」不超过组内实际 assignment
-        总数的 _MOE_PAD_RATIO_LIMIT 倍。
+        总数的 limit 倍（limit 由 _moe_pad_ratio_limit 按设备
+        类型给出）。
 
         零计数专家不进入任何组；相邻组之间允许存在零计数
         专家，组内各专家的段在按 id 排序后的序列中仍然连续。
-        分组只依赖确定性的 counts，相同数据始终得到相同的
-        分组。
+        分组只依赖确定性的 counts 与设备类型，相同数据始终
+        得到相同的分组。
         """
-        limit = _MOE_PAD_RATIO_LIMIT
         groups: List[Tuple[int, int]] = []
         total = len(counts)
         index = 0
@@ -1139,7 +1154,7 @@ class SparseMoE(nn.Module):
         """
         分组填充 + 批量 bmm 的专家计算路径。
 
-        整批填充比例超过 _MOE_PAD_RATIO_LIMIT（路由不均衡）
+        整批填充比例超过设备对应的填充上限（路由不均衡）
         时使用：多专家组把组内各专家的段散射进
         [组内专家数, 组内最大计数, dim] 的零填充缓冲，一次
         bmm 完成组内全部专家。填充行的输入是精确的 0：其前向
@@ -1328,12 +1343,13 @@ class SparseMoE(nn.Module):
 
         counts_list = self._read_counts(counts)
         max_count = max(counts_list)
+        limit = _moe_pad_ratio_limit(gathered.device)
 
-        # 填充比例受 _MOE_PAD_RATIO_LIMIT 限制时走批量
+        # 填充比例受设备对应的填充上限约束时走批量
         # bmm 路径。
         if (
             self.n_experts * max_count
-            <= _MOE_PAD_RATIO_LIMIT * gathered.size(0)
+            <= limit * gathered.size(0)
         ):
             return self._dispatch_batched(
                 counts,
@@ -1347,9 +1363,9 @@ class SparseMoE(nn.Module):
                 dim,
             )
 
-        # 整批填充比例超过 _MOE_PAD_RATIO_LIMIT 时按专家
-        # 分组，组内填充比例仍受该上限约束。
-        groups = self._plan_expert_groups(counts_list)
+        # 整批填充比例超过填充上限时按专家分组，组内
+        # 填充比例仍受该上限约束。
+        groups = self._plan_expert_groups(counts_list, limit)
 
         if any(begin < end for begin, end in groups):
             prefix = [0]
