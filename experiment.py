@@ -4811,6 +4811,17 @@ _CURVE_STILL_DESCENDING = 0.05
 _CURVE_NO_LEARN_DROP = 0.05
 _CURVE_NO_LEARN_BASELINE = 0.9
 
+# 过拟合的第二条证据：训练损失已不再下降（记忆化 regime 下
+# 往往在低位走平），但最终训练损失比验证损失低出该相对比例
+# 以上（泛化 gap 大）且验证损失回升达到阈值。只看「训练损失
+# 仍在降」会把这类典型过拟合误报成 healthy。
+_CURVE_GENERALIZATION_GAP = 0.1
+
+# 学习率已退火到峰值的该比例以下时，训练/验证双走平更像
+# 调度末期的正常收敛平台，而不是学习率不当/数据管道问题
+# （默认调度为 cosine 退火到峰值的 10%，留少量余量）。
+_CURVE_LR_ANNEALED_FRACTION = 0.15
+
 _SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 
 
@@ -4864,23 +4875,32 @@ def analyze_training_curve(
     val_loss 配对，按以下规则给出结论：
 
     - ``overfitting``：验证损失最优点早于最后一次验证、最终
-      验证损失较最优值回升超过阈值，而训练损失仍在下降；
+      验证损失较最优值回升超过阈值，且训练损失仍在下降、
+      或最终训练损失已显著低于验证损失（泛化 gap 大——
+      记忆化 regime 下训练损失常在低位走平而不是继续下降）；
     - ``underfitting``：训练损失整体几乎不降，且最终仍接近随
       机基线（ln(vocab_size)）；
+    - ``plateau``：训练与验证损失最近一个验证间隔内都没有
+      有效下降（排除过拟合后，两者都不降指向欠拟合、学习率
+      不当或数据管道问题；学习率已退火殆尽时则更像正常
+      收敛平台，报告会结合记录中的 lr 曲线区分两种情形）；
     - ``not_converged``：最近一次间隔内训练与验证损失仍同步
       明显下降，说明训练步数/学习率还没到平台；
     - ``diverged``：最近一步损失非有限（NaN/Inf）；
-    - ``healthy``：训练与验证损失同步下降且验证未回升；
+    - ``healthy``：验证仍在改善（或训练验证同步缓降）且
+      验证未回升；
     - ``insufficient_data``：验证点不足以做结论。
 
     返回的诊断会追加为 ``{"step": "curve_analysis", ...}``
     记录，并打印对应建议（过拟合→正则化/增大数据/早停，
-    欠拟合→查学习率、优化器与数据管道）。
+    欠拟合/双平台→查学习率、优化器与数据管道）。
     """
     train_points: List[Tuple[int, float]] = []
     nonfinite_steps: List[int] = []
     eval_points: List[Dict[str, object]] = []
     pending: List[float] = []
+    peak_lr: Optional[float] = None
+    last_lr: Optional[float] = None
 
     for record in records:
         step = record.get("step")
@@ -4906,6 +4926,22 @@ def analyze_training_curve(
                 train_loss = float(train_loss)
                 train_points.append((step, train_loss))
                 pending.append(train_loss)
+
+            # 学习率曲线（每步记录）：用于区分「双平台」是调度
+            # 末期的正常收敛，还是高学习率下的训练停滞。
+            record_lr = record.get("lr")
+            if (
+                isinstance(record_lr, (int, float))
+                and not isinstance(record_lr, bool)
+                and math.isfinite(float(record_lr))
+            ):
+                record_lr = float(record_lr)
+                last_lr = record_lr
+                if (
+                    peak_lr is None
+                    or record_lr > peak_lr
+                ):
+                    peak_lr = record_lr
 
         if "val_loss" not in record:
             continue
@@ -4969,6 +5005,15 @@ def analyze_training_curve(
         "n_eval_points": len(finite_evals),
         "n_nonfinite_events": len(nonfinite_steps),
         "nonfinite_steps": nonfinite_steps[-10:],
+        "peak_lr": peak_lr,
+        "last_lr": last_lr,
+        "last_lr_over_peak": (
+            round(last_lr / peak_lr, 6)
+            if peak_lr is not None
+            and peak_lr > 0.0
+            and last_lr is not None
+            else None
+        ),
         "warnings": warnings,
         "status": "insufficient_data",
         "recommendation": (
@@ -5054,6 +5099,23 @@ def analyze_training_curve(
         previous["val_loss"],
     )
 
+    # 泛化 gap：最终训练损失比验证损失低出的相对比例。记忆化
+    # regime 下训练损失常在低位走平而不再「仍在下降」，但
+    # 大 gap + 验证回升同样是典型过拟合证据。
+    generalization_gap_ratio = (
+        (
+            float(last["val_loss"]) - float(last["train_loss"])
+        )
+        / float(last["val_loss"])
+        if last["train_loss"] is not None
+        and float(last["val_loss"]) > 0.0
+        else None
+    )
+    train_below_val = (
+        generalization_gap_ratio is not None
+        and generalization_gap_ratio >= _CURVE_GENERALIZATION_GAP
+    )
+
     analysis.update({
         "first_train_loss": first["train_loss"],
         "last_train_loss": last["train_loss"],
@@ -5080,6 +5142,11 @@ def analyze_training_curve(
             if last["train_loss"] is not None
             else None
         ),
+        "generalization_gap_ratio_last": (
+            None
+            if generalization_gap_ratio is None
+            else round(generalization_gap_ratio, 6)
+        ),
         "curve_sparkline_train": _sparkline(
             [value for _, value in train_points]
         ),
@@ -5091,13 +5158,23 @@ def analyze_training_curve(
     if (
         best_index <= len(finite_evals) - 2
         and regression >= _CURVE_OVERFIT_REGRESSION
-        and train_still_down
+        and (train_still_down or train_below_val)
     ):
         analysis["status"] = "overfitting"
+        if train_still_down:
+            analysis["overfit_signal"] = "train_still_descending"
+            evidence_text = "训练损失仍在下降"
+        else:
+            analysis["overfit_signal"] = "generalization_gap"
+            evidence_text = (
+                "训练损失已不再下降但比验证损失低 "
+                f"{generalization_gap_ratio * 100:.1f}%"
+                "（泛化 gap 大，记忆化特征）"
+            )
         analysis["recommendation"] = (
             f"验证损失在第 {best['step']} 步达到最优 "
             f"{float(best['val_loss']):.4f} 后回升 "
-            f"{regression * 100:.1f}%，训练损失仍在下降："
+            f"{regression * 100:.1f}%，{evidence_text}："
             "典型过拟合。建议按序尝试：加正则化"
             "（调大 --weight-decay / 适度增大 balance_coef）、"
             "增大训练数据、用 --early-stop-patience 早停"
@@ -5125,6 +5202,55 @@ def analyze_training_curve(
             "对齐（可先跑 --sanity-only 小批量过拟合检查）、"
             "模型容量与训练步数是否足够。"
         )
+    elif (
+        recent_train_drop is not None
+        and recent_val_drop is not None
+        and recent_train_drop < _CURVE_STILL_DESCENDING
+        and recent_val_drop < _CURVE_STILL_DESCENDING
+    ):
+        # 两者都不降：学习率已退火殆尽时是正常的末期收敛平台；
+        # 学习率仍高时则指向欠拟合（容量不足）、学习率不当或
+        # 数据管道问题，继续加步数只会浪费算力。
+        analysis["status"] = "plateau"
+        lr_annealed = (
+            peak_lr is not None
+            and peak_lr > 0.0
+            and last_lr is not None
+            and last_lr
+            < _CURVE_LR_ANNEALED_FRACTION * peak_lr
+        )
+        drops_text = (
+            f"训练 {max(0.0, recent_train_drop) * 100:.1f}% / "
+            f"验证 {max(0.0, recent_val_drop) * 100:.1f}%"
+        )
+        if lr_annealed:
+            analysis["plateau_kind"] = "schedule_end"
+            analysis["recommendation"] = (
+                f"最近一次验证间隔内训练与验证损失都没有有效下降"
+                f"（{drops_text}），且学习率已退火至峰值的 "
+                f"{analysis['last_lr_over_peak'] * 100:.0f}%："
+                "更像调度末期的正常收敛平台。若结果已够用可就此"
+                "结束；仍需改善时应调整学习率调度/模型容量后重跑，"
+                "而不是在已退火的学习率下继续加步数。"
+            )
+        else:
+            analysis["plateau_kind"] = "stalled"
+            lr_text = (
+                f"（当前 lr={last_lr:.3e}，峰值 {peak_lr:.3e}）"
+                if last_lr is not None and peak_lr is not None
+                else ""
+            )
+            analysis["recommendation"] = (
+                f"最近一次验证间隔内训练与验证损失都没有有效下降"
+                f"（{drops_text}），且已排除过拟合：两者都不降"
+                f"通常指向欠拟合（模型容量不足）、学习率不当"
+                f"{lr_text}或数据管道本身有问题。建议检查："
+                "学习率是否过小或过大、模型容量"
+                "（--d-model / --n-layers）是否足够，并用 "
+                "--sanity-only 的小批量过拟合检查排除数据管道 "
+                "bug（标签错位、输入输出不对齐）；定位原因前"
+                "不要盲目增加步数。"
+            )
     elif (
         recent_train_drop is not None
         and recent_val_drop is not None
@@ -5218,9 +5344,10 @@ def monitor_training_curve(
 
     返回 ``(analysis, new_status)``；状态与上一次相同或验证点
     还不足以判断（``insufficient_data``）时 ``new_status`` 为
-    None，表示不需要重复记录/打印。这样过拟合、欠拟合或发散
-    能在训练过程中就被发现并采取动作（加正则化、早停、调学习
-    率），而不是等训练全部结束后从最终数值里事后发现。
+    None，表示不需要重复记录/打印。这样过拟合、欠拟合、
+    双平台（学习率/容量/数据管道问题）或发散能在训练过程中
+    就被发现并采取动作（加正则化、早停、调学习率），而不是
+    等训练全部结束后从最终数值里事后发现。
     """
     analysis = analyze_training_curve(
         records,
@@ -6757,7 +6884,9 @@ _NONFINITE_CHECKLIST = [
     "上限；有限 logits + 非有限损失通常是 log(0)/除零/目标"
     "越界等损失侧问题。",
     "3) 混合精度：fp16 autocast 下 matmul/softmax 溢出会先"
-    "出现大绝对值再变 NaN；可对比关闭 AMP（--device cpu 或"
+    "出现大绝对值再变 NaN；梯度下溢则表现为小梯度被 flush 成"
+    "0、更新丢失（grad_scale 被持续上调、梯度范数异常小、"
+    "训练停滞但不发散）。可对比关闭 AMP（--device cpu 或"
     "换 bf16）判断。",
     "4) 梯度与优化：逐参数梯度是否爆炸/非有限、参数与优化器"
     "状态是否已被污染；若是则降低学习率、开启/收紧梯度裁剪"
@@ -7849,6 +7978,29 @@ _COST_FIELD_LABELS = {
     "peak_memory_mb": "峰值内存",
 }
 
+# 需要运行结束实际测量的效率字段（参数量是结构属性，旧运行也
+# 常有；FLOPs/延迟/内存全缺说明该运行没有做效率测量，精度与
+# 成本的权衡无法评估，必须显式点出而不是静默跳过）。
+_MEASURED_COST_FIELDS: Tuple[str, ...] = (
+    "flops_per_forward",
+    "latency_ms_per_forward",
+    "peak_memory_mb",
+)
+
+
+def _cell_missing_measured_costs(
+    cell: Dict[str, object],
+) -> List[str]:
+    """列出一个实验单元缺失的实测效率字段（FLOPs/延迟/内存）。"""
+    costs = cell.get("costs")
+    if not isinstance(costs, dict):
+        return list(_MEASURED_COST_FIELDS)
+    return [
+        field
+        for field in _MEASURED_COST_FIELDS
+        if field not in costs
+    ]
+
 
 def _cell_cost_mean(
     cell: Dict[str, object],
@@ -8790,11 +8942,19 @@ def _cost_comparison(
         significant,
     )
 
+    # 记录哪些「实测效率字段」缺失：涨点/变差结论无法做精度与
+    # 成本权衡时，展示层必须显式提示，而不是静默略过效率。
     return (
         {
             "baseline": baseline_costs,
             "variant": variant_costs,
             "ratios": cost_ratios,
+            "baseline_missing_measured_fields": (
+                _cell_missing_measured_costs(cell_a)
+            ),
+            "variant_missing_measured_fields": (
+                _cell_missing_measured_costs(cell_b)
+            ),
         },
         cost_verdict,
     )
@@ -9119,6 +9279,21 @@ def _contrast_display(
             )
         if ratio_parts:
             cost_text = "  效率倍率: " + " ".join(ratio_parts)
+
+    # 涨点/变差但缺实测效率数据（FLOPs/延迟/内存都没有可比
+    # 倍率）：只报指标差值等于回避精度与成本的权衡，必须点出
+    # 权衡缺失，而不是让结论静默通过。
+    if (
+        verdict in ("改善", "变差")
+        and not (
+            isinstance(ratios, dict)
+            and any(
+                field in ratios
+                for field in _MEASURED_COST_FIELDS
+            )
+        )
+    ):
+        caveat += "（缺效率数据，无法评估精度/成本权衡）"
 
     return (
         f"{factor}: {baseline}→{variant}{context}  "
@@ -10236,6 +10411,24 @@ def print_comparison_analysis(
                 f"{_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}"
             )
 
+    # 缺效率测量数据的实验单元必须点名：旧版本运行或
+    # --skip-efficiency 的运行没有 FLOPs/延迟/内存，涉及这些
+    # 单元的涨点结论无法做精度与成本的权衡（统计基线 ngram
+    # 是查表模型、本来就无该口径，不计入）。
+    missing_efficiency_cells = [
+        aggregate["label"]
+        for aggregate in aggregates
+        if _cell_missing_measured_costs(aggregate)
+        and "mode=ngram" not in str(aggregate["label"])
+    ]
+    if missing_efficiency_cells:
+        print(
+            "  [cost] 以下实验单元缺效率测量数据（旧运行或 "
+            "--skip-efficiency），涉及它们的对比无法评估"
+            "精度/成本权衡: "
+            + "; ".join(missing_efficiency_cells)
+        )
+
     print()
     direction = "越低越好" if not higher_is_better else "越高越好"
     print(
@@ -10400,6 +10593,7 @@ def print_comparison_analysis(
         "baseline_adequacy": adequacy,
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
+        "missing_efficiency_cells": missing_efficiency_cells,
         "n_runs": len(rows),
     }
 
@@ -17726,7 +17920,16 @@ def main():
     bad_cases_path = out_dir / "bad_cases.json"
     bad_case_payload: Dict[str, object] = {}
 
-    if args.bad_cases > 0:
+    if args.bad_cases > 0 and numerical_polluted:
+        # 参数/优化器状态已被 NaN/Inf 污染时，模型输出全是
+        # NaN：坏案例的置信度/归因毫无意义，把它写进
+        # bad_cases.json 只会用噪声冒充「改进思路的证据」。
+        print(
+            "[bad-case] 参数/优化器状态已被 NaN/Inf 污染，"
+            "跳过坏案例分析（输出不可信，不能作为改进线索）；"
+            "请从污染前的检查点恢复并处理数值问题后再分析。"
+        )
+    elif args.bad_cases > 0:
         bad_case_report = analyze_bad_cases(
             model,
             dataset,
