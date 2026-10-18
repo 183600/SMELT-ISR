@@ -369,53 +369,125 @@ class CausalSelfAttention(nn.Module):
         return F.linear(self.core(x), self.out.weight)
 
 
-class _SwiGLU(torch.autograd.Function):
+def _swiglu_backward(
+    grad_hidden: torch.Tensor,
+    gate_up: torch.Tensor,
+) -> torch.Tensor:
     """
-    对 [.., 2*hidden] 的线性输出做 SwiGLU：
-    前一半过 SiLU 后与后一半相乘。
+    SwiGLU 的共用反向实现（供 _SwiGLUDown 使用）。
+
+    gate_up 是 [.., 2*hidden] 的拼接张量（gate 在前、up 在
+    后）。mul 反向给出两路梯度，gate 路再过 silu 反向；两路
+    梯度分别写回一次分配的 grad_gate_up 的对应半区（两半区
+    互不相交且并集完整）。
+    """
+    gate, up = gate_up.chunk(2, dim=-1)
+
+    grad_gate_up = torch.empty_like(gate_up)
+    grad_gate, grad_up = grad_gate_up.chunk(2, dim=-1)
+
+    # grad_up 半区先写入 grad_hidden * up 作为 silu 反向的输入。
+    torch.mul(grad_hidden, up, out=grad_up)
+    torch.ops.aten.silu_backward.grad_input(
+        grad_up,
+        gate,
+        grad_input=grad_gate,
+    )
+
+    # grad_up = grad_hidden * silu(gate)。
+    torch.ops.aten.silu.out(gate, out=grad_up)
+    torch.mul(grad_hidden, grad_up, out=grad_up)
+    return grad_gate_up
+
+
+class _SwiGLUDown(torch.autograd.Function):
+    """
+    SwiGLU 与下投影的组合节点。
+
+    前向与「silu(gate) * up 后接下投影」逐位一致，但 hidden
+    中间结果不进入 autograd 的保存集合：反向时由 gate_up
+    重新算出隐藏层（两次逐元素算子），换取激活显存下降。
+    down_weight 支持两种布局：
+    - [E, D, H]：批量专家，下投影为 bmm；
+    - [D, H]：单专家，下投影为普通线性。
     """
 
     @staticmethod
-    def forward(ctx, h: torch.Tensor) -> torch.Tensor:
-        gate, up = h.chunk(2, dim=-1)
+    def forward(
+        ctx,
+        gate_up: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        # gate/up 是 gate_up 的切片视图，保存 gate_up 即可同时
+        # 覆盖两者且供反向重算隐藏层。forward 内 grad mode 默认
+        # 关闭，因此以 requires_grad 判断是否需要保存。
+        gate, up = gate_up.chunk(2, dim=-1)
 
-        if h.requires_grad:
-            # gate/up 是 h 的切片视图，保存 h 即可同时覆盖两者。
-            # forward 内 grad mode 默认关闭，因此以 requires_grad
-            # 判断是否需要保存。
-            ctx.save_for_backward(h)
+        if gate_up.requires_grad:
+            ctx.save_for_backward(gate_up, down_weight)
 
-            # h 需要保存供反向使用，SiLU 保持 out-of-place，
+            # gate_up 需要保存供反向使用，SiLU 保持 out-of-place，
             # mul_ 原地写入其输出。
-            return F.silu(gate).mul_(up)
+            hidden = F.silu(gate).mul_(up)
+        else:
+            # 无需反向时 gate_up 只是临时张量，SiLU 直接原地
+            # 写入 gate（gate_up 的前半区），数值上与上面一致。
+            hidden = F.silu(gate, inplace=True).mul_(up)
 
-        # 无需反向时 h 只是临时张量，SiLU 直接原地写入
-        # gate（h 的前半区）。
-        return F.silu(gate, inplace=True).mul_(up)
+        # autocast 下单专家路径的权重与激活可能不同 dtype；与
+        # 线性层的 autocast 语义一致，先按激活 dtype 对齐权重
+        #（批量路径的权重 stack 本就缓存为 autocast dtype，
+        # 此处为空操作）。
+        if down_weight.dtype != hidden.dtype:
+            down_weight = down_weight.to(hidden.dtype)
+
+        if down_weight.dim() == 3:
+            return torch.bmm(hidden, down_weight.transpose(1, 2))
+        return F.linear(hidden, down_weight)
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:
-        (h,) = ctx.saved_tensors
-        gate, up = h.chunk(2, dim=-1)
+    def backward(
+        ctx,
+        grad_out: torch.Tensor,
+    ) -> tuple:
+        gate_up, down_weight = ctx.saved_tensors
 
-        # mul 反向给出两路梯度，gate 路再过 silu 反向；
-        # 两路梯度分别写回 grad_h 的对应半区
-        #（两半区互不相交且并集完整）。
-        grad_h = torch.empty_like(h)
-        grad_h_gate, grad_h_up = grad_h.chunk(2, dim=-1)
+        # 隐藏层按需重算：与 forward 同一算子、同一顺序。
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = F.silu(gate).mul_(up)
 
-        # grad_up 半区先写入 grad_out * up 作为 silu 反向的输入。
-        torch.mul(grad_out, up, out=grad_h_up)
-        torch.ops.aten.silu_backward.grad_input(
-            grad_h_up,
-            gate,
-            grad_input=grad_h_gate,
-        )
+        # autocast 下单专家路径的权重与激活可能不同 dtype，计算
+        # 前对齐，返回梯度时再还原为权重的 dtype。
+        compute_weight = down_weight
+        if compute_weight.dtype != grad_out.dtype:
+            compute_weight = compute_weight.to(grad_out.dtype)
 
-        # grad_up = grad_out * silu(gate)。
-        torch.ops.aten.silu.out(gate, out=grad_h_up)
-        torch.mul(grad_out, grad_h_up, out=grad_h_up)
-        return grad_h
+        if down_weight.dim() == 3:
+            # 与 bmm(hidden, W^T) 的反向同序：grad_hidden 来自
+            # grad_out @ W；grad_W 来自 hidden^T @ grad_out 的
+            # 转置视图。
+            grad_hidden = torch.bmm(grad_out, compute_weight)
+            grad_weight = torch.bmm(
+                hidden.transpose(1, 2),
+                grad_out,
+            ).transpose(1, 2)
+        else:
+            # 与 F.linear(hidden, W) 的反向同序；输入允许带任意
+            # 前导维（如 dense 模式的 [batch, time, dim]），权重的
+            # 梯度按全部前导维求和，与线性层反向的展平口径一致。
+            grad_hidden = torch.matmul(grad_out, compute_weight)
+            grad_weight = torch.matmul(
+                grad_out.reshape(
+                    -1,
+                    grad_out.size(-1),
+                ).transpose(0, 1),
+                hidden.reshape(-1, hidden.size(-1)),
+            )
+
+        if grad_weight.dtype != down_weight.dtype:
+            grad_weight = grad_weight.to(down_weight.dtype)
+
+        return _swiglu_backward(grad_hidden, gate_up), grad_weight
 
 
 class Expert(nn.Module):
@@ -432,17 +504,16 @@ class Expert(nn.Module):
         self.down = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # gate 与 up 的融合输出直接进入 SwiGLU。
+        # gate 与 up 的融合输出直接进入 SwiGLU + 下投影的组合节点。
         gate_up = F.linear(x, self.gate_up.weight)
 
-        # 无反向需求（no_grad/inference_mode 下的评估路径）时
-        # 直接原地计算，数值上与 _SwiGLU 的无反向分支完全一致。
+        # 无反向需求（no_grad/inference_mode 下的评估路径）时直接
+        # 原地计算，数值上与组合节点的前向完全一致。
         if gate_up.requires_grad:
-            hidden = _SwiGLU.apply(gate_up)
-        else:
-            gate, up = gate_up.chunk(2, dim=-1)
-            hidden = F.silu(gate, inplace=True).mul_(up)
+            return _SwiGLUDown.apply(gate_up, self.down.weight)
 
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = F.silu(gate, inplace=True).mul_(up)
         return F.linear(hidden, self.down.weight)
 
     def _load_from_state_dict(
@@ -898,12 +969,6 @@ class SparseMoE(nn.Module):
             gate_up_weight.transpose(1, 2),
         )
 
-        if gate_up.requires_grad:
-            hidden = _SwiGLU.apply(gate_up)
-        else:
-            gate, up = gate_up.chunk(2, dim=-1)
-            hidden = F.silu(gate, inplace=True).mul_(up)
-
         down_weight = self._cached_weight_stack(
             "down",
             [
@@ -916,6 +981,14 @@ class SparseMoE(nn.Module):
             down_weight = down_weight[
                 expert_range[0]:expert_range[1] + 1
             ]
+
+        if gate_up.requires_grad:
+            # SwiGLU + 下投影的组合节点：hidden 不进入保存集合，
+            # 反向时由 gate_up 重算。
+            return _SwiGLUDown.apply(gate_up, down_weight)
+
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = F.silu(gate, inplace=True).mul_(up)
 
         return torch.bmm(
             hidden,
