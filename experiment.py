@@ -16217,7 +16217,23 @@ def main():
         run_experiment_sweep(args)
         return
 
-    device = torch.device(args.device)
+    # 设备字符串与可用性与其他命令行参数同一口径：非法或
+    # 不可用的设备走 parser.error 的清晰报错，而不是抛裸
+    # traceback（后者要到模型搬运 CUDA 时才在深处失败）。
+    try:
+        device = torch.device(args.device)
+    except RuntimeError as error:
+        parser.error(f"--device 无效: {error}")
+
+    if (
+        device.type == "cuda"
+        and not torch.cuda.is_available()
+    ):
+        parser.error(
+            f"--device={args.device} 需要 CUDA，但当前环境"
+            "不可用（torch.cuda.is_available()=False）；"
+            "请改用 --device cpu 或在带 GPU 的环境运行"
+        )
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -16240,7 +16256,14 @@ def main():
         scaler = None
 
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # 输出路径不可用（已存在同名文件、无写权限等）与其他
+    # 命令行参数同一口径走 parser.error。
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        parser.error(
+            f"--out 目录无法创建或已存在同名文件: {error}"
+        )
 
     # 测试集尘封协议不只约束单次运行，也约束输出目录：
     # 目录里已有 test 记录时，全新训练会把 metrics.jsonl
@@ -16263,11 +16286,33 @@ def main():
     saved_data_test_fraction = None
 
     if args.resume is not None:
-        # 检查点先载入 CPU，再按目标设备分别搬运。
-        rng_payload = load_checkpoint(
-            args.resume,
-            torch.device("cpu"),
-        )
+        # 检查点先载入 CPU，再按目标设备分别搬运。读取失败
+        # （文件缺失/损坏/不是 torch 存档）与其他命令行参数
+        # 同一口径走 parser.error；损坏文件的异常种类不定
+        # （unpickler 可能抛出各种异常），与 load_selected_model
+        # 一样用宽捕获。
+        try:
+            rng_payload = load_checkpoint(
+                args.resume,
+                torch.device("cpu"),
+            )
+        except Exception as error:
+            parser.error(
+                f"无法读取 --resume 检查点 {args.resume}: {error}"
+            )
+        if (
+            not isinstance(rng_payload, dict)
+            or not {
+                "config",
+                "model",
+                "optimizer",
+            } <= set(rng_payload)
+        ):
+            parser.error(
+                f"--resume 检查点 {args.resume} 缺少"
+                " config/model/optimizer 必需字段："
+                "不是由本脚本 save_checkpoint 产生的存档"
+            )
         saved_args = rng_payload.get("args", {})
         saved_data_sha256 = saved_args.get("data_sha256")
         saved_data_val_fraction = saved_args.get(
@@ -16419,7 +16464,12 @@ def main():
                 "原运行不同"
             )
 
-    cfg.validate()
+    # 结构与损失配置的合法性与其他命令行参数同一口径：
+    # 校验失败走 parser.error 的清晰报错，而不是抛裸 traceback。
+    try:
+        cfg.validate()
+    except ValueError as error:
+        parser.error(f"模型结构/损失配置无效: {error}")
 
     # resume 可能把 group_separator 恢复成存档值，
     # 统一在构造数据管线前重新解析。
@@ -16445,7 +16495,7 @@ def main():
             device=device,
             group_separator=group_separator_bytes,
         )
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         parser.error(f"数据管线初始化失败: {error}")
 
     if args.evaluate_test and not dataset.has_test:
