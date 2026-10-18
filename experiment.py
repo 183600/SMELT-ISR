@@ -5,6 +5,7 @@ import codecs
 from collections import deque
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import math
@@ -8632,6 +8633,32 @@ _SIGNIFICANCE_LEVEL = 0.05
 _MIN_SEEDS_FOR_STATS = 3
 _RECOMMENDED_SEEDS = 3
 
+# 功效分析的目标功效与实际意义等价界。
+#
+# 显著性检验只能回答「有没有证据反对差异为 0」，回答不了
+# 「差异是否小到可以忽略」：p>0.05 只说明现有数据没能证明
+# 差异存在，既不等于差异不存在，也不等于差异可以忽略。
+# 因此报告额外给出两类口径：
+# - 最小可检出效应（MDE）：在当前种子数、当前种子间方差的
+#   条件下，达到 _TARGET_POWER 功效（惯例 80%）所能检出的
+#   最小真实效应；观测到的 |Δ| 小于 MDE 时不显著属预期，
+#   不能当作「无差异」的证据；
+# - 等价性检验（TOST）：在预先声明的等价界（相对基线均值的
+#   比例，_DEFAULT_EQUIVALENCE_MARGIN = 1%）内做两个单侧
+#   检验，显著通过才能主张「无实质差异」，否则结论只能是
+#   「未发现显著差异（不确定）」。
+_TARGET_POWER = 0.80
+_DEFAULT_EQUIVALENCE_MARGIN = 0.01
+
+# 非中心 t 功效的数值积分设置：对 u = sqrt(V)（V ~ chi2_df）
+# 做复合 Simpson 积分。u 的密度以 sqrt(df-1) 为众数、宽度
+# 约 1/√2，右尾为 exp(-u^2/2)：积分上限取众数 + _T_POWER_TAIL
+# （右尾 < 1e-31 可截断），节点数随上限自适应，df 很大时
+# 也不会把全部质量丢在积分区间之外。
+_T_POWER_TAIL = 12.0
+_T_POWER_MIN_INTERVALS = 800
+_T_POWER_MAX_INTERVALS = 4000
+
 
 def _independent_seed_count(
     n_runs: int,
@@ -9432,6 +9459,434 @@ def _contrast_interval(
     }
 
 
+def _normal_cdf(value: float) -> float:
+    """标准正态分布 CDF（math.erf 实现，无 SciPy 依赖）。"""
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+@functools.lru_cache(maxsize=64)
+def _t_power_nodes(
+    df: float,
+) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+    """
+    t 分布功效积分的 Simpson 节点与权重（按 df 缓存）。
+
+    T = (Z + δ)/sqrt(V/df)，Z ~ N(0,1)，V ~ chi2_df。令
+    u = sqrt(V)，则 u 的密度为
+    g(u) = 2^(1-df/2) u^(df-1) exp(-u^2/2) / Γ(df/2)，
+    且 P(|T| > c | u) = Φ(-c·u/√df - δ) + 1 - Φ(c·u/√df - δ)。
+
+    积分区间上界取 chi 分布众数 sqrt(df-1) 加 _T_POWER_TAIL
+    （chi 分布的宽度约 1/√2，右尾可安全截断）；节点数随区间
+    长度自适应，保证 df 从 2 到数千都足够精确。
+
+    返回 (u_i, simpson_weight_i · g(u_i))；密度用对数域计算，
+    df 较大时也不会溢出。
+    """
+    mode = math.sqrt(df - 1.0) if df > 1.0 else 0.0
+    u_max = mode + _T_POWER_TAIL
+    intervals = max(
+        _T_POWER_MIN_INTERVALS,
+        math.ceil(u_max * 24.0),
+    )
+    intervals = min(intervals, _T_POWER_MAX_INTERVALS)
+    if intervals % 2:
+        intervals += 1
+
+    step = u_max / intervals
+    log_gamma = math.lgamma(df / 2.0)
+    log_const = (1.0 - df / 2.0) * math.log(2.0) - log_gamma
+
+    u_values: List[float] = []
+    weighted: List[float] = []
+    for index in range(intervals + 1):
+        u = index * step
+        if index == 0 or index == intervals:
+            simpson = step / 3.0
+        elif index % 2 == 0:
+            simpson = 2.0 * step / 3.0
+        else:
+            simpson = 4.0 * step / 3.0
+
+        if u <= 0.0:
+            # u^(df-1)：df>1 时为 0；df=1 时 g(0)=sqrt(2/π)。
+            density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
+        else:
+            density = math.exp(
+                log_const + (df - 1.0) * math.log(u) - u * u / 2.0
+            )
+        u_values.append(u)
+        weighted.append(simpson * density)
+
+    return tuple(u_values), tuple(weighted)
+
+
+def _t_power(
+    effect: float,
+    se: float,
+    df: float,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Optional[float]:
+    """
+    双侧 t 检验在给定效应量下的统计功效（非中心 t 分布）。
+
+    非中心参数 δ = |effect|/se；功效 = P(|T| > t 临界值)。
+    效应量与 df 不可用时返回 None。数值积分与 SciPy 的
+    ``nct`` 口径一致：δ=0 时功效恰为 alpha；δ 增大时单调
+    趋近 1。
+    """
+    try:
+        effect_value = abs(float(effect))
+        se_value = float(se)
+        df_value = float(df)
+        alpha_value = float(alpha)
+    except (TypeError, ValueError):
+        return None
+
+    if (
+        not math.isfinite(effect_value)
+        or not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or not (0.0 < alpha_value < 0.5)
+    ):
+        return None
+    if df_value <= 0.0:
+        return None
+    if se_value <= 0.0:
+        # 零标准误：非零效应必然被检出；零效应必然不显著。
+        return 1.0 if effect_value > 0.0 else alpha_value
+
+    critical = _t_critical(df_value, alpha_value)
+    if critical is None:
+        return None
+
+    noncentrality = effect_value / se_value
+    scale = critical / math.sqrt(df_value)
+
+    u_values, weighted = _t_power_nodes(df_value)
+    total = 0.0
+    for u, weight in zip(u_values, weighted):
+        if weight == 0.0:
+            continue
+        shift = scale * u
+        total += weight * (
+            _normal_cdf(-shift - noncentrality)
+            + 1.0 - _normal_cdf(shift - noncentrality)
+        )
+    return min(1.0, max(0.0, total))
+
+
+# 求解最小可检出效应时的非中心参数上限：δ=100 时双侧
+# alpha=0.05 的功效已 > 1-1e-10，任何实际设置都远达不到。
+_MDE_MAX_NONCENTRALITY = 100.0
+
+
+def _minimum_detectable_effect(
+    se: float,
+    df: float,
+    target_power: float = _TARGET_POWER,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Optional[float]:
+    """
+    当前设计（se、df 给定）在目标功效下能检出的最小真实
+    效应量（绝对口径，与指标同单位）。
+
+    对非中心参数 δ 二分：δ 越大功效越高。观测到的 |Δ| 小于
+    MDE 时，「不显著」是功效不足的预期结果，不能解读为
+    「无差异」；要在当前种子数下缩小 MDE，需要增加随机种子
+    或降低种子间方差。
+    """
+    try:
+        se_value = float(se)
+        df_value = float(df)
+        target = float(target_power)
+    except (TypeError, ValueError):
+        return None
+
+    if (
+        not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or not math.isfinite(target)
+        or df_value <= 0.0
+        or not (0.0 < target < 1.0)
+    ):
+        return None
+    if se_value <= 0.0:
+        # 零标准误：任意非零效应都以功效 1 被检出。
+        return 0.0
+
+    low = 0.0
+    high = _MDE_MAX_NONCENTRALITY
+    power_high = _t_power(high * se_value, se_value, df_value, alpha)
+    if power_high is None or power_high < target:
+        return None
+
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        power_mid = _t_power(
+            mid * se_value,
+            se_value,
+            df_value,
+            alpha,
+        )
+        if power_mid is None:
+            return None
+        if power_mid < target:
+            low = mid
+        else:
+            high = mid
+    return ((low + high) / 2.0) * se_value
+
+
+def _seeds_to_detect(
+    effect: float,
+    sd: float,
+    target_power: float = _TARGET_POWER,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+    max_seeds: int = 128,
+) -> Optional[int]:
+    """
+    以每个种子一次运行的配对设计，要在目标功效下检出给定
+    效应量所需的种子数（近似：把观测到的种子间标准差当作
+    真值，se = sd/sqrt(n)、df = n-1）。
+
+    用于回答「不显著到底是没效应还是种子太少」：若当前种子
+    数远小于所需种子数，结论只能是「该规模下无法判定」。
+    sd=0（无种子间方差）返回 1；效应为 0 时返回 None。
+    """
+    try:
+        effect_value = abs(float(effect))
+        sd_value = float(sd)
+        target = float(target_power)
+    except (TypeError, ValueError):
+        return None
+
+    if (
+        not math.isfinite(effect_value)
+        or not math.isfinite(sd_value)
+        or not math.isfinite(target)
+        or not (0.0 < target < 1.0)
+    ):
+        return None
+    if effect_value <= 0.0:
+        return None
+    if sd_value <= 0.0:
+        return 1
+
+    for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
+        power = _t_power(
+            effect_value,
+            sd_value / math.sqrt(n),
+            float(n - 1),
+            alpha,
+        )
+        if power is not None and power >= target:
+            return n
+    return None
+
+
+def _t_cdf(t: float, df: float) -> Optional[float]:
+    """
+    Student t 分布 CDF F(t)：由双侧尾概率换算（无 SciPy 依赖）。
+
+    P(|T| >= |t|) = 2·(1 - F(|t|))，因此 t>0 时
+    F(t) = 1 - p(|t|)/2，t<0 时 F(t) = p(|t|)/2。
+    """
+    two_sided = _two_sided_t_p_value(t, df)
+    if two_sided is None:
+        return None
+    if t >= 0.0:
+        return 1.0 - two_sided / 2.0
+    return two_sided / 2.0
+
+
+def _tost_test(
+    effect: float,
+    se: float,
+    df: float,
+    margin: float,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Dict[str, object]:
+    """
+    等价性检验（TOST，two one-sided tests）。
+
+    H0_upper: effect >= +margin（上单侧，p_upper = P(T <= (Δ̂-margin)/se)）
+    H0_lower: effect <= -margin（下单侧，p_lower = P(T >= (Δ̂+margin)/se)）
+    p_tost = max(p_upper, p_lower)；p_tost <= alpha 才成立
+    「差异落在 ±margin 等价界内」的结论。
+
+    margin 必须是预先声明的实际意义界（见
+    _DEFAULT_EQUIVALENCE_MARGIN 与 --equivalence-margin）；
+    margin 越宽越容易「等价」，因此其取值必须写进报告、
+    不能看到数据后再调。返回 p 值为未校正口径，家族内
+    多重比较校正由 _apply_multiple_comparison_correction 统一
+    处理（不等价的误判同样会被多重比较放大）。
+    """
+    try:
+        effect_value = float(effect)
+        se_value = float(se)
+        df_value = float(df)
+        margin_value = abs(float(margin))
+        alpha_value = float(alpha)
+    except (TypeError, ValueError):
+        return {}
+
+    if (
+        not math.isfinite(effect_value)
+        or not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or not math.isfinite(margin_value)
+        or not (0.0 < alpha_value < 0.5)
+    ):
+        return {}
+    if margin_value <= 0.0 or df_value <= 0.0:
+        return {}
+
+    if se_value <= 0.0:
+        # 零标准误：差异精确已知。界内即等价（p=0），
+        # 界外即明显不等价（p=1）；恰好落在边界上保守
+        # 地判为不等价。
+        equivalent = abs(effect_value) < margin_value
+        return {
+            "tost_p_lower": 0.0 if equivalent else 1.0,
+            "tost_p_upper": 0.0 if equivalent else 1.0,
+            "tost_p_value": 0.0 if equivalent else 1.0,
+            "tost_margin": margin_value,
+        }
+
+    t_upper = (effect_value - margin_value) / se_value
+    t_lower = (effect_value + margin_value) / se_value
+
+    cdf_upper = _t_cdf(t_upper, df_value)
+    cdf_lower = _t_cdf(t_lower, df_value)
+    if cdf_upper is None or cdf_lower is None:
+        return {}
+
+    p_upper = cdf_upper
+    p_lower = 1.0 - cdf_lower
+    return {
+        "tost_p_lower": p_lower,
+        "tost_p_upper": p_upper,
+        "tost_p_value": max(p_lower, p_upper),
+        "tost_margin": margin_value,
+    }
+
+
+def _attach_power_equivalence(
+    contrast: Dict[str, object],
+    delta: Optional[float],
+    test: Dict[str, object],
+    equivalence_margin: Optional[float],
+) -> None:
+    """
+    把功效与等价性口径挂到对比记录上（原地更新）。
+
+    字段含义：
+    - ``mde_80``：当前 se、df 下 80% 功效能检出的最小效应
+      （绝对口径）；``mde_80_relative`` 为相对 |基线均值| 的
+      比例。观测到的 |Δ| 小于 MDE 时，「不显著」没有信息量。
+    - ``power_at_effect``：观测效应量自身的功效；远低于目标
+      功效时，即使点估计看似差异不小也不能据此下结论。
+    - ``seeds_to_detect``：按观测到的种子间波动，要在 80%
+      功效下检出观测效应所需的（近似）种子数；远大于当前
+      种子数说明实验规模不足以判定。
+    - ``equivalence_margin`` / ``tost_*``：预先声明的等价界
+      （相对基线均值）与 TOST 结果；``equivalent`` 为未校正
+      的原始判定，家族校正由
+      ``_apply_multiple_comparison_correction`` 统一完成。
+    """
+    se = test.get("se")
+    df = test.get("df")
+    if se is None or df is None:
+        return
+    try:
+        se_value = float(se)
+        df_value = float(df)
+    except (TypeError, ValueError):
+        return
+
+    baseline_mean = contrast.get("mean_baseline")
+    baseline_abs = None
+    if (
+        isinstance(baseline_mean, (int, float))
+        and not isinstance(baseline_mean, bool)
+        and math.isfinite(float(baseline_mean))
+        and abs(float(baseline_mean)) > 0.0
+    ):
+        baseline_abs = abs(float(baseline_mean))
+
+    mde = _minimum_detectable_effect(se_value, df_value)
+    if mde is not None:
+        contrast["mde_80"] = mde
+        if baseline_abs is not None:
+            contrast["mde_80_relative"] = mde / baseline_abs
+
+    if delta is not None and math.isfinite(float(delta)):
+        delta_value = float(delta)
+        power = _t_power(abs(delta_value), se_value, df_value)
+        if power is not None:
+            contrast["power_at_effect"] = power
+
+        # 还原观测到的重复间标准差：配对设计 se = sd/√n；
+        # Welch 用两臂较小样本量近似（标为近似口径）。
+        n_pairs = contrast.get("n_pairs")
+        n_baseline = contrast.get("n_baseline")
+        n_variant = contrast.get("n_variant")
+        sd_observed = None
+        if (
+            isinstance(n_pairs, int)
+            and n_pairs >= _MIN_SEEDS_FOR_STATS
+        ):
+            sd_observed = se_value * math.sqrt(n_pairs)
+        elif (
+            isinstance(n_baseline, int)
+            and isinstance(n_variant, int)
+            and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
+        ):
+            sd_observed = se_value * math.sqrt(
+                min(n_baseline, n_variant)
+            )
+        if sd_observed is not None and delta_value != 0.0:
+            seeds_needed = _seeds_to_detect(
+                delta_value,
+                sd_observed,
+            )
+            if seeds_needed is not None:
+                contrast["seeds_to_detect"] = seeds_needed
+
+    if equivalence_margin is None or delta is None:
+        return
+    try:
+        margin_relative = float(equivalence_margin)
+    except (TypeError, ValueError):
+        return
+    if (
+        not math.isfinite(margin_relative)
+        or margin_relative <= 0.0
+    ):
+        return
+    contrast["equivalence_margin"] = margin_relative
+    if baseline_abs is None:
+        # 基线均值为 0 时相对等价界没有定义；不虚构口径。
+        contrast["equivalence_margin_abs"] = None
+        return
+
+    margin_abs = margin_relative * baseline_abs
+    contrast["equivalence_margin_abs"] = margin_abs
+    tost = _tost_test(
+        float(delta),
+        se_value,
+        df_value,
+        margin_abs,
+    )
+    if not tost:
+        return
+    contrast.update(tost)
+    contrast["equivalent"] = bool(
+        float(tost["tost_p_value"]) <= _SIGNIFICANCE_LEVEL
+    )
+
+
 def _holm_bonferroni(
     p_values: List[Optional[float]],
 ) -> List[Optional[float]]:
@@ -9804,11 +10259,14 @@ def _apply_multiple_comparison_correction(
     - ``significant_raw``：未校正判定（留档，可追溯「校正
       前后结论翻转」）；
     - ``significant``：以 Holm 校正为准的最终判定；效率的
-      权衡结论（``cost_verdict``）同步按该判定重算。
+      权衡结论（``cost_verdict``）同步按该判定重算；
+    - ``tost_p_value_holm`` / ``tost_p_value_bh`` 与
+      ``equivalent_raw`` / ``equivalent``：等价性检验（TOST）
+      的同口径校正，「等价」主张同样受多重比较约束。
 
     不校正的风险：跑 6 个两两对比，即使每个都用 alpha=0.05，
     至少出现一个假阳性的概率约 26%。只有校正后的显著性才是
-    可以在结论中主张的显著性。
+    可以在结论中主张的显著性；等价主张同理。
     """
     eligible = [
         contrast
@@ -9847,11 +10305,45 @@ def _apply_multiple_comparison_correction(
                 corrected,
             )
 
+    # 等价性（TOST）主张同样构成检验家族：对 m 个对比都声称
+    # 「差异落在等价界内」，至少一个误判的概率同样随家族规模
+    # 上升。TOST p 值越小越支持等价，这里做与显著性同口径的
+    # Holm（FWER）/ BH（FDR）校正：只有校正后仍 <= alpha 的
+    # 等价结论才是可以在报告中主张的「无实质差异」，其余只能
+    # 报告「未发现显著差异（结论不确定）」。
+    tost_eligible = [
+        contrast
+        for contrast in contrasts
+        if contrast.get("tost_p_value") is not None
+    ]
+    tost_values = [
+        float(contrast["tost_p_value"]) for contrast in tost_eligible
+    ]
+    tost_holm = _holm_bonferroni(tost_values)
+    tost_bh = _benjamini_hochberg(tost_values)
+
+    for contrast, holm_p, bh_p in zip(
+        tost_eligible,
+        tost_holm,
+        tost_bh,
+    ):
+        contrast["tost_p_value_holm"] = holm_p
+        contrast["tost_p_value_bh"] = bh_p
+        if "equivalent_raw" not in contrast:
+            contrast["equivalent_raw"] = bool(
+                contrast.get("equivalent")
+            )
+        contrast["equivalent"] = bool(
+            holm_p is not None
+            and float(holm_p) <= _SIGNIFICANCE_LEVEL
+        )
+
 
 def factor_contrasts(
     aggregates: List[Dict[str, object]],
     group_keys: List[str],
     metric: str,
+    equivalence_margin: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """
     单因子对比：只有恰好一个因子取值不同的两个实验单元之间
@@ -9859,6 +10351,11 @@ def factor_contrasts(
     若干这样的单因子对比给出；一次变化多个因子的组合被标记
     为混杂对比，结论无法归因。返回前对家族内全部检验做
     Holm（FWER）/ BH（FDR）多重比较校正并附效应量 95% CI。
+
+    ``equivalence_margin`` 给定时（相对基线均值的比例，见
+    ``--equivalence-margin``），每个对比额外附带 80% 功效的
+    最小可检出效应（MDE）与 TOST 等价性检验：不显著 ≠ 等价，
+    只有落在预先声明的等价界内才是「无实质差异」的证据。
     """
     contrasts: List[Dict[str, object]] = []
     higher_is_better = metric_higher_is_better(metric)
@@ -9970,6 +10467,8 @@ def factor_contrasts(
                 "df": test.get("df"),
                 "p_value": test.get("p_value"),
                 "n_pairs": test.get("n_pairs", 0),
+                "n_baseline": len(samples_a),
+                "n_variant": len(samples_b),
                 "duplicate_seeds": bool(
                     test.get("duplicate_seeds")
                 ),
@@ -9979,6 +10478,12 @@ def factor_contrasts(
                 "cost_verdict": cost_verdict,
             })
             contrast.update(_contrast_interval(test))
+            _attach_power_equivalence(
+                contrast,
+                delta,
+                test,
+                equivalence_margin,
+            )
             contrasts.append(contrast)
 
     # 家族的显著性判定必须在全部对比都生成后统一校正，
@@ -10092,6 +10597,58 @@ def _contrast_display(
             "不能据此声称差异）"
         )
 
+    # 不显著 ≠ 等价：未校正的显著性检验只能回答「有没有
+    # 证据反对差异为 0」。等价性必须由预先声明等价界的
+    # TOST 支撑；检验过但两个问题都没答上时（不显著且不等价）
+    # 结论只能是「不确定」，并把 80% 功效下的最小可检出效应
+    # （MDE）摆出来，说明该种子规模本来能/不能检出多大的差异。
+    if test in ("paired_t", "welch_t"):
+        margin_abs = contrast.get("equivalence_margin_abs")
+        if contrast.get("equivalent"):
+            margin_text = (
+                f"±{float(margin_abs):.4f}"
+                if isinstance(margin_abs, (int, float))
+                else "等价界内"
+            )
+            tost_holm = contrast.get("tost_p_value_holm")
+            tost_text = (
+                f"，Holm p={float(tost_holm):.3f}"
+                if isinstance(tost_holm, (int, float))
+                else ""
+            )
+            significant_note = (
+                "；差异统计显著但落在等价界内（统计显著 ≠ 实际重要）"
+                if contrast.get("significant")
+                else ""
+            )
+            caveat += (
+                f"（TOST 等价：|Δ| 落在 {margin_text} 等价界内"
+                f"{tost_text}，支持无实质差异{significant_note}）"
+            )
+        elif not contrast.get("significant"):
+            mde = contrast.get("mde_80")
+            mde_text = (
+                f"80% 功效下只能检出 |Δ|≥{float(mde):.4f}，"
+                if isinstance(mde, (int, float))
+                else ""
+            )
+            caveat += (
+                f"（未显著且等价性未确立：{mde_text}"
+                "未显著不代表等价，结论不确定）"
+            )
+            seeds_needed = contrast.get("seeds_to_detect")
+            current_seeds = contrast.get("n_pairs")
+            if (
+                isinstance(seeds_needed, int)
+                and isinstance(current_seeds, int)
+                and current_seeds >= _MIN_SEEDS_FOR_STATS
+                and seeds_needed > current_seeds
+            ):
+                caveat += (
+                    f"（按当前种子间波动，检出该效应约需 "
+                    f"{seeds_needed} 个种子，当前 {current_seeds} 个）"
+                )
+
     # 伪重复：同一单元里同一随机种子出现多次（复制的运行）
     # 不是独立重复实验，配对检验不可用，结论的统计功效存疑。
     if contrast.get("duplicate_seeds"):
@@ -10150,12 +10707,15 @@ def compare_cells_to_baseline(
     aggregates: List[Dict[str, object]],
     baseline_mode: Optional[str],
     metric: str,
+    equivalence_margin: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """
     指定基线模式（--compare-baseline），把每个实验单元与
     基线单元直接对比。基线模式有多个单元（如 balance_coef
     不同）时选运行数最多的一个。直接对比构成自己的检验
-    家族，同样做多重比较校正并附效应量 95% CI。
+    家族，同样做多重比较校正并附效应量 95% CI，以及
+    80% 功效 MDE 与 TOST 等价性口径（``equivalence_margin``
+    给定时）。
     """
     if not baseline_mode:
         return []
@@ -10229,6 +10789,10 @@ def compare_cells_to_baseline(
             "df": result.get("df"),
             "p_value": result.get("p_value"),
             "n_pairs": result.get("n_pairs", 0),
+            "n_baseline": len(
+                reference["samples"].get(metric, [])
+            ),
+            "n_variant": len(aggregate["samples"].get(metric, [])),
             "duplicate_seeds": bool(
                 result.get("duplicate_seeds")
             ),
@@ -10238,6 +10802,12 @@ def compare_cells_to_baseline(
             "cost_verdict": cost_verdict,
         }
         entry.update(_contrast_interval(result))
+        _attach_power_equivalence(
+            entry,
+            delta,
+            result,
+            equivalence_margin,
+        )
         contrasts.append(entry)
 
     # 与单因子对比同理：--compare-baseline 的直接对比构成
@@ -11205,15 +11775,23 @@ def print_comparison_analysis(
     baseline_mode: Optional[str] = None,
     metric: str = "val_loss",
     ablation_modes: Optional[List[str]] = None,
+    equivalence_margin: Optional[float] = _DEFAULT_EQUIVALENCE_MARGIN,
 ) -> Dict[str, object]:
     """
     打印完整的对比分析：受控变量检查、按种子聚合的
     Mean ± Std、单因子显著性检验（含多重比较校正与效应量
-    95% 置信区间）与消融覆盖检查。
+    95% 置信区间）、80% 功效的最小可检出效应（MDE）与
+    TOST 等价性检验，以及消融覆盖检查。
 
     ``ablation_modes`` 声明本轮消融必须覆盖的延迟合并方案
     （--suite-ablation --ablation-modes）；为 None 时按运行
     集中实际出现的方案推断。
+
+    ``equivalence_margin`` 是相对基线均值的等价界比例
+    （--equivalence-margin，默认 1%）：报告用 TOST 区分
+    「证据支持无实质差异」与「未发现显著差异（不确定）」，
+    并把 MDE 与观测效应所需的种子数列出；为 None 时只做
+    显著性检验（不推荐，不显著会被误读为等价）。
 
     返回结构化结果，供写入汇总报告。
     """
@@ -11244,11 +11822,17 @@ def print_comparison_analysis(
             group_keys.append(key)
 
     aggregates = aggregate_runs(rows, group_keys)
-    contrasts = factor_contrasts(aggregates, group_keys, metric)
+    contrasts = factor_contrasts(
+        aggregates,
+        group_keys,
+        metric,
+        equivalence_margin=equivalence_margin,
+    )
     reference = compare_cells_to_baseline(
         aggregates,
         baseline_mode,
         metric,
+        equivalence_margin=equivalence_margin,
     )
     coverage = ablation_coverage(rows, factors, ablation_modes)
     # 伪重复：同一实验单元里同一随机种子出现多次（如复制运行
@@ -11535,6 +12119,144 @@ def print_comparison_analysis(
         f"{_RECOMMENDED_SEEDS}"
     )
 
+    # 等价性与统计功效：不显著只能得到「没有证据反对差异为 0」，
+    # 不等于「差异可忽略」。等价结论必须来自预先声明等价界的
+    # TOST（且过家族校正）；MDE 与所需种子数把「不显著到底是
+    # 没效应还是种子太少」量化出来。
+    equivalence_entries: List[Dict[str, object]] = []
+    for family, family_contrasts in (
+        ("single_factor", contrasts),
+        ("baseline", reference),
+    ):
+        for contrast in family_contrasts:
+            if contrast.get("confounded"):
+                continue
+            if contrast.get("test") not in ("paired_t", "welch_t"):
+                continue
+            equivalence_entries.append({
+                "family": family,
+                "baseline": contrast.get("baseline"),
+                "variant": contrast.get("variant"),
+                "delta": contrast.get("delta"),
+                "significant": bool(contrast.get("significant")),
+                "mde_80": contrast.get("mde_80"),
+                "mde_80_relative": contrast.get("mde_80_relative"),
+                "power_at_effect": contrast.get("power_at_effect"),
+                "seeds_to_detect": contrast.get("seeds_to_detect"),
+                "n_pairs": contrast.get("n_pairs"),
+                "equivalence_margin_abs": contrast.get(
+                    "equivalence_margin_abs"
+                ),
+                "tost_p_value": contrast.get("tost_p_value"),
+                "tost_p_value_holm": contrast.get(
+                    "tost_p_value_holm"
+                ),
+                "equivalent_raw": contrast.get("equivalent_raw"),
+                "equivalent": contrast.get("equivalent"),
+            })
+
+    print()
+    if equivalence_margin is None:
+        print(
+            "[equivalence] 未设定等价界（equivalence_margin=None）："
+            "只报告显著性；不显著 ≠ 等价，不能据此主张无差异"
+        )
+    else:
+        print(
+            "[equivalence] 等价性与统计功效（等价界 = 基线均值的 "
+            f"±{float(equivalence_margin) * 100:.1f}%；"
+            "不显著 ≠ 等价）"
+        )
+        if not equivalence_entries:
+            print(
+                "  无可用检验（至少需要两个实验单元且每侧 "
+                f"≥{_MIN_SEEDS_FOR_STATS} 个种子）"
+            )
+        else:
+            equivalent_entries = [
+                entry
+                for entry in equivalence_entries
+                if entry["equivalent"]
+            ]
+            inconclusive_entries = [
+                entry
+                for entry in equivalence_entries
+                if not entry["significant"]
+                and not entry["equivalent"]
+            ]
+            for entry in equivalent_entries:
+                holm = entry.get("tost_p_value_holm")
+                holm_text = (
+                    f"Holm p={float(holm):.3f}"
+                    if isinstance(holm, (int, float))
+                    else "p=NA"
+                )
+                margin_abs = entry.get("equivalence_margin_abs")
+                margin_text = (
+                    f"（等价界 ±{float(margin_abs):.4f}）"
+                    if isinstance(margin_abs, (int, float))
+                    else ""
+                )
+                significant_note = (
+                    "；差异统计显著但落在等价界内（统计显著 ≠ 实际重要）"
+                    if entry["significant"]
+                    else ""
+                )
+                delta = entry.get("delta")
+                delta_text = (
+                    f"Δ={float(delta):+.4f}"
+                    if isinstance(delta, (int, float))
+                    else "Δ=NA"
+                )
+                print(
+                    f"  [equivalent] {entry['baseline']}→"
+                    f"{entry['variant']}  {delta_text}  "
+                    f"TOST {holm_text}{margin_text}："
+                    f"支持无实质差异{significant_note}"
+                )
+            for entry in inconclusive_entries:
+                mde = entry.get("mde_80")
+                mde_text = (
+                    f"80% 功效 MDE={float(mde):.4f}"
+                    if isinstance(mde, (int, float))
+                    else "MDE=NA"
+                )
+                mde_relative = entry.get("mde_80_relative")
+                if isinstance(mde_relative, (int, float)):
+                    mde_text += f"（相对 {float(mde_relative) * 100:.2f}%）"
+                seeds_needed = entry.get("seeds_to_detect")
+                seeds_text = ""
+                n_pairs = entry.get("n_pairs")
+                if (
+                    isinstance(seeds_needed, int)
+                    and isinstance(n_pairs, int)
+                    and n_pairs >= _MIN_SEEDS_FOR_STATS
+                ):
+                    seeds_text = (
+                        f"；检出该效应约需 {seeds_needed} 个种子"
+                        f"（当前 {n_pairs} 个）"
+                    )
+                delta = entry.get("delta")
+                delta_text = (
+                    f"Δ={float(delta):+.4f}"
+                    if isinstance(delta, (int, float))
+                    else "Δ=NA"
+                )
+                print(
+                    f"  [inconclusive] {entry['baseline']}→"
+                    f"{entry['variant']}  {delta_text}  {mde_text}"
+                    f"{seeds_text}：不显著也说明不了等价"
+                )
+            if not equivalent_entries and not inconclusive_entries:
+                print(
+                    "  所有对比均显著：本家族没有需要等价性"
+                    "解读的对比"
+                )
+            print(
+                "  注：等价界必须事先声明（--equivalence-margin）；"
+                "看到数据后再放宽等价界可以「制造」等价结论"
+            )
+
     # 基线合理性：复杂模型必须战胜精心调优过的基线，
     # 战胜稻草人说明不了任何问题（详见 baseline_adequacy）。
     print()
@@ -11633,6 +12355,9 @@ def print_comparison_analysis(
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
         "missing_efficiency_cells": missing_efficiency_cells,
+        "equivalence_margin": equivalence_margin,
+        "target_power": _TARGET_POWER,
+        "power_equivalence": equivalence_entries,
         "n_runs": len(rows),
     }
 
@@ -14906,6 +15631,105 @@ def run_self_test():
     assert first["significant_raw"] is True
     assert not first["significant"]
 
+    # ---- 对比分析：统计功效（非中心 t）与最小可检出效应 ----
+    # δ=0 时双侧功效恰等于 alpha（数值积分回归 t 检验定义）。
+    for zero_df in (2.0, 4.0, 10.0, 100.0):
+        zero_power = _t_power(0.0, 1.0, zero_df)
+        assert zero_power is not None
+        assert abs(zero_power - _SIGNIFICANCE_LEVEL) < 1e-5, zero_power
+    # 效应越大功效单调不减，大效应趋近 1（df=4 尾厚，
+    # δ=10 时功效 > 0.999）。
+    power_curve = [
+        _t_power(effect, 1.0, 4.0)
+        for effect in (0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
+    ]
+    assert all(p is not None for p in power_curve)
+    assert power_curve == sorted(power_curve)
+    assert float(power_curve[-1]) > 0.999
+    # 大 df 退化为正态近似：δ=1.96 时功效 ≈ 0.5
+    # （Φ(0) + Φ(-3.92) = 0.50004）。
+    normal_power = _t_power(1.96, 1.0, 100000.0)
+    assert normal_power is not None
+    assert abs(normal_power - 0.50004) < 5e-3, normal_power
+    # MDE 反解自洽：在 MDE 处功效恰为目标值。
+    mde_value = _minimum_detectable_effect(0.1, 4.0)
+    assert mde_value is not None and mde_value > 0.0
+    mde_power = _t_power(mde_value, 0.1, 4.0)
+    assert mde_power is not None
+    assert abs(mde_power - _TARGET_POWER) < 1e-3
+    # 种子间方差越大，MDE 越大（需要更大效应才能检出）。
+    mde_large_var = _minimum_detectable_effect(0.3, 4.0)
+    assert mde_large_var is not None and mde_large_var > mde_value
+    # 零标准误的退化：非零效应必被检出，零效应必不显著；
+    # 零方差时任意非零效应都可检出（MDE=0）。
+    assert _t_power(0.5, 0.0, 4.0) == 1.0
+    assert _t_power(0.0, 0.0, 4.0) == _SIGNIFICANCE_LEVEL
+    assert _minimum_detectable_effect(0.0, 4.0) == 0.0
+    assert _t_power(1.0, 1.0, 0.0) is None
+    assert _minimum_detectable_effect(0.1, 0.0) is None
+
+    # 所需种子数：效应/标准差 = 1 时约 9~12 个种子
+    # （配对 t 检验 80% 功效），效应减半需要更多种子。
+    unit_effect_seeds = _seeds_to_detect(1.0, 1.0)
+    assert unit_effect_seeds is not None
+    assert 8 <= unit_effect_seeds <= 12, unit_effect_seeds
+    half_effect_seeds = _seeds_to_detect(0.5, 1.0)
+    assert (
+        half_effect_seeds is not None
+        and half_effect_seeds > unit_effect_seeds
+    )
+    assert _seeds_to_detect(0.0, 1.0) is None
+
+    # ---- 对比分析：TOST 等价性检验 ----
+    # 小效应落在宽等价界内 → 等价（p 很小）；大效应 → 不等价。
+    tost_equivalent = _tost_test(0.001, 0.01, 8.0, 0.05)
+    assert float(tost_equivalent["tost_p_value"]) < 0.001
+    tost_different = _tost_test(0.2, 0.01, 8.0, 0.05)
+    assert float(tost_different["tost_p_value"]) > 0.9
+    # TOST p 必须等于两个单侧 p 的较大者（与 t CDF 换算自洽）。
+    tost_manual = _tost_test(0.02, 0.05, 6.0, 0.04)
+    expected_upper = _t_cdf((0.02 - 0.04) / 0.05, 6.0)
+    expected_lower = 1.0 - _t_cdf((0.02 + 0.04) / 0.05, 6.0)
+    assert expected_upper is not None and expected_lower is not None
+    assert abs(
+        float(tost_manual["tost_p_value"])
+        - max(expected_upper, expected_lower)
+    ) < 1e-12
+    # 零标准误的确定性判定：界内等价（p=0），界外不等价（p=1）。
+    assert (
+        _tost_test(0.001, 0.0, 8.0, 0.02)["tost_p_value"] == 0.0
+    )
+    assert (
+        _tost_test(0.05, 0.0, 8.0, 0.02)["tost_p_value"] == 1.0
+    )
+    # 等价性主张同样受多重比较校正：两个原始「等价」在
+    # 两检验家族里都翻转为不成立，equivalent_raw 留档。
+    equivalence_contrasts = [
+        {
+            "p_value": 0.20,
+            "significant": False,
+            "equivalent": True,
+            "tost_p_value": 0.03,
+            "verdict": "tie",
+        },
+        {
+            "p_value": 0.30,
+            "significant": False,
+            "equivalent": True,
+            "tost_p_value": 0.04,
+            "verdict": "tie",
+        },
+    ]
+    _apply_multiple_comparison_correction(equivalence_contrasts)
+    for entry in equivalence_contrasts:
+        assert entry["equivalent_raw"] is True
+        assert not entry["equivalent"]
+        assert abs(float(entry["tost_p_value_holm"]) - 0.06) < 1e-12
+    # 单检验家族不改变等价的 TOST p 值。
+    _apply_multiple_comparison_correction(equivalence_contrasts[:1])
+    assert equivalence_contrasts[0]["equivalent"] is True
+    assert equivalence_contrasts[0]["equivalent_raw"] is True
+
     # ---- 对比分析：受控变量 / 聚合 / 显著性 / 消融覆盖 ----
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
@@ -15207,6 +16031,121 @@ def run_self_test():
         )
         assert contrast["ci95_excludes_zero"]
         assert "95%CI" in _contrast_display(contrast, "val_loss")
+
+        # 功效/等价性口径：显著的真实差异（Δ=-0.25 vs 等价界
+        # ±1%×3.10≈0.031）必须给出 MDE、所需种子数与
+        # TOST 不等价判定，不能把它误标成「等价」。
+        powered_contrast = factor_contrasts(
+            aggregates,
+            ["mode"],
+            "val_loss",
+            equivalence_margin=0.01,
+        )[0]
+        assert powered_contrast["mde_80"] is not None
+        assert powered_contrast["mde_80"] > 0.0
+        assert powered_contrast["mde_80_relative"] is not None
+        assert powered_contrast["power_at_effect"] is not None
+        assert powered_contrast["seeds_to_detect"] is not None
+        assert powered_contrast["equivalence_margin"] == 0.01
+        assert abs(
+            float(powered_contrast["equivalence_margin_abs"])
+            - 0.031
+        ) < 1e-9
+        assert powered_contrast["equivalent"] is False
+        assert powered_contrast["equivalent_raw"] is False
+        assert (
+            float(powered_contrast["tost_p_value_holm"])
+            > _SIGNIFICANCE_LEVEL
+        )
+        assert "tost_p_value" in powered_contrast
+        assert "95%CI" in _contrast_display(
+            powered_contrast,
+            "val_loss",
+        )
+
+        # 接近等价的对比（Δ 远小于等价界、种子间波动极小）
+        # 必须被判定为等价：TOST 通过后展示层给出「支持无实质
+        # 差异」，这才是「不显著 → 无差异」所需要的证据。
+        near_equal_aggregates = [
+            {
+                "label": "mode=smelt",
+                "keys": {"mode": "smelt"},
+                "n_runs": 3,
+                "runs": ["smelt_seed42", "smelt_seed43", "smelt_seed44"],
+                "seeds": [42, 43, 44],
+                "duplicate_seeds": [],
+                "costs": {},
+                "val_loss_mean": 3.0000,
+                "val_loss_std": 0.0001,
+                "samples": {"val_loss": [
+                    {"seed": 42, "value": 3.0000},
+                    {"seed": 43, "value": 3.0001},
+                    {"seed": 44, "value": 2.9999},
+                ]},
+            },
+            {
+                "label": "mode=local_base",
+                "keys": {"mode": "local_base"},
+                "n_runs": 3,
+                "runs": [
+                    "local_base_seed42",
+                    "local_base_seed43",
+                    "local_base_seed44",
+                ],
+                "seeds": [42, 43, 44],
+                "duplicate_seeds": [],
+                "costs": {},
+                "val_loss_mean": 2.99985,
+                "val_loss_std": 0.00015,
+                "samples": {"val_loss": [
+                    {"seed": 42, "value": 2.9998},
+                    {"seed": 43, "value": 3.0000},
+                    {"seed": 44, "value": 2.99975},
+                ]},
+            },
+        ]
+        equivalent_contrast = factor_contrasts(
+            near_equal_aggregates,
+            ["mode"],
+            "val_loss",
+            equivalence_margin=0.01,
+        )[0]
+        assert equivalent_contrast["equivalent"] is True
+        assert equivalent_contrast["equivalent_raw"] is True
+        assert (
+            float(equivalent_contrast["tost_p_value_holm"])
+            <= _SIGNIFICANCE_LEVEL
+        )
+        equivalent_display = _contrast_display(
+            equivalent_contrast,
+            "val_loss",
+        )
+        assert "TOST 等价" in equivalent_display
+        assert "无实质差异" in equivalent_display
+
+        # 不显著且等价性未确立：展示层必须同时给出
+        # 「未显著 ≠ 等价」与 80% 功效 MDE，不能只写「无差异」。
+        inconclusive_display = _contrast_display(
+            {
+                "factor": "mode",
+                "baseline_value": "local_base",
+                "variant_value": "A",
+                "baseline": "mode=local_base",
+                "delta": -0.001,
+                "p_value": 0.60,
+                "test": "paired_t",
+                "n_pairs": 3,
+                "verdict": "improvement",
+                "significant": False,
+                "delta_over_noise": 0.10,
+                "mde_80": 0.0150,
+                "seeds_to_detect": 12,
+            },
+            "val_loss",
+        )
+        assert "未显著不代表等价" in inconclusive_display
+        assert "0.0150" in inconclusive_display
+        assert "12 个种子" in inconclusive_display
 
         # 伪重复：同一单元里同一个种子被复制成多个运行（目录
         # 复制的常见事故）不是独立重复实验。必须点名重复种子、
@@ -16020,7 +16959,8 @@ def run_self_test():
         assert not balanced_report["advisories"]
 
         # print_comparison_analysis 必须携带三个新检查的结构化
-        # 结果（随 comparison_analysis.json 落盘）。
+        # 结果（随 comparison_analysis.json 落盘），等价性/功效
+        # 口径同样要落盘（报告可脱离终端回读）。
         full_analysis = print_comparison_analysis(
             hyp_rows,
             factors=factors,
@@ -16030,6 +16970,21 @@ def run_self_test():
         assert full_analysis["baseline_adequacy"]["ok"] is True
         assert full_analysis["hypothesis_registry"]["cells"]
         assert "imbalance_advisory" in full_analysis
+        assert (
+            full_analysis["equivalence_margin"]
+            == _DEFAULT_EQUIVALENCE_MARGIN
+        )
+        assert full_analysis["target_power"] == _TARGET_POWER
+        assert "power_equivalence" in full_analysis
+        # 指定等价界后按声明口径记录（不是固定默认值）。
+        custom_margin_analysis = print_comparison_analysis(
+            hyp_rows,
+            factors=factors,
+            baseline_mode="smelt",
+            metric="val_loss",
+            equivalence_margin=0.02,
+        )
+        assert custom_margin_analysis["equivalence_margin"] == 0.02
 
         # ---- 基线调参网格（--suite-baseline-tuning） ----
         # 计划只允许学习率变化（steps/batch/数据继承同一命令行，
@@ -17262,6 +18217,7 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             if args.suite_ablation and args.ablation_modes
             else None
         ),
+        equivalence_margin=args.equivalence_margin,
     )
     # 种子计划随报告落盘：事后能核对本轮结论是在几个种子上
     # 得出的、是否使用了低统计功效豁免。
@@ -17551,6 +18507,21 @@ def main():
             + ", ".join(COMPARISON_METRIC_KEYS)
         ),
     )
+    parser.add_argument(
+        "--equivalence-margin",
+        type=float,
+        default=_DEFAULT_EQUIVALENCE_MARGIN,
+        metavar="REL",
+        help=(
+            "等价性检验（TOST）的等价界，相对基线均值的比例"
+            "（默认 "
+            f"{_DEFAULT_EQUIVALENCE_MARGIN:g}，即 1%%）："
+            "「不显著」只能说明未发现差异，不等于无差异；"
+            "报告在预先声明的等价界内给出 TOST 判定，以及 "
+            "80% 功效下的最小可检出效应（MDE）与所需种子数，"
+            "避免把功效不足误读成方法等价"
+        ),
+    )
 
     parser.add_argument(
         "--seeds",
@@ -17720,6 +18691,14 @@ def main():
         parser.error("--weight-decay 必须是有限非负数")
     if not math.isfinite(args.grad_clip) or args.grad_clip <= 0:
         parser.error("--grad-clip 必须为正数")
+    if (
+        not math.isfinite(args.equivalence_margin)
+        or args.equivalence_margin <= 0.0
+    ):
+        parser.error(
+            "--equivalence-margin 必须是有限正数"
+            "（相对基线均值的比例，如 0.01 = 1%）"
+        )
     if args.skip_sanity_check and args.sanity_only:
         parser.error(
             "--skip-sanity-check 与 --sanity-only 不能同时使用"
@@ -17989,6 +18968,7 @@ def main():
             factors=parse_factor_spec(args.compare_factors),
             baseline_mode=args.compare_baseline,
             metric=args.compare_metric,
+            equivalence_margin=args.equivalence_margin,
         )
         return
 

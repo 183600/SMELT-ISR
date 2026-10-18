@@ -121,11 +121,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `aggregate_runs`、`factor_contrasts`、`_paired_t_test`、
   `_welch_t_test`、`_two_sided_t_p_value`：按实验单元聚合
   Mean ± Std、单因子显著性检验（无 SciPy 依赖的 t 分布 p 值）。
+- `_t_power`、`_minimum_detectable_effect`、`_seeds_to_detect`：
+  非中心 t 分布功效的数值积分（对 chi 分布做自适应 Simpson
+  积分，按 df 缓存节点）、80% 功效的最小可检出效应（MDE）
+  与按当前种子间波动检出观测效应所需的近似种子数。
+- `_tost_test`、`_t_cdf`、`_attach_power_equivalence`：TOST
+  等价性检验（等价界相对基线均值，`--equivalence-margin`）、
+  t 分布 CDF 与对比记录的功效/等价性字段挂载。
 - `_holm_bonferroni`、`_benjamini_hochberg`、`_t_critical`、
   `_contrast_interval`、`_apply_multiple_comparison_correction`：
   检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
   t 临界值与效应量 95% 置信区间；显著性判定与权衡结论
-  以 Holm 校正后为准。
+  以 Holm 校正后为准，等价性（TOST）主张做同口径校正。
 - `ablation_coverage`：(1+N)×2 全因子消融覆盖检查（默认
   N=A/B 两个延迟合并方案；含消融单元之间
   `k1/k2/top_k/residual_scale` 结构一致性与均衡强度一致性
@@ -231,7 +238,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两
   对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
   会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
-  3~5。**伪重复检测**：同一实验单元里同一随机种子出现多次
+  3~5。**不显著 ≠ 等价（功效与等价性口径）**：显著性检验
+  只能回答「有没有证据反对差异为 0」。每个检验过的对比同时
+  记录 80% 功效下的最小可检出效应 `mde_80`（含相对基线均值的
+  `mde_80_relative`）、观测效应自身的功效 `power_at_effect` 与
+  按当前种子间波动检出观测效应所需的近似种子数
+  `seeds_to_detect`；并对预先声明的等价界 `--equivalence-margin`
+  （相对基线均值，默认 1%）做 TOST 两单侧等价性检验。TOST
+  p 值（`tost_p_value`，较小者支持等价）与显著性检验共享
+  家族校正：Holm 校正后仍通过才能在报告中主张「无实质差异」
+  （`equivalent`，未校正判定留档于 `equivalent_raw`）；不显著
+  且等价性未确立时结论只能是「不确定」，展示层打印 MDE 与
+  所需种子数，区分「效应太小」与「种子太少」。等价界必须
+  事先声明：看到数据后再放宽界可以「制造」等价结论。功效
+  积分对 chi 分布做自适应 Simpson 数值积分（按 df 缓存），
+  δ=0 时功效恰为 alpha，大 df 退化为正态近似，自测覆盖这些
+  解析回归点。**伪重复检测**：同一实验单元里同一随机种子出现多次
   （复制运行目录、重复登记同一运行）会被按种子配对时的字典
   静默合并、虚增样本数并低估种子间方差；聚合层显式记录
   `duplicate_seeds`，展示层点名重复种子，检验层禁用配对检验
@@ -366,8 +388,11 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--early-stop-min-delta`、`--bad-cases`（默认 10，0 关闭）、
 `--skip-efficiency`（跳过结束时的效率测量）、
 `--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
-变量检查、Mean ± Std 与显著性检验）、`--compare-factors`、
-`--compare-baseline MODE`、`--compare-metric`。
+变量检查、Mean ± Std、显著性检验与功效/等价性分析）、
+`--compare-factors`、`--compare-baseline MODE`、`--compare-metric`、
+`--equivalence-margin REL`（TOST 等价界，相对基线均值，默认
+0.01 = 1%；报告以此区分「无实质差异」与「未发现显著差异」，
+并给出 80% 功效 MDE 与所需种子数）。
 
 多种子 / 消融套件：`--seeds SEED [SEED ...]`、
 `--suite-modes MODE [MODE ...]`（配合 `--seeds` 做控变量的
