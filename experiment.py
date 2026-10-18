@@ -3454,6 +3454,11 @@ _AUC_MIN_SUPPORT = 20
 # 不会触顶）。超出时按窗口顺序截断并在结果中注明。
 _AUC_MAX_TOKENS = 100_000
 
+# AUC 分块排序的块大小上限（纳入类数 × 评估位置数）：
+# 块内一次批量排序，块规模固定使中间量有界（10 万位置
+# 时每块 16 个类）。
+_AUC_SORT_CHUNK_ELEMENTS = 1_600_000
+
 
 def confusion_matrix_metrics(
     confusion: torch.Tensor,
@@ -3521,122 +3526,6 @@ def confusion_matrix_metrics(
     }
 
 
-def _binary_roc_auc(
-    sorted_scores: torch.Tensor,
-    order: torch.Tensor,
-    labels: torch.Tensor,
-) -> Optional[float]:
-    """
-    精确处理并列分数的 Mann-Whitney ROC-AUC。
-
-    sorted_scores / order 是 scores 的升序排序结果及其索引，
-    由调用方统一计算并在 ROC-AUC 与 PR-AUC 之间复用；
-    labels 为 0/1 的目标向量；正类或负类为空时返回
-    None（该类不计入 macro 平均）。
-    """
-    n = sorted_scores.numel()
-    n_pos = int(labels.sum())
-
-    if n_pos == 0 or n_pos == n:
-        return None
-
-    n_neg = n - n_pos
-
-    # 并列分数取平均秩，保证 AUC 与并列组内的随机排序
-    # 期望一致。
-    change = torch.ones(n, dtype=torch.bool)
-    change[1:] = sorted_scores[1:] != sorted_scores[:-1]
-    group = torch.cumsum(change, 0) - 1
-
-    starts = torch.nonzero(change).squeeze(1)
-    ends = torch.cat(
-        [
-            starts[1:],
-            torch.tensor([n], dtype=starts.dtype),
-        ]
-    )
-
-    # 排序后第 i 个位置（0 基）的 1 基秩为 i+1；同组并列
-    # 分数共享平均秩 (start + end) / 2（1 基、右开）。
-    average_rank = (
-        starts[group] + 1 + ends[group]
-    ).double() / 2.0
-
-    positive_ranks = average_rank[
-        labels[order].bool()
-    ]
-
-    auc = (
-        positive_ranks.sum()
-        - n_pos * (n_pos + 1) / 2.0
-    ) / float(n_pos * n_neg)
-
-    return float(auc)
-
-
-def _binary_average_precision(
-    sorted_scores: torch.Tensor,
-    order: torch.Tensor,
-    labels: torch.Tensor,
-) -> Optional[float]:
-    """
-    单类 one-vs-rest 的 average precision（PR-AUC）。
-
-    sorted_scores / order 是 scores 的升序排序结果及其索引，
-    由调用方统一计算并在 ROC-AUC 与 PR-AUC 之间复用；按
-    相异分数阈值分步累计（与 sklearn average_precision_score
-    的阶梯式口径一致）；正类为空时返回 None。
-
-    labels 为 0/1 目标向量（布尔或浮点）。累计真正例数在
-    整数/布尔下完成，除法则提升到 fp64，结果与先转 fp64
-    再累计逐位一致。
-    """
-    n_pos = int(labels.sum())
-
-    if n_pos == 0:
-        return None
-
-    # 升序排序翻转即降序；并列组仍然连续，且阈值组的
-    # 枚举顺序（分数从高到低）与组内顺序无关，结果不变。
-    order = order.flip(0)
-    sorted_scores = sorted_scores.flip(0)
-    sorted_labels = labels[order]
-
-    n = labels.numel()
-    positions = torch.arange(
-        1,
-        n + 1,
-        dtype=torch.float64,
-    )
-
-    # 每个相异分数阈值组结束位置的累计真正例数。
-    hits = torch.cumsum(sorted_labels, 0)
-
-    # 组边界：分数变化处的下一个位置是该组的结束位置
-    # （1 基）；最后一组以 n 结束。
-    boundary = torch.ones(n, dtype=torch.bool)
-    boundary[:-1] = (
-        sorted_scores[1:] != sorted_scores[:-1]
-    )
-    boundary_indices = torch.nonzero(boundary).squeeze(1)
-
-    tp = hits[boundary_indices]
-    ranks = positions[boundary_indices]
-
-    precision = tp / ranks
-    recall = tp.double() / float(n_pos)
-
-    # AP = Σ (R_i − R_{i−1}) × Precision_i。
-    recall_gain = torch.cat(
-        [
-            recall[:1],
-            recall[1:] - recall[:-1],
-        ]
-    )
-
-    return float((recall_gain * precision).sum())
-
-
 def macro_auc_metrics(
     probabilities: torch.Tensor,
     targets: torch.Tensor,
@@ -3660,6 +3549,17 @@ def macro_auc_metrics(
     比例缩放，脱离该水平看绝对值没有意义；1:1000 级别的
     不平衡下随机 PR-AUC 只有约 0.001，而随机 ROC-AUC 仍
     是 0.5，两者的「及格线」完全不同。
+
+    每个类独立做 one-vs-rest：ROC-AUC 为并列分数取平均
+    秩的 Mann-Whitney 统计量；PR-AUC 按相异分数阈值分步
+    累计（与 sklearn average_precision_score 的阶梯式口径
+    一致）。正类或负类为空的类按对应口径不计入 macro。
+
+    实现按「类块 × 全部 token」分块：块内对各类分数一次
+    批量排序后向量化统计，逐类结果与逐类单独排序的实现
+    逐位一致——组秩与组边界均为整数运算（半整数秩以 2 倍
+    整数累计，求和精确且与逐类求和同值），PR-AUC 分段
+    求和的加数顺序也保持不变。
     """
     probabilities = probabilities.detach().cpu().float()
     targets = targets.detach().cpu()
@@ -3672,37 +3572,169 @@ def macro_auc_metrics(
         support >= min_support
     ).squeeze(1)
 
+    n_tokens = int(targets.numel())
+
     pr_aucs: List[float] = []
     roc_aucs: List[float] = []
     pr_prevalence_sum = 0.0
 
-    # compute once on CPU for prevalence to avoid repeated device ops
-    targets_cpu = targets.cpu()
-    for class_index in eligible.tolist():
-        labels = targets_cpu == class_index
-        scores = probabilities[:, class_index]
-
-        # ROC-AUC 与 PR-AUC 复用同一次排序结果。
-        sorted_scores, order = torch.sort(scores)
-
-        pr = _binary_average_precision(
-            sorted_scores,
-            order,
-            labels,
+    if eligible.numel() > 0 and n_tokens > 0:
+        # 块大小（类数 × 评估位置数）固定，块内中间量规模
+        # 不随评估集增大而膨胀。
+        chunk_size = max(
+            1,
+            _AUC_SORT_CHUNK_ELEMENTS // n_tokens,
         )
-        if pr is not None:
-            pr_aucs.append(pr)
-            pr_prevalence_sum += (
-                float(labels.sum().item()) / labels.numel()
+        index_i32 = torch.arange(n_tokens, dtype=torch.int32)
+        invalid_i32 = torch.tensor(-1, dtype=torch.int32)
+        n_i32 = torch.tensor(n_tokens, dtype=torch.int32)
+
+        for begin in range(0, eligible.numel(), chunk_size):
+            chunk = eligible[begin:begin + chunk_size]
+            n_classes = int(chunk.numel())
+
+            # 块内每个类一列：分数升序排序，ROC-AUC 与
+            # PR-AUC 复用同一次排序结果。
+            scores = probabilities[:, chunk].t().contiguous()
+            labels = (
+                targets.unsqueeze(0) == chunk.unsqueeze(1)
+            )
+            n_pos = labels.sum(dim=1)
+            n_pos_list = n_pos.tolist()
+
+            sorted_scores, order = torch.sort(
+                scores, dim=1
+            )
+            sorted_labels = labels.gather(1, order)
+
+            # 并列组：change 标记组起点；组内每个位置的
+            # 1 基平均秩为 (start + end_excl + 1) / 2。
+            change = torch.ones_like(
+                sorted_scores, dtype=torch.bool
+            )
+            change[:, 1:] = (
+                sorted_scores[:, 1:] != sorted_scores[:, :-1]
+            )
+            group_start = torch.cummax(
+                torch.where(change, index_i32, invalid_i32),
+                dim=1,
+            ).values
+            next_change = torch.flip(
+                torch.cummin(
+                    torch.flip(
+                        torch.where(change, index_i32, n_i32),
+                        dims=[1],
+                    ),
+                    dim=1,
+                ).values,
+                dims=[1],
+            )
+            group_end_excl = torch.cat(
+                [
+                    next_change[:, 1:],
+                    n_i32.expand(n_classes, 1),
+                ],
+                dim=1,
             )
 
-        roc = _binary_roc_auc(
-            sorted_scores,
-            order,
-            labels,
-        )
-        if roc is not None:
-            roc_aucs.append(roc)
+            # 平均秩恒为整数或半整数，以 2×秩 的整数和
+            # 累计，除以 2 后与逐类实现的 fp64 秩和一致。
+            rank_half = (
+                (group_start << 1)
+                + (group_end_excl - group_start)
+                + 1
+            )
+            roc_rank_half_sums = (
+                rank_half * sorted_labels
+            ).sum(dim=1)
+
+            # PR-AUC：降序排序下每个相异分数阈值组的
+            # 结束位置（1 基秩）与累计真正例数。
+            labels_desc = sorted_labels.flip(1)
+            hits = torch.cumsum(labels_desc, dim=1)
+            scores_desc = sorted_scores.flip(1)
+            boundary = torch.ones_like(
+                sorted_scores, dtype=torch.bool
+            )
+            boundary[:, :-1] = (
+                scores_desc[:, 1:] != scores_desc[:, :-1]
+            )
+            boundary_counts = boundary.sum(dim=1)
+
+            # 组边界按行主序压缩成一维：每类的边界连续，
+            # split 分段即为逐类顺序。行内顺序与逐类实现
+            # 的组枚举顺序相同。
+            boundary_flat = (
+                boundary.view(-1).nonzero().squeeze(1)
+            )
+            boundary_class = torch.div(
+                boundary_flat,
+                n_tokens,
+                rounding_mode="floor",
+            )
+            boundary_hits = hits.view(-1).gather(
+                0, boundary_flat
+            )
+            boundary_ranks_desc = (
+                boundary_flat
+                - boundary_class * n_tokens
+            ).double() + 1.0
+
+            recall = (
+                boundary_hits.double()
+                / n_pos.gather(
+                    0, boundary_class
+                ).double()
+            )
+            precision = (
+                boundary_hits.double()
+                / boundary_ranks_desc
+            )
+
+            # AP = Σ (R_i − R_{i−1}) × Precision_i；段首
+            # 的 R_{i−1} 取 0，增益即该组 recall。
+            recall_gain = recall.clone()
+            if recall_gain.numel() > 1:
+                recall_gain[1:] = recall[1:] - recall[:-1]
+                boundary_start = torch.ones(
+                    recall_gain.numel(), dtype=torch.bool
+                )
+                boundary_start[1:] = (
+                    boundary_class[1:] != boundary_class[:-1]
+                )
+                recall_gain[boundary_start] = recall[
+                    boundary_start
+                ]
+            ap_terms = recall_gain * precision
+            ap_sums = torch.split(
+                ap_terms, boundary_counts.tolist()
+            )
+
+            for class_offset in range(n_classes):
+                n_pos_class = int(n_pos_list[class_offset])
+                if n_pos_class > 0:
+                    pr_aucs.append(
+                        float(ap_sums[class_offset].sum())
+                    )
+                    pr_prevalence_sum += (
+                        float(n_pos_class) / n_tokens
+                    )
+                if 0 < n_pos_class < n_tokens:
+                    n_neg_class = n_tokens - n_pos_class
+                    roc_aucs.append(
+                        float(
+                            (
+                                roc_rank_half_sums[
+                                    class_offset
+                                ].double()
+                                / 2.0
+                                - n_pos_class
+                                * (n_pos_class + 1)
+                                / 2.0
+                            )
+                            / float(n_pos_class * n_neg_class)
+                        )
+                    )
 
     return {
         "pr_auc_macro": (
@@ -3727,7 +3759,7 @@ def macro_auc_metrics(
         "pr_auc_n_classes": len(pr_aucs),
         "roc_auc_n_classes": len(roc_aucs),
         "auc_min_support": min_support,
-        "auc_tokens_evaluated": int(targets.numel()),
+        "auc_tokens_evaluated": n_tokens,
     }
 
 
