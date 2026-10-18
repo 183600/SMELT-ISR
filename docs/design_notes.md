@@ -99,16 +99,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   测试集封存、sanity check 判定与「同种子两次运行逐位一致」
   的端到端可复现性自测。
 - `analyze_training_curve`、`print_curve_analysis`：从 `metrics.jsonl`
-  重建训练/验证曲线并给出过拟合、欠拟合、未收敛、发散等判定。
+  重建训练/验证曲线并给出过拟合、欠拟合、未收敛、发散等判定；
+  泛化 gap 持续扩大但验证尚未回升时给出「过拟合前兆」警告与
+  早停建议。`monitor_training_curve` 在训练期间的每个验证点
+  复用同一判定，只在状态迁移时打印并写入 `curve_monitor` 记录。
 - `early_stop_state_from_records`：恢复训练时从历史验证点重建早停
   状态（最优值、最优步、连续未改善次数）。
 - `diagnose_non_finite`、`print_non_finite_report`：首次出现
   NaN/Inf 损失或梯度时的四步排查（数据 → 前向数值 → 混合精度 →
   梯度/优化器状态），报告写入触发的 `metrics.jsonl` 记录。
-- `analyze_bad_cases`、`print_bad_cases`：分组错误案例并从
-  歧义、系统性混淆、疑似标签噪声、不确定四类原因中给出归类。
-- `measure_efficiency`、`print_efficiency`：参数量与前向 FLOPs
-  （线性层实测 + 注意力估计）。
+- `analyze_bad_cases`、`print_bad_cases`：在验证集固定窗口上流式
+  统计全部目标 token（不做随机下采样），把错误案例按歧义、
+  系统性混淆、疑似标签噪声、不确定四类原因归类；top-N 最差样本
+  用「每批 top-N + 跨批截断」精确维护，窗口只为入选样本保留。
+- `measure_efficiency`、`print_efficiency`：参数量、前向 FLOPs
+  （线性层实测 + 注意力估计）、推理延迟/吞吐、训练步耗时
+  （前向+反向，不含优化器更新）与推理/训练峰值显存。
 - `compare_runs`、`print_comparison`：汇总多个运行目录的
   config 与最终指标。
 - `build_comparison_protocol`、`check_controlled_variables`：
@@ -133,11 +139,16 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 ## 结果分析方法
 
 - **曲线而非单点**：每轮实验结束时从 `metrics.jsonl` 重建曲线，
-  在 `{"step": "curve_analysis", ...}` 中记录状态与建议。
+  在 `{"step": "curve_analysis", ...}` 中记录状态与建议；
+  训练期间每个验证点在线复用同一判定，状态迁移（如
+  healthy→overfitting、发散）立即打印并写入 `curve_monitor`。
   判定需要至少 3 个验证点；验证损失在最优值后又明显回升判为
-  过拟合，训练损失仍在下降或验证损失远高于 `ln(vocab_size)` 时
-  判为欠拟合/尚未学到（`--steps` 不足），出现非有限事件判为发散。
-  训练损失或梯度任一非有限都计为非有限事件并写入记录。
+  过拟合，训练损失不降且仍接近随机基线判为欠拟合，两者都不降
+  （区分学习率已退火与停滞）指向欠拟合/学习率不当/数据管道，
+  出现非有限事件判为发散。泛化 gap 从首个验证点起扩大达到阈值
+  且最终 gap 已不低时，即使验证损失尚未回升也会给出过拟合前兆
+  警告（`gap_widening_warning`）与早停建议。训练损失或梯度任一
+  非有限都计为非有限事件并写入记录。
 - **NaN/Inf 系统排查**：训练循环检测到非有限损失/梯度时跳过该步
   的优化器与调度器更新，首次事件自动运行 `diagnose_non_finite`：
   1）数据批次是否存在 NaN/Inf 或越界 token（整数比较前提升到
@@ -146,13 +157,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   溢出；4）逐参数梯度与优化器状态是否被污染。参数或优化器状态
   已被污染（或连续三次事件）时提前停止训练，不覆盖 `last.pt`，
   提示从污染前检查点恢复并降低学习率/收紧 `--grad-clip`。
-- **坏案例分析**：从验证集固定窗口抽取置信度最低的若干 token，
-  记录上下文、目标/预测字节、是否命中同窗口重复模式，按四类原因
-  归类；完整报告写入 `out_dir/bad_cases.json`。测试集解封的
-  唯一一次评估会附带 test 坏案例。
+- **坏案例分析**：在验证集固定窗口上流式统计全部 token 的
+  损失/置信度/margin（每 token 约 10 字节紧凑缓冲，不物化窗口
+  矩阵、不做随机下采样，token 准确率与 `evaluate` 同口径），
+  top-N 最差样本用「每批 top-N + 跨批截断」精确维护，记录上下文、
+  目标/预测字节与混淆计数，按四类原因归类；全量错误 token 的
+  类别份额（`error_category_counts/shares`）作为改进线索的主证据，
+  避免「最高损失样本恰好同类」把结论带偏；完整报告写入
+  `out_dir/bad_cases.json`。测试集解封的唯一一次评估会附带
+  test 坏案例。
 - **效率口径**：FLOPs 线性层部分用 `FlopCounterMode` 实测，
   注意力按 4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层
-  执行两轮，按真实执行次数累计）。
+  执行两轮，按真实执行次数累计）；另有实测的推理延迟/吞吐与
+  训练步耗时（前向+反向中位耗时，测量在最终/测试评估前执行、
+  不含优化器更新以免污染待评估参数）、推理/训练峰值显存与
+  进程 RSS。`--compare` 的效率倍率同时覆盖参数、FLOPs、推理
+  延迟、训练步耗时与峰值内存。
 - **早停与选型**：`--early-stop-patience` 启用；NaN 验证损失不算
   「改善」；`--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑
   语义一致。最优验证点同时是模型选择依据（`best.pt`），final/test

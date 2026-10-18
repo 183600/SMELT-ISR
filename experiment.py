@@ -5052,6 +5052,13 @@ _CURVE_NO_LEARN_BASELINE = 0.9
 # 仍在降」会把这类典型过拟合误报成 healthy。
 _CURVE_GENERALIZATION_GAP = 0.1
 
+# 泛化 gap 的早期预警：从首个验证点到最后一个验证点，泛化
+# gap（相对验证损失的比例）扩大达到该幅度、且最终 gap 已不低
+# 时，即使验证损失尚未明显回升（未触发 overfitting），也提示
+# 「训练损失继续降但验证收益停滞」的过拟合前兆，建议提前准备
+# 早停/加正则化。等在验证损失明显回升后才报警会浪费训练预算。
+_CURVE_GAP_WIDENING = 0.05
+
 # 学习率已退火到峰值的该比例以下时，训练/验证双走平更像
 # 调度末期的正常收敛平台，而不是学习率不当/数据管道问题
 # （默认调度为 cosine 退火到峰值的 10%，留少量余量）。
@@ -5347,13 +5354,22 @@ def analyze_training_curve(
     # 泛化 gap：最终训练损失比验证损失低出的相对比例。记忆化
     # regime 下训练损失常在低位走平而不再「仍在下降」，但
     # 大 gap + 验证回升同样是典型过拟合证据。
-    generalization_gap_ratio = (
-        (
-            float(last["val_loss"]) - float(last["train_loss"])
-        )
-        / float(last["val_loss"])
-        if last["train_loss"] is not None
-        and float(last["val_loss"]) > 0.0
+    def _gap_ratio(point):
+        if (
+            point["train_loss"] is None
+            or float(point["val_loss"]) <= 0.0
+        ):
+            return None
+        return (
+            float(point["val_loss"]) - float(point["train_loss"])
+        ) / float(point["val_loss"])
+
+    generalization_gap_ratio = _gap_ratio(last)
+    generalization_gap_ratio_first = _gap_ratio(first)
+    generalization_gap_trend = (
+        generalization_gap_ratio - generalization_gap_ratio_first
+        if generalization_gap_ratio is not None
+        and generalization_gap_ratio_first is not None
         else None
     )
     train_below_val = (
@@ -5392,6 +5408,16 @@ def analyze_training_curve(
             if generalization_gap_ratio is None
             else round(generalization_gap_ratio, 6)
         ),
+        "generalization_gap_ratio_first": (
+            None
+            if generalization_gap_ratio_first is None
+            else round(generalization_gap_ratio_first, 6)
+        ),
+        "generalization_gap_trend": (
+            None
+            if generalization_gap_trend is None
+            else round(generalization_gap_trend, 6)
+        ),
         "curve_sparkline_train": _sparkline(
             [value for _, value in train_points]
         ),
@@ -5399,6 +5425,26 @@ def analyze_training_curve(
             [point["val_loss"] for point in finite_evals]
         ),
     })
+
+    # 过拟合前兆：验证损失尚未明显回升（未触发 overfitting），
+    # 但泛化 gap 从首个验证点起持续扩大且已不低。此时训练损失
+    # 仍在降而验证收益停滞，继续训练大概率只会加深过拟合；
+    # 在状态判定后统一追加警告，不改变既有 status 语义。
+    gap_widening = (
+        generalization_gap_trend is not None
+        and generalization_gap_ratio is not None
+        and generalization_gap_trend >= _CURVE_GAP_WIDENING
+        and generalization_gap_ratio >= _CURVE_GENERALIZATION_GAP
+    )
+    analysis["gap_widening_warning"] = bool(gap_widening)
+    if gap_widening:
+        warnings.append(
+            "泛化 gap 相对首个验证点扩大 "
+            f"{generalization_gap_trend * 100:.1f} 个百分点"
+            "（最终 gap "
+            f"{generalization_gap_ratio * 100:.1f}%）："
+            "训练损失继续下降但验证收益停滞，是过拟合前兆。"
+        )
 
     if (
         best_index <= len(finite_evals) - 2
@@ -5514,6 +5560,21 @@ def analyze_training_curve(
             "训练与验证损失同步下降、验证未回升或仅轻微波动，"
             "曲线健康；如需进一步改善，可关注仍未收敛时的"
             "更多步数与模型容量。"
+        )
+
+    # 过拟合前兆的行动建议：状态仍判 healthy/not_converged（验证
+    # 尚未回升），但必须提示现在就设置早停/加强正则化，而不是等
+    # 验证损失回升后才行动。
+    if gap_widening and analysis["status"] in (
+        "healthy",
+        "not_converged",
+    ):
+        analysis["recommendation"] = (
+            str(analysis["recommendation"])
+            + " 注意泛化 gap 正在扩大（训练损失下降、验证收益"
+            "停滞）：建议立即设定或收紧早停"
+            "（--early-stop-patience），并加强正则化/增大数据，"
+            "避免验证损失回升后才被动止损。"
         )
 
     analysis["recent_train_drop"] = (
@@ -5672,11 +5733,6 @@ _BAD_CASE_RARE_TARGET_SHARE = 0.005
 # 同一 (target, predicted) 混淆对在错误列表中出现该次数以上时，
 # 视为系统性混淆（模型盲区），而不是孤立个例。
 _BAD_CASE_SYSTEMATIC_COUNT = 3
-# 坏案例统计的 token 数上限与抽样种子：超过上限时按固定
-# 种子随机下采样，避免在超大评估集上做全量 topk，同时保证
-# 报告可复现且不消耗全局 RNG。
-_BAD_CASE_MAX_TOKENS = 100_000
-_BAD_CASE_SUBSAMPLE_SEED = 20240601
 
 
 def _render_byte(value: int) -> str:
@@ -5720,6 +5776,14 @@ def analyze_bad_cases(
       label_noise_suspect（目标字节稀少但模型高置信度答错，
       提示标注可能有误）、uncertain（其余）。
 
+    统计口径与实现：在固定窗口上流式处理全部目标 token，
+    token 准确率、混淆对、逐目标错误率与错误类别归因都基于
+    全量评估 token（与 evaluate 同一窗口集合、同一预测口径），
+    不对评估集做随机下采样；top_n 最差样本通过「每批 top-N +
+    跨批截断」精确维护（全局 top-N 必然出现在各自批次的
+    top-N 内），窗口只为入选样本保留，内存与 top_n 成正比、
+    与评估 token 数基本无关。相同数据与模型下报告逐位可复现。
+
     仅访问 val（或显式解封后的 test），绝不接触训练期间尘封的
     测试集；输出既打印，也写回 metrics.jsonl 的
     ``{"step": "bad_cases", ...}`` 记录，完整报告另存
@@ -5735,12 +5799,32 @@ def analyze_bad_cases(
 
     vocab_size = _unwrap_model(model).cfg.vocab_size
 
+    # fixed_eval_batch 的每个窗口行含 seq_len+1 个 token，
+    # 输入 x 与目标 y 各 seq_len 个位置。
+    sequence_length = dataset.seq_len
+
+    # 全量统计缓冲：每个 token 只保留紧凑标量（loss fp32 +
+    # target/predicted uint8 + confidence/margin fp16，约 10
+    # 字节/token），不对评估窗口做全量物化。此前的实现把
+    # [N, seq_len] 的窗口矩阵整体拼接后在超限时随机下采样，
+    # 导致「全量错误归因」实际上只是子样本归因；流式统计后
+    # 口径与 evaluate 的固定窗口评估完全一致。
     losses: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []
     predictions: List[torch.Tensor] = []
     confidences: List[torch.Tensor] = []
     margins: List[torch.Tensor] = []
-    windows: List[torch.Tensor] = []
+
+    # 全局 top-N 最差 token：每批先取本批 top-N 候选再跨批截断
+    #（全局 top-N 必然在各自批次的 top-N 内），窗口只为入选
+    # 样本保留，内存与 top_n 成正比而不是与评估 token 数成正比。
+    # 插入序号保证并列损失下的排序确定（报告可复现）。
+    # 候选项：(loss, 插入序号, 窗口行, 目标位置, target,
+    # predicted, confidence, margin)。
+    top_candidates: List[
+        Tuple[float, int, torch.Tensor, int, int, int, float, float]
+    ] = []
+    top_insert_counter = 0
 
     try:
         with torch.autocast(
@@ -5790,21 +5874,62 @@ def analyze_bad_cases(
                     dim=1,
                 )
 
-                losses.append(loss_tokens.reshape(-1).cpu())
-                targets.append(y.reshape(-1).cpu())
+                batch_loss = loss_tokens.reshape(-1)
+                batch_target = y.reshape(-1)
+                batch_predicted = predicted.reshape(-1)
+                batch_confidence = confidence.reshape(-1)
+                batch_margin = (
+                    confidence - target_probability
+                ).reshape(-1)
+
+                losses.append(batch_loss.cpu())
+                targets.append(batch_target.cpu())
                 predictions.append(
-                    predicted.reshape(-1).to(torch.int16).cpu()
+                    batch_predicted.to(torch.int16).cpu()
                 )
                 confidences.append(
-                    confidence.reshape(-1).to(torch.float16).cpu()
+                    batch_confidence.to(torch.float16).cpu()
                 )
                 margins.append(
-                    (confidence - target_probability)
-                    .reshape(-1)
-                    .to(torch.float16)
-                    .cpu()
+                    batch_margin.to(torch.float16).cpu()
                 )
-                windows.append(window.cpu())
+
+                # 本批的 top-N 候选（全局 top-N 必在其中）。
+                if top_n > 0 and batch_loss.numel() > 0:
+                    batch_k = min(top_n, batch_loss.numel())
+                    batch_top_losses, batch_top_indices = (
+                        torch.topk(batch_loss, k=batch_k)
+                    )
+                    batch_top_losses = (
+                        batch_top_losses.cpu().tolist()
+                    )
+                    batch_top_indices = (
+                        batch_top_indices.reshape(-1).cpu()
+                    )
+                    window_cpu = window.cpu()
+                    for local_loss, local_index in zip(
+                        batch_top_losses,
+                        batch_top_indices.tolist(),
+                    ):
+                        row = local_index // sequence_length
+                        position = local_index % sequence_length
+                        top_candidates.append((
+                            float(local_loss),
+                            top_insert_counter,
+                            window_cpu[row],
+                            position,
+                            int(batch_target[local_index]),
+                            int(batch_predicted[local_index]),
+                            float(batch_confidence[local_index]),
+                            float(batch_margin[local_index]),
+                        ))
+                        top_insert_counter += 1
+
+                    if len(top_candidates) > top_n:
+                        top_candidates.sort(
+                            key=lambda entry: (-entry[0], entry[1])
+                        )
+                        del top_candidates[top_n:]
 
         if not losses:
             return {
@@ -5823,27 +5948,8 @@ def analyze_bad_cases(
         predicted_all = torch.cat(predictions).to(torch.int64)
         confidence_all = torch.cat(confidences).float()
         margin_all = torch.cat(margins).float()
-        window_all = torch.cat(windows)
-        max_bad = _BAD_CASE_MAX_TOKENS
-        if loss_all.numel() > max_bad:
-            # 固定局部生成器：抽样不消耗全局 RNG，坏案例报告
-            # 在相同运行之间逐位可复现。
-            subsample_generator = torch.Generator().manual_seed(
-                _BAD_CASE_SUBSAMPLE_SEED
-            )
-            idx = torch.randperm(
-                loss_all.numel(),
-                generator=subsample_generator,
-            )[:max_bad]
-            loss_all = loss_all[idx]
-            target_all = target_all[idx]
-            predicted_all = predicted_all[idx]
-            confidence_all = confidence_all[idx]
-            margin_all = margin_all[idx]
-            window_all = window_all[idx]
 
         num_tokens = loss_all.numel()
-        sequence_length = window_all.size(1) - 1
 
         wrong_mask = target_all != predicted_all
         token_accuracy = float(
@@ -5911,23 +6017,30 @@ def analyze_bad_cases(
                 int(target_counts[byte]),
             ])
 
-        # 污染最严重的 top_n token。
-        count = min(top_n, loss_all.numel())
-        top_losses, top_indices = torch.topk(loss_all, k=count)
+        # 污染最严重的 top_n token：候选在流式循环中以「每批
+        # top-N + 跨批截断」精确维护（全局 top-N 必在各批
+        # top-N 内），这里只做最终排序与上下文渲染。
+        top_candidates.sort(
+            key=lambda entry: (-entry[0], entry[1])
+        )
 
         top_cases = []
-        for rank, flat_index in enumerate(
-            top_indices.tolist()
-        ):
-            row = flat_index // sequence_length
-            position = flat_index % sequence_length
+        for rank, entry in enumerate(top_candidates):
+            (
+                entry_loss,
+                _entry_order,
+                window_row,
+                position,
+                target,
+                predicted,
+                confidence,
+                margin,
+            ) = entry
 
-            target = int(target_all[flat_index])
-            predicted = int(predicted_all[flat_index])
-            confidence = float(confidence_all[flat_index])
-            margin = float(margin_all[flat_index])
             pair_count = int(
-                confusion_count_by_token[flat_index]
+                confusion_counts[
+                    target * vocab_size + predicted
+                ]
             )
 
             if margin < _BAD_CASE_AMBIGUOUS_MARGIN:
@@ -5946,14 +6059,15 @@ def analyze_bad_cases(
             else:
                 category = "uncertain"
 
-            window = window_all[row]
+            # 窗口 = [x[0]] + y，目标 token 是窗口的第
+            # position+1 个元素（候选构建时已知）。
             target_position = position + 1
             begin = max(0, target_position - context_before)
             end = min(
-                window.numel(),
+                window_row.numel(),
                 target_position + 1 + context_after,
             )
-            fragment = window[begin:end].tolist()
+            fragment = window_row[begin:end].tolist()
             marker = target_position - begin
 
             context = (
@@ -5970,14 +6084,14 @@ def analyze_bad_cases(
                 "target_text": _render_byte(target),
                 "predicted": predicted,
                 "predicted_text": _render_byte(predicted),
-                "loss": round(float(loss_all[flat_index]), 6),
+                "loss": round(float(entry_loss), 6),
                 "confidence": round(confidence, 6),
                 "margin": round(margin, 6),
                 "category": category,
                 "confusion_count": pair_count,
                 "context": context,
                 "window_text": _render_bytes(
-                    window.tolist()
+                    window_row.tolist()
                 ),
             })
 
@@ -7666,7 +7780,15 @@ def measure_efficiency(
     iters: int = 5,
 ) -> Dict[str, object]:
     """
-    效率测量：参数量、前向 FLOPs 等模型规模指标。
+    效率测量：参数量、前向 FLOPs、推理延迟与训练步耗时等
+    精度之外的代价指标。
+
+    - 推理延迟 / 吞吐 / 推理与训练峰值显存按设备实测；
+    - ``training_ms_per_step``：前向 + 反向的中位耗时（**不含**
+      优化器更新与梯度裁剪；本函数在最终/测试评估之前执行，
+      不能推进优化器、污染待评估的模型参数）。它回答「训练
+      同样的步数要多花多少时间」，与 FLOPs（只含前向）互补，
+      避免只看理论计算量而漏掉反向/带宽代价。
 
     本测量在训练结束时对当前模型测一次，与精度指标一起写入
     config.json 与 metrics.jsonl（``{"step": "efficiency", ...}``）。
@@ -7696,6 +7818,7 @@ def measure_efficiency(
     flops = _count_forward_flops(raw_model, x, y)
 
     latency_seconds = None
+    training_step_seconds = None
     inference_peak_mb = None
     training_peak_mb = None
 
@@ -7725,21 +7848,52 @@ def measure_efficiency(
         timings.sort()
         latency_seconds = timings[len(timings) // 2]
 
+        # 训练步耗时（前向 + 反向，不含优化器更新）：推理延迟
+        # 只反映前向成本，反向与激活保存的代价可能完全不同。
+        # 与推理计时同一 warmup/iters 口径取中位数；训练峰值
+        # 显存在同一次计时中一并测量（CUDA 路径）。
+        model.train()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats(device)
 
-            model.train()
-            with autocast:
+        with autocast:
+            for _ in range(max(0, warmup)):
                 output = model(x, y)
                 output["loss"].backward()
-            training_peak_mb = round(
-                torch.cuda.max_memory_allocated(device)
-                / 1e6,
-                3,
-            )
-            model.zero_grad(set_to_none=True)
+                model.zero_grad(set_to_none=True)
 
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+        training_timings: List[float] = []
+        with autocast:
+            for _ in range(max(1, iters)):
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                start = time.perf_counter()
+                output = model(x, y)
+                output["loss"].backward()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                training_timings.append(
+                    time.perf_counter() - start
+                )
+                model.zero_grad(set_to_none=True)
+
+            if device.type == "cuda":
+                training_peak_mb = round(
+                    torch.cuda.max_memory_allocated(device)
+                    / 1e6,
+                    3,
+                )
+
+        training_timings.sort()
+        training_step_seconds = training_timings[
+            len(training_timings) // 2
+        ]
+        del output
+
+        if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
             with torch.inference_mode(), autocast:
                 model(x, y)
@@ -7748,15 +7902,6 @@ def measure_efficiency(
                 / 1e6,
                 3,
             )
-            del output
-        else:
-            # CPU 路径：跑一次训练模式前反向。
-            model.train()
-            with autocast:
-                output = model(x, y)
-                output["loss"].backward()
-            model.zero_grad(set_to_none=True)
-            del output
     finally:
         model.train(was_training)
 
@@ -7782,6 +7927,14 @@ def measure_efficiency(
             round(latency_seconds * 1e3, 4)
             if latency_seconds is not None
             else None
+        ),
+        "training_ms_per_step": (
+            round(training_step_seconds * 1e3, 4)
+            if training_step_seconds is not None
+            else None
+        ),
+        "training_ms_note": (
+            "前向+反向中位耗时；不含优化器更新/梯度裁剪"
         ),
         "throughput_tokens_per_sec": (
             round(tokens / latency_seconds, 2)
@@ -7825,6 +7978,8 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
         f"FLOPs/forward="
         f"{_format(efficiency.get('flops_per_forward'), '', '.3e')} | "
         f"latency={_format(efficiency.get('latency_ms_per_forward'), 'ms')} | "
+        f"train_step="
+        f"{_format(efficiency.get('training_ms_per_step'), 'ms')} | "
         f"throughput="
         f"{_format(efficiency.get('throughput_tokens_per_sec'), 'tok/s')}"
     )
@@ -7977,6 +8132,9 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["latency_ms_per_forward"] = efficiency.get(
             "latency_ms_per_forward"
         )
+        row["training_ms_per_step"] = efficiency.get(
+            "training_ms_per_step"
+        )
         row["flops_per_forward"] = efficiency.get(
             "flops_per_forward"
         )
@@ -8099,8 +8257,8 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
         f"{'run':<20} {'mode':<9} {'params':>9} "
         f"{'val_loss':>9} {'val_bpb':>8} {'acc':>6} "
         f"{'macroF1':>8} "
-        f"{'lat(ms)':>9} {'GFLOPs':>8} {'mem(MB)':>9} "
-        f"{'curve':<18}"
+        f"{'lat(ms)':>9} {'train(ms)':>10} {'GFLOPs':>8} "
+        f"{'mem(MB)':>9} {'curve':<18}"
     )
     print(header)
     print("-" * len(header))
@@ -8126,6 +8284,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{_value(row.get('val_token_accuracy'), '.4f'):>6} "
             f"{_value(row.get('val_macro_f1'), '.4f'):>8} "
             f"{_value(row.get('latency_ms_per_forward'), '.4f'):>9} "
+            f"{_value(row.get('training_ms_per_step'), '.1f'):>10} "
             f"{gflops:>8} "
             f"{_value(row.get('peak_memory_mb'), '.1f'):>9} "
             f"{str(row.get('curve_status')):<18}"
@@ -8280,24 +8439,31 @@ _RECOMMENDED_SEEDS = 3
 # 时，即使统计显著也必须在结论中显式权衡「涨点是否值得」。
 _COST_RATIO_MATERIAL = 1.5
 
-# 参与效率权衡的字段（顺序即展示顺序）。
+# 参与效率权衡的字段（顺序即展示顺序）。训练步耗时（前向+反向
+# 中位耗时）与推理延迟互补：反向/带宽代价只体现在前者，FLOPs
+# 只统计前向。「涨点 0.5% 但每步训练时间 ×10」必须能被识别。
 _COST_FIELDS: Tuple[str, ...] = (
     "n_params",
     "flops_per_forward",
     "latency_ms_per_forward",
+    "training_ms_per_step",
     "peak_memory_mb",
 )
 
 _COST_FIELD_LABELS = {
     "n_params": "参数",
     "flops_per_forward": "FLOPs",
-    "latency_ms_per_forward": "延迟",
+    "latency_ms_per_forward": "推理延迟",
+    "training_ms_per_step": "训练步耗时",
     "peak_memory_mb": "峰值内存",
 }
 
 # 需要运行结束实际测量的效率字段（参数量是结构属性，旧运行也
 # 常有；FLOPs/延迟/内存全缺说明该运行没有做效率测量，精度与
 # 成本的权衡无法评估，必须显式点出而不是静默跳过）。
+# 训练步耗时同样是实测值，但它是后加入的补充代价字段：旧运行
+# 没有该记录不改变「是否做过效率测量」的判定，避免把所有旧运行
+# 都误标成缺效率数据；有该字段时照常参与倍率与权衡判定。
 _MEASURED_COST_FIELDS: Tuple[str, ...] = (
     "flops_per_forward",
     "latency_ms_per_forward",
@@ -11009,7 +11175,7 @@ def print_comparison_analysis(
         )
         cost_header = (
             f"{'cell':<40} {'params':>10} {'GFLOPs':>9} "
-            f"{'lat(ms)':>9} {'mem(MB)':>9}"
+            f"{'lat(ms)':>9} {'train(ms)':>10} {'mem(MB)':>9}"
         )
         print(cost_header)
         print("-" * len(cost_header))
@@ -11026,6 +11192,7 @@ def print_comparison_analysis(
                 f"{_cost_text(aggregate, 'n_params', 1.0, '.0f'):>10} "
                 f"{_cost_text(aggregate, 'flops_per_forward', 1e-9):>9} "
                 f"{_cost_text(aggregate, 'latency_ms_per_forward'):>9} "
+                f"{_cost_text(aggregate, 'training_ms_per_step', 1.0, '.1f'):>10} "
                 f"{_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}"
             )
 
@@ -13929,6 +14096,34 @@ def run_self_test():
         healthy_analysis
     )
 
+    # 泛化 gap 早期预警：验证损失基本走平（未达到过拟合的回升
+    # 阈值），但训练损失持续下降使 gap 快速扩大——状态仍是
+    # healthy，但必须给出「过拟合前兆」警告与早停建议，而不是
+    # 等验证损失明显回升后才报警。
+    gap_widening_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.0},
+            {"step": 20, "train_loss": 4.2, "val_loss": 4.5},
+            {"step": 30, "train_loss": 3.5, "val_loss": 4.45},
+            {"step": 40, "train_loss": 2.8, "val_loss": 4.44},
+            {"step": 50, "train_loss": 2.2, "val_loss": 4.43},
+        ],
+        baseline_loss=baseline,
+    )
+    assert gap_widening_analysis["status"] == "healthy", (
+        gap_widening_analysis
+    )
+    assert gap_widening_analysis["gap_widening_warning"] is True, (
+        gap_widening_analysis
+    )
+    assert any(
+        "过拟合前兆" in warning
+        for warning in gap_widening_analysis["warnings"]
+    ), gap_widening_analysis["warnings"]
+    assert "早停" in str(
+        gap_widening_analysis["recommendation"]
+    )
+
     diverged_analysis = analyze_training_curve(
         [
             {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
@@ -14217,6 +14412,29 @@ def run_self_test():
             - 1.0
         ) < 1e-6
 
+    # 坏案例统计必须是全量口径而不是子样本：同一模型、同一
+    # 固定窗口集合、同一 argmax 口径下，坏案例的 token 准确率
+    # 必须与 evaluate 的 val_token_accuracy 一致（数值差仅来自
+    # fp32 均值 vs fp64 混淆矩阵求和的舍入）。若未来重新引入
+    # 下采样或窗口集合漂移，这个断言会立刻失败。
+    bad_case_eval = evaluate(
+        bad_case_model,
+        eval_dataset,
+        batch_size=2,
+        batches=2,
+        device=eval_device,
+        amp_dtype=None,
+    )
+    assert abs(
+        float(bad_case_report["token_accuracy"])
+        - float(bad_case_eval["val_token_accuracy"])
+    ) < 1e-6, (
+        bad_case_report["token_accuracy"],
+        bad_case_eval["val_token_accuracy"],
+    )
+    # 错误率分母必须与 evaluate 评估的 token 数一致（全量）。
+    assert bad_case_report["tokens_evaluated"] >= 1
+
     # 效率测量：参数量与模型一致，各测量值有效或明确不可用。
     efficiency_model = LanguageModel(
         Config(
@@ -14244,6 +14462,10 @@ def run_self_test():
     )
     assert efficiency["latency_ms_per_forward"] is not None
     assert float(efficiency["latency_ms_per_forward"]) > 0.0
+    # 训练步耗时（前向+反向）必须实测为正；推理延迟与训练步
+    # 耗时是两套口径，涨点评估时都要看。
+    assert efficiency["training_ms_per_step"] is not None
+    assert float(efficiency["training_ms_per_step"]) > 0.0
     assert (
         efficiency["flops_per_forward"] is None
         or int(efficiency["flops_per_forward"]) > 0
@@ -15731,6 +15953,7 @@ def run_self_test():
             "efficiency": {
                 "flops_per_forward": flops,
                 "latency_ms_per_forward": flops / 1e9,
+                "training_ms_per_step": flops / 1e9,
                 "training_peak_memory_mb": 100.0,
             },
         }
@@ -15781,6 +16004,7 @@ def run_self_test():
         cost_contrast = cost_contrasts[0]
         ratios = cost_contrast["cost"]["ratios"]
         assert abs(ratios["flops_per_forward"] - 2.0) < 1e-9
+        assert abs(ratios["training_ms_per_step"] - 2.0) < 1e-9
         assert abs(ratios["n_params"] - 1.0) < 1e-9
         assert cost_contrast["cost_verdict"] == "gain_with_cost", (
             cost_contrast

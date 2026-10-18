@@ -185,10 +185,10 @@ python experiment.py \
 - **简单基线的调参协议**：`--suite-baseline-tuning`（配合 `--seeds`）对简单基线做预注册的学习率网格搜索（`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`，`--baseline-tuning-mode` 选模式）：候选之间只允许学习率不同（steps/batch/数据/结构全部继承同一条命令行），在 val 上按 Mean ± Std 选择 winner（无法区分时取更小 lr），报告写入 `<out>/baseline_tuning.json`；后续基线训练用 `--baseline-tuning-from <报告>` 核对模式/winner lr/steps/数据指纹一致，并把来源写入 `config.json` 的 `baseline_tuning` 字段——这是「基线被调过参」的唯一证据。test 集全程尘封。
 - **消融完整性**：`--suite-ablation` 运行「延迟合并 × 均衡损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`=0/当前值）；默认覆盖项目提出的**全部**延迟合并方案（A 与 B，(1+N)×2 = 3×2 六格），每个创新点都必须证明各自有用——只跑 A 的组合不足以支撑 B 的结论。覆盖检查会列出缺失的组合、点名结构混杂（各单元 k1/k2/top_k/residual_scale 或均衡强度不一致）与伪重复；显式声明本轮必须覆盖哪些方案用 `--ablation-modes A B`。`--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
 - **结果分析（曲线 / NaN / 坏案例 / 效率）**：
-  - **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐。
+  - **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐；验证损失尚未回升但泛化 gap 持续扩大时提前给出「过拟合前兆」警告（`gap_widening_warning`）与早停建议，不必等验证回升后才被动止损。
   - **NaN/Inf 系统排查**：按「数据 NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合精度溢出 → 梯度爆炸/学习率过大」路径收集证据；`nan_diagnosis` 记录失败步梯度范数与近期中位数的对比，区分梯度爆炸与前向/损失侧根因。
-  - **坏案例分析**：在与周期验证相同的固定窗口上打印损失最高的样本并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；同时对**全部错误 token**做类别归因（`error_category_counts` / `error_category_shares`），不只统计 top-N，作为提出新改进思路的证据。
-  - **效率与精度权衡**：`--compare` 汇总每个实验单元的参数量、FLOPs、推理延迟与显存/内存，并在单因子对比里标注成本倍数；显著涨点但成本 ≥1.5×、或指标变差且更贵的对比会被显式标记（须评估性价比 / 严格劣于基线），避免「涨 0.5% 但计算 ×10」被当成有效改进。
+  - **坏案例分析**：在与周期验证相同的固定窗口上、对**全部**评估 token 做流式统计（每 token 仅保留约 10 字节紧凑标量，不做随机下采样，token 准确率与 `evaluate` 同口径），top-N 最差样本用「每批 top-N + 跨批截断」精确维护并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；全量错误 token 的类别归因（`error_category_counts` / `error_category_shares`）不只统计 top-N，作为提出新改进思路的证据。
+  - **效率与精度权衡**：`--compare` 汇总每个实验单元的参数量、FLOPs、推理延迟、训练步耗时（前向+反向）与显存/内存，并在单因子对比里标注成本倍数；显著涨点但成本 ≥1.5×、或指标变差且更贵的对比会被显式标记（须评估性价比 / 严格劣于基线），避免「涨 0.5% 但计算 ×10」被当成有效改进。
 
 ### 多随机种子与消融套件示例
 
