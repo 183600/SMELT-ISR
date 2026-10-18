@@ -7945,6 +7945,15 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "n_experts",
     "expert_hidden",
     "top_k",
+    # k1/k2/balance_coef/dense_fnn_hidden 是最容易悄悄改变结果的
+    # 结构/损失项：它们默认被声明为实验因子，但只要调用方把
+    # --compare-factors 改成更窄的列表，就必须退化为受控变量
+    # 逐项核对，否则「延迟合并」的对比会混入分支几何（k1/k2）
+    # 或均衡强度（balance_coef）的差异。
+    "k1",
+    "k2",
+    "balance_coef",
+    "dense_fnn_hidden",
     "residual_scale",
     "val_fraction",
     "test_fraction",
@@ -8027,8 +8036,13 @@ _FACTOR_VALUE_ORDER = {
 }
 
 # 显著性与统计功效的判定阈值。
+#
+# 统计检验至少需要 3 个随机种子（配对/ Welch t 检验的 df ≥ 2）：
+# 2 个种子时 df=1，t 分布尾部极厚，同样的差值既能给出 p≈0.5 也
+# 能给出 p≈0.05，显著性判定基本由噪声决定，不足以支撑「方法
+# 更好」的结论。少于 3 个种子只汇报差值，不给 p 值与显著性。
 _SIGNIFICANCE_LEVEL = 0.05
-_MIN_SEEDS_FOR_STATS = 2
+_MIN_SEEDS_FOR_STATS = 3
 _RECOMMENDED_SEEDS = 3
 
 # 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量、
@@ -8129,6 +8143,12 @@ def build_comparison_protocol(
         "n_experts": cfg.n_experts,
         "expert_hidden": cfg.expert_hidden,
         "top_k": cfg.top_k,
+        # 分支路由几何与均衡损失强度：即使调用方缩减了
+        # --compare-factors，也必须作为受控变量被核对。
+        "k1": cfg.k1,
+        "k2": cfg.k2,
+        "balance_coef": cfg.balance_coef,
+        "dense_fnn_hidden": cfg.dense_fnn_hidden,
         "residual_scale": cfg.residual_scale,
         "val_fraction": getattr(args, "val_fraction", None),
         "test_fraction": getattr(args, "test_fraction", None),
@@ -8152,13 +8172,12 @@ def experiment_protocol_from_payload(
     comparison_protocol 字段时按 args/config/data 尽力回退
     （能唯一确定的设置才回退，无法确定的留 None，由检查器
     标记为「缺记录」而不是静默视为一致）。
-    """
-    protocol = payload.get("comparison_protocol")
-    if isinstance(protocol, dict):
-        result = dict(protocol)
-        result.setdefault("comparison_family", "neural")
-        return result
 
+    记录过的协议项优先；记录中缺失的协议项（例如旧版本运行
+    没有后来新增的 k1/k2/balance_coef/dense_fnn_hidden）用可
+    回退字段补齐，避免新旧运行混用时把「未记录」误判成
+    「值不同/缺失」。
+    """
     cfg = payload.get("config") or {}
     run_args = payload.get("args") or {}
     data = payload.get("data") or {}
@@ -8178,7 +8197,7 @@ def experiment_protocol_from_payload(
 
     has_training = run_args.get("lr") is not None
 
-    return {
+    fallback = {
         "comparison_family": (
             "statistical"
             if cfg.get("mode") == "ngram"
@@ -8210,6 +8229,10 @@ def experiment_protocol_from_payload(
         "n_experts": cfg.get("n_experts"),
         "expert_hidden": cfg.get("expert_hidden"),
         "top_k": cfg.get("top_k"),
+        "k1": cfg.get("k1"),
+        "k2": cfg.get("k2"),
+        "balance_coef": cfg.get("balance_coef"),
+        "dense_fnn_hidden": cfg.get("dense_fnn_hidden"),
         "residual_scale": cfg.get("residual_scale"),
         "val_fraction": _pick(
             data.get("val_fraction"),
@@ -8235,6 +8258,15 @@ def experiment_protocol_from_payload(
             else None
         ),
     }
+
+    protocol = payload.get("comparison_protocol")
+    if isinstance(protocol, dict):
+        result = dict(fallback)
+        result.update(protocol)
+        result.setdefault("comparison_family", "neural")
+        return result
+
+    return fallback
 
 
 def parse_factor_spec(spec: str) -> List[str]:
@@ -9328,6 +9360,11 @@ def _contrast_display(
         caveat = "（多重比较校正后不显著，不能据此声称提升）"
     elif verdict == "改善" and test in ("paired_t", "welch_t"):
         caveat = "（未达显著水平，不能据此声称提升）"
+    elif test == "insufficient_seeds" and verdict in ("改善", "变差"):
+        caveat = (
+            "（种子数不足，未做显著性检验，"
+            "不能据此声称差异）"
+        )
 
     # 效率与精度权衡：效率倍率必须与涨点一起展示；显著改善
     # 但效率倍率大幅上升、或指标变差且效率倍率更高时给出
@@ -9473,18 +9510,37 @@ def compare_cells_to_baseline(
     return contrasts
 
 
+# 2×2 消融（延迟合并 × 均衡损失）中除两个消融轴之外必须保持
+# 恒定的结构设置：分支几何（k1/k2）、路由宽度（top_k）与残差
+# 缩放。它们跨消融单元不一致时，主效应会被结构差异混杂。
+_ABLATION_STRUCTURAL_KEYS: Tuple[str, ...] = (
+    "k1",
+    "k2",
+    "top_k",
+    "residual_scale",
+)
+
+
 def ablation_coverage(
     rows: List[Dict[str, object]],
     factors: List[str],
 ) -> Dict[str, object]:
     """
     消融完整性检查：延迟合并（local_base→A）与负载均衡损失
-    （balance_coef 开/关）构成 2×2 全因子。报告缺失的组合、
-    种子数不足的单元，以及「B 与 smelt 计算量不等价」这类
-    会把额外计算误解释为方法收益的提醒。
+    （balance_coef 开/关）构成 2×2 全因子：
+    无 = local_base/b=off、仅延迟合并 = A/b=off、
+    仅均衡损失 = local_base/b=on、两者 = A/b=on。
+    报告缺失的组合、种子数不足的单元、会让主效应无法归因的
+    结构混杂（各单元之间 k1/k2/top_k/residual_scale 不一致
+    时，「延迟合并」的收益混入了分支几何/路由宽度/残差缩放），
+    以及「B 与 smelt 计算量不等价」这类会把额外计算误解释为
+    方法收益的提醒。
     """
     factor_set = set(factors)
-    legend = "local_base/b=off, local_base/b=on, A/b=off, A/b=on"
+    legend = (
+        "无=local_base/b=off, 仅延迟合并=A/b=off, "
+        "仅均衡损失=local_base/b=on, 两者=A/b=on"
+    )
 
     report: Dict[str, object] = {
         "legend": legend,
@@ -9494,6 +9550,7 @@ def ablation_coverage(
         "present_cells": [],
         "missing_cells": [],
         "low_replicate_cells": [],
+        "structural_confounds": [],
         "advisories": [],
         "n_rows": len(rows),
     }
@@ -9508,6 +9565,7 @@ def ablation_coverage(
     modes_present: Dict[str, int] = {}
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
+    structural_signatures: Dict[str, int] = {}
     unknown_balance = False
 
     for row in rows:
@@ -9515,6 +9573,14 @@ def ablation_coverage(
         balance = _row_factor_value(row, "balance_coef")
         modes_present[mode] = modes_present.get(mode, 0) + 1
         if mode in {"local_base", "A"}:
+            structural_label = ", ".join(
+                f"{name}="
+                f"{_format_factor_value(_row_factor_value(row, name))}"
+                for name in _ABLATION_STRUCTURAL_KEYS
+            )
+            structural_signatures[structural_label] = (
+                structural_signatures.get(structural_label, 0) + 1
+            )
             balance_by_mode.setdefault(mode, [])
             if balance not in balance_by_mode[mode]:
                 balance_by_mode[mode].append(balance)
@@ -9533,6 +9599,25 @@ def ablation_coverage(
         report["low_replicate_cells"].append(
             "存在未记录 balance_coef 的 local_base/A 运行，"
             "其消融单元格无法判定"
+        )
+
+    # 消融的受控变量纪律：2×2 的两个轴（延迟合并、均衡损失）
+    # 是唯一允许变化的设置。k1/k2/top_k/residual_scale 不一致
+    # 时，主效应与分支几何/路由宽度/残差缩放混杂，组合覆盖再
+    # 齐全也不能支撑「各设计各自有用」。
+    if len(structural_signatures) > 1:
+        report["structural_confounds"].append(
+            "消融单元之间 "
+            + "/".join(_ABLATION_STRUCTURAL_KEYS)
+            + " 的设置不一致或未记录（"
+            + "; ".join(
+                f"{label} ×{count}"
+                for label, count in sorted(
+                    structural_signatures.items()
+                )
+            )
+            + "）：延迟合并/均衡损失的主效应会与分支几何、"
+            "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
         )
 
     if "B" in modes_present and "smelt" in modes_present:
@@ -9623,9 +9708,10 @@ def ablation_coverage(
         "balance_coef" in factor_set
         and len(merge_pair_cells) == 4
         and not report["missing_cells"]
+        and not report["structural_confounds"]
     ):
         report["advisories"].append(
-            "2×2 全因子组合齐全："
+            "2×2 全因子组合齐全且结构设置一致："
             "可同时给出延迟合并与均衡损失的主效应及交互"
         )
 
@@ -10643,6 +10729,8 @@ def print_comparison_analysis(
             for cell in coverage["present_cells"]
         )
         print(f"  已覆盖组合: {present}")
+    for message in coverage.get("structural_confounds", []):
+        print(f"  [confounded] {message}")
     if coverage["low_replicate_cells"]:
         for message in coverage["low_replicate_cells"]:
             print(f"  [warn] {message}")
@@ -10652,6 +10740,7 @@ def print_comparison_analysis(
         not coverage["missing_cells"]
         and coverage["present_cells"]
         and not coverage["low_replicate_cells"]
+        and not coverage.get("structural_confounds")
     ):
         print("  OK：2×2 全因子组合齐全且种子数达标")
 
@@ -13890,6 +13979,8 @@ def run_self_test():
             baseline_tuning: Optional[Dict[str, object]] = None,
             pr_auc_chance: Optional[float] = None,
             pr_auc: Optional[float] = None,
+            k1: int = 2,
+            k2: int = 2,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -13924,8 +14015,8 @@ def run_self_test():
                 "config": {
                     "mode": mode,
                     "top_k": 2,
-                    "k1": 2,
-                    "k2": 2,
+                    "k1": k1,
+                    "k2": k2,
                     "balance_coef": balance,
                     "dense_fnn_hidden": None,
                     "seq_len": 8,
@@ -14164,6 +14255,38 @@ def run_self_test():
         )
         assert "实际意义存疑" in small_effect_display
 
+        # 统计功效门槛：少于 3 个种子不做显著性检验（2 个种子
+        # 时 df=1，p 值基本由噪声决定），显示层禁止据此声称差异。
+        assert (
+            _paired_t_test([0.1, 0.2])["test"]
+            == "insufficient_seeds"
+        )
+        assert (
+            _welch_t_test([1.0, 2.0], [3.0, 4.0])["test"]
+            == "insufficient_seeds"
+        )
+        assert (
+            _paired_t_test([0.1, 0.2, 0.3, 0.4])["test"]
+            == "paired_t"
+        )
+        underpowered_display = _contrast_display(
+            {
+                "factor": "mode",
+                "baseline_value": "local_base",
+                "variant_value": "A",
+                "baseline": "mode=local_base",
+                "delta": -0.10,
+                "p_value": None,
+                "test": "insufficient_seeds",
+                "n_pairs": 0,
+                "verdict": "improvement",
+                "significant": False,
+                "delta_over_noise": 0.50,
+            },
+            "val_loss",
+        )
+        assert "不能据此声称差异" in underpowered_display
+
         # 学习率不同必须被受控变量检查抓住；声明为因子后
         # 则不再报违规。
         bad_path = _write_analysis_run(
@@ -14212,6 +14335,37 @@ def run_self_test():
             for violation in steps_controlled["violations"]
         )
 
+        # k1/k2 是最容易悄悄改变结果的结构设置：把 --compare-factors
+        # 收窄到 mode,seed 后，k1 不同必须被受控变量检查抓住，
+        # 不能因为「默认因子里有 k1」就永远不核对。
+        k1_path = _write_analysis_run(
+            "A_seed47_badk1",
+            "A",
+            47,
+            3e-4,
+            100,
+            0.01,
+            2.40,
+            k1=4,
+        )
+        narrow_factors = parse_factor_spec("mode,seed")
+        k1_controlled = check_controlled_variables(
+            compare_runs(run_paths + [k1_path]),
+            narrow_factors,
+        )
+        assert any(
+            violation["key"] == "k1"
+            for violation in k1_controlled["violations"]
+        ), k1_controlled["violations"]
+        declared_k1 = check_controlled_variables(
+            compare_runs(run_paths + [k1_path]),
+            narrow_factors + ["k1"],
+        )
+        assert all(
+            violation["key"] != "k1"
+            for violation in declared_k1["violations"]
+        )
+
         # 消融覆盖：只跑了 balance=0.01 的开启臂，缺 2×2 的
         # 关闭臂组合，必须被标记为缺失。
         coverage = ablation_coverage(analysis_rows, factors)
@@ -14249,9 +14403,44 @@ def run_self_test():
             factors,
         )
         assert not full_coverage["missing_cells"], full_coverage
+        assert not full_coverage["structural_confounds"]
         assert any(
             "只有 1 个种子" in message
             for message in full_coverage["low_replicate_cells"]
+        )
+
+        # 组合齐全但结构设置不一致（某个消融单元格用了 k1=4）：
+        # 主效应与分支几何混杂，必须报 [confounded] 且不能再
+        # 声明「全因子齐全」。
+        confounded_paths = full_paths + [
+            _write_analysis_run(
+                "A_bal0_seed43_k1four",
+                "A",
+                43,
+                3e-4,
+                100,
+                0.0,
+                2.90,
+                k1=4,
+            ),
+        ]
+        confounded_coverage = ablation_coverage(
+            compare_runs(confounded_paths),
+            factors,
+        )
+        assert not confounded_coverage["missing_cells"]
+        assert confounded_coverage["structural_confounds"], (
+            confounded_coverage
+        )
+        assert any(
+            "k1" in message
+            for message in confounded_coverage[
+                "structural_confounds"
+            ]
+        )
+        assert not any(
+            "全因子组合齐全" in message
+            for message in confounded_coverage["advisories"]
         )
 
         # 与延迟合并无关的对比（smelt vs B）不虚报消融缺失，

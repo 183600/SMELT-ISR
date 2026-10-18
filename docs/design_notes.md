@@ -121,7 +121,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
   t 临界值与效应量 95% 置信区间；显著性判定与权衡结论
   以 Holm 校正后为准。
-- `ablation_coverage`：2×2 全因子消融覆盖检查。
+- `ablation_coverage`：2×2 全因子消融覆盖检查（含消融单元
+  之间 `k1/k2/top_k/residual_scale` 结构一致性的混杂检查）。
 - `print_comparison_analysis`、`write_comparison_report`：
   完整的对比分析输出与 `comparison_analysis.json` 落盘。
 - `strip_sweep_args`、`build_sweep_plan`、`run_experiment_sweep`：
@@ -169,9 +170,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **受控变量协议**：每次训练把优化器（AdamW 及 betas/eps）、
   学习率与调度、warmup、训练步数、weight decay、梯度裁剪、
   batch size、数据增强（当前为无增强，显式记录）、数据指纹、
-  模型结构、评估协议与选型口径（`model_selection`，新运行为
-  验证集选型、无记录的旧运行回退标记为最后一步）写入
-  `config.json` 的 `comparison_protocol` 字段。`--compare`
+  模型结构（含分支几何 `k1/k2`、路由宽度 `top_k`、均衡损失
+  系数 `balance_coef`、`dense_fnn_hidden`、`residual_scale`）、
+  评估协议与选型口径（`model_selection`，新运行为验证集选型、
+  无记录的旧运行回退标记为最后一步）写入 `config.json` 的
+  `comparison_protocol` 字段。这些键即使没有出现在
+  `--compare-factors`（默认因子包含 `k1/k2/balance_coef/`
+  `dense_fnn_hidden`）里，也会退化为受控变量逐项核对——把
+  因子列表收窄到 `mode,seed` 时，某个运行偷偷改大 `k1` 会被
+  立即抓住。旧版本记录的协议缺少后来新增的键时，用
+  `config/args/data` 中可唯一确定的值回填，避免新旧运行
+  混用时把「未记录」误判成「值不同/缺失」。`--compare`
   默认要求这些协议项在声明因子之外逐项一致；不一致会以
   `[violation]` 明确列出（如某个运行换了优化器、调了学习率、
   训练轮数，或 final 指标口径不同），提示结论无法归因到
@@ -188,7 +197,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   集合相同用配对 t 检验（同种子 = 配对重复），否则用 Welch
   t 检验，并汇报 p 值、「噪声比」（|Δ|/合并标准差）与 Δ 的
   95% 置信区间（t 分布临界值；区间极宽说明现有种子数只能
-  排除「差异为 0」，还不足以定位效应大小）。同一检验家族内
+  排除「差异为 0」，还不足以定位效应大小）。显著性检验要求
+  每侧至少 3 个随机种子（配对/ Welch t 检验 df ≥ 2；2 个
+  种子时 df=1，p 值基本由噪声决定）；少于 3 个种子只汇报
+  差值，显式标注「种子数不足，未做显著性检验，不能据此
+  声称差异」。同一检验家族内
   的全部对比（一次分析的单因子对比集合，或 `--compare-baseline`
   的直接对比集合）统一做多重比较校正：显著性判定与权衡
   结论以 Holm-Bonferroni（FWER）校正后的 p 值为准，BH（FDR）
@@ -239,12 +252,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
   损失」2×2 全因子（`local_base`/`A` × `balance_coef`=0/当前
-  值），四个组合都覆盖后才能同时给出两个创新点各自的主效应
-  与交互；`--suite-modes` 把同一套受控设置应用到多个模式
-  （如 `smelt local_base A B`），保证跨模式对比除模式外所有
-  设置逐项一致。两个套件都自动执行消融覆盖检查，缺失的组合
-  会以 `[missing]` 列出（只报告部分组合不能支撑「各自都有用」
-  的结论）；一次变化多个因子的对比标记为 `[confounded]`。
+  值；四个组合分别对应「无 / 仅延迟合并 / 仅均衡损失 /
+  两者」），四个组合都覆盖后才能同时给出两个创新点各自的
+  主效应与交互；`--suite-modes` 把同一套受控设置应用到多个
+  模式（如 `smelt local_base A B`），保证跨模式对比除模式外
+  所有设置逐项一致。两个套件都自动执行消融覆盖检查，缺失的
+  组合会以 `[missing]` 列出（只报告部分组合不能支撑「各自
+  都有用」的结论）；一次变化多个因子的对比标记为
+  `[confounded]`。消融覆盖检查还会核对各单元之间
+  `k1/k2/top_k/residual_scale` 是否一致：组合齐全但结构设置
+  不同（如某个单元悄悄用了更大的 `k1`）时主效应会与分支几何、
+  路由宽度或残差缩放混杂，同样以 `[confounded]` 标出且不
+  声明「全因子齐全」。
 - **汇总报告**：套件运行结束后把受控变量检查、聚合统计、
   单因子对比与消融覆盖写入 `<out>/comparison_analysis.json`；
   `--compare` 只读运行目录、不写文件。
