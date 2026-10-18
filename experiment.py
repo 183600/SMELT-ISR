@@ -3395,8 +3395,7 @@ def evaluate(
 
     # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
     # 并按 _AUC_MAX_TOKENS 封顶。收集缓冲按固定窗口的实际
-    # 位置数预分配（不超过封顶值），逐批写入，避免收尾 cat
-    # 时同时保留两份完整数据。
+    # 位置数预分配（不超过封顶值），逐批写入。
     auc_probs: Optional[torch.Tensor] = None
     auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
@@ -4192,8 +4191,7 @@ def _ngram_extended_metrics(
     )
 
     # 与神经模型评估同口径：按窗口总位置数预分配收集缓冲
-    # （不超过封顶值），逐窗口写入，避免收尾 cat 时同时保留
-    # 两份完整数据。
+    # （不超过封顶值），逐窗口写入。
     auc_capacity = min(
         _AUC_MAX_TOKENS,
         sum(
@@ -10405,7 +10403,7 @@ def run_sanity_overfit(
     第一步反向之后还会先做梯度探针（见 _probe_gradient_flow）：
     损失必须连在计算图上、梯度必须有限、至少一个参数收到非零
     梯度、非专家参数不得缺失梯度；探针失败时立即停止并给出
-    排查提示，不等 300 步训练「碰运气」。
+    排查提示。
 
     检查必须走与全量训练一致的前向/反向路径：主训练启用
     --grad-checkpoint 时本检查同样开启 activation
@@ -10483,7 +10481,7 @@ def run_sanity_overfit(
                 loss = result["lm_loss"]
 
                 # 损失必须连在计算图上；否则 backward 必然失败
-                # 或训练空转，直接停下，不浪费后面的步数。
+                # 或训练空转，直接停下。
                 loss_connected = True
                 if step == 1 and (
                     not loss.requires_grad
@@ -10550,8 +10548,7 @@ def run_sanity_overfit(
                         f"token_acc={final_acc:.4f}"
                     )
 
-                # 探针失败：立即停止训练并给出排查提示，避免
-                # 在不断重复的坏梯度上白白跑完所有步。
+                # 探针失败：立即停止训练并给出排查提示。
                 if step == 1 and (
                     grad_probe is not None
                     and grad_probe["failures"]
