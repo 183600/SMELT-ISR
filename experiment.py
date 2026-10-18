@@ -404,9 +404,9 @@ class _SwiGLUDown(torch.autograd.Function):
     """
     SwiGLU 与下投影的组合节点。
 
-    前向与「silu(gate) * up 后接下投影」逐位一致，但 hidden
-    中间结果不进入 autograd 的保存集合：反向时由 gate_up
-    重新算出隐藏层（两次逐元素算子），换取激活显存下降。
+    前向与「silu(gate) * up 后接下投影」逐位一致；hidden
+    中间结果不进入 autograd 的保存集合，反向时由 gate_up
+    按前向同一算子重新算出。
     down_weight 支持两种布局：
     - [E, D, H]：批量专家，下投影为 bmm；
     - [D, H]：单专家，下投影为普通线性。
@@ -983,8 +983,7 @@ class SparseMoE(nn.Module):
             ]
 
         if gate_up.requires_grad:
-            # SwiGLU + 下投影的组合节点：hidden 不进入保存集合，
-            # 反向时由 gate_up 重算。
+            # SwiGLU 与下投影的组合节点。
             return _SwiGLUDown.apply(gate_up, down_weight)
 
         gate, up = gate_up.chunk(2, dim=-1)
@@ -1076,13 +1075,12 @@ class SparseMoE(nn.Module):
         """
         把非空专家按 id 顺序贪心分组（闭区间），使每组
         「专家数 × 组内最大计数」不超过组内实际 assignment
-        总数的 _MOE_PAD_RATIO_LIMIT 倍（与整批 bmm 路径
-        同一上限，填充浪费有界）。
+        总数的 _MOE_PAD_RATIO_LIMIT 倍。
 
-        零计数专家不进入任何组（不为其分配填充行）；相邻
-        组之间允许存在零计数专家，组内各专家的段在按 id
-        排序后的序列中仍然连续。分组只依赖确定性的 counts，
-        相同数据始终得到相同的分组。
+        零计数专家不进入任何组；相邻组之间允许存在零计数
+        专家，组内各专家的段在按 id 排序后的序列中仍然连续。
+        分组只依赖确定性的 counts，相同数据始终得到相同的
+        分组。
         """
         limit = _MOE_PAD_RATIO_LIMIT
         groups: List[Tuple[int, int]] = []
@@ -1103,7 +1101,7 @@ class SparseMoE(nn.Module):
                 candidate_rows = rows + counts[end]
                 width = end - index + 1
 
-                # 单专家组永远可接受（无填充浪费）。
+                # 单专家组永远可接受。
                 if (
                     width == 1
                     or width * candidate_peak
@@ -1136,7 +1134,7 @@ class SparseMoE(nn.Module):
         """
         分组填充 + 批量 bmm 的专家计算路径。
 
-        路由不均衡、整批填充浪费超过 _MOE_PAD_RATIO_LIMIT
+        整批填充比例超过 _MOE_PAD_RATIO_LIMIT（路由不均衡）
         时使用：每个组把组内各专家的段散射进
         [组内专家数, 组内最大计数, dim] 的零填充缓冲，一次
         bmm 完成组内全部专家（含只有 1 个专家的组，等价于
@@ -1321,10 +1319,8 @@ class SparseMoE(nn.Module):
                 dim,
             )
 
-        # 路由不均衡时整批填充浪费过大，退回逐专家循环会
-        # 产生大量小 GEMM；改为按专家分组：组内填充浪费仍受
-        # _MOE_PAD_RATIO_LIMIT 约束，把能合并的专家合并为
-        # 少量 bmm，只有路由到极多 token 的“大”专家单独计算。
+        # 整批填充比例超过 _MOE_PAD_RATIO_LIMIT 时按专家
+        # 分组，组内填充比例仍受该上限约束。
         groups = self._plan_expert_groups(counts_list)
 
         if any(begin < end for begin, end in groups):
@@ -5283,7 +5279,7 @@ def analyze_training_curve(
     ):
         # 两者都不降：学习率已退火殆尽时是正常的末期收敛平台；
         # 学习率仍高时则指向欠拟合（容量不足）、学习率不当或
-        # 数据管道问题，继续加步数只会浪费算力。
+        # 数据管道问题。
         analysis["status"] = "plateau"
         lr_annealed = (
             peak_lr is not None
