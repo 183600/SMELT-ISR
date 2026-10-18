@@ -864,15 +864,21 @@ class SparseMoE(nn.Module):
     def _batched_experts_forward(
         self,
         inputs: torch.Tensor,
+        expert_range: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
-        对 [n_experts, rows, dim] 的批量输入执行全部专家计算。
+        对 [n_experts, rows, dim] 的批量输入执行专家计算。
 
         各专家权重 stack 成批量矩阵后用 bmm 完成两层 GEMM；
         stack 缓冲按参数版本跨调用复用（见
         _cached_weight_stack），反向按切片把梯度散回各专家
         参数，参数与检查点格式不变。SwiGLU 语义与
         Expert.forward 完全一致。
+
+        expert_range 给定时只计算 [begin, end]（闭区间）的
+        连续专家子集：权重 stack 直接按切片复用（切片的
+        反向会把子集外的梯度补零后再散回参数），用于
+        _dispatch_grouped 的分组 bmm。
         """
         gate_up_weight = self._cached_weight_stack(
             "gate_up",
@@ -881,6 +887,11 @@ class SparseMoE(nn.Module):
                 for expert in self.experts
             ],
         )
+
+        if expert_range is not None:
+            gate_up_weight = gate_up_weight[
+                expert_range[0]:expert_range[1] + 1
+            ]
 
         gate_up = torch.bmm(
             inputs,
@@ -900,6 +911,11 @@ class SparseMoE(nn.Module):
                 for expert in self.experts
             ],
         )
+
+        if expert_range is not None:
+            down_weight = down_weight[
+                expert_range[0]:expert_range[1] + 1
+            ]
 
         return torch.bmm(
             hidden,
@@ -979,6 +995,148 @@ class SparseMoE(nn.Module):
             0,
             dest_by_original,
         ).view(num_tokens, top_k, dim)
+
+    def _plan_expert_groups(
+        self,
+        counts: List[int],
+    ) -> List[Tuple[int, int]]:
+        """
+        把非空专家按 id 顺序贪心分组（闭区间），使每组
+        「专家数 × 组内最大计数」不超过组内实际 assignment
+        总数的 _MOE_PAD_RATIO_LIMIT 倍（与整批 bmm 路径
+        同一上限，填充浪费有界）。
+
+        零计数专家不进入任何组（不为其分配填充行）；相邻
+        组之间允许存在零计数专家，组内各专家的段在按 id
+        排序后的序列中仍然连续。分组只依赖确定性的 counts，
+        相同数据始终得到相同的分组。
+        """
+        limit = _MOE_PAD_RATIO_LIMIT
+        groups: List[Tuple[int, int]] = []
+        total = len(counts)
+        index = 0
+
+        while index < total:
+            if counts[index] == 0:
+                index += 1
+                continue
+
+            end = index
+            rows = 0
+            peak = 0
+
+            while end < total and counts[end] > 0:
+                candidate_peak = max(peak, counts[end])
+                candidate_rows = rows + counts[end]
+                width = end - index + 1
+
+                # 单专家组永远可接受（无填充浪费）。
+                if (
+                    width == 1
+                    or width * candidate_peak
+                    <= limit * candidate_rows
+                ):
+                    peak = candidate_peak
+                    rows = candidate_rows
+                    end += 1
+                else:
+                    break
+
+            groups.append((index, end - 1))
+            index = end
+
+        return groups
+
+    def _dispatch_grouped(
+        self,
+        counts_tensor: torch.Tensor,
+        counts: List[int],
+        prefix: List[int],
+        gathered: torch.Tensor,
+        perm: torch.Tensor,
+        assignment_experts: torch.Tensor,
+        groups: List[Tuple[int, int]],
+        num_tokens: int,
+        top_k: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """
+        分组填充 + 批量 bmm 的专家计算路径。
+
+        路由不均衡、整批填充浪费超过 _MOE_PAD_RATIO_LIMIT
+        时使用：每个组把组内各专家的段散射进
+        [组内专家数, 组内最大计数, dim] 的零填充缓冲，一次
+        bmm 完成组内全部专家（含只有 1 个专家的组，等价于
+        逐专家 GEMM）。填充行的输入是精确的 0：其前向输出
+        为 0，对权重梯度的贡献也恒为精确的 0，因此与逐专家
+        循环路径的数值语义一致。
+
+        dest 由排序后行号 j 所属专家与局部行号给出；每个
+        排序位置至多写入一次且并集只差填充行，逐专家输出
+        按 id 顺序交给 _MergeExpertOutputs 散射回原始
+        assignment 顺序。
+        """
+        n_experts = self.n_experts
+        device = gathered.device
+        total = gathered.size(0)
+
+        # 排序后第 j 行所属专家，及该行在其专家段内的局部行号。
+        starts = torch.cumsum(counts_tensor, dim=0) - (
+            counts_tensor
+        )
+        seg_id = assignment_experts.index_select(0, perm)
+        seg_local = (
+            torch.arange(total, device=device) - starts[seg_id]
+        )
+
+        # 零计数专家用空切片占位，保持与 counts 一一对应。
+        expert_outputs: List[Optional[torch.Tensor]] = [
+            gathered[:0] if count == 0 else None
+            for count in counts
+        ]
+
+        for begin, end in groups:
+            group_counts = counts[begin:end + 1]
+            group_rows = sum(group_counts)
+            peak = max(group_counts)
+            offset = prefix[begin]
+
+            sub_seg = seg_id[offset:offset + group_rows]
+            sub_local = seg_local[offset:offset + group_rows]
+            dest = (sub_seg - begin) * peak + sub_local
+
+            padded = gathered.new_zeros(
+                len(group_counts) * peak,
+                dim,
+            )
+            padded.index_copy_(
+                0,
+                dest,
+                gathered[offset:offset + group_rows],
+            )
+
+            out = self._batched_experts_forward(
+                padded.view(len(group_counts), peak, dim),
+                (begin, end),
+            ).view(len(group_counts) * peak, dim)
+
+            for slot, count in enumerate(group_counts):
+                start = slot * peak
+                expert_outputs[begin + slot] = out[
+                    start:start + count
+                ]
+
+        # 各专家输出由单个自定义节点散射回原始（未排序）
+        # 位置；与逐专家循环路径共用同一出口。
+        return _MergeExpertOutputs.apply(
+            perm,
+            counts,
+            *expert_outputs,
+        ).view(
+            num_tokens,
+            top_k,
+            dim,
+        )
 
     def dispatch(
         self,
@@ -1085,6 +1243,30 @@ class SparseMoE(nn.Module):
                 assignment_experts,
                 counts_list,
                 max_count,
+                num_tokens,
+                top_k,
+                dim,
+            )
+
+        # 路由不均衡时整批填充浪费过大，退回逐专家循环会
+        # 产生大量小 GEMM；改为按专家分组：组内填充浪费仍受
+        # _MOE_PAD_RATIO_LIMIT 约束，把能合并的专家合并为
+        # 少量 bmm，只有路由到极多 token 的“大”专家单独计算。
+        groups = self._plan_expert_groups(counts_list)
+
+        if any(begin < end for begin, end in groups):
+            prefix = [0]
+            for count in counts_list:
+                prefix.append(prefix[-1] + count)
+
+            return self._dispatch_grouped(
+                counts,
+                counts_list,
+                prefix,
+                gathered,
+                perm,
+                assignment_experts,
+                groups,
                 num_tokens,
                 top_k,
                 dim,
