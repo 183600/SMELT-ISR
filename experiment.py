@@ -3557,7 +3557,7 @@ def macro_auc_metrics(
 
     pr_aucs: List[float] = []
     roc_aucs: List[float] = []
-    prevalence_sum = 0.0
+    pr_prevalence_sum = 0.0
 
     for class_index in eligible.tolist():
         labels = targets == class_index
@@ -3573,6 +3573,14 @@ def macro_auc_metrics(
         )
         if pr is not None:
             pr_aucs.append(pr)
+            # 随机打分器的单类 average precision 期望值 = 该类
+            # prevalence（正类占比）；macro PR-AUC 的随机水平
+            # 就是各纳入类 prevalence 的均值，必须与 pr_aucs
+            # 纳入完全相同的类。PR-AUC 的绝对值在类别不平衡下
+            # 不代表「好/坏」，必须与这个水平对照解读。
+            pr_prevalence_sum += (
+                int(labels.sum()) / labels.numel()
+            )
 
         roc = _binary_roc_auc(
             sorted_scores,
@@ -3582,14 +3590,6 @@ def macro_auc_metrics(
         if roc is not None:
             roc_aucs.append(roc)
 
-        # 随机打分器的单类 average precision 期望值 = 该类
-        # prevalence（正类占比）；macro PR-AUC 的随机水平就是
-        # 各纳入类 prevalence 的均值。PR-AUC 的绝对值在类别
-        # 不平衡下不代表「好/坏」，必须与这个水平对照解读。
-        prevalence_sum += int(labels.sum()) / labels.numel()
-
-    n_prevalence = len(eligible)
-
     return {
         "pr_auc_macro": (
             sum(pr_aucs) / len(pr_aucs)
@@ -3597,8 +3597,8 @@ def macro_auc_metrics(
             else None
         ),
         "pr_auc_macro_chance": (
-            prevalence_sum / n_prevalence
-            if n_prevalence
+            pr_prevalence_sum / len(pr_aucs)
+            if pr_aucs
             else None
         ),
         "roc_auc_macro": (
@@ -3606,7 +3606,12 @@ def macro_auc_metrics(
             if roc_aucs
             else None
         ),
-        "auc_n_classes": len(roc_aucs),
+        # 三类计数分开记录：单类语料等退化情形下 PR 与 ROC 的
+        # 可计算集合不同（全正类的 ROC 无定义），单一
+        # auc_n_classes 无法同时描述两条 macro 曲线的口径。
+        "auc_n_classes": len(eligible),
+        "pr_auc_n_classes": len(pr_aucs),
+        "roc_auc_n_classes": len(roc_aucs),
         "auc_min_support": min_support,
         "auc_tokens_evaluated": int(targets.numel()),
     }
@@ -3822,6 +3827,8 @@ def evaluate(
             metrics[f"{split}_pr_auc_macro_chance"] = None
             metrics[f"{split}_roc_auc_macro"] = None
             metrics[f"{split}_auc_n_classes"] = 0
+            metrics[f"{split}_pr_auc_n_classes"] = 0
+            metrics[f"{split}_roc_auc_n_classes"] = 0
             metrics[f"{split}_auc_min_support"] = (
                 _AUC_MIN_SUPPORT
             )
@@ -5022,19 +5029,29 @@ def analyze_training_curve(
 
         if "grad_norm" in record or "train_loss" in record:
             train_loss = record.get("train_loss")
-            # 非有限事件既可能落在损失上（写盘为 null），也可能
-            # 只落在梯度上（损失仍有限但 grad_norm 为 null）。
-            nonfinite = train_loss is None or (
-                "grad_norm" in record
-                and record.get("grad_norm") is None
+            grad_norm = record.get("grad_norm")
+            # 非有限事件既可能落在损失上（写盘为 null，在线记录
+            # 保留 NaN/Inf），也可能只落在梯度上。判据必须覆盖
+            # 原值非有限的情况，否则 NaN 会流进 _sparkline 的
+            # int() 转换。
+            train_finite = (
+                isinstance(train_loss, (int, float))
+                and not isinstance(train_loss, bool)
+                and math.isfinite(float(train_loss))
             )
+            grad_nonfinite = "grad_norm" in record and not (
+                isinstance(grad_norm, (int, float))
+                and not isinstance(grad_norm, bool)
+                and math.isfinite(float(grad_norm))
+            )
+            nonfinite = not train_finite or grad_nonfinite
             if nonfinite:
                 if (
                     not nonfinite_steps
                     or nonfinite_steps[-1] != step
                 ):
                     nonfinite_steps.append(step)
-            if train_loss is not None:
+            if train_finite:
                 train_loss = float(train_loss)
                 train_points.append((step, train_loss))
                 pending.append(train_loss)
@@ -5493,10 +5510,19 @@ def early_stop_state_from_records(
             continue
 
         val_loss = record.get("val_loss")
-        if val_loss is None:
+        # 非有限验证损失不算「改善」也不触发「未改善」计数，
+        # 与在线训练循环的判定保持一致；否则 NaN 会把 best_loss
+        # 永久污染成 NaN，resume 后的选型与早停全部失准。
+        if (
+            val_loss is None
+            or isinstance(val_loss, bool)
+            or not isinstance(val_loss, (int, float))
+        ):
             continue
 
         val_loss = float(val_loss)
+        if not math.isfinite(val_loss):
+            continue
 
         if (
             best_loss is None
@@ -6798,10 +6824,10 @@ class RoutingProbe:
         }
 
         rq4_summary = {}
-        for round_name, fields in rq4_round_values.items():
+        for round_name, field_values in rq4_round_values.items():
             rq4_summary[round_name] = {
                 field: sum(values) / len(values)
-                for field, values in fields.items()
+                for field, values in field_values.items()
                 if values
             }
 
@@ -7119,7 +7145,13 @@ def diagnose_non_finite(
     # 训练循环在反向之前就释放了 logits；诊断时补跑一次前向。
     # 只在确认出错后执行一次。
     probe_source = "training result"
-    if logits is None and isinstance(model, LanguageModel):
+    # torch.compile 返回的 OptimizedModule 不是 LanguageModel 的
+    # isinstance，必须解包后再判断，否则 --compile 运行时前向
+    # 证据（logits 有限性/量级）永远缺失。
+    if logits is None and isinstance(
+        _unwrap_model(model),
+        LanguageModel,
+    ):
         was_training = model.training
         try:
             model.eval()
@@ -7847,6 +7879,14 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         )
         row["val_token_accuracy"] = (
             final_record.get("val_token_accuracy")
+            if final_record is not None
+            else None
+        )
+        # micro F1 与 token accuracy 口径一致，但在 COMPARISON_
+        # METRIC_KEYS 中被 --compare-metric 接受；缺这一行会让
+        # val_micro_f1 的跨运行对比永远报「缺指标」。
+        row["val_micro_f1"] = (
+            final_record.get("val_micro_f1")
             if final_record is not None
             else None
         )
@@ -10169,6 +10209,10 @@ def baseline_adequacy(
             )
 
     # 2) 基线 vs 调优好的 n-gram 统计基线（若在对比集合中）。
+    # 基线本身就是 ngram 时不能拿 ngram 与自己比：baseline_rows
+    # 与 ngram_rows 是同一批运行，差值恒为 0，会凭空给出
+    # 「基线不劣于 ngram」的稻草人判定；统计基线自身在 val 上
+    # 做过网格调参，按第 3 步的豁免口径处理。
     ngram_rows = [
         row
         for row in rows
@@ -10178,7 +10222,7 @@ def baseline_adequacy(
         and math.isfinite(float(row[metric]))
     ]
     baseline_better_than_ngram: Optional[bool] = None
-    if ngram_rows:
+    if ngram_rows and baseline_mode != "ngram":
         ngram_mean = _mean(
             [float(row[metric]) for row in ngram_rows]
         )
@@ -11328,8 +11372,12 @@ def run_sanity_overfit(
                                 model
                             )
 
-                    scaler.step(optimizer)
-                    scaler.update()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    # 损失未连接时没有 scale/backward，GradScaler
+                    # 没有 inf 检查记录，调用 step 会直接抛
+                    # RuntimeError；此时跳过优化器步进，保留
+                    # grad_probe 的失败证据供上层报告。
                 else:
                     if loss_connected:
                         loss.backward()
@@ -11637,7 +11685,9 @@ def write_run_config(
     }
 
     # resume 会重写 config.json；保留上次运行结束时补充的
-    # efficiency 测量结果。
+    # efficiency 测量结果与调参来源记录。只有续跑才允许继承：
+    # 在既有目录上全新训练（如复用输出目录）不能把上一次运行
+    # 的读数错记到自己名下。
     config_path = out_dir / "config.json"
     if config_path.exists():
         try:
@@ -11645,7 +11695,10 @@ def write_run_config(
                 previous = json.load(f)
         except (OSError, json.JSONDecodeError):
             previous = None
-        if isinstance(previous, dict):
+        if (
+            isinstance(previous, dict)
+            and getattr(args, "resume", None) is not None
+        ):
             if "efficiency" in previous:
                 payload.setdefault(
                     "efficiency",
@@ -11664,20 +11717,19 @@ def write_run_config(
                 ]
             # resume 通常不再重复传 --hypothesis/--rq；此时保留原
             # 运行记录的科学假设，避免重写 config.json 时丢失。
-            if getattr(args, "resume", None) is not None:
-                for key in ("hypothesis", "research_question"):
-                    previous_value = previous.get(key)
-                    if (
-                        not str(payload.get(key) or "").strip()
-                        and isinstance(previous_value, str)
-                        and previous_value.strip()
-                    ):
-                        payload[key] = previous_value
+            for key in ("hypothesis", "research_question"):
+                previous_value = previous.get(key)
                 if (
-                    previous.get("hypothesis_check_skipped")
-                    and not payload["hypothesis_check_skipped"]
+                    not str(payload.get(key) or "").strip()
+                    and isinstance(previous_value, str)
+                    and previous_value.strip()
                 ):
-                    payload["hypothesis_check_skipped"] = True
+                    payload[key] = previous_value
+            if (
+                previous.get("hypothesis_check_skipped")
+                and not payload["hypothesis_check_skipped"]
+            ):
+                payload["hypothesis_check_skipped"] = True
 
     # config.json 是实验追踪的唯一来源，写入中途失败不能留下
     # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
@@ -16385,11 +16437,12 @@ def baseline_tuning_provenance_error(
     lr: float,
     steps: int,
     data_sha256: Optional[str],
+    batch_size: Optional[int] = None,
 ) -> Optional[str]:
     """
     核对「当前基线训练」是否忠实复用了调参报告的 winner：
-    模式、学习率、训练步数与数据指纹都必须一致。返回错误
-    消息或 None。
+    模式、学习率、训练步数、批大小与数据指纹都必须一致。
+    返回错误消息或 None。
     """
     record_mode = str(payload.get("mode"))
     if mode != record_mode:
@@ -16414,6 +16467,19 @@ def baseline_tuning_provenance_error(
             f"当前 --steps={int(steps)} 与调参训练配置 "
             f"steps={int(record_steps)} 不一致：学习率是在"
             "原训练配置下调出来的，训练配置变了应重新调参"
+        )
+
+    record_batch = config.get("batch_size")
+    if (
+        batch_size is not None
+        and isinstance(record_batch, int)
+        and not isinstance(record_batch, bool)
+        and int(batch_size) != int(record_batch)
+    ):
+        return (
+            f"当前 --batch-size={int(batch_size)} 与调参训练"
+            f"配置 batch_size={int(record_batch)} 不一致："
+            "学习率与批大小耦合，训练配置变了应重新调参"
         )
 
     record_sha = config.get("data_sha256")
@@ -17550,31 +17616,59 @@ def main():
             args.test_fraction = saved_data_test_fraction
 
         # 群组分隔符决定吸附后的实际切分位置，与划分比例一样
-        # 是数据划分协议的一部分；resume 时按存档恢复。
-        saved_group_separator = saved_args.get(
-            "group_separator"
-        )
-
-        if (
-            saved_group_separator is not None
-            and saved_group_separator != args.group_separator
-        ):
-            print(
-                "resume restored group_separator "
-                f"{args.group_separator!r} -> "
-                f"{saved_group_separator!r} "
-                "(群组切分是数据划分的一部分)"
+        # 是数据划分协议的一部分；resume 时按存档恢复。现代
+        # checkpoint 一定带有该键（None 表示原运行未启用群组
+        # 切分），按存档恢复（包括 None）；只有缺键的旧
+        # checkpoint 才回退到当前命令行值并警告。
+        if "group_separator" in saved_args:
+            saved_group_separator = saved_args.get(
+                "group_separator"
             )
-            args.group_separator = saved_group_separator
-        elif (
-            saved_group_separator is None
-            and args.group_separator is not None
-        ):
+            if saved_group_separator != args.group_separator:
+                print(
+                    "resume restored group_separator "
+                    f"{args.group_separator!r} -> "
+                    f"{saved_group_separator!r} "
+                    "(群组切分是数据划分的一部分)"
+                )
+                args.group_separator = saved_group_separator
+        elif args.group_separator is not None:
             print(
                 "resume checkpoint predates --group-separator; "
                 "当前按群组切分，train/val/test 位置可能与"
                 "原运行不同"
             )
+
+        # seed 决定数据采样顺序与初始化噪声，是采样轨迹的
+        # 核心变量；resume 时按存档恢复，避免续跑换了随机流。
+        saved_seed = saved_args.get("seed")
+        if (
+            isinstance(saved_seed, int)
+            and not isinstance(saved_seed, bool)
+            and saved_seed != args.seed
+        ):
+            print(
+                "resume restored seed "
+                f"{args.seed} -> {saved_seed} "
+                "(随机流是采样轨迹的一部分)"
+            )
+            args.seed = saved_seed
+
+        # 早停参数决定训练在哪个 step 停止；续跑时若换了参数，
+        # 「早停判定」会与存档时的口径不一致（甚至已恢复的
+        # 未改善计数按旧 patience 累积）。按存档恢复。
+        for key in ("early_stop_patience", "early_stop_min_delta"):
+            saved_value = saved_args.get(key)
+            if (
+                saved_value is not None
+                and saved_value != getattr(args, key)
+            ):
+                print(
+                    f"resume restored {key} "
+                    f"{getattr(args, key)} -> {saved_value} "
+                    "(早停判定必须与存档口径一致)"
+                )
+                setattr(args, key, saved_value)
 
     # 结构与损失配置的合法性与其他命令行参数同一口径：
     # 校验失败走 parser.error 的清晰报错，而不是抛裸 traceback。
@@ -17673,6 +17767,7 @@ def main():
             lr=args.lr,
             steps=args.steps,
             data_sha256=dataset.data_sha256,
+            batch_size=args.batch_size,
         )
         if provenance_error is not None:
             parser.error(
