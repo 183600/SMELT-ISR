@@ -715,6 +715,10 @@ class SparseMoE(nn.Module):
         self._weight_stacks.clear()
         return super()._apply(fn, recurse=recurse)
 
+    def invalidate_weight_cache(self) -> None:
+        """清空缓存，确保后续前向使用当前参数。"""
+        self._weight_stacks.clear()
+
     def _cached_weight_stack(
         self,
         key: str,
@@ -723,12 +727,14 @@ class SparseMoE(nn.Module):
         """
         返回 [n_experts, ...] 的专家权重 stack，跨调用复用。
 
-        缓存以 (autocast dtype, 版本号, 数据指针) 为签名：任何
-        原地更新（优化器更新、加载检查点）都会推进版本号并触发
-        重建；参数张量被替换时由 _apply 清空缓存兜底。CUDA
-        autocast 下缓存 autocast dtype 的 stack。需要反向时
-        经 _StackedExpertWeights 把梯度按专家散回参数，与
-        「torch.stack + bmm」在 autocast 下的计算图语义相同。
+        缓存以 (autocast dtype, 版本号, 数据指针) 为签名：普通
+        原地更新（如 load_state_dict）会推进版本号并触发重建；
+        但 fused AdamW 的原地更新不会推进版本号，因此训练循环
+        在 optimizer.step() 后显式清空缓存。参数张量被替换时
+        由 _apply 清空缓存兜底。CUDA autocast 下缓存 autocast
+        dtype 的 stack。需要反向时经 _StackedExpertWeights 把
+        梯度按专家散回参数，与「torch.stack + bmm」在 autocast
+        下的计算图语义相同。
         """
         first = weights[0]
         target_dtype = self._autocast_target_dtype(first)
@@ -1864,6 +1870,19 @@ class LanguageModel(nn.Module):
                 preserve_rng_state=False,
             )
         return fn(*args)
+
+    def invalidate_weight_caches(self) -> None:
+        """
+        使所有 MoE Block 的专家权重 stack 缓存失效。
+
+        fused AdamW 原地更新参数时不会推进张量的版本号，
+        _cached_weight_stack 的版本签名无法感知更新，因此
+        optimizer.step() 后必须显式清空，否则后续前向会复用
+        更新前的专家权重。
+        """
+        for block in self.blocks:
+            if block.moe is not None:
+                block.moe.invalidate_weight_cache()
 
     def run_independent_blocks(
         self,
@@ -11059,6 +11078,10 @@ def run_sanity_overfit(
 
                     optimizer.step()
 
+                # fused AdamW 不推进参数版本号，显式使专家权重
+                # stack 缓存失效，确保下一步前向使用新参数。
+                model.invalidate_weight_caches()
+
                 # 仅在需要报告或收尾的步取回标量，取值来源
                 # 与时刻均与原实现一致。
                 if (
@@ -17802,6 +17825,9 @@ def main():
             else:
                 optimizer.step()
             scheduler.step()
+            # fused AdamW 不推进参数版本号，显式使专家权重
+            # stack 缓存失效，确保下一步前向使用新参数。
+            model.invalidate_weight_caches()
             consecutive_nonfinite = 0
         else:
             nonfinite_events += 1
