@@ -13351,12 +13351,16 @@ def run_self_test():
         descending_analysis
     )
 
+    # healthy 的判据：验证未明显回升（regression 低于过拟合
+    # 阈值）且训练仍在有效下降（最近间隔 ≥ _CURVE_STILL_DESCENDING），
+    # 验证仅轻微波动；训练与验证都停在原地的曲线会被判为
+    # plateau，不能作为 healthy 的样本。
     healthy_analysis = analyze_training_curve(
         [
             {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
             {"step": 20, "train_loss": 4.0, "val_loss": 4.3},
-            {"step": 30, "train_loss": 3.18, "val_loss": 3.45},
-            {"step": 40, "train_loss": 3.15, "val_loss": 3.46},
+            {"step": 30, "train_loss": 3.3, "val_loss": 3.45},
+            {"step": 40, "train_loss": 3.1, "val_loss": 3.46},
         ],
         baseline_loss=baseline,
     )
