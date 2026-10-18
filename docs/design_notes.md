@@ -112,9 +112,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   统计全部目标 token（不做随机下采样），把错误案例按歧义、
   系统性混淆、疑似标签噪声、不确定四类原因归类；top-N 最差样本
   用「每批 top-N + 跨批截断」精确维护，窗口只为入选样本保留。
-- `measure_efficiency`、`print_efficiency`：参数量、前向 FLOPs
-  （线性层实测 + 注意力估计）、推理延迟/吞吐、训练步耗时
-  （前向+反向，不含优化器更新）与推理/训练峰值显存。
+- `measure_efficiency`、`print_efficiency`：参数量与前向 FLOPs
+  （线性层实测 + 注意力估计）。
 - `compare_runs`、`print_comparison`：汇总多个运行目录的
   config 与最终指标。
 - `build_comparison_protocol`、`check_controlled_variables`：
@@ -168,11 +167,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   test 坏案例。
 - **效率口径**：FLOPs 线性层部分用 `FlopCounterMode` 实测，
   注意力按 4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层
-  执行两轮，按真实执行次数累计）；另有实测的推理延迟/吞吐与
-  训练步耗时（前向+反向中位耗时，测量在最终/测试评估前执行、
-  不含优化器更新以免污染待评估参数）、推理/训练峰值显存与
-  进程 RSS。`--compare` 的效率倍率同时覆盖参数、FLOPs、推理
-  延迟、训练步耗时与峰值内存。
+  执行两轮，按真实执行次数累计）。
 - **早停与选型**：`--early-stop-patience` 启用；NaN 验证损失不算
   「改善」；`--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑
   语义一致。最优验证点同时是模型选择依据（`best.pt`），final/test

@@ -1149,8 +1149,7 @@ class SparseMoE(nn.Module):
         只有 1 个专家的组无需填充：段内排序行序即局部行序，
         dest 恒为恒等映射，直接对该专家的连续输入段走与
         逐专家循环路径相同的 2D 线性计算（Expert.forward），
-        省去零填充缓冲与散射拷贝，也无需构造排序位置到
-        填充布局的下标。
+        无需构造排序位置到填充布局的下标。
 
         dest 由排序后行号 j 所属专家与局部行号给出；每个
         排序位置至多写入一次且并集只差填充行，逐专家输出
@@ -1831,8 +1830,7 @@ class _BlockCheckpoint(torch.autograd.Function):
     所有 Block 内都没有 dropout 等随机算子（通用实现中相应
     地关闭了 RNG 状态保存），输出固定为张量元组，因此不需要
     通用实现的逐张量持有器、重算元数据比对与按图任务惰性
-    重算——在小模型高频 Block 调用下，这些逐张量的 Python
-    记账开销占 checkpointing 的相当比例。
+    重算。
     """
 
     @staticmethod
@@ -5056,7 +5054,7 @@ _CURVE_GENERALIZATION_GAP = 0.1
 # gap（相对验证损失的比例）扩大达到该幅度、且最终 gap 已不低
 # 时，即使验证损失尚未明显回升（未触发 overfitting），也提示
 # 「训练损失继续降但验证收益停滞」的过拟合前兆，建议提前准备
-# 早停/加正则化。等在验证损失明显回升后才报警会浪费训练预算。
+# 早停/加正则化。等待验证损失明显回升后再报警会偏晚。
 _CURVE_GAP_WIDENING = 0.05
 
 # 学习率已退火到峰值的该比例以下时，训练/验证双走平更像
@@ -5538,8 +5536,8 @@ def analyze_training_curve(
                 f"{lr_text}或数据管道本身有问题。建议检查："
                 "学习率是否过小或过大、模型容量"
                 "（--d-model / --n-layers）是否足够，并用 "
-                "--sanity-only 的小批量过拟合检查排除数据管道 "
-                "bug（标签错位、输入输出不对齐）；定位原因前"
+                "--sanity-only 的小批量过拟合检查排除数据管道"
+                "问题（标签错位、输入输出不对齐）；定位原因前"
                 "不要盲目增加步数。"
             )
     elif (
@@ -5781,8 +5779,8 @@ def analyze_bad_cases(
     全量评估 token（与 evaluate 同一窗口集合、同一预测口径），
     不对评估集做随机下采样；top_n 最差样本通过「每批 top-N +
     跨批截断」精确维护（全局 top-N 必然出现在各自批次的
-    top-N 内），窗口只为入选样本保留，内存与 top_n 成正比、
-    与评估 token 数基本无关。相同数据与模型下报告逐位可复现。
+    top-N 内），窗口只为入选样本保留。相同数据与模型下报告
+    逐位可复现。
 
     仅访问 val（或显式解封后的 test），绝不接触训练期间尘封的
     测试集；输出既打印，也写回 metrics.jsonl 的
@@ -5805,10 +5803,8 @@ def analyze_bad_cases(
 
     # 全量统计缓冲：每个 token 只保留紧凑标量（loss fp32 +
     # target/predicted uint8 + confidence/margin fp16，约 10
-    # 字节/token），不对评估窗口做全量物化。此前的实现把
-    # [N, seq_len] 的窗口矩阵整体拼接后在超限时随机下采样，
-    # 导致「全量错误归因」实际上只是子样本归因；流式统计后
-    # 口径与 evaluate 的固定窗口评估完全一致。
+    # 字节/token），不对评估窗口做全量物化；统计口径与
+    # evaluate 的固定窗口评估完全一致。
     losses: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []
     predictions: List[torch.Tensor] = []
@@ -5817,7 +5813,7 @@ def analyze_bad_cases(
 
     # 全局 top-N 最差 token：每批先取本批 top-N 候选再跨批截断
     #（全局 top-N 必然在各自批次的 top-N 内），窗口只为入选
-    # 样本保留，内存与 top_n 成正比而不是与评估 token 数成正比。
+    # 样本保留。
     # 插入序号保证并列损失下的排序确定（报告可复现）。
     # 候选项：(loss, 插入序号, 窗口行, 目标位置, target,
     # predicted, confidence, margin)。
@@ -7780,15 +7776,7 @@ def measure_efficiency(
     iters: int = 5,
 ) -> Dict[str, object]:
     """
-    效率测量：参数量、前向 FLOPs、推理延迟与训练步耗时等
-    精度之外的代价指标。
-
-    - 推理延迟 / 吞吐 / 推理与训练峰值显存按设备实测；
-    - ``training_ms_per_step``：前向 + 反向的中位耗时（**不含**
-      优化器更新与梯度裁剪；本函数在最终/测试评估之前执行，
-      不能推进优化器、污染待评估的模型参数）。它回答「训练
-      同样的步数要多花多少时间」，与 FLOPs（只含前向）互补，
-      避免只看理论计算量而漏掉反向/带宽代价。
+    效率测量：参数量、前向 FLOPs 等模型规模指标。
 
     本测量在训练结束时对当前模型测一次，与精度指标一起写入
     config.json 与 metrics.jsonl（``{"step": "efficiency", ...}``）。
@@ -7848,10 +7836,9 @@ def measure_efficiency(
         timings.sort()
         latency_seconds = timings[len(timings) // 2]
 
-        # 训练步耗时（前向 + 反向，不含优化器更新）：推理延迟
-        # 只反映前向成本，反向与激活保存的代价可能完全不同。
-        # 与推理计时同一 warmup/iters 口径取中位数；训练峰值
-        # 显存在同一次计时中一并测量（CUDA 路径）。
+        # 训练步耗时（前向 + 反向，不含优化器更新）：与推理
+        # 计时同一 warmup/iters 口径取中位数；训练峰值内存
+        # 在同一次计时中一并测量（CUDA 路径）。
         model.train()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -8434,14 +8421,13 @@ _SIGNIFICANCE_LEVEL = 0.05
 _MIN_SEEDS_FOR_STATS = 3
 _RECOMMENDED_SEEDS = 3
 
-# 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量、
-# 计算量（FLOPs）、延迟与峰值内存；效率倍率达到基线的该阈值
+# 效率与精度的权衡：对比实验除指标涨点外还必须报告参数量与
+# 计算量（FLOPs）等模型规模指标；效率倍率达到基线的该阈值
 # 时，即使统计显著也必须在结论中显式权衡「涨点是否值得」。
 _COST_RATIO_MATERIAL = 1.5
 
-# 参与效率权衡的字段（顺序即展示顺序）。训练步耗时（前向+反向
-# 中位耗时）与推理延迟互补：反向/带宽代价只体现在前者，FLOPs
-# 只统计前向。「涨点 0.5% 但每步训练时间 ×10」必须能被识别。
+# 参与效率权衡的字段（顺序即展示顺序）。各字段分别反映
+# 模型结构与训练规模的差异。
 _COST_FIELDS: Tuple[str, ...] = (
     "n_params",
     "flops_per_forward",
@@ -8459,9 +8445,9 @@ _COST_FIELD_LABELS = {
 }
 
 # 需要运行结束实际测量的效率字段（参数量是结构属性，旧运行也
-# 常有；FLOPs/延迟/内存全缺说明该运行没有做效率测量，精度与
-# 成本的权衡无法评估，必须显式点出而不是静默跳过）。
-# 训练步耗时同样是实测值，但它是后加入的补充代价字段：旧运行
+# 常有；实测字段全缺说明该运行没有做效率测量，精度与效率的
+# 权衡无法评估，必须显式点出而不是静默跳过）。
+# 训练步耗时同样是实测值，但它是后加入的补充字段：旧运行
 # 没有该记录不改变「是否做过效率测量」的判定，避免把所有旧运行
 # 都误标成缺效率数据；有该字段时照常参与倍率与权衡判定。
 _MEASURED_COST_FIELDS: Tuple[str, ...] = (
@@ -8474,7 +8460,7 @@ _MEASURED_COST_FIELDS: Tuple[str, ...] = (
 def _cell_missing_measured_costs(
     cell: Dict[str, object],
 ) -> List[str]:
-    """列出一个实验单元缺失的实测效率字段（FLOPs/延迟/内存）。"""
+    """列出一个实验单元缺失的实测效率字段。"""
     costs = cell.get("costs")
     if not isinstance(costs, dict):
         return list(_MEASURED_COST_FIELDS)
@@ -9357,9 +9343,8 @@ def aggregate_runs(
             "costs": {},
         }
 
-        # 效率指标（参数量 / FLOPs / 延迟 / 峰值内存）随精度指标
-        # 一起聚合：评价改进必须同时给出涨点与效率指标，否则
-        # 微小的涨点可能掩盖数量级的差异。
+        # 效率指标随精度指标一起聚合：评价改进必须同时给出
+        # 涨点与效率指标，否则微小的涨点可能掩盖数量级的差异。
         for field in _COST_FIELDS:
             values = [
                 float(group_row[field])
@@ -9541,7 +9526,7 @@ def _cost_comparison(
     )
 
     # 记录哪些「实测效率字段」缺失：涨点/变差结论无法做精度与
-    # 成本权衡时，展示层必须显式提示，而不是静默略过效率。
+    # 效率权衡时，展示层必须显式提示，而不是静默略过效率。
     return (
         {
             "baseline": baseline_costs,
@@ -9894,9 +9879,9 @@ def _contrast_display(
         if ratio_parts:
             cost_text = "  效率倍率: " + " ".join(ratio_parts)
 
-    # 涨点/变差但缺实测效率数据（FLOPs/延迟/内存都没有可比
-    # 倍率）：只报指标差值等于回避精度与成本的权衡，必须点出
-    # 权衡缺失，而不是让结论静默通过。
+    # 涨点/变差但缺实测效率数据（没有可比倍率）：只报指标差值
+    # 等于回避精度与效率的权衡，必须点出权衡缺失，而不是让
+    # 结论静默通过。
     if (
         verdict in ("改善", "变差")
         and not (
@@ -9907,7 +9892,7 @@ def _contrast_display(
             )
         )
     ):
-        caveat += "（缺效率数据，无法评估精度/成本权衡）"
+        caveat += "（缺效率数据，无法评估精度/效率权衡）"
 
     return (
         f"{factor}: {baseline}→{variant}{context}  "
@@ -11160,7 +11145,7 @@ def print_comparison_analysis(
     for message in imbalance["advisories"]:
         print(f"  [note] {message}")
 
-    # 效率与精度权衡：涨点必须与参数量/计算量/延迟/内存一起看。
+    # 效率与精度权衡：涨点必须与参数量/计算量等一起看。
     cost_rows = [
         aggregate
         for aggregate in aggregates
@@ -11170,7 +11155,7 @@ def print_comparison_analysis(
         print()
         print(
             "[efficiency] 各实验单元效率（运行结束时测量；"
-            "参数量/FLOPs 可跨环境比较，延迟与内存受硬件影响，"
+            "参数量/FLOPs 可跨环境比较，其余字段受硬件影响，"
             "仅在同一环境内可比）"
         )
         cost_header = (
@@ -11197,8 +11182,8 @@ def print_comparison_analysis(
             )
 
     # 缺效率测量数据的实验单元必须点名：旧版本运行或
-    # --skip-efficiency 的运行没有 FLOPs/延迟/内存，涉及这些
-    # 单元的涨点结论无法做精度与成本的权衡（统计基线 ngram
+    # --skip-efficiency 的运行没有实测效率字段，涉及这些
+    # 单元的涨点结论无法做精度与效率的权衡（统计基线 ngram
     # 是查表模型、本来就无该口径，不计入）。
     missing_efficiency_cells = [
         aggregate["label"]
@@ -11208,9 +11193,9 @@ def print_comparison_analysis(
     ]
     if missing_efficiency_cells:
         print(
-            "  [cost] 以下实验单元缺效率测量数据（旧运行或 "
+            "  [efficiency] 以下实验单元缺效率测量数据（旧运行或 "
             "--skip-efficiency），涉及它们的对比无法评估"
-            "精度/成本权衡: "
+            "精度/效率权衡: "
             + "; ".join(missing_efficiency_cells)
         )
 
@@ -11444,7 +11429,7 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
     """
     在第一次反向后检查梯度是否健康。
 
-    比「能否过拟合」更早、更直接地定位严重 bug：
+    比「能否过拟合」更早、更直接地定位严重问题：
     - 至少一个参数收到非零梯度（梯度未反传、参数未进入优化器
       会让训练空转）；
     - 全部梯度必须有限（NaN/Inf 会静默污染所有参数）；
@@ -11578,9 +11563,9 @@ def run_sanity_overfit(
     融合、不改写 autograd 语义，不镜像。
 
     这是必要不充分的检查：连小批量都无法过拟合，通常意味着
-    梯度没有正确反传、损失计算错误、优化器配置错误等严重缺陷；
+    梯度没有正确反传、损失计算错误、优化器配置错误等问题；
     但通过也不代表代码完全正确，数据增强、特征对齐、标签映射
-    等缺陷仍可能漏网，仍需配合中间结果检查。
+    等问题仍可能漏网，仍需配合中间结果检查。
 
     函数内部固定 seed 并在结束后恢复调用前的全部 RNG 状态，
     因此是否运行本检查不影响主训练的随机轨迹。
@@ -18368,8 +18353,8 @@ def main():
         fused_adamw = True
     except (RuntimeError, TypeError):
         fused_adamw = False
-    # fused 不可用时改用 foreach 批量更新：逐元素计算与逐参数
-    # 路径逐位一致（已验证）。
+    # fused 不可用时改用 foreach 批量更新：逐元素计算与
+    # 逐参数路径逐位一致。
     try:
         optimizer = torch.optim.AdamW(
             param_groups,
