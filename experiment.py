@@ -555,10 +555,9 @@ class Expert(nn.Module):
 # 批量专家路径的填充上限：padded 行数（n_experts *
 # max(counts)）超过 assignment 总数的该倍数时，退回逐专家
 # 循环路径。阈值判定只依赖确定性的 counts 与设备类型，
-# 相同数据始终选择同一路径。GPU 上把多个小 GEMM 合成
-# bmm 能摊薄 kernel 启动开销，故留出 1.25 倍的填充浪费；
-# CPU 上采用更保守的填充上限，故只在零填充浪费
-# （<= 1.0 倍）时才批量。
+# 相同数据始终选择同一路径。GPU 的填充上限为 1.25 倍；
+# CPU 更保守，填充不超过 assignment 总数（<= 1.0 倍）
+# 时才走批量路径。
 _MOE_PAD_RATIO_LIMIT = 1.25
 _CPU_MOE_PAD_RATIO_LIMIT = 1.0
 
