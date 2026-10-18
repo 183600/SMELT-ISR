@@ -1141,30 +1141,25 @@ class SparseMoE(nn.Module):
         分组填充 + 批量 bmm 的专家计算路径。
 
         整批填充比例超过 _MOE_PAD_RATIO_LIMIT（路由不均衡）
-        时使用：每个组把组内各专家的段散射进
+        时使用：多专家组把组内各专家的段散射进
         [组内专家数, 组内最大计数, dim] 的零填充缓冲，一次
-        bmm 完成组内全部专家（含只有 1 个专家的组，等价于
-        逐专家 GEMM）。填充行的输入是精确的 0：其前向输出
-        为 0，对权重梯度的贡献也恒为精确的 0，因此与逐专家
-        循环路径的数值语义一致。
+        bmm 完成组内全部专家。填充行的输入是精确的 0：其前向
+        输出为 0，对权重梯度的贡献也恒为精确的 0，因此与
+        逐专家循环路径的数值语义一致。
+
+        只有 1 个专家的组无需填充：段内排序行序即局部行序，
+        dest 恒为恒等映射，直接对该专家的连续输入段走与
+        逐专家循环路径相同的 2D 线性计算（Expert.forward），
+        省去零填充缓冲与散射拷贝，也无需构造排序位置到
+        填充布局的下标。
 
         dest 由排序后行号 j 所属专家与局部行号给出；每个
         排序位置至多写入一次且并集只差填充行，逐专家输出
         按 id 顺序交给 _MergeExpertOutputs 散射回原始
         assignment 顺序。
         """
-        n_experts = self.n_experts
         device = gathered.device
         total = gathered.size(0)
-
-        # 排序后第 j 行所属专家，及该行在其专家段内的局部行号。
-        starts = torch.cumsum(counts_tensor, dim=0) - (
-            counts_tensor
-        )
-        seg_id = assignment_experts.index_select(0, perm)
-        seg_local = (
-            torch.arange(total, device=device) - starts[seg_id]
-        )
 
         # 零计数专家用空切片占位，保持与 counts 一一对应。
         expert_outputs: List[Optional[torch.Tensor]] = [
@@ -1172,12 +1167,41 @@ class SparseMoE(nn.Module):
             for count in counts
         ]
 
+        # 排序后第 j 行所属专家，及该行在其专家段内的局部
+        # 行号；仅多专家组需要，首次遇到时再计算。
+        seg_id: Optional[torch.Tensor] = None
+        seg_local: Optional[torch.Tensor] = None
+
         for begin, end in groups:
             group_counts = counts[begin:end + 1]
             group_rows = sum(group_counts)
-            peak = max(group_counts)
             offset = prefix[begin]
 
+            # 单专家组：连续输入段直接进入该专家的 2D 线性
+            # 前向，不构造零填充缓冲。
+            if begin == end:
+                expert_outputs[begin] = self.experts[
+                    begin
+                ].forward(
+                    gathered[offset:offset + group_rows]
+                )
+                continue
+
+            if seg_id is None:
+                starts = torch.cumsum(
+                    counts_tensor,
+                    dim=0,
+                ) - counts_tensor
+                seg_id = assignment_experts.index_select(
+                    0,
+                    perm,
+                )
+                seg_local = (
+                    torch.arange(total, device=device)
+                    - starts[seg_id]
+                )
+
+            peak = max(group_counts)
             sub_seg = seg_id[offset:offset + group_rows]
             sub_local = seg_local[offset:offset + group_rows]
             dest = (sub_seg - begin) * peak + sub_local
