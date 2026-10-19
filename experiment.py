@@ -3422,17 +3422,26 @@ def confusion_matrix_metrics(
     """
     从 [n_classes, n_classes] 混淆矩阵（行 = 目标类，
     列 = 预测类）计算 token accuracy 与 micro / macro /
-    weighted F1，以及多数类参考 accuracy。
+    weighted F1 以及 macro / weighted precision、recall，
+    还有多数类参考 accuracy。
 
     返回键全部不带 split 前缀，由调用方加上
     （val_ / test_），并保证口径在文档中显式说明：
     - ``token_accuracy`` / ``micro_f1``：micro 口径
-      （单标签多分类下两者恒等）；
-    - ``macro_f1``：对 support > 0 的类求算术平均；
-    - ``weighted_f1``：按各类 support 加权平均；
+      （单标签多分类下两者恒等；micro precision =
+      micro recall = accuracy，故不单列）；
+    - ``macro_f1`` / ``precision_macro`` / ``recall_macro``：
+      对 support > 0 的类求算术平均（每类等权，少数类
+      退化不会被高频类掩盖）；
+    - ``weighted_f1`` / ``precision_weighted`` /
+      ``recall_weighted``：按各类 support 加权平均；
     - ``majority_accuracy``：把所有位置都预测成评估集
       中最频繁字节时的 accuracy，是类别不平衡下
       解读 accuracy 的下界参考。
+
+    precision / recall 让假设里「按研究目标选指标」（如
+    「召回率不低于 90%」）真正可判定，而不是登记一个
+    评估管线从不计算的指标。
     """
     confusion = confusion.double()
     total = confusion.sum()
@@ -3443,6 +3452,10 @@ def confusion_matrix_metrics(
             "micro_f1": float("nan"),
             "macro_f1": float("nan"),
             "weighted_f1": float("nan"),
+            "precision_macro": float("nan"),
+            "precision_weighted": float("nan"),
+            "recall_macro": float("nan"),
+            "recall_weighted": float("nan"),
             "majority_accuracy": float("nan"),
             "classes_present": 0.0,
         }
@@ -3474,6 +3487,14 @@ def confusion_matrix_metrics(
         "macro_f1": float(f1[present].mean()),
         "weighted_f1": float(
             (f1 * support).sum() / total
+        ),
+        "precision_macro": float(precision[present].mean()),
+        "precision_weighted": float(
+            (precision * support).sum() / total
+        ),
+        "recall_macro": float(recall[present].mean()),
+        "recall_weighted": float(
+            (recall * support).sum() / total
         ),
         "majority_accuracy": float(
             support.max() / total
@@ -3754,6 +3775,13 @@ def evaluate(
     - ``{split}_macro_f1`` / ``{split}_weighted_f1``：
       必须注明平均口径，macro 只对评估集中出现过的类
       求平均；
+    - ``{split}_precision_macro`` /
+      ``{split}_precision_weighted`` /
+      ``{split}_recall_macro`` /
+      ``{split}_recall_weighted``：precision / recall 的
+      macro（对出现过的类等权）与 weighted（按 support
+      加权）口径；micro precision/recall 与 accuracy 恒等
+      故不单列；
     - ``{split}_majority_accuracy``：常数预测器（永远
       猜最高频字节）的 accuracy，类别不平衡下解读
       accuracy 的参考下界。
@@ -3977,10 +4005,13 @@ def compute_reference_baselines(
       判断模型是否真的学到了上下文信息。
 
     返回 uniform / unigram 在指定 split 上的 loss、
-    accuracy、micro/macro/weighted F1 与多数类参考
-    accuracy，随 config.json / metrics.jsonl 存档。
-    训练曲线诊断把「是否学到东西」的欠拟合参照从
-    uniform 换成更强的 unigram，避免只战胜稻草人。
+    accuracy、macro/weighted F1、macro/weighted
+    precision/recall 与多数类参考 accuracy，以及 AUC 类
+    指标的常数预测器水平（PR-AUC 随机水平 = 纳入类平均
+    prevalence，ROC-AUC = 0.5），随 config.json /
+    metrics.jsonl 存档。训练曲线诊断把「是否学到东西」的
+    欠拟合参照从 uniform 换成更强的 unigram，避免只战胜
+    稻草人。
     """
     # 字节级管线的词表固定为 256。
     vocab_size = 256
@@ -4057,6 +4088,32 @@ def compute_reference_baselines(
 
     class_metrics = confusion_matrix_metrics(confusion)
 
+    # PR-AUC / ROC-AUC 的常数预测器参考：unigram 对所有位置输出
+    # 同一个（逐类不同的）分布，one-vs-rest 排序分数逐类恒定，
+    # 因此
+    # - PR-AUC 恰好等于该类在评估集上的 prevalence（平均精度
+    #   在全部并列时 = 正类比例），macro 随机水平 = 纳入类
+    #   （support >= _AUC_MIN_SUPPORT）prevalence 的均值；
+    # - ROC-AUC 恒为 0.5（并列分数无排序信息）。
+    # 只对有序指标的类（0 < support < 评估 token 数）定义
+    # ROC 参考，与 macro_auc_metrics 的纳入口径一致。这样在
+    # 按项目建议切换到 PR-AUC 对比时，稻草人核对不会静默失效。
+    eval_support = confusion.sum(dim=1)
+    eval_tokens = float(eval_support.sum())
+    auc_eligible = eval_support >= _AUC_MIN_SUPPORT
+    pr_auc_chance = None
+    roc_auc_reference = None
+    if eval_tokens > 0.0:
+        if bool(auc_eligible.any()):
+            pr_auc_chance = float(
+                (eval_support[auc_eligible] / eval_tokens).mean()
+            )
+        roc_eligible = auc_eligible & (eval_support > 0.0) & (
+            eval_support < eval_tokens
+        )
+        if bool(roc_eligible.any()):
+            roc_auc_reference = 0.5
+
     return {
         "split": split,
         "tokens_evaluated": evaluated_tokens,
@@ -4074,6 +4131,25 @@ def compute_reference_baselines(
         "unigram_weighted_f1": class_metrics[
             "weighted_f1"
         ],
+        # precision / recall：与 evaluate 同口径（macro 对
+        # support > 0 的类等权、weighted 按 support 加权），
+        # 供假设以「召回率/精确率」判定时核对基线是否强于
+        # 无上下文预测器。
+        "unigram_precision_macro": class_metrics[
+            "precision_macro"
+        ],
+        "unigram_precision_weighted": class_metrics[
+            "precision_weighted"
+        ],
+        "unigram_recall_macro": class_metrics[
+            "recall_macro"
+        ],
+        "unigram_recall_weighted": class_metrics[
+            "recall_weighted"
+        ],
+        # 序数指标（AUC）的常数预测器参考（见上方注释）。
+        "unigram_pr_auc_macro_chance": pr_auc_chance,
+        "unigram_roc_auc_macro": roc_auc_reference,
     }
 
 
@@ -8208,6 +8284,28 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        # precision / recall（macro 与 weighted 口径）：假设以
+        # 「召回率/精确率」判定时必须有对应指标可供对比。
+        row["val_precision_macro"] = (
+            final_record.get("val_precision_macro")
+            if final_record is not None
+            else None
+        )
+        row["val_precision_weighted"] = (
+            final_record.get("val_precision_weighted")
+            if final_record is not None
+            else None
+        )
+        row["val_recall_macro"] = (
+            final_record.get("val_recall_macro")
+            if final_record is not None
+            else None
+        )
+        row["val_recall_weighted"] = (
+            final_record.get("val_recall_weighted")
+            if final_record is not None
+            else None
+        )
         row["val_pr_auc_macro"] = (
             final_record.get("val_pr_auc_macro")
             if final_record is not None
@@ -8302,6 +8400,57 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{str(row.get('curve_status')):<18}"
         )
 
+    # RQ3/RQ4 路由诊断：跨越单次运行的结论必须能看到每个运行的
+    # 路由指标，而不是只留在各自 config.json 的定性诊断里。
+    # 旧运行或 dense 基线没有路由记录时明确注明，不虚报。
+    routing_rows = [
+        row for row in rows if row.get("routing_available")
+    ]
+    if routing_rows:
+        print()
+        print(
+            "[routing] RQ3/RQ4 路由诊断（val 固定窗口，"
+            "测试集不参与；聚合与显著性检验见 --compare "
+            "的对比分析）"
+        )
+        routing_header = (
+            f"{'run':<20} {'jac(branch)':>11} "
+            f"{'slotReuse':>9} {'selfReuse':>9} "
+            f"{'r1LoadH':>8} {'r2LoadH':>8} {'dead':>5} "
+            f"{'routerH':>8} {'cosine':>8}"
+        )
+        print(routing_header)
+        print("-" * len(routing_header))
+
+        def _rv(value, spec=".4f") -> str:
+            if value is None:
+                return "-"
+            return format(float(value), spec)
+
+        for row in routing_rows:
+            print(
+                f"{str(row.get('run'))[:19]:<20} "
+                f"{_rv(row.get('routing_jaccard_branch')):>11} "
+                f"{_rv(row.get('routing_slot_reuse_branch')):>9} "
+                f"{_rv(row.get('routing_branch_self_reuse')):>9} "
+                f"{_rv(row.get('routing_r1_load_entropy')):>8} "
+                f"{_rv(row.get('routing_r2_load_entropy')):>8} "
+                f"{_rv(row.get('routing_r2_dead_experts'), '.0f'):>5} "
+                f"{_rv(row.get('routing_r2_router_entropy')):>8} "
+                f"{_rv(row.get('routing_branch_cosine')):>8}"
+            )
+        missing_routing = [
+            str(row.get("run"))
+            for row in rows
+            if not row.get("routing_available")
+        ]
+        if missing_routing:
+            print(
+                "  [note] 以下运行没有路由诊断记录（dense 基线"
+                "无 MoE 路由，或旧运行/--skip-routing-analysis）："
+                + "; ".join(missing_routing)
+            )
+
 
 # ============================================================
 # Comparison analysis: controlled variables / seeds / statistics
@@ -8393,6 +8542,9 @@ DEFAULT_COMPARISON_FACTORS = (
 # accuracy 恒等）、macro（对出现过的类等权平均，不平衡时
 # 最能暴露少数类退化）与 weighted（按 support 加权，介于
 # 两者之间）。名字即口径，跨运行对比时必须显式选择。
+# precision / recall 同样按 macro 与 weighted 两种口径列出：
+# 假设声称「依据召回率判定」时，评估管线必须真的计算它，
+# 否则会出现「假设的判定指标不可检验」的假性对齐。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
     "val_ppl",
@@ -8401,12 +8553,19 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_micro_f1",
     "val_macro_f1",
     "val_weighted_f1",
+    "val_precision_macro",
+    "val_precision_weighted",
+    "val_recall_macro",
+    "val_recall_weighted",
     "val_pr_auc_macro",
     "val_roc_auc_macro",
 )
 
 # --compare 行级的 RQ3/RQ4 路由诊断字段（来自各运行 config.json
 # 的 routing_analysis；旧运行缺失时保持 None，不虚报指标）。
+# 这些字段同样是 val 口径（诊断只在验证集固定窗口上做一次），
+# 并接入 COMPARISON_METRIC_KEYS：RQ3/RQ4 的结论必须能跨种子
+# 聚合、参与显著性检验，而不是只能靠单次运行的定性诊断。
 _ROUTING_ROW_FIELDS: Tuple[str, ...] = (
     "routing_jaccard_branch",
     "routing_slot_reuse_branch",
@@ -8419,10 +8578,28 @@ _ROUTING_ROW_FIELDS: Tuple[str, ...] = (
     "routing_branch_cosine",
 )
 
+# 路由诊断指标作为对比指标：它们描述两轮路由的内部行为，
+# 「方向」按本项目 RQ3/RQ4 的目标口径约定——第二轮与第一轮
+# 越独立（jaccard / slot_reuse / self_reuse 越低）、分支轨迹
+# 越分化（cosine 越低）、死专家越少，越符合假设方向；负载
+# 熵与路由熵越高越均匀。方向只影响差值符号与 improvement/
+# regression 标签；显著性检验与聚合不受影响，且报告必须
+# 同时原样给出差值，不能只引用标签做因果解读。
+COMPARISON_METRIC_KEYS = COMPARISON_METRIC_KEYS + _ROUTING_ROW_FIELDS
+
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
     "val_ppl",
     "val_bits_per_byte",
+    # RQ3：第二轮选择与第一轮不同的专家（重合度越低越独立）；
+    # RQ4：死专家越少越好、分支轨迹越分化（cosine 越低）说明
+    # 延迟合并确实产生了独立计算。
+    "routing_jaccard_branch",
+    "routing_jaccard_token",
+    "routing_slot_reuse_branch",
+    "routing_branch_self_reuse",
+    "routing_r2_dead_experts",
+    "routing_branch_cosine",
 }
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
@@ -10944,6 +11121,17 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_micro_f1": "unigram_token_accuracy",
     "val_macro_f1": "unigram_macro_f1",
     "val_weighted_f1": "unigram_weighted_f1",
+    "val_precision_macro": "unigram_precision_macro",
+    "val_precision_weighted": "unigram_precision_weighted",
+    "val_recall_macro": "unigram_recall_macro",
+    "val_recall_weighted": "unigram_recall_weighted",
+    # 排序指标同样要有稻草人守卫：PR-AUC 的常数预测器水平 =
+    # 纳入类平均 prevalence（unigram_pr_auc_macro_chance），
+    # ROC-AUC 的常数预测器水平 = 0.5。否则按项目自己的建议
+    # 切到 PR-AUC 对比时，基线合理性检查会静默降级为
+    # 「无法核对」。旧运行缺这些参考字段时按缺记录处理。
+    "val_pr_auc_macro": "unigram_pr_auc_macro_chance",
+    "val_roc_auc_macro": "unigram_roc_auc_macro",
 }
 
 # 类别不平衡提示阈值：最高频类的 support 占比达到第一个值时，
@@ -11101,6 +11289,28 @@ def baseline_adequacy(
                 metric,
                 row.get("reference_baselines"),
             )
+            reference_source = _TRIVIAL_REFERENCE_FIELDS[metric]
+            if reference_value is None and metric == (
+                "val_pr_auc_macro"
+            ):
+                # 旧运行的 reference_baselines 没有常数预测器
+                # 的 PR-AUC 水平，但该运行自身的
+                # val_pr_auc_macro_chance 就是它的随机水平
+                # （平均 prevalence），拿它做对照同样能完成
+                # 稻草人核对，只是来源不同，需在检查记录里注明。
+                fallback_chance = row.get(
+                    "val_pr_auc_macro_chance"
+                )
+                if (
+                    isinstance(fallback_chance, (int, float))
+                    and not isinstance(fallback_chance, bool)
+                    and math.isfinite(float(fallback_chance))
+                ):
+                    reference_value = float(fallback_chance)
+                    reference_source = (
+                        "val_pr_auc_macro_chance"
+                        "（该运行的 PR-AUC 随机水平）"
+                    )
             if reference_value is None:
                 missing_reference += 1
                 continue
@@ -11115,6 +11325,7 @@ def baseline_adequacy(
                 "run": row.get("run"),
                 "value": float(value),
                 "trivial_reference": reference_value,
+                "trivial_reference_source": reference_source,
                 "better_than_trivial": better,
             })
             if not better:
@@ -11297,6 +11508,52 @@ _HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
     ("routing_load", r"负载|dead[\s_-]?expert|路由"),
 )
 
+# 假设词表 → 当前评估/对比管线真正可判定的指标集合。
+# 只有这里列出的名字才算「假设写明了判定指标」：如果某个
+# 名字没有映射（或映射到的指标不在 COMPARISON_METRIC_KEYS
+# 里），登记时会单独点名「该指标当前没有评估口径」，避免
+# 假设自称用某个指标判定、评估管线却从不计算它（假性对齐）。
+_HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
+    "loss": ("val_loss",),
+    "ppl": ("val_ppl",),
+    "bits_per_byte": ("val_bits_per_byte",),
+    "accuracy": ("val_token_accuracy",),
+    "f1": (
+        "val_micro_f1",
+        "val_macro_f1",
+        "val_weighted_f1",
+    ),
+    "pr_auc": ("val_pr_auc_macro",),
+    "roc_auc": ("val_roc_auc_macro",),
+    "precision": (
+        "val_precision_macro",
+        "val_precision_weighted",
+    ),
+    "recall": (
+        "val_recall_macro",
+        "val_recall_weighted",
+    ),
+    "jaccard": (
+        "routing_jaccard_branch",
+        "routing_jaccard_token",
+    ),
+    "entropy": (
+        "routing_r1_load_entropy",
+        "routing_r2_load_entropy",
+        "routing_r2_router_entropy",
+    ),
+    "routing_load": (
+        "routing_slot_reuse_branch",
+        "routing_branch_self_reuse",
+        "routing_r2_dead_experts",
+    ),
+}
+
+# 路由诊断类判定指标依赖 routing_analysis：dense 基线、
+# --skip-routing-analysis 或旧运行没有该记录时，假设无法被
+# 当前运行的数据判定。
+_HYPOTHESIS_ROUTING_METRICS = frozenset(_ROUTING_ROW_FIELDS)
+
 
 def hypothesis_metric_mentions(text: str) -> List[str]:
     """
@@ -11315,6 +11572,42 @@ def hypothesis_metric_mentions(text: str) -> List[str]:
     return mentions
 
 
+def hypothesis_metric_unverifiable(
+    mentions: List[str],
+    routing_available: Optional[bool] = None,
+) -> List[str]:
+    """
+    返回假设提到的判定指标中「当前评估管线无法判定」的名字。
+
+    - 词表名字没有映射到 COMPARISON_METRIC_KEYS 的指标时，
+      整个名字都不可判定；
+    - 映射到的指标全是路由诊断（``routing_*``）且本次运行
+      没有 routing_analysis 记录（dense 基线、显式跳过或
+      旧运行；``routing_available=False``）时，同样不可判定；
+      ``routing_available=None`` 表示未知（如登记阶段尚未
+      执行诊断），不做否定判定。
+    """
+    unverifiable: List[str] = []
+    for name in mentions:
+        supported = [
+            metric
+            for metric in _HYPOTHESIS_METRIC_SUPPORT.get(name, ())
+            if metric in COMPARISON_METRIC_KEYS
+        ]
+        if not supported:
+            unverifiable.append(name)
+            continue
+        if (
+            routing_available is False
+            and all(
+                metric in _HYPOTHESIS_ROUTING_METRICS
+                for metric in supported
+            )
+        ):
+            unverifiable.append(name)
+    return unverifiable
+
+
 def hypothesis_registry(
     rows: List[Dict[str, object]],
 ) -> Dict[str, object]:
@@ -11328,13 +11621,17 @@ def hypothesis_registry(
     （ngram）不受假设纪律约束。
 
     同时核对假设是否写明了判定指标：没写指标的假设无法与
-    评估口径对齐（「效果更好」不可检验），运行被单独点名。
+    评估口径对齐（「效果更好」不可检验），运行被单独点名；
+    写明了但当前评估管线不可判定的指标（如路由类指标而运行
+    没有 routing_analysis 记录）同样单独点名，避免假性对齐。
     """
     cells: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
     missing_runs: List[str] = []
     skipped_runs: List[str] = []
     hypotheses_without_metric: List[str] = []
+    hypotheses_with_unverifiable_metric: List[str] = []
+    unverifiable_details: List[str] = []
 
     for row in rows:
         mode = str(row.get("mode"))
@@ -11346,6 +11643,7 @@ def hypothesis_registry(
                 "hypotheses": [],
                 "hypotheses_metric_mentions": [],
                 "hypotheses_without_metric_runs": [],
+                "hypotheses_with_unverifiable_metric_runs": [],
                 "research_questions": [],
                 "missing_hypothesis_runs": [],
                 "hypothesis_check_skipped_runs": [],
@@ -11380,6 +11678,28 @@ def hypothesis_registry(
                     run_name
                 )
                 hypotheses_without_metric.append(run_name)
+                continue
+            # 提到的指标必须在当前评估管线的可判定集合内：
+            # 路由类指标在运行没有 routing_analysis 记录时
+            # 无法判定，不能算「假设已写明判定指标」。
+            unverifiable = hypothesis_metric_unverifiable(
+                mentions,
+                routing_available=bool(
+                    row.get("routing_available")
+                ),
+            )
+            if unverifiable:
+                entry[
+                    "hypotheses_with_unverifiable_metric_runs"
+                ].append(run_name)
+                hypotheses_with_unverifiable_metric.append(
+                    run_name
+                )
+                unverifiable_details.append(
+                    f"{run_name}（"
+                    + ", ".join(unverifiable)
+                    + "）"
+                )
             continue
 
         if mode == "ngram":
@@ -11410,6 +11730,16 @@ def hypothesis_registry(
             + "。可检验的假设应写出「依据什么指标、预期"
             "改善多少」"
         )
+    if hypotheses_with_unverifiable_metric:
+        advisories.append(
+            "以下运行的假设提到的判定指标当前不可判定"
+            "（路由诊断类指标需要该运行有 routing_analysis "
+            "记录；dense 基线、--skip-routing-analysis 或旧"
+            "运行的假设无法据此核对）："
+            + "; ".join(unverifiable_details)
+            + "。请改用当前评估管线真正计算的指标，或先补上"
+            "对应的诊断"
+        )
     if skipped_runs:
         advisories.append(
             "以下运行显式跳过了假设检查"
@@ -11421,6 +11751,10 @@ def hypothesis_registry(
         "cells": [cells[mode] for mode in order],
         "missing_hypothesis_runs": missing_runs,
         "hypotheses_without_metric_runs": hypotheses_without_metric,
+        "hypotheses_with_unverifiable_metric_runs": (
+            hypotheses_with_unverifiable_metric
+        ),
+        "unverifiable_metric_details": unverifiable_details,
         "hypothesis_check_skipped_runs": skipped_runs,
         "advisories": advisories,
     }
@@ -11738,9 +12072,26 @@ def print_comparison_analysis(
 
     if aggregates:
         # 聚合表只展示 val 口径：test 指标不参与跨运行
-        # 对比（尘封协议）。
+        # 对比（尘封协议）。除 val_loss 外必须同时打印当前
+        # --compare-metric 选中的判定指标：显著性/等价性结论
+        # 基于该指标，主表若只给 loss 会让读者把表格里的 loss
+        # 误当成判定依据。列名即口径，缺指标显示 "-"。
+        metric_columns = ["val_loss"]
+        if metric != "val_loss":
+            metric_columns.append(metric)
         header = (
-            f"{'cell':<40} {'n':>3} {'val_loss':>18}"
+            f"{'cell':<40} {'n':>3} "
+            + " ".join(
+                f"{column:>19}" for column in metric_columns
+            )
+        )
+        print(
+            f"  判定指标（--compare-metric）: {metric}"
+            + (
+                ""
+                if metric == "val_loss"
+                else "（表中同时给出 val_loss 以便对照）"
+            )
         )
         print(header)
         print("-" * len(header))
@@ -11758,7 +12109,10 @@ def print_comparison_analysis(
             print(
                 f"{str(aggregate['label'])[:39]:<40} "
                 f"{int(aggregate['n_runs']):>3} "
-                f"{_stat(aggregate, 'val_loss'):>18}"
+                + " ".join(
+                    f"{_stat(aggregate, column):>19}"
+                    for column in metric_columns
+                )
             )
 
         underpowered = [
@@ -11792,6 +12146,50 @@ def print_comparison_analysis(
                 "种子间方差被低估、配对检验不可用）: "
                 + details
             )
+
+        # RQ3/RQ4 的路由指标必须能跨种子聚合，而不是只靠单次
+        # 运行的定性诊断；即使当前判定指标不是路由指标，也
+        # 单独给出聚合表（选中路由指标时已在上表展示）。
+        routing_summary_fields = [
+            "routing_jaccard_branch",
+            "routing_slot_reuse_branch",
+            "routing_r2_load_entropy",
+            "routing_r2_dead_experts",
+            "routing_branch_cosine",
+        ]
+        present_routing_fields = [
+            field
+            for field in routing_summary_fields
+            if metric != field
+            and any(
+                aggregate.get(f"{field}_mean") is not None
+                for aggregate in aggregates
+            )
+        ]
+        if present_routing_fields:
+            print()
+            print(
+                "[routing] RQ3/RQ4 路由指标按实验单元聚合"
+                "（Mean ± Std；可用 --compare-metric 直接选为"
+                "判定指标做显著性检验）"
+            )
+            routing_header = (
+                f"{'cell':<40} "
+                + " ".join(
+                    f"{field.replace('routing_', ''):>16}"
+                    for field in present_routing_fields
+                )
+            )
+            print(routing_header)
+            print("-" * len(routing_header))
+            for aggregate in aggregates:
+                print(
+                    f"{str(aggregate['label'])[:39]:<40} "
+                    + " ".join(
+                        f"{_stat(aggregate, field):>16}"
+                        for field in present_routing_fields
+                    )
+                )
     else:
         print("  无有效指标可聚合")
 
@@ -12102,7 +12500,9 @@ def print_comparison_analysis(
                 "  OK：统计基线在 val 上做过 阶数 × 平滑系数 "
                 "网格调优（简单基线已充分调参）"
             )
-        elif adequacy.get("tuned"):
+        elif adequacy.get("tuned") and not adequacy.get(
+            "tuning_metric_mismatch"
+        ):
             tuned_runs = adequacy.get("tuned_runs") or []
             details = "; ".join(
                 f"{item['run']}（调参口径="
@@ -12114,6 +12514,17 @@ def print_comparison_analysis(
                 "  OK：基线记录了调参来源（--baseline-tuning-from）"
                 + (f": {details}" if details else "")
             )
+        elif adequacy.get("tuned"):
+            # 调参口径与当前对比指标不一致时不能打印无条件的
+            # OK：在 val_loss 上调的参证明不了基线在 macro F1 /
+            # PR-AUC 上也被调强，「未证明在该指标上调过参」
+            # 必须作为显式结论，而不是脚注。
+            print(
+                "  [warn] 基线记录了调参来源，但调参口径与当前"
+                "对比指标不一致：不能证明基线在当前指标上被"
+                "调强；请在该指标上重新调参，或改用与调参口径"
+                "一致的对比指标"
+            )
         elif adequacy["baseline_mode"] is not None:
             print(
                 "  [untuned] 基线没有调参来源记录，也没有强于"
@@ -12123,7 +12534,14 @@ def print_comparison_analysis(
             )
         for message in adequacy["straw_man"]:
             print(f"  [straw-man] {message}")
+        mismatch_messages = set(
+            adequacy.get("tuning_metric_mismatch") or []
+        )
         for message in adequacy["advisories"]:
+            # mismatch 已在上方以 [warn] 显式打印，避免重复
+            # 出现在更弱层级的 [note] 里造成信息对立。
+            if message in mismatch_messages:
+                continue
             print(f"  [note] {message}")
 
     print()
@@ -12747,6 +13165,12 @@ def write_run_config(
         "n_params": n_params,
         "hypothesis": args.hypothesis,
         "research_question": args.rq,
+        # 假设里提到的判定指标（规范化名字）：单次运行的假设
+        # 质量也要可追溯，不必等到 --compare 阶段才第一次
+        # 发现「假设没写指标无法判定」。
+        "hypothesis_metric_mentions": hypothesis_metric_mentions(
+            args.hypothesis
+        ),
         "hypothesis_check_skipped": bool(
             args.skip_hypothesis_check
         ),
@@ -12823,6 +13247,14 @@ def write_run_config(
                 and not payload["hypothesis_check_skipped"]
             ):
                 payload["hypothesis_check_skipped"] = True
+
+    # 假设的判定指标以最终生效的假设文本为准（resume 可能从
+    # 原运行恢复了假设），不能沿用命令行空文本的解析结果。
+    payload["hypothesis_metric_mentions"] = (
+        hypothesis_metric_mentions(
+            str(payload.get("hypothesis") or "")
+        )
+    )
 
     # config.json 是实验追踪的唯一来源，写入中途失败不能留下
     # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
@@ -15563,6 +15995,8 @@ def run_self_test():
             k1: int = 2,
             k2: int = 2,
             protocol_overrides: Optional[Dict[str, object]] = None,
+            routing: Optional[Dict[str, object]] = None,
+            precision_recall: Optional[Dict[str, float]] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -15621,6 +16055,7 @@ def run_self_test():
                 "research_question": rq,
                 "reference_baselines": reference,
                 "baseline_tuning": baseline_tuning,
+                "routing_analysis": routing,
                 "data": {"sha256": "deadbeef"},
                 "comparison_protocol": protocol,
             }
@@ -15645,6 +16080,8 @@ def run_self_test():
                 ] = pr_auc_chance
             if pr_auc is not None:
                 final_record["val_pr_auc_macro"] = pr_auc
+            if precision_recall:
+                final_record.update(precision_recall)
             write_jsonl_record(
                 run_dir / "metrics.jsonl",
                 final_record,
@@ -16771,6 +17208,261 @@ def run_self_test():
         )
         assert not balanced_report["advisories"]
 
+        # ---- precision / recall：假设的判定指标必须真的可计算 ----
+        # 词表宣称 precision/recall 可作判定口径，评估管线就
+        # 必须真的输出它们（macro / weighted 两种口径）。
+        confusion = torch.tensor(
+            [
+                [8.0, 2.0],
+                [3.0, 7.0],
+            ]
+        )
+        cm = confusion_matrix_metrics(confusion)
+        assert abs(
+            cm["precision_macro"] - ((8 / 11) + (7 / 9)) / 2
+        ) < 1e-12
+        assert abs(cm["recall_macro"] - 0.75) < 1e-12
+        assert abs(
+            cm["precision_weighted"]
+            - ((8 / 11) + (7 / 9)) / 2
+        ) < 1e-12
+        assert abs(
+            cm["recall_weighted"] - 0.75
+        ) < 1e-12
+        assert "val_recall_macro" in COMPARISON_METRIC_KEYS
+        assert "val_precision_weighted" in COMPARISON_METRIC_KEYS
+        assert hypothesis_metric_unverifiable(["recall"], None) == []
+        assert hypothesis_metric_unverifiable(
+            ["precision"], None
+        ) == []
+        assert hypothesis_metric_unverifiable(
+            ["jaccard"], routing_available=False
+        ) == ["jaccard"]
+        assert hypothesis_metric_unverifiable(
+            ["jaccard"], routing_available=True
+        ) == []
+        assert hypothesis_metric_unverifiable(
+            ["jaccard"], routing_available=None
+        ) == []
+        assert hypothesis_metric_unverifiable(
+            ["loss"], routing_available=False
+        ) == []
+
+        # ---- RQ3/RQ4 路由指标：跨种子聚合与显著性检验 ----
+        routing_payload = {
+            "rq3_expert_overlap": {
+                "summary": {
+                    "second_round_jaccard_mean": 0.30,
+                    "second_round_slot_reuse_mean": 0.40,
+                    "token_second_round_jaccard_mean": 0.25,
+                    "branch_self_reuse_share": 0.50,
+                }
+            },
+            "rq4_load_and_entropy": {
+                "summary": {
+                    "round1": {"load_entropy": 0.90},
+                    "round2": {
+                        "load_entropy": 0.85,
+                        "dead_experts": 1,
+                        "router_entropy_mean": 1.20,
+                    },
+                }
+            },
+            "branch_divergence": {
+                "summary": {"branch_cosine_mean": 0.70}
+            },
+        }
+        routing_paths = []
+        for seed in (42, 43, 44):
+            routing_paths.append(_write_analysis_run(
+                f"route_A_seed{seed}",
+                "A",
+                seed,
+                3e-4,
+                100,
+                0.01,
+                4.0,
+                hypothesis=(
+                    "延迟合并让第二轮 Jaccard 重合度降低"
+                ),
+                rq="RQ3",
+                routing=routing_payload,
+            ))
+        for seed in (42, 43, 44):
+            routing_paths.append(_write_analysis_run(
+                f"route_B_seed{seed}",
+                "B",
+                seed,
+                3e-4,
+                100,
+                0.01,
+                3.9,
+                hypothesis=(
+                    "延迟合并让第二轮 Jaccard 重合度降低"
+                ),
+                rq="RQ3",
+                routing={**routing_payload, "rq3_expert_overlap": {
+                    "summary": {
+                        "second_round_jaccard_mean": 0.15,
+                        "second_round_slot_reuse_mean": 0.25,
+                        "token_second_round_jaccard_mean": 0.10,
+                        "branch_self_reuse_share": 0.30,
+                    }
+                }},
+            ))
+        routing_rows = compare_runs(routing_paths)
+        assert routing_rows[0]["routing_available"] is True
+        assert routing_rows[0]["routing_jaccard_branch"] == 0.30
+        assert routing_rows[0]["routing_r2_dead_experts"] == 1
+        assert routing_rows[0]["routing_branch_cosine"] == 0.70
+        routing_aggregates = aggregate_runs(
+            routing_rows, ["mode"]
+        )
+        aggregates_by_mode = {
+            aggregate["keys"]["mode"]: aggregate
+            for aggregate in routing_aggregates
+        }
+        assert abs(
+            float(
+                aggregates_by_mode["A"][
+                    "routing_jaccard_branch_mean"
+                ]
+            )
+            - 0.30
+        ) < 1e-12
+        assert aggregates_by_mode["A"][
+            "routing_jaccard_branch_n"
+        ] == 3
+        routing_contrasts = factor_contrasts(
+            routing_aggregates,
+            ["mode"],
+            "routing_jaccard_branch",
+        )
+        assert routing_contrasts
+        assert abs(
+            float(routing_contrasts[0]["delta"]) + 0.15
+        ) < 1e-12
+
+        # 假设写了路由判定指标、但运行没有 routing_analysis
+        # （dense 或旧运行）时，不能算「假设已写明判定指标」。
+        no_routing_hyp_path = _write_analysis_run(
+            "no_route_hyp_seed1",
+            "dense",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.0,
+            hypothesis="第二轮 Jaccard 重合度降低",
+            rq="RQ3",
+        )
+        no_routing_registry = hypothesis_registry(
+            compare_runs([no_routing_hyp_path])
+        )
+        assert no_routing_registry[
+            "hypotheses_with_unverifiable_metric_runs"
+        ] == ["no_route_hyp_seed1"]
+        assert any(
+            "不可判定" in message
+            for message in no_routing_registry["advisories"]
+        )
+        routing_registry = hypothesis_registry(
+            compare_runs([routing_paths[0]])
+        )
+        assert not routing_registry[
+            "hypotheses_with_unverifiable_metric_runs"
+        ]
+
+        # ---- PR-AUC / ROC-AUC 的稻草人参考（不平衡场景） ----
+        # 常数预测器的 PR-AUC 水平 = 纳入类平均 prevalence，
+        # ROC-AUC = 0.5；切换对比指标到 PR-AUC 时基线合理性
+        # 检查不能静默降级。
+        auc_reference = dict(
+            good_reference,
+            unigram_pr_auc_macro_chance=0.001,
+            unigram_roc_auc_macro=0.5,
+        )
+        pr_baseline_path = _write_analysis_run(
+            "pr_smelt_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.50,
+            reference=auc_reference,
+            baseline_tuning=good_tuning,
+            pr_auc=0.02,
+            pr_auc_chance=0.001,
+        )
+        pr_adequacy = baseline_adequacy(
+            compare_runs([pr_baseline_path]),
+            "smelt",
+            "val_pr_auc_macro",
+        )
+        assert pr_adequacy["ok"] is True, pr_adequacy
+        assert pr_adequacy["checks"]
+        assert (
+            pr_adequacy["checks"][0]["trivial_reference"]
+            == 0.001
+        )
+        assert pr_adequacy["checks"][0][
+            "trivial_reference_source"
+        ] == "unigram_pr_auc_macro_chance"
+
+        # 基线 PR-AUC 低于随机水平：必须被标记为稻草人。
+        weak_pr_path = _write_analysis_run(
+            "weak_pr_smelt_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.50,
+            reference=auc_reference,
+            baseline_tuning=good_tuning,
+            pr_auc=0.0005,
+            pr_auc_chance=0.001,
+        )
+        weak_pr_adequacy = baseline_adequacy(
+            compare_runs([weak_pr_path]),
+            "smelt",
+            "val_pr_auc_macro",
+        )
+        assert weak_pr_adequacy["ok"] is False
+        assert any(
+            "unigram" in message
+            for message in weak_pr_adequacy["straw_man"]
+        )
+
+        # 旧运行的 reference_baselines 没有 PR-AUC 常数预测器
+        # 水平，但运行自身的 val_pr_auc_macro_chance 就是它的
+        # 随机水平：核对可以完成，且来源必须如实标注。
+        fallback_pr_path = _write_analysis_run(
+            "fallback_pr_smelt_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.50,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+            pr_auc=0.02,
+            pr_auc_chance=0.001,
+        )
+        fallback_pr_adequacy = baseline_adequacy(
+            compare_runs([fallback_pr_path]),
+            "smelt",
+            "val_pr_auc_macro",
+        )
+        assert fallback_pr_adequacy["ok"] is True
+        assert "val_pr_auc_macro_chance" in (
+            fallback_pr_adequacy["checks"][0][
+                "trivial_reference_source"
+            ]
+        )
+
         # print_comparison_analysis 必须携带三个新检查的结构化
         # 结果（随 comparison_analysis.json 落盘），等价性/功效
         # 口径同样要落盘（报告可脱离终端回读）。
@@ -16855,6 +17547,79 @@ def run_self_test():
             for issue in tuning_report["issues"]
         )
 
+        # 均值不同但差距落在种子波动内（最优均值候选的噪声
+        # 覆盖了更小 lr）：winner 必须按 selection_rule 取更小
+        # lr 的保守解，且提示必须与事实一致。
+        noisy_paths = []
+        for seed, value in ((42, 4.00), (43, 4.05), (44, 3.95)):
+            noisy_paths.append(_write_analysis_run(
+                f"noisy_lr1e-4_seed{seed}",
+                "dense",
+                seed,
+                1e-4,
+                100,
+                0.0,
+                value,
+            ))
+        for seed, value in ((42, 3.97), (43, 4.00), (44, 3.94)):
+            noisy_paths.append(_write_analysis_run(
+                f"noisy_lr1e-3_seed{seed}",
+                "dense",
+                seed,
+                1e-3,
+                100,
+                0.0,
+                value,
+            ))
+        noisy_report = analyze_baseline_tuning(
+            compare_runs(noisy_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 1e-3],
+            [42, 43, 44],
+        )
+        assert noisy_report["winner"]["lr"] == 1e-4
+        assert (
+            noisy_report["winner_selection"]
+            == "conservative_tie_break"
+        )
+        assert noisy_report["tied_lrs"] == [1e-4, 1e-3]
+        assert any(
+            "无法在统计上区分" in issue
+            and "保守 winner" in issue
+            for issue in noisy_report["issues"]
+        )
+
+        # 均值可区分（无种子波动）时不做多余的保守替换：
+        # winner 就是最优均值候选，如实记录选择方式。
+        clear_paths = []
+        for lr, value in ((1e-4, 4.0), (3e-4, 4.5), (1e-3, 4.2)):
+            for seed in (42, 43, 44):
+                clear_paths.append(_write_analysis_run(
+                    f"clear_lr{format(lr, 'g')}_seed{seed}",
+                    "dense",
+                    seed,
+                    lr,
+                    100,
+                    0.0,
+                    value,
+                ))
+        clear_report = analyze_baseline_tuning(
+            compare_runs(clear_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4, 1e-3],
+            [42, 43, 44],
+        )
+        assert clear_report["winner"]["lr"] == 1e-4
+        assert clear_report["winner_selection"] == "best_mean"
+        assert clear_report["tied_lrs"] == [1e-4]
+        assert clear_report["winner_at_grid_boundary"] is True
+        assert not any(
+            "无法在统计上区分" in issue
+            for issue in clear_report["issues"]
+        )
+
         # 候选之间训练配置不一致：调参结论无效，必须报 issue
         # （否则「更优 lr」可能与「训练更久」混杂）。
         config_break_path = _write_analysis_run(
@@ -16874,48 +17639,130 @@ def run_self_test():
             [42, 43, 44],
         )
         assert any(
-            "训练配置" in issue
+            "训练协议" in issue
             for issue in config_break_controlled["issues"]
         )
 
+        # winner 必须来自调参报告的并列选择协议：均值更优但
+        # 与更小 lr 的差距落在种子波动内时，保守选择小 lr，
+        # 且 winner_selection 如实记录；边界 winner 要有提示。
+        # （见下方 mean-noisy 用例。）
+        assert (
+            tuning_report["winner_selection"]
+            == "conservative_tie_break"
+        )
+        assert tuning_report["tied_lrs"] == [1e-4, 3e-4]
+        assert tuning_report["winner_at_grid_boundary"] is True
+        assert any(
+            "网格边界" in issue
+            for issue in tuning_report["issues"]
+        )
+
         # 调参报告落盘 → 读回 → 来源核对：模式 / winner lr /
-        # steps / 数据指纹任一不一致都必须拒绝。
+        # steps / 数据指纹 / 完整训练协议任一不一致都必须拒绝。
         tuning_source = write_baseline_tuning_report(
             Path(analysis_dir) / "tuning_out",
             tuning_report,
         )
         tuning_payload = load_baseline_tuning(tuning_source)
         assert tuning_payload["winner"]["lr"] == 1e-4
+        sampled_protocol = compare_runs(
+            [tuning_paths[0]]
+        )[0]["protocol"]
         assert (
             baseline_tuning_provenance_error(
-                tuning_payload, "dense", 1e-4, 100, "deadbeef"
+                tuning_payload,
+                "dense",
+                1e-4,
+                100,
+                "deadbeef",
+                protocol=sampled_protocol,
             )
             is None
         )
         assert (
             baseline_tuning_provenance_error(
-                tuning_payload, "smelt", 1e-4, 100, "deadbeef"
+                tuning_payload,
+                "smelt",
+                1e-4,
+                100,
+                "deadbeef",
+                protocol=sampled_protocol,
             )
             is not None
         )
         assert (
             baseline_tuning_provenance_error(
-                tuning_payload, "dense", 3e-4, 100, "deadbeef"
+                tuning_payload,
+                "dense",
+                3e-4,
+                100,
+                "deadbeef",
+                protocol=sampled_protocol,
             )
             is not None
         )
         assert (
             baseline_tuning_provenance_error(
-                tuning_payload, "dense", 1e-4, 200, "deadbeef"
+                tuning_payload,
+                "dense",
+                1e-4,
+                200,
+                "deadbeef",
+                protocol=sampled_protocol,
             )
             is not None
         )
         assert (
             baseline_tuning_provenance_error(
-                tuning_payload, "dense", 1e-4, 100, "cafebabe"
+                tuning_payload,
+                "dense",
+                1e-4,
+                100,
+                "cafebabe",
+                protocol=sampled_protocol,
             )
             is not None
         )
+        # 训练协议被改动（例如 warmup 100 → 500）：学习率与
+        # warmup 耦合，必须拒绝「借用调参证据」。
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload,
+                "dense",
+                1e-4,
+                100,
+                "deadbeef",
+                protocol=dict(
+                    sampled_protocol, warmup_steps=500
+                ),
+            )
+            is not None
+        )
+        # 缺 complete protocol（旧版报告或旧入口）时不能默认
+        # 通过：显式拒绝而不是静默放行。
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload, "dense", 1e-4, 100, "deadbeef"
+            )
+            is not None
+        )
+        legacy_payload = dict(tuning_payload)
+        legacy_payload["training_config"] = {
+            "total_steps": 100,
+            "batch_size": 8,
+            "data_sha256": "deadbeef",
+        }
+        legacy_error = baseline_tuning_provenance_error(
+            legacy_payload,
+            "dense",
+            1e-4,
+            100,
+            "deadbeef",
+            protocol=sampled_protocol,
+        )
+        assert legacy_error is not None
+        assert "重新生成调参报告" in legacy_error
         provenance_record = baseline_tuning_provenance_record(
             tuning_payload, str(tuning_source)
         )
@@ -17317,6 +18164,15 @@ _DEFAULT_BASELINE_TUNING_LRS: Tuple[float, ...] = (
     1e-3,
 )
 
+# 调参来源核对所用的完整受控变量协议：学习率是调参因子本身，
+# 不在核对范围内；其余协议项（warmup / 调度 / weight decay /
+# 梯度裁剪 / 数据划分 / 群组划分 / 评估窗口等）必须与调参时
+# 逐项一致。学习率与 warmup/调度/weight decay 耦合，只核对
+# steps/batch/数据指纹不足以证明「受控变量」没被悄悄改掉。
+_BASELINE_TUNING_PROTOCOL_KEYS: Tuple[str, ...] = tuple(
+    key for key in COMPARISON_PROTOCOL_KEYS if key != "lr"
+)
+
 
 def strip_sweep_args(argv: List[str]) -> List[str]:
     """
@@ -17508,12 +18364,22 @@ def analyze_baseline_tuning(
 ) -> Dict[str, object]:
     """
     汇总基线调参网格：按学习率聚合各候选的 val 指标
-    Mean ± Std，按方向选出 winner（并列时取更小的学习率，
-    更保守、更接近默认值）。
+    Mean ± Std，按方向选出 winner。
 
-    同时核对调参协议本身：每个候选的训练配置（steps /
-    batch_size / 数据指纹）必须完全一致，否则「调参」会
-    与「训练得更久」混杂；候选缺指标时显式记录 issue。
+    选择规则（与 ``selection_rule`` 字段一致）：先取指标
+    均值最优的候选，再把与最优均值的差距小于种子波动
+    （两侧 std 的较大者）的候选全部视为「无法区分」，从这个
+    并列集合中取更小的学习率作为 winner（更保守、更接近
+    默认值）；并列集合的成员与保守选择都会写进报告。
+    自测必须覆盖「均值不同但差距落在噪声内」的分支，否则
+    规则只在均值恰好相等时才被验证。
+
+    同时核对调参协议本身：每个候选的全部受控变量
+    （steps / batch / 数据指纹 / warmup / 调度 / weight decay /
+    梯度裁剪 / 数据划分 / 评估窗口等）必须完全一致，否则
+    「调参」会与「训练得更久或换了协议」混杂；候选缺指标时
+    显式记录 issue。winner 落在网格边界（最小值或最大值）
+    时提示最优可能落在网格之外，应扩展候选后重跑。
     """
     higher_is_better = metric_higher_is_better(metric)
 
@@ -17526,55 +18392,82 @@ def analyze_baseline_tuning(
         "seeds": [int(seed) for seed in seeds],
         "n_candidates": len(lrs) * len(seeds),
         "n_runs": len(rows),
+        # 完整受控变量协议（除学习率这个调参因子以外）：记录
+        # 下来供 --baseline-tuning-from 逐项核对，避免「在
+        # 一种协议下调参、在另一种协议下训练最终基线」。
         "training_config": {
-            "total_steps": None,
-            "batch_size": None,
-            "data_sha256": None,
+            key: None for key in _BASELINE_TUNING_PROTOCOL_KEYS
         },
+        "protocol_keys": list(_BASELINE_TUNING_PROTOCOL_KEYS),
         "candidates": [],
         "winner": None,
+        "winner_selection": None,
+        "tied_lrs": [],
+        "winner_at_grid_boundary": False,
         "selection_rule": (
-            "在 val 上按指标均值选择；均值并列（含噪声范围内"
-            "无法区分时）取更小的学习率"
+            "在 val 上先取指标均值最优的候选；与最优均值的差距"
+            "小于种子波动（两侧 std 的较大者）的候选视为并列"
+            "（无法在统计上区分），从并列集合中取更小的学习率"
+            "作为 winner（更保守）"
         ),
         "issues": [],
         "caveats": [
             "调参只看 val：test 集全程尘封，不参与候选排序",
-            "各候选训练配置（steps/batch/数据）完全一致，"
-            "调参不会与「训练更久」混杂",
+            "各候选的全部受控变量（steps/batch/数据/调度/"
+            "warmup/weight decay/梯度裁剪/数据划分等）完全"
+            "一致，调参不会与「训练更久或换了协议」混杂",
             "调参后应固定 winner 配置训练最终基线，并用 "
-            "--baseline-tuning-from 记录来源；复杂模型必须"
+            "--baseline-tuning-from 记录来源；该来源会逐项"
+            "核对训练协议，协议不一致时拒绝；复杂模型必须"
             "战胜这条调过参的基线才有意义",
         ],
     }
 
-    # 训练配置一致性：调参网格的受控变量。只统计有协议记录的
-    # 运行，缺失记录不能被当成「训练配置不同」虚报。
-    config_values = set()
+    # 训练配置一致性：调参网格的受控变量。逐项核对完整协议；
+    # 只统计有协议记录的运行，缺失记录不能被当成「训练配置
+    # 不同」虚报（但仍会在来源核对阶段要求补齐）。
+    protocol_values: Dict[str, set] = {
+        key: set() for key in _BASELINE_TUNING_PROTOCOL_KEYS
+    }
+    recorded_protocol = 0
     for row in rows:
         protocol = row.get("protocol")
         if not isinstance(protocol, dict):
             continue
-        config_values.add((
-            protocol.get("total_steps"),
-            protocol.get("batch_size"),
-            protocol.get("data_sha256"),
-        ))
-    if len(config_values) > 1:
+        recorded_protocol += 1
+        for key in _BASELINE_TUNING_PROTOCOL_KEYS:
+            value = protocol.get(key)
+            if value is None:
+                continue
+            protocol_values[key].add(
+                json.dumps(
+                    value,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+
+    inconsistent_keys = [
+        key
+        for key, values in protocol_values.items()
+        if len(values) > 1
+    ]
+    if inconsistent_keys:
         report["issues"].append(
-            "候选之间的训练配置（total_steps / batch_size / "
-            "数据指纹）不一致，调参结果与「训练得更久或数据"
-            "不同」混杂，不可用于选择基线超参数"
+            "候选之间的训练协议不一致（"
+            + ", ".join(inconsistent_keys)
+            + "）：调参结果与「训练得更久 / 换了优化协议或"
+            "数据划分」混杂，不可用于选择基线超参数"
         )
-    elif config_values:
-        total_steps, batch_size, data_sha256 = next(
-            iter(config_values)
-        )
-        report["training_config"] = {
-            "total_steps": total_steps,
-            "batch_size": batch_size,
-            "data_sha256": data_sha256,
-        }
+    if recorded_protocol:
+        # 记录每个键的（唯一）取值；缺记录或候选间不一致的
+        # 键保持 None，由来源核对阶段显式拒绝。
+        for key, values in protocol_values.items():
+            if len(values) == 1:
+                report["training_config"][key] = json.loads(
+                    next(iter(values))
+                )
 
     def _row_lr(row: Dict[str, object]) -> Optional[float]:
         protocol = row.get("protocol")
@@ -17631,15 +18524,44 @@ def analyze_baseline_tuning(
         )
         return report
 
-    def _rank(candidate: Dict[str, object]):
+    def _mean_order(candidate: Dict[str, object]) -> float:
         mean = float(candidate["metric_mean"])
-        # 并列/无法区分时选更小的学习率（更保守）。
-        return (
-            -mean if higher_is_better else mean,
-            float(candidate["lr"]),
-        )
+        return -mean if higher_is_better else mean
 
-    winner = min(usable, key=_rank)
+    best = min(usable, key=_mean_order)
+    best_mean = float(best["metric_mean"])
+    best_std = float(best["metric_std"] or 0.0)
+
+    # 并列/无法区分集合：与最优均值的差距小于种子波动
+    # （两侧 std 的较大者）的候选都算无法在统计上区分，或
+    # 均值恰好相等（噪声为 0 时的精确并列）。winner 必须从
+    # 该并列集合中取更小的学习率——这正是 selection_rule
+    # 声明的协议，不能只在均值精确相等时才做保守选择。
+    tied: List[Dict[str, object]] = []
+    indistinguishable: List[float] = []
+    for candidate in usable:
+        mean = float(candidate["metric_mean"])
+        # gap = 候选比最优均值「差」多少（方向上非负；
+        # 精确并列时为 0，浮点比较可能得到极小负值）。
+        gap = (
+            best_mean - mean
+            if higher_is_better
+            else mean - best_mean
+        )
+        noise = max(
+            best_std,
+            float(candidate["metric_std"] or 0.0),
+        )
+        is_tied = gap <= 0.0 or (noise > 0.0 and gap < noise)
+        if is_tied:
+            tied.append(candidate)
+            if candidate is not best:
+                indistinguishable.append(float(candidate["lr"]))
+
+    winner = min(tied, key=lambda c: float(c["lr"]))
+    # 只要存在并列集合（>1 个候选无法区分/精确并列），winner
+    # 就是按 selection_rule 取更小 lr 的结果，如实记录。
+    conservative_tie_break = len(tied) > 1
     report["winner"] = {
         "lr": float(winner["lr"]),
         "metric": metric,
@@ -17648,35 +18570,53 @@ def analyze_baseline_tuning(
         "n_runs": int(winner["n_runs"]),
         "runs": winner["runs"],
     }
+    report["tied_lrs"] = sorted(
+        float(candidate["lr"]) for candidate in tied
+    )
+    report["winner_selection"] = (
+        "conservative_tie_break"
+        if conservative_tie_break
+        else "best_mean"
+    )
 
-    # 若多个候选与 winner 的均值差落在种子波动内，显式提示
-    # 「噪声范围内无法区分」，避免把偶然波动当成调参结论。
-    winner_mean = float(winner["metric_mean"])
-    winner_std = winner["metric_std"]
-    indistinguishable = []
-    for candidate in usable:
-        if candidate is winner:
-            continue
-        mean = float(candidate["metric_mean"])
-        gap = (
-            mean - winner_mean
-            if higher_is_better
-            else winner_mean - mean
-        )
-        noise = max(
-            float(winner_std or 0.0),
-            float(candidate["metric_std"] or 0.0),
-        )
-        if noise > 0.0 and gap < noise:
-            indistinguishable.append(float(candidate["lr"]))
     if indistinguishable:
         report["issues"].append(
-            "以下学习率候选与 winner 的差距小于种子波动"
-            "（无法在统计上区分，已按更小 lr 取保守解）: "
+            "以下学习率候选与最优均值候选的差距小于种子波动"
+            "（无法在统计上区分，已按 selection_rule 从并列"
+            "集合中取更小 lr 作为保守 winner）: "
             + ", ".join(
                 format(lr, "g") for lr in indistinguishable
             )
         )
+    elif conservative_tie_break:
+        # 均值精确相等的并列情形（噪声为 0 或无候选 std）。
+        report["issues"].append(
+            "存在与最优均值恰好并列的学习率候选，已按 "
+            "selection_rule 取更小的学习率（保守解）"
+        )
+
+    # 网格边界：winner 恰是候选网格的最小/最大值时，最优可能
+    # 落在网格之外，「调过参的基线」仍可能是被网格边界限制的
+    # 弱基线；必须提示扩展候选后重跑。
+    sorted_grid = sorted(float(lr) for lr in lrs)
+    if sorted_grid and float(winner["lr"]) in (
+        sorted_grid[0],
+        sorted_grid[-1],
+    ):
+        report["winner_at_grid_boundary"] = True
+        if len(sorted_grid) > 1:
+            report["issues"].append(
+                "winner lr="
+                f"{format(float(winner['lr']), 'g')} 位于候选"
+                "网格边界（"
+                + ", ".join(
+                    format(lr, "g") for lr in sorted_grid
+                )
+                + "）：最优可能落在网格之外，当前「调过参的"
+                "基线」仍可能被网格边界限制；建议扩展 "
+                "--baseline-tuning-lrs（如加入更小/更大的"
+                "候选）后重跑调参"
+            )
 
     return report
 
@@ -17727,6 +18667,20 @@ def print_baseline_tuning_report(
             f"(n={winner.get('n_runs')}, "
             f"{metric}, {direction})"
         )
+        selection = report.get("winner_selection")
+        if selection == "conservative_tie_break":
+            tied = report.get("tied_lrs") or []
+            print(
+                "  [winner-selection] 最优均值候选与更小 lr 的"
+                "差距落在种子波动内，按 selection_rule 取保守"
+                "解；并列候选: "
+                + ", ".join(format(float(lr), "g") for lr in tied)
+            )
+        else:
+            print(
+                "  [winner-selection] winner 为最优均值候选"
+                "（没有与之无法区分的更小 lr）"
+            )
         print(
             "  下一步：用 --suite-modes "
             f"{report['mode']} --seeds ... --lr "
@@ -17811,6 +18765,16 @@ def load_baseline_tuning(path: Path) -> Dict[str, object]:
     return payload
 
 
+def _protocol_value_text(value: object) -> str:
+    """协议值的稳定文本表示，用于错误消息与逐项比较。"""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 def baseline_tuning_provenance_error(
     payload: Dict[str, object],
     mode: str,
@@ -17818,11 +18782,22 @@ def baseline_tuning_provenance_error(
     steps: int,
     data_sha256: Optional[str],
     batch_size: Optional[int] = None,
+    protocol: Optional[Dict[str, object]] = None,
 ) -> Optional[str]:
     """
     核对「当前基线训练」是否忠实复用了调参报告的 winner：
-    模式、学习率、训练步数、批大小与数据指纹都必须一致。
+    模式、学习率、训练步数、批大小、数据指纹，以及完整的
+    受控变量协议（warmup / 调度 / weight decay / 梯度裁剪 /
+    数据划分 / 群组划分 / 评估窗口 / 数值环境等）都必须一致。
     返回错误消息或 None。
+
+    学习率与 warmup、调度、weight decay 等耦合：只核对
+    steps/batch/数据指纹时，在一种协议下调出 winner、再换
+    协议训练「最终基线」也能借用调参证据。因此：
+    - ``protocol`` 为当前训练的 comparison_protocol；
+    - 调参报告缺少协议字段（旧版报告）时显式拒绝，而不是
+      默认为通过；
+    - 任一项与调参时不一致即拒绝，并指明具体协议项。
     """
     record_mode = str(payload.get("mode"))
     if mode != record_mode:
@@ -17838,6 +18813,42 @@ def baseline_tuning_provenance_error(
             f"当前 --lr={format(lr, 'g')} 与调参 winner "
             f"lr={format(winner_lr, 'g')} 不一致：调参来源"
             "必须真实复用于基线训练，不能借用调参报告"
+        )
+
+    config = payload.get("training_config")
+    if not isinstance(config, dict):
+        return (
+            "调参报告的 training_config 缺失或格式非法："
+            "来源记录不足以核对训练协议一致"
+        )
+
+    # 旧版报告只有 total_steps / batch_size / data_sha256，
+    # 缺协议字段时不能默认为通过——那等于把「调参来源」当
+    # 护身符。显式要求重新生成完整报告。
+    missing_keys = [
+        key
+        for key in _BASELINE_TUNING_PROTOCOL_KEYS
+        if key not in config
+        or (
+            config.get(key) is None
+            and isinstance(protocol, dict)
+            and protocol.get(key) is not None
+        )
+    ]
+    if missing_keys:
+        return (
+            "调参报告缺少受控变量协议字段（"
+            + ", ".join(missing_keys)
+            + "）：来源记录不足以核对当前训练与调参时的"
+            "协议一致，请用新版 --suite-baseline-tuning "
+            "重新生成调参报告"
+        )
+
+    if protocol is None:
+        return (
+            "当前训练没有 comparison_protocol 记录，无法核对"
+            "训练协议与调参时一致：请用当前版本的训练入口"
+            "重新运行（--baseline-tuning-from 需要协议核对）"
         )
 
     config = payload.get("training_config") or {}
@@ -17873,6 +18884,25 @@ def baseline_tuning_provenance_error(
             "当前数据指纹与调参时的数据不一致：学习率是在"
             "原数据上调出来的，换数据后应重新调参"
         )
+
+    # 完整协议逐项核对：warmup / lr_schedule / weight_decay /
+    # grad_clip / val/test_fraction / group_separator /
+    # eval_batches / amp_dtype 等任何一项不同都说明「最终基线」
+    # 不是在调参时的受控条件下训练的。
+    for key in _BASELINE_TUNING_PROTOCOL_KEYS:
+        record_value = config.get(key)
+        current_value = protocol.get(key)
+        if _protocol_value_text(
+            record_value
+        ) != _protocol_value_text(current_value):
+            return (
+                f"当前训练的协议项 {key}="
+                f"{_protocol_value_text(current_value)} 与调参"
+                f"训练配置 {key}="
+                f"{_protocol_value_text(record_value)} 不一致："
+                "学习率与 warmup/调度/weight decay/数据划分等"
+                "耦合，协议变了应重新调参"
+            )
 
     return None
 
@@ -18435,7 +19465,8 @@ def main():
         help=(
             "把 --suite-baseline-tuning 生成的调参报告作为本次"
             "基线训练的调参来源：核对模式/学习率/训练步数/数据"
-            "指纹与 winner 一致，并写入 config.json 的 "
+            "指纹及完整训练协议（warmup/调度/weight decay/数据"
+            "划分等）与调参时逐项一致，并写入 config.json 的 "
             "baseline_tuning 字段，供基线合理性检查核对"
         ),
     )
@@ -19159,9 +20190,10 @@ def main():
         )
 
     # 基线调参来源（--baseline-tuning-from）：核对本次基线的
-    # 模式/学习率/训练步数/数据指纹确实复用了调参报告的 winner，
-    # 并把来源写入 config.json 的 baseline_tuning 字段。没有这步
-    # 核对，「调过参的基线」只是口头声明。
+    # 模式/学习率/训练步数/数据指纹与完整训练协议确实复用了
+    # 调参报告的 winner，并把来源写入 config.json 的
+    # baseline_tuning 字段。没有这步核对，「调过参的基线」
+    # 只是口头声明。
     baseline_tuning_record: Optional[Dict[str, object]] = None
     if args.baseline_tuning_from is not None:
         tuning_path = Path(args.baseline_tuning_from)
@@ -19176,6 +20208,7 @@ def main():
             steps=args.steps,
             data_sha256=dataset.data_sha256,
             batch_size=args.batch_size,
+            protocol=build_comparison_protocol(cfg, args),
         )
         if provenance_error is not None:
             parser.error(
@@ -19262,6 +20295,40 @@ def main():
                 else ""
             )
         )
+        # 假设纪律不只在事后 --compare 阶段核对：训练启动时就
+        # 指出「假设不可检验」，避免跑完才发现无法判定。
+        # 结果同时写入 config.json 的 hypothesis_metric_mentions。
+        entry_mentions = hypothesis_metric_mentions(
+            args.hypothesis
+        )
+        entry_unverifiable = hypothesis_metric_unverifiable(
+            entry_mentions,
+            routing_available=(
+                False
+                if (
+                    args.mode == "dense"
+                    or args.statistical_baseline
+                    or args.skip_routing_analysis
+                )
+                else None
+            ),
+        )
+        if not entry_mentions:
+            print(
+                "[hypothesis] [warn] 假设未写明判定指标"
+                "（如验证损失 / macro F1 / PR-AUC / 召回率）："
+                "无法与评估口径对齐，事后 --compare 也无法"
+                "判定成败；建议写出「依据什么指标、预期"
+                "改善多少」"
+            )
+        elif entry_unverifiable:
+            print(
+                "[hypothesis] [warn] 假设提到的判定指标当前"
+                "不可判定: " + ", ".join(entry_unverifiable)
+                + "（路由诊断类指标需要该运行有 "
+                "routing_analysis；dense 基线或 "
+                "--skip-routing-analysis 时无法核对）"
+            )
 
     # 全新训练默认先跑过拟合小批量 sanity check；恢复训练默认跳过
     # （可以用 --sanity-only 单独检查）。--skip-sanity-check 显式跳过。

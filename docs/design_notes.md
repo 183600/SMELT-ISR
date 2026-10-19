@@ -266,32 +266,47 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **基线合理性（稻草人守卫）**：`--compare-baseline MODE`
   在给出相对差值之外，还核对基线本身是否值得战胜：基线在
   主指标上必须真的优于无上下文 unigram 参考（各运行
-  `config.json` 的 `reference_baselines`），不能劣于对比集合
+  `config.json` 的 `reference_baselines`；PR-AUC / ROC-AUC
+  同样有常数预测器参考——纳入类平均 prevalence 与 0.5，
+  切换对比指标后守卫不会静默失效），不能劣于对比集合
   里调优好的 n-gram 统计基线，种子数应 ≥3，且必须带有调参
   证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线
   自身在 val 上做过 阶数 × 平滑系数 网格调优，视为已调参）；
   否则以 `[straw-man]` 明确标记「战胜没调过参的弱基线不能
   证明复杂模型的收益，先用 `--suite-baseline-tuning` 把基线
-  调强」。调参依据的指标与当前对比指标不一致时单独提示
-  「指标未对齐」（调在 val_loss 上不能证明 macro F1 也强）。
+  调强」。调参依据的指标与当前对比指标不一致时不打印无条件
+  的 OK，而是显式警告「不能证明基线在该指标上被调强」
+  （调在 val_loss 上不能证明 macro F1 也强）。
   未指定基线或缺少参考记录时给出提示而不是虚报通过。
 - **简单基线的调参协议**：`--suite-baseline-tuning`（配合
   `--seeds`）对简单基线做预注册的学习率网格搜索
   （`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`；
   `--baseline-tuning-mode` 选模式）：候选之间只允许学习率
-  不同，steps/batch/数据/结构全部继承同一条命令行，保证调参
-  与「训练更久」不混杂；按 val 指标 Mean ± Std 选择 winner，
-  与 winner 差距落在种子波动内时明确提示「无法区分」并取更小
-  lr（更保守），报告写入 `<out>/baseline_tuning.json`。后续
-  基线训练用 `--baseline-tuning-from <报告>` 核对模式 / winner
-  lr / steps / 数据指纹一致，并把来源写入 `config.json` 的
+  不同（steps/batch/数据/结构/调度等全部继承同一条命令行），
+  保证调参与「训练更久或换了协议」不混杂；按 val 指标
+  Mean ± Std 选择 winner——先取最优均值候选，再把与最优均值
+  差距小于种子波动（两侧 std 的较大者）的候选视为无法区分，
+  从并列集合中取更小 lr 的保守解，并列集合与选择方式
+  （`winner_selection`/`tied_lrs`）如实写入报告；winner 落在
+  网格边界时提示扩展候选后重跑。报告写入
+  `<out>/baseline_tuning.json`。后续基线训练用
+  `--baseline-tuning-from <报告>` 核对模式 / winner lr / steps /
+  数据指纹与完整训练协议（warmup/调度/weight decay/梯度裁剪/
+  数据划分/评估窗口等）逐项一致（旧版报告缺协议字段时显式
+  拒绝，不默认为通过），并把来源写入 `config.json` 的
   `baseline_tuning` 字段——这是「基线被调过参」的唯一证据；
   报告本身不是最终基线，test 集全程尘封。
 - **假设登记与指标口径提示**：对比分析按模式汇总每个运行在
   `--hypothesis`/`--rq` 登记的假设，缺失假设的运行被点名
   （统计基线除外），避免把排列组合超参数当成假设驱动的实验；
   假设没写明判定指标（如「效果更好」而不提验证损失 / macro
-  F1 / PR-AUC / 召回率）同样无法与评估口径对齐，单独点名。
+  F1 / PR-AUC / 召回率）同样无法与评估口径对齐，单独点名；
+  写明的指标必须是评估管线真正计算的（precision / recall 已
+  按 macro / weighted 口径输出并进入对比指标集合；路由类
+  指标需要该运行有 `routing_analysis` 记录），否则同样点名
+  「该指标当前不可判定」。单次训练启动时也会检查假设是否
+  写明判定指标，并把 `hypothesis_metric_mentions` 写入
+  `config.json`，避免跑完才发现无法判定。
   同时基于 `val_majority_accuracy`（最高频类的 support 占比）
   提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值
   有限，占比 ≥90% 时 accuracy/micro 已被常数预测主导、必须

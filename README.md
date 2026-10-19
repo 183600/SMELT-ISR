@@ -170,6 +170,8 @@ python experiment.py \
 - **RQ3**: 第二轮是否会选择与第一轮不同的专家？（分析专家重合度与 Jaccard 相似度）
 - **RQ4**: 延迟合并是否改善专家专门化？（分析专家负载分布与路由熵）
 
+RQ3/RQ4 的路由诊断（第二轮 Jaccard / slot 复用 / 分支自复用、第一二轮负载熵与路由熵、死专家数、分支余弦）随每次运行写入 `config.json` 的 `routing_analysis`，并在 `--compare` 中按运行展示、按种子聚合（Mean ± Std）；它们同样进入可对比指标集（`--compare-metric routing_jaccard_branch` 等），因此路由结论可以带跨种子统计与显著性检验，而不是只靠单次运行的定性描述。
+
 ### 对照口径与可复现性
 
 - **B 的两轮路由与合并权重**：方案 B 的第一轮中间区域全程使用 $k_1$，第二轮完整中间区域才使用 $k_2$；合并使用第一轮路由得到且 Top-$k_1$ 归一化的固定权重，不会用最终分支状态重新计算合并权重。论文分析或消融中应明确这一点。
@@ -181,8 +183,8 @@ python experiment.py \
 - **实验追踪**：每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
 - **受控变量检查**：`config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、数据指纹、模型结构、评估协议与选型口径（新运行为验证集选型，无记录的旧运行标记为最后一步），以及**有效训练长度与数值设置**（早停容忍度 `early_stop_patience`/`early_stop_min_delta`、AMP 精度 `amp_dtype`、设备类型、梯度检查点、`torch.compile`）。`--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数、换了 AMP/设备、或 final 指标口径不同，都会被明确列出，避免把调参收益误当成方法本身的收益。
 - **统计可靠性**：`--seeds 42 43 44` 对同一配置跑多个随机种子，自动汇报每个实验单元的 Mean ± Std（样本标准差）；种子集合相同用配对 t 检验、否则用 Welch t 检验，给出 p 值与噪声比（|Δ|/合并标准差）。种子数少于 3 会被标记为统计功效不足；只有 0.2% 的提升而种子间方差有 0.5% 时不会被当成有效提升。**不显著 ≠ 等价**：每个检验过的对比同时报告 80% 功效下的最小可检出效应（MDE，含相对基线比例）、观测效应自身的功效（`power_at_effect`）与按当前种子间波动检出该效应所需的种子数；并对预先声明的等价界（`--equivalence-margin`，相对基线均值，默认 1%）做 TOST 等价性检验。TOST p 值与显著性检验同一家族口径做 Holm（FWER）校正：只有校正后仍通过才主张「无实质差异」，不显著且 TOST 未通过时结论只能是「不确定」（展示层同时打印 MDE 与所需种子数，说明是效应太小还是种子太少）；等价界必须事先声明，看到数据后再放宽界可以「制造」等价。**伪重复检测**：同一实验单元里同一个随机种子出现多次（复制运行目录等事故）不是独立重复实验，报告会点名重复种子、禁用配对检验并退回 Welch；关键套件（`--suite-modes`/`--suite-ablation`/`--suite-baseline-tuning`）少于 3 个种子会直接拒绝运行，冒烟/调试需显式加 `--allow-underpowered`（豁免随种子计划写入报告）。
-- **基线合理性与假设登记**：`--compare-baseline MODE` 在给出差值之外还会核对基线是否值得战胜：基线主指标必须强于无上下文 unigram 参考（各运行 `reference_baselines`）、不劣于调优好的字节级 n-gram 统计基线、种子数 ≥3、且带有调参证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线自身已在 val 上调优，视为已调参），否则以 `[straw-man]` 标记（战胜没调过参的弱基线不能证明复杂模型的收益，先用 `--suite-baseline-tuning` 把基线调强）；调参口径与当前对比指标不一致时单独提示「指标未对齐」；对比报告同时按模式列出 `--hypothesis`/`--rq` 登记的假设（缺假设、或假设没写明判定指标（如「验证损失 / macro F1 / PR-AUC / 召回率」）的运行被点名，统计基线除外），并按 `val_majority_accuracy` 提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值有限，≥99.9%（约 1:1000）的极度不平衡按单独分级处理——PR-AUC 必须与随机水平（≈平均 prevalence，评估时随 `val_pr_auc_macro_chance` 记录）对照看 lift，ROC-AUC 的随机水平仍是 0.5、会给出过于乐观的分数。各项检查随 `comparison_analysis.json` 落盘。
-- **简单基线的调参协议**：`--suite-baseline-tuning`（配合 `--seeds`）对简单基线做预注册的学习率网格搜索（`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`，`--baseline-tuning-mode` 选模式）：候选之间只允许学习率不同（steps/batch/数据/结构全部继承同一条命令行），在 val 上按 Mean ± Std 选择 winner（无法区分时取更小 lr），报告写入 `<out>/baseline_tuning.json`；后续基线训练用 `--baseline-tuning-from <报告>` 核对模式/winner lr/steps/数据指纹一致，并把来源写入 `config.json` 的 `baseline_tuning` 字段——这是「基线被调过参」的唯一证据。test 集全程尘封。
+- **基线合理性与假设登记**：`--compare-baseline MODE` 在给出差值之外还会核对基线是否值得战胜：基线主指标必须强于无上下文 unigram 参考（各运行 `reference_baselines`；PR-AUC 的参考是其常数预测器水平 = 纳入类平均 prevalence，ROC-AUC = 0.5，因此把对比指标切到 PR-AUC 时稻草人守卫不会静默失效）、不劣于调优好的字节级 n-gram 统计基线、种子数 ≥3、且带有调参证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线自身已在 val 上调优，视为已调参），否则以 `[straw-man]` 标记（战胜没调过参的弱基线不能证明复杂模型的收益，先用 `--suite-baseline-tuning` 把基线调强）；调参口径与当前对比指标不一致时不再打印无条件的 OK，而是显式警告「不能证明基线在该指标上被调强」；对比报告同时按模式列出 `--hypothesis`/`--rq` 登记的假设（缺假设、假设没写明判定指标、或提到的指标当前不可判定——如路由类指标而该运行没有 `routing_analysis` 记录——的运行都被点名，统计基线除外；单次训练启动时也会提示「假设未写明判定指标」，并把 `hypothesis_metric_mentions` 写入 `config.json`），并按 `val_majority_accuracy` 提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值有限，≥99.9%（约 1:1000）的极度不平衡按单独分级处理——PR-AUC 必须与随机水平（≈平均 prevalence，评估时随 `val_pr_auc_macro_chance` 记录）对照看 lift，ROC-AUC 的随机水平仍是 0.5、会给出过于乐观的分数。各项检查随 `comparison_analysis.json` 落盘。
+- **简单基线的调参协议**：`--suite-baseline-tuning`（配合 `--seeds`）对简单基线做预注册的学习率网格搜索（`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`，`--baseline-tuning-mode` 选模式）：候选之间只允许学习率不同（steps/batch/数据/结构/调度等全部继承同一条命令行），在 val 上按 Mean ± Std 选择 winner——先取最优均值候选，再把与最优均值差距小于种子波动（两侧 std 的较大者）的候选视为无法区分，从并列集合中取更小 lr 的保守解，并列集合与选择方式（`winner_selection`/`tied_lrs`）如实写入报告；winner 落在网格边界（最小/最大候选）时提示最优可能位于网格之外、建议扩展候选后重跑。报告写入 `<out>/baseline_tuning.json`；后续基线训练用 `--baseline-tuning-from <报告>` 核对模式/winner lr/steps/数据指纹与**完整训练协议**（warmup/调度/weight decay/梯度裁剪/数据划分/评估窗口等）逐项一致（旧版报告缺协议字段时显式拒绝，不默认为通过），并把来源写入 `config.json` 的 `baseline_tuning` 字段——这是「基线被调过参」的唯一证据。test 集全程尘封。
 - **消融完整性**：`--suite-ablation` 运行「延迟合并 × 均衡损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`=0/当前值）；默认覆盖项目提出的**全部**延迟合并方案（A 与 B，(1+N)×2 = 3×2 六格），每个创新点都必须证明各自有用——只跑 A 的组合不足以支撑 B 的结论。覆盖检查会列出缺失的组合、点名结构混杂（各单元 k1/k2/top_k/residual_scale 或均衡强度不一致）与伪重复；显式声明本轮必须覆盖哪些方案用 `--ablation-modes A B`。`--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
 - **结果分析（曲线 / NaN / 坏案例 / 效率）**：
   - **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐；验证损失尚未回升但泛化 gap 持续扩大时提前给出「过拟合前兆」警告（`gap_widening_warning`）与早停建议，不必等验证回升后才被动止损。
@@ -204,20 +206,26 @@ python experiment.py --data corpus.txt --out runs/ablation \
   --seeds 42 43 44 --suite-ablation --ablation-modes A B \
   --steps 2000 --hypothesis "各设计各自有用" --rq RQ1
 
-# 先调参简单基线：学习率网格（val 选择），winner 与报告落在 runs/tuning
+# 先调参简单基线：学习率网格（val 选择），winner 与报告落在 runs/tuning；
+# 注意 --baseline-tuning-mode 必须是之后要声明为 baseline 的那个模式
 python experiment.py --data corpus.txt --out runs/tuning \
   --seeds 42 43 44 --suite-baseline-tuning --baseline-tuning-mode dense \
   --steps 2000 --hypothesis "基线调参使其值得战胜" --rq RQ1
 
-# 再用 winner 训练最终基线并记录调参来源（config.json 的 baseline_tuning）
+# 再用 winner 训练最终基线并记录调参来源（config.json 的 baseline_tuning）；
+# 把 --lr 换成 runs/tuning/baseline_tuning.json 里的 winner lr
 python experiment.py --data corpus.txt --out runs/baseline_dense \
   --mode dense --lr 3e-4 \
   --baseline-tuning-from runs/tuning/baseline_tuning.json \
   --steps 2000 --hypothesis "dense 基线在调参后的表现" --rq RQ1
 
-# 只读汇总已完成运行：受控变量检查 + Mean ± Std + 显著性检验
+# 只读汇总已完成运行：受控变量检查 + Mean ± Std + 显著性检验。
+# --compare-baseline 必须指向真正调过参的模式（这里是 dense，且
+# runs/baseline_dense 带有 baseline_tuning 来源记录）；若要声明
+# smelt 为基线，就对 smelt 跑 --suite-baseline-tuning 并同样记录来源，
+# 或在对比集合中加入 --statistical-baseline 产出的 ngram 运行。
 python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
-  runs/ablation/A_bal0_seed42 --compare-baseline smelt
+  runs/ablation/A_bal0_seed42 runs/baseline_dense --compare-baseline dense
 ```
 
 ## 📂 输出结构
