@@ -727,7 +727,7 @@ class SparseMoE(nn.Module):
     def _apply(self, fn, recurse=True):
         # .to() / .float() 等可能整体替换参数张量（版本号不递增），
         # 权重 stack 缓存必须随之失效；填充缓冲的键含设备/dtype，
-        # 旧键不会再被命中，一并释放避免显存滞留。
+        # 旧键不会再被命中，一并释放。
         self._weight_stacks.clear()
         self.clear_padded_buffer_cache()
         return super()._apply(fn, recurse=recurse)
@@ -810,8 +810,8 @@ class SparseMoE(nn.Module):
                         dtype=target_dtype,
                         device=first.device,
                     )
-                # 转换语义与 stack 后 .to() 相同；_foreach_copy_ 把
-                # 逐专家拷贝合并成一次融合调用（不可用时回退循环）。
+                # 转换语义与 stack 后 .to() 相同；_foreach_copy_ 一次
+                # 完成逐专家拷贝（不可用时回退循环）。
                 if hasattr(torch, "_foreach_copy_"):
                     torch._foreach_copy_(
                         list(stacked.unbind(0)),
@@ -872,9 +872,8 @@ class SparseMoE(nn.Module):
         # 数量为分母；均匀路由时 E * sum(f_i * P_i) 恰好等于
         # top_k，均衡强度随路由宽度线性增大，跨 k 比较时
         # 应按比例折算 balance_coef（保持 balance_coef * k 不变）。
-        # 对 16K 量级的 assignment，scatter_add_ 比 bincount
-        # 的专用扫描内核更快（实测），且输出仍为 int64，后续
-        # dispatch 的索引算术语义不变。
+        # counts 用 scatter_add_ 统计，输出为 int64，后续
+        # dispatch 的索引算术语义与逐 token 计数一致。
         assignment_indices = top_indices.reshape(-1)
         counts = torch.zeros(
             self.n_experts,
@@ -973,8 +972,8 @@ class SparseMoE(nn.Module):
         返回 None（训练时填充缓冲会进入计算图，必须新建）。
 
         评估路径只读取被 index_copy_ 写入的行（其余行的 bmm
-        输出不会被收集），因此复用时不整块清零；陈旧值（含
-        NaN/Inf）不会进入任何结果。
+        输出不会被收集），旧缓冲中的陈旧值（含 NaN/Inf）不会
+        进入任何结果。
         """
         if torch.is_grad_enabled():
             return None
@@ -1195,8 +1194,7 @@ class SparseMoE(nn.Module):
         ).view(n_experts * cap, dim)
 
         # 直接散射回原始（未排序）assignment 顺序：perm[j] 是排序
-        # 行 j 的原始位置，因此 final[perm[j]] = 专家输出，省去
-        # 中间 sorted_out 缓冲与「排序位置 → 原始位置」的逆置换。
+        # 行 j 的原始位置，因此 final[perm[j]] = 专家输出。
         final = out.new_empty(total, dim)
         final.index_copy_(
             0,
@@ -1205,8 +1203,8 @@ class SparseMoE(nn.Module):
         )
 
         # 溢出回退：容量外的 assignment 由对应专家的 2D 前向计算
-        # 后写入同一缓冲。余量下通常无溢出，先排队主路径 bmm 再
-        # 检查，避免空循环产生数百个空 kernel。
+        # 后写入同一缓冲。余量下通常无溢出，先完成主路径 bmm
+        # 再检查溢出。
         if bool(overflow.any()):
             experts = self.experts
             for expert_index in range(n_experts):
@@ -3951,8 +3949,7 @@ def evaluate(
                         dim=-1,
                     )
                     num_new = probs.size(0)
-                    # 直接 D2H 拷入 CPU 收集缓冲，避免 .cpu() 先
-                    # 在主机侧另分配一份再二次拷贝的临时内存。
+                    # 直接 D2H 拷入 CPU 收集缓冲。
                     auc_probs[
                         auc_tokens:auc_tokens + num_new
                     ].copy_(probs)
@@ -4365,7 +4362,7 @@ class NgramBaseline:
                     dtype=torch.int64,
                 ),
                 # 位置索引只需覆盖 batch*seq_len（远小于 2^31），
-                # int32 让缓存的逐阶表（val_tables）内存减半。
+                # 用 int32 存储。
                 torch.arange(
                     n_positions,
                     dtype=torch.int32,
@@ -6576,8 +6573,8 @@ class RoutingProbe:
 
         余弦接近 1 说明分支轨迹几乎重合（延迟合并没有带来
         独立计算）；明显小于 1 说明分支确实在分化。逐 pair
-        统计先在设备上堆叠，最后一次取回，避免逐 pair 触发
-        设备同步；均值/最小值仍在 Python 侧按同一顺序计算。
+        统计先在设备上堆叠，最后一次取回；均值/最小值仍在
+        Python 侧按同一顺序计算。
         """
         branches = int(x.size(branch_dim))
         if branches < 2:
@@ -6709,9 +6706,7 @@ class RoutingProbe:
                     self._branch_cosine_stats(x, branch_dim)
                 )
 
-            # 逐调用统计全部在设备上累积，最后一次取回：
-            # 原先每个浮点统计各触发一次同步，最终评估的上千次
-            # 调用会把 GPU 流水线串行化。
+            # 统计量在设备上累积后一次性取回。
             scalars = torch.stack([
                 router_entropy.to(torch.float64),
                 load_entropy.to(torch.float64),
@@ -12739,9 +12734,7 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
 
     total_sq = 0.0
 
-    # 逐参数的有限性判定与平方和先在设备上累积，最后一次性
-    # 取回：原先每个参数两次隐式 D2H（isfinite().all() 与
-    # float(...)）会把 sanity check 的第一步反向串行化。
+    # 逐参数的有限性判定与平方和打包后再一次性取回。
     pending: List[Tuple[str, torch.Tensor]] = []
 
     for name, parameter in model.named_parameters():
@@ -13562,7 +13555,7 @@ def _snapshot_to_cpu(value: object) -> object:
     ``lm_head.weight`` 与 ``token_embedding.weight``），快照
     按（存储地址、偏移、dtype、形状、步幅）去重：共享张量
     只复制一次并复用同一 CPU 副本，让 torch.save 仍能对
-    存储去重，避免 checkpoint 无谓增大。
+    存储去重。
     """
     memo: Dict[Tuple[object, ...], torch.Tensor] = {}
 
@@ -20874,8 +20867,7 @@ def main():
 
     if args.compile:
         # 在状态加载之后编译。训练批与固定评估窗口的形状稳定
-        #（seq_len、batch_size 固定），显式声明非动态形状，
-        # 避免自动动态形状在前几次不同分段行数上反复重编译；
+        #（seq_len、batch_size 固定），显式声明非动态形状；
         # 数据相关的 MoE 溢出回退分支保留在 eager 下执行。
         model = torch.compile(model, dynamic=False)
 
@@ -21126,9 +21118,7 @@ def main():
             loss.backward()
 
         # 反向发射之后再预取下一批：checkpoint_gen_state 已在采样
-        # 之前捕获，采样顺序与不放预取时完全一致；此时 CPU 的
-        # 收集/搬运与 GPU 的反向执行重叠，避免在 forward 与
-        # backward 之间插入 CPU 工作形成气泡。
+        # 之前捕获，采样顺序与不放预取时完全一致。
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch(
                 "train",
@@ -21143,8 +21133,7 @@ def main():
         )
 
         # 损失与梯度范数都必须有限才推进优化器：任一非有限
-        # 都意味着这一步的参数更新不可信。grad_norm 与 loss 的
-        # 标量取回合并为一次设备同步。
+        # 都意味着这一步的参数更新不可信。
         grad_norm_value, loss_value = torch.stack(
             (grad_norm.detach(), loss.detach()),
         ).tolist()
