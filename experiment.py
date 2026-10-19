@@ -9133,6 +9133,43 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        # 实际有效训练长度与选型结果：受控变量检查必须核对
+        # 「实际训练了多久」而不只是计划步数，且 final/test
+        # 指标是否来自验证集选型的模型要能从 final 记录恢复
+        # （config 顶层记录可能因崩溃缺失）。
+        row["trained_steps"] = (
+            final_record.get("trained_steps")
+            if final_record is not None
+            else None
+        )
+        row["optimizer_steps"] = (
+            final_record.get("optimizer_steps")
+            if final_record is not None
+            else None
+        )
+        row["end_step"] = (
+            final_record.get("selected_step")
+            if final_record is not None
+            else None
+        )
+        row["selected_model"] = (
+            final_record.get("selected_model")
+            if final_record is not None
+            else None
+        )
+
+        protocol = row.get("protocol")
+        if isinstance(protocol, dict):
+            if row["trained_steps"] is not None:
+                protocol["trained_steps"] = row["trained_steps"]
+            if row["optimizer_steps"] is not None:
+                protocol["optimizer_steps"] = row["optimizer_steps"]
+            if row["selected_model"] == "best_val":
+                protocol["model_selection"] = (
+                    "best_val_with_last_fallback"
+                )
+            elif row["selected_model"] == "last":
+                protocol["model_selection"] = "last_step"
 
         rows.append(row)
 
@@ -9258,6 +9295,12 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "lr_schedule",
     "warmup_steps",
     "total_steps",
+    # 实际有效训练长度：total_steps 只是计划值，早停或
+    # non-finite 跳步会让各臂实际执行的步数/优化器更新次数
+    # 不同；这些字段在训练结束时由 compare_runs 从 final
+    # 记录注入协议并逐项核对（缺失时显式列为未核对）。
+    "trained_steps",
+    "optimizer_steps",
     "weight_decay",
     "grad_clip",
     "batch_size",
@@ -9894,6 +9937,9 @@ def check_controlled_variables(
 
     checked: List[str] = []
     violations: List[Dict[str, object]] = []
+    # 所有神经运行都缺记录的协议项：无法判定一致性。必须单独
+    # 列为「未核对」，不能让「没记录」静默混进 OK 结论。
+    unchecked: List[str] = []
 
     for key in COMPARISON_PROTOCOL_KEYS:
         if key in factor_set:
@@ -9919,7 +9965,9 @@ def check_controlled_variables(
         ]
 
         if not present:
-            # 所有运行都缺记录：无法判定，不计入检查也不报违规。
+            # 所有运行都缺记录：无法判定，列为未核对。
+            if neural:
+                unchecked.append(key)
             continue
 
         checked.append(key)
@@ -9941,6 +9989,7 @@ def check_controlled_variables(
     return {
         "factors": list(factors),
         "checked_keys": checked,
+        "unchecked_keys": unchecked,
         "violations": violations,
         "n_neural_runs": len(neural),
         "statistical_runs": statistical,
@@ -10749,6 +10798,50 @@ def _metric_samples(
     return samples
 
 
+def _collapse_seed_samples(
+    samples: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """
+    把同一随机种子的多个样本折叠为一个独立观测（取均值）。
+
+    伪重复（复制的同一运行 / 同一 seed 跑了多个目录）不是独立
+    重复实验：聚合 Mean ± Std 与 Welch 检验都必须以「独立种子」
+    为单位，否则复制运行会虚增样本数、压低种子间方差并制造
+    假阳性。未记录种子的样本无法判断是否重复，保持各自独立
+    （只扣除确定的伪重复，不凭空减少样本）。
+    """
+    grouped: Dict[object, List[Dict[str, object]]] = {}
+    order: List[object] = []
+    unseeded: List[Dict[str, object]] = []
+
+    for sample in samples:
+        seed = sample.get("seed")
+        if seed is None:
+            unseeded.append(sample)
+            continue
+        key = _stable_factor_key(seed)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(sample)
+
+    collapsed: List[Dict[str, object]] = []
+    for key in order:
+        group = grouped[key]
+        collapsed.append({
+            "seed": group[0].get("seed"),
+            "run": ", ".join(
+                str(sample.get("run")) for sample in group
+            ),
+            "value": _mean(
+                [float(sample["value"]) for sample in group]
+            ),
+            "n_runs": len(group),
+        })
+    collapsed.extend(unseeded)
+    return collapsed
+
+
 def aggregate_runs(
     rows: List[Dict[str, object]],
     group_keys: List[str],
@@ -10841,7 +10934,11 @@ def aggregate_runs(
 
         for metric in metric_keys:
             samples = _metric_samples(group_rows, metric)
-            values = [float(s["value"]) for s in samples]
+            # 统计量按独立种子计算：伪重复（同一 seed 的多个
+            # 运行）先行折叠，复制运行不能虚增 n、压低方差。
+            # 原始样本保留在 samples 里供检验层继续识别伪重复。
+            independent = _collapse_seed_samples(samples)
+            values = [float(s["value"]) for s in independent]
             mean = _mean(values)
             std = _sample_std(values)
 
@@ -10883,8 +10980,10 @@ def _contrast_test(
 
     同一单元里出现重复随机种子（伪重复）时不能做配对检验：
     字典会静默丢掉重复样本，把「复制的同一个运行」当成独立
-    重复。检测到伪重复时退回 Welch（每个运行各算一个样本）
-    并在结果里记录 ``duplicate_seeds``，展示层据此提示。
+    重复。检测到伪重复时退回 Welch，并且把同一 seed 的多个
+    样本折叠为一个独立观测，避免复制运行虚增 Welch 的样本数
+    与自由度、把不显著差异做成显著性。结果里记录
+    ``duplicate_seeds``，展示层据此提示。
     """
     seeds_a = [
         sample["seed"]
@@ -10900,6 +10999,11 @@ def _contrast_test(
         len(seeds_a) != len(set(seeds_a))
         or len(seeds_b) != len(set(seeds_b))
     )
+
+    # 推断单位是独立随机种子：伪重复先折叠成每 seed 一个观测，
+    # 检验的 n / df / 均值都不再把复制运行当独立重复。
+    samples_a = _collapse_seed_samples(samples_a)
+    samples_b = _collapse_seed_samples(samples_b)
 
     by_seed_a = {
         sample["seed"]: float(sample["value"])
@@ -11204,6 +11308,10 @@ def factor_contrasts(
                 noise_ratio = abs(delta) / pooled_std
 
             test = _contrast_test(samples_a, samples_b)
+            # 展示的样本数按独立种子口径（伪重复折叠后），
+            # 与检验使用的 n/df 保持同一单位。
+            independent_a = _collapse_seed_samples(samples_a)
+            independent_b = _collapse_seed_samples(samples_b)
 
             if delta is None:
                 verdict = "missing_metric"
@@ -11249,8 +11357,8 @@ def factor_contrasts(
                 "df": test.get("df"),
                 "p_value": test.get("p_value"),
                 "n_pairs": test.get("n_pairs", 0),
-                "n_baseline": len(samples_a),
-                "n_variant": len(samples_b),
+                "n_baseline": len(independent_a),
+                "n_variant": len(independent_b),
                 "duplicate_seeds": bool(
                     test.get("duplicate_seeds")
                 ),
@@ -11512,7 +11620,15 @@ def compare_cells_to_baseline(
 
     reference = max(
         matching,
-        key=lambda aggregate: int(aggregate.get("n_runs", 0)),
+        key=lambda aggregate: (
+            # 参考单元按独立种子数选，伪重复不能靠复制目录
+            # 把自己「选」成基线。
+            _independent_seed_count(
+                int(aggregate.get("n_runs", 0)),
+                list(aggregate.get("seeds") or []),
+            ),
+            int(aggregate.get("n_runs", 0)),
+        ),
     )
 
     contrasts: List[Dict[str, object]] = []
@@ -11582,9 +11698,15 @@ def compare_cells_to_baseline(
             "p_value": result.get("p_value"),
             "n_pairs": result.get("n_pairs", 0),
             "n_baseline": len(
-                reference["samples"].get(metric, [])
+                _collapse_seed_samples(
+                    reference["samples"].get(metric, [])
+                )
             ),
-            "n_variant": len(aggregate["samples"].get(metric, [])),
+            "n_variant": len(
+                _collapse_seed_samples(
+                    aggregate["samples"].get(metric, [])
+                )
+            ),
             "duplicate_seeds": bool(
                 result.get("duplicate_seeds")
             ),
@@ -11701,6 +11823,8 @@ def ablation_coverage(
     structural_signatures: Dict[str, int] = {}
     balance_values_on: set = set()
     unknown_balance = False
+    missing_structural_units: set = set()
+    missing_structural_keys: set = set()
 
     ablation_related = {"local_base", *_DELAYED_MERGE_MODES}
 
@@ -11709,11 +11833,29 @@ def ablation_coverage(
         balance = _row_factor_value(row, "balance_coef")
         modes_present[mode] = modes_present.get(mode, 0) + 1
         if mode in ablation_related:
-            structural_label = ", ".join(
-                f"{name}="
-                f"{_format_factor_value(_row_factor_value(row, name))}"
+            # 精确签名：用稳定键而不是 %g 文本，浮点细微差异
+            # 不能被格式化抹平；缺失值显式记录，不能把「未记录」
+            # 当成「一致」。
+            raw_structural = [
+                _row_factor_value(row, name)
                 for name in _ABLATION_STRUCTURAL_KEYS
-            )
+            ]
+            missing_names = [
+                name
+                for name, value in zip(
+                    _ABLATION_STRUCTURAL_KEYS, raw_structural
+                )
+                if value is None
+            ]
+            if missing_names:
+                missing_structural_units.add(
+                    str(row.get("run"))
+                )
+                missing_structural_keys.update(missing_names)
+            structural_label = repr(tuple(
+                _stable_factor_key(value)
+                for value in raw_structural
+            ))
             structural_signatures[structural_label] = (
                 structural_signatures.get(structural_label, 0) + 1
             )
@@ -11746,11 +11888,21 @@ def ablation_coverage(
     # k1/k2/top_k/residual_scale 必须保持恒定。不一致时主效应
     # 与分支几何/路由宽度/残差缩放混杂，组合覆盖再齐全也不能
     # 支撑「各设计各自有用」。
+    if missing_structural_units:
+        report["structural_confounds"].append(
+            "消融单元存在未记录的结构设置（"
+            + ", ".join(sorted(missing_structural_keys))
+            + "；涉及 "
+            + ", ".join(sorted(missing_structural_units))
+            + "）：无法核对结构设置在单元间一致，"
+            "主效应不能归因到待验证的设计上"
+        )
+
     if len(structural_signatures) > 1:
         report["structural_confounds"].append(
             "消融单元之间 "
             + "/".join(_ABLATION_STRUCTURAL_KEYS)
-            + " 的设置不一致或未记录（"
+            + " 的设置不一致（"
             + "; ".join(
                 f"{label} ×{count}"
                 for label, count in sorted(
@@ -12215,6 +12367,47 @@ def baseline_adequacy(
                 )
                 continue
 
+            # 低功效调参（< 3 个独立种子 / --allow-underpowered）
+            # 的 winner 可能是种子噪声，不能作为「基线已充分
+            # 调参」的证据；协议不一致的调参报告本身不可用；
+            # 旧版记录缺 seed_plan 时无法核对功效，同样不作为
+            # 证据（与 --baseline-tuning-from 的口径一致）。
+            record_seed_plan = record.get("seed_plan")
+            if not isinstance(record_seed_plan, dict):
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源缺少 seed_plan"
+                    "（旧版记录）：无法核对调参的独立种子数与"
+                    "统计功效，不能作为基线已调参的证据"
+                )
+                continue
+            recorded_seeds = record_seed_plan.get("n_seeds")
+            tuning_underpowered = bool(
+                record_seed_plan.get("underpowered_override")
+            ) or (
+                isinstance(recorded_seeds, int)
+                and not isinstance(recorded_seeds, bool)
+                and recorded_seeds < _MIN_SEEDS_FOR_STATS
+            )
+            if tuning_underpowered:
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源在少于 "
+                    f"{_MIN_SEEDS_FOR_STATS} 个独立随机种子的"
+                    "情况下选出 winner（underpowered）：winner "
+                    "可能只是种子噪声，不能作为基线已调参的证据"
+                )
+                continue
+            record_issues = record.get("issues")
+            if isinstance(record_issues, list) and any(
+                "训练协议不一致" in str(issue)
+                for issue in record_issues
+            ):
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源存在候选间训练"
+                    "协议不一致：调参结果与训练配置混杂，不能"
+                    "作为基线已调参的证据"
+                )
+                continue
+
             tuning_evidence = True
             record_metric = record.get("metric")
             report["tuned_runs"].append({
@@ -12223,6 +12416,14 @@ def baseline_adequacy(
                 "winner_lr": winner_lr,
                 "n_candidates": record.get("n_candidates"),
             })
+            if record.get("winner_at_grid_boundary") or record.get(
+                "best_mean_at_grid_boundary"
+            ):
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参 winner/最优均值候选"
+                    "位于学习率网格边界：最优可能落在网格之外，"
+                    "基线可能仍未被调强；建议扩展候选后重跑调参"
+                )
             if (
                 isinstance(record_metric, str)
                 and record_metric != metric
@@ -12837,6 +13038,12 @@ def print_comparison_analysis(
             "  以上差异会使对比结论无法归因到待验证模块；"
             "请统一这些设置后重跑，或在 --compare-factors 中"
             "显式声明为因子"
+        )
+
+    if controlled.get("unchecked_keys"):
+        print(
+            "  [warn] 以下协议项所有运行都未记录，无法核对"
+            "一致性: " + ", ".join(controlled["unchecked_keys"])
         )
 
     print()
@@ -17305,6 +17512,14 @@ def run_self_test():
         assert duplicate_contrast["duplicate_seeds"]
         assert duplicate_contrast["test"] == "welch_t"
         assert duplicate_contrast["n_pairs"] == 0
+        # 伪重复折叠为独立种子观测：检验与展示的样本数都不能
+        # 把复制运行算成独立重复（A 单元 4 个运行、3 个种子）。
+        assert duplicate_contrast["n_baseline"] == 3
+        assert duplicate_contrast["n_variant"] == 3
+        assert (
+            duplicate_by_label["mode=A"]["val_loss_n"] == 3
+        )
+        assert duplicate_by_label["mode=A"]["n_runs"] == 4
         assert (
             "重复随机种子"
             in _contrast_display(duplicate_contrast, "val_loss")
@@ -17728,6 +17943,12 @@ def run_self_test():
             "winner_lr": 3e-4,
             "winner_mean": 4.5,
             "n_candidates": 9,
+            "seed_plan": {
+                "seeds": [1, 2, 3],
+                "n_seeds": 3,
+                "min_seeds_for_significance": 3,
+                "underpowered_override": False,
+            },
         }
 
         smelt_path = _write_analysis_run(
@@ -17894,6 +18115,64 @@ def run_self_test():
         assert any(
             "未对齐" in message
             for message in mismatch_adequacy["advisories"]
+        )
+
+        # 低功效调参（--allow-underpowered / 种子数 < 3）不能
+        # 洗白成「基线已充分调参」：记录存在也要判 tuning 无效。
+        underpowered_tuning = dict(good_tuning)
+        underpowered_tuning["seed_plan"] = {
+            "seeds": [1, 2],
+            "n_seeds": 2,
+            "min_seeds_for_significance": 3,
+            "underpowered_override": True,
+        }
+        underpowered_path = _write_analysis_run(
+            "underpowered_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+            baseline_tuning=underpowered_tuning,
+        )
+        underpowered_adequacy = baseline_adequacy(
+            compare_runs([underpowered_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert underpowered_adequacy["tuned"] is False
+        assert underpowered_adequacy["ok"] is False
+        assert any(
+            "underpowered" in message
+            for message in underpowered_adequacy["advisories"]
+        )
+
+        # 旧版调参记录缺 seed_plan：功效无法核对，同样不作为
+        # 「基线已调参」的证据。
+        legacy_tuning = dict(good_tuning)
+        legacy_tuning.pop("seed_plan")
+        legacy_tuning_path = _write_analysis_run(
+            "legacy_tuning_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+            baseline_tuning=legacy_tuning,
+        )
+        legacy_tuning_adequacy = baseline_adequacy(
+            compare_runs([legacy_tuning_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert legacy_tuning_adequacy["tuned"] is False
+        assert any(
+            "seed_plan" in message
+            for message in legacy_tuning_adequacy["advisories"]
         )
 
         # 没有调参记录、但已强于调优好的 n-gram：不标记
@@ -18630,6 +18909,38 @@ def run_self_test():
         )
         assert legacy_error is not None
         assert "重新生成调参报告" in legacy_error
+
+        # 低功效调参（--allow-underpowered / < 3 种子）不能作为
+        # 基线来源；缺 seed_plan 的旧版报告同样拒绝。
+        underpowered_payload = dict(tuning_payload)
+        underpowered_payload["seed_plan"] = dict(
+            tuning_payload["seed_plan"],
+            seeds=[42, 43],
+            n_seeds=2,
+            underpowered_override=True,
+        )
+        underpowered_error = baseline_tuning_provenance_error(
+            underpowered_payload,
+            "dense",
+            1e-4,
+            100,
+            "deadbeef",
+            protocol=sampled_protocol,
+        )
+        assert underpowered_error is not None
+        assert "underpowered" in underpowered_error
+        no_seed_plan_payload = dict(tuning_payload)
+        no_seed_plan_payload.pop("seed_plan")
+        no_seed_plan_error = baseline_tuning_provenance_error(
+            no_seed_plan_payload,
+            "dense",
+            1e-4,
+            100,
+            "deadbeef",
+            protocol=sampled_protocol,
+        )
+        assert no_seed_plan_error is not None
+        assert "seed_plan" in no_seed_plan_error
         provenance_record = baseline_tuning_provenance_record(
             tuning_payload, str(tuning_source)
         )
@@ -19100,7 +19411,9 @@ def build_sweep_plan(
 
     if ablation:
         delayed_modes = (
-            list(ablation_modes)
+            # 防御性去重：重复方案会让同一消融单元被运行两次、
+            # 同一输出目录被覆盖或重复登记。
+            list(dict.fromkeys(ablation_modes))
             if ablation_modes
             else list(_DELAYED_MERGE_MODES)
         )
@@ -19155,6 +19468,12 @@ def build_baseline_tuning_plan(
     「超参数搜索」，而不是偷跑更多步。
     """
     plan: List[Dict[str, object]] = []
+    labels = [f"lr{format(lr, 'g')}" for lr in lrs]
+    if len(set(labels)) != len(labels):
+        raise ValueError(
+            "基线调参候选的学习率在运行目录名中格式化后重名，"
+            "会互相覆盖输出目录；请使用差异更大的候选"
+        )
     for lr in lrs:
         for seed in seeds:
             plan.append({
@@ -19271,6 +19590,16 @@ def analyze_baseline_tuning(
         "winner_selection": None,
         "tied_lrs": [],
         "winner_at_grid_boundary": False,
+        "best_mean_at_grid_boundary": False,
+        # 种子计划随报告落盘：调参的统计功效（独立种子数、
+        # 是否用了低功效豁免）是「基线已充分调参」的一部分，
+        # 下游来源核对与基线合理性检查都必须能看到。
+        "seed_plan": {
+            "seeds": [int(seed) for seed in seeds],
+            "n_seeds": len(seeds),
+            "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
+            "underpowered_override": False,
+        },
         "selection_rule": (
             "在 val 上先取指标均值最优的候选；与最优均值的差距"
             "小于种子波动（两侧 std 的较大者）的候选视为并列"
@@ -19462,28 +19791,43 @@ def analyze_baseline_tuning(
             "selection_rule 取更小的学习率（保守解）"
         )
 
-    # 网格边界：winner 恰是候选网格的最小/最大值时，最优可能
-    # 落在网格之外，「调过参的基线」仍可能是被网格边界限制的
-    # 弱基线；必须提示扩展候选后重跑。
+    # 网格边界：winner 或**最优均值候选**恰是候选网格的最小/
+    # 最大值时，最优可能落在网格之外，「调过参的基线」仍可能是
+    # 被网格边界限制的弱基线；必须提示扩展候选后重跑。只检查
+    # 保守并列 winner 会漏掉「最优均值在边界、保守 winner 在
+    # 内部」的情形。
     sorted_grid = sorted(float(lr) for lr in lrs)
-    if sorted_grid and float(winner["lr"]) in (
-        sorted_grid[0],
-        sorted_grid[-1],
-    ):
-        report["winner_at_grid_boundary"] = True
-        if len(sorted_grid) > 1:
-            report["issues"].append(
-                "winner lr="
-                f"{format(float(winner['lr']), 'g')} 位于候选"
-                "网格边界（"
-                + ", ".join(
-                    format(lr, "g") for lr in sorted_grid
-                )
-                + "）：最优可能落在网格之外，当前「调过参的"
-                "基线」仍可能被网格边界限制；建议扩展 "
-                "--baseline-tuning-lrs（如加入更小/更大的"
-                "候选）后重跑调参"
+    boundary_lrs = (
+        (sorted_grid[0], sorted_grid[-1]) if sorted_grid else ()
+    )
+    winner_at_boundary = bool(boundary_lrs) and (
+        float(winner["lr"]) in boundary_lrs
+    )
+    best_at_boundary = bool(boundary_lrs) and (
+        float(best["lr"]) in boundary_lrs
+    )
+    report["winner_at_grid_boundary"] = winner_at_boundary
+    report["best_mean_at_grid_boundary"] = best_at_boundary
+    if (winner_at_boundary or best_at_boundary) and len(
+        sorted_grid
+    ) > 1:
+        reason = (
+            f"winner lr={format(float(winner['lr']), 'g')}"
+            if winner_at_boundary
+            else "最优均值候选 lr="
+            f"{format(float(best['lr']), 'g')}"
+        )
+        report["issues"].append(
+            reason
+            + " 位于候选网格边界（"
+            + ", ".join(
+                format(lr, "g") for lr in sorted_grid
             )
+            + "）：最优可能落在网格之外，当前「调过参的"
+            "基线」仍可能被网格边界限制；建议扩展 "
+            "--baseline-tuning-lrs（如加入更小/更大的"
+            "候选）后重跑调参"
+        )
 
     return report
 
@@ -19682,6 +20026,43 @@ def baseline_tuning_provenance_error(
             "必须真实复用于基线训练，不能借用调参报告"
         )
 
+    # 统计功效：调参 winner 是种子噪声的产物时，这条「调过参
+    # 的基线」不可信。低功效调参（--allow-underpowered 或
+    # 种子数 < 3）不能作为「基线已充分调参」的证据。
+    seed_plan = payload.get("seed_plan")
+    if not isinstance(seed_plan, dict):
+        return (
+            "调参报告缺少 seed_plan（旧版报告）：无法核对调参"
+            "的独立种子数与统计功效，请用新版 "
+            "--suite-baseline-tuning 重新生成调参报告"
+        )
+    tuning_seeds = seed_plan.get("n_seeds")
+    if seed_plan.get("underpowered_override") or (
+        isinstance(tuning_seeds, int)
+        and not isinstance(tuning_seeds, bool)
+        and tuning_seeds < _MIN_SEEDS_FOR_STATS
+    ):
+        return (
+            "调参报告在少于 "
+            f"{_MIN_SEEDS_FOR_STATS} 个独立随机种子的情况下"
+            "选出 winner（underpowered）：winner 可能只是种子"
+            "噪声的产物，不能作为「基线已充分调参」的证据；"
+            "请用 3~5 个种子重新调参"
+        )
+
+    # 候选之间训练协议不一致时，调参结论与训练配置混杂，
+    # 报告本身已标为不可用。
+    tuning_issues = payload.get("issues")
+    if isinstance(tuning_issues, list) and any(
+        "训练协议不一致" in str(issue)
+        for issue in tuning_issues
+    ):
+        return (
+            "调参报告的候选之间存在训练协议不一致：调参结果与"
+            "「训练更久 / 换了协议」混杂，不能作为基线来源；"
+            "请修正配置后重新调参"
+        )
+
     config = payload.get("training_config")
     if not isinstance(config, dict):
         return (
@@ -19793,6 +20174,16 @@ def baseline_tuning_provenance_record(
         "n_candidates": payload.get("n_candidates"),
         "grid": payload.get("grid"),
         "training_config": payload.get("training_config"),
+        # 统计功效与调参质量问题必须随来源一起落盘：低功效或有
+        # 协议冲突的调参报告不能被下游当成「基线已充分调参」。
+        "seed_plan": payload.get("seed_plan"),
+        "issues": payload.get("issues"),
+        "winner_at_grid_boundary": payload.get(
+            "winner_at_grid_boundary"
+        ),
+        "best_mean_at_grid_boundary": payload.get(
+            "best_mean_at_grid_boundary"
+        ),
     }
 
 
@@ -20582,6 +20973,13 @@ def main():
             "--ablation-modes 只适用于 --suite-ablation"
             "（用于声明本轮必须覆盖哪些延迟合并方案）"
         )
+    if args.ablation_modes is not None and (
+        len(set(args.ablation_modes)) != len(args.ablation_modes)
+    ):
+        parser.error(
+            "--ablation-modes 存在重复的延迟合并方案"
+            "（重复方案会重复运行同一消融单元、覆盖输出目录）"
+        )
     if args.allow_underpowered and not (
         args.suite_modes
         or args.suite_ablation
@@ -20630,6 +21028,19 @@ def main():
         args.baseline_tuning_lrs
     ):
         parser.error("--baseline-tuning-lrs 存在重复候选")
+    # 运行目录名用 %g 生成：两个不同的 lr 若格式化后同名，
+    # 后一个候选会覆盖前一个的运行目录，报告里出现重复样本
+    # 甚至 0 样本候选。入口必须显式拒绝，而不是静默覆盖。
+    tuning_labels = [
+        f"lr{format(lr, 'g')}"
+        for lr in args.baseline_tuning_lrs
+    ]
+    if len(set(tuning_labels)) != len(tuning_labels):
+        parser.error(
+            "--baseline-tuning-lrs 的候选在输出目录名中"
+            "格式化后重名（%g 精度不足）：请改用差异更大的"
+            "学习率候选，避免调参运行互相覆盖"
+        )
     if args.suite_baseline_tuning and len(
         set(args.baseline_tuning_lrs)
     ) < 2:
@@ -22242,6 +22653,14 @@ def main():
             else None
         ),
         "selection_note": selection_note,
+        # 实际有效训练长度：早停与 non-finite 跳步会让
+        # 「计划步数相同」的两臂实际训练量不同，跨运行对比
+        # 必须能核对（--compare 注入 comparison_protocol）。
+        "trained_steps": max(0, int(end_step) - int(start_step)),
+        "optimizer_steps": max(
+            0,
+            int(end_step) - int(start_step) - int(nonfinite_events),
+        ),
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
         "numerical_polluted": numerical_polluted,
