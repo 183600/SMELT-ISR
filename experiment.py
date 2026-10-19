@@ -565,6 +565,17 @@ _MOE_PADDED_CACHE_REGISTRY: (
 ) = weakref.WeakKeyDictionary()
 
 
+# dispatch 行下标缓存的字节上限（每模块）：total 在一次训练里
+# 只有少数几个取值，首次分配后全命中；超限退回逐次分配。
+_MOE_ARANGE_CACHE_MAX_BYTES = 1024 * 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    """dtype 的每元素字节数；避免热路径上为查询而分配空张量。"""
+    return torch.empty(0, dtype=dtype).element_size()
+
+
 class _StackedExpertWeights(torch.autograd.Function):
     """
     缓存的专家权重 stack 的梯度出口。
@@ -724,13 +735,68 @@ class SparseMoE(nn.Module):
         # 推进版本号），需要把新参数写回既有缓冲。
         self._weight_cache_generation = 0
 
+        # 专家权重参数引用缓存：热路径直接取用，避免每次前向
+        # 重建「3 层属性访问 × n_experts」的列表。参数对象由
+        # 模块自身持有，缓存不延长其生命周期；仅 _apply 可能
+        # 整体替换参数张量，届时重建。
+        self._expert_gate_up_weights: List[torch.Tensor] = []
+        self._expert_down_weights: List[torch.Tensor] = []
+        self._refresh_expert_weight_lists()
+
+        # dispatch 的行下标 arange 缓存：键 (device, n)。
+        self._aranges: Dict[
+            Tuple[torch.device, int], torch.Tensor
+        ] = {}
+        self._arange_bytes = 0
+
+    def _refresh_expert_weight_lists(self) -> None:
+        self._expert_gate_up_weights = [
+            expert.gate_up.weight for expert in self.experts
+        ]
+        self._expert_down_weights = [
+            expert.down.weight for expert in self.experts
+        ]
+
+    def _cached_arange(
+        self,
+        device: torch.device,
+        n: int,
+    ) -> torch.Tensor:
+        """
+        dispatch 热路径的行下标 arange 缓存。
+
+        形状跨调用稳定（total 只有少数几个取值），首次分配后
+        全命中；缓存张量只被读取（消费它的算术均为
+        out-of-place），字节封顶防止形状漂移时无界增长，
+        _apply 迁移设备时清空。
+        """
+        key = (device, n)
+        cached = self._aranges.get(key)
+        if cached is not None:
+            return cached
+
+        tensor = torch.arange(n, device=device)
+        bytes_needed = n * tensor.element_size()
+        if (
+            self._arange_bytes + bytes_needed
+            <= _MOE_ARANGE_CACHE_MAX_BYTES
+        ):
+            self._aranges[key] = tensor
+            self._arange_bytes += bytes_needed
+        return tensor
+
     def _apply(self, fn, recurse=True):
         # .to() / .float() 等可能整体替换参数张量（版本号不递增），
         # 权重 stack 缓存必须随之失效；填充缓冲的键含设备/dtype，
-        # 旧键不会再被命中，一并释放。
+        # 旧键不会再被命中，一并释放。专家权重引用与行下标缓存
+        # 同理在参数/设备更新后重建。
         self._weight_stacks.clear()
         self.clear_padded_buffer_cache()
-        return super()._apply(fn, recurse=recurse)
+        self._aranges.clear()
+        self._arange_bytes = 0
+        result = super()._apply(fn, recurse=recurse)
+        self._refresh_expert_weight_lists()
+        return result
 
     def clear_padded_buffer_cache(self) -> None:
         """释放当前模块缓存的推理填充缓冲并归还全局额度。"""
@@ -979,7 +1045,7 @@ class SparseMoE(nn.Module):
             return buffer
 
         bytes_needed = (
-            rows * dim * torch.empty(0, dtype=dtype).element_size()
+            rows * dim * _dtype_element_size(dtype)
         )
         cached_total = sum(_MOE_PADDED_CACHE_REGISTRY.values())
         if (
@@ -1020,10 +1086,7 @@ class SparseMoE(nn.Module):
         """
         gate_up_weight = self._cached_weight_stack(
             "gate_up",
-            [
-                expert.gate_up.weight
-                for expert in self.experts
-            ],
+            self._expert_gate_up_weights,
         )
 
         gate_up = torch.bmm(
@@ -1033,10 +1096,7 @@ class SparseMoE(nn.Module):
 
         down_weight = self._cached_weight_stack(
             "down",
-            [
-                expert.down.weight
-                for expert in self.experts
-            ],
+            self._expert_down_weights,
         )
 
         if gate_up.requires_grad:
@@ -1175,13 +1235,16 @@ class SparseMoE(nn.Module):
         # clamp 与回退分支。
         has_overflow = bool(counts.max() > cap)
 
+        # 行下标经 _cached_arange 复用（形状跨调用稳定）。
+        row_ids = self._cached_arange(device, total)
+
         # 目标行号 dest[j] = seg_id[j] * cap + (j - starts[seg_id[j]])
         # 展开为 j + (seg_id[j] * cap - starts[seg_id[j]])：每专家
         # 的偏移只算 E 项，常规路径因此少两次全长索引算术；溢出
         # 路径再单独算段内局部行号（罕见）。
-        dest = torch.arange(total, device=device) + (
+        dest = row_ids + (
             (
-                torch.arange(n_experts, device=device) * cap
+                self._cached_arange(device, n_experts) * cap
                 - starts
             ).index_select(0, seg_id)
         )
@@ -1190,7 +1253,7 @@ class SparseMoE(nn.Module):
             # 容量内的行散射进填充缓冲；溢出行只参与裁剪后的
             # index_copy_（不写入填充缓冲）。
             local = (
-                torch.arange(total, device=device)
+                row_ids
                 - starts.index_select(0, seg_id)
             )
             overflow = local >= cap
@@ -1211,7 +1274,15 @@ class SparseMoE(nn.Module):
         )
         if padded is None:
             padded = gathered.new_zeros(n_experts * cap, dim)
+
         padded.index_copy_(0, copy_index, copy_source)
+
+        if not has_overflow:
+            # 常规路径到此 gathered 的数据不再被任何一方引用
+            #（index_select / index_copy_ 的反向只保存下标），
+            # 显式释放可让峰值激活少一份 [total, dim] 副本；
+            # 溢出路径下方回退仍需读取 gathered，保持引用。
+            del gathered, copy_source
 
         out = self._batched_experts_forward(
             padded.view(n_experts, cap, dim)
