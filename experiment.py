@@ -872,17 +872,12 @@ class SparseMoE(nn.Module):
         # 数量为分母；均匀路由时 E * sum(f_i * P_i) 恰好等于
         # top_k，均衡强度随路由宽度线性增大，跨 k 比较时
         # 应按比例折算 balance_coef（保持 balance_coef * k 不变）。
-        # counts 用 scatter_add_ 统计，输出为 int64，后续
-        # dispatch 的索引算术语义与逐 token 计数一致。
+        # counts 用 bincount 统计（无 ones_like 分配），输出为
+        # int64，后续 dispatch 的索引算术语义与逐 token 计数一致。
         assignment_indices = top_indices.reshape(-1)
-        counts = torch.zeros(
-            self.n_experts,
-            dtype=torch.int64,
-            device=top_indices.device,
-        ).scatter_add_(
-            0,
+        counts = torch.bincount(
             assignment_indices,
-            torch.ones_like(assignment_indices),
+            minlength=self.n_experts,
         )
 
         # 辅助负载均衡项只在梯度开启时可能被消费（总损失、
@@ -1065,13 +1060,12 @@ class SparseMoE(nn.Module):
         """
         对每个 token-expert assignment 执行专家计算。
 
-        一般路径（n_experts > 1 且 top_k != n_experts）按
-        assignment 总数给出静态每专家容量
-        cap = ceil(total / n_experts)：排序后的专家段散射进
-        [n_experts, cap, dim] 的零填充缓冲，一次 bmm 完成
+        一般路径（n_experts > 1 且 top_k != n_experts）给每个
+        专家分配容量 cap（均衡路由下即实际最大桶，倾斜路由
+        下为有界的均值上界，见下方注释）：排序后的专家段散射
+        进 [n_experts, cap, dim] 的零填充缓冲，一次 bmm 完成
         容量内的全部专家；超出容量的 assignment 由对应专家的
-        2D 前向单独计算。容量只依赖 assignment 总数、不依赖
-        counts 的分布；语义与逐专家循环一致（容量内
+        2D 前向单独计算。语义与逐专家循环一致（容量内
         为 bmm、溢出为逐专家线性层，均为精确结果）。
 
         返回:
@@ -1157,18 +1151,20 @@ class SparseMoE(nn.Module):
         device = gathered.device
         n_experts = self.n_experts
 
-        # 静态容量只依赖 assignment 总数（不依赖各专家计数）。
-        # 基础容量取均值上界 ceil(total / n_experts)；counts[e]
-        # 近似 Binomial(total, 1/n_experts)，标准差不超过
-        # sqrt(total / n_experts)，再加 6 倍标准差余量后单专家
-        # 溢出概率可忽略。多出的行是精确 0 填充，只让 bmm 多算
-        # 少量行，不改变任何输出；万一仍溢出，下面的逐专家
-        # 回退路径保证语义不变。
+        # 静态容量只依赖 assignment 总数（不依赖各专家计数）：
+        # 形状跨批次稳定，torch.compile 无需为不同路由结果重复
+        # 编译。基础容量取均值上界 ceil(total / n_experts)；
+        # counts[e] 近似 Binomial(total, 1/n_experts)，标准差
+        # 不超过 sqrt(total / n_experts)，余量取 4 倍标准差
+        # （溢出概率 ~1e-5/专家；余量越小填充行越少，bmm 的
+        # 无效行与保存的激活也越少）。多出的行是精确 0 填充，
+        # 只让 bmm 多算少量行，不改变任何输出；万一仍溢出，
+        # 下面的逐专家回退路径保证语义不变。
         cap = -(-total // n_experts)
-        cap += 6 * math.isqrt(max(1, cap)) + 1
+        cap += 4 * math.isqrt(max(1, cap)) + 1
 
         # 各专家段在排序序列中的起始行，以及排序后第 j 行
-        # 所属专家与其段内局部行号。
+        # 所属专家。
         starts = torch.cumsum(counts, dim=0) - counts
         seg_id = assignment_experts.index_select(0, perm)
 
@@ -1179,19 +1175,30 @@ class SparseMoE(nn.Module):
         # clamp 与回退分支。
         has_overflow = bool(counts.max() > cap)
 
-        local = torch.arange(total, device=device) - starts[seg_id]
+        # 目标行号 dest[j] = seg_id[j] * cap + (j - starts[seg_id[j]])
+        # 展开为 j + (seg_id[j] * cap - starts[seg_id[j]])：每专家
+        # 的偏移只算 E 项，常规路径因此少两次全长索引算术；溢出
+        # 路径再单独算段内局部行号（罕见）。
+        dest = torch.arange(total, device=device) + (
+            (
+                torch.arange(n_experts, device=device) * cap
+                - starts
+            ).index_select(0, seg_id)
+        )
 
         if has_overflow:
-            # 容量内的行散射进填充缓冲；溢出行的目标位置被夹紧，
-            # 只参与裁剪后的 index_copy_（不写入填充缓冲）。
+            # 容量内的行散射进填充缓冲；溢出行只参与裁剪后的
+            # index_copy_（不写入填充缓冲）。
+            local = (
+                torch.arange(total, device=device)
+                - starts.index_select(0, seg_id)
+            )
             overflow = local >= cap
             in_cap = ~overflow
-            dest = seg_id * cap + local.clamp(max=cap - 1)
             copy_index = dest[in_cap]
             copy_source = gathered[in_cap]
             out_index = perm[in_cap]
         else:
-            dest = seg_id * cap + local
             copy_index = dest
             copy_source = gathered
             out_index = perm
@@ -4096,6 +4103,12 @@ def compute_reference_baselines(
 
     unigram_prediction = int(train_counts.argmax())
 
+    # log 概率预先算好（词表仅 256 项），循环内只做查表求和：
+    # 与逐批对整批 token 求 log 的取值逐位一致，但省掉了每个
+    # 批次对全部评估位置重复求 log 的开销。
+    uniform_log_probs = uniform_probs.log()
+    unigram_log_probs = unigram_probs.log()
+
     uniform_total = 0.0
     unigram_total = 0.0
     evaluated_tokens = 0
@@ -4119,11 +4132,11 @@ def compute_reference_baselines(
 
         flat_target = y.reshape(-1).to(torch.int64)
 
-        uniform_total += float(
-            -uniform_probs[flat_target].log().sum()
+        uniform_total -= float(
+            uniform_log_probs[flat_target].sum()
         )
-        unigram_total += float(
-            -unigram_probs[flat_target].log().sum()
+        unigram_total -= float(
+            unigram_log_probs[flat_target].sum()
         )
         evaluated_tokens += flat_target.numel()
 
