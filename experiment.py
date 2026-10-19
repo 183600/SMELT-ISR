@@ -1171,13 +1171,30 @@ class SparseMoE(nn.Module):
         # 所属专家与其段内局部行号。
         starts = torch.cumsum(counts, dim=0) - counts
         seg_id = assignment_experts.index_select(0, perm)
+
+        # 溢出判定只需要看每专家的 assignment 数：同一专家的段在
+        # 排序序列中连续，段内局部行号为 0..counts[e]-1，因此
+        # 「存在溢出」等价于 counts 的最大值超过容量。判定放在
+        # 构造掩码之前：常规无溢出路径不产生掩码，也不需要
+        # clamp 与回退分支。
+        has_overflow = bool(counts.max() > cap)
+
         local = torch.arange(total, device=device) - starts[seg_id]
 
-        # 容量内的行散射进填充缓冲；溢出行的目标位置被夹紧，
-        # 只参与裁剪后的 index_copy_（不写入填充缓冲）。
-        in_cap = local < cap
-        overflow = in_cap.logical_not()
-        dest = seg_id * cap + local.clamp(max=cap - 1)
+        if has_overflow:
+            # 容量内的行散射进填充缓冲；溢出行的目标位置被夹紧，
+            # 只参与裁剪后的 index_copy_（不写入填充缓冲）。
+            overflow = local >= cap
+            in_cap = ~overflow
+            dest = seg_id * cap + local.clamp(max=cap - 1)
+            copy_index = dest[in_cap]
+            copy_source = gathered[in_cap]
+            out_index = perm[in_cap]
+        else:
+            dest = seg_id * cap + local
+            copy_index = dest
+            copy_source = gathered
+            out_index = perm
 
         padded = self._padded_buffer(
             gathered.dtype,
@@ -1187,7 +1204,7 @@ class SparseMoE(nn.Module):
         )
         if padded is None:
             padded = gathered.new_zeros(n_experts * cap, dim)
-        padded.index_copy_(0, dest[in_cap], gathered[in_cap])
+        padded.index_copy_(0, copy_index, copy_source)
 
         out = self._batched_experts_forward(
             padded.view(n_experts, cap, dim)
@@ -1198,14 +1215,13 @@ class SparseMoE(nn.Module):
         final = out.new_empty(total, dim)
         final.index_copy_(
             0,
-            perm[in_cap],
-            out.index_select(0, dest[in_cap]),
+            out_index,
+            out.index_select(0, copy_index),
         )
 
         # 溢出回退：容量外的 assignment 由对应专家的 2D 前向计算
-        # 后写入同一缓冲。余量下通常无溢出，先完成主路径 bmm
-        # 再检查溢出。
-        if bool(overflow.any()):
+        # 后写入同一缓冲（余量下通常不触发）。
+        if has_overflow:
             experts = self.experts
             for expert_index in range(n_experts):
                 rows = overflow & (seg_id == expert_index)
@@ -3922,9 +3938,15 @@ def evaluate(
                 )
                 flat_predicted = predicted.reshape(-1)
 
+                # add(alpha=) 单次完成 target * vocab_size +
+                # predicted（逐位等值）；flat_target 保持原值供
+                # AUC 收集使用。
                 confusion += torch.bincount(
-                    flat_target * vocab_size
-                    + flat_predicted,
+                    torch.add(
+                        flat_predicted,
+                        flat_target,
+                        alpha=vocab_size,
+                    ),
                     minlength=vocab_size ** 2,
                 ).view(
                     vocab_size,
@@ -19476,7 +19498,7 @@ def main():
             f"{_DEFAULT_EQUIVALENCE_MARGIN:g}，即 1%%）："
             "「不显著」只能说明未发现差异，不等于无差异；"
             "报告在预先声明的等价界内给出 TOST 判定，以及 "
-            "80% 功效下的最小可检出效应（MDE）与所需种子数，"
+            "80%% 功效下的最小可检出效应（MDE）与所需种子数，"
             "避免把功效不足误读成方法等价"
         ),
     )
