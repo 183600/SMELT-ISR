@@ -10105,6 +10105,10 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
     """
     if df <= 0.0:
         return None
+    if math.isnan(t):
+        # NaN 的 p 值没有定义：返回 0.0 会被当成“极显著”，
+        # 必须显式返回 None 让调用方走「无检验结果」分支。
+        return None
     if not math.isfinite(t):
         return 0.0
 
@@ -10648,25 +10652,33 @@ def _attach_power_equivalence(
         if power is not None:
             contrast["power_at_effect"] = power
 
-        # 还原观测到的重复间标准差：配对设计 se = sd/√n；
-        # Welch 用两臂较小样本量近似（标为近似口径）。
+        # 还原观测到的重复间标准差：配对设计 se = sd/√n，直接
+        # sd = se·√n。Welch 两臂样本量不等时，把「等臂规划下与
+        # 当前 se 等价的每臂种子数」取调和均值
+        # n_eq = 2·n_a·n_b/(n_a+n_b)，对应 sd = se·√n_eq；
+        # 用 min(n_a, n_b) 会把所需种子数说得比实际乐观。
         n_pairs = contrast.get("n_pairs")
         n_baseline = contrast.get("n_baseline")
         n_variant = contrast.get("n_variant")
         sd_observed = None
         if (
             isinstance(n_pairs, int)
+            and not isinstance(n_pairs, bool)
             and n_pairs >= _MIN_SEEDS_FOR_STATS
         ):
             sd_observed = se_value * math.sqrt(n_pairs)
         elif (
             isinstance(n_baseline, int)
+            and not isinstance(n_baseline, bool)
             and isinstance(n_variant, int)
+            and not isinstance(n_variant, bool)
             and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
         ):
-            sd_observed = se_value * math.sqrt(
-                min(n_baseline, n_variant)
+            n_equivalent = (
+                2.0 * n_baseline * n_variant
+                / (n_baseline + n_variant)
             )
+            sd_observed = se_value * math.sqrt(n_equivalent)
         if sd_observed is not None and delta_value != 0.0:
             seeds_needed = _seeds_to_detect(
                 delta_value,
@@ -11378,6 +11390,46 @@ def factor_contrasts(
     return contrasts
 
 
+def _current_seed_count(
+    contrast: Dict[str, object],
+) -> Optional[float]:
+    """
+    展示「当前种子数」的检验口径：配对检验用配对对数；Welch
+    用与检验 se 等价的每臂种子数（两臂样本量的调和均值，两臂
+    不等时低于较小臂的直觉计数但不会高估规模）。无法确定时
+    返回 None。
+    """
+    n_pairs = contrast.get("n_pairs")
+    if (
+        isinstance(n_pairs, int)
+        and not isinstance(n_pairs, bool)
+        and n_pairs >= _MIN_SEEDS_FOR_STATS
+    ):
+        return float(n_pairs)
+
+    n_baseline = contrast.get("n_baseline")
+    n_variant = contrast.get("n_variant")
+    if (
+        isinstance(n_baseline, int)
+        and not isinstance(n_baseline, bool)
+        and isinstance(n_variant, int)
+        and not isinstance(n_variant, bool)
+        and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
+    ):
+        return (
+            2.0 * n_baseline * n_variant
+            / (n_baseline + n_variant)
+        )
+    return None
+
+
+def _format_seed_count(value: float) -> str:
+    """种子数展示：整数值不补小数，等效调和均值为小数时保留 1 位。"""
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
 def _contrast_display(
     contrast: Dict[str, object],
     metric: str,
@@ -11522,16 +11574,16 @@ def _contrast_display(
                 "未显著不代表等价，结论不确定）"
             )
             seeds_needed = contrast.get("seeds_to_detect")
-            current_seeds = contrast.get("n_pairs")
+            current_seeds = _current_seed_count(contrast)
             if (
                 isinstance(seeds_needed, int)
-                and isinstance(current_seeds, int)
-                and current_seeds >= _MIN_SEEDS_FOR_STATS
+                and current_seeds is not None
                 and seeds_needed > current_seeds
             ):
                 caveat += (
                     f"（按当前种子间波动，检出该效应约需 "
-                    f"{seeds_needed} 个种子，当前 {current_seeds} 个）"
+                    f"{seeds_needed} 个种子，当前 "
+                    f"{_format_seed_count(current_seeds)} 个）"
                 )
 
     # 伪重复：同一单元里同一随机种子出现多次（复制的运行）
@@ -13441,15 +13493,15 @@ def print_comparison_analysis(
                     mde_text += f"（相对 {float(mde_relative) * 100:.2f}%）"
                 seeds_needed = entry.get("seeds_to_detect")
                 seeds_text = ""
-                n_pairs = entry.get("n_pairs")
+                current_seeds = _current_seed_count(entry)
                 if (
                     isinstance(seeds_needed, int)
-                    and isinstance(n_pairs, int)
-                    and n_pairs >= _MIN_SEEDS_FOR_STATS
+                    and current_seeds is not None
                 ):
                     seeds_text = (
                         f"；检出该效应约需 {seeds_needed} 个种子"
-                        f"（当前 {n_pairs} 个）"
+                        f"（当前 "
+                        f"{_format_seed_count(current_seeds)} 个）"
                     )
                 delta = entry.get("delta")
                 delta_text = (
@@ -13548,9 +13600,17 @@ def print_comparison_analysis(
                 continue
             print(f"  [note] {message}")
 
+    expected_cells = coverage.get("expected_cells") or []
+    # 表头形状按声明的消融方案数动态给出：默认 A/B 时为 3×2，
+    # 只有两个方案时才恰好是 2×2，不能硬编码。
+    shape_text = (
+        f"{len(expected_cells) // 2}×2"
+        if expected_cells
+        else "延迟合并 × 均衡损失"
+    )
     print()
     print(
-        "[ablation] 消融覆盖检查（延迟合并 × 均衡损失 2×2："
+        f"[ablation] 消融覆盖检查（{shape_text}："
         f"{coverage['legend']}）"
     )
     if coverage["missing_cells"]:
@@ -13569,13 +13629,26 @@ def print_comparison_analysis(
             print(f"  [warn] {message}")
     for advisory in coverage["advisories"]:
         print(f"  [note] {advisory}")
+    # 「全因子齐全」只在两个轴都进入对比因子、且已覆盖格子数
+    # 等于预期全因子格数时才成立：只跑 balance_coef 一个轴
+    # （或只跑部分组合）时不能打印全因子 OK，否则会把
+    # 「局部覆盖」冒充成「各创新点各自有用」的证据。
+    full_factorial = (
+        "mode" in factors
+        and "balance_coef" in factors
+        and bool(expected_cells)
+        and len(coverage["present_cells"]) == len(expected_cells)
+    )
     if (
-        not coverage["missing_cells"]
-        and coverage["present_cells"]
+        full_factorial
+        and not coverage["missing_cells"]
         and not coverage["low_replicate_cells"]
         and not coverage.get("structural_confounds")
     ):
-        print("  OK：2×2 全因子组合齐全且种子数达标")
+        print(
+            f"  OK：{len(expected_cells) // 2}×2 全因子组合齐全"
+            "且种子数达标"
+        )
 
     return {
         "factors": factors,
@@ -14455,13 +14528,19 @@ def test_record_exists(path: Path) -> bool:
                     continue
                 # test 的坏案例记录先于 test 汇总记录写出；中断在
                 # 两者之间时测试集实际已被评估过，同样视为已解封。
-                if record.get("step") == "test" or (
+                # test_started 标记先于评估写出：评估中途崩溃时
+                # 测试集实际已开始解封，不能因为没写成 test 记录
+                # 就认为名额还在。
+                if record.get("step") in ("test_started", "test") or (
                     record.get("step") == "bad_cases"
                     and record.get("split") == "test"
                 ):
                     return True
-    except OSError:
-        return False
+    except (OSError, UnicodeDecodeError):
+        # 文件存在但读不出内容（权限/IO 错误、非 UTF-8 字节）时
+        # 不能当作「没有 test 记录」放行后续操作：尘封协议宁可
+        # 保守拒绝一次，也不能冒重复解封测试集的风险。
+        return True
 
     return False
 
@@ -21158,15 +21237,21 @@ def main():
     # 测试集尘封协议不只约束单次运行，也约束输出目录：
     # 目录里已有 test 记录时，全新训练会把 metrics.jsonl
     # 截断重写，使测试集在无感知的情况下被重复解封
-    # （旧记录被抹掉，之后可再次 --evaluate-test）。
-    # 直接拒绝复用该目录。
-    if args.resume is None and test_record_exists(
-        out_dir / "metrics.jsonl"
-    ):
+    # （旧记录被抹掉，之后可再次 --evaluate-test）；resume
+    # 则会让新训练/新选型继承旧 test 记录，test 指标对应的
+    # 不再是最终模型。两种情况都必须直接拒绝复用该目录。
+    if test_record_exists(out_dir / "metrics.jsonl"):
+        if args.resume is None:
+            parser.error(
+                "输出目录的 metrics.jsonl 中已有测试集评估记录："
+                "全新训练会截断重写该文件，使测试集被重复解封、"
+                "退化为隐式验证集。请换用全新的 --out 目录。"
+            )
         parser.error(
             "输出目录的 metrics.jsonl 中已有测试集评估记录："
-            "全新训练会截断重写该文件，使测试集被重复解封、"
-            "退化为隐式验证集。请换用全新的 --out 目录。"
+            "测试集已解封结束，resume 继续训练会改写模型/选型，"
+            "使已有 test 记录不再对应最终模型。如需继续实验，"
+            "请换用全新的 --out 目录。"
         )
 
     start_step = 0
@@ -22915,6 +23000,22 @@ def main():
                     "名额未消耗）。请先清洗数据后重跑。"
                 )
             else:
+                # 解封不可回滚：正式评估前先把 test_started 标记
+                # 落盘并 flush。评估中途崩溃时，标记会让同目录的
+                # 后续运行（含 --resume）拒绝再次解封，而不是因为
+                # 缺 test 记录就误以为名额还在。
+                metrics_file.write(
+                    json.dumps(
+                        _json_safe({
+                            "step": "test_started",
+                            "split": "test",
+                        }),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                metrics_file.flush()
+
                 # 测试集只解封一次：坏案例收集与最终测试评估
                 # 共享同一批窗口前向，不再重复跑模型。
                 test_bad_case_collector: Optional[
