@@ -2528,6 +2528,184 @@ def _count_groups(
     return counts
 
 
+def _group_content_digest(
+    raw: memoryview,
+    start: int,
+    end: int,
+) -> bytes:
+    """
+    群组内容的精确指纹（blake2b-128）。
+
+    群组级去重/泄露审计使用完整内容指纹，不受窗口采样步长
+    影响：短群组、跨 split 错位重复和窗口审计抽不到的重复
+    文档都能被精确识别。指纹只用于审计/清洗决策，不进入
+    模型特征。
+    """
+    return hashlib.blake2b(
+        raw[start:end],
+        digest_size=16,
+    ).digest()
+
+
+def _merge_byte_intervals(
+    intervals: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """合并重叠/相邻的 [start, end) 区间，输出按起点升序。"""
+    if not intervals:
+        return []
+
+    ordered = sorted(
+        (start, end)
+        for start, end in intervals
+        if end > start
+    )
+    if not ordered:
+        return []
+
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _valid_window_start_intervals(
+    total_starts: int,
+    seq_len: int,
+    excluded_spans: List[Tuple[int, int]],
+) -> Optional[List[Tuple[int, int]]]:
+    """
+    计算「窗口完全不触碰被清洗字节」的合法起点区间。
+
+    窗口起点 s 覆盖训练字节 [s, s + seq_len]（含下一 token
+    监督位），因此与排除区间 [start, end) 相交当且仅当
+    s ∈ [start - seq_len, end - 1]。返回按起点升序的闭区间
+    列表；没有排除区间时返回 None（调用方走无掩码快路径）。
+    """
+    if not excluded_spans:
+        return None
+
+    blocked: List[Tuple[int, int]] = []
+    for start, end in _merge_byte_intervals(excluded_spans):
+        low = max(0, start - seq_len)
+        high = min(total_starts - 1, end - 1)
+        if low <= high:
+            blocked.append((low, high))
+
+    if not blocked:
+        return None
+
+    valid: List[Tuple[int, int]] = []
+    cursor = 0
+    for low, high in blocked:
+        if cursor < low:
+            valid.append((cursor, low - 1))
+        cursor = max(cursor, high + 1)
+    if cursor < total_starts:
+        valid.append((cursor, total_starts - 1))
+
+    return valid
+
+
+def _plan_train_group_dedup(
+    raw: memoryview,
+    separator: bytes,
+    train_end: int,
+    eval_ranges: Dict[str, Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划训练集群组清洗：只从 train 中剔除群组，绝不改动
+    val/test。
+
+    剔除规则：
+    - 内容与 val 或 test 中任一完整群组完全相同（跨 split
+      重复，属于泄露）；
+    - 与训练集中更早出现的群组完全相同（保留第一次出现）。
+    返回被剔除群的字节区间与可追踪的统计。调用方只会在
+    训练窗口采样时屏蔽这些区间，验证/测试数据保持原样。
+    """
+    eval_digests: Dict[str, set] = {
+        "val": set(),
+        "test": set(),
+    }
+    for split, (begin, end) in eval_ranges.items():
+        if end <= begin:
+            continue
+        for span_start, span_end in _iter_group_spans(
+            raw,
+            separator,
+            begin,
+            end,
+        ):
+            eval_digests[split].add(
+                _group_content_digest(raw, span_start, span_end)
+            )
+
+    seen = set()
+    excluded: List[Tuple[int, int]] = []
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "policy": (
+            "drop train groups duplicated in val/test or earlier "
+            "in train; val/test untouched"
+        ),
+        "groups_total": 0,
+        "groups_kept": 0,
+        "groups_dropped": 0,
+        "dropped_bytes": 0,
+        "dropped_duplicate_of": {
+            "val": 0,
+            "test": 0,
+            "train": 0,
+        },
+        "examples": [],
+    }
+
+    for span_start, span_end in _iter_group_spans(
+        raw,
+        separator,
+        0,
+        train_end,
+    ):
+        stats["groups_total"] += 1
+        digest = _group_content_digest(
+            raw,
+            span_start,
+            span_end,
+        )
+
+        reason: Optional[str] = None
+        if digest in eval_digests["val"]:
+            reason = "val"
+        elif digest in eval_digests["test"]:
+            reason = "test"
+        elif digest in seen:
+            reason = "train"
+
+        if reason is None:
+            seen.add(digest)
+            stats["groups_kept"] += 1
+            continue
+
+        excluded.append((span_start, span_end))
+        stats["groups_dropped"] += 1
+        stats["dropped_bytes"] += span_end - span_start
+        stats["dropped_duplicate_of"][reason] += 1
+        if len(stats["examples"]) < 5:
+            stats["examples"].append(
+                [span_start, span_end, reason]
+            )
+
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
+
+
 def _snap_group_split(
     buf: bytearray,
     separator: bytes,
@@ -2682,6 +2860,7 @@ class ByteDataset:
         test_fraction: float = 0.05,
         device: Optional[torch.device] = None,
         group_separator: Optional[bytes] = None,
+        deduplicate_train_groups: bool = False,
     ):
         data_path = Path(filename)
 
@@ -2735,6 +2914,27 @@ class ByteDataset:
         self.group_separator = group_separator
         self.group_cuts: Optional[Dict[str, int]] = None
         self.groups_per_split: Optional[Dict[str, int]] = None
+
+        if deduplicate_train_groups and group_separator is None:
+            raise ValueError(
+                "deduplicate_train_groups 需要 group_separator："
+                "没有显式的群组边界就无法在不改动 val/test 的"
+                "前提下做内容级去重"
+            )
+
+        # 训练集清洗（可选的群组级去重）：只剔除 train 中与
+        # val/test 或更早训练群组完全重复的群组。被剔除的字节
+        # 不会进入任何训练窗口；val/test 的字节与切分位置保持
+        # 完全不变。
+        self.train_excluded_spans: List[Tuple[int, int]] = []
+        self.train_cleaning: Optional[Dict[str, object]] = None
+        self._train_start_intervals: Optional[
+            List[Tuple[int, int]]
+        ] = None
+        self._train_interval_lows: Optional[torch.Tensor] = None
+        self._train_interval_lengths: Optional[torch.Tensor] = None
+        self._train_interval_cumulative: Optional[torch.Tensor] = None
+        self.train_num_valid_starts: Optional[int] = None
 
         # 仅做时间顺序上的连续切分，不计算统计量、不打乱：
         # [0, n_train) 训练，[n_train, n_train + n_val) 验证，
@@ -2795,6 +2995,19 @@ class ByteDataset:
             "test": (n_val_end, len(tokens)),
         }
 
+        if deduplicate_train_groups:
+            excluded, cleaning_stats = _plan_train_group_dedup(
+                self._raw,
+                group_separator,
+                n_train,
+                {
+                    "val": (n_train, n_val_end),
+                    "test": (n_val_end, len(tokens)),
+                },
+            )
+            self.train_excluded_spans = excluded
+            self.train_cleaning = cleaning_stats
+
         self.train = tokens[:n_train]
         self.val = tokens[n_train:n_val_end]
         self.test = tokens[n_val_end:]
@@ -2820,6 +3033,48 @@ class ByteDataset:
         if test_fraction > 0.0 and len(self.test) < seq_len + 1:
             raise ValueError(
                 "测试集长度不足（检查 test_fraction 或语料大小）"
+            )
+
+        if self.train_excluded_spans:
+            total_starts = len(self.train) - seq_len
+            valid_intervals = _valid_window_start_intervals(
+                total_starts,
+                seq_len,
+                self.train_excluded_spans,
+            )
+            if not valid_intervals:
+                raise ValueError(
+                    "训练集群组去重后没有剩余任何合法训练窗口："
+                    "清洗比例过高（几乎全部训练群组都与 val/test "
+                    "重复或互为重复），请检查语料/群组分隔符，"
+                    "而不是在去重后继续训练"
+                )
+
+            self._train_start_intervals = valid_intervals
+            lengths = [
+                high - low + 1
+                for low, high in valid_intervals
+            ]
+            self._train_interval_lows = torch.tensor(
+                [low for low, _ in valid_intervals],
+                dtype=torch.long,
+            )
+            self._train_interval_lengths = torch.tensor(
+                lengths,
+                dtype=torch.long,
+            )
+            self._train_interval_cumulative = torch.cumsum(
+                self._train_interval_lengths,
+                dim=0,
+            )
+            self.train_num_valid_starts = int(
+                self._train_interval_cumulative[-1]
+            )
+            self.train_cleaning["valid_window_starts"] = (
+                self.train_num_valid_starts
+            )
+            self.train_cleaning["total_window_starts"] = (
+                total_starts
             )
 
         # unfold 产生 [num_windows, seq_len + 1] 的滑动窗口
@@ -2924,6 +3179,52 @@ class ByteDataset:
 
         return chunks
 
+    def _sample_train_starts(
+        self,
+        batch_size: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """
+        采样训练窗口起点；启用训练集群组清洗时只在合法起点
+        区间内均匀采样，窗口不会触碰任何被剔除的群组内容。
+
+        无清洗时走原路径（整个训练 split 均匀采样），保持
+        随机流与历史运行逐位一致。
+        """
+        total_starts = len(self.train) - self.seq_len
+
+        if self._train_start_intervals is None:
+            return torch.randint(
+                low=0,
+                high=total_starts,
+                size=(batch_size,),
+                generator=generator,
+            )
+
+        assert self._train_interval_lows is not None
+        assert self._train_interval_lengths is not None
+        assert self._train_interval_cumulative is not None
+        assert self.train_num_valid_starts is not None
+
+        # 在每个合法区间内按区间长度均匀采样：先按累计长度
+        # 抽全局序号，再映射回区间与区间内偏移。
+        global_index = torch.randint(
+            low=0,
+            high=self.train_num_valid_starts,
+            size=(batch_size,),
+            generator=generator,
+        )
+        interval = torch.searchsorted(
+            self._train_interval_cumulative,
+            global_index,
+            right=True,
+        )
+        offsets = global_index - (
+            self._train_interval_cumulative[interval]
+            - self._train_interval_lengths[interval]
+        )
+        return self._train_interval_lows[interval] + offsets
+
     def batch(
         self,
         split: str,
@@ -2947,14 +3248,19 @@ class ByteDataset:
         else:
             raise ValueError(f"未知 split: {split}")
 
-        max_start = len(data) - self.seq_len
-
-        starts = torch.randint(
-            low=0,
-            high=max_start,
-            size=(batch_size,),
-            generator=generator,
-        )
+        if split == "train":
+            starts = self._sample_train_starts(
+                batch_size,
+                generator,
+            )
+        else:
+            max_start = len(data) - self.seq_len
+            starts = torch.randint(
+                low=0,
+                high=max_start,
+                size=(batch_size,),
+                generator=generator,
+            )
 
         # 窗口先以 uint8 搬运：输入 embedding 只接受 int32/int64，
         # 在目标设备上转 int32；目标 token 保持 uint8（cross_entropy
@@ -3152,6 +3458,7 @@ def _window_signature_scan(
     length: int,
     window_len: int,
     max_windows: int = _AUDIT_MAX_WINDOWS,
+    exclude_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> Dict[str, object]:
     """
     对 [offset, offset + length) 内的滑动窗口做有界签名扫描。
@@ -3160,6 +3467,10 @@ def _window_signature_scan(
     内容（数据泄露的常见来源）与 split 内部重复。窗口数超过
     max_windows 时等间距抽样，返回实际采样规模。该扫描只做
     数据审计，不参与特征计算或模型决策。
+
+    exclude_spans 是绝对字节区间（如训练集清洗剔除的群组）；
+    与这些区间重叠的窗口不参与签名统计，避免把已经不会进入
+    训练的内容继续标记为泄露。
     """
     total = length - window_len + 1
 
@@ -3169,20 +3480,42 @@ def _window_signature_scan(
             "total": 0,
             "stride": 1,
             "within_duplicates": 0,
+            "skipped_excluded": 0,
             "signatures": {},
         }
 
     stride = max(1, math.ceil(total / max_windows))
+    excluded = _merge_byte_intervals(
+        list(exclude_spans or [])
+    )
 
     signatures: Dict[bytes, List[int]] = {}
     within_duplicates = 0
     sampled = 0
+    skipped_excluded = 0
+    excluded_index = 0
 
     for start in range(0, total, stride):
+        absolute_start = offset + start
+
+        while (
+            excluded_index < len(excluded)
+            and excluded[excluded_index][1] <= absolute_start
+        ):
+            excluded_index += 1
+
+        if (
+            excluded_index < len(excluded)
+            and excluded[excluded_index][0]
+            < absolute_start + window_len
+        ):
+            skipped_excluded += 1
+            continue
+
         digest = hashlib.blake2b(
             raw[
-                offset + start:
-                offset + start + window_len
+                absolute_start:
+                absolute_start + window_len
             ],
             digest_size=16,
         ).digest()
@@ -3201,6 +3534,7 @@ def _window_signature_scan(
         "total": total,
         "stride": stride,
         "within_duplicates": within_duplicates,
+        "skipped_excluded": skipped_excluded,
         "signatures": signatures,
     }
 
@@ -3267,6 +3601,97 @@ def _scan_text_integrity(
     return {
         "utf8_replacements": replacements,
         "nul_bytes": nul_bytes,
+    }
+
+
+def _group_content_duplicate_audit(
+    dataset: ByteDataset,
+    split_names: List[str],
+) -> Optional[Dict[str, object]]:
+    """
+    群组级精确内容去重审计。
+
+    窗口签名扫描是有界抽样的，可能漏掉短群组或错位重复；
+    这里对每个群组的完整内容做 blake2b-128 指纹，逐 split
+    核对完全相同的群组。跨 split 的重复群组是泄露级问题
+    （同一文档/用户同时出现在训练与验证/测试两侧），必须
+    进入 violations；split 内部的重复群组只作为重复样本/
+    标签噪声提醒。
+
+    训练集清洗（deduplicate_train_groups）剔除的群组不参与
+    统计，因此清洗后的审计能反映「实际进入训练的内容」。
+    """
+    separator = dataset.group_separator
+    if separator is None:
+        return None
+
+    excluded = set(dataset.train_excluded_spans)
+    indices: Dict[str, Dict[bytes, List[int]]] = {}
+    per_split: Dict[str, Dict[str, int]] = {}
+
+    for split in split_names:
+        begin, end = dataset.split_bounds[split]
+        if end <= begin:
+            continue
+
+        index: Dict[bytes, List[int]] = {}
+        groups = 0
+
+        for span_start, span_end in _iter_group_spans(
+            dataset._raw_buffer,
+            separator,
+            begin,
+            end,
+        ):
+            if split == "train" and (
+                (span_start, span_end) in excluded
+            ):
+                continue
+
+            digest = _group_content_digest(
+                dataset._raw,
+                span_start,
+                span_end,
+            )
+            index.setdefault(digest, []).append(span_start)
+            groups += 1
+
+        indices[split] = index
+        per_split[split] = {
+            "groups": groups,
+            "unique_groups": len(index),
+            "within_split_duplicates": (
+                groups - len(index)
+            ),
+        }
+
+    cross_split: Dict[str, object] = {}
+    for left, right in (
+        ("train", "val"),
+        ("train", "test"),
+        ("val", "test"),
+    ):
+        if left not in indices or right not in indices:
+            continue
+
+        left_index = indices[left]
+        right_index = indices[right]
+        common = left_index.keys() & right_index.keys()
+
+        cross_split[f"{left}_{right}"] = {
+            "shared_groups": len(common),
+            "examples": [
+                [
+                    left_index[digest][0],
+                    right_index[digest][0],
+                ]
+                for digest in list(common)[:3]
+            ],
+        }
+
+    return {
+        "per_split": per_split,
+        "cross_split": cross_split,
     }
 
 
@@ -3376,6 +3801,11 @@ def audit_data_splits(
                 end - begin,
                 dataset.seq_len + 1,
                 max_windows,
+                exclude_spans=(
+                    dataset.train_excluded_spans
+                    if split == "train"
+                    else None
+                ),
             )
             if cache_scans:
                 if scan_cache is None:
@@ -3400,12 +3830,19 @@ def audit_data_splits(
                 "utf8_replacements": 0,
                 "nul_bytes": 0,
             }
+            train_excluded = (
+                set(dataset.train_excluded_spans)
+                if split == "train"
+                else set()
+            )
             for span_start, span_end in _iter_group_spans(
                 dataset._raw_buffer,
                 dataset.group_separator,
                 begin,
                 end,
             ):
+                if (span_start, span_end) in train_excluded:
+                    continue
                 part = _scan_text_integrity(
                     dataset._raw,
                     span_start,
@@ -3550,6 +3987,11 @@ def audit_data_splits(
         # 群组划分协议：分界点都是群组起始字节，因此每个群组
         # 整体落在一个 split 内；这里把群组规模写进审计，供
         # 事后核对（数据集构造时还做了防御性断言）。
+        content_duplicates = _group_content_duplicate_audit(
+            dataset,
+            split_names,
+        )
+
         groups_report = {
             "separator_hex": dataset.group_separator.hex(),
             "separator_length": len(dataset.group_separator),
@@ -3560,7 +4002,33 @@ def audit_data_splits(
                 if dataset.groups_per_split is not None
                 else None
             ),
+            "content_duplicates": content_duplicates,
+            "train_cleaning": dataset.train_cleaning,
         }
+
+        if content_duplicates is not None:
+            for split, info in content_duplicates[
+                "per_split"
+            ].items():
+                if info["within_split_duplicates"] > 0:
+                    warnings.append(
+                        f"{split}: 检测到 "
+                        f"{info['within_split_duplicates']} 个"
+                        "完全重复的群组（重复样本/标签噪声）"
+                    )
+
+            for pair, info in content_duplicates[
+                "cross_split"
+            ].items():
+                if info["shared_groups"] <= 0:
+                    continue
+                message = (
+                    f"{pair}: 检测到 "
+                    f"{info['shared_groups']} 个内容完全"
+                    "相同的群组（跨 split 群组泄露风险）"
+                )
+                warnings.append(message)
+                violations.append(message)
 
     return {
         "max_windows": max_windows,
@@ -3618,6 +4086,28 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 for name, count in per_split.items()
             )
         )
+
+    if isinstance(groups, dict):
+        cleaning = groups.get("train_cleaning")
+        if isinstance(cleaning, dict):
+            print(
+                "[data]   训练集群组去重: "
+                f"drop={cleaning.get('groups_dropped')}"
+                f"/{cleaning.get('groups_total')} 群组, "
+                f"{cleaning.get('dropped_bytes')}B, "
+                "valid_starts="
+                f"{cleaning.get('valid_window_starts')}"
+                f"/{cleaning.get('total_window_starts')}"
+            )
+
+        duplicates = groups.get("content_duplicates") or {}
+        for pair, info in (
+            duplicates.get("cross_split") or {}
+        ).items():
+            print(
+                f"[data]   群组内容重复 {pair} = "
+                f"{info.get('shared_groups')}"
+            )
 
     for key, distance in report.get(
         "distribution_shift",
@@ -5309,6 +5799,13 @@ def run_statistical_baseline(
                 "请设置正的 --test-fraction 且语料足够长"
             )
 
+        if test_evaluation_sealed(out_dir):
+            raise SystemExit(
+                "[test] 输出目录已有测试集评估记录/封条；"
+                "统计基线也遵守唯一一次解封协议，请使用全新的 "
+                "--out 目录"
+            )
+
         test_audit = audit_data_splits(
             dataset,
             include_test=True,
@@ -5328,6 +5825,22 @@ def run_statistical_baseline(
             )
             test_windows = None
         else:
+            # 与神经训练路径同一封存协议：先落 test_started
+            # 记录与持久封条，再访问测试窗口；评估中途崩溃也
+            # 不能重复解封。
+            _write({
+                "step": "test_started",
+                "split": "test",
+                "model": "ngram",
+            })
+            write_test_evaluation_seal(
+                out_dir,
+                {
+                    "dataset_sha256": dataset.data_sha256,
+                    "test_fraction": dataset.test_fraction,
+                    "model": "ngram",
+                },
+            )
             test_windows = _ngram_eval_batches(
                 dataset,
                 "test",
@@ -5390,6 +5903,13 @@ def run_statistical_baseline(
             "val_fraction": dataset.val_fraction,
             "test_fraction": dataset.test_fraction,
             "group_separator": getattr(args, "group_separator", None),
+            "deduplicate_train_groups": bool(
+                getattr(
+                    args,
+                    "deduplicate_train_groups",
+                    False,
+                )
+            ),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
             "data_sha256": dataset.data_sha256,
@@ -9369,6 +9889,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "val_fraction",
     "test_fraction",
     "group_separator",
+    "deduplicate_train_groups",
     "eval_interval",
     "eval_batches",
     "data_sha256",
@@ -9697,6 +10218,9 @@ def build_comparison_protocol(
         # 群组分隔符决定切分位置（同一文件 + 不同分隔符 =
         # 不同的数据划分），必须作为受控变量核对。
         "group_separator": getattr(args, "group_separator", None),
+        "deduplicate_train_groups": bool(
+            getattr(args, "deduplicate_train_groups", False)
+        ),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
@@ -9813,6 +10337,11 @@ def experiment_protocol_from_payload(
         "group_separator": _pick(
             data.get("group_separator"),
             run_args.get("group_separator"),
+        ),
+        "deduplicate_train_groups": bool(
+            run_args.get("deduplicate_train_groups", False)
+            if has_training
+            else False
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
@@ -15014,6 +15543,13 @@ def write_run_config(
                 "group_separator",
                 None,
             ),
+            "deduplicate_train_groups": bool(
+                getattr(
+                    args,
+                    "deduplicate_train_groups",
+                    False,
+                )
+            ),
         },
         "data_audit": data_audit,
         "run_metadata": run_metadata,
@@ -15245,6 +15781,73 @@ def read_metrics_records(path: Path) -> List[Dict[str, object]]:
                 records.append(record)
 
     return records
+
+
+_TEST_SEAL_FILENAME = ".test_evaluated.json"
+
+
+def _test_seal_path(out_dir: Path) -> Path:
+    return Path(out_dir) / _TEST_SEAL_FILENAME
+
+
+def test_evaluation_sealed(out_dir: Path) -> bool:
+    """
+    测试集是否已在输出目录解封过。
+
+    除 metrics.jsonl 的 test/test_started 记录外，还检查独立的
+    持久封条文件：metrics.jsonl 被截断、重写或误删时，仅靠
+    记录检查会让同一目录再次解封测试集，测试集因此退化为
+    隐式验证集。封条与记录任一存在都视为已解封。
+    """
+    out_dir = Path(out_dir)
+
+    if test_record_exists(out_dir / "metrics.jsonl"):
+        return True
+
+    return _test_seal_path(out_dir).exists()
+
+
+def write_test_evaluation_seal(
+    out_dir: Path,
+    record: Optional[Dict[str, object]] = None,
+) -> None:
+    """
+    在正式评估测试集前写持久封条（原子替换）。
+
+    封条只标记「该输出目录已开始解封测试集」，不包含测试
+    指标；即使评估中途崩溃，后续运行也会拒绝重复解封。
+    """
+    out_dir = Path(out_dir)
+    path = _test_seal_path(out_dir)
+    payload = {
+        "sealed": True,
+        "step": "test_started",
+        "split": "test",
+        **(record or {}),
+    }
+
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(out_dir),
+            prefix=".test-seal.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def test_record_exists(path: Path) -> bool:
@@ -16732,6 +17335,25 @@ def run_self_test():
             {"step": "test", "test_loss": 1.0},
         )
         assert test_record_exists(metrics_file)
+
+    # 独立持久封条：metrics.jsonl 被截断/删除后，同一目录仍
+    # 不能再次解封测试集。
+    with tempfile.TemporaryDirectory() as seal_dir:
+        seal_root = Path(seal_dir)
+        assert not test_evaluation_sealed(seal_root)
+        write_test_evaluation_seal(
+            seal_root,
+            {"dataset_sha256": "abc"},
+        )
+        assert test_evaluation_sealed(seal_root)
+        assert _test_seal_path(seal_root).exists()
+
+        write_jsonl_record(
+            seal_root / "metrics.jsonl",
+            {"step": "final", "val_loss": 1.0},
+        )
+        (seal_root / "metrics.jsonl").unlink()
+        assert test_evaluation_sealed(seal_root)
 
     # 验证集选中的模型存档：保存 / 读取 / 恢复必须逐位一致；
     # best.pt 缺失时安全返回 None（调用方回退到最后一步并提示）。
@@ -21841,13 +22463,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--deduplicate-train-groups",
+        action="store_true",
+        help=(
+            "训练集群组级去重（需要 --group-separator）：只从 "
+            "train 中剔除与 val/test 或更早训练群组内容完全"
+            "相同的群组，被剔除的字节不进入任何训练窗口；"
+            "val/test 的字节与切分位置完全不变。用于清洗"
+            "跨 split 重复文档造成的泄露与训练集重复样本"
+        ),
+    )
+    parser.add_argument(
         "--strict-data-audit",
         action="store_true",
         help=(
             "严格数据审计：训练前的 train/val 审计或解封测试集"
             "时的审计只要发现越界 token、跨 split 重复内容、"
-            "超阈值的 UTF-8/NUL 损坏，就拒绝开始训练/拒绝"
-            "解封测试集（默认只警告并照常继续）"
+            "群组级跨 split 重复或超阈值的 UTF-8/NUL 损坏，"
+            "就拒绝开始训练/拒绝解封测试集（默认只警告并"
+            "照常继续）"
         ),
     )
 
@@ -22537,20 +23171,21 @@ def main():
         )
 
     # 测试集尘封协议不只约束单次运行，也约束输出目录：
-    # 目录里已有 test 记录时，全新训练会把 metrics.jsonl
-    # 截断重写，使测试集在无感知的情况下被重复解封
-    # （旧记录被抹掉，之后可再次 --evaluate-test）；resume
+    # 目录里已有 test 记录或持久封条时，全新训练会把
+    # metrics.jsonl 截断重写，使测试集在无感知的情况下被重复
+    # 解封（旧记录被抹掉，之后可再次 --evaluate-test）；resume
     # 则会让新训练/新选型继承旧 test 记录，test 指标对应的
     # 不再是最终模型。两种情况都必须直接拒绝复用该目录。
-    if test_record_exists(out_dir / "metrics.jsonl"):
+    if test_evaluation_sealed(out_dir):
         if args.resume is None:
             parser.error(
-                "输出目录的 metrics.jsonl 中已有测试集评估记录："
-                "全新训练会截断重写该文件，使测试集被重复解封、"
-                "退化为隐式验证集。请换用全新的 --out 目录。"
+                "输出目录已有测试集评估记录/封条："
+                "全新训练会截断重写 metrics.jsonl，使测试集被"
+                "重复解封、退化为隐式验证集。请换用全新的 "
+                "--out 目录。"
             )
         parser.error(
-            "输出目录的 metrics.jsonl 中已有测试集评估记录："
+            "输出目录已有测试集评估记录/封条："
             "测试集已解封结束，resume 继续训练会改写模型/选型，"
             "使已有 test 记录不再对应最终模型。如需继续实验，"
             "请换用全新的 --out 目录。"
@@ -22738,6 +23373,22 @@ def main():
                 "原运行不同"
             )
 
+        # 训练集群组去重同样改变实际参与训练的样本集合，
+        # 是采样轨迹的一部分；按存档恢复，避免续跑悄悄
+        # 换回未清洗/已清洗的另一套训练数据。
+        if "deduplicate_train_groups" in saved_args:
+            saved_dedup = bool(
+                saved_args.get("deduplicate_train_groups")
+            )
+            if saved_dedup != bool(args.deduplicate_train_groups):
+                print(
+                    "resume restored deduplicate_train_groups "
+                    f"{bool(args.deduplicate_train_groups)} -> "
+                    f"{saved_dedup} (训练集清洗是采样轨迹的"
+                    "一部分)"
+                )
+                args.deduplicate_train_groups = saved_dedup
+
         # seed 决定数据采样顺序与初始化噪声，是采样轨迹的
         # 核心变量；resume 时按存档恢复，避免续跑换了随机流。
         saved_seed = saved_args.get("seed")
@@ -22836,6 +23487,13 @@ def main():
                 f"--group-separator 无效: {error}"
             )
 
+    if args.deduplicate_train_groups and group_separator_bytes is None:
+        parser.error(
+            "--deduplicate-train-groups 需要 --group-separator："
+            "没有显式群组边界时无法只清洗 train 而不改动 "
+            "val/test"
+        )
+
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
@@ -22847,6 +23505,9 @@ def main():
             test_fraction=args.test_fraction,
             device=device,
             group_separator=group_separator_bytes,
+            deduplicate_train_groups=(
+                args.deduplicate_train_groups
+            ),
         )
     except (OSError, ValueError) as error:
         parser.error(f"数据管线初始化失败: {error}")
@@ -24404,9 +25065,9 @@ def main():
             "再显式 --evaluate-test。"
         )
     elif args.evaluate_test:
-        if test_record_exists(metrics_path):
+        if test_evaluation_sealed(out_dir):
             print(
-                "[test] metrics.jsonl 中已有测试集评估记录；"
+                "[test] 输出目录已有测试集评估记录/封条；"
                 "测试集在该目录的运行中已解封过一次，拒绝重复评估。"
                 "如需新的最终结论，请使用全新的 --out 目录，"
                 "并在确认模型与超参数冻结后再加 --evaluate-test。"
@@ -24448,6 +25109,16 @@ def main():
                     + "\n"
                 )
                 metrics_file.flush()
+
+                # 独立持久封条：即使 metrics.jsonl 之后被截断/
+                # 重写，同一目录也不能再次解封测试集。
+                write_test_evaluation_seal(
+                    out_dir,
+                    {
+                        "dataset_sha256": dataset.data_sha256,
+                        "test_fraction": dataset.test_fraction,
+                    },
+                )
 
                 # 测试集只解封一次：坏案例收集与最终测试评估
                 # 共享同一批窗口前向，不再重复跑模型。
