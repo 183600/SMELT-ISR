@@ -2517,33 +2517,29 @@ def _count_groups(
     cuts: List[int],
 ) -> List[int]:
     """
-    统计每个 split 内部的完整群组数量（cuts 必须落在群组边界上）。
+    统计每个 split 内部的完整（非空）群组数量（cuts 必须落在
+    群组边界上）。
 
-    群组起点集合 = {0} ∪ {分隔符之后 < N 的边界}；[a, b) 内的
-    群组数 = 该区间内的群组起点数。cuts 本身是群组起点：
-    恰好等于切分点的边界计入右侧 split 的基础 1，不能再重复
-    计入左侧。
+    与 _iter_group_spans 同一口径：空群组（前导/连续分隔符
+    之间）不计入「完整群组」；群组按起始字节归属 split，cuts
+    本身是群组起点，因此恰好等于切分点的群组只计入右侧
+    split。末尾分隔符之后的空群组同样不计入。
     """
-    total = len(buf)
     first, second = cuts[0], cuts[-1]
-    counts = [1, 1, 1]
+    counts = [0, 0, 0]
 
-    for end in _iter_group_boundaries(buf, separator, 0):
-        if end >= total:
-            break
-        if end < first:
+    for span_start, _ in _iter_group_spans(
+        buf,
+        separator,
+        0,
+        len(buf),
+    ):
+        if span_start < first:
             counts[0] += 1
-        elif end == first or end == second:
-            # 切分点本身：作为右侧 split 的起始群组计入基础 1。
-            continue
-        elif end < second:
+        elif span_start < second:
             counts[1] += 1
         else:
             counts[2] += 1
-
-    if second >= total:
-        # test split 为空（test_fraction = 0 时 val 右端即文件末尾）。
-        counts[2] = 0
 
     return counts
 
@@ -10918,9 +10914,14 @@ def _contrast_test(
 
     common_seeds = sorted(set(by_seed_a) & set(by_seed_b))
 
+    # 配对要求两侧样本**全部**带种子且种子集合相同：只比较
+    # 「有种子的样本」会让无种子样本被静默排除出检验，却仍计入
+    # 均值/Δ/样本数，检验结果与展示的效应量脱节。
     paired = (
         not duplicate_seeds
         and len(common_seeds) >= _MIN_SEEDS_FOR_STATS
+        and len(by_seed_a) == len(samples_a)
+        and len(by_seed_b) == len(samples_b)
         and len(common_seeds) == len(by_seed_a)
         and len(common_seeds) == len(by_seed_b)
     )
@@ -11518,6 +11519,16 @@ def compare_cells_to_baseline(
 
     for aggregate in aggregates:
         if aggregate is reference:
+            continue
+        # 同一基线模式的其他单元（如不同的 balance_coef /
+        # top_k）与参考单元的差异不是 mode 因子对比：把它们
+        # 混入本家族既会膨胀 mode 检验家族，又会给出
+        # 「mode: smelt→smelt」这类误导标签。这些差异由
+        # factor_contrasts 的单因子对比负责。
+        if (
+            str(aggregate["keys"].get("mode"))
+            == str(reference["keys"].get("mode"))
+        ):
             continue
         result = _contrast_test(
             reference["samples"].get(metric, []),
