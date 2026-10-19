@@ -1279,8 +1279,7 @@ class SparseMoE(nn.Module):
         # 按段切片分发。同一专家内部的行序不影响结果
         #（专家按行独立计算，散射下标互不重复），因此无需
         # 稳定排序；torch.sort 在相同输入上是确定性的。
-        # 排序值即排序后每行所属专家（seg_id），直接复用，
-        # 省掉一次 [total] 的 index_select。
+        # 排序值即排序后每行所属专家（seg_id）。
         seg_id, perm = torch.sort(assignment_experts)
 
         # 展平后的 assignment 下标 j 对应 token j // top_k；
@@ -1306,14 +1305,9 @@ class SparseMoE(nn.Module):
         n_experts = self.n_experts
 
         # 静态容量只依赖 assignment 总数（不依赖各专家计数）：
-        # 形状跨批次稳定，torch.compile 无需为不同路由结果重复
-        # 编译。基础容量取均值上界 ceil(total / n_experts)；
-        # counts[e] 近似 Binomial(total, 1/n_experts)，标准差
-        # 不超过 sqrt(total / n_experts)，余量取 4 倍标准差
-        # （溢出概率 ~1e-5/专家；余量越小填充行越少，bmm 的
-        # 无效行与保存的激活也越少）。多出的行是精确 0 填充，
-        # 只让 bmm 多算少量行，不改变任何输出；万一仍溢出，
-        # 下面的逐专家回退路径保证语义不变。
+        # 基础容量取均值上界 ceil(total / n_experts)，余量取
+        # 4 倍标准差。多出的行是精确 0 填充，不改变任何输出；
+        # 万一仍溢出，下面的逐专家回退路径保证语义不变。
         cap = -(-total // n_experts)
         cap += 4 * math.isqrt(max(1, cap)) + 1
 
@@ -1322,9 +1316,8 @@ class SparseMoE(nn.Module):
         starts = torch.cumsum(counts, dim=0)
         starts.sub_(counts)
 
-        # CUDA 上下标收窄为 int32（与上面的排序键一致）：索引
-        # 带宽与显存减半。行数达到 int32 上限的极端情况仍用
-        # int64，避免溢出。
+        # CUDA 上下标收窄为 int32（与上面的排序键一致）。
+        # 行数达到 int32 上限的极端情况仍用 int64，避免溢出。
         index_dtype = (
             torch.int32
             if device.type == "cuda" and total < 2 ** 31
@@ -1335,12 +1328,9 @@ class SparseMoE(nn.Module):
 
         # 溢出判定只需要看每专家的 assignment 数：同一专家的段在
         # 排序序列中连续，段内局部行号为 0..counts[e]-1，因此
-        # 「存在溢出」等价于 counts 的最大值超过容量。先在设备上
-        # 取一次最大值（单次同步），Python 侧比较避免额外的比较
-        # 核；判定放在构造掩码之前：常规无溢出路径不产生掩码，
-        # 也不需要 clamp 与回退分支。
-        # 一次取回逐专家计数（供溢出判定与按专家分段散射复用），
-        # 只同步一次。
+        # 「存在溢出」等价于 counts 的最大值超过容量。判定放在
+        # 构造掩码之前：常规无溢出路径不产生掩码，也不需要
+        # clamp 与回退分支。逐专家计数同时供分段散射复用。
         counts_list = counts.tolist()
         has_overflow = max(counts_list) > cap
 
@@ -1396,8 +1386,7 @@ class SparseMoE(nn.Module):
 
         if not has_overflow:
             # 常规路径到此 gathered 的数据不再被任何一方引用
-            #（index_select / index_copy_ 的反向只保存下标），
-            # 显式释放可让峰值激活少一份 [total, dim] 副本；
+            #（index_select / index_copy_ 的反向只保存下标）；
             # 溢出路径下方回退仍需读取 gathered，保持引用。
             del gathered, copy_source
 
@@ -1417,7 +1406,7 @@ class SparseMoE(nn.Module):
                 out.index_select(0, copy_index),
             )
         else:
-            # 常见路径按专家逐段散射，避免 [total, dim] 临时张量。
+            # 常见路径按专家逐段散射。
             final = _ScatterPaddedExpertOutputs.apply(
                 out,
                 perm,
@@ -4216,8 +4205,7 @@ def evaluate(
                         remaining,
                         flat_logits.size(0),
                     )
-                    # 按行分块：逐行 softmax 与整批等价，但
-                    # 峰值 fp32 概率矩阵被限制在单块大小。
+                    # 按行分块：逐行 softmax 与整批等价。
                     for start in range(
                         0,
                         num_new,
@@ -4369,8 +4357,7 @@ def compute_reference_baselines(
     unigram_prediction = int(train_counts.argmax())
 
     # log 概率预先算好（词表仅 256 项），循环内只做查表求和：
-    # 与逐批对整批 token 求 log 的取值逐位一致，但省掉了每个
-    # 批次对全部评估位置重复求 log 的开销。
+    # 与逐批对整批 token 求 log 的取值逐位一致。
     uniform_log_probs = uniform_probs.log()
     unigram_log_probs = unigram_probs.log()
 
@@ -6490,8 +6477,7 @@ class _BadCaseCollector:
     ``evaluate`` 与 ``analyze_bad_cases`` 使用完全相同的固定
     窗口与预测口径；最终评估时把收集器传入 ``evaluate``，即可
     复用同一次前向，避免为坏案例分析再跑一遍验证/测试集。
-    收集器只保留逐 token 标量与 top-N 窗口，内存占用与独立
-    分析路径一致。
+    收集器只保留逐 token 标量与 top-N 窗口。
     """
 
     def __init__(
@@ -12628,7 +12614,7 @@ def baseline_adequacy(
     #    曲线诊断（compare_runs 读入的 curve_analysis.status）
     #    记录 not_converged（仍在下降，没到平台）/ underfitting
     #    （训练损失几乎不降、接近随机基线）/ diverged。
-    #    欠训的基线看起来弱并不说明方法更好——不同训练预算下
+    #    欠训的基线看起来弱并不说明方法更好——不同训练配置下
     #    「战胜基线」没有可比性。
     unconverged_baselines: List[str] = []
     for row in baseline_rows:
@@ -12647,7 +12633,7 @@ def baseline_adequacy(
             + "; ".join(unconverged_baselines)
             + "。欠训的弱基线不说明方法更强：请先增加训练步数"
             "或按 --suite-baseline-tuning 调强基线，并在两臂"
-            "使用同一训练预算后再比较"
+            "使用同一训练配置后再比较"
         )
         report["advisories"].append(message)
         report["untuned"].append(message)
@@ -17648,8 +17634,7 @@ def run_self_test():
     )
     assert efficiency["latency_ms_per_forward"] is not None
     assert float(efficiency["latency_ms_per_forward"]) > 0.0
-    # 训练步耗时（前向+反向）必须实测为正；推理延迟与训练步
-    # 耗时是两套口径，涨点评估时都要看。
+    # 训练步耗时（前向+反向）必须实测为正。
     assert efficiency["training_ms_per_step"] is not None
     assert float(efficiency["training_ms_per_step"]) > 0.0
     assert (
@@ -19945,7 +19930,7 @@ def run_self_test():
         )
 
         # winner 候选仍在下降（curve_status=not_converged）时，
-        # 限制基线的不是学习率而是训练预算：调参报告必须提示
+        # 限制基线的不是学习率而是训练配置：调参报告必须提示
         # 「winner 不能代表调强过的基线」。
         unconverged_tuning_paths = []
         for seed, value in ((42, 4.0), (43, 4.0), (44, 4.0)):
@@ -21096,7 +21081,7 @@ def analyze_baseline_tuning(
 
     # 收敛性：winner 的学习率候选若在曲线诊断里仍是
     # not_converged / underfitting / diverged，说明限制基线的
-    # 不是学习率而是训练预算/数据/实现——在欠训曲线上选出的
+    # 不是学习率而是训练配置/数据/实现——在欠训曲线上选出的
     # lr 不能让基线变成「调强过的基线」。
     winner_lr = float(winner["lr"])
     winner_unconverged_runs = [
@@ -21116,7 +21101,7 @@ def analyze_baseline_tuning(
             f"{format(winner_lr, 'g')} 的部分候选运行没有训练到"
             "收敛/稳定（曲线诊断）: "
             + ", ".join(winner_unconverged_runs)
-            + "。限制基线的可能不是学习率而是训练预算/数据/"
+            + "。限制基线的可能不是学习率而是训练配置/数据/"
             "实现：请增加 --steps（或核查数据与实现）后重新"
             "调参，否则 winner 不能代表「调强过的基线」"
         )

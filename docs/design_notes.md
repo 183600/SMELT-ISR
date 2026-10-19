@@ -367,7 +367,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   n-gram」「种子数」之外，还检查：
   - 基线运行的曲线诊断（`curve_analysis.status`）为
     `not_converged` / `underfitting` / `diverged` 时点名
-    「欠训的弱基线不说明方法更强」，要求在相同训练预算下
+    「欠训的弱基线不说明方法更强」，要求在相同训练配置下
     先调强基线；
   - 挑战模型相对基线的参数量 / 前向 FLOPs 超过
     `_COST_RATIO_MATERIAL`（1.5×）时提示容量混淆，要求报告
@@ -376,7 +376,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   - n-gram 对照运行少于 3 个时提示其点估计没有种子间波动，
     微小优势可能落在 val 网格搜索噪声内。
   `--suite-baseline-tuning` 的 winner 候选若仍 `not_converged`，
-  调参报告本身也会给出「限制基线的是训练预算而非学习率」的
+  调参报告本身也会给出「限制基线的是训练配置而非学习率」的
   issue。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
   损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`
