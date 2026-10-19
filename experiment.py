@@ -6093,51 +6093,82 @@ def monitor_training_curve(
     return analysis, status
 
 
+def selection_improved(
+    value: float,
+    best: Optional[float],
+    higher_is_better: bool,
+    min_delta: float,
+) -> bool:
+    """
+    判断一次验证观测是否刷新了选型指标的最优值。
+
+    与早停共用同一口径：``min_delta`` 是必须超过的改善幅度，
+    方向由指标本身决定（loss/ppl 越低越好，F1/accuracy 越高
+    越好）。非有限值一律不算改善。
+    """
+    if not math.isfinite(value):
+        return False
+    if best is None:
+        return True
+    if higher_is_better:
+        return value > best + min_delta
+    return value < best - min_delta
+
+
 def early_stop_state_from_records(
     records: List[Dict[str, object]],
     min_delta: float,
+    metric: str = "val_loss",
 ) -> Tuple[Optional[float], Optional[int], int]:
     """
-    从已有 metrics.jsonl 记录恢复早停状态（最优验证损失、最优
+    从已有 metrics.jsonl 记录恢复早停状态（最优选型指标、最优
     步数、连续未改善次数），保证 resume 后早停判定与原运行一致。
+
+    ``metric`` 必须与本次运行的 ``--selection-metric`` 一致；
+    方向由 ``metric_higher_is_better`` 决定（分类指标越高越好，
+    loss/ppl 越低越好）。旧记录缺少该指标时跳过，不把「没算」
+    当成「变差」。
     """
-    best_loss: Optional[float] = None
+    best_value: Optional[float] = None
     best_step: Optional[int] = None
     evals_without_improvement = 0
+    higher_is_better = metric_higher_is_better(metric)
 
     for record in records:
         step = record.get("step")
         if not isinstance(step, int):
             continue
-        if "val_loss" not in record:
+        if metric not in record:
             continue
 
-        val_loss = record.get("val_loss")
-        # 非有限验证损失不算「改善」也不触发「未改善」计数，
-        # 与在线训练循环的判定保持一致；否则 NaN 会把 best_loss
+        value = record.get(metric)
+        # 非有限值不算「改善」也不触发「未改善」计数，
+        # 与在线训练循环的判定保持一致；否则 NaN 会把 best
         # 永久污染成 NaN，resume 后的选型与早停全部失准。
         if (
-            val_loss is None
-            or isinstance(val_loss, bool)
-            or not isinstance(val_loss, (int, float))
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
         ):
             continue
 
-        val_loss = float(val_loss)
-        if not math.isfinite(val_loss):
+        value = float(value)
+        if not math.isfinite(value):
             continue
 
-        if (
-            best_loss is None
-            or val_loss < best_loss - min_delta
+        if selection_improved(
+            value,
+            best_value,
+            higher_is_better,
+            min_delta,
         ):
-            best_loss = val_loss
+            best_value = value
             best_step = step
             evals_without_improvement = 0
         else:
             evals_without_improvement += 1
 
-    return best_loss, best_step, evals_without_improvement
+    return best_value, best_step, evals_without_improvement
 
 
 # ============================================================
@@ -8924,6 +8955,25 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             config_payload.get("hypothesis_check_skipped")
         )
 
+        # 预注册的假设参数（--primary-metric / 方向 / 最小效应）：
+        # 对比阶段据此核对「观测结果是否与训练前的预期一致」
+        # 与「分析指标是不是预注册的主指标」，避免事后挑指标、
+        # 事后解释方向。旧运行没有该记录时保持 None。
+        preregistration = config_payload.get(
+            "hypothesis_preregistration"
+        )
+        if not isinstance(preregistration, dict):
+            preregistration = {}
+        row["primary_metric"] = preregistration.get(
+            "primary_metric"
+        )
+        row["hypothesis_direction"] = preregistration.get(
+            "direction"
+        )
+        row["hypothesis_min_effect"] = preregistration.get(
+            "min_effect"
+        )
+
         # 参考基线（uniform / unigram 在 val 上的同口径指标）：
         # 对比分析用它核对「所声明的基线是否真的强于无上下文
         # 预测器」，否则复杂模型战胜的只是稻草人。
@@ -9340,6 +9390,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 最后一步参数，新运行是验证集选中的最优验证点；两者混在
     # 一起对比不是同一口径，必须被检查发现。
     "model_selection",
+    # 选型/早停依据的指标：默认 val_loss，但预注册主指标是
+    # macro F1 等分类指标时必须能按同一指标选 checkpoint，
+    # 否则最终模型不是按假设的判定口径选出来的。
+    "selection_metric",
 )
 
 # 允许声明为实验因子（跨运行允许不同）的键：行级字段 +
@@ -9426,6 +9480,20 @@ _LOWER_IS_BETTER_METRICS = {
     "routing_r2_dead_experts",
     "routing_branch_cosine",
 }
+
+# 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
+# 依据：AUC 只在最终/测试评估时计算，路由诊断要等训练结束后的
+# 一次专门前向，训练过程中拿不到，不能用于选型。
+_SELECTION_METRIC_KEYS = tuple(
+    key
+    for key in COMPARISON_METRIC_KEYS
+    if key not in _ROUTING_ROW_FIELDS
+    and key
+    not in {
+        "val_pr_auc_macro",
+        "val_roc_auc_macro",
+    }
+)
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
 # 用于让「基线→改进」的差值符号可解释。
@@ -9649,6 +9717,9 @@ def build_comparison_protocol(
         # 选型协议：final/test 都在验证集选中的模型上评估
         # （best.pt 不可用时回退到最后一步并明确提示）。
         "model_selection": "best_val_with_last_fallback",
+        "selection_metric": getattr(
+            args, "selection_metric", "val_loss"
+        ),
     }
 
 
@@ -9768,6 +9839,12 @@ def experiment_protocol_from_payload(
             if run_args.get("lr") is not None
             else None
         ),
+        # 旧运行（没有该字段）一律按历史行为在 val_loss 上
+        # 选型；参数里已有记录的按记录回填。
+        "selection_metric": _pick(
+            run_args.get("selection_metric"),
+            "val_loss" if has_training else None,
+        ),
     }
 
     protocol = payload.get("comparison_protocol")
@@ -9829,6 +9906,24 @@ def parse_factor_spec(spec: str) -> List[str]:
             + "（可用: "
             + ", ".join(sorted(candidates))
             + "）"
+        )
+
+    # 选型协议不是实验因子：把「按 val_loss 选 checkpoint」与
+    # 「按 macro F1 选 checkpoint」声明为因子，看起来在比较
+    # 方法，实际比较的是选型规则 + 早停轨迹，最终指标差异
+    # 无法归因于方法本身。
+    locked = [
+        key
+        for key in keys
+        if key in {"model_selection", "selection_metric"}
+    ]
+    if locked:
+        raise ValueError(
+            "选型协议不能声明为实验因子: "
+            + ", ".join(locked)
+            + "（--selection-metric 决定 checkpoint 怎么选，"
+            "跨运行必须一致；需要比较选型规则时请单独做方法学"
+            "实验，而不是把它混进方法对比）"
         )
 
     return keys
@@ -12220,6 +12315,8 @@ def baseline_adequacy(
         "tuned_runs": [],
         "untuned": [],
         "tuning_metric_mismatch": [],
+        "unconverged_baselines": [],
+        "capacity_confounds": [],
         "ok": None,
     }
 
@@ -12527,6 +12624,130 @@ def baseline_adequacy(
             "噪声可能主导改进结论"
         )
 
+    # 5) 基线是否训练到收敛：没训练够的基线与「没调过参」同类，
+    #    曲线诊断（compare_runs 读入的 curve_analysis.status）
+    #    记录 not_converged（仍在下降，没到平台）/ underfitting
+    #    （训练损失几乎不降、接近随机基线）/ diverged。
+    #    欠训的基线看起来弱并不说明方法更好——不同训练预算下
+    #    「战胜基线」没有可比性。
+    unconverged_baselines: List[str] = []
+    for row in baseline_rows:
+        status = row.get("curve_status")
+        if status in (
+            "not_converged",
+            "underfitting",
+            "diverged",
+        ):
+            unconverged_baselines.append(
+                f"{row.get('run')}（curve_status={status}）"
+            )
+    if unconverged_baselines:
+        message = (
+            "以下基线运行没有训练到收敛/稳定（曲线诊断）："
+            + "; ".join(unconverged_baselines)
+            + "。欠训的弱基线不说明方法更强：请先增加训练步数"
+            "或按 --suite-baseline-tuning 调强基线，并在两臂"
+            "使用同一训练预算后再比较"
+        )
+        report["advisories"].append(message)
+        report["untuned"].append(message)
+        report["unconverged_baselines"] = unconverged_baselines
+    else:
+        report["unconverged_baselines"] = []
+
+    # 6) 容量/计算量对齐：挑战模型（对比集合里主指标最优的
+    #    非基线神经运行）参数量/FLOPs 远大于基线时，涨点可能
+    #    来自容量而不是机制；必须提示等参数/等计算对照。
+    challengers = [
+        row
+        for row in rows
+        if str(row.get("mode")) != baseline_mode
+        and str(row.get("mode")) != "ngram"
+        and isinstance(row.get(metric), (int, float))
+        and not isinstance(row.get(metric), bool)
+        and math.isfinite(float(row[metric]))
+    ]
+    capacity_findings: List[str] = []
+    if challengers:
+        def _finite_cost(value: object) -> Optional[float]:
+            if isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            ):
+                value = float(value)
+                if math.isfinite(value):
+                    return value
+            return None
+
+        best_challenger = (
+            max(
+                challengers,
+                key=lambda row: float(row[metric]),
+            )
+            if higher_is_better
+            else min(
+                challengers,
+                key=lambda row: float(row[metric]),
+            )
+        )
+        for field, label in (
+            ("n_params", "参数量"),
+            ("flops_per_forward", "前向 FLOPs"),
+        ):
+            baseline_cost = _mean([
+                float(row[field])
+                for row in baseline_rows
+                if isinstance(row.get(field), (int, float))
+                and not isinstance(row.get(field), bool)
+                and math.isfinite(float(row[field]))
+                and float(row[field]) > 0.0
+            ])
+            challenger_cost = _finite_cost(
+                best_challenger.get(field)
+            )
+            if (
+                baseline_cost is None
+                or challenger_cost is None
+                or challenger_cost <= 0.0
+            ):
+                continue
+            ratio = challenger_cost / baseline_cost
+            if ratio >= _COST_RATIO_MATERIAL:
+                capacity_findings.append(
+                    f"{label}是基线的 {ratio:.2f} 倍"
+                    f"（挑战模型 {challenger_cost:.3g} vs 基线 "
+                    f"{baseline_cost:.3g}，"
+                    f"{best_challenger.get('run')}）"
+                )
+    if capacity_findings:
+        message = (
+            "挑战模型与所选基线的容量/计算量不对齐（"
+            + "; ".join(capacity_findings)
+            + "）：涨点可能来自模型容量而不是待验证机制；"
+            "请报告等参数对照（dense 用 --dense-fnn-hidden "
+            "n_experts×expert_hidden）或等计算对照（如 smelt / "
+            "local_base），并在结论中区分容量与机制"
+        )
+        report["advisories"].append(message)
+        report["capacity_confounds"] = capacity_findings
+    else:
+        report["capacity_confounds"] = []
+
+    # 7) n-gram 统计基线对照的稳定性：单次运行的 n-gram 点估计
+    #    没有种子间波动可估，拿它当「调优好的强基线」时结论可能
+    #    被一次 val 网格搜索的随机性左右；种子数不足时提示。
+    ngram_independent_seeds = _independent_seed_count(
+        len(ngram_rows),
+        [row.get("seed") for row in ngram_rows],
+    )
+    if ngram_rows and ngram_independent_seeds < _RECOMMENDED_SEEDS:
+        report["advisories"].append(
+            f"n-gram 对照只有 {ngram_independent_seeds} 个运行"
+            f"（建议 ≥{_RECOMMENDED_SEEDS}）：统计基线的点估计"
+            "没有种子间波动可估，调参 winner 的微小优势可能"
+            "落在其 val 选取噪声内；建议多种子重跑 n-gram "
+            "并报告 Mean ± Std"
+        )
+
     if report["straw_man"]:
         report["ok"] = False
     elif (
@@ -12604,6 +12825,17 @@ _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
 # 当前运行的数据判定。
 _HYPOTHESIS_ROUTING_METRICS = frozenset(_ROUTING_ROW_FIELDS)
 
+# 多分类下 F1 / precision / recall 必须注明平均口径（macro、
+# micro、weighted 三者结果可能差异很大）。假设只写「F1 提升」
+# 无法与评估口径对齐：同一个实验在三种口径下可能一个显著、
+# 一个不显著。命中下列指标名但通篇没有任何口径限定词时，
+# 假设被单独点名。
+_HYPOTHESIS_AVERAGING_METRICS = ("f1", "precision", "recall")
+_HYPOTHESIS_AVERAGING_QUALIFIER = re.compile(
+    r"macro|micro|weighted|宏|微|加权",
+    re.IGNORECASE,
+)
+
 
 def hypothesis_metric_mentions(text: str) -> List[str]:
     """
@@ -12658,8 +12890,125 @@ def hypothesis_metric_unverifiable(
     return unverifiable
 
 
+def hypothesis_ambiguous_averaging_metrics(
+    text: str,
+    mentions: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    返回假设中「未注明平均口径」的多分类指标名。
+
+    单标签多分类下 F1 / precision / recall 的 macro、micro、
+    weighted 三种平均口径可能给出显著不同的结论，假设只写
+    「F1 提升」无法与评估口径对齐；文本里出现口径限定词
+    （macro / micro / weighted / 宏平均 / 微平均 / 加权）才
+    算写明。未命中任何歧义指标时返回空列表。
+    """
+    if mentions is None:
+        mentions = hypothesis_metric_mentions(text)
+    if not any(
+        name in _HYPOTHESIS_AVERAGING_METRICS
+        for name in mentions
+    ):
+        return []
+    if _HYPOTHESIS_AVERAGING_QUALIFIER.search(text):
+        return []
+    return [
+        name
+        for name in _HYPOTHESIS_AVERAGING_METRICS
+        if name in mentions
+    ]
+
+
+def hypothesis_preregistration_error(
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """
+    假设预注册检查：在训练开始前把「预期方向、最小有意义
+    效应、主判定指标」写死，避免看完结果再挑指标、解释
+    方向。
+
+    规则：
+    - ``--hypothesis-direction`` / ``--hypothesis-min-effect``
+      必须与 ``--primary-metric`` 一起使用；
+    - ``--hypothesis-min-effect`` 必须与方向一起使用，且为
+      有限正数（相对对照臂均值的比例）；
+    - ``--primary-metric`` 必须是评估管线真正计算的对比指标
+      （COMPARISON_METRIC_KEYS），且在 ``--hypothesis`` 文本
+      里被点名（假设与判定口径必须对齐）；
+    - 统计基线 / 只读对比 / 结构自检不使用这套预注册。
+
+    返回错误消息（应交给 parser.error 报告）或 None。
+    """
+    direction = getattr(args, "hypothesis_direction", None)
+    min_effect = getattr(args, "hypothesis_min_effect", None)
+    primary_metric = getattr(args, "primary_metric", None)
+
+    if primary_metric is None and direction is None and min_effect is None:
+        return None
+
+    if (
+        args.compare is not None
+        or args.statistical_baseline
+        or args.sanity_only
+    ):
+        return (
+            "--primary-metric / --hypothesis-direction / "
+            "--hypothesis-min-effect 只适用于训练入口："
+            "--compare 只读分析、--statistical-baseline 与 "
+            "--sanity-only 不训练神经模型"
+        )
+
+    if primary_metric is None:
+        return (
+            "--hypothesis-direction / --hypothesis-min-effect "
+            "必须与 --primary-metric 一起使用：方向与最小效应"
+            "需要一个明确的判定指标才有意义"
+        )
+
+    if primary_metric not in COMPARISON_METRIC_KEYS:
+        return (
+            f"--primary-metric={primary_metric} 不是评估管线"
+            "计算的对比指标；可选："
+            + ", ".join(COMPARISON_METRIC_KEYS)
+        )
+
+    if min_effect is not None and direction is None:
+        return (
+            "--hypothesis-min-effect 必须与 "
+            "--hypothesis-direction 一起使用：只声明最小效应"
+            "而不声明方向无法判定「是否达到」"
+        )
+
+    if min_effect is not None and (
+        not math.isfinite(float(min_effect))
+        or float(min_effect) <= 0.0
+    ):
+        return (
+            "--hypothesis-min-effect 必须是有限正数"
+            "（相对对照臂均值的比例，如 0.02 = 2%）"
+        )
+
+    hypothesis_text = args.hypothesis or ""
+    mentions = hypothesis_metric_mentions(hypothesis_text)
+    aligned = any(
+        primary_metric in _HYPOTHESIS_METRIC_SUPPORT.get(name, ())
+        for name in mentions
+    )
+    if not aligned:
+        return (
+            f"--primary-metric={primary_metric} 没有在 "
+            "--hypothesis 文本中被点名：假设必须写明用哪个"
+            "指标判定成败（如「验证损失至少改善 2%」或"
+            "「macro F1 提升」），否则预注册的主指标与假设"
+            "无法对齐"
+        )
+
+    return None
+
+
 def hypothesis_registry(
     rows: List[Dict[str, object]],
+    metric: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     每个实验单元登记的科学假设汇总。
@@ -12674,6 +13023,14 @@ def hypothesis_registry(
     评估口径对齐（「效果更好」不可检验），运行被单独点名；
     写明了但当前评估管线不可判定的指标（如路由类指标而运行
     没有 routing_analysis 记录）同样单独点名，避免假性对齐。
+    F1 / precision / recall 未注明 macro/micro/weighted 时
+    同样点名（三种平均口径可能给出不同结论）。
+
+    ``metric`` 为当前对比使用的判定指标（--compare-metric）：
+    运行预注册了 ``--primary-metric`` 但与当前指标不一致时，
+    「战胜基线」的结论可能来自事后换指标，单独列出
+    （metric shopping 守卫）。旧运行没有预注册记录，无法
+    核对，只提示不判罚。
     """
     cells: Dict[str, Dict[str, object]] = {}
     order: List[str] = []
@@ -12682,6 +13039,12 @@ def hypothesis_registry(
     hypotheses_without_metric: List[str] = []
     hypotheses_with_unverifiable_metric: List[str] = []
     unverifiable_details: List[str] = []
+    ambiguous_averaging_runs: List[str] = []
+    ambiguous_averaging_details: List[str] = []
+    preregistered_runs: List[str] = []
+    preregistration_missing_runs: List[str] = []
+    metric_mismatch_runs: List[str] = []
+    metric_mismatch_details: List[str] = []
 
     for row in rows:
         mode = str(row.get("mode"))
@@ -12694,6 +13057,10 @@ def hypothesis_registry(
                 "hypotheses_metric_mentions": [],
                 "hypotheses_without_metric_runs": [],
                 "hypotheses_with_unverifiable_metric_runs": [],
+                "hypotheses_with_ambiguous_averaging_runs": [],
+                "preregistered_primary_metrics": [],
+                "preregistration_missing_runs": [],
+                "metric_mismatch_runs": [],
                 "research_questions": [],
                 "missing_hypothesis_runs": [],
                 "hypothesis_check_skipped_runs": [],
@@ -12723,6 +13090,52 @@ def hypothesis_registry(
                     "hypothesis": hypothesis_text,
                     "metric_mentions": mentions,
                 })
+
+            # 多分类平均口径歧义：F1 / precision / recall 不注明
+            # macro / micro / weighted 时三种口径可能给出不同
+            # 结论，假设无法与评估口径对齐。
+            ambiguous = hypothesis_ambiguous_averaging_metrics(
+                hypothesis_text,
+                mentions,
+            )
+            if ambiguous:
+                entry[
+                    "hypotheses_with_ambiguous_averaging_runs"
+                ].append(run_name)
+                ambiguous_averaging_runs.append(run_name)
+                ambiguous_averaging_details.append(
+                    f"{run_name}（"
+                    + ", ".join(ambiguous)
+                    + "）"
+                )
+
+            # 预注册的主指标：训练前声明、训练后不可改；
+            # 与当前分析指标不一致时可能是事后换指标。
+            preregistered = row.get("primary_metric")
+            if isinstance(preregistered, str) and preregistered:
+                preregistered_runs.append(run_name)
+                if (
+                    preregistered
+                    not in entry["preregistered_primary_metrics"]
+                ):
+                    entry[
+                        "preregistered_primary_metrics"
+                    ].append(preregistered)
+                if metric is not None and preregistered != metric:
+                    entry["metric_mismatch_runs"].append(
+                        run_name
+                    )
+                    metric_mismatch_runs.append(run_name)
+                    metric_mismatch_details.append(
+                        f"{run_name}（预注册 {preregistered}，"
+                        f"当前判定 {metric}）"
+                    )
+            elif mode != "ngram":
+                entry["preregistration_missing_runs"].append(
+                    run_name
+                )
+                preregistration_missing_runs.append(run_name)
+
             if not mentions:
                 entry["hypotheses_without_metric_runs"].append(
                     run_name
@@ -12790,6 +13203,31 @@ def hypothesis_registry(
             + "。请改用当前评估管线真正计算的指标，或先补上"
             "对应的诊断"
         )
+    if ambiguous_averaging_runs:
+        advisories.append(
+            "以下运行的假设提到 F1 / precision / recall "
+            "但未注明平均口径（macro / micro / weighted "
+            "三者结果可能差异很大，同一个实验可能一种口径"
+            "显著、另一种不显著）："
+            + "; ".join(ambiguous_averaging_details)
+            + "。请在假设里写明判定口径，并与 --primary-metric "
+            "/ --compare-metric 保持一致"
+        )
+    if metric_mismatch_runs:
+        advisories.append(
+            f"以下运行预注册的主指标与当前判定指标 {metric} "
+            "不一致（预注册主指标应在看到结果之前声明；"
+            "事后改判指标属于指标选择偏差，结论只能作为"
+            "探索性结果）："
+            + "; ".join(metric_mismatch_details)
+        )
+    if preregistration_missing_runs:
+        advisories.append(
+            "以下运行没有预注册主指标（--primary-metric，"
+            "旧运行或未声明）：无法排除事后从多个指标里挑"
+            "显著的那个（指标选择多重比较）；建议新实验在"
+            "训练前用 --primary-metric 声明判定指标"
+        )
     if skipped_runs:
         advisories.append(
             "以下运行显式跳过了假设检查"
@@ -12799,13 +13237,250 @@ def hypothesis_registry(
 
     return {
         "cells": [cells[mode] for mode in order],
+        "metric": metric,
         "missing_hypothesis_runs": missing_runs,
         "hypotheses_without_metric_runs": hypotheses_without_metric,
         "hypotheses_with_unverifiable_metric_runs": (
             hypotheses_with_unverifiable_metric
         ),
         "unverifiable_metric_details": unverifiable_details,
+        "hypotheses_with_ambiguous_averaging_runs": (
+            ambiguous_averaging_runs
+        ),
+        "ambiguous_averaging_details": (
+            ambiguous_averaging_details
+        ),
+        "preregistered_runs": preregistered_runs,
+        "preregistration_missing_runs": (
+            preregistration_missing_runs
+        ),
+        "metric_mismatch_runs": metric_mismatch_runs,
+        "metric_mismatch_details": metric_mismatch_details,
         "hypothesis_check_skipped_runs": skipped_runs,
+        "advisories": advisories,
+    }
+
+
+def hypothesis_alignment(
+    rows: List[Dict[str, object]],
+    aggregates: List[Dict[str, object]],
+    contrasts: List[Dict[str, object]],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    把观测到的对比结果与预注册假设（方向 + 最小效应）核对。
+
+    只有训练前用 --primary-metric / --hypothesis-direction /
+    --hypothesis-min-effect 声明过的运行才参与核对；未预注册
+    的运行只登记「无法核对」。核对对象是**变体实验单元**相对
+    对照单元的差值（delta = 变体均值 - 对照均值）：
+
+    - ``refuted``：观测方向与预注册方向显著相反（Holm 校正
+      后显著）——假设被数据推翻，不能靠事后改写解释；
+    - ``direction_mismatch_not_significant``：方向相反但不
+      显著，结论只能是「不确定」（样本不足）；
+    - ``below_declared_min_effect``：方向一致但幅度小于预注册
+      的最小有意义效应，不能主张支持假设（哪怕统计显著）；
+    - ``supported``：方向一致、达到最小效应（若有声明）且
+      校正后显著；
+    - ``not_significant``／``no_effect_observed``：方向一致
+      但不显著（或差值为 0），证据不足；
+    - ``conflicting_preregistration``：同一实验单元的运行给出
+      了互相矛盾的方向，核对无法进行。
+    """
+    declarations: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        direction = row.get("hypothesis_direction")
+        if direction not in ("decrease", "increase"):
+            continue
+        declarations[str(row.get("run"))] = {
+            "run": str(row.get("run")),
+            "primary_metric": row.get("primary_metric"),
+            "direction": direction,
+            "min_effect": row.get("hypothesis_min_effect"),
+        }
+
+    cell_by_label = {
+        str(aggregate.get("label")): aggregate
+        for aggregate in aggregates
+    }
+
+    checks: List[Dict[str, object]] = []
+    advisories: List[str] = []
+    refuted: List[str] = []
+    supported: List[str] = []
+    below_min_effect: List[str] = []
+
+    for contrast in contrasts:
+        if contrast.get("confounded") or contrast.get(
+            "delta"
+        ) is None:
+            continue
+        cell = cell_by_label.get(str(contrast.get("variant")))
+        if not isinstance(cell, dict):
+            continue
+
+        cell_declarations = [
+            declarations[run]
+            for run in (cell.get("runs") or [])
+            if run in declarations
+        ]
+        metric_declarations = [
+            declaration
+            for declaration in cell_declarations
+            if declaration.get("primary_metric") == metric
+        ]
+        if not metric_declarations:
+            continue
+
+        declared_min_effects = [
+            float(declaration["min_effect"])
+            for declaration in metric_declarations
+            if isinstance(
+                declaration.get("min_effect"), (int, float)
+            )
+            and not isinstance(
+                declaration.get("min_effect"), bool
+            )
+        ]
+        directions = {
+            str(declaration["direction"])
+            for declaration in metric_declarations
+        }
+        entry: Dict[str, object] = {
+            "baseline": contrast.get("baseline"),
+            "variant": contrast.get("variant"),
+            "factor": contrast.get("factor"),
+            "metric": metric,
+            "delta": contrast.get("delta"),
+            "significant": bool(contrast.get("significant")),
+            "p_value_holm": contrast.get("p_value_holm"),
+            "expected_direction": None,
+            "min_effect": (
+                min(declared_min_effects)
+                if declared_min_effects
+                else None
+            ),
+            "declared_by": [
+                declaration["run"]
+                for declaration in metric_declarations
+            ],
+            "status": None,
+        }
+
+        if len(directions) > 1:
+            entry["expected_direction"] = sorted(directions)
+            entry["status"] = "conflicting_preregistration"
+            checks.append(entry)
+            advisories.append(
+                f"{contrast.get('variant')} 的预注册方向互相"
+                "矛盾（" + ", ".join(sorted(directions))
+                + "）：同一实验单元的方案应有统一的预期方向，"
+                "核对无法进行"
+            )
+            continue
+
+        direction = next(iter(directions))
+        entry["expected_direction"] = direction
+        delta = float(contrast["delta"])
+        expected_sign = -1.0 if direction == "decrease" else 1.0
+        baseline_mean = contrast.get("mean_baseline")
+        min_effect = entry["min_effect"]
+        threshold_abs = None
+        if (
+            isinstance(min_effect, float)
+            and isinstance(baseline_mean, (int, float))
+            and not isinstance(baseline_mean, bool)
+        ):
+            threshold_abs = min_effect * abs(float(baseline_mean))
+        entry["min_effect_abs"] = threshold_abs
+
+        conflict = direction == "decrease" and delta > 0.0 or (
+            direction == "increase" and delta < 0.0
+        )
+        if delta == 0.0:
+            status = "no_effect_observed"
+        elif conflict:
+            status = (
+                "refuted"
+                if entry["significant"]
+                else "direction_mismatch_not_significant"
+            )
+        elif (
+            threshold_abs is not None
+            and abs(delta) < threshold_abs
+        ):
+            status = "below_declared_min_effect"
+        elif entry["significant"]:
+            status = "supported"
+        else:
+            status = "not_significant"
+        entry["status"] = status
+        checks.append(entry)
+
+        label = (
+            f"{contrast.get('baseline')}→"
+            f"{contrast.get('variant')}"
+        )
+        if status == "refuted":
+            refuted.append(
+                f"{label}（Δ={delta:+.4f}，预期 "
+                f"{direction}，Holm p="
+                f"{entry['p_value_holm']}）"
+            )
+        elif status == "supported":
+            supported.append(
+                f"{label}（Δ={delta:+.4f}，预期 "
+                f"{direction}"
+                + (
+                    f"，最小效应 {min_effect:.2%}"
+                    if isinstance(min_effect, float)
+                    else ""
+                )
+                + "）"
+            )
+        elif status == "below_declared_min_effect":
+            below_min_effect.append(
+                f"{label}（Δ={delta:+.4f}，低于预注册最小效应 "
+                f"{min_effect:.2%}×对照均值="
+                f"{threshold_abs:.4f}）"
+            )
+
+    if refuted:
+        advisories.append(
+            "以下对比的观测效应与预注册方向显著相反（假设"
+            "被数据推翻，不能靠事后改写解释；如要提出新"
+            "解释，应作为新的预注册假设重新实验）："
+            + "; ".join(refuted)
+        )
+    if below_min_effect:
+        advisories.append(
+            "以下对比方向一致但幅度未达预注册的最小有意义"
+            "效应：即使统计显著也不能主张支持假设（事先声明"
+            "的最小效应正是用来区分「显著」与「有意义」）："
+            + "; ".join(below_min_effect)
+        )
+    if not checks:
+        advisories.append(
+            "没有可核对的预注册对比：运行未声明 "
+            "--primary-metric/--hypothesis-direction，或声明"
+            "的主指标与当前判定指标不一致；方向与最小效应"
+            "核对需要训练前预注册"
+        )
+
+    status_counts: Dict[str, int] = {}
+    for check in checks:
+        status = str(check.get("status"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    return {
+        "metric": metric,
+        "n_checks": len(checks),
+        "checks": checks,
+        "status_counts": status_counts,
+        "refuted": refuted,
+        "supported": supported,
+        "below_min_effect": below_min_effect,
         "advisories": advisories,
     }
 
@@ -13044,7 +13719,13 @@ def print_comparison_analysis(
         for aggregate in aggregates
         if aggregate.get("duplicate_seeds")
     ]
-    hypotheses = hypothesis_registry(rows)
+    hypotheses = hypothesis_registry(rows, metric)
+    alignment = hypothesis_alignment(
+        rows,
+        aggregates,
+        contrasts,
+        metric,
+    )
     adequacy = baseline_adequacy(rows, baseline_mode, metric)
     imbalance = imbalance_metric_advisory(rows, metric)
 
@@ -13118,6 +13799,42 @@ def print_comparison_analysis(
                 "未登记假设"
             )
     for message in hypotheses["advisories"]:
+        print(f"  [warn] {message}")
+
+    print()
+    print(
+        "[hypothesis-alignment] 预注册方向/最小效应核对"
+        "（--primary-metric / --hypothesis-direction / "
+        "--hypothesis-min-effect；观测 Δ = 变体 - 对照）"
+    )
+    if not alignment["checks"]:
+        print("  无预注册对比可核对")
+    else:
+        for check in alignment["checks"]:
+            delta = check.get("delta")
+            delta_text = (
+                f"Δ={float(delta):+.4f}"
+                if isinstance(delta, (int, float))
+                else "Δ=NA"
+            )
+            direction = check.get("expected_direction")
+            direction_text = (
+                "/".join(direction)
+                if isinstance(direction, list)
+                else str(direction)
+            )
+            p_holm = check.get("p_value_holm")
+            p_text = (
+                f"Holm p={float(p_holm):.4f}"
+                if isinstance(p_holm, (int, float))
+                else "Holm p=NA"
+            )
+            print(
+                f"  [{check['status']}] {check['baseline']}→"
+                f"{check['variant']}  {delta_text}  "
+                f"预期 {direction_text}  {p_text}"
+            )
+    for message in alignment["advisories"]:
         print(f"  [warn] {message}")
 
     print()
@@ -13655,6 +14372,7 @@ def print_comparison_analysis(
         "metric": metric,
         "controlled": controlled,
         "hypothesis_registry": hypotheses,
+        "hypothesis_alignment": alignment,
         "aggregates": aggregates,
         "duplicate_seed_cells": duplicate_seed_cells,
         "contrasts": contrasts,
@@ -14274,6 +14992,21 @@ def write_run_config(
         "hypothesis_check_skipped": bool(
             args.skip_hypothesis_check
         ),
+        # 训练前预注册的判定口径：主指标、预期方向、最小有意义
+        # 效应。对比阶段据此核对「观测方向/幅度是否与训练前的
+        # 预期一致」以及「分析指标是否是预注册的主指标」，
+        # 避免事后挑指标、事后解释方向。
+        "hypothesis_preregistration": {
+            "primary_metric": getattr(
+                args, "primary_metric", None
+            ),
+            "direction": getattr(
+                args, "hypothesis_direction", None
+            ),
+            "min_effect": getattr(
+                args, "hypothesis_min_effect", None
+            ),
+        },
         "reference_baselines": reference_baselines,
         "baseline_tuning": baseline_tuning,
         "data": {
@@ -14347,6 +15080,28 @@ def write_run_config(
                 and not payload["hypothesis_check_skipped"]
             ):
                 payload["hypothesis_check_skipped"] = True
+            # 预注册同样属于原运行的一部分：resume 未重新声明
+            # 时不能把训练前的预注册记录抹掉。
+            previous_prereg = previous.get(
+                "hypothesis_preregistration"
+            )
+            if isinstance(previous_prereg, dict):
+                current_prereg = payload.get(
+                    "hypothesis_preregistration"
+                ) or {}
+                for key in (
+                    "primary_metric",
+                    "direction",
+                    "min_effect",
+                ):
+                    if (
+                        current_prereg.get(key) is None
+                        and previous_prereg.get(key) is not None
+                    ):
+                        current_prereg[key] = previous_prereg[key]
+                payload["hypothesis_preregistration"] = (
+                    current_prereg
+                )
 
     # 假设的判定指标以最终生效的假设文本为准（resume 可能从
     # 原运行恢复了假设），不能沿用命令行空文本的解析结果。
@@ -14693,22 +15448,39 @@ def save_selected_model(
     step: int,
     val_loss: float,
     args: argparse.Namespace,
+    selection_metric: Optional[str] = None,
+    selection_value: Optional[float] = None,
 ) -> None:
     """
     保存「验证集选定」的模型权重（不含优化器状态）。
 
-    每次周期验证刷新最优验证损失时覆盖写入。最终评估与唯一
-    一次测试集评估都在该模型上进行，保证测试集看到的是经
-    验证集选择的模型，而不是训练结束时恰好排在上一步的参数。
-    与 save_checkpoint 一样先写临时文件再原子替换。
+    每次周期验证刷新最优选型指标时覆盖写入；选型指标默认是
+    val_loss，可用 ``--selection-metric`` 改为与预注册主指标
+    一致的分类指标。最终评估与唯一一次测试集评估都在该模型上
+    进行，保证测试集看到的是经验证集选择的模型，而不是训练
+    结束时恰好排在上一步的参数。与 save_checkpoint 一样先写
+    临时文件再原子替换。
     """
     raw_model = getattr(model, "_orig_mod", model)
+
+    if selection_metric is None:
+        selection_metric = getattr(
+            args, "selection_metric", "val_loss"
+        )
+    if selection_value is None:
+        selection_value = val_loss
 
     payload = {
         "config": asdict(raw_model.cfg),
         "model": _snapshot_to_cpu(raw_model.state_dict()),
         "step": step,
-        "val_loss": float(val_loss),
+        "val_loss": (
+            float(val_loss)
+            if val_loss is not None
+            else None
+        ),
+        "selection_metric": str(selection_metric),
+        "selection_value": float(selection_value),
         "args": vars(args),
     }
 
@@ -15992,13 +16764,19 @@ def run_self_test():
             for key, value in selection_model.state_dict().items()
         }
 
-        selected_args = argparse.Namespace(seed=1, mode="B")
+        selected_args = argparse.Namespace(
+            seed=1,
+            mode="B",
+            selection_metric="val_macro_f1",
+        )
         save_selected_model(
             str(selected_path),
             selection_model,
             7,
             1.25,
             selected_args,
+            selection_metric="val_macro_f1",
+            selection_value=0.5,
         )
 
         assert selected_path.exists()
@@ -16018,6 +16796,13 @@ def run_self_test():
         assert int(selected_payload["step"]) == 7
         assert abs(
             float(selected_payload["val_loss"]) - 1.25
+        ) < 1e-12
+        assert (
+            selected_payload["selection_metric"]
+            == "val_macro_f1"
+        )
+        assert abs(
+            float(selected_payload["selection_value"]) - 0.5
         ) < 1e-12
 
         restore_selected_weights(
@@ -16613,6 +17398,39 @@ def run_self_test():
     assert early_best_step == 20
     assert early_no_improve == 0
 
+    # 选型改善的通用口径：loss 越低越好，F1 越高越好；
+    # min_delta 是必须超过的改善幅度，相等不算改善。
+    assert selection_improved(4.0, 5.0, False, 0.0)
+    assert not selection_improved(5.0, 5.0, False, 0.0)
+    assert not selection_improved(4.9, 5.0, False, 0.2)
+    assert selection_improved(0.5, 0.4, True, 0.0)
+    assert not selection_improved(0.4, 0.4, True, 0.0)
+    assert not selection_improved(float("nan"), 0.4, True, 0.0)
+    assert selection_improved(0.62, 0.60, True, 0.01)
+    assert not selection_improved(0.61, 0.60, True, 0.01)
+
+    # 按分类指标恢复选型/早停状态：越高越好，且只读取该
+    # 指标（缺少该键的记录不能当成变差）。
+    (
+        early_best,
+        early_best_step,
+        early_no_improve,
+    ) = early_stop_state_from_records(
+        [
+            {"step": 10, "val_macro_f1": 0.40},
+            {"step": 20, "val_macro_f1": 0.55},
+            {"step": 30, "val_macro_f1": 0.54},
+            {"step": 40},  # 没有该指标：跳过，不计未改善
+            {"step": 50, "val_macro_f1": 0.56},
+            {"step": 60, "val_macro_f1": 0.555},
+        ],
+        min_delta=0.0,
+        metric="val_macro_f1",
+    )
+    assert abs(early_best - 0.56) < 1e-12
+    assert early_best_step == 50
+    assert early_no_improve == 1
+
     # NaN/Inf 排查：越界数据必须被发现；非有限梯度必须被定位。
     bad_data_check = _check_batch_integrity(
         torch.tensor([[0, 300]], dtype=torch.int32),
@@ -17145,6 +17963,10 @@ def run_self_test():
             protocol_overrides: Optional[Dict[str, object]] = None,
             routing: Optional[Dict[str, object]] = None,
             precision_recall: Optional[Dict[str, float]] = None,
+            preregistration: Optional[Dict[str, object]] = None,
+            curve_status: Optional[str] = None,
+            n_params: Optional[int] = None,
+            flops: Optional[int] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -17201,18 +18023,42 @@ def run_self_test():
                 },
                 "hypothesis": hypothesis,
                 "research_question": rq,
+                "hypothesis_preregistration": (
+                    preregistration
+                    if isinstance(preregistration, dict)
+                    else {
+                        "primary_metric": None,
+                        "direction": None,
+                        "min_effect": None,
+                    }
+                ),
                 "reference_baselines": reference,
                 "baseline_tuning": baseline_tuning,
                 "routing_analysis": routing,
                 "data": {"sha256": "deadbeef"},
                 "comparison_protocol": protocol,
             }
+            if n_params is not None:
+                config_payload["n_params"] = n_params
+            if flops is not None:
+                config_payload["efficiency"] = {
+                    "flops_per_forward": flops,
+                }
             with open(
                 run_dir / "config.json",
                 "w",
                 encoding="utf-8",
             ) as f:
                 json.dump(config_payload, f)
+
+            if curve_status is not None:
+                write_jsonl_record(
+                    run_dir / "metrics.jsonl",
+                    {
+                        "step": "curve_analysis",
+                        "status": curve_status,
+                    },
+                )
 
             final_record: Dict[str, object] = {
                 "step": "final",
@@ -18291,6 +19137,106 @@ def run_self_test():
             for message in no_baseline["advisories"]
         )
 
+        # 基线收敛性守卫：曲线诊断为 not_converged / underfitting /
+        # diverged 的基线是欠训的弱基线，必须点名（不能只看
+        # 「有没有调参记录」）。
+        unconverged_path = _write_analysis_run(
+            "unconverged_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+            curve_status="not_converged",
+        )
+        unconverged_adequacy = baseline_adequacy(
+            compare_runs([unconverged_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert unconverged_adequacy["unconverged_baselines"]
+        assert any(
+            "not_converged" in message
+            for message in unconverged_adequacy["advisories"]
+        )
+
+        # 容量对齐守卫：挑战模型参数量远大于基线时，涨点可能
+        # 来自容量而非机制，必须提示等参数/等计算对照。
+        small_baseline_path = _write_analysis_run(
+            "small_base_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+            n_params=1000,
+            flops=10000,
+            curve_status="healthy",
+        )
+        big_challenger_path = _write_analysis_run(
+            "big_challenger_seed1",
+            "B",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.10,
+            n_params=5000,
+            flops=50000,
+            curve_status="healthy",
+        )
+        capacity_adequacy = baseline_adequacy(
+            compare_runs([
+                small_baseline_path,
+                big_challenger_path,
+            ]),
+            "smelt",
+            "val_loss",
+        )
+        assert capacity_adequacy["capacity_confounds"]
+        assert any(
+            "容量" in message or "等参数" in message
+            for message in capacity_adequacy["advisories"]
+        )
+        same_capacity_adequacy = baseline_adequacy(
+            compare_runs([
+                small_baseline_path,
+                _write_analysis_run(
+                    "same_size_seed1",
+                    "B",
+                    1,
+                    3e-4,
+                    100,
+                    0.01,
+                    4.10,
+                    n_params=1100,
+                    flops=11000,
+                    curve_status="healthy",
+                ),
+            ]),
+            "smelt",
+            "val_loss",
+        )
+        assert not same_capacity_adequacy["capacity_confounds"]
+
+        # n-gram 对照运行数不足：点估计没有种子间波动，
+        # 必须提示结论可能落在 val 网格搜索噪声内。
+        single_ngram_adequacy = baseline_adequacy(
+            compare_runs([small_baseline_path, ngram_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert any(
+            "n-gram 对照只有" in message
+            for message in single_ngram_adequacy["advisories"]
+        )
+
         # 假设登记：有假设的运行按模式汇总，无假设的运行被点名；
         # 统计基线（ngram）不受假设纪律约束。
         registry = hypothesis_registry(hyp_rows)
@@ -18352,6 +19298,237 @@ def run_self_test():
             "PR-AUC 上升"
         )
         assert hypothesis_metric_mentions("效果更好") == []
+
+        # 多分类平均口径歧义：F1 / precision / recall 必须注明
+        # macro / micro / weighted，否则三种口径的结论可能不同，
+        # 假设无法与评估口径对齐。
+        assert hypothesis_ambiguous_averaging_metrics(
+            "F1 提升"
+        ) == ["f1"]
+        assert hypothesis_ambiguous_averaging_metrics(
+            "macro F1 提升"
+        ) == []
+        assert hypothesis_ambiguous_averaging_metrics(
+            "加权召回率不降"
+        ) == []
+        assert hypothesis_ambiguous_averaging_metrics(
+            "precision 与 recall 都提升"
+        ) == ["precision", "recall"]
+        ambiguous_path = _write_analysis_run(
+            "ambiguous_seed1",
+            "A",
+            4,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            hypothesis="延迟合并使 F1 提升",
+        )
+        ambiguous_registry = hypothesis_registry(
+            compare_runs([ambiguous_path]),
+            "val_loss",
+        )
+        assert ambiguous_registry[
+            "hypotheses_with_ambiguous_averaging_runs"
+        ] == ["ambiguous_seed1"]
+        assert any(
+            "平均口径" in message
+            for message in ambiguous_registry["advisories"]
+        )
+
+        # 预注册校验：方向/最小效应必须与主指标配套，主指标必须
+        # 在假设文本里被点名，统计基线/只读对比不接受预注册。
+        def _prereg_args(**overrides):
+            base = {
+                "compare": None,
+                "statistical_baseline": False,
+                "sanity_only": False,
+                "hypothesis": "延迟合并使验证损失至少下降 2%",
+                "primary_metric": None,
+                "hypothesis_direction": None,
+                "hypothesis_min_effect": None,
+            }
+            base.update(overrides)
+            return argparse.Namespace(**base)
+
+        assert hypothesis_preregistration_error(
+            _prereg_args()
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(hypothesis_direction="decrease")
+        ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                primary_metric="val_loss",
+                hypothesis_direction="decrease",
+                hypothesis_min_effect=-0.1,
+            )
+        ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                primary_metric="val_macro_f1",
+                hypothesis_direction="increase",
+            )
+        ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                primary_metric="val_loss",
+                hypothesis_direction="decrease",
+                hypothesis_min_effect=0.02,
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                compare=["some_run"],
+                primary_metric="val_loss",
+            )
+        ) is not None
+
+        # 预注册主指标与当前分析指标不一致：metric shopping
+        # 守卫必须点名。
+        prereg_run = _write_analysis_run(
+            "prereg_seed1",
+            "A",
+            5,
+            3e-4,
+            100,
+            0.01,
+            4.10,
+            hypothesis="延迟合并使验证损失至少下降 2%",
+            preregistration={
+                "primary_metric": "val_loss",
+                "direction": "decrease",
+                "min_effect": 0.02,
+            },
+        )
+        prereg_rows = compare_runs([prereg_run])
+        prereg_registry = hypothesis_registry(
+            prereg_rows, "val_loss"
+        )
+        assert prereg_registry["preregistered_runs"] == [
+            "prereg_seed1"
+        ]
+        assert not prereg_registry["metric_mismatch_runs"]
+        mismatch_registry = hypothesis_registry(
+            prereg_rows, "val_macro_f1"
+        )
+        assert mismatch_registry["metric_mismatch_runs"] == [
+            "prereg_seed1"
+        ]
+        assert any(
+            "预注册" in message
+            for message in mismatch_registry["advisories"]
+        )
+
+        # 方向/最小效应核对：supported / refuted /
+        # below_declared_min_effect / direction_mismatch 各分支。
+        def _synthetic_aggregate(
+            label: str,
+            runs: List[str],
+            mean: float,
+        ) -> Dict[str, object]:
+            return {
+                "label": label,
+                "runs": list(runs),
+                "keys": {"mode": label},
+                "n_runs": len(runs),
+                "samples": {"val_loss": []},
+                "val_loss_mean": mean,
+                "val_loss_std": 0.01,
+                "costs": {},
+            }
+
+        def _synthetic_contrast(
+            baseline_label: str,
+            variant_label: str,
+            baseline_mean: float,
+            variant_mean: float,
+            significant: bool,
+        ) -> Dict[str, object]:
+            return {
+                "baseline": baseline_label,
+                "variant": variant_label,
+                "factor": "mode",
+                "confounded": False,
+                "delta": variant_mean - baseline_mean,
+                "mean_baseline": baseline_mean,
+                "mean_variant": variant_mean,
+                "significant": significant,
+                "p_value_holm": 0.01 if significant else 0.5,
+            }
+
+        alignment_aggregates = [
+            _synthetic_aggregate("smelt", ["smelt_seed1"], 4.5),
+            _synthetic_aggregate(
+                "A", ["prereg_seed1"], 4.4
+            ),
+        ]
+        supported_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.4, True
+                )
+            ],
+            "val_loss",
+        )
+        assert supported_alignment["checks"][0]["status"] == (
+            "supported"
+        ), supported_alignment
+        below_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.48, True
+                )
+            ],
+            "val_loss",
+        )
+        assert below_alignment["checks"][0]["status"] == (
+            "below_declared_min_effect"
+        )
+        refuted_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.6, True
+                )
+            ],
+            "val_loss",
+        )
+        assert refuted_alignment["checks"][0]["status"] == (
+            "refuted"
+        )
+        assert refuted_alignment["refuted"]
+        mismatch_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.6, False
+                )
+            ],
+            "val_loss",
+        )
+        assert mismatch_alignment["checks"][0]["status"] == (
+            "direction_mismatch_not_significant"
+        )
+        # 指标不一致的对比不参与核对（预注册针对的是主指标）。
+        other_metric_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.4, True
+                )
+            ],
+            "val_macro_f1",
+        )
+        assert other_metric_alignment["n_checks"] == 0
+        assert other_metric_alignment["advisories"]
 
         # 类别不平衡：多数类占比 95% 时必须提示 accuracy/micro
         # 失效、优先 PR-AUC；ROC-AUC 口径额外提示其偏乐观。
@@ -18765,6 +19942,52 @@ def run_self_test():
         assert any(
             "无法在统计上区分" in issue
             for issue in tuning_report["issues"]
+        )
+
+        # winner 候选仍在下降（curve_status=not_converged）时，
+        # 限制基线的不是学习率而是训练预算：调参报告必须提示
+        # 「winner 不能代表调强过的基线」。
+        unconverged_tuning_paths = []
+        for seed, value in ((42, 4.0), (43, 4.0), (44, 4.0)):
+            unconverged_tuning_paths.append(
+                _write_analysis_run(
+                    f"tune_unc_lr1e-4_seed{seed}",
+                    "dense",
+                    seed,
+                    1e-4,
+                    100,
+                    0.0,
+                    value,
+                    curve_status="not_converged",
+                )
+            )
+        for seed, value in ((42, 4.5), (43, 4.5), (44, 4.5)):
+            unconverged_tuning_paths.append(
+                _write_analysis_run(
+                    f"tune_unc_lr3e-4_seed{seed}",
+                    "dense",
+                    seed,
+                    3e-4,
+                    100,
+                    0.0,
+                    value,
+                    curve_status="healthy",
+                )
+            )
+        unconverged_tuning_report = analyze_baseline_tuning(
+            compare_runs(unconverged_tuning_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert unconverged_tuning_report["winner"]["lr"] == 1e-4
+        assert unconverged_tuning_report[
+            "winner_unconverged_runs"
+        ]
+        assert any(
+            "收敛" in issue
+            for issue in unconverged_tuning_report["issues"]
         )
 
         # 均值不同但差距落在种子波动内（最优均值候选的噪声
@@ -19288,7 +20511,12 @@ def run_self_test():
     ])
     assert stripped_modes == ["--k1", "2"]
 
-    for unknown_spec in ("", "mode,not_a_factor"):
+    for unknown_spec in (
+        "",
+        "mode,not_a_factor",
+        "selection_metric",
+        "model_selection",
+    ):
         try:
             parse_factor_spec(unknown_spec)
         except ValueError:
@@ -19665,6 +20893,7 @@ def analyze_baseline_tuning(
         "tied_lrs": [],
         "winner_at_grid_boundary": False,
         "best_mean_at_grid_boundary": False,
+        "winner_unconverged_runs": [],
         # 种子计划随报告落盘：调参的统计功效（独立种子数、
         # 是否用了低功效豁免）是「基线已充分调参」的一部分，
         # 下游来源核对与基线合理性检查都必须能看到。
@@ -19863,6 +21092,33 @@ def analyze_baseline_tuning(
         report["issues"].append(
             "存在与最优均值恰好并列的学习率候选，已按 "
             "selection_rule 取更小的学习率（保守解）"
+        )
+
+    # 收敛性：winner 的学习率候选若在曲线诊断里仍是
+    # not_converged / underfitting / diverged，说明限制基线的
+    # 不是学习率而是训练预算/数据/实现——在欠训曲线上选出的
+    # lr 不能让基线变成「调强过的基线」。
+    winner_lr = float(winner["lr"])
+    winner_unconverged_runs = [
+        str(row.get("run"))
+        for row in rows
+        if _row_lr(row) == winner_lr
+        and row.get("curve_status") in (
+            "not_converged",
+            "underfitting",
+            "diverged",
+        )
+    ]
+    report["winner_unconverged_runs"] = winner_unconverged_runs
+    if winner_unconverged_runs:
+        report["issues"].append(
+            "winner lr="
+            f"{format(winner_lr, 'g')} 的部分候选运行没有训练到"
+            "收敛/稳定（曲线诊断）: "
+            + ", ".join(winner_unconverged_runs)
+            + "。限制基线的可能不是学习率而是训练预算/数据/"
+            "实现：请增加 --steps（或核查数据与实现）后重新"
+            "调参，否则 winner 不能代表「调强过的基线」"
         )
 
     # 网格边界：winner 或**最优均值候选**恰是候选网格的最小/
@@ -20489,6 +21745,59 @@ def main():
         help=(
             "本 run 对应的研究问题标签（如 RQ1），"
             "与 --hypothesis 一起写入 config.json"
+        ),
+    )
+    parser.add_argument(
+        "--primary-metric",
+        type=str,
+        default=None,
+        metavar="METRIC",
+        help=(
+            "预注册的主判定指标（--compare-metric 的候选之一）："
+            "训练开始前声明本轮以哪个指标判定成败，"
+            "对比阶段若分析指标与预注册主指标不一致会提示"
+            "「事后换指标」；未预注册则无法排除指标选择偏差"
+        ),
+    )
+    parser.add_argument(
+        "--hypothesis-direction",
+        type=str,
+        default=None,
+        choices=("decrease", "increase"),
+        help=(
+            "预注册的预期方向：实验臂相对对照臂，主指标的"
+            "数值应当 decrease（下降）还是 increase（上升）。"
+            "必须与 --primary-metric 一起使用；对比阶段会核对"
+            "观测方向是否与预注册一致（相反且显著时判为"
+            "假设被推翻）"
+        ),
+    )
+    parser.add_argument(
+        "--hypothesis-min-effect",
+        type=float,
+        default=None,
+        metavar="REL",
+        help=(
+            "预注册的最小有意义相对效应（如 0.02 = 2%，相对"
+            "对照臂均值）：观测效应达到该幅度才支持假设；"
+            "必须与 --primary-metric 和 --hypothesis-direction "
+            "一起使用。事先声明的最小效应可以区分「方向对但"
+            "小到没有实际意义」与真正支持假设"
+        ),
+    )
+    parser.add_argument(
+        "--selection-metric",
+        type=str,
+        default=None,
+        choices=_SELECTION_METRIC_KEYS,
+        metavar="METRIC",
+        help=(
+            "验证集 checkpoint 选型与早停依据的指标（默认"
+            " val_loss；预注册了 --primary-metric 且该指标在"
+            "周期验证中可计算时默认跟随主指标）：按宏观 F1 "
+            "判定成败时若仍按 val_loss 选型，最终模型并不是"
+            "按假设口径选出来的。可选范围限于周期验证实际"
+            "计算的指标（AUC 与路由诊断只在最终评估计算）"
         ),
     )
     parser.add_argument(
@@ -21155,6 +22464,14 @@ def main():
     if hypothesis_error is not None:
         parser.error(hypothesis_error)
 
+    # 预注册纪律：方向 / 最小效应 / 主指标必须在训练开始前
+    # 声明并互相一致（检查逻辑见
+    # hypothesis_preregistration_error）。
+    preregistration_error = hypothesis_preregistration_error(args)
+
+    if preregistration_error is not None:
+        parser.error(preregistration_error)
+
     # --compare 模式只读运行目录，不需要 --data / --out。
     if args.compare is not None:
         compare_rows = compare_runs(args.compare)
@@ -21467,6 +22784,54 @@ def main():
                 )
                 setattr(args, key, saved_value)
 
+        # 选型指标同样决定 best.pt 与早停状态：续跑时若换了
+        # 指标，历史评估点的「最优」会被重新解释。按存档恢复，
+        # 保证选型协议跨恢复一致；显式改指标续跑不是不允许，
+        # 但必须新建输出目录重新训练。
+        saved_selection_metric = saved_args.get(
+            "selection_metric"
+        )
+        if (
+            saved_selection_metric is not None
+            and saved_selection_metric
+            != args.selection_metric
+        ):
+            print(
+                "resume restored selection_metric "
+                f"{args.selection_metric} -> "
+                f"{saved_selection_metric} "
+                "(选型/早停必须与存档口径一致)"
+            )
+            args.selection_metric = saved_selection_metric
+
+    # 选型指标解析：默认 val_loss；预注册主指标且周期验证能算
+    # 时跟随主指标（假设按什么判定，checkpoint 就按什么选）。
+    # 主指标是 PR-AUC / 路由诊断等只能在最终评估计算的指标时
+    # 无法用于选型，回退 val_loss 并明确警告。
+    if args.selection_metric is None:
+        if args.primary_metric in _SELECTION_METRIC_KEYS:
+            args.selection_metric = args.primary_metric
+        else:
+            args.selection_metric = "val_loss"
+
+    if (
+        args.primary_metric is not None
+        and args.selection_metric != args.primary_metric
+    ):
+        print(
+            "[selection] [warn] 预注册主指标为 "
+            f"{args.primary_metric}，但 checkpoint 选型/早停"
+            f"使用 {args.selection_metric}：最终模型不是按"
+            "假设的判定口径选出的。若该指标无法在周期验证"
+            "计算，考虑改预注册指标或显式声明 "
+            "--selection-metric。"
+        )
+    elif args.selection_metric != "val_loss":
+        print(
+            "[selection] 选型/早停指标为 "
+            f"{args.selection_metric}（不是 val_loss）"
+        )
+
     # 结构与损失配置的合法性与其他命令行参数同一口径：
     # 校验失败走 parser.error 的清晰报错，而不是抛裸 traceback。
     try:
@@ -21692,6 +23057,37 @@ def main():
                 + "（路由诊断类指标需要该运行有 "
                 "routing_analysis；dense 基线或 "
                 "--skip-routing-analysis 时无法核对）"
+            )
+        else:
+            # 平均口径歧义：F1 / precision / recall 在单标签
+            # 多分类下有 macro/micro/weighted 三种口径，结果
+            # 可能差异很大；假设必须注明用哪一种。
+            entry_ambiguous = (
+                hypothesis_ambiguous_averaging_metrics(
+                    args.hypothesis,
+                    entry_mentions,
+                )
+            )
+            if entry_ambiguous:
+                print(
+                    "[hypothesis] [warn] 假设提到的 "
+                    + ", ".join(entry_ambiguous)
+                    + " 未注明平均口径（macro / micro / "
+                    "weighted 三者结果可能差异很大）：请写明"
+                    "判定口径，并与 --primary-metric / "
+                    "--compare-metric 保持一致"
+                )
+        # 预注册提示：假设提到了判定指标却没有预注册主指标
+        # 时，事后仍可从多个指标里挑显著的那个；入口先说清楚，
+        # 不强制阻断（旧流程兼容）。
+        if entry_mentions and not args.primary_metric:
+            print(
+                "[hypothesis] [warn] 未用 --primary-metric 预注册"
+                "主判定指标：事后 --compare 可以任选 "
+                f"{len(COMPARISON_METRIC_KEYS)} 个指标中的一个，"
+                "指标选择偏差无法从记录上排除；建议训练前声明"
+                "主指标（可选加 --hypothesis-direction / "
+                "--hypothesis-min-effect）"
             )
 
     # 全新训练默认先跑过拟合小批量 sanity check；恢复训练默认跳过
@@ -22183,24 +23579,26 @@ def main():
     recent_grad_norms: List[Tuple[int, float]] = []
 
     # 验证集模型选择 + 早停状态：resume 时从原运行的
-    # metrics.jsonl 恢复「最优验证损失 / 最优步 / 连续未改善
+    # metrics.jsonl 恢复「最优选型指标 / 最优步 / 连续未改善
     # 次数」，保证早停判定与模型选择跨恢复一致；全新训练不读
-    # 旧文件（文件会被截断重写）。
-    best_val_loss: Optional[float] = None
-    best_val_step: Optional[int] = None
+    # 旧文件（文件会被截断重写）。选型指标默认 val_loss，也可
+    # 用 --selection-metric 对齐预注册的判定指标。
+    best_selection_value: Optional[float] = None
+    best_selection_step: Optional[int] = None
     evals_without_improvement = 0
 
     if args.resume is not None:
         (
-            best_val_loss,
-            best_val_step,
+            best_selection_value,
+            best_selection_step,
             evals_without_improvement,
         ) = early_stop_state_from_records(
             read_metrics_records(metrics_path),
             args.early_stop_min_delta,
+            metric=args.selection_metric,
         )
 
-    # 训练期间每个刷新最优验证损失的评估点覆盖写入 best.pt；
+    # 训练期间每个刷新最优选型指标的评估点覆盖写入 best.pt；
     # 训练结束后用它做 final / test 评估（test 只在这一份
     # 经验证集选择的模型上解封一次）。
     selected_model_path = out_dir / _SELECTED_MODEL_FILENAME
@@ -22550,37 +23948,48 @@ def main():
                 )
                 metrics_file.flush()
 
-            # 验证集模型选择：无论是否启用早停，都记录最优验证
-            # 点并把权重写入 best.pt；训练结束后的 final / test
-            # 评估使用该模型（验证集用于选型，测试集只在选定的
-            # 模型上解封一次）。NaN/Inf 验证损失不作数，避免故障
-            # 顺带触发早停或污染选型。
+            # 验证集模型选择：无论是否启用早停，都记录最优选型
+            # 指标的评估点并把权重写入 best.pt；训练结束后的
+            # final / test 评估使用该模型（验证集用于选型，测试
+            # 集只在选定的模型上解封一次）。非有限值不作数，
+            # 避免故障顺带触发早停或污染选型。
+            selection_value = eval_metrics.get(
+                args.selection_metric
+            )
             val_loss = eval_metrics.get("val_loss")
 
-            if val_loss is None or not math.isfinite(
-                float(val_loss)
+            if (
+                selection_value is None
+                or not math.isfinite(float(selection_value))
             ):
                 pass
-            elif (
-                best_val_loss is None
-                or float(val_loss)
-                < best_val_loss
-                - args.early_stop_min_delta
+            elif selection_improved(
+                float(selection_value),
+                best_selection_value,
+                metric_higher_is_better(args.selection_metric),
+                args.early_stop_min_delta,
             ):
-                best_val_loss = float(val_loss)
-                best_val_step = step + 1
+                best_selection_value = float(selection_value)
+                best_selection_step = step + 1
                 evals_without_improvement = 0
                 save_selected_model(
                     str(selected_model_path),
                     model,
                     step + 1,
-                    best_val_loss,
+                    (
+                        float(val_loss)
+                        if val_loss is not None
+                        and math.isfinite(float(val_loss))
+                        else None
+                    ),
                     args,
+                    selection_metric=args.selection_metric,
+                    selection_value=best_selection_value,
                 )
             else:
                 evals_without_improvement += 1
 
-            # 早停：验证损失连续无改善达到 patience 时提前结束。
+            # 早停：选型指标连续无改善达到 patience 时提前结束。
             if (
                 args.early_stop_patience > 0
                 and evals_without_improvement
@@ -22588,11 +23997,12 @@ def main():
             ):
                 early_stopped = True
                 print(
-                    "[early-stop] 验证损失连续 "
+                    f"[early-stop] 选型指标 "
+                    f"{args.selection_metric} 连续 "
                     f"{evals_without_improvement} 次未改善"
                     "（最优 "
-                    f"{best_val_loss:.4f} @ step "
-                    f"{best_val_step}），"
+                    f"{best_selection_value:.4f} @ step "
+                    f"{best_selection_step}），"
                     f"在第 {step + 1} 步提前结束训练；"
                     "如需继续训练可调大 --steps 后 resume。"
                 )
@@ -22643,13 +24053,14 @@ def main():
         )
 
     # 按验证集选定模型：final / test 评估之前，把权重恢复为
-    # best.pt（验证损失最优的评估点）。这样「最终模型」由
+    # best.pt（选型指标最优的评估点）。这样「最终模型」由
     # 验证集决定，而不是由最后一步恰好停在哪里决定；测试集
     # 也只在这份模型上解封一次。
     selection_policy = "last"
     selection_note: Optional[str] = None
+    selected_val_loss: Optional[float] = None
 
-    if best_val_step is not None:
+    if best_selection_step is not None:
         selected_payload = load_selected_model(
             str(selected_model_path),
             torch.device("cpu"),
@@ -22657,14 +24068,28 @@ def main():
 
         if (
             selected_payload is not None
-            and int(selected_payload.get("step", -1)) == best_val_step
+            and int(selected_payload.get("step", -1))
+            == best_selection_step
         ):
             restore_selected_weights(model, selected_payload)
             selection_policy = "best_val"
+            payload_val_loss = selected_payload.get("val_loss")
+            if (
+                payload_val_loss is not None
+                and math.isfinite(float(payload_val_loss))
+            ):
+                selected_val_loss = float(payload_val_loss)
             print(
                 "[select] 使用验证集选中的模型做最终评估："
-                f"step={best_val_step}, "
-                f"val_loss={float(best_val_loss):.4f}"
+                f"step={best_selection_step}, "
+                f"{args.selection_metric}="
+                f"{best_selection_value:.4f}"
+                + (
+                    f", val_loss={selected_val_loss:.4f}"
+                    if selected_val_loss is not None
+                    and args.selection_metric != "val_loss"
+                    else ""
+                )
             )
         else:
             selection_note = (
@@ -22715,20 +24140,37 @@ def main():
         bad_case_collector=val_bad_case_collector,
     )
 
+    # 最优验证损失仍按历史口径单独汇总（选型指标可能是
+    # macro F1 等分类指标，两者不应混为一谈）。
+    (
+        min_val_loss,
+        min_val_loss_step,
+        _,
+    ) = early_stop_state_from_records(
+        read_metrics_records(metrics_path),
+        0.0,
+        metric="val_loss",
+    )
+
     final_record = {
         "step": "final",
         **final_metrics,
         "early_stopped": early_stopped,
-        "best_val_loss": best_val_loss,
-        "best_val_step": best_val_step,
+        # 历史字段：全程最优验证损失（与选型指标无关）。
+        "best_val_loss": min_val_loss,
+        "best_val_step": min_val_loss_step,
+        # 本次选型实际使用的指标与最优值。
+        "selection_metric": args.selection_metric,
+        "best_selection_value": best_selection_value,
+        "best_selection_step": best_selection_step,
         "selected_model": selection_policy,
         "selected_step": (
-            best_val_step
+            best_selection_step
             if selection_policy == "best_val"
             else end_step
         ),
         "selected_val_loss": (
-            best_val_loss
+            selected_val_loss
             if selection_policy == "best_val"
             else None
         ),
@@ -22768,13 +24210,19 @@ def main():
         "model_selection",
         {
             "policy": selection_policy,
+            "selection_metric": args.selection_metric,
+            "selected_metric_value": (
+                best_selection_value
+                if selection_policy == "best_val"
+                else None
+            ),
             "selected_step": (
-                best_val_step
+                best_selection_step
                 if selection_policy == "best_val"
                 else end_step
             ),
             "selected_val_loss": (
-                best_val_loss
+                selected_val_loss
                 if selection_policy == "best_val"
                 else None
             ),
@@ -22922,7 +24370,7 @@ def main():
         routing_report["batch_size"] = args.batch_size
         routing_report["selected_model"] = selection_policy
         routing_report["selected_step"] = (
-            best_val_step
+            best_selection_step
             if selection_policy == "best_val"
             else end_step
         )

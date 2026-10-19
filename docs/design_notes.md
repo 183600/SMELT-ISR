@@ -47,12 +47,15 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   显式传入 `--evaluate-test` 时解封评估一次
   （`metrics.jsonl` 写入 `{"step": "test", ...}`）；同一输出目录中
   已有 test 记录时会拒绝重复评估，防止测试集变成隐式验证集。
-- **验证集选型**：训练期间每次刷新最优验证损失（判据与早停一致）
-  就把权重原子写入 `best.pt`；训练结束后的 `final` 评估与唯一一次
-  test 评估都在这份验证集选定的模型上进行，而不是训练最后一步的
-  参数。选型口径写入 `metrics.jsonl` 的 `final` 记录与 `config.json`
-  的 `model_selection` 字段；`best.pt` 缺失或与记录不一致时明确
-  提示并回退到最后一步（`last.pt` 仍是断点恢复用的完整状态）。
+- **验证集选型**：训练期间每次刷新最优选型指标（默认验证
+  损失，`--selection-metric` 可改为与预注册主指标一致的分类
+  指标；判据与早停一致）就把权重原子写入 `best.pt`；训练结束
+  后的 `final` 评估与唯一一次 test 评估都在这份验证集选定的
+  模型上进行，而不是训练最后一步的参数。选型指标、选中步与
+  选中点的验证损失写入 `metrics.jsonl` 的 `final` 记录与
+  `config.json` 的 `model_selection` 字段；`best.pt` 缺失或与
+  记录不一致时明确提示并回退到最后一步（`last.pt` 仍是断点
+  恢复用的完整状态）。
 - **数据审计**：训练前对 train/val 自动做值域校验、文本完整性
   （无法 UTF-8 解码的字节序列与 NUL 字节，即字节级标签噪声/语料
   损坏检查）、字节直方图分布偏移（JS 距离）与滑窗重复内容扫描
@@ -196,8 +199,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   batch size、数据增强（当前为无增强，显式记录）、数据指纹、
   模型结构（含分支几何 `k1/k2`、路由宽度 `top_k`、均衡损失
   系数 `balance_coef`、`dense_fnn_hidden`、`residual_scale`）、
-  评估协议与选型口径（`model_selection`，新运行为验证集选型、
-  无记录的旧运行回退标记为最后一步），以及有效训练长度与
+  评估协议与选型口径（`model_selection` 与 `selection_metric`：
+  新运行为验证集选型、无记录的旧运行回退标记为最后一步；按
+  loss 选型与按宏观 F1 选型的运行不能混在一起比较），以及
+  有效训练长度与
   数值设置（早停容忍度 `early_stop_patience`/
   `early_stop_min_delta`、AMP 精度 `amp_dtype`、设备类型
   `device_type`、梯度检查点 `grad_checkpoint`、
@@ -318,6 +323,61 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   绝对值当准确率读。四项检查的结构化结果
   （`hypothesis_registry`、`baseline_adequacy`、
   `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
+- **假设预注册（方向 / 最小效应 / 主指标）**：可检验的假设
+  不仅要写判定指标，还应在训练前写死「预期方向」与「最小有
+  意义效应」，否则看到结果后可以任意解释方向、或从多个指标
+  里挑显著的那个（指标选择偏差）。入口支持：
+  - `--primary-metric`：预注册主判定指标（必须是评估管线
+    真正计算的对比指标，且在 `--hypothesis` 文本中被点名）；
+  - `--hypothesis-direction decrease|increase`：实验臂相对
+    对照臂，主指标的**数值**预期下降/上升；
+  - `--hypothesis-min-effect REL`：最小有意义相对效应
+    （相对对照均值，如 0.02 = 2%）。
+  三者写入 `config.json` 的 `hypothesis_preregistration`。
+  `--compare` 阶段据此输出 `hypothesis_alignment`：
+  观测方向与预注册显著相反 → `refuted`（假设被数据推翻，
+  不能事后改写解释）；方向一致但幅度未达最小效应 →
+  `below_declared_min_effect`（统计显著也不等于支持假设）；
+  方向一致且达到最小效应、Holm 校正后显著 → `supported`；
+  其余为 `not_significant` / `direction_mismatch_not_significant`。
+  分析指标与运行预注册主指标不一致时单独提示
+  `[metric-shopping]`（事后换指标），旧运行没有预注册记录时
+  只提示「无法排除指标选择偏差」。
+  另外，单标签多分类的 F1 / precision / recall 必须注明
+  macro / micro / weighted 口径（三者结论可能显著不同），
+  假设只写「F1 提升」会被单独点名。
+- **选型指标与判定口径对齐**：模型 checkpoint 默认按
+  `val_loss` 选型并早停，但若预注册主指标是 macro F1 等
+  分类指标，按 loss 选出的模型并不是按假设口径选出的。
+  `--selection-metric` 可把验证集选型/早停改为周期验证
+  实际计算的任一对比指标（`val_macro_f1`、
+  `val_recall_weighted` 等；AUC 与路由诊断只在最终评估
+  计算，不能用于选型）。未显式指定时，若
+  `--primary-metric` 可在周期验证中计算则自动跟随，
+  否则回退 `val_loss` 并警告口径不一致。指标方向由
+  `metric_higher_is_better` 决定（loss/ppl 越低越好，
+  其余越高越好）；选型指标、最优值、选中步与选中点的
+  val_loss 一并写入 `best.pt`、`metrics.jsonl` 的 final
+  记录与 `config.json` 的 `model_selection`，并作为受控
+  变量参与 `--compare` 核对（按 loss 选型与按 F1 选型的
+  运行不能混在一起比较）。恢复训练时选型指标按检查点
+  恢复，避免中途换指标重新解释历史评估点。
+- **基线欠训与容量混淆守卫**：`baseline_adequacy` 除核对
+  「基线强于 unigram 参考」「基线有调参来源」「不劣于调优好的
+  n-gram」「种子数」之外，还检查：
+  - 基线运行的曲线诊断（`curve_analysis.status`）为
+    `not_converged` / `underfitting` / `diverged` 时点名
+    「欠训的弱基线不说明方法更强」，要求在相同训练预算下
+    先调强基线；
+  - 挑战模型相对基线的参数量 / 前向 FLOPs 超过
+    `_COST_RATIO_MATERIAL`（1.5×）时提示容量混淆，要求报告
+    等参数（`--dense-fnn-hidden n_experts×expert_hidden`）
+    或等计算（`smelt` / `local_base`）对照，区分容量与机制；
+  - n-gram 对照运行少于 3 个时提示其点估计没有种子间波动，
+    微小优势可能落在 val 网格搜索噪声内。
+  `--suite-baseline-tuning` 的 winner 候选若仍 `not_converged`，
+  调参报告本身也会给出「限制基线的是训练预算而非学习率」的
+  issue。
 - **全因子消融**：`--suite-ablation` 运行「延迟合并 × 均衡
   损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`
   =0/当前值；(1+N)×2 格分别对应「无 / 仅延迟合并 / 仅均衡
@@ -397,10 +457,15 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--sanity-lr`、`--sanity-loss-threshold`、`--sanity-acc-threshold`、
 `--val-fraction`、`--test-fraction`、`--evaluate-test`、
 `--group-separator`（群组整体划分）、`--strict-data-audit`
-（泄露级审计问题拒绝训练/拒绝解封测试集）。
+（泄露级审计问题拒绝训练/拒绝解封测试集）；假设预注册：
+`--hypothesis`（必填）、`--rq`、`--primary-metric`、
+`--hypothesis-direction decrease|increase`、
+`--hypothesis-min-effect REL`（后三者配套使用）。
 
 结果分析相关参数：`--early-stop-patience`（默认 0，关闭早停）、
-`--early-stop-min-delta`、`--bad-cases`（默认 10，0 关闭）、
+`--early-stop-min-delta`、`--selection-metric`（验证集选型/
+早停指标，默认 `val_loss`；预注册主指标可周期计算时自动
+跟随）、`--bad-cases`（默认 10，0 关闭）、
 `--skip-efficiency`（跳过结束时的效率测量）、
 `--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
 变量检查、Mean ± Std、显著性检验与功效/等价性分析）、
