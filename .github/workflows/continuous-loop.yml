@@ -590,40 +590,16 @@ jobs:
             return 1
           }
 
-          # ================= 两段式阶段：先检测、再修复 =================
-          # 需要两段式的阶段（perf / bug / sci，按仓库实际阶段）各拆成两次 opencode 调用：
-          #   1) detect：只检测问题，把清单写入临时 .md（不改代码）；
-          #   2) fix：读取清单，修复全部问题，然后删除该 .md。
-          # 临时文件用后即删，不会进入提交。
+          # ================= 单次调用内“先定位、再修复” =================
+          # 不再单独占用 detect 预算：把“快速定位问题”并入同一次 opencode 调用，
+          # 让修复拿满整个阶段预算，减少一次模型调用的固定开销。
           ISSUES_FILE=".opencode_issues.md"
-          DETECT_DIVISOR=4          # 检测预算约占阶段的 1/4（至少 8 分钟）
-          make_detect_prompt() {
-            printf '本次只做检测，绝对不要修改任何代码或文件（唯一允许写入的是临时问题清单 `%s`）。\n\n阶段任务如下（其中所有“修改/修复/改进”动作都留到第二步，本次一律不执行）：\n%s\n\n要求：\n1. 通读相关代码、配置、测试与实验脚本，尽可能具体地定位问题（尽量给出 `文件:行号`）。\n2. 把发现的问题按严重程度从高到低写入 `%s`；每条包含位置、问题描述、为什么是问题、建议的修复方向。\n3. 即使没有发现问题，也要在文件里写明“未发现问题”；该清单是流程要求的临时中间文件，不属于任务中禁止的“报告”。\n4. 除该清单外，不要修改、删除或移动任何文件（尤其 .github/、LICENSE、README*、PLAN.md、测试与数据文件），不要 git add/commit/push，不要运行会改变仓库状态的命令。\n5. 再次强调：本次只输出问题清单，不要动手修复。\n' "$ISSUES_FILE" "$1" "$ISSUES_FILE"
-          }
-          make_fix_prompt() {
-            printf '本阶段分两步执行：第一步（检测）已经完成或因剩余时间不足而跳过，问题清单保存在 `%s`。\n第二步（现在执行）：先读取该清单，逐条修复其中列出的全部问题，不要遗漏；若清单不存在、为空或明显不完整，则自行重新检查并修复。修复完成后必须删除 `%s`，并确认仓库中不再残留该文件；该清单是流程要求的临时中间文件，不属于任务中禁止的“报告”。\n\n下面是本阶段原本的任务与约束：\n%s\n' "$ISSUES_FILE" "$ISSUES_FILE" "$1"
-          }
-          run_phase_2step() {
-            local phase="$1" base_prompt="$2" budget="$3"
-            local remain=$(( DEADLINE - $(date +%s) ))
-            if [ "$remain" -lt 1500 ]; then
-              echo "[info] phase=$phase 剩余时间不足两段式，直接执行修复（修复步骤会自动补检）"
-              rm -f "$ISSUES_FILE"
-              run_phase "${phase}-fix" "$(make_fix_prompt "$base_prompt")" "$budget"
-              rm -f "$ISSUES_FILE"
-              return 0
-            fi
-            local detect_budget=$(( budget / DETECT_DIVISOR ))
-            [ "$detect_budget" -lt 480 ] && detect_budget=480
-            local t0=$(date +%s)
-            rm -f "$ISSUES_FILE"
-            echo "[info] phase=$phase 两段式：先检测（预算 ${detect_budget}s），再修复"
-            run_phase "${phase}-detect" "$(make_detect_prompt "$base_prompt")" "$detect_budget"
-            local fix_budget=$(( budget - ( $(date +%s) - t0 ) ))
-            [ "$fix_budget" -lt 600 ] && fix_budget=600
-            echo "[info] phase=$phase 两段式：开始修复（预算 ${fix_budget}s）"
-            run_phase "${phase}-fix" "$(make_fix_prompt "$base_prompt")" "$fix_budget"
-            rm -f "$ISSUES_FILE"
+          fast_prompt() {
+            case "$1" in
+              perf) printf '先用不超过 10 分钟快速列出 3-5 个高价值性能问题（可写入 `%s`，该临时清单不是报告），然后立即开始修复；优先做 1-2 个最有把握、能通过自检的优化，不要一次改太多。至少完成一个可提交的优化；若 20 分钟内没有可提交改动，缩小范围先做一个小而确定的优化。修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              bug)  printf '直接定位并修复 bug，优先高价值、可验证的问题；不要把时间花在写分析报告上，尽快产出可提交的修复；至少完成一个可提交的修复，若 20 分钟内没有可提交改动，缩小范围先修一个边界条件或小 bug。若需要可把要点写入 `%s`，修完删除。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              sci)  printf '先用不超过 8 分钟选出 1-2 个最值得改的实验方法问题（可写入 `%s`，该临时清单不是报告），然后立即修改代码；优先做能通过自检的实质改进，不要在分析上花太多时间。至少完成一个可提交的改进；若 20 分钟内没有可提交改动，缩小范围先做一个小而确定的改进。修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+            esac
           }
 
           # ================= 主循环 =================
@@ -671,9 +647,9 @@ jobs:
 
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
               case "$phase" in
-                perf|bug|sci) run_phase_2step "$phase" "$P" "$T" ;;
-                *)            run_phase "$phase" "$P" "$T" ;;
+                perf|bug|sci) P="$(fast_prompt "$phase" "$P")" ;;
               esac
+              run_phase "$phase" "$P" "$T"
 
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
