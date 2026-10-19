@@ -6647,6 +6647,7 @@ class RoutingProbe:
             gate_mass = torch.zeros(
                 n_experts,
                 dtype=torch.float32,
+                device=flat_indices.device,
             )
             gate_mass.scatter_add_(0, flat_indices, weights)
 
@@ -13556,17 +13557,39 @@ def _snapshot_to_cpu(value: object) -> object:
     活参数/优化器状态可能是设备张量：torch.save 逐张量隐式
     D2H 并持有视图，先把整个负载显式快照到 CPU，序列化阶段
     就与训练设备解耦（值、dtype、键结构不变）。
+
+    同一段底层存储常被多个键共享（如绑定权重
+    ``lm_head.weight`` 与 ``token_embedding.weight``），快照
+    按（存储地址、偏移、dtype、形状、步幅）去重：共享张量
+    只复制一次并复用同一 CPU 副本，让 torch.save 仍能对
+    存储去重，避免 checkpoint 无谓增大。
     """
-    if torch.is_tensor(value):
-        return value.detach().to("cpu", copy=True)
-    if isinstance(value, dict):
-        return {
-            key: _snapshot_to_cpu(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_snapshot_to_cpu(item) for item in value]
-    return value
+    memo: Dict[Tuple[object, ...], torch.Tensor] = {}
+
+    def snapshot(item: object) -> object:
+        if torch.is_tensor(item):
+            key = (
+                item.untyped_storage().data_ptr(),
+                item.storage_offset(),
+                item.dtype,
+                tuple(item.size()),
+                tuple(item.stride()),
+            )
+            cached = memo.get(key)
+            if cached is None:
+                cached = item.detach().to("cpu", copy=True)
+                memo[key] = cached
+            return cached
+        if isinstance(item, dict):
+            return {
+                key: snapshot(entry)
+                for key, entry in item.items()
+            }
+        if isinstance(item, (list, tuple)):
+            return [snapshot(entry) for entry in item]
+        return item
+
+    return snapshot(value)
 
 
 def save_checkpoint(
