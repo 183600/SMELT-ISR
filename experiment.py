@@ -375,7 +375,8 @@ class CausalSelfAttention(nn.Module):
 def _swiglu_backward(
     grad_hidden: torch.Tensor,
     gate_up: torch.Tensor,
-) -> torch.Tensor:
+    return_hidden: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """
     SwiGLU 的共用反向实现（供 _SwiGLUDown 使用）。
 
@@ -383,6 +384,9 @@ def _swiglu_backward(
     后）。mul 反向给出两路梯度，gate 路再过 silu 反向；两路
     梯度分别写回一次分配的 grad_gate_up 的对应半区（两半区
     互不相交且并集完整）。
+
+    ``return_hidden=True`` 时同时返回由同一份 ``silu(gate)``
+    重算的隐藏层，供下投影权重的梯度复用，避免再算一次 SiLU。
     """
     gate, up = gate_up.chunk(2, dim=-1)
 
@@ -397,9 +401,16 @@ def _swiglu_backward(
         grad_input=grad_gate,
     )
 
-    # grad_up = grad_hidden * silu(gate)。
+    # grad_up = grad_hidden * silu(gate)。silu(gate) 先原地
+    # 写入 grad_up 半区；需要隐藏层时在同一份 silu 结果上
+    # 乘 up 得到 hidden，省去一次独立的 SiLU 计算。
     torch.ops.aten.silu.out(gate, out=grad_up)
+    hidden = None
+    if return_hidden:
+        hidden = torch.mul(grad_up, up)
     torch.mul(grad_hidden, grad_up, out=grad_up)
+    if return_hidden:
+        return grad_gate_up, hidden
     return grad_gate_up
 
 
@@ -455,10 +466,6 @@ class _SwiGLUDown(torch.autograd.Function):
     ) -> tuple:
         gate_up, down_weight = ctx.saved_tensors
 
-        # 隐藏层按需重算：与 forward 同一算子、同一顺序。
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden = F.silu(gate).mul_(up)
-
         # autocast 下单专家路径的权重与激活可能不同 dtype，计算
         # 前对齐，返回梯度时再还原为权重的 dtype。
         compute_weight = down_weight
@@ -470,6 +477,11 @@ class _SwiGLUDown(torch.autograd.Function):
             # grad_out @ W；grad_W 来自 hidden^T @ grad_out 的
             # 转置视图。
             grad_hidden = torch.bmm(grad_out, compute_weight)
+            grad_gate_up, hidden = _swiglu_backward(
+                grad_hidden,
+                gate_up,
+                return_hidden=True,
+            )
             grad_weight = torch.bmm(
                 hidden.transpose(1, 2),
                 grad_out,
@@ -479,6 +491,11 @@ class _SwiGLUDown(torch.autograd.Function):
             # 前导维（如 dense 模式的 [batch, time, dim]），权重的
             # 梯度按全部前导维求和，与线性层反向的展平口径一致。
             grad_hidden = torch.matmul(grad_out, compute_weight)
+            grad_gate_up, hidden = _swiglu_backward(
+                grad_hidden,
+                gate_up,
+                return_hidden=True,
+            )
             grad_weight = torch.matmul(
                 grad_out.reshape(
                     -1,
@@ -490,7 +507,7 @@ class _SwiGLUDown(torch.autograd.Function):
         if grad_weight.dtype != down_weight.dtype:
             grad_weight = grad_weight.to(down_weight.dtype)
 
-        return _swiglu_backward(grad_hidden, gate_up), grad_weight
+        return grad_gate_up, grad_weight
 
 
 class Expert(nn.Module):
@@ -680,6 +697,84 @@ class _MergeExpertOutputs(torch.autograd.Function):
         return (None, None) + tuple(segment_grads)
 
 
+class _ScatterPaddedExpertOutputs(torch.autograd.Function):
+    """
+    把填充缓冲中的各专家有效输出散射回原始 assignment 顺序。
+
+    dispatch 的常见路径（无溢出）不再先 ``index_select`` 出
+    一份 [total, dim] 临时张量再 ``index_copy_``，而是按专家
+    逐段直接写入输出缓冲：前向少一份 [total, dim] 峰值激活，
+    反向也少一份同规模临时梯度。每段只是整行拷贝，数值与
+    原「gather + scatter」路径逐位一致；反向把上游梯度按同样
+    的段映射写回填充缓冲，未使用的填充行梯度恒为 0。
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        padded: torch.Tensor,
+        perm: torch.Tensor,
+        counts: List[int],
+        cap: int,
+    ) -> torch.Tensor:
+        ctx.cap = int(cap)
+        ctx.counts = tuple(int(count) for count in counts)
+        ctx.shape = padded.shape
+        ctx.dtype = padded.dtype
+        ctx.device = padded.device
+
+        final = torch.empty(
+            perm.numel(),
+            padded.size(-1),
+            dtype=padded.dtype,
+            device=padded.device,
+        )
+        offset = 0
+        for expert, count in enumerate(ctx.counts):
+            if count > 0:
+                final.index_copy_(
+                    0,
+                    perm[offset:offset + count],
+                    padded[
+                        expert * ctx.cap:
+                        expert * ctx.cap + count
+                    ],
+                )
+            offset += count
+
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(perm)
+        return final
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_final: torch.Tensor,
+    ) -> tuple:
+        (perm,) = ctx.saved_tensors
+
+        grad_padded = torch.zeros(
+            ctx.shape,
+            dtype=ctx.dtype,
+            device=ctx.device,
+        )
+        offset = 0
+        for expert, count in enumerate(ctx.counts):
+            if count > 0:
+                grad_padded[
+                    expert * ctx.cap:
+                    expert * ctx.cap + count
+                ].copy_(
+                    grad_final.index_select(
+                        0,
+                        perm[offset:offset + count],
+                    )
+                )
+            offset += count
+
+        return grad_padded, None, None, None
+
+
 class SparseMoE(nn.Module):
     """
     Token-level top-k MoE。
@@ -761,6 +856,7 @@ class SparseMoE(nn.Module):
         self,
         device: torch.device,
         n: int,
+        dtype: torch.dtype = torch.int64,
     ) -> torch.Tensor:
         """
         dispatch 热路径的行下标 arange 缓存。
@@ -768,14 +864,15 @@ class SparseMoE(nn.Module):
         形状跨调用稳定（total 只有少数几个取值），首次分配后
         全命中；缓存张量只被读取（消费它的算术均为
         out-of-place），字节封顶防止形状漂移时无界增长，
-        _apply 迁移设备时清空。
+        _apply 迁移设备时清空。CUDA 上用 int32 下标（显存与
+        索引带宽减半），CPU 保持 int64。
         """
-        key = (device, n)
+        key = (device, dtype, n)
         cached = self._aranges.get(key)
         if cached is not None:
             return cached
 
-        tensor = torch.arange(n, device=device)
+        tensor = torch.arange(n, device=device, dtype=dtype)
         bytes_needed = n * tensor.element_size()
         if (
             self._arange_bytes + bytes_needed
@@ -1187,7 +1284,9 @@ class SparseMoE(nn.Module):
         # 按段切片分发。同一专家内部的行序不影响结果
         #（专家按行独立计算，散射下标互不重复），因此无需
         # 稳定排序；torch.sort 在相同输入上是确定性的。
-        _, perm = torch.sort(assignment_experts)
+        # 排序值即排序后每行所属专家（seg_id），直接复用，
+        # 省掉一次 [total] 的 index_select。
+        seg_id, perm = torch.sort(assignment_experts)
 
         # 展平后的 assignment 下标 j 对应 token j // top_k；
         # top_k == 1 时排序下标本身就是 token 下标。
@@ -1223,20 +1322,39 @@ class SparseMoE(nn.Module):
         cap = -(-total // n_experts)
         cap += 4 * math.isqrt(max(1, cap)) + 1
 
-        # 各专家段在排序序列中的起始行，以及排序后第 j 行
-        # 所属专家。
-        starts = torch.cumsum(counts, dim=0) - counts
-        seg_id = assignment_experts.index_select(0, perm)
+        # 各专家段在排序序列中的起始行（cumsum 结果原地减去
+        # counts 得到 exclusive 前缀和，少一次小张量分配）。
+        starts = torch.cumsum(counts, dim=0)
+        starts.sub_(counts)
+
+        # CUDA 上下标收窄为 int32（与上面的排序键一致）：索引
+        # 带宽与显存减半。行数达到 int32 上限的极端情况仍用
+        # int64，避免溢出。
+        index_dtype = (
+            torch.int32
+            if device.type == "cuda" and total < 2 ** 31
+            else torch.int64
+        )
+        if index_dtype == torch.int32:
+            starts = starts.to(index_dtype)
 
         # 溢出判定只需要看每专家的 assignment 数：同一专家的段在
         # 排序序列中连续，段内局部行号为 0..counts[e]-1，因此
-        # 「存在溢出」等价于 counts 的最大值超过容量。判定放在
-        # 构造掩码之前：常规无溢出路径不产生掩码，也不需要
-        # clamp 与回退分支。
-        has_overflow = bool(counts.max() > cap)
+        # 「存在溢出」等价于 counts 的最大值超过容量。先在设备上
+        # 取一次最大值（单次同步），Python 侧比较避免额外的比较
+        # 核；判定放在构造掩码之前：常规无溢出路径不产生掩码，
+        # 也不需要 clamp 与回退分支。
+        # 一次取回逐专家计数（供溢出判定与按专家分段散射复用），
+        # 只同步一次。
+        counts_list = counts.tolist()
+        has_overflow = max(counts_list) > cap
 
         # 行下标经 _cached_arange 复用（形状跨调用稳定）。
-        row_ids = self._cached_arange(device, total)
+        row_ids = self._cached_arange(
+            device,
+            total,
+            index_dtype,
+        )
 
         # 目标行号 dest[j] = seg_id[j] * cap + (j - starts[seg_id[j]])
         # 展开为 j + (seg_id[j] * cap - starts[seg_id[j]])：每专家
@@ -1244,7 +1362,11 @@ class SparseMoE(nn.Module):
         # 路径再单独算段内局部行号（罕见）。
         dest = row_ids + (
             (
-                self._cached_arange(device, n_experts) * cap
+                self._cached_arange(
+                    device,
+                    n_experts,
+                    index_dtype,
+                ) * cap
                 - starts
             ).index_select(0, seg_id)
         )
@@ -1290,12 +1412,23 @@ class SparseMoE(nn.Module):
 
         # 直接散射回原始（未排序）assignment 顺序：perm[j] 是排序
         # 行 j 的原始位置，因此 final[perm[j]] = 专家输出。
-        final = out.new_empty(total, dim)
-        final.index_copy_(
-            0,
-            out_index,
-            out.index_select(0, copy_index),
-        )
+        if has_overflow:
+            # 溢出路径的 perm/计数不是逐专家完整段，退回通用的
+            # gather + scatter（仅在容量余量不足的罕见步触发）。
+            final = out.new_empty(total, dim)
+            final.index_copy_(
+                0,
+                out_index,
+                out.index_select(0, copy_index),
+            )
+        else:
+            # 常见路径按专家逐段散射，避免 [total, dim] 临时张量。
+            final = _ScatterPaddedExpertOutputs.apply(
+                out,
+                perm,
+                counts_list,
+                cap,
+            )
 
         # 溢出回退：容量外的 assignment 由对应专家的 2D 前向计算
         # 后写入同一缓冲（余量下通常不触发）。
@@ -3161,6 +3294,7 @@ def audit_data_splits(
     dataset: ByteDataset,
     include_test: bool = False,
     max_windows: int = _AUDIT_MAX_WINDOWS,
+    cache_scans: bool = False,
 ) -> Dict[str, object]:
     """
     数据审计：值域校验、文本完整性、分布偏移与重复窗口检测。
@@ -3238,13 +3372,37 @@ def audit_data_splits(
         )
 
         begin, end = dataset.split_bounds[split]
-        scans[split] = _window_signature_scan(
-            dataset._raw,
+        # 训练前审计与解封测试集时的审计都会扫描 train/val；
+        # 数据在运行期间不可变，按 (起点, 长度, 窗口, 上限) 缓存
+        # 扫描结果，避免最终审计重复做一次全量哈希。
+        scan_cache = getattr(
+            dataset, "_audit_scan_cache", None
+        )
+        scan_key = (
             begin,
             end - begin,
             dataset.seq_len + 1,
             max_windows,
         )
+        scan = (
+            scan_cache.get(scan_key)
+            if scan_cache is not None
+            else None
+        )
+        if scan is None:
+            scan = _window_signature_scan(
+                dataset._raw,
+                begin,
+                end - begin,
+                dataset.seq_len + 1,
+                max_windows,
+            )
+            if cache_scans:
+                if scan_cache is None:
+                    scan_cache = {}
+                    dataset._audit_scan_cache = scan_cache
+                scan_cache[scan_key] = scan
+        scans[split] = scan
         if dataset.group_separator is None:
             integrity = _scan_text_integrity(
                 dataset._raw,
@@ -3534,6 +3692,11 @@ _AUC_MIN_SUPPORT = 20
 # 概率矩阵会随该上限线性增长；默认验证窗口约 8 万位置，
 # 不会触顶）。超出时按窗口顺序截断并在结果中注明。
 _AUC_MAX_TOKENS = 100_000
+
+# AUC 收集按行分块做 fp32 softmax 与 D2H：每块最多这么多行，
+# 避免一次性物化 [剩余 token, vocab] 的 fp32 概率矩阵
+#（100k × 256 × 4B ≈ 100MB）。逐行 softmax 与整批结果逐位一致。
+_AUC_SOFTMAX_CHUNK_ROWS = 8192
 
 # AUC 分块排序的块大小上限（纳入类数 × 评估位置数）：
 # 块内一次批量排序，块规模固定使中间量有界（10 万位置
@@ -3881,6 +4044,7 @@ def evaluate(
     split: str = "val",
     compute_auc: bool = False,
     routing_probe: Optional["RoutingProbe"] = None,
+    bad_case_collector: Optional["_BadCaseCollector"] = None,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -3965,6 +4129,11 @@ def evaluate(
     auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
 
+    # CUDA 下收集缓冲使用锁页内存并异步 D2H：转移与下一批
+    # 前向重叠，避免每批一次全设备同步；全部批次结束后统一
+    # 同步一次。CPU/非锁页路径保持原有的同步语义。
+    auc_async = compute_auc and device.type == "cuda"
+
     if compute_auc:
         _, eval_data = dataset._eval_windows(split)
         num_starts = len(eval_data) - dataset.seq_len
@@ -3977,10 +4146,12 @@ def evaluate(
             auc_capacity,
             vocab_size,
             dtype=torch.float32,
+            pin_memory=auc_async,
         )
         auc_targets = torch.empty(
             auc_capacity,
             dtype=torch.int64,
+            pin_memory=auc_async,
         )
 
     try:
@@ -4009,6 +4180,11 @@ def evaluate(
                 # softmax 仍在 fp32 下统计，避免半精度数值噪声
                 # 影响逐类指标。
                 raw_logits = result.pop("logits")
+
+                # 坏案例收集复用同一次前向（仅最终评估传入）；
+                # 不影响下面任何指标的计算与数值。
+                if bad_case_collector is not None:
+                    bad_case_collector.update(x, y, raw_logits)
 
                 predicted = raw_logits.argmax(dim=-1)
                 flat_target = y.reshape(-1).to(
@@ -4041,21 +4217,44 @@ def evaluate(
                     remaining = (
                         _AUC_MAX_TOKENS - auc_tokens
                     )
-                    probs = F.softmax(
-                        raw_logits.reshape(
-                            -1,
-                            vocab_size,
-                        )[:remaining].float(),
-                        dim=-1,
+                    flat_logits = raw_logits.reshape(
+                        -1,
+                        vocab_size,
                     )
-                    num_new = probs.size(0)
-                    # 直接 D2H 拷入 CPU 收集缓冲。
-                    auc_probs[
-                        auc_tokens:auc_tokens + num_new
-                    ].copy_(probs)
+                    num_new = min(
+                        remaining,
+                        flat_logits.size(0),
+                    )
+                    # 按行分块：逐行 softmax 与整批等价，但
+                    # 峰值 fp32 概率矩阵被限制在单块大小。
+                    for start in range(
+                        0,
+                        num_new,
+                        _AUC_SOFTMAX_CHUNK_ROWS,
+                    ):
+                        stop = min(
+                            start + _AUC_SOFTMAX_CHUNK_ROWS,
+                            num_new,
+                        )
+                        probs = F.softmax(
+                            flat_logits[start:stop].float(),
+                            dim=-1,
+                        )
+                        # 直接 D2H 拷入 CPU 收集缓冲；锁页
+                        # 缓冲下异步执行，循环结束统一同步。
+                        auc_probs[
+                            auc_tokens + start:
+                            auc_tokens + stop
+                        ].copy_(
+                            probs,
+                            non_blocking=auc_async,
+                        )
                     auc_targets[
                         auc_tokens:auc_tokens + num_new
-                    ].copy_(flat_target[:num_new])
+                    ].copy_(
+                        flat_target[:num_new],
+                        non_blocking=auc_async,
+                    )
                     auc_tokens += num_new
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
@@ -4087,6 +4286,10 @@ def evaluate(
         metrics[f"{split}_{key}"] = value
 
     if compute_auc:
+        # 异步 D2H 全部入队后，在读取 CPU 收集缓冲前统一等待。
+        if auc_async and auc_tokens > 0:
+            torch.cuda.synchronize(device)
+
         if auc_tokens > 0:
             auc_metrics = macro_auc_metrics(
                 auc_probs[:auc_tokens],
@@ -5980,6 +6183,551 @@ def _render_bytes(values) -> str:
     return "".join(_render_byte(value) for value in values)
 
 
+def _bad_case_report_from_buffers(
+    loss_buffer: torch.Tensor,
+    target_buffer: torch.Tensor,
+    predicted_buffer: torch.Tensor,
+    confidence_buffer: torch.Tensor,
+    margin_buffer: torch.Tensor,
+    written: int,
+    top_candidates: List[
+        Tuple[float, int, torch.Tensor, int, int, int, float, float]
+    ],
+    split: str,
+    top_n: int,
+    context_before: int,
+    context_after: int,
+    vocab_size: int,
+) -> Dict[str, object]:
+    """由紧凑逐 token 缓冲生成坏案例报告（供流式收集器复用）。"""
+    loss_all = loss_buffer[:written]
+    target_all = target_buffer[:written].to(torch.int64)
+    predicted_all = predicted_buffer[:written].to(torch.int64)
+    confidence_all = confidence_buffer[:written].float()
+    margin_all = margin_buffer[:written].float()
+
+    num_tokens = loss_all.numel()
+
+    wrong_mask = target_all != predicted_all
+    token_accuracy = float(
+        (1.0 - wrong_mask.float().mean()).item()
+    )
+
+    # 逐目标字节在评估 split 中的占比，用于标注噪声提示。
+    target_counts = torch.bincount(
+        target_all,
+        minlength=vocab_size,
+    ).to(torch.float64)
+    target_share = target_counts / max(1.0, float(num_tokens))
+
+    # 高频混淆对：target * vocab + predicted。
+    confusion_index = (
+        target_all * vocab_size + predicted_all
+    )
+    confusion_counts = torch.bincount(
+        confusion_index[wrong_mask],
+        minlength=vocab_size * vocab_size,
+    )
+    confusion_count_by_token = confusion_counts[
+        confusion_index
+    ]
+
+    top_confusion_values, top_confusion_indices = torch.topk(
+        confusion_counts,
+        k=min(10, int((confusion_counts > 0).sum().item()) or 1),
+    )
+
+    top_confusions = []
+    for count, index in zip(
+        top_confusion_values.tolist(),
+        top_confusion_indices.tolist(),
+    ):
+        if count <= 0:
+            break
+        top_confusions.append([
+            int(index) // vocab_size,
+            int(index) % vocab_size,
+            int(count),
+        ])
+
+    # 逐目标字节错误率（只保留出现过的目标字节，按错误率排序）。
+    error_counts = torch.bincount(
+        target_all[wrong_mask],
+        minlength=vocab_size,
+    )
+    error_rate = torch.where(
+        target_counts > 0,
+        error_counts.to(torch.float64)
+        / target_counts.clamp(min=1),
+        torch.zeros(vocab_size, dtype=torch.float64),
+    )
+    seen = target_counts > 0
+    seen_indices = torch.nonzero(seen).reshape(-1)
+    seen_rates = error_rate[seen_indices]
+    order = torch.argsort(seen_rates, descending=True)
+    error_rate_by_target = []
+    for index in order[:10].tolist():
+        byte = int(seen_indices[index])
+        error_rate_by_target.append([
+            byte,
+            round(float(seen_rates[index]), 6),
+            int(target_counts[byte]),
+        ])
+
+    # 污染最严重的 top_n token：候选在流式循环中以「每批
+    # top-N + 跨批截断」精确维护（全局 top-N 必在各批
+    # top-N 内），这里只做最终排序与上下文渲染。
+    top_candidates.sort(
+        key=lambda entry: (-entry[0], entry[1])
+    )
+
+    top_cases = []
+    for rank, entry in enumerate(top_candidates):
+        (
+            entry_loss,
+            _entry_order,
+            window_row,
+            position,
+            target,
+            predicted,
+            confidence,
+            margin,
+        ) = entry
+
+        pair_count = int(
+            confusion_counts[
+                target * vocab_size + predicted
+            ]
+        )
+
+        if margin < _BAD_CASE_AMBIGUOUS_MARGIN:
+            category = "ambiguous"
+        elif (
+            pair_count >= _BAD_CASE_SYSTEMATIC_COUNT
+            and confidence >= 0.5
+        ):
+            category = "systematic_confusion"
+        elif (
+            confidence >= _BAD_CASE_CONFIDENT
+            and float(target_share[target])
+            < _BAD_CASE_RARE_TARGET_SHARE
+        ):
+            category = "label_noise_suspect"
+        else:
+            category = "uncertain"
+
+        # 窗口 = [x[0]] + y，目标 token 是窗口的第
+        # position+1 个元素（候选构建时已知）。
+        target_position = position + 1
+        begin = max(0, target_position - context_before)
+        end = min(
+            window_row.numel(),
+            target_position + 1 + context_after,
+        )
+        fragment = window_row[begin:end].tolist()
+        marker = target_position - begin
+
+        context = (
+            _render_bytes(fragment[:marker])
+            + "["
+            + _render_byte(target)
+            + "]"
+            + _render_bytes(fragment[marker + 1:])
+        )
+
+        top_cases.append({
+            "rank": rank + 1,
+            "target": target,
+            "target_text": _render_byte(target),
+            "predicted": predicted,
+            "predicted_text": _render_byte(predicted),
+            "loss": round(float(entry_loss), 6),
+            "confidence": round(confidence, 6),
+            "margin": round(margin, 6),
+            "category": category,
+            "confusion_count": pair_count,
+            "context": context,
+            "window_text": _render_bytes(
+                window_row.tolist()
+            ),
+        })
+
+    category_counts: Dict[str, int] = {}
+    for case in top_cases:
+        key = str(case["category"])
+        category_counts[key] = (
+            category_counts.get(key, 0) + 1
+        )
+
+    # 全量错误 token 的类别归因（不只是 top_n 个最差样本）：
+    # 错误原因分布是提出新改进思路的最重要证据，必须按整个
+    # 评估 split 统计，避免「最高损失的几个样本正好都是同一
+    # 类」把结论带偏。分类规则与逐案例完全一致，优先级为
+    # ambiguous > systematic_confusion > label_noise_suspect
+    # > uncertain。
+    wrong_category_code = torch.full_like(target_all, 3)
+    wrong_category_code = torch.where(
+        (
+            (confidence_all >= _BAD_CASE_CONFIDENT)
+            & (
+                target_share[target_all]
+                < _BAD_CASE_RARE_TARGET_SHARE
+            )
+        ),
+        torch.full_like(wrong_category_code, 2),
+        wrong_category_code,
+    )
+    wrong_category_code = torch.where(
+        (
+            (confusion_count_by_token >= _BAD_CASE_SYSTEMATIC_COUNT)
+            & (confidence_all >= 0.5)
+        ),
+        torch.full_like(wrong_category_code, 1),
+        wrong_category_code,
+    )
+    wrong_category_code = torch.where(
+        margin_all < _BAD_CASE_AMBIGUOUS_MARGIN,
+        torch.full_like(wrong_category_code, 0),
+        wrong_category_code,
+    )
+    wrong_category_code = wrong_category_code[wrong_mask]
+
+    category_names = (
+        "ambiguous",
+        "systematic_confusion",
+        "label_noise_suspect",
+        "uncertain",
+    )
+    wrong_tokens = int(wrong_mask.sum())
+    error_category_counts = {
+        name: int((wrong_category_code == code).sum())
+        for code, name in enumerate(category_names)
+    }
+    error_category_shares = {
+        name: (
+            round(count / wrong_tokens, 6)
+            if wrong_tokens > 0
+            else None
+        )
+        for name, count in error_category_counts.items()
+    }
+
+    top1 = top_cases[0] if top_cases else None
+    dominant_category = (
+        max(
+            error_category_counts,
+            key=lambda name: error_category_counts[name],
+        )
+        if wrong_tokens > 0
+        else None
+    )
+    summary = (
+        f"评估 {num_tokens} 个 token，token 准确率 "
+        f"{token_accuracy:.4f}（{wrong_tokens} 个错误）；"
+        + (
+            "全量错误归因以 "
+            f"{dominant_category}"
+            f"（{error_category_shares[dominant_category] * 100:.1f}%）"
+            "为主；最差样本 "
+            if dominant_category is not None
+            else "无错误 token；最差样本 "
+        )
+        + (
+            "target="
+            f"'{_render_byte(int(top1['target']))}', "
+            "predicted="
+            f"'{_render_byte(int(top1['predicted']))}', "
+            f"loss={float(top1['loss']):.4f}, "
+            f"category={top1['category']}。"
+            if top1 is not None
+            else "无。"
+        )
+    )
+
+    report: Dict[str, object] = {
+        "split": split,
+        "tokens_evaluated": int(num_tokens),
+        "token_accuracy": round(token_accuracy, 6),
+        "wrong_tokens": wrong_tokens,
+        "top_cases": top_cases,
+        "top_confusions": top_confusions,
+        "error_rate_by_target": error_rate_by_target,
+        "category_counts": category_counts,
+        "error_category_counts": error_category_counts,
+        "error_category_shares": error_category_shares,
+        "summary": summary,
+    }
+
+    return report
+
+
+class _BadCaseCollector:
+    """
+    在评估前向中流式收集坏案例所需的全量紧凑统计。
+
+    ``evaluate`` 与 ``analyze_bad_cases`` 使用完全相同的固定
+    窗口与预测口径；最终评估时把收集器传入 ``evaluate``，即可
+    复用同一次前向，避免为坏案例分析再跑一遍验证/测试集。
+    收集器只保留逐 token 标量与 top-N 窗口，内存占用与独立
+    分析路径一致。
+    """
+
+    def __init__(
+        self,
+        dataset: ByteDataset,
+        split: str,
+        batch_size: int,
+        batches: int,
+        top_n: int,
+        context_before: int = 16,
+        context_after: int = 8,
+        device: Optional[torch.device] = None,
+    ):
+        self.split = split
+        self.top_n = top_n
+        self.context_before = context_before
+        self.context_after = context_after
+        self.device = device
+        self.sequence_length = dataset.seq_len
+
+        _, eval_data = dataset._eval_windows(split)
+        num_starts = len(eval_data) - self.sequence_length
+        capacity = (
+            min(batches * batch_size, num_starts)
+            * self.sequence_length
+        )
+
+        self.async_copy = (
+            device is not None and device.type == "cuda"
+        )
+        pin = self.async_copy
+        self.loss_buffer = torch.empty(
+            capacity, dtype=torch.float32, pin_memory=pin
+        )
+        self.target_buffer = torch.empty(
+            capacity, dtype=torch.uint8, pin_memory=pin
+        )
+        self.predicted_buffer = torch.empty(
+            capacity, dtype=torch.int16, pin_memory=pin
+        )
+        self.confidence_buffer = torch.empty(
+            capacity, dtype=torch.float16, pin_memory=pin
+        )
+        self.margin_buffer = torch.empty(
+            capacity, dtype=torch.float16, pin_memory=pin
+        )
+
+        self.top_candidates: List[
+            Tuple[
+                float,
+                int,
+                torch.Tensor,
+                int,
+                int,
+                int,
+                float,
+                float,
+            ]
+        ] = []
+        self.pending_candidates: List[
+            Dict[str, torch.Tensor]
+        ] = []
+        self._candidates_materialized = False
+        self.written = 0
+
+    def update(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> None:
+        """处理一个评估批（与 analyze_bad_cases 的单批逻辑一致）。"""
+        logits = logits.float()
+
+        log_normalizer = torch.logsumexp(logits, dim=-1)
+        target_logits = logits.gather(
+            -1,
+            y.unsqueeze(-1).to(torch.int64),
+        ).squeeze(-1)
+        loss_tokens = log_normalizer - target_logits
+
+        top_values, predicted = logits.max(dim=-1)
+        confidence = (top_values - log_normalizer).exp()
+        target_probability = (
+            target_logits - log_normalizer
+        ).exp()
+
+        window = torch.cat(
+            [x[:, :1].to(torch.uint8), y],
+            dim=1,
+        )
+
+        batch_loss = loss_tokens.reshape(-1)
+        batch_target = y.reshape(-1)
+        batch_predicted = predicted.reshape(-1)
+        batch_confidence = confidence.reshape(-1)
+        batch_margin = (
+            confidence - target_probability
+        ).reshape(-1)
+
+        batch_rows = batch_loss.numel()
+        batch_end = self.written + batch_rows
+        self.loss_buffer[
+            self.written:batch_end
+        ].copy_(
+            batch_loss, non_blocking=self.async_copy
+        )
+        self.target_buffer[
+            self.written:batch_end
+        ].copy_(
+            batch_target.to(torch.uint8),
+            non_blocking=self.async_copy,
+        )
+        self.predicted_buffer[
+            self.written:batch_end
+        ].copy_(
+            batch_predicted.to(torch.int16),
+            non_blocking=self.async_copy,
+        )
+        self.confidence_buffer[
+            self.written:batch_end
+        ].copy_(
+            batch_confidence.to(torch.float16),
+            non_blocking=self.async_copy,
+        )
+        self.margin_buffer[
+            self.written:batch_end
+        ].copy_(
+            batch_margin.to(torch.float16),
+            non_blocking=self.async_copy,
+        )
+        self.written = batch_end
+
+        if self.top_n > 0 and batch_loss.numel() > 0:
+            batch_k = min(self.top_n, batch_loss.numel())
+            batch_top_losses, batch_top_indices = (
+                torch.topk(batch_loss, k=batch_k)
+            )
+            batch_top_indices = (
+                batch_top_indices.reshape(-1)
+            )
+            rows = torch.div(
+                batch_top_indices,
+                self.sequence_length,
+                rounding_mode="floor",
+            )
+            # 候选数据先在设备上暂存，报告阶段一次取回：
+            # 每批 top-N 已经保证全局 top-N 必在并集中，
+            # 最终按 (loss, 插入序号) 排序截断即可。
+            self.pending_candidates.append({
+                "losses": batch_top_losses,
+                "indices": batch_top_indices,
+                "windows": window.index_select(0, rows),
+                "targets": batch_target.index_select(
+                    0, batch_top_indices
+                ),
+                "predicted": batch_predicted.index_select(
+                    0, batch_top_indices
+                ),
+                "confidence": batch_confidence.index_select(
+                    0, batch_top_indices
+                ),
+                "margin": batch_margin.index_select(
+                    0, batch_top_indices
+                ),
+            })
+
+    def _materialize_candidates(self) -> None:
+        """一次性取回流式暂存的 top-N 候选并重建全局列表。"""
+        if self._candidates_materialized:
+            return
+        self._candidates_materialized = True
+
+        if not self.pending_candidates:
+            return
+
+        losses = torch.cat(
+            [item["losses"] for item in self.pending_candidates]
+        ).cpu().tolist()
+        indices = torch.cat(
+            [item["indices"] for item in self.pending_candidates]
+        ).cpu().tolist()
+        windows = torch.cat(
+            [item["windows"] for item in self.pending_candidates]
+        ).cpu()
+        targets = torch.cat(
+            [item["targets"] for item in self.pending_candidates]
+        ).cpu().tolist()
+        predicted = torch.cat(
+            [item["predicted"] for item in self.pending_candidates]
+        ).cpu().tolist()
+        confidence = torch.cat(
+            [item["confidence"] for item in self.pending_candidates]
+        ).cpu().tolist()
+        margin = torch.cat(
+            [item["margin"] for item in self.pending_candidates]
+        ).cpu().tolist()
+
+        offset = 0
+        counter = 0
+        for item in self.pending_candidates:
+            count = int(item["losses"].numel())
+            for slot in range(offset, offset + count):
+                self.top_candidates.append((
+                    float(losses[slot]),
+                    counter,
+                    windows[slot],
+                    int(indices[slot])
+                    % self.sequence_length,
+                    int(targets[slot]),
+                    int(predicted[slot]),
+                    float(confidence[slot]),
+                    float(margin[slot]),
+                ))
+                counter += 1
+            offset += count
+
+        self.pending_candidates.clear()
+        self.top_candidates.sort(
+            key=lambda entry: (-entry[0], entry[1])
+        )
+        del self.top_candidates[self.top_n:]
+
+    def report(self, vocab_size: int) -> Dict[str, object]:
+        """生成与独立分析路径逐位一致的坏案例报告。"""
+        if self.async_copy and self.written > 0:
+            torch.cuda.synchronize(self.device)
+
+        self._materialize_candidates()
+
+        if self.written == 0:
+            return {
+                "split": self.split,
+                "tokens_evaluated": 0,
+                "token_accuracy": None,
+                "top_cases": [],
+                "top_confusions": [],
+                "error_rate_by_target": [],
+                "category_counts": {},
+                "summary": "评估窗口为空，未生成坏案例。",
+            }
+
+        return _bad_case_report_from_buffers(
+            self.loss_buffer,
+            self.target_buffer,
+            self.predicted_buffer,
+            self.confidence_buffer,
+            self.margin_buffer,
+            self.written,
+            self.top_candidates,
+            self.split,
+            self.top_n,
+            self.context_before,
+            self.context_after,
+            vocab_size,
+        )
+
+
 @torch.inference_mode()
 def analyze_bad_cases(
     model: LanguageModel,
@@ -5992,6 +6740,7 @@ def analyze_bad_cases(
     top_n: int = 10,
     context_before: int = 16,
     context_after: int = 8,
+    collector: Optional["_BadCaseCollector"] = None,
 ) -> Dict[str, object]:
     """
     坏案例分析：把预测错误的样本打印出来并归类错误原因。
@@ -6020,7 +6769,15 @@ def analyze_bad_cases(
     测试集；输出既打印，也写回 metrics.jsonl 的
     ``{"step": "bad_cases", ...}`` 记录，完整报告另存
     bad_cases.json，作为提出新改进思路的证据来源。
+
+    ``collector`` 非 None 时直接复用最终 ``evaluate`` 已完成的
+    同窗口前向统计，不再重复跑一遍模型。
     """
+    if collector is not None:
+        return collector.report(
+            _unwrap_model(model).cfg.vocab_size
+        )
+
     was_training = model.training
     model.eval()
 
@@ -6043,11 +6800,24 @@ def analyze_bad_cases(
     _, eval_data = dataset._eval_windows(split)
     num_starts = len(eval_data) - sequence_length
     capacity = min(batches * batch_size, num_starts) * sequence_length
-    loss_buffer = torch.empty(capacity, dtype=torch.float32)
-    target_buffer = torch.empty(capacity, dtype=torch.uint8)
-    predicted_buffer = torch.empty(capacity, dtype=torch.int16)
-    confidence_buffer = torch.empty(capacity, dtype=torch.float16)
-    margin_buffer = torch.empty(capacity, dtype=torch.float16)
+    # CUDA 下用锁页缓冲异步 D2H：紧凑标量转移与下一批前向
+    # 重叠，全部批次结束后统一次同步。CPU 路径保持同步语义。
+    async_copy = device.type == "cuda"
+    loss_buffer = torch.empty(
+        capacity, dtype=torch.float32, pin_memory=async_copy
+    )
+    target_buffer = torch.empty(
+        capacity, dtype=torch.uint8, pin_memory=async_copy
+    )
+    predicted_buffer = torch.empty(
+        capacity, dtype=torch.int16, pin_memory=async_copy
+    )
+    confidence_buffer = torch.empty(
+        capacity, dtype=torch.float16, pin_memory=async_copy
+    )
+    margin_buffer = torch.empty(
+        capacity, dtype=torch.float16, pin_memory=async_copy
+    )
     written = 0
 
     # 全局 top-N 最差 token：每批先取本批 top-N 候选再跨批截断
@@ -6120,19 +6890,23 @@ def analyze_bad_cases(
                 batch_rows = batch_loss.numel()
                 batch_end = written + batch_rows
                 loss_buffer[written:batch_end].copy_(
-                    batch_loss.cpu()
+                    batch_loss, non_blocking=async_copy
                 )
                 target_buffer[written:batch_end].copy_(
-                    batch_target.cpu()
+                    batch_target.to(torch.uint8),
+                    non_blocking=async_copy,
                 )
                 predicted_buffer[written:batch_end].copy_(
-                    batch_predicted.to(torch.int16).cpu()
+                    batch_predicted.to(torch.int16),
+                    non_blocking=async_copy,
                 )
                 confidence_buffer[written:batch_end].copy_(
-                    batch_confidence.to(torch.float16).cpu()
+                    batch_confidence.to(torch.float16),
+                    non_blocking=async_copy,
                 )
                 margin_buffer[written:batch_end].copy_(
-                    batch_margin.to(torch.float16).cpu()
+                    batch_margin.to(torch.float16),
+                    non_blocking=async_copy,
                 )
                 written = batch_end
 
@@ -6142,28 +6916,59 @@ def analyze_bad_cases(
                     batch_top_losses, batch_top_indices = (
                         torch.topk(batch_loss, k=batch_k)
                     )
+                    # 一次同步取回本批候选损失，随后按索引一次性
+                    # 取回候选标量与窗口行，避免逐个元素同步。
                     batch_top_losses = (
                         batch_top_losses.cpu().tolist()
                     )
                     batch_top_indices = (
-                        batch_top_indices.reshape(-1).cpu()
+                        batch_top_indices.reshape(-1)
                     )
-                    window_cpu = window.cpu()
-                    for local_loss, local_index in zip(
+                    rows = torch.div(
+                        batch_top_indices,
+                        sequence_length,
+                        rounding_mode="floor",
+                    )
+                    candidate_target = (
+                        batch_target.index_select(
+                            0, batch_top_indices
+                        ).cpu().tolist()
+                    )
+                    candidate_predicted = (
+                        batch_predicted.index_select(
+                            0, batch_top_indices
+                        ).cpu().tolist()
+                    )
+                    candidate_confidence = (
+                        batch_confidence.index_select(
+                            0, batch_top_indices
+                        ).cpu().tolist()
+                    )
+                    candidate_margin = (
+                        batch_margin.index_select(
+                            0, batch_top_indices
+                        ).cpu().tolist()
+                    )
+                    window_cpu = window.index_select(0, rows).cpu()
+                    for candidate_slot, (
+                        local_loss,
+                        local_index,
+                    ) in enumerate(zip(
                         batch_top_losses,
                         batch_top_indices.tolist(),
-                    ):
-                        row = local_index // sequence_length
+                    )):
                         position = local_index % sequence_length
                         top_candidates.append((
                             float(local_loss),
                             top_insert_counter,
-                            window_cpu[row],
+                            window_cpu[candidate_slot],
                             position,
-                            int(batch_target[local_index]),
-                            int(batch_predicted[local_index]),
-                            float(batch_confidence[local_index]),
-                            float(batch_margin[local_index]),
+                            int(candidate_target[candidate_slot]),
+                            int(candidate_predicted[candidate_slot]),
+                            float(
+                                candidate_confidence[candidate_slot]
+                            ),
+                            float(candidate_margin[candidate_slot]),
                         ))
                         top_insert_counter += 1
 
@@ -6172,6 +6977,10 @@ def analyze_bad_cases(
                             key=lambda entry: (-entry[0], entry[1])
                         )
                         del top_candidates[top_n:]
+
+        # 异步 D2H 全部入队后，读取 CPU 缓冲前统一等待。
+        if async_copy and written > 0:
+            torch.cuda.synchronize(device)
 
         if written == 0:
             return {
@@ -6185,265 +6994,20 @@ def analyze_bad_cases(
                 "summary": "评估窗口为空，未生成坏案例。",
             }
 
-        loss_all = loss_buffer[:written]
-        target_all = target_buffer[:written].to(torch.int64)
-        predicted_all = predicted_buffer[:written].to(torch.int64)
-        confidence_all = confidence_buffer[:written].float()
-        margin_all = margin_buffer[:written].float()
-
-        num_tokens = loss_all.numel()
-
-        wrong_mask = target_all != predicted_all
-        token_accuracy = float(
-            (1.0 - wrong_mask.float().mean()).item()
+        return _bad_case_report_from_buffers(
+            loss_buffer,
+            target_buffer,
+            predicted_buffer,
+            confidence_buffer,
+            margin_buffer,
+            written,
+            top_candidates,
+            split,
+            top_n,
+            context_before,
+            context_after,
+            vocab_size,
         )
-
-        # 逐目标字节在评估 split 中的占比，用于标注噪声提示。
-        target_counts = torch.bincount(
-            target_all,
-            minlength=vocab_size,
-        ).to(torch.float64)
-        target_share = target_counts / max(1.0, float(num_tokens))
-
-        # 高频混淆对：target * vocab + predicted。
-        confusion_index = (
-            target_all * vocab_size + predicted_all
-        )
-        confusion_counts = torch.bincount(
-            confusion_index[wrong_mask],
-            minlength=vocab_size * vocab_size,
-        )
-        confusion_count_by_token = confusion_counts[
-            confusion_index
-        ]
-
-        top_confusion_values, top_confusion_indices = torch.topk(
-            confusion_counts,
-            k=min(10, int((confusion_counts > 0).sum().item()) or 1),
-        )
-
-        top_confusions = []
-        for count, index in zip(
-            top_confusion_values.tolist(),
-            top_confusion_indices.tolist(),
-        ):
-            if count <= 0:
-                break
-            top_confusions.append([
-                int(index) // vocab_size,
-                int(index) % vocab_size,
-                int(count),
-            ])
-
-        # 逐目标字节错误率（只保留出现过的目标字节，按错误率排序）。
-        error_counts = torch.bincount(
-            target_all[wrong_mask],
-            minlength=vocab_size,
-        )
-        error_rate = torch.where(
-            target_counts > 0,
-            error_counts.to(torch.float64)
-            / target_counts.clamp(min=1),
-            torch.zeros(vocab_size, dtype=torch.float64),
-        )
-        seen = target_counts > 0
-        seen_indices = torch.nonzero(seen).reshape(-1)
-        seen_rates = error_rate[seen_indices]
-        order = torch.argsort(seen_rates, descending=True)
-        error_rate_by_target = []
-        for index in order[:10].tolist():
-            byte = int(seen_indices[index])
-            error_rate_by_target.append([
-                byte,
-                round(float(seen_rates[index]), 6),
-                int(target_counts[byte]),
-            ])
-
-        # 污染最严重的 top_n token：候选在流式循环中以「每批
-        # top-N + 跨批截断」精确维护（全局 top-N 必在各批
-        # top-N 内），这里只做最终排序与上下文渲染。
-        top_candidates.sort(
-            key=lambda entry: (-entry[0], entry[1])
-        )
-
-        top_cases = []
-        for rank, entry in enumerate(top_candidates):
-            (
-                entry_loss,
-                _entry_order,
-                window_row,
-                position,
-                target,
-                predicted,
-                confidence,
-                margin,
-            ) = entry
-
-            pair_count = int(
-                confusion_counts[
-                    target * vocab_size + predicted
-                ]
-            )
-
-            if margin < _BAD_CASE_AMBIGUOUS_MARGIN:
-                category = "ambiguous"
-            elif (
-                pair_count >= _BAD_CASE_SYSTEMATIC_COUNT
-                and confidence >= 0.5
-            ):
-                category = "systematic_confusion"
-            elif (
-                confidence >= _BAD_CASE_CONFIDENT
-                and float(target_share[target])
-                < _BAD_CASE_RARE_TARGET_SHARE
-            ):
-                category = "label_noise_suspect"
-            else:
-                category = "uncertain"
-
-            # 窗口 = [x[0]] + y，目标 token 是窗口的第
-            # position+1 个元素（候选构建时已知）。
-            target_position = position + 1
-            begin = max(0, target_position - context_before)
-            end = min(
-                window_row.numel(),
-                target_position + 1 + context_after,
-            )
-            fragment = window_row[begin:end].tolist()
-            marker = target_position - begin
-
-            context = (
-                _render_bytes(fragment[:marker])
-                + "["
-                + _render_byte(target)
-                + "]"
-                + _render_bytes(fragment[marker + 1:])
-            )
-
-            top_cases.append({
-                "rank": rank + 1,
-                "target": target,
-                "target_text": _render_byte(target),
-                "predicted": predicted,
-                "predicted_text": _render_byte(predicted),
-                "loss": round(float(entry_loss), 6),
-                "confidence": round(confidence, 6),
-                "margin": round(margin, 6),
-                "category": category,
-                "confusion_count": pair_count,
-                "context": context,
-                "window_text": _render_bytes(
-                    window_row.tolist()
-                ),
-            })
-
-        category_counts: Dict[str, int] = {}
-        for case in top_cases:
-            key = str(case["category"])
-            category_counts[key] = (
-                category_counts.get(key, 0) + 1
-            )
-
-        # 全量错误 token 的类别归因（不只是 top_n 个最差样本）：
-        # 错误原因分布是提出新改进思路的最重要证据，必须按整个
-        # 评估 split 统计，避免「最高损失的几个样本正好都是同一
-        # 类」把结论带偏。分类规则与逐案例完全一致，优先级为
-        # ambiguous > systematic_confusion > label_noise_suspect
-        # > uncertain。
-        wrong_category_code = torch.full_like(target_all, 3)
-        wrong_category_code = torch.where(
-            (
-                (confidence_all >= _BAD_CASE_CONFIDENT)
-                & (
-                    target_share[target_all]
-                    < _BAD_CASE_RARE_TARGET_SHARE
-                )
-            ),
-            torch.full_like(wrong_category_code, 2),
-            wrong_category_code,
-        )
-        wrong_category_code = torch.where(
-            (
-                (confusion_count_by_token >= _BAD_CASE_SYSTEMATIC_COUNT)
-                & (confidence_all >= 0.5)
-            ),
-            torch.full_like(wrong_category_code, 1),
-            wrong_category_code,
-        )
-        wrong_category_code = torch.where(
-            margin_all < _BAD_CASE_AMBIGUOUS_MARGIN,
-            torch.full_like(wrong_category_code, 0),
-            wrong_category_code,
-        )
-        wrong_category_code = wrong_category_code[wrong_mask]
-
-        category_names = (
-            "ambiguous",
-            "systematic_confusion",
-            "label_noise_suspect",
-            "uncertain",
-        )
-        wrong_tokens = int(wrong_mask.sum())
-        error_category_counts = {
-            name: int((wrong_category_code == code).sum())
-            for code, name in enumerate(category_names)
-        }
-        error_category_shares = {
-            name: (
-                round(count / wrong_tokens, 6)
-                if wrong_tokens > 0
-                else None
-            )
-            for name, count in error_category_counts.items()
-        }
-
-        top1 = top_cases[0] if top_cases else None
-        dominant_category = (
-            max(
-                error_category_counts,
-                key=lambda name: error_category_counts[name],
-            )
-            if wrong_tokens > 0
-            else None
-        )
-        summary = (
-            f"评估 {num_tokens} 个 token，token 准确率 "
-            f"{token_accuracy:.4f}（{wrong_tokens} 个错误）；"
-            + (
-                "全量错误归因以 "
-                f"{dominant_category}"
-                f"（{error_category_shares[dominant_category] * 100:.1f}%）"
-                "为主；最差样本 "
-                if dominant_category is not None
-                else "无错误 token；最差样本 "
-            )
-            + (
-                "target="
-                f"'{_render_byte(int(top1['target']))}', "
-                "predicted="
-                f"'{_render_byte(int(top1['predicted']))}', "
-                f"loss={float(top1['loss']):.4f}, "
-                f"category={top1['category']}。"
-                if top1 is not None
-                else "无。"
-            )
-        )
-
-        report: Dict[str, object] = {
-            "split": split,
-            "tokens_evaluated": int(num_tokens),
-            "token_accuracy": round(token_accuracy, 6),
-            "wrong_tokens": wrong_tokens,
-            "top_cases": top_cases,
-            "top_confusions": top_confusions,
-            "error_rate_by_target": error_rate_by_target,
-            "category_counts": category_counts,
-            "error_category_counts": error_category_counts,
-            "error_category_shares": error_category_shares,
-            "summary": summary,
-        }
-
-        return report
     finally:
         model.train(was_training)
 
@@ -6673,14 +7237,17 @@ class RoutingProbe:
         self,
         x: torch.Tensor,
         branch_dim: int,
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """
         分支表示的两两余弦相似度（mean 与最小 pair）。
 
         余弦接近 1 说明分支轨迹几乎重合（延迟合并没有带来
         独立计算）；明显小于 1 说明分支确实在分化。逐 pair
-        统计先在设备上堆叠，最后一次取回；均值/最小值仍在
-        Python 侧按同一顺序计算。
+        统计先在设备上堆叠；均值/最小值保持为设备标量，由
+        build_report 与其他路由统计一起一次性取回。
         """
         branches = int(x.size(branch_dim))
         if branches < 2:
@@ -6703,12 +7270,11 @@ class RoutingProbe:
                 cosine = (moved[i] * moved[j]).sum(dim=-1)
                 pair_tensors.append(cosine.mean())
 
-        pair_means = torch.stack(pair_tensors).tolist()
+        pair_means = torch.stack(pair_tensors)
 
-        return (
-            sum(pair_means) / len(pair_means),
-            min(pair_means),
-        )
+        # 保持为 0 维设备张量，由 build_report 一次性取回；
+        # 避免每次 route 记录都触发一次设备同步。
+        return pair_means.mean(), pair_means.min()
 
     def record(
         self,
@@ -6777,8 +7343,8 @@ class RoutingProbe:
                 router_entropy = probs.new_zeros(())
                 load_entropy = probs.new_zeros(())
 
-            branch_mean: Optional[float] = None
-            branch_min: Optional[float] = None
+            branch_mean: Optional[torch.Tensor] = None
+            branch_min: Optional[torch.Tensor] = None
             cfg = self.cfg
             shape = x.shape
             is_middle = cfg.middle_start <= block < cfg.middle_end
@@ -6812,14 +7378,27 @@ class RoutingProbe:
                     self._branch_cosine_stats(x, branch_dim)
                 )
 
-            # 统计量在设备上累积后一次性取回。
-            scalars = torch.stack([
+            # 统计量全部留在设备上，build_report 时一次取回；
+            # 逐条记录内不做 .tolist()/.cpu()，避免每次 route
+            # 都触发一次 CUDA 同步。
+            scalar_values = [
                 router_entropy.to(torch.float64),
                 load_entropy.to(torch.float64),
                 usage_share.max().to(torch.float64),
                 (usage == 0).sum().to(torch.float64),
                 probs.max(-1).values.mean().to(torch.float64),
-            ]).tolist()
+            ]
+            if branch_mean is None:
+                nan = router_entropy.new_tensor(
+                    float("nan")
+                ).to(torch.float64)
+                scalar_values.extend([nan, nan])
+            else:
+                scalar_values.extend([
+                    branch_mean.to(torch.float64),
+                    branch_min.to(torch.float64),
+                ])
+            scalars = torch.stack(scalar_values)
 
             self.events.append({
                 "block": block,
@@ -6827,18 +7406,10 @@ class RoutingProbe:
                 "top_k": int(indices.size(-1)),
                 "rows": int(indices.size(0)),
                 "input_shape": [int(size) for size in shape],
-                "usage": usage.to(torch.int64).tolist(),
-                "gate_mass": gate_mass.tolist(),
-                "load_entropy": scalars[1],
-                "load_max_share": scalars[2],
-                "dead_experts": int(scalars[3]),
-                "router_entropy": scalars[0],
-                "router_max_prob": scalars[4],
-                "indices": indices.to(
-                    torch.int16
-                ).cpu(),
-                "branch_cosine_mean": branch_mean,
-                "branch_cosine_min_pair": branch_min,
+                "usage": usage.to(torch.int64),
+                "gate_mass": gate_mass,
+                "scalars": scalars,
+                "indices": indices.to(torch.int16),
             })
 
     @staticmethod
@@ -7128,6 +7699,68 @@ class RoutingProbe:
 
         return result
 
+    def _materialize_events(self) -> None:
+        """
+        把 record 阶段留在设备上的小张量一次性取回并写回事件。
+
+        单次 stack/concat 后统一 D2H，避免 O(route 调用数) 的
+        隐式同步；取回后的事件结构与旧实现完全一致，下游报告
+        代码无需改动。重复调用是幂等的。
+        """
+        if not self.events:
+            return
+        if isinstance(self.events[0].get("usage"), list):
+            return
+
+        scalars = torch.stack(
+            [event["scalars"] for event in self.events]
+        ).cpu()
+        usages = torch.stack(
+            [event["usage"] for event in self.events]
+        ).cpu()
+        gate_masses = torch.stack(
+            [event["gate_mass"] for event in self.events]
+        ).cpu()
+        flat_indices = torch.cat(
+            [
+                event["indices"].reshape(-1)
+                for event in self.events
+            ]
+        ).cpu()
+
+        offset = 0
+        for position, event in enumerate(self.events):
+            values = scalars[position].tolist()
+            event["router_entropy"] = values[0]
+            event["load_entropy"] = values[1]
+            event["load_max_share"] = values[2]
+            event["dead_experts"] = int(values[3])
+            event["router_max_prob"] = values[4]
+            event["branch_cosine_mean"] = (
+                None
+                if math.isnan(values[5])
+                else values[5]
+            )
+            event["branch_cosine_min_pair"] = (
+                None
+                if math.isnan(values[6])
+                else values[6]
+            )
+            event["usage"] = usages[position].to(
+                torch.int64
+            ).tolist()
+            event["gate_mass"] = gate_masses[
+                position
+            ].tolist()
+
+            shape = event["indices"].shape
+            count = event["indices"].numel()
+            event["indices"] = flat_indices[
+                offset:offset + count
+            ].view(shape)
+            offset += count
+            del event["scalars"]
+
     def build_report(self, split: str = "val") -> Dict[str, object]:
         cfg = self.cfg
         report: Dict[str, object] = {
@@ -7162,6 +7795,8 @@ class RoutingProbe:
                 "分析前向未记录到任何 route 调用"
             )
             return report
+
+        self._materialize_events()
 
         grouped: Dict[int, Dict[int, List[Dict[str, object]]]] = {}
         for event in self.events:
@@ -20453,7 +21088,13 @@ def main():
     # 数据审计在训练之前完成：重复内容、分布偏移与 token 值域
     # 问题会被记录并在发现风险时给出警告。test 此时保持尘封，
     # 只在 --evaluate-test 的最终评估时参与审计。
-    data_audit = audit_data_splits(dataset, include_test=False)
+    data_audit = audit_data_splits(
+        dataset,
+        include_test=False,
+        # 仅当本次运行会解封测试集时才保留扫描结果，供最终
+        # 审计复用；避免普通训练长期占用签名缓存的系统内存。
+        cache_scans=args.evaluate_test,
+    )
     print_data_audit(data_audit)
 
     # 严格数据审计：发现泄露/标签噪声时拒绝开始训练。检查放在
@@ -21547,6 +22188,19 @@ def main():
             args.batch_size,
         )
 
+    # 坏案例与最终验证使用同一批固定窗口：收集器随本次前向
+    # 流式统计，后续分析不再重复跑一遍验证集。
+    val_bad_case_collector: Optional[_BadCaseCollector] = None
+    if args.bad_cases > 0 and not numerical_polluted:
+        val_bad_case_collector = _BadCaseCollector(
+            dataset,
+            "val",
+            args.batch_size,
+            args.eval_batches,
+            args.bad_cases,
+            device=device,
+        )
+
     final_metrics = evaluate(
         model,
         dataset,
@@ -21556,6 +22210,7 @@ def main():
         amp_dtype=amp_dtype,
         compute_auc=True,
         routing_probe=routing_probe,
+        bad_case_collector=val_bad_case_collector,
     )
 
     final_record = {
@@ -21670,6 +22325,7 @@ def main():
             amp_dtype=amp_dtype,
             split="val",
             top_n=args.bad_cases,
+            collector=val_bad_case_collector,
         )
         print_bad_cases(bad_case_report)
 
@@ -21834,6 +22490,21 @@ def main():
                     "名额未消耗）。请先清洗数据后重跑。"
                 )
             else:
+                # 测试集只解封一次：坏案例收集与最终测试评估
+                # 共享同一批窗口前向，不再重复跑模型。
+                test_bad_case_collector: Optional[
+                    _BadCaseCollector
+                ] = None
+                if args.bad_cases > 0:
+                    test_bad_case_collector = _BadCaseCollector(
+                        dataset,
+                        "test",
+                        args.batch_size,
+                        args.eval_batches,
+                        args.bad_cases,
+                        device=device,
+                    )
+
                 test_metrics = evaluate(
                     model,
                     dataset,
@@ -21843,6 +22514,7 @@ def main():
                     amp_dtype=amp_dtype,
                     split="test",
                     compute_auc=True,
+                    bad_case_collector=test_bad_case_collector,
                 )
 
                 # 坏案例分析随唯一一次解封一起做（val 分析照常）。
@@ -21856,6 +22528,7 @@ def main():
                         amp_dtype=amp_dtype,
                         split="test",
                         top_n=args.bad_cases,
+                        collector=test_bad_case_collector,
                     )
                     print_bad_cases(test_bad_cases)
                     bad_case_payload["test"] = test_bad_cases
