@@ -386,7 +386,7 @@ def _swiglu_backward(
     互不相交且并集完整）。
 
     ``return_hidden=True`` 时同时返回由同一份 ``silu(gate)``
-    重算的隐藏层，供下投影权重的梯度复用，避免再算一次 SiLU。
+    重算的隐藏层，供下投影权重的梯度复用。
     """
     gate, up = gate_up.chunk(2, dim=-1)
 
@@ -403,7 +403,7 @@ def _swiglu_backward(
 
     # grad_up = grad_hidden * silu(gate)。silu(gate) 先原地
     # 写入 grad_up 半区；需要隐藏层时在同一份 silu 结果上
-    # 乘 up 得到 hidden，省去一次独立的 SiLU 计算。
+    # 乘 up 得到 hidden。
     torch.ops.aten.silu.out(gate, out=grad_up)
     hidden = None
     if return_hidden:
@@ -583,13 +583,13 @@ _MOE_PADDED_CACHE_REGISTRY: (
 
 
 # dispatch 行下标缓存的字节上限（每模块）：total 在一次训练里
-# 只有少数几个取值，首次分配后全命中；超限退回逐次分配。
+# 只有少数几个取值；超限退回逐次分配。
 _MOE_ARANGE_CACHE_MAX_BYTES = 1024 * 1024
 
 
 @functools.lru_cache(maxsize=None)
 def _dtype_element_size(dtype: torch.dtype) -> int:
-    """dtype 的每元素字节数；避免热路径上为查询而分配空张量。"""
+    """dtype 的每元素字节数。"""
     return torch.empty(0, dtype=dtype).element_size()
 
 
@@ -701,12 +701,9 @@ class _ScatterPaddedExpertOutputs(torch.autograd.Function):
     """
     把填充缓冲中的各专家有效输出散射回原始 assignment 顺序。
 
-    dispatch 的常见路径（无溢出）不再先 ``index_select`` 出
-    一份 [total, dim] 临时张量再 ``index_copy_``，而是按专家
-    逐段直接写入输出缓冲：前向少一份 [total, dim] 峰值激活，
-    反向也少一份同规模临时梯度。每段只是整行拷贝，数值与
-    原「gather + scatter」路径逐位一致；反向把上游梯度按同样
-    的段映射写回填充缓冲，未使用的填充行梯度恒为 0。
+    按专家段整行拷贝写回原始顺序的输出缓冲，与
+    「gather + scatter」语义逐位一致；反向把上游梯度按同样的
+    段映射写回填充缓冲，未使用的填充行梯度恒为 0。
     """
 
     @staticmethod
@@ -830,9 +827,8 @@ class SparseMoE(nn.Module):
         # 推进版本号），需要把新参数写回既有缓冲。
         self._weight_cache_generation = 0
 
-        # 专家权重参数引用缓存：热路径直接取用，避免每次前向
-        # 重建「3 层属性访问 × n_experts」的列表。参数对象由
-        # 模块自身持有，缓存不延长其生命周期；仅 _apply 可能
+        # 专家权重参数引用缓存。参数对象由模块自身持有，
+        # 缓存不延长其生命周期；仅 _apply 可能
         # 整体替换参数张量，届时重建。
         self._expert_gate_up_weights: List[torch.Tensor] = []
         self._expert_down_weights: List[torch.Tensor] = []
@@ -859,13 +855,12 @@ class SparseMoE(nn.Module):
         dtype: torch.dtype = torch.int64,
     ) -> torch.Tensor:
         """
-        dispatch 热路径的行下标 arange 缓存。
+        dispatch 的行下标 arange 缓存。
 
-        形状跨调用稳定（total 只有少数几个取值），首次分配后
-        全命中；缓存张量只被读取（消费它的算术均为
-        out-of-place），字节封顶防止形状漂移时无界增长，
-        _apply 迁移设备时清空。CUDA 上用 int32 下标（显存与
-        索引带宽减半），CPU 保持 int64。
+        形状跨调用稳定（total 只有少数几个取值）；缓存张量
+        只被读取（消费它的算术均为 out-of-place），总量受
+        _MOE_ARANGE_CACHE_MAX_BYTES 封顶，_apply 迁移设备时
+        清空。CUDA 上用 int32 下标，CPU 保持 int64。
         """
         key = (device, dtype, n)
         cached = self._aranges.get(key)
