@@ -2958,6 +2958,7 @@ class ByteDataset:
         group_separator: Optional[bytes] = None,
         deduplicate_train_groups: bool = False,
         drop_train_corrupt_groups: bool = False,
+        drop_train_degenerate_groups: bool = False,
     ):
         data_path = Path(filename)
 
@@ -3027,6 +3028,19 @@ class ByteDataset:
             )
         self.drop_train_corrupt_groups = bool(
             drop_train_corrupt_groups
+        )
+
+        if (
+            drop_train_degenerate_groups
+            and group_separator is None
+        ):
+            raise ValueError(
+                "drop_train_degenerate_groups 需要 "
+                "group_separator：没有显式的群组边界就无法在"
+                "不改动 val/test 的前提下整组剔除异常值"
+            )
+        self.drop_train_degenerate_groups = bool(
+            drop_train_degenerate_groups
         )
 
         # 训练集清洗（可选的群组级去重）：只剔除 train 中与
@@ -3142,8 +3156,23 @@ class ByteDataset:
                 )
             )
 
+        degenerate_excluded: List[Tuple[int, int]] = []
+        degenerate_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_degenerate_groups:
+            degenerate_excluded, degenerate_stats = (
+                _plan_train_degenerate_cleaning(
+                    self._raw_buffer,
+                    group_separator,
+                    n_train,
+                    dedup_excluded + corrupt_excluded,
+                )
+            )
+
         combined_excluded = sorted(
-            dedup_excluded + corrupt_excluded
+            dedup_excluded
+            + corrupt_excluded
+            + degenerate_excluded
         )
         merged_excluded = _merge_byte_intervals(
             combined_excluded
@@ -3162,37 +3191,58 @@ class ByteDataset:
                 "内部错误，拒绝继续"
             )
 
-        if dedup_stats is not None or corrupt_stats is not None:
+        if (
+            dedup_stats is not None
+            or corrupt_stats is not None
+            or degenerate_stats is not None
+        ):
             dropped_bytes = sum(
                 end - start
                 for start, end in merged_excluded
             )
-            if dedup_stats is not None:
-                combined_stats = dict(dedup_stats)
-            else:
-                combined_stats = dict(corrupt_stats or {})
+            base_stats = (
+                dedup_stats
+                or corrupt_stats
+                or degenerate_stats
+                or {}
+            )
+            combined_stats = dict(base_stats)
+            total_groups = int(
+                combined_stats.get("groups_total", 0)
+            )
 
             if corrupt_stats is not None:
                 combined_stats["corruption"] = corrupt_stats
+            if degenerate_stats is not None:
+                combined_stats["degenerate"] = degenerate_stats
 
-            if (
-                dedup_stats is not None
-                and corrupt_stats is not None
-            ):
-                combined_stats["groups_dropped"] = (
-                    int(dedup_stats["groups_dropped"])
-                    + int(corrupt_stats["groups_dropped"])
+            cleaning_kinds: List[str] = []
+            groups_dropped = 0
+            if dedup_stats is not None:
+                groups_dropped += int(
+                    dedup_stats["groups_dropped"]
                 )
-                combined_stats["groups_kept"] = (
-                    int(dedup_stats["groups_total"])
-                    - int(combined_stats["groups_dropped"])
+                cleaning_kinds.append("duplicate")
+            if corrupt_stats is not None:
+                groups_dropped += int(
+                    corrupt_stats["groups_dropped"]
                 )
-                combined_stats["policy"] = (
-                    "drop train groups duplicated in val/test or "
-                    "earlier in train, and train groups containing "
-                    "invalid UTF-8/NUL bytes; val/test untouched"
+                cleaning_kinds.append("corrupt")
+            if degenerate_stats is not None:
+                groups_dropped += int(
+                    degenerate_stats["groups_dropped"]
                 )
+                cleaning_kinds.append("degenerate")
 
+            combined_stats["groups_dropped"] = groups_dropped
+            combined_stats["groups_kept"] = (
+                total_groups - groups_dropped
+            )
+            combined_stats["policy"] = (
+                "drop train groups by kind(s): "
+                + ", ".join(cleaning_kinds)
+                + "; val/test untouched"
+            )
             combined_stats["dropped_bytes"] = dropped_bytes
             combined_stats["post_clean_train_bytes"] = (
                 n_train - dropped_bytes
@@ -4202,6 +4252,12 @@ _AUDIT_UTF8_REPLACE_WARN = 1e-3
 # （文本语料中 NUL 基本只来自错误编码或文件拼接损坏）。
 _AUDIT_NUL_WARN = 1e-4
 
+# 群组级异常值检查：长度至少为该值、且单一字节占比达到阈值的
+# 群组视为低信息/退化群组（填充、重复字符、错误拼接的常见形态）。
+# 只在 train 上统计；--drop-train-degenerate-groups 可整组清洗。
+_AUDIT_DEGENERATE_GROUP_MIN_BYTES = 64
+_AUDIT_DEGENERATE_GROUP_TOP_SHARE = 0.99
+
 # 实际 split 比例相对名义值漂移超过该幅度（且绝对差
 # 至少 _AUDIT_SPLIT_FRACTION_MIN_ABS）时告警：群组边界
 # 吸附可能把验证/测试集缩小到名义比例的一小部分。
@@ -4879,6 +4935,180 @@ def _plan_train_corruption_cleaning(
     return excluded, stats
 
 
+def _group_top_byte_share(
+    raw: memoryview,
+    start: int,
+    end: int,
+) -> Tuple[int, float]:
+    """返回群组内最高频字节及其占比（空群组返回 (0, 0.0)）。"""
+    length = end - start
+    if length <= 0:
+        return 0, 0.0
+
+    content = bytes(raw[start:end])
+    counts = torch.bincount(
+        torch.frombuffer(content, dtype=torch.uint8),
+        minlength=256,
+    )
+    top_count = int(counts.max())
+    return int(counts.argmax()), top_count / length
+
+
+def _plan_train_degenerate_cleaning(
+    raw: bytearray,
+    separator: bytes,
+    train_end: int,
+    already_excluded: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划训练集异常值清洗：只从 train 中整组剔除「长度达到
+    阈值且单一字节占比极高」的低信息/退化群组，绝不改动
+    val/test。
+
+    判定只使用群组自身内容（没有跨 split 统计量），阈值固定
+    并记录在审计中；已经被去重/标签噪声清洗剔除的群组不重复
+    统计。
+    """
+    excluded_set = set(already_excluded)
+    excluded: List[Tuple[int, int]] = []
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "policy": (
+            "drop train groups with length >= "
+            f"{_AUDIT_DEGENERATE_GROUP_MIN_BYTES} and top-byte "
+            f"share >= {_AUDIT_DEGENERATE_GROUP_TOP_SHARE}; "
+            "val/test untouched"
+        ),
+        "min_bytes": _AUDIT_DEGENERATE_GROUP_MIN_BYTES,
+        "top_share_threshold": (
+            _AUDIT_DEGENERATE_GROUP_TOP_SHARE
+        ),
+        "groups_total": 0,
+        "groups_scanned": 0,
+        "groups_already_excluded": 0,
+        "groups_dropped": 0,
+        "dropped_bytes": 0,
+        "max_top_byte_share": 0.0,
+        "examples": [],
+    }
+
+    for span_start, span_end in _iter_group_spans(
+        raw,
+        separator,
+        0,
+        train_end,
+    ):
+        stats["groups_total"] += 1
+
+        if (span_start, span_end) in excluded_set:
+            stats["groups_already_excluded"] += 1
+            continue
+
+        stats["groups_scanned"] += 1
+        top_byte, top_share = _group_top_byte_share(
+            memoryview(raw),
+            span_start,
+            span_end,
+        )
+        stats["max_top_byte_share"] = max(
+            float(stats["max_top_byte_share"]),
+            top_share,
+        )
+
+        if (
+            span_end - span_start
+            < _AUDIT_DEGENERATE_GROUP_MIN_BYTES
+            or top_share < _AUDIT_DEGENERATE_GROUP_TOP_SHARE
+        ):
+            continue
+
+        stats["groups_dropped"] += 1
+        stats["dropped_bytes"] += span_end - span_start
+        excluded.append((span_start, span_end))
+        if len(stats["examples"]) < 5:
+            stats["examples"].append([
+                span_start,
+                span_end,
+                top_byte,
+                round(top_share, 6),
+            ])
+
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
+
+
+def _train_group_health_audit(
+    dataset: ByteDataset,
+) -> Optional[Dict[str, object]]:
+    """
+    训练集群组级异常值审计：统计「长度达到阈值且单一字节占比
+    极高」的低信息/退化群组。
+
+    只看 train，且跳过已被清洗剔除的群组；val/test 不参与统计。
+    这是异常值检查，不会自动删除数据（需要显式
+    --drop-train-degenerate-groups 才整组清洗）。
+    """
+    separator = dataset.group_separator
+    if separator is None:
+        return None
+
+    excluded = set(dataset.train_excluded_spans)
+    stats: Dict[str, object] = {
+        "min_bytes": _AUDIT_DEGENERATE_GROUP_MIN_BYTES,
+        "top_share_threshold": (
+            _AUDIT_DEGENERATE_GROUP_TOP_SHARE
+        ),
+        "groups_checked": 0,
+        "long_groups_checked": 0,
+        "degenerate_groups": 0,
+        "degenerate_bytes": 0,
+        "max_top_byte_share": 0.0,
+        "examples": [],
+    }
+
+    for span_start, span_end in _iter_group_spans(
+        dataset._raw_buffer,
+        separator,
+        0,
+        dataset.split_bounds["train"][1],
+    ):
+        if (span_start, span_end) in excluded:
+            continue
+
+        stats["groups_checked"] += 1
+        length = span_end - span_start
+        if length < _AUDIT_DEGENERATE_GROUP_MIN_BYTES:
+            continue
+
+        stats["long_groups_checked"] += 1
+        top_byte, top_share = _group_top_byte_share(
+            dataset._raw,
+            span_start,
+            span_end,
+        )
+        stats["max_top_byte_share"] = max(
+            float(stats["max_top_byte_share"]),
+            top_share,
+        )
+
+        if top_share < _AUDIT_DEGENERATE_GROUP_TOP_SHARE:
+            continue
+
+        stats["degenerate_groups"] += 1
+        stats["degenerate_bytes"] += length
+        if len(stats["examples"]) < 5:
+            stats["examples"].append([
+                span_start,
+                span_end,
+                top_byte,
+                round(top_share, 6),
+            ])
+
+    return stats
+
+
 def _group_content_duplicate_audit(
     dataset: ByteDataset,
     split_names: List[str],
@@ -5439,6 +5669,7 @@ def audit_data_splits(
             dataset,
             split_names,
         )
+        content_health = _train_group_health_audit(dataset)
 
         groups_report = {
             "separator_hex": dataset.group_separator.hex(),
@@ -5451,8 +5682,24 @@ def audit_data_splits(
                 else None
             ),
             "content_duplicates": content_duplicates,
+            "content_health": content_health,
             "train_cleaning": dataset.train_cleaning,
         }
+
+        if (
+            content_health is not None
+            and content_health["degenerate_groups"] > 0
+        ):
+            warnings.append(
+                "train: 检测到 "
+                f"{content_health['degenerate_groups']} 个"
+                "低信息/退化群组（长度 >= "
+                f"{content_health['min_bytes']}B 且单一字节"
+                "占比 >= "
+                f"{content_health['top_share_threshold']}），"
+                "疑似填充/重复字符污染（异常值）；可检查后用 "
+                "--drop-train-degenerate-groups 清洗"
+            )
 
         if content_duplicates is not None:
             for split, info in content_duplicates[
@@ -5634,6 +5881,17 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 "valid_starts="
                 f"{cleaning.get('valid_window_starts')}"
                 f"/{cleaning.get('total_window_starts')}"
+            )
+
+        health = groups.get("content_health")
+        if isinstance(health, dict):
+            print(
+                "[data]   训练群组异常值: "
+                f"degenerate={health.get('degenerate_groups')}"
+                f"/{health.get('long_groups_checked')} "
+                "长群组（单一字节占比阈值 "
+                f"{health.get('top_share_threshold')}），"
+                f"最大占比 {health.get('max_top_byte_share'):.4f}"
             )
 
         duplicates = groups.get("content_duplicates") or {}
@@ -7972,6 +8230,13 @@ def run_statistical_baseline(
                 getattr(
                     args,
                     "drop_train_corrupt_groups",
+                    False,
+                )
+            ),
+            "drop_train_degenerate_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_degenerate_groups",
                     False,
                 )
             ),
@@ -12277,6 +12542,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_corrupt_groups",
+    "drop_train_degenerate_groups",
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
@@ -12306,6 +12572,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_corrupt_groups",
+    "drop_train_degenerate_groups",
     "allow_data_leakage",
     "batch_size",
     "eval_batches",
@@ -12696,6 +12963,9 @@ def build_comparison_protocol(
         "drop_train_corrupt_groups": bool(
             getattr(args, "drop_train_corrupt_groups", False)
         ),
+        "drop_train_degenerate_groups": bool(
+            getattr(args, "drop_train_degenerate_groups", False)
+        ),
         "allow_data_leakage": bool(
             getattr(args, "allow_data_leakage", False)
         ),
@@ -12827,6 +13097,11 @@ def experiment_protocol_from_payload(
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
+            if has_training
+            else False
+        ),
+        "drop_train_degenerate_groups": bool(
+            run_args.get("drop_train_degenerate_groups", False)
             if has_training
             else False
         ),
@@ -20547,6 +20822,13 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_degenerate_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_degenerate_groups",
+                    False,
+                )
+            ),
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
             ),
@@ -22956,6 +23238,116 @@ def run_self_test():
         "failures"
     ]
     assert cleaned_corrupt_probe["train_cleaning_checked"]
+
+    # 训练集异常值：长且几乎单一字节的退化群组必须被审计发现；
+    # 显式清洗时只整组剔除该 train 群组，val/test 不动。
+    degenerate_groups = [
+        b"A" * 20,
+        b"B" * 20,
+        b"Z" * 100,
+        b"C" * 20,
+        b"D" * 20,
+        b"E" * 20,
+    ]
+    degenerate_payload = (
+        separator.join(degenerate_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as degenerate_file:
+        degenerate_file.write(degenerate_payload)
+        degenerate_file.flush()
+
+        raw_degenerate_dataset = ByteDataset(
+            degenerate_file.name,
+            seq_len=8,
+            val_fraction=0.1,
+            test_fraction=0.1,
+            group_separator=separator,
+        )
+        cleaned_degenerate_dataset = ByteDataset(
+            degenerate_file.name,
+            seq_len=8,
+            val_fraction=0.1,
+            test_fraction=0.1,
+            group_separator=separator,
+            drop_train_degenerate_groups=True,
+        )
+
+        raw_degenerate_audit = audit_data_splits(
+            raw_degenerate_dataset,
+            include_test=True,
+        )
+        cleaned_degenerate_audit = audit_data_splits(
+            cleaned_degenerate_dataset,
+            include_test=True,
+        )
+
+    assert raw_degenerate_dataset.split_bounds == {
+        "train": (0, 168),
+        "val": (168, 190),
+        "test": (190, 212),
+    }
+    health = raw_degenerate_audit["groups"]["content_health"]
+    assert health["long_groups_checked"] == 1
+    assert health["degenerate_groups"] == 1
+    assert health["max_top_byte_share"] == 1.0
+    assert any(
+        "退化群组" in warning
+        for warning in raw_degenerate_audit["warnings"]
+    )
+
+    assert (
+        cleaned_degenerate_dataset.split_bounds
+        == raw_degenerate_dataset.split_bounds
+    )
+    assert cleaned_degenerate_dataset.train_excluded_spans == [
+        (44, 144)
+    ]
+    assert cleaned_degenerate_dataset.train_cleaning[
+        "degenerate"
+    ]["groups_dropped"] == 1
+    assert cleaned_degenerate_dataset.train_cleaning[
+        "groups_dropped"
+    ] == 1
+    assert cleaned_degenerate_dataset.effective_train_bytes == 68
+    assert (
+        cleaned_degenerate_audit["groups"]["content_health"][
+            "degenerate_groups"
+        ]
+        == 0
+    )
+    assert enforce_strict_data_audit(cleaned_degenerate_audit)
+    assert cleaned_degenerate_audit["leakage_violations"] == []
+
+    cleaned_degenerate_x, _ = (
+        cleaned_degenerate_dataset.batch(
+            "train",
+            32,
+            torch.Generator().manual_seed(13),
+            eval_device,
+        )
+    )
+    assert ord("Z") not in set(
+        cleaned_degenerate_x.flatten().tolist()
+    )
+
+    cleaned_degenerate_ngram = NgramBaseline(
+        cleaned_degenerate_dataset.train,
+        max_order=2,
+        exclude_spans=(
+            cleaned_degenerate_dataset.train_excluded_spans
+        ),
+    )
+    assert cleaned_degenerate_ngram.train_total == 68
+
+    cleaned_degenerate_probe = probe_data_pipeline(
+        cleaned_degenerate_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert cleaned_degenerate_probe["ok"], (
+        cleaned_degenerate_probe["failures"]
+    )
 
     # 名义位置不落在边界上时必须吸附到最近的群组边界。
     separator_five = b"<END>"
@@ -30241,6 +30633,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-degenerate-groups",
+        action="store_true",
+        help=(
+            "训练集异常值清洗（需要 --group-separator）：只从 "
+            "train 中整组剔除低信息/退化群组（长度 >= "
+            f"{_AUDIT_DEGENERATE_GROUP_MIN_BYTES}B 且单一字节"
+            f"占比 >= {_AUDIT_DEGENERATE_GROUP_TOP_SHARE}），"
+            "如填充/重复字符污染；val/test 的字节与切分位置"
+            "完全不变"
+        ),
+    )
+    parser.add_argument(
         "--strict-data-audit",
         action="store_true",
         help=(
@@ -31388,6 +31792,24 @@ def main():
                     saved_corrupt_drop
                 )
 
+        if "drop_train_degenerate_groups" in saved_args:
+            saved_degenerate_drop = bool(
+                saved_args.get("drop_train_degenerate_groups")
+            )
+            if saved_degenerate_drop != bool(
+                args.drop_train_degenerate_groups
+            ):
+                print(
+                    "resume restored "
+                    "drop_train_degenerate_groups "
+                    f"{bool(args.drop_train_degenerate_groups)} -> "
+                    f"{saved_degenerate_drop} (训练集清洗是采样"
+                    "轨迹的一部分)"
+                )
+                args.drop_train_degenerate_groups = (
+                    saved_degenerate_drop
+                )
+
         # seed 决定数据采样顺序与初始化噪声，是采样轨迹的
         # 核心变量；resume 时按存档恢复，避免续跑换了随机流。
         saved_seed = saved_args.get("seed")
@@ -31503,6 +31925,16 @@ def main():
             "val/test"
         )
 
+    if (
+        args.drop_train_degenerate_groups
+        and group_separator_bytes is None
+    ):
+        parser.error(
+            "--drop-train-degenerate-groups 需要 "
+            "--group-separator：没有显式群组边界时无法只清洗 "
+            "train 而不改动 val/test"
+        )
+
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
@@ -31519,6 +31951,9 @@ def main():
             ),
             drop_train_corrupt_groups=(
                 args.drop_train_corrupt_groups
+            ),
+            drop_train_degenerate_groups=(
+                args.drop_train_degenerate_groups
             ),
         )
     except (OSError, ValueError) as error:
