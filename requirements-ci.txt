@@ -1,0 +1,18 @@
+# CI-only dependency set (CPU, Python 3.12).
+#
+# 本仓库根目录没有 requirements.txt / pyproject.toml，experiment.py 的第三方依赖只有
+#   - torch（torch / torch.nn / torch.nn.functional，训练与自测都靠它）
+#   - numpy（随机种子状态存档、--self-test 的逐位复现校验会用到）
+# 因此这里只固定这两个包，不引入仓库里没有用到的依赖。
+#
+# 该文件的两个用途：
+#   1. continuous-loop.yml 里 actions/setup-python 的 pip 缓存键
+#      （cache-dependency-path: requirements-ci.txt）；
+#   2. 每次 run 预热一次（CPU wheel），测试门与 opencode 阶段直接复用缓存。
+#
+# 安装方式（CPU wheel）：
+#   python -m pip install -r requirements-ci.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+# 注意：安装失败是**非致命**的（workflow 里带 `|| echo`），不会中断循环。
+numpy==2.5.4
+torch==2.14.1
