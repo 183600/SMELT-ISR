@@ -10908,6 +10908,15 @@ _SELECTION_METRIC_KEYS = tuple(
     }
 )
 
+# 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
+# 才计算的 AUC 与等计算量 loss），但不含路由诊断——dense/ngram
+# 基线没有路由记录，在这些指标上“调参”无法执行。
+_BASELINE_TUNING_METRIC_KEYS = tuple(
+    key
+    for key in COMPARISON_METRIC_KEYS
+    if key not in _ROUTING_ROW_FIELDS
+)
+
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
 # 用于让「基线→改进」的差值符号可解释。
 _FACTOR_VALUE_ORDER = {
@@ -15343,9 +15352,40 @@ def baseline_adequacy(
                     "作为基线已调参的证据"
                 )
                 continue
+            seed_alignment = record.get("seed_alignment")
+            if (
+                isinstance(seed_alignment, dict)
+                and seed_alignment.get("aligned") is False
+            ):
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源种子集合不一致/"
+                    "存在伪重复：候选 Mean ± Std 的差异可能"
+                    "来自种子而不是学习率，不能作为基线已调参"
+                    "的证据"
+                )
+                continue
+
+            record_metric = record.get("metric")
+            if (
+                isinstance(record_metric, str)
+                and record_metric != metric
+            ):
+                # 「调在 val_loss 上」不能证明在 macro F1 /
+                # PR-AUC 上也已调强：tuned 只表示「在当前
+                # 判定口径上调过参」，指标不一致时必须重新
+                # 调参，而不是只看一条 warning 就当作强基线。
+                message = (
+                    f"基线 {run_name} 的调参依据是 {record_metric}，"
+                    f"当前对比口径是 {metric}：指标未对齐，"
+                    "该调参不能证明基线在当前口径上也是强的；"
+                    "请用 --baseline-tuning-metric "
+                    f"{metric} 重新调参"
+                )
+                report["tuning_metric_mismatch"].append(message)
+                report["advisories"].append(message)
+                continue
 
             tuning_evidence = True
-            record_metric = record.get("metric")
             report["tuned_runs"].append({
                 "run": run_name,
                 "tuning_metric": record_metric,
@@ -15360,17 +15400,6 @@ def baseline_adequacy(
                     "位于学习率网格边界：最优可能落在网格之外，"
                     "基线可能仍未被调强；建议扩展候选后重跑调参"
                 )
-            if (
-                isinstance(record_metric, str)
-                and record_metric != metric
-            ):
-                message = (
-                    f"基线 {run_name} 的调参依据是 {record_metric}，"
-                    f"当前对比口径是 {metric}：指标未对齐，"
-                    "该调参不能证明基线在当前口径上也是强的"
-                )
-                report["tuning_metric_mismatch"].append(message)
-                report["advisories"].append(message)
 
         report["tuned"] = tuning_evidence
 
@@ -15498,6 +15527,13 @@ def baseline_adequacy(
                             for issue in issues
                         )
                     )
+                    seed_alignment = record.get(
+                        "seed_alignment"
+                    )
+                    seeds_misaligned = bool(
+                        isinstance(seed_alignment, dict)
+                        and seed_alignment.get("aligned") is False
+                    )
                     own_tuning = bool(
                         record_mode == row_mode
                         and isinstance(seed_plan, dict)
@@ -15513,6 +15549,7 @@ def baseline_adequacy(
                         and record_metric == metric
                         and not underpowered
                         and not inconsistent
+                        and not seeds_misaligned
                     )
                 if own_tuning:
                     parity["challengers_with_own_tuning"].append(
@@ -23894,7 +23931,9 @@ def run_self_test():
             "smelt",
             "val_loss",
         )
-        assert mismatch_adequacy["tuned"] is True
+        # 指标未对齐时不能算「在当前判定口径上调过参」：
+        # 调在 val_loss 上不能证明 macro F1 也已被调强。
+        assert mismatch_adequacy["tuned"] is False
         assert mismatch_adequacy["tuning_metric_mismatch"]
         assert any(
             "未对齐" in message
@@ -24868,6 +24907,10 @@ def run_self_test():
             unigram_pr_auc_macro_chance=0.001,
             unigram_roc_auc_macro=0.5,
         )
+        # 调参口径必须与当前判定口径一致（val_pr_auc_macro）：
+        # 在 val_loss 上调强的基线不能证明 PR-AUC 也被调强。
+        pr_tuning = dict(good_tuning)
+        pr_tuning["metric"] = "val_pr_auc_macro"
         pr_baseline_path = _write_analysis_run(
             "pr_smelt_seed1",
             "smelt",
@@ -24877,7 +24920,7 @@ def run_self_test():
             0.01,
             4.50,
             reference=auc_reference,
-            baseline_tuning=good_tuning,
+            baseline_tuning=pr_tuning,
             pr_auc=0.02,
             pr_auc_chance=0.001,
         )
@@ -24933,7 +24976,7 @@ def run_self_test():
             0.01,
             4.50,
             reference=good_reference,
-            baseline_tuning=good_tuning,
+            baseline_tuning=pr_tuning,
             pr_auc=0.02,
             pr_auc_chance=0.001,
         )
@@ -25028,9 +25071,111 @@ def run_self_test():
             float(tuning_report["winner"]["metric_mean"]) - 4.0
         ) < 1e-12
         assert tuning_report["training_config"]["total_steps"] == 100
+        assert tuning_report["seed_alignment"]["aligned"] is True
+        assert tuning_report["seed_alignment"]["common_seeds"] == [
+            42,
+            43,
+            44,
+        ]
         assert any(
             "无法在统计上区分" in issue
             for issue in tuning_report["issues"]
+        )
+
+        # 预注册主指标优先作为基线调参口径：否则会在 loss 上
+        # 调强基线、却用 macro F1 判定成败。
+        resolved_metric = resolve_baseline_tuning_metric(
+            argparse.Namespace(
+                baseline_tuning_metric=None,
+                primary_metric="val_macro_f1",
+                compare_metric="val_loss",
+            )
+        )
+        assert resolved_metric == (
+            "val_macro_f1",
+            "primary_metric",
+        )
+        explicit_metric = resolve_baseline_tuning_metric(
+            argparse.Namespace(
+                baseline_tuning_metric="val_pr_auc_macro",
+                primary_metric="val_macro_f1",
+                compare_metric="val_loss",
+            )
+        )
+        assert explicit_metric == (
+            "val_pr_auc_macro",
+            "explicit",
+        )
+        fallback_metric = resolve_baseline_tuning_metric(
+            argparse.Namespace(
+                baseline_tuning_metric=None,
+                primary_metric="routing_jaccard_branch",
+                compare_metric="val_loss",
+            )
+        )
+        assert fallback_metric == ("val_loss", "compare_metric")
+
+        # 各候选的随机种子集合不一致：均值差可能是种子难度
+        # 差异，报告必须显式标记为不可作为调参证据。
+        misaligned_paths = []
+        for seed, value in ((42, 4.0), (43, 4.0), (44, 4.0)):
+            misaligned_paths.append(_write_analysis_run(
+                f"misaligned_lr1e-4_seed{seed}",
+                "dense",
+                seed,
+                1e-4,
+                100,
+                0.0,
+                value,
+            ))
+        for seed, value in ((42, 4.5), (43, 4.5), (45, 4.5)):
+            misaligned_paths.append(_write_analysis_run(
+                f"misaligned_lr3e-4_seed{seed}",
+                "dense",
+                seed,
+                3e-4,
+                100,
+                0.0,
+                value,
+            ))
+        misaligned_report = analyze_baseline_tuning(
+            compare_runs(misaligned_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert misaligned_report["seed_alignment"]["aligned"] is False
+        assert any(
+            "种子集合不一致" in issue
+            for issue in misaligned_report["issues"]
+        )
+
+        # 同一候选内重复种子是伪重复，同样不能作为调参证据。
+        duplicate_paths = list(tuning_paths)
+        duplicate_paths.append(_write_analysis_run(
+            "tune_lr1e-4_seed42_repeat",
+            "dense",
+            42,
+            1e-4,
+            100,
+            0.0,
+            4.1,
+        ))
+        duplicate_report = analyze_baseline_tuning(
+            compare_runs(duplicate_paths),
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert duplicate_report["seed_alignment"]["aligned"] is False
+        assert duplicate_report["seed_alignment"][
+            "duplicate_seeds"
+        ]
+        assert any(
+            "伪重复" in issue
+            for issue in duplicate_report["issues"]
         )
 
         # winner 候选仍在下降（curve_status=not_converged）时，
@@ -25364,6 +25509,24 @@ def run_self_test():
         )
         assert missing_seed_count_error is not None
         assert "n_seeds" in missing_seed_count_error
+        misaligned_seed_payload = dict(tuning_payload)
+        misaligned_seed_payload["seed_alignment"] = {
+            "aligned": False,
+            "candidate_seed_sets": {},
+            "common_seeds": [],
+            "duplicate_seeds": {},
+            "missing_seed_runs": [],
+        }
+        misaligned_seed_error = baseline_tuning_provenance_error(
+            misaligned_seed_payload,
+            "dense",
+            1e-4,
+            100,
+            "deadbeef",
+            protocol=sampled_protocol,
+        )
+        assert misaligned_seed_error is not None
+        assert "种子集合" in misaligned_seed_error
         provenance_record = baseline_tuning_provenance_record(
             tuning_payload, str(tuning_source)
         )
@@ -26086,6 +26249,40 @@ def _execute_sweep_plan(
     return run_paths
 
 
+def resolve_baseline_tuning_metric(
+    args: argparse.Namespace,
+) -> Tuple[str, str]:
+    """
+    决定简单基线调参的目标指标与来源。
+
+    预注册主指标（--primary-metric）优先于对比指标：若在
+    val_loss 上调强基线、却用 macro F1 / PR-AUC 判定成败，
+    「基线已调优」的前提在判定口径上并不成立。显式
+    --baseline-tuning-metric 优先于两者。主指标是路由诊断
+    （dense/ngram 基线没有该记录）时回退到 --compare-metric，
+    并打印原因而不是静默换指标。
+
+    返回 ``(metric, source)``，source 为 ``explicit`` /
+    ``primary_metric`` / ``compare_metric``。
+    """
+    explicit = getattr(args, "baseline_tuning_metric", None)
+    if explicit is not None:
+        return str(explicit), "explicit"
+
+    primary = getattr(args, "primary_metric", None)
+    if primary is not None:
+        if primary in _BASELINE_TUNING_METRIC_KEYS:
+            return str(primary), "primary_metric"
+        print(
+            "[baseline-tuning] 预注册主指标 "
+            f"{primary} 不是简单基线可计算的指标"
+            "（路由诊断需要 MoE 运行），回退到 "
+            f"--compare-metric={args.compare_metric}"
+        )
+
+    return str(args.compare_metric), "compare_metric"
+
+
 def analyze_baseline_tuning(
     rows: List[Dict[str, object]],
     metric: str,
@@ -26104,6 +26301,10 @@ def analyze_baseline_tuning(
     默认值）；并列集合的成员与保守选择都会写进报告。
     自测必须覆盖「均值不同但差距落在噪声内」的分支，否则
     规则只在均值恰好相等时才被验证。
+
+    候选必须使用同一组随机种子：若候选的种子集合不同或
+    同一候选内出现重复种子，Mean ± Std 的比较会混入种子
+    差异/伪重复，winner 不能作为「调优过的基线」证据。
 
     同时核对调参协议本身：每个候选的全部受控变量
     （steps / batch / 数据指纹 / warmup / 调度 / weight decay /
@@ -26145,6 +26346,16 @@ def analyze_baseline_tuning(
             "n_seeds": len(seeds),
             "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
             "underpowered_override": False,
+        },
+        # 候选的种子集合必须一致：不同候选跑不同种子时，
+        # 均值差异可能是种子难度差异而不是学习率差异；
+        # 同一候选内重复种子则是伪重复，会低估方差。
+        "seed_alignment": {
+            "candidate_seed_sets": {},
+            "common_seeds": [],
+            "aligned": None,
+            "duplicate_seeds": {},
+            "missing_seed_runs": [],
         },
         "selection_rule": (
             "在 val 上先取指标均值最优的候选；与最优均值的差距"
@@ -26223,6 +26434,19 @@ def analyze_baseline_tuning(
         return None
 
     candidates: List[Dict[str, object]] = []
+    seed_alignment = report["seed_alignment"]
+    assert isinstance(seed_alignment, dict)
+    candidate_seed_sets = seed_alignment[
+        "candidate_seed_sets"
+    ]
+    duplicate_seeds_by_candidate = seed_alignment[
+        "duplicate_seeds"
+    ]
+    missing_seed_runs = seed_alignment["missing_seed_runs"]
+    assert isinstance(candidate_seed_sets, dict)
+    assert isinstance(duplicate_seeds_by_candidate, dict)
+    assert isinstance(missing_seed_runs, list)
+
     for lr in lrs:
         lr_rows = [
             row for row in rows if _row_lr(row) == float(lr)
@@ -26235,6 +26459,26 @@ def analyze_baseline_tuning(
             and math.isfinite(float(row[metric]))
         ]
         mean = _mean(values)
+
+        seed_values: List[int] = []
+        for row in lr_rows:
+            seed = row.get("seed")
+            if isinstance(seed, int) and not isinstance(seed, bool):
+                seed_values.append(int(seed))
+            else:
+                missing_seed_runs.append(str(row.get("run")))
+
+        label = format(lr, "g")
+        unique_seeds = sorted(set(seed_values))
+        candidate_seed_sets[label] = unique_seeds
+        duplicate_seeds = sorted({
+            seed
+            for seed in unique_seeds
+            if seed_values.count(seed) > 1
+        })
+        if duplicate_seeds:
+            duplicate_seeds_by_candidate[label] = duplicate_seeds
+
         candidate = {
             "lr": float(lr),
             "n_runs": len(lr_rows),
@@ -26242,6 +26486,7 @@ def analyze_baseline_tuning(
             "metric_mean": mean,
             "metric_std": _sample_std(values),
             "runs": [str(row.get("run")) for row in lr_rows],
+            "seeds": unique_seeds,
         }
         if len(values) < len(lr_rows):
             report["issues"].append(
@@ -26252,6 +26497,60 @@ def analyze_baseline_tuning(
         candidates.append(candidate)
 
     report["candidates"] = candidates
+
+    # 种子集合核对：只有所有候选都在同一组种子上评估，
+    # 均值差才能归因到学习率；否则 winner 可能只是抽到了
+    # 更容易/更难的种子。重复种子是伪重复，会低估方差。
+    nonempty_sets = [
+        tuple(seeds)
+        for seeds in candidate_seed_sets.values()
+        if seeds
+    ]
+    if duplicate_seeds_by_candidate:
+        seed_alignment["aligned"] = False
+        report["issues"].append(
+            "同一学习率候选内出现重复随机种子（伪重复）："
+            + "; ".join(
+                f"lr={label} 种子 "
+                + ", ".join(str(seed) for seed in seeds)
+                for label, seeds in sorted(
+                    duplicate_seeds_by_candidate.items()
+                )
+            )
+            + "。重复运行不是独立样本，会低估种子间方差，"
+            "winner 不能作为「调优过的基线」证据"
+        )
+    elif missing_seed_runs:
+        seed_alignment["aligned"] = None
+        report["issues"].append(
+            "部分调参运行缺少随机种子记录，无法核对候选是否"
+            "在同一组种子上评估（" + ", ".join(
+                missing_seed_runs
+            ) + "）：均值差可能混入种子差异，不能作为"
+            "「调优过的基线」证据"
+        )
+    elif len(set(nonempty_sets)) > 1 or len(
+        nonempty_sets
+    ) != len(lrs):
+        seed_alignment["aligned"] = False
+        report["issues"].append(
+            "各学习率候选使用的随机种子集合不一致："
+            + "; ".join(
+                f"lr={label} 种子=["
+                + ", ".join(str(seed) for seed in seeds)
+                + "]"
+                for label, seeds in sorted(
+                    candidate_seed_sets.items()
+                )
+            )
+            + "。均值差可能是种子难度差异而不是学习率差异，"
+            "winner 不能作为「调优过的基线」证据"
+        )
+    else:
+        seed_alignment["aligned"] = True
+        seed_alignment["common_seeds"] = (
+            list(nonempty_sets[0]) if nonempty_sets else []
+        )
 
     usable = [
         candidate
@@ -26424,7 +26723,13 @@ def print_baseline_tuning_report(
         "test 集尘封不参与）"
     )
     print(
-        f"  模式: {report['mode']}；指标: {metric}（{direction}）；"
+        f"  模式: {report['mode']}；指标: {metric}（{direction}"
+        + (
+            f"，来源={report['metric_source']}"
+            if report.get("metric_source")
+            else ""
+        )
+        + "）；"
         f"训练配置: steps={config.get('total_steps')}, "
         f"batch_size={config.get('batch_size')}"
     )
@@ -26628,6 +26933,21 @@ def baseline_tuning_provenance_error(
             "请用 3~5 个种子重新调参"
         )
 
+    # 候选的种子集合不一致/存在伪重复时，winner 可能只是
+    # 种子差异的产物。字段缺失（旧版报告）保持兼容，但显式
+    # 标记为不一致时必须拒绝。
+    seed_alignment = payload.get("seed_alignment")
+    if (
+        isinstance(seed_alignment, dict)
+        and seed_alignment.get("aligned") is False
+    ):
+        return (
+            "调参报告的候选种子集合不一致（或同一候选内存在"
+            "重复种子）：winner 的均值差可能来自种子/伪重复"
+            "而不是学习率，不能作为基线来源；请让所有候选"
+            "使用同一组 3~5 个随机种子重新调参"
+        )
+
     # 候选之间训练协议不一致时，调参结论与训练配置混杂，
     # 报告本身已标为不可用。
     tuning_issues = payload.get("issues")
@@ -26747,14 +27067,17 @@ def baseline_tuning_provenance_record(
         "source": str(source),
         "mode": payload.get("mode"),
         "metric": payload.get("metric"),
+        "metric_source": payload.get("metric_source"),
         "winner_lr": winner.get("lr"),
         "winner_mean": winner.get("metric_mean"),
         "n_candidates": payload.get("n_candidates"),
         "grid": payload.get("grid"),
         "training_config": payload.get("training_config"),
-        # 统计功效与调参质量问题必须随来源一起落盘：低功效或有
-        # 协议冲突的调参报告不能被下游当成「基线已充分调参」。
+        # 统计功效与调参质量问题必须随来源一起落盘：低功效、
+        # 种子集合不一致或有协议冲突的调参报告不能被下游当成
+        # 「基线已充分调参」。
         "seed_plan": payload.get("seed_plan"),
+        "seed_alignment": payload.get("seed_alignment"),
         "issues": payload.get("issues"),
         "winner_at_grid_boundary": payload.get(
             "winner_at_grid_boundary"
@@ -26771,7 +27094,7 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     搜索（val 选择，test 尘封），输出调参报告。调参只是把
     基线调到「值得战胜」，报告本身不是最终基线。
     """
-    metric = args.compare_metric
+    metric, metric_source = resolve_baseline_tuning_metric(args)
     lrs = list(args.baseline_tuning_lrs)
     seeds = list(args.seeds)
 
@@ -26790,8 +27113,8 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
         "[suite-baseline-tuning] 基线调参：mode="
         f"{args.baseline_tuning_mode}, 学习率候选="
         + ", ".join(format(lr, "g") for lr in lrs)
-        + f", seeds={seeds}, 指标={metric}（val 选择，"
-        "test 集不参与）"
+        + f", seeds={seeds}, 指标={metric}"
+        f"（来源={metric_source}, val 选择，test 集不参与）"
     )
     if len(seeds) < _RECOMMENDED_SEEDS:
         print(
@@ -26814,6 +27137,7 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
         lrs,
         seeds,
     )
+    report["metric_source"] = metric_source
     report["seed_plan"] = {
         "seeds": [int(seed) for seed in seeds],
         "n_seeds": len(seeds),
@@ -27374,6 +27698,19 @@ def main():
         help=(
             "基线调参的模式（默认 dense：最简单的神经基线；"
             "先调强简单基线，再谈复杂模型）"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tuning-metric",
+        type=str,
+        default=None,
+        choices=_BASELINE_TUNING_METRIC_KEYS,
+        metavar="METRIC",
+        help=(
+            "基线调参的 val 选择指标；缺省时优先跟随 "
+            "--primary-metric（预注册主指标），否则用 "
+            "--compare-metric。在 val_loss 上调强的基线不能"
+            "证明它在 macro F1 / PR-AUC 上也已调强"
         ),
     )
     parser.add_argument(
