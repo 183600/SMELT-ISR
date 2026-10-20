@@ -4182,6 +4182,14 @@ _AUDIT_SHIFT_WARN = 0.1
 # abab...、评估集是 baba...；二元组 JS 距离对这类偏移敏感。
 _AUDIT_BIGRAM_SHIFT_WARN = 0.1
 
+# 条件分布 P(next_byte | prev_byte) 的 JS 距离阈值：联合二元组
+# 分布相同也可能存在「同一上下文接不同标签」的监督漂移。
+_AUDIT_CONDITIONAL_SHIFT_WARN = 0.1
+
+# eval 中未见过的 (上下文, 目标) 转移比例阈值：比例过高说明
+# 训练集没有覆盖评估集的监督模式，泛化指标会包含大量外推。
+_AUDIT_UNSEEN_TRANSITION_WARN = 0.5
+
 # 单个字节占比超过该阈值时疑似填充/退化数据（异常值检查）。
 _AUDIT_TOP_BYTE_WARN = 0.5
 
@@ -4277,6 +4285,103 @@ def _js_distance(
 
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
     return math.sqrt(max(0.0, float(js)))
+
+
+def _conditional_bigram_shift(
+    train_counts: torch.Tensor,
+    eval_counts: torch.Tensor,
+    vocab_size: int = 256,
+) -> Dict[str, float]:
+    """
+    给定上下文后的标签分布偏移（P(next_byte | prev_byte)）。
+
+    单字节/联合二元组分布可能掩盖条件分布变化：同样的二元组
+    词表，若「同一上下文后面接什么」发生变化，监督信号已经
+    漂移。这里逐上下文比较 train 与 eval 的条件分布：
+
+    - ``conditional_js``：按 eval 中该上下文的出现次数加权的
+      条件 JS 距离（只统计 train 中出现过的上下文；对每行做
+      Laplace 平滑，避免零概率使距离失真）；
+    - ``seen_context_share``：eval 二元组中，其上下文在 train
+      至少出现过一次的比例；
+    - ``unseen_transition_share``：eval 二元组中，该
+      (上下文, 目标) 转移在 train 从未出现的比例。
+
+    统计量只用于审计，不进入模型训练或选型。train 计数已经
+    扣除清洗区间，与神经网络/统计基线看到的训练内容一致。
+    """
+    train = train_counts.view(
+        vocab_size,
+        vocab_size,
+    ).to(torch.float64)
+    evaluation = eval_counts.view(
+        vocab_size,
+        vocab_size,
+    ).to(torch.float64)
+
+    train_ctx = train.sum(dim=1)
+    eval_ctx = evaluation.sum(dim=1)
+    total_eval_pairs = float(eval_ctx.sum())
+
+    if total_eval_pairs <= 0.0:
+        return {
+            "conditional_js": 0.0,
+            "seen_context_share": 0.0,
+            "unseen_transition_share": 0.0,
+            "eval_pairs": 0.0,
+        }
+
+    supported = (eval_ctx > 0) & (train_ctx > 0)
+    seen_pairs = float(eval_ctx[supported].sum())
+    seen_context_share = seen_pairs / total_eval_pairs
+
+    unseen_pairs = float(
+        (evaluation * (train == 0)).sum()
+    )
+    unseen_transition_share = unseen_pairs / total_eval_pairs
+
+    if seen_pairs <= 0.0:
+        conditional_js = 1.0
+    else:
+        train_rows = train[supported] + 1.0
+        eval_rows = evaluation[supported] + 1.0
+        train_probs = train_rows / train_rows.sum(
+            dim=1,
+            keepdim=True,
+        )
+        eval_probs = eval_rows / eval_rows.sum(
+            dim=1,
+            keepdim=True,
+        )
+        mean_probs = 0.5 * (train_probs + eval_probs)
+
+        def _kl_rows(
+            left: torch.Tensor,
+            right: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                left * (left / right).log2()
+            ).sum(dim=1)
+
+        js_rows = 0.5 * _kl_rows(
+            train_probs,
+            mean_probs,
+        ) + 0.5 * _kl_rows(
+            eval_probs,
+            mean_probs,
+        )
+        distances = js_rows.clamp_min(0.0).sqrt()
+        weights = eval_ctx[supported]
+        conditional_js = float(
+            (distances * weights).sum() / weights.sum()
+        )
+
+    return {
+        "conditional_js": conditional_js,
+        "seen_context_share": seen_context_share,
+        "unseen_transition_share": unseen_transition_share,
+        "eval_pairs": total_eval_pairs,
+    }
 
 
 def _subtract_byte_intervals(
@@ -5172,6 +5277,7 @@ def audit_data_splits(
             )
 
     bigram_histograms: Dict[str, torch.Tensor] = {}
+    bigram_counts: Dict[str, torch.Tensor] = {}
 
     for split in split_names:
         counts = _byte_bigram_counts(
@@ -5182,6 +5288,7 @@ def audit_data_splits(
                 else None
             ),
         )
+        bigram_counts[split] = counts
         total = int(counts.sum())
         if total > 0:
             bigram_histograms[split] = (
@@ -5190,6 +5297,9 @@ def audit_data_splits(
 
     distribution_shift: Dict[str, float] = {}
     distribution_shift_bigram: Dict[str, float] = {}
+    distribution_shift_conditional: Dict[str, float] = {}
+    unseen_transition_share: Dict[str, float] = {}
+    seen_context_share: Dict[str, float] = {}
 
     for left, right in (
         ("train", "val"),
@@ -5230,6 +5340,47 @@ def audit_data_splits(
                     f"（JS 距离 {bigram_distance:.4f}）："
                     "单字节词表可能相同，但上下文/顺序分布"
                     "已发生变化"
+                )
+
+        if left in bigram_counts and right in bigram_counts:
+            conditional = _conditional_bigram_shift(
+                bigram_counts[left],
+                bigram_counts[right],
+            )
+            distribution_shift_conditional[key] = round(
+                conditional["conditional_js"],
+                6,
+            )
+            unseen_transition_share[key] = round(
+                conditional["unseen_transition_share"],
+                6,
+            )
+            seen_context_share[key] = round(
+                conditional["seen_context_share"],
+                6,
+            )
+
+            if (
+                conditional["conditional_js"]
+                > _AUDIT_CONDITIONAL_SHIFT_WARN
+            ):
+                warnings.append(
+                    f"{key}: 给定上下文后的标签分布偏移较大"
+                    "（条件 JS 距离 "
+                    f"{conditional['conditional_js']:.4f}）："
+                    "同一上下文在 train 与评估 split 中"
+                    "接不同标签，监督信号已漂移"
+                )
+
+            if (
+                conditional["unseen_transition_share"]
+                > _AUDIT_UNSEEN_TRANSITION_WARN
+            ):
+                warnings.append(
+                    f"{key}: 评估集中 "
+                    f"{conditional['unseen_transition_share']:.1%} "
+                    "的 (上下文, 目标) 转移在 train 从未出现；"
+                    "指标包含大量外推，需检查切分/分布偏移"
                 )
 
     duplicate_windows: Dict[str, object] = {}
@@ -5356,6 +5507,11 @@ def audit_data_splits(
         "dataset_split_fractions": dataset.split_fractions,
         "distribution_shift": distribution_shift,
         "distribution_shift_bigram": distribution_shift_bigram,
+        "distribution_shift_conditional": (
+            distribution_shift_conditional
+        ),
+        "unseen_transition_share": unseen_transition_share,
+        "seen_context_share": seen_context_share,
         "duplicate_windows": duplicate_windows,
         "content_chunks": content_chunks,
         "groups": groups_report,
@@ -5502,6 +5658,17 @@ def print_data_audit(report: Dict[str, object]) -> None:
         print(
             f"[data]   {key} 字节二元组分布 JS 距离 = "
             f"{distance:.4f}"
+        )
+
+    for key, distance in report.get(
+        "distribution_shift_conditional",
+        {},
+    ).items():
+        print(
+            f"[data]   {key} 条件标签分布 JS 距离 = "
+            f"{distance:.4f} "
+            "(未见转移 "
+            f"{report.get('unseen_transition_share', {}).get(key, 0.0):.1%})"
         )
 
     for key, info in report.get(
@@ -22242,6 +22409,24 @@ def run_self_test():
         assert math.isfinite(distance)
         assert 0.0 <= distance <= 1.0
 
+    for distance in clean_audit[
+        "distribution_shift_conditional"
+    ].values():
+        assert math.isfinite(distance)
+        assert 0.0 <= distance <= 1.0
+
+    for share in clean_audit[
+        "unseen_transition_share"
+    ].values():
+        assert math.isfinite(share)
+        assert 0.0 <= share <= 1.0
+
+    for share in clean_audit[
+        "seen_context_share"
+    ].values():
+        assert math.isfinite(share)
+        assert 0.0 <= share <= 1.0
+
     # 单字节频率相同、但相邻字节顺序完全相反时，一元分布
     # JS 距离应为 0，二元组分布必须报告显著偏移。只看词表
     # 频率会漏掉这种上下文分布变化。
@@ -22272,6 +22457,26 @@ def run_self_test():
     )
     assert any(
         "二元组分布偏移" in warning
+        for warning in order_audit["warnings"]
+    )
+    # 条件标签分布（P(next|prev)）同样必须发现顺序反转：
+    # 联合二元组分布已偏移，且所有 eval 转移在 train 均未出现。
+    assert (
+        order_audit["distribution_shift_conditional"][
+            "train_val"
+        ]
+        > _AUDIT_CONDITIONAL_SHIFT_WARN
+    )
+    assert (
+        order_audit["unseen_transition_share"]["train_val"]
+        == 1.0
+    )
+    assert (
+        order_audit["seen_context_share"]["train_val"]
+        == 1.0
+    )
+    assert any(
+        "标签分布偏移" in warning
         for warning in order_audit["warnings"]
     )
 
