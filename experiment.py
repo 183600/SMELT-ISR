@@ -4810,6 +4810,72 @@ def _window_signature_scan(
     }
 
 
+def _leakage_scan_coverage(
+    scans: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    汇总窗口签名扫描的覆盖情况，暴露「零发现」的证据强度。
+
+    「未发现跨 split 重复窗口」只对被采样到的窗口成立：窗口
+    总数超过 ``max_windows`` 时等间距抽样（stride>1），未采样
+    窗口之间的重复完全不在证据范围内。把 coverage 写进审计，
+    读者才能区分「穷尽扫描的零发现」与「抽样扫描的零发现」；
+    内容定义分块审计按局部内容指纹穷尽扫描，是错位重复的
+    兜底，但同样不能替代窗口级证据的口径披露。
+    """
+    per_split: Dict[str, Dict[str, object]] = {}
+    exhaustive = True
+
+    for split, scan in scans.items():
+        total = int(scan["total"])
+        sampled = int(scan["sampled"])
+        stride = int(scan["stride"])
+        per_split[split] = {
+            "sampled": sampled,
+            "total": total,
+            "stride": stride,
+            "coverage": (
+                round(sampled / total, 6) if total > 0 else None
+            ),
+        }
+        if total > 0 and stride > 1:
+            exhaustive = False
+
+    residual_risk: Optional[str] = None
+    if not exhaustive:
+        worst = max(
+            (
+                (int(info["stride"]), split)
+                for split, info in per_split.items()
+                if int(info["total"]) > 0
+            ),
+            default=(1, ""),
+        )
+        split_text = ", ".join(
+            f"{split}:{info['sampled']}/{info['total']}"
+            + (
+                f"(stride={info['stride']})"
+                if int(info["stride"]) > 1
+                else ""
+            )
+            for split, info in per_split.items()
+            if int(info["total"]) > 0
+        )
+        residual_risk = (
+            f"窗口签名扫描未穷尽（最大 stride={worst[0]}；"
+            f"{split_text}）：「未发现跨 split 重复窗口」"
+            "只覆盖等间距采样的窗口，不等于「不存在重复」；"
+            "内容定义分块审计为穷尽扫描，可兜底检出错位重复，"
+            "但不能据此主张窗口级零泄露"
+        )
+
+    return {
+        "exhaustive": exhaustive,
+        "per_split": per_split,
+        "residual_risk": residual_risk,
+    }
+
+
 def _scan_text_integrity(
     raw: memoryview,
     offset: int,
@@ -5256,6 +5322,11 @@ def audit_data_splits(
     - 群组划分（传入 group_separator 时）报告每个 split 的完整
       群组数与分隔符，供追踪「群组整体不跨界」的协议。
 
+    ``leakage_scan_coverage`` 记录窗口签名扫描的覆盖（各 split
+    采样窗口数/总窗口数与 stride）。stride>1 时窗口级「未发现
+    跨 split 重复」只是抽样范围内的负结果，报告会显式写出残余
+    风险，避免把抽样零发现读成「数据里没有泄露」。
+
     返回的 ``warnings`` 是全部提醒；``violations`` 是其中会
     被 ``--strict-data-audit`` 视为致命的问题（越界 token、
     跨 split 重复内容、任何 UTF-8/NUL 损坏）——这些问题直接
@@ -5689,6 +5760,12 @@ def audit_data_splits(
             violations.append(message)
             leakage_violations.append(message)
 
+    # 抽样扫描的零发现不能当成「无泄露」的证明：把覆盖情况与
+    # 残余风险写进审计，读者才知道这条负结果的证据边界在哪。
+    scan_coverage = _leakage_scan_coverage(scans)
+    if scan_coverage["residual_risk"]:
+        warnings.append(str(scan_coverage["residual_risk"]))
+
     groups_report: Optional[Dict[str, object]] = None
 
     if dataset.group_separator is not None:
@@ -5790,6 +5867,7 @@ def audit_data_splits(
         "unseen_transition_share": unseen_transition_share,
         "seen_context_share": seen_context_share,
         "duplicate_windows": duplicate_windows,
+        "leakage_scan_coverage": scan_coverage,
         "content_chunks": content_chunks,
         "groups": groups_report,
         "warnings": warnings,
@@ -5821,6 +5899,12 @@ def enforce_data_leakage_gate(
     leakage = report.get("leakage_violations") or []
 
     if not leakage:
+        # 通过也必须交代证据边界：窗口签名扫描可能只是抽样，
+        # 「没拦下泄露」不等于「数据里没有泄露」。
+        coverage = report.get("leakage_scan_coverage") or {}
+        residual = coverage.get("residual_risk")
+        if residual:
+            print(f"[data] 泄露门通过（未发现跨 split 重复）：{residual}")
         return True
 
     where = f"（{context}）" if context else ""
@@ -5968,6 +6052,28 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 f"[data]   {key} 共享窗口签名数 = "
                 f"{info['shared_signatures']}"
             )
+
+    coverage = report.get("leakage_scan_coverage") or {}
+    per_split_coverage = coverage.get("per_split") or {}
+    if per_split_coverage:
+        print(
+            "[data]   泄露窗口扫描覆盖: "
+            + ", ".join(
+                f"{name}:{info['sampled']}/{info['total']}"
+                + (
+                    f"(stride={info['stride']})"
+                    if int(info["stride"]) > 1
+                    else ""
+                )
+                for name, info in per_split_coverage.items()
+                if int(info["total"]) > 0
+            )
+            + (
+                "（穷尽扫描）"
+                if coverage.get("exhaustive")
+                else "（抽样扫描，零发现 ≠ 无泄露）"
+            )
+        )
 
     chunks = report.get("content_chunks") or {}
     for key, info in (
@@ -24774,6 +24880,25 @@ def run_self_test():
         ]["shared_chunks"]
         == 0
     )
+
+    # 抽样扫描必须显式暴露覆盖：stride>1 时窗口级零发现不能
+    # 被解读成「无泄露」，穷尽扫描才允许主张窗口级证据完整。
+    chunk_coverage = chunk_audit["leakage_scan_coverage"]
+    assert chunk_coverage["exhaustive"] is False
+    assert "不等于" in chunk_coverage["residual_risk"]
+    assert (
+        chunk_coverage["per_split"]["train"]["stride"] > 1
+    )
+    assert any(
+        "不等于" in warning
+        for warning in chunk_audit["warnings"]
+    )
+    clean_coverage = clean_audit["leakage_scan_coverage"]
+    assert clean_coverage["exhaustive"] is True
+    assert clean_coverage["residual_risk"] is None
+    for info in clean_coverage["per_split"].values():
+        assert info["stride"] == 1
+        assert info["coverage"] == 1.0
 
     # 单个字节占主导的退化语料必须被标记（异常值检查）。
     with tempfile.NamedTemporaryFile() as padded_file:

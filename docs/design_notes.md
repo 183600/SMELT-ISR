@@ -90,6 +90,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
   解封且不写 test 记录。默认只警告，便于先诊断再清洗。
+- **扫描覆盖与残余风险**：窗口签名扫描在窗口数超过上限时按 stride
+  等间距抽样，因此「未发现跨 split 重复窗口」只是采样范围内的负
+  结果。`data_audit.leakage_scan_coverage` 记录各 split 的
+  采样/总窗口数、stride 与覆盖率；stride>1 时审计与泄露门都会显式
+  写出残余风险（「未发现」≠「不存在」）。内容定义分块指纹按局部
+  内容穷尽扫描，可兜底被 stride 漏掉的错位重复，但兜底命中与否
+  都不改变窗口级负结果的抽样性质。
 
 ## 代码组织
 
@@ -101,9 +108,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `ByteDataset`、`evaluate`：字节级数据管线与按 split 的固定窗口评估。
 - `parse_group_separator`、`_snap_group_split`、`_count_groups`：
   群组分隔符解析与「群组整体不跨界」的切分位置吸附。
-- `audit_data_splits`、`_window_signature_scan`、`_scan_text_integrity`、
-  `enforce_strict_data_audit`：数据审计（值域、文本完整性/标签噪声、
-  分布偏移、重复窗口）与严格模式下的泄露拦截。
+- `audit_data_splits`、`_window_signature_scan`、`_leakage_scan_coverage`、
+  `_scan_text_integrity`、`enforce_strict_data_audit`、
+  `enforce_data_leakage_gate`：数据审计（值域、文本完整性/标签噪声、
+  分布偏移、重复窗口及其扫描覆盖）、严格模式下的标签噪声拦截与
+  默认启用的跨 split 泄露硬门。
 - `run_sanity_overfit`、`_probe_gradient_flow`、`_expert_parameter_ids`：
   训练前的过拟合小批量 sanity check 与第一步梯度探针（损失连通性、
   有限性、非零梯度、非专家参数缺失梯度）。
