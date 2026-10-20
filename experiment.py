@@ -16661,7 +16661,9 @@ def factor_contrasts(
             # 完整案例分析（只用有该指标的运行）默认假设「缺指标
             # 与指标值无关」。两臂缺失数不同时，对比就建立在不同
             # 的运行子集上：差异可能来自「哪些运行留下了」而不是
-            # 方法本身，必须显式暴露而不是静默丢弃。
+            # 方法本身，必须显式暴露而不是静默丢弃。缺失按「原始
+            # 样本数 vs 运行数」计算：伪重复折叠已经单独标记，
+            # 不能混进缺失计数里造成误报。
             deterministic_cell = bool(
                 cell_a.get("deterministic")
                 or cell_b.get("deterministic")
@@ -16671,12 +16673,12 @@ def factor_contrasts(
             missing_a = (
                 0
                 if deterministic_cell
-                else max(0, expected_a - len(independent_a))
+                else max(0, expected_a - len(samples_a))
             )
             missing_b = (
                 0
                 if deterministic_cell
-                else max(0, expected_b - len(independent_b))
+                else max(0, expected_b - len(samples_b))
             )
 
             if delta is None:
@@ -21216,7 +21218,9 @@ def print_comparison_analysis(
     print(
         "[aggregate] 按实验单元聚合（Mean ± Std，样本标准差；"
         "std 反映不同随机种子的方差；CI 为均值的 t 分布 95% "
-        "置信区间，n<2 或确定性折叠后不给出）"
+        "置信区间，n<2 或确定性折叠后不给出；n(seed) 中括号"
+        "为独立种子数，与运行数不同时说明存在伪重复或确定性"
+        "折叠）"
     )
     if selection_metric_mismatch:
         print(
@@ -21256,7 +21260,7 @@ def print_comparison_analysis(
         if metric != "val_loss":
             metric_columns.append(metric)
         header = (
-            f"{'cell':<40} {'n':>3} "
+            f"{'cell':<40} {'n(seed)':>8} "
             + " ".join(
                 f"{column:>39}" for column in metric_columns
             )
@@ -21293,10 +21297,19 @@ def print_comparison_analysis(
                 )
             return text
 
+        # n 列同时给出独立种子数：伪重复/确定性折叠时运行数
+        # 不等于独立重复数，只报 n_runs 会让人高估统计功效。
+        def _n_text(aggregate) -> str:
+            runs = int(aggregate["n_runs"])
+            seeds = int(
+                aggregate.get("effective_seed_count", runs) or runs
+            )
+            return str(runs) if seeds == runs else f"{runs}({seeds})"
+
         for aggregate in aggregates:
             print(
                 f"{str(aggregate['label'])[:39]:<40} "
-                f"{int(aggregate['n_runs']):>3} "
+                f"{_n_text(aggregate):>8} "
                 + " ".join(
                     f"{_stat(aggregate, column):>39}"
                     for column in metric_columns
@@ -28469,6 +28482,18 @@ def run_self_test():
             duplicate_by_label["mode=A"]["val_loss_n"] == 3
         )
         assert duplicate_by_label["mode=A"]["n_runs"] == 4
+        # 聚合表的 n(seed) 列依据：运行数 4、独立种子数 3，
+        # 两者不同时展示层必须写成 4(3)，不能只报 n_runs。
+        assert (
+            duplicate_by_label["mode=A"]["effective_seed_count"]
+            == 3
+        )
+        assert (
+            duplicate_by_label["mode=local_base"][
+                "effective_seed_count"
+            ]
+            == 3
+        )
         assert (
             "重复随机种子"
             in _contrast_display(duplicate_contrast, "val_loss")
