@@ -268,6 +268,24 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   在少于 3 个不同随机种子时直接拒绝运行，冒烟/调试需显式
   加 `--allow-underpowered`；豁免与种子计划（`seed_plan`）
   随报告落盘，避免低功效运行被当作正式结论。
+  **确定性基线**：ngram 的计数与固定窗口评估不消耗随机性，
+  换 seed 重跑只是同一估计的复制，不是独立重复。聚合层按
+  `deterministic` 标记把同一单元的多个 seed 折叠为 1 个观测
+  （`effective_seed_count=1`、`val_*_std=None` 而非人为 0），
+  检验层不会因零方差制造假显著；展示层提示其不确定性应来自
+  评估窗口 bootstrap 或多次时间切分，而不是增加种子数。若多个
+  确定性 seed 运行给出不同指标，`deterministic_conflict_cells`
+  点名该单元：确定性管线本应逐位一致，差异来自数据/评估而非
+  随机性，不能按种子重复解读。
+- **等训练计算预算对比**：A/B 每步 FLOPs 高于 smelt，等步数
+  比较会把机制收益与额外计算混在一起。`--compare` 从各运行
+  `metrics.jsonl` 的周期验证曲线按 `step × 3 × flops_per_forward`
+  估算累计训练 FLOPs，在所有可比运行都能覆盖的共同预算点线性
+  插值出 `val_loss_at_matched_flops`（不向曲线终点外推）；该
+  派生指标可作 `--compare-metric` 或预注册主指标参与聚合与
+  检验，终端打印 `[compute-matched]`，报告写入
+  `compute_matched`。共同预算只覆盖最贵运行不足一半训练预算
+  时显式提示结论只适用于该预算点。
 - **基线合理性（稻草人守卫）**：`--compare-baseline MODE`
   在给出相对差值之外，还核对基线本身是否值得战胜：基线在
   主指标上必须真的优于无上下文 unigram 参考（各运行
@@ -282,6 +300,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   调强」。调参依据的指标与当前对比指标不一致时不打印无条件
   的 OK，而是显式警告「不能证明基线在该指标上被调强」
   （调在 val_loss 上不能证明 macro F1 也强）。
+  对比集合没有 ngram 时显式提示简单基线守卫退化为只看
+  unigram 参考；确定性 ngram 的多个 seed 不计入独立种子，
+  也不建议用「多种子重跑」估计其不确定性。
+  **调参预算对称性**：基线做了学习率网格、挑战臂却使用默认
+  lr 且没有独立调参来源时，`tuning_budget_parity` 单独提示：
+  落败不能排除调参不足，胜出只是保守下界。
   未指定基线或缺少参考记录时给出提示而不是虚报通过。
 - **简单基线的调参协议**：`--suite-baseline-tuning`（配合
   `--seeds`）对简单基线做预注册的学习率网格搜索
@@ -300,7 +324,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   数据划分/评估窗口等）逐项一致（旧版报告缺协议字段时显式
   拒绝，不默认为通过），并把来源写入 `config.json` 的
   `baseline_tuning` 字段——这是「基线被调过参」的唯一证据；
-  报告本身不是最终基线，test 集全程尘封。
+  报告本身不是最终基线，test 集全程尘封。调参网格只扫学习率，
+  不改变 dense 容量；容量是否与挑战模型等参数由
+  `baseline_capacity` 另行核对，需要时用 `--dense-fnn-hidden`
+  显式补等参数基线。
 - **假设登记与指标口径提示**：对比分析按模式汇总每个运行在
   `--hypothesis`/`--rq` 登记的假设，缺失假设的运行被点名
   （统计基线除外），避免把排列组合超参数当成假设驱动的实验；
@@ -360,8 +387,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   val_loss 一并写入 `best.pt`、`metrics.jsonl` 的 final
   记录与 `config.json` 的 `model_selection`，并作为受控
   变量参与 `--compare` 核对（按 loss 选型与按 F1 选型的
-  运行不能混在一起比较）。恢复训练时选型指标按检查点
-  恢复，避免中途换指标重新解释历史评估点。
+  运行不能混在一起比较）。`--compare` 再次核对运行记录的
+  `selection_metric` 与当前 `--compare-metric`：当前指标本身
+  可用于选型却不一致时，`selection_metric_mismatch` 明确警告
+  「最终模型不是按假设的判定口径选出的」；等计算预算 loss、
+  AUC 等只能离线计算的指标不触发该警告。恢复训练时选型
+  指标按检查点恢复，避免中途换指标重新解释历史评估点。
 - **基线欠训与容量混淆守卫**：`baseline_adequacy` 除核对
   「基线强于 unigram 参考」「基线有调参来源」「不劣于调优好的
   n-gram」「种子数」之外，还检查：
@@ -373,8 +404,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
     `_COST_RATIO_MATERIAL`（1.5×）时提示容量混淆，要求报告
     等参数（`--dense-fnn-hidden n_experts×expert_hidden`）
     或等计算（`smelt` / `local_base`）对照，区分容量与机制；
-  - n-gram 对照运行少于 3 个时提示其点估计没有种子间波动，
-    微小优势可能落在 val 网格搜索噪声内。
+  - dense 基线默认 `dense_fnn_hidden=None` 解析为
+    `top_k×expert_hidden`，这是等激活计算而非等参数容量；
+    挑战模型参数更多时，`baseline_capacity` 给出等参数宽度，
+    提示用 `--dense-fnn-hidden n_experts×expert_hidden` 补
+    等参数基线；
+  - n-gram 是确定性对照：多个 seed 折叠为 1 个观测，
+    `ngram_deterministic=True`，不再建议多种子重跑；需要
+    误差线时对评估窗口做 bootstrap 或多次时间切分。
   `--suite-baseline-tuning` 的 winner 候选若仍 `not_converged`，
   调参报告本身也会给出「限制基线的是训练配置而非学习率」的
   issue。

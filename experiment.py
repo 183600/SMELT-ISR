@@ -6151,6 +6151,9 @@ def run_statistical_baseline(
 
     # ---- config.json：与训练运行相同结构，可直接 --compare ----
     payload = {
+        # 计数与固定窗口评估都不消耗随机性：显式标记，供
+        # --compare 折叠多个 seed 的复制运行（不能当独立重复）。
+        "deterministic": True,
         "config": {
             "mode": "ngram",
             "vocab_size": 256,
@@ -9691,6 +9694,258 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
     )
 
 
+# 等计算预算对比：训练一步的 FLOPs 近似为 3×前向 FLOPs
+# （前向 + 反向约等于 2 次前向）。该常数只用于把预算换算成
+# 「训练 FLOPs」的绝对量级，各运行共享同一常数，不改变共同
+# 预算点的位置。
+_TRAIN_FLOPS_MULTIPLIER = 3.0
+
+_COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
+
+
+def _is_deterministic_run(row: Dict[str, object]) -> bool:
+    """
+    该运行是否不使用随机性。
+
+    统计基线 ngram 的计数、调参与固定窗口评估都是确定性的：
+    换一个 --seed 重跑不会产生新的独立重复，只是同一估计的
+    复制。把不同 seed 的 ngram 运行当成独立样本会虚增 n、
+    把种子方差压成 0，甚至让检验出现假阳性。未来若有其他
+    确定性基线，可在 config.json 写 deterministic=true。
+    """
+    if bool(row.get("deterministic")):
+        return True
+    return str(row.get("mode")) == "ngram"
+
+
+def _finite_float(value: object) -> Optional[float]:
+    """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float)
+    ):
+        return None
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _val_curve_points(
+    run_dir: Path,
+    flops_per_forward: float,
+) -> List[Tuple[float, float]]:
+    """
+    从 metrics.jsonl 读出 (累计训练 FLOPs, val_loss) 验证曲线点。
+
+    只使用周期验证记录（数值 step + 有限 val_loss）：final 记录
+    是「验证集最优 checkpoint」的指标，不是该步的即时指标，把它
+    混进曲线会让不同运行在相同预算点比较时引入选型偏差。
+    """
+    points: Dict[float, float] = {}
+
+    for record in read_metrics_records(
+        run_dir / "metrics.jsonl"
+    ):
+        step = _finite_float(record.get("step"))
+        loss = _finite_float(record.get("val_loss"))
+        if step is None or step <= 0.0 or loss is None:
+            continue
+        cumulative = (
+            step
+            * _TRAIN_FLOPS_MULTIPLIER
+            * flops_per_forward
+        )
+        # 同一步有多条验证记录（如 NaN 诊断附加记录）时保留
+        # 最后一条；评估协议相同，值应一致。
+        points[float(cumulative)] = loss
+
+    return sorted(points.items())
+
+
+def _interpolate_curve(
+    points: List[Tuple[float, float]],
+    x: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    在验证曲线上取 x 处的 loss：命中验证点则精确取值，
+    否则在相邻两点间线性插值。x 落在曲线范围外时返回
+    (None, 原因)，不静默外推。
+    """
+    if not points:
+        return None, "没有周期验证曲线"
+    if x < points[0][0] or x > points[-1][0]:
+        return None, "共同预算落在该运行的验证曲线范围之外"
+    if x == points[0][0]:
+        return points[0][1], "exact_eval_point"
+    if x == points[-1][0]:
+        return points[-1][1], "exact_eval_point"
+
+    for index in range(1, len(points)):
+        x_prev, y_prev = points[index - 1]
+        x_next, y_next = points[index]
+        if x <= x_next:
+            if x == x_next:
+                return y_next, "exact_eval_point"
+            ratio = (x - x_prev) / (x_next - x_prev)
+            return (
+                y_prev + ratio * (y_next - y_prev),
+                "linear_between_evals",
+            )
+
+    return None, "共同预算落在该运行的验证曲线范围之外"
+
+
+def annotate_compute_matched_metrics(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    为每个运行计算「等训练计算预算」的验证 loss，并写回行级
+    指标 ``val_loss_at_matched_flops``。
+
+    动机：延迟合并 A/B 在分支创建后按 k1 倍分支执行后续计算，
+    每训练步的 FLOPs 高于 smelt。只比较相同训练步数会把「机制
+    收益」和「额外计算」混在一起；只报告效率倍率也不能回答
+    「给基线同样的计算预算，谁更好」。
+
+    协议：
+    - 每步训练 FLOPs ≈ _TRAIN_FLOPS_MULTIPLIER × 实测前向
+      FLOPs（同一运行内的常数倍不改变曲线形状）；
+    - 共同预算取所有可比运行中「最后一个周期验证点累计
+      FLOPs」的最小值——保证每个运行都在自己的验证曲线范围内
+      有观测，不做外推；
+    - 在共同预算处对验证曲线做线性插值（命中验证点则精确
+      取值），得到 val_loss_at_matched_flops；
+    - 这是**分析期**派生指标，不用于训练期选型/早停；它直接
+      进入 COMPARISON_METRIC_KEYS，可用于聚合、显著性检验与
+      预注册主指标。
+
+    没有效率测量（--skip-efficiency/旧运行）或没有周期验证
+    曲线的运行不参与共同预算，也不会被虚报指标；原因写入返回
+    报告。统计基线 ngram 是查表模型，没有训练 FLOPs，同样排除。
+    """
+    report: Dict[str, object] = {
+        "metric": _COMPUTE_MATCHED_METRIC,
+        "train_flops_multiplier": _TRAIN_FLOPS_MULTIPLIER,
+        "target_flops": None,
+        "target_note": None,
+        "runs": [],
+        "excluded_runs": [],
+        "advisories": [],
+        "ok": False,
+    }
+
+    curves: Dict[int, List[Tuple[float, float]]] = {}
+    for index, row in enumerate(rows):
+        row.pop(_COMPUTE_MATCHED_METRIC, None)
+        row.pop("matched_compute_target_flops", None)
+        row.pop("matched_compute_ratio", None)
+
+        flops = _finite_float(row.get("flops_per_forward"))
+        if flops is None or flops <= 0.0:
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "缺少前向 FLOPs（旧运行或 "
+                    "--skip-efficiency），无法换算训练计算预算"
+                ),
+            })
+            continue
+
+        points = _val_curve_points(
+            Path(str(row.get("path"))),
+            flops,
+        )
+        if not points:
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "没有可用的周期验证曲线"
+                    "（metrics.jsonl 缺数值 step + val_loss）"
+                ),
+            })
+            continue
+        curves[index] = points
+
+    if not curves:
+        report["advisories"].append(
+            "没有任何运行同时具备前向 FLOPs 与周期验证曲线："
+            "无法计算等训练计算预算的 val_loss；请用未跳过"
+            "效率测量的新版运行重跑"
+        )
+        return report
+
+    target_flops = min(points[-1][0] for points in curves.values())
+    report["target_flops"] = target_flops
+    report["target_note"] = (
+        "共同预算 = 可比运行最后一个周期验证点累计训练 FLOPs "
+        f"的最小值；训练 FLOPs≈{_TRAIN_FLOPS_MULTIPLIER:g}×"
+        "前向 FLOPs"
+    )
+
+    for index, points in curves.items():
+        row = rows[index]
+        value, method = _interpolate_curve(points, target_flops)
+        if value is None:
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": method,
+            })
+            continue
+
+        row[_COMPUTE_MATCHED_METRIC] = value
+        row["matched_compute_target_flops"] = target_flops
+        row["matched_compute_ratio"] = (
+            target_flops / points[-1][0]
+            if points[-1][0] > 0.0
+            else None
+        )
+        report["runs"].append({
+            "run": row.get("run"),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "value": value,
+            "interpolation": method,
+            "last_curve_flops": points[-1][0],
+            "budget_ratio": row["matched_compute_ratio"],
+        })
+
+    if report["runs"]:
+        report["ok"] = True
+        # 便宜臂与昂贵臂在共同预算处截断的程度不同：若最贵
+        # 运行只能用到自身预算的一小部分，说明比较点很早，
+        # 结论只适用于该预算点，不能外推到完整训练结束。
+        ratios = [
+            float(item["budget_ratio"])
+            for item in report["runs"]
+            if isinstance(item.get("budget_ratio"), (int, float))
+            and not isinstance(item["budget_ratio"], bool)
+        ]
+        if ratios and min(ratios) < 0.5:
+            report["advisories"].append(
+                "等计算预算点只覆盖最贵运行不到一半的训练预算"
+                f"（最小比例 {min(ratios):.1%}）：结论只适用于该"
+                "预算点，不能当作完整训练结束时的对比；如需完整"
+                "预算结论，请给便宜臂增加训练步数或增加昂贵臂"
+                "前段评估密度"
+            )
+    else:
+        report["advisories"].append(
+            "没有运行能在共同预算点提供验证 loss：无法做"
+            "等计算预算对比"
+        )
+
+    if report["excluded_runs"]:
+        report["advisories"].append(
+            "以下运行未参与等计算预算对比（不虚报指标）: "
+            + "; ".join(
+                f"{item['run']}（{item['reason']}）"
+                for item in report["excluded_runs"]
+            )
+        )
+
+    return report
+
+
 def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
     """
     汇总多个运行目录的 config 与最终指标。
@@ -9725,6 +9980,13 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             except (OSError, json.JSONDecodeError):
                 config_payload = {}
 
+        # 确定性标记：ngram 统计基线换 seed 不会产生新的独立
+        # 重复；聚合与检验必须据此折叠，而不是把复制运行当
+        # 独立种子。
+        row["deterministic"] = bool(
+            config_payload.get("deterministic")
+        )
+
         run_config = config_payload.get("config") or {}
         if isinstance(run_config, dict):
             row["mode"] = run_config.get("mode")
@@ -9735,10 +9997,23 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["dense_fnn_hidden"] = run_config.get(
                 "dense_fnn_hidden"
             )
+            row["n_experts"] = run_config.get("n_experts")
+            row["expert_hidden"] = run_config.get(
+                "expert_hidden"
+            )
 
         run_args = config_payload.get("args") or {}
         if isinstance(run_args, dict):
             row["seed"] = run_args.get("seed")
+            # 选型指标：旧运行没有该字段，历史行为是在
+            # val_loss 上选 checkpoint；ngram 不训练，保持
+            # None，不参与选型一致性检查。
+            if str(run_config.get("mode")) == "ngram":
+                row["selection_metric"] = None
+            else:
+                row["selection_metric"] = (
+                    run_args.get("selection_metric") or "val_loss"
+                )
 
         # 假设纪律：对比分析要能展示每个运行登记的科学假设，
         # 并把缺失假设（旧运行或显式跳过）单独标记出来，避免
@@ -10268,8 +10543,16 @@ DEFAULT_COMPARISON_FACTORS = (
 # precision / recall 同样按 macro 与 weighted 两种口径列出：
 # 假设声称「依据召回率判定」时，评估管线必须真的计算它，
 # 否则会出现「假设的判定指标不可检验」的假性对齐。
+#
+# val_loss_at_matched_flops 不是训练时周期评估的指标，而是
+# --compare 阶段从各运行 metrics.jsonl 的验证曲线插值出的
+# 「等训练计算预算」loss（见 annotate_compute_matched_metrics）：
+# 延迟合并 B/A 每步 FLOPs 高于 smelt，等步数比较会把机制收益
+# 与额外计算混在一起。它与 val_loss 同单位、同方向，可直接
+# 作为 --compare-metric 或预注册主指标做显著性检验。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
+    "val_loss_at_matched_flops",
     "val_ppl",
     "val_bits_per_byte",
     "val_token_accuracy",
@@ -10312,6 +10595,7 @@ COMPARISON_METRIC_KEYS = COMPARISON_METRIC_KEYS + _ROUTING_ROW_FIELDS
 
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
+    "val_loss_at_matched_flops",
     "val_ppl",
     "val_bits_per_byte",
     # RQ3：第二轮选择与第一轮不同的专家（重合度越低越独立）；
@@ -10327,7 +10611,8 @@ _LOWER_IS_BETTER_METRICS = {
 
 # 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
 # 依据：AUC 只在最终/测试评估时计算，路由诊断要等训练结束后的
-# 一次专门前向，训练过程中拿不到，不能用于选型。
+# 一次专门前向，等计算预算 loss 更是 --compare 阶段才插值得到，
+# 训练过程中拿不到，不能用于选型。
 _SELECTION_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
@@ -10336,6 +10621,7 @@ _SELECTION_METRIC_KEYS = tuple(
     not in {
         "val_pr_auc_macro",
         "val_roc_auc_macro",
+        "val_loss_at_matched_flops",
     }
 )
 
@@ -11955,6 +12241,11 @@ def aggregate_runs(
             if count > 1
         )
 
+        deterministic_rows = [
+            row for row in group_rows if _is_deterministic_run(row)
+        ]
+        all_deterministic = len(deterministic_rows) == len(group_rows)
+
         aggregate: Dict[str, object] = {
             "label": label,
             "keys": dict(zip(group_keys, factor_values)),
@@ -11962,6 +12253,21 @@ def aggregate_runs(
             "runs": [str(r.get("run")) for r in group_rows],
             "seeds": seed_values,
             "duplicate_seeds": duplicate_seeds,
+            # 确定性基线（ngram）换 seed 只是复制同一估计：
+            # 多个运行不能算独立重复，统计推断按 1 个观测计。
+            "deterministic": all_deterministic,
+            "deterministic_repeat_runs": (
+                [str(row.get("run")) for row in deterministic_rows]
+                if all_deterministic and len(deterministic_rows) > 1
+                else []
+            ),
+            "effective_seed_count": (
+                1
+                if all_deterministic
+                else _independent_seed_count(
+                    len(group_rows), seed_values
+                )
+            ),
             "samples": {},
             "costs": {},
         }
@@ -11987,6 +12293,19 @@ def aggregate_runs(
 
         for metric in metric_keys:
             samples = _metric_samples(group_rows, metric)
+            # 确定性基线：不同 seed 的运行是同一估计的复制，
+            # 只保留一个观测，避免把确定性结果当成多种子
+            # 重复（std=0 会人为放大显著性）。
+            if all_deterministic and samples:
+                values = sorted({
+                    round(float(sample["value"]), 12)
+                    for sample in samples
+                })
+                if len(values) > 1:
+                    aggregate.setdefault(
+                        "deterministic_repeat_conflicts", []
+                    ).append(metric)
+                samples = samples[:1]
             # 统计量按独立种子计算：伪重复（同一 seed 的多个
             # 运行）先行折叠，复制运行不能虚增 n、压低方差。
             # 原始样本保留在 samples 里供检验层继续识别伪重复。
@@ -12715,11 +13034,9 @@ def compare_cells_to_baseline(
         matching,
         key=lambda aggregate: (
             # 参考单元按独立种子数选，伪重复不能靠复制目录
-            # 把自己「选」成基线。
-            _independent_seed_count(
-                int(aggregate.get("n_runs", 0)),
-                list(aggregate.get("seeds") or []),
-            ),
+            # 把自己「选」成基线；确定性基线（ngram）的多个
+            # seed 只是复制同一估计，按 1 个观测计。
+            int(aggregate.get("effective_seed_count", 0)),
             int(aggregate.get("n_runs", 0)),
         ),
     )
@@ -13162,6 +13479,10 @@ def ablation_coverage(
 # 指标（如 PR-AUC / ROC-AUC）只提示无法核对，不虚报通过。
 _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_loss": "unigram_loss",
+    # 等计算预算 loss 与 val_loss 同口径（同一验证窗口、
+    # 同一 NLL 单位），只是取自不同的训练计算预算点；无上下文
+    # unigram 参考仍然是它的稻草人下界。
+    "val_loss_at_matched_flops": "unigram_loss",
     "val_ppl": "unigram_loss",
     "val_bits_per_byte": "unigram_loss",
     "val_token_accuracy": "unigram_token_accuracy",
@@ -13268,6 +13589,9 @@ def baseline_adequacy(
         "tuning_metric_mismatch": [],
         "unconverged_baselines": [],
         "capacity_confounds": [],
+        "baseline_capacity": None,
+        "ngram_missing": False,
+        "tuning_budget_parity": None,
         "ok": None,
     }
 
@@ -13407,6 +13731,14 @@ def baseline_adequacy(
         and math.isfinite(float(row[metric]))
     ]
     baseline_better_than_ngram: Optional[bool] = None
+    if baseline_mode != "ngram" and not ngram_rows:
+        report["ngram_missing"] = True
+        report["advisories"].append(
+            "对比集合未包含 n-gram 统计基线：无法确认神经基线"
+            "已强于简单统计基线，简单基线守卫会退化为只看"
+            "unigram 参考；请用 --statistical-baseline 在同一"
+            "数据/评估口径下训练 ngram，并把该运行加入 --compare"
+        )
     if ngram_rows and baseline_mode != "ngram":
         ngram_mean = _mean(
             [float(row[metric]) for row in ngram_rows]
@@ -13558,21 +13890,188 @@ def baseline_adequacy(
                 report["untuned"].append(message)
                 report["straw_man"].append(message)
 
+    # 3b) 调参预算对称性：基线做了学习率网格搜索、挑战臂却
+    #     沿用默认学习率时，「基线被调强、挑战臂没调」会让
+    #     差值无法归因到机制。基线仍可能确实是强基线（3a 的
+    #     结论不受影响），所以这里只给混杂提示，不把基线判为
+    #     straw-man：挑战臂若在预算不对称下仍胜出，结论是保守
+    #     下界；若落败，则不能排除挑战臂只是没调好。
+    parity: Dict[str, object] = {
+        "baseline_winner_lrs": [],
+        "challengers_using_baseline_lr": [],
+        "challengers_with_own_tuning": [],
+        "challengers_without_tuning_parity": [],
+        "advisories": [],
+        "ok": None,
+    }
+    report["tuning_budget_parity"] = parity
+
+    if baseline_mode != "ngram":
+        baseline_tuned_lrs: List[float] = []
+        for row in baseline_rows:
+            record = row.get("baseline_tuning")
+            if not isinstance(record, dict):
+                continue
+            winner_lr = record.get("winner_lr")
+            if winner_lr is None:
+                winner = record.get("winner")
+                if isinstance(winner, dict):
+                    winner_lr = winner.get("lr")
+            value = _finite_float(winner_lr)
+            if value is not None and value > 0.0:
+                baseline_tuned_lrs.append(value)
+
+        unique_lrs = sorted({
+            round(value, 12) for value in baseline_tuned_lrs
+        })
+        parity["baseline_winner_lrs"] = unique_lrs
+
+        if len(unique_lrs) > 1:
+            message = (
+                "基线运行的调参 winner 学习率不一致（"
+                + ", ".join(format(lr, "g") for lr in unique_lrs)
+                + "）：各基线运行不是同一条调过参的配置，"
+                "调参预算对称性无法核对"
+            )
+            parity["advisories"].append(message)
+            report["advisories"].append(message)
+        elif unique_lrs:
+            baseline_lr = float(unique_lrs[0])
+            for row in rows:
+                row_mode = str(row.get("mode"))
+                if row_mode in (baseline_mode, "ngram"):
+                    continue
+                protocol = row.get("protocol")
+                if not isinstance(protocol, dict):
+                    continue
+                challenger_lr = _finite_float(protocol.get("lr"))
+                if challenger_lr is None:
+                    continue
+                run_name = str(row.get("run"))
+                if math.isclose(
+                    challenger_lr,
+                    baseline_lr,
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                ):
+                    parity["challengers_using_baseline_lr"].append(
+                        run_name
+                    )
+                    continue
+
+                record = row.get("baseline_tuning")
+                own_tuning = False
+                if isinstance(record, dict):
+                    record_mode = record.get("mode")
+                    record_winner_lr = record.get("winner_lr")
+                    if record_winner_lr is None:
+                        winner = record.get("winner")
+                        if isinstance(winner, dict):
+                            record_winner_lr = winner.get("lr")
+                    record_lr = _finite_float(record_winner_lr)
+                    record_metric = record.get("metric")
+                    seed_plan = record.get("seed_plan")
+                    record_seeds = (
+                        seed_plan.get("n_seeds")
+                        if isinstance(seed_plan, dict)
+                        else None
+                    )
+                    underpowered = bool(
+                        isinstance(seed_plan, dict)
+                        and seed_plan.get("underpowered_override")
+                    ) or (
+                        isinstance(record_seeds, int)
+                        and not isinstance(record_seeds, bool)
+                        and record_seeds < _MIN_SEEDS_FOR_STATS
+                    )
+                    issues = record.get("issues")
+                    inconsistent = bool(
+                        isinstance(issues, list)
+                        and any(
+                            "训练协议不一致" in str(issue)
+                            for issue in issues
+                        )
+                    )
+                    own_tuning = bool(
+                        record_mode == row_mode
+                        and record_lr is not None
+                        and math.isclose(
+                            record_lr,
+                            challenger_lr,
+                            rel_tol=1e-9,
+                            abs_tol=1e-12,
+                        )
+                        and record_metric == metric
+                        and not underpowered
+                        and not inconsistent
+                    )
+                if own_tuning:
+                    parity["challengers_with_own_tuning"].append(
+                        run_name
+                    )
+                else:
+                    parity["challengers_without_tuning_parity"].append({
+                        "run": run_name,
+                        "mode": row_mode,
+                        "lr": challenger_lr,
+                        "baseline_tuned_lr": baseline_lr,
+                    })
+
+            if parity["challengers_without_tuning_parity"]:
+                details = "; ".join(
+                    f"{item['run']}（{item['mode']}, lr="
+                    f"{format(item['lr'], 'g')}）"
+                    for item in parity[
+                        "challengers_without_tuning_parity"
+                    ]
+                )
+                message = (
+                    "调参预算不对称：基线已在 val 上做学习率网格"
+                    f"搜索（winner lr={format(baseline_lr, 'g')}），"
+                    "以下挑战臂却使用不同学习率且没有自己的调参"
+                    f"来源：{details}。若挑战臂落败，不能排除只是"
+                    "学习率没调好；若仍胜出，结论是保守下界。"
+                    "请为挑战臂复用同一训练协议的学习率网格"
+                    "（相同候选集、相同种子）后再比较，或显式"
+                    "记录其调参来源"
+                )
+                parity["advisories"].append(message)
+                report["advisories"].append(message)
+        parity["ok"] = not parity["advisories"]
+
     # 4) 基线本身的统计功效（按独立种子数，伪重复不计入）。
+    baseline_deterministic = bool(baseline_rows) and all(
+        _is_deterministic_run(row) for row in baseline_rows
+    )
+    report["baseline_deterministic"] = baseline_deterministic
     baseline_seeds = [
         row.get("seed")
         for row in baseline_rows
         if row.get("seed") is not None
     ]
-    baseline_independent_seeds = _independent_seed_count(
-        len(baseline_rows),
-        baseline_seeds,
+    baseline_independent_seeds = (
+        1
+        if baseline_deterministic
+        else _independent_seed_count(
+            len(baseline_rows),
+            baseline_seeds,
+        )
     )
-    if baseline_independent_seeds < _RECOMMENDED_SEEDS:
+    if (
+        not baseline_deterministic
+        and baseline_independent_seeds < _RECOMMENDED_SEEDS
+    ):
         report["advisories"].append(
             f"基线只有 {baseline_independent_seeds} 个种子"
             f"（建议 ≥{_RECOMMENDED_SEEDS}）：基线自身的种子"
             "噪声可能主导改进结论"
+        )
+    elif baseline_deterministic:
+        report["advisories"].append(
+            "确定性基线（ngram）不产生种子间波动：多个 seed "
+            "运行是同一估计的复制，按 1 个观测处理；其评估"
+            "不确定性应来自评估窗口/bootstrap 或多次时间切分，"
+            "而不是增加种子数"
         )
 
     # 5) 基线是否训练到收敛：没训练够的基线与「没调过参」同类，
@@ -13683,21 +14182,102 @@ def baseline_adequacy(
     else:
         report["capacity_confounds"] = []
 
+    # 6b) dense 基线的容量口径：默认 dense_fnn_hidden=None 取
+    #     top_k×expert_hidden，是「等激活计算」而不是「等参数」。
+    #     挑战模型参数量更大时，即使 FLOPs 对齐，涨点仍可能来自
+    #     参数容量。明确给出等参数容量与重跑建议，避免把容量
+    #     差异误读成机制收益。
+    dense_capacities: List[Tuple[int, int]] = []
+    for row in baseline_rows:
+        if str(row.get("mode")) != "dense":
+            continue
+        n_experts = row.get("n_experts")
+        expert_hidden = row.get("expert_hidden")
+        top_k = row.get("top_k")
+        explicit = row.get("dense_fnn_hidden")
+        if not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            for value in (n_experts, expert_hidden, top_k)
+        ):
+            continue
+        effective = (
+            int(explicit)
+            if isinstance(explicit, int)
+            and not isinstance(explicit, bool)
+            and explicit > 0
+            else int(top_k) * int(expert_hidden)
+        )
+        dense_capacities.append((
+            effective,
+            int(n_experts) * int(expert_hidden),
+        ))
+    if dense_capacities and capacity_findings:
+        current_capacity = max(
+            effective for effective, _ in dense_capacities
+        )
+        parameter_matched = max(
+            matched for _, matched in dense_capacities
+        )
+        if current_capacity < parameter_matched:
+            report["baseline_capacity"] = {
+                "effective_dense_fnn_hidden": current_capacity,
+                "parameter_matched_dense_fnn_hidden": (
+                    parameter_matched
+                ),
+                "parameter_matched": False,
+            }
+            report["advisories"].append(
+                "dense 基线按等激活计算容量配置"
+                f"（dense_fnn_hidden={current_capacity} = "
+                "top_k×expert_hidden），不是等参数容量"
+                f"（应为 n_experts×expert_hidden="
+                f"{parameter_matched}）。挑战模型参数量更大时，"
+                "涨点仍可能来自容量；请用 --dense-fnn-hidden "
+                f"{parameter_matched} 训练等参数基线，或同时"
+                "报告等参数与等计算两条基线"
+            )
+        else:
+            report["baseline_capacity"] = {
+                "effective_dense_fnn_hidden": current_capacity,
+                "parameter_matched_dense_fnn_hidden": (
+                    parameter_matched
+                ),
+                "parameter_matched": True,
+            }
+
     # 7) n-gram 统计基线对照的稳定性：单次运行的 n-gram 点估计
     #    没有种子间波动可估，拿它当「调优好的强基线」时结论可能
     #    被一次 val 网格搜索的随机性左右；种子数不足时提示。
-    ngram_independent_seeds = _independent_seed_count(
-        len(ngram_rows),
-        [row.get("seed") for row in ngram_rows],
+    ngram_deterministic = bool(ngram_rows) and all(
+        _is_deterministic_run(row) for row in ngram_rows
     )
-    if ngram_rows and ngram_independent_seeds < _RECOMMENDED_SEEDS:
+    report["ngram_deterministic"] = ngram_deterministic
+    if ngram_rows and ngram_deterministic:
+        # ngram 的计数与固定窗口评估都是确定性的：重复运行
+        # 不会产生新的独立样本。需要不确定性时应对评估窗口
+        # 做 bootstrap，或用不同时间切分重复整个评估，而不是
+        # 假装换 seed 就得到独立重复。
         report["advisories"].append(
-            f"n-gram 对照只有 {ngram_independent_seeds} 个运行"
-            f"（建议 ≥{_RECOMMENDED_SEEDS}）：统计基线的点估计"
-            "没有种子间波动可估，调参 winner 的微小优势可能"
-            "落在其 val 选取噪声内；建议多种子重跑 n-gram "
-            "并报告 Mean ± Std"
+            "n-gram 对照是确定性基线（换 seed 重跑结果相同）："
+            "不能用多种子 Mean ± Std 估计其不确定性；如需"
+            "误差线，请对评估窗口做 bootstrap，或在不同的"
+            "时间切分上重复评估"
         )
+    elif ngram_rows:
+        ngram_independent_seeds = _independent_seed_count(
+            len(ngram_rows),
+            [row.get("seed") for row in ngram_rows],
+        )
+        if ngram_independent_seeds < _RECOMMENDED_SEEDS:
+            report["advisories"].append(
+                f"n-gram 对照只有 {ngram_independent_seeds} 个运行"
+                f"（建议 ≥{_RECOMMENDED_SEEDS}）：统计基线的点估计"
+                "没有种子间波动可估，调参 winner 的微小优势可能"
+                "落在其 val 选取噪声内；建议多种子重跑 n-gram "
+                "并报告 Mean ± Std"
+            )
 
     if report["straw_man"]:
         report["ok"] = False
@@ -13736,7 +14316,10 @@ _HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
 # 里），登记时会单独点名「该指标当前没有评估口径」，避免
 # 假设自称用某个指标判定、评估管线却从不计算它（假性对齐）。
 _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
-    "loss": ("val_loss",),
+    "loss": (
+        "val_loss",
+        "val_loss_at_matched_flops",
+    ),
     "ppl": ("val_ppl",),
     "bits_per_byte": ("val_bits_per_byte",),
     "accuracy": ("val_token_accuracy",),
@@ -14628,6 +15211,11 @@ def print_comparison_analysis(
             + "）"
         )
 
+    # 等训练计算预算的 loss：A/B 每步 FLOPs 高于 smelt，等步数
+    # 对比会把机制收益和额外计算混在一起。该派生指标在本函数
+    # 入口统一注入行级字段，后续聚合/检验/基线检查一并使用。
+    compute_matched = annotate_compute_matched_metrics(rows)
+
     controlled = check_controlled_variables(rows, factors)
 
     # 只有实际跨运行变化的因子才定义实验单元；恒定因子
@@ -14670,6 +15258,14 @@ def print_comparison_analysis(
         for aggregate in aggregates
         if aggregate.get("duplicate_seeds")
     ]
+    deterministic_conflict_cells = [
+        {
+            "cell": aggregate["label"],
+            "metrics": aggregate["deterministic_repeat_conflicts"],
+        }
+        for aggregate in aggregates
+        if aggregate.get("deterministic_repeat_conflicts")
+    ]
     hypotheses = hypothesis_registry(rows, metric)
     alignment = hypothesis_alignment(
         rows,
@@ -14679,6 +15275,26 @@ def print_comparison_analysis(
     )
     adequacy = baseline_adequacy(rows, baseline_mode, metric)
     imbalance = imbalance_metric_advisory(rows, metric)
+    # 选型口径一致性：checkpoint 按 val_loss 选、结论却按
+    # macro F1 判定时，最终模型不是假设要检验的那个模型。
+    # 只在当前指标本身可用于选型时检查（等计算预算 loss /
+    # AUC 等只能离线计算的指标不适用）。
+    selection_metric_mismatch = (
+        [
+            {
+                "run": str(row.get("run")),
+                "mode": row.get("mode"),
+                "selection_metric": row.get("selection_metric"),
+            }
+            for row in rows
+            if metric in _SELECTION_METRIC_KEYS
+            and str(row.get("mode")) != "ngram"
+            and row.get("selection_metric") is not None
+            and str(row.get("selection_metric")) != metric
+        ]
+        if metric in _SELECTION_METRIC_KEYS
+        else []
+    )
 
     higher_is_better = metric_higher_is_better(metric)
 
@@ -14840,6 +15456,17 @@ def print_comparison_analysis(
         "[aggregate] 按实验单元聚合（Mean ± Std，样本标准差；"
         "std 反映不同随机种子的方差）"
     )
+    if selection_metric_mismatch:
+        print(
+            "  [selection] [warn] 以下运行的 checkpoint 选型指标"
+            f"不是当前判定指标 {metric}：最终模型不是按假设的"
+            "判定口径选出的，指标差异可能混入选型规则；请在"
+            "训练时用 --selection-metric 对齐判定指标后重跑: "
+            + ", ".join(
+                f"{item['run']}（{item['selection_metric']}）"
+                for item in selection_metric_mismatch
+            )
+        )
 
     if aggregates:
         # 聚合表只展示 val 口径：test 指标不参与跨运行
@@ -14889,10 +15516,9 @@ def print_comparison_analysis(
         underpowered = [
             aggregate["label"]
             for aggregate in aggregates
-            if _independent_seed_count(
-                int(aggregate["n_runs"]),
-                list(aggregate.get("seeds") or []),
-            ) < _RECOMMENDED_SEEDS
+            if not aggregate.get("deterministic")
+            and int(aggregate.get("effective_seed_count", 0))
+            < _RECOMMENDED_SEEDS
         ]
         if underpowered:
             print(
@@ -14900,6 +15526,32 @@ def print_comparison_analysis(
                 f"{_RECOMMENDED_SEEDS}（建议 3~5 个不同随机"
                 "种子并汇报 Mean ± Std）: "
                 + "; ".join(underpowered)
+            )
+        deterministic_cells = [
+            aggregate["label"]
+            for aggregate in aggregates
+            if aggregate.get("deterministic")
+        ]
+        if deterministic_cells:
+            print(
+                "  [note] 确定性基线（ngram）不做种子重复："
+                "换 seed 重跑是同一估计的复制，已折叠为 1 个"
+                "观测；其评估不确定性应来自评估窗口/"
+                "时间切分的 bootstrap 或多次切分，而不是种子数: "
+                + "; ".join(deterministic_cells)
+            )
+        if deterministic_conflict_cells:
+            print(
+                "  [warn] 以下确定性基线单元的不同 seed 运行"
+                "给出了不同指标值：确定性管线本应逐位一致，"
+                "可能存在数据/评估差异；已折叠为 1 个观测，"
+                "但不能按多种子重复解读: "
+                + "; ".join(
+                    f"{item['cell']}（"
+                    + ", ".join(item["metrics"])
+                    + "）"
+                    for item in deterministic_conflict_cells
+                )
             )
         if duplicate_seed_cells:
             details = "; ".join(
@@ -15029,6 +15681,44 @@ def print_comparison_analysis(
             "精度/效率权衡: "
             + "; ".join(missing_efficiency_cells)
         )
+
+    # 等计算预算对比：只比较相同训练步数时，B/A 的额外分支
+    # 计算会被误读成机制收益。这里把各运行的验证曲线按累计
+    # 训练 FLOPs 对齐到共同预算点，给出 val_loss_at_matched_flops。
+    print()
+    print(
+        "[compute-matched] 等训练计算预算的验证 loss"
+        "（训练 FLOPs≈3×前向；共同预算取各运行最后一个周期"
+        "验证点的最小值，不做外推）"
+    )
+    if not compute_matched["runs"]:
+        print("  无可用的等计算预算对比")
+    else:
+        print(
+            "  共同预算 FLOPs="
+            f"{float(compute_matched['target_flops']):.3e}"
+        )
+        for item in compute_matched["runs"]:
+            ratio = item.get("budget_ratio")
+            ratio_text = (
+                f"（用自身预算的 {float(ratio):.1%}）"
+                if isinstance(ratio, (int, float))
+                else ""
+            )
+            print(
+                f"  {str(item.get('run'))[:36]:<37} "
+                f"mode={str(item.get('mode')):<10} "
+                f"loss={float(item['value']):.4f}"
+                f"{ratio_text}"
+                f" [{item['interpolation']}]"
+            )
+        print(
+            "  可用 --compare-metric val_loss_at_matched_flops "
+            "把它作为判定指标做聚合与显著性检验；该点只代表"
+            "共同预算处，不等于完整训练结束时的排序"
+        )
+    for message in compute_matched["advisories"]:
+        print(f"  [note] {message}")
 
     print()
     direction = "越低越好" if not higher_is_better else "越高越好"
@@ -15315,6 +16005,36 @@ def print_comparison_analysis(
                 continue
             print(f"  [note] {message}")
 
+        parity = adequacy.get("tuning_budget_parity") or {}
+        parity_mismatches = parity.get(
+            "challengers_without_tuning_parity"
+        ) or []
+        if parity.get("baseline_winner_lrs"):
+            print(
+                "  [tuning-budget] 基线调参 winner lr="
+                + ", ".join(
+                    format(float(lr), "g")
+                    for lr in parity["baseline_winner_lrs"]
+                )
+                + f"；复用同一 lr 的挑战臂 "
+                f"{len(parity.get('challengers_using_baseline_lr') or [])} "
+                f"个，有独立调参来源的挑战臂 "
+                f"{len(parity.get('challengers_with_own_tuning') or [])} 个"
+            )
+        if parity_mismatches:
+            print(
+                "  [tuning-budget] [warn] 以下挑战臂的学习率与"
+                "调参基线不一致且没有独立调参来源：调参预算"
+                "不对称，落败不能排除调参不足、胜出是保守下界"
+            )
+            for item in parity_mismatches:
+                print(
+                    f"    {item['run']}（{item['mode']}, lr="
+                    f"{format(float(item['lr']), 'g')} vs 基线 "
+                    f"winner lr="
+                    f"{format(float(item['baseline_tuned_lr']), 'g')}）"
+                )
+
     expected_cells = coverage.get("expected_cells") or []
     # 表头形状按声明的消融方案数动态给出：默认 A/B 时为 3×2，
     # 只有两个方案时才恰好是 2×2，不能硬编码。
@@ -15374,12 +16094,17 @@ def print_comparison_analysis(
         "hypothesis_alignment": alignment,
         "aggregates": aggregates,
         "duplicate_seed_cells": duplicate_seed_cells,
+        "deterministic_conflict_cells": (
+            deterministic_conflict_cells
+        ),
         "contrasts": contrasts,
         "reference_contrasts": reference,
         "baseline_adequacy": adequacy,
+        "selection_metric_mismatch": selection_metric_mismatch,
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
         "missing_efficiency_cells": missing_efficiency_cells,
+        "compute_matched": compute_matched,
         "equivalence_margin": equivalence_margin,
         "target_power": _TARGET_POWER,
         "power_equivalence": equivalence_entries,
@@ -18934,6 +19659,84 @@ def run_self_test():
         "latency_ms_per_forward"
     ] == 1.5
 
+    # ---- 等训练计算预算（val_loss_at_matched_flops） ----
+    # 便宜臂与昂贵臂的每步 FLOPs 不同：共同预算取两者最后
+    # 验证点累计 FLOPs 的较小值，昂贵臂在较早的预算点被插值，
+    # 而不是拿各自训练结束时的 loss 直接比较。
+    assert "val_loss_at_matched_flops" in COMPARISON_METRIC_KEYS
+    with tempfile.TemporaryDirectory() as matched_dir:
+        specs = (
+            ("cheap", 100.0, [(10, 5.0), (20, 4.0), (30, 3.0)]),
+            (
+                "expensive",
+                150.0,
+                [(10, 4.8), (25, 3.7), (30, 2.9)],
+            ),
+        )
+        matched_paths = []
+        for name, flops, curve in specs:
+            run_dir = Path(matched_dir) / name
+            run_dir.mkdir()
+            with open(
+                run_dir / "config.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    {
+                        "config": {"mode": name},
+                        "efficiency": {
+                            "flops_per_forward": flops,
+                        },
+                    },
+                    f,
+                )
+            for step, loss in curve:
+                write_jsonl_record(
+                    run_dir / "metrics.jsonl",
+                    {"step": step, "val_loss": loss},
+                )
+            write_jsonl_record(
+                run_dir / "metrics.jsonl",
+                {"step": "final", "val_loss": 2.0},
+            )
+            matched_paths.append(str(run_dir))
+
+        matched_rows = compare_runs(matched_paths)
+        matched_report = annotate_compute_matched_metrics(
+            matched_rows
+        )
+
+    assert matched_report["ok"], matched_report
+    # 共同预算 = 便宜臂最后一个验证点：30×3×100 = 9000。
+    assert abs(
+        float(matched_report["target_flops"]) - 9000.0
+    ) < 1e-9
+    by_run = {
+        str(row["run"]): row for row in matched_rows
+    }
+    assert abs(
+        float(by_run["cheap"]["val_loss_at_matched_flops"]) - 3.0
+    ) < 1e-9
+    # 9000 落在昂贵臂 4500(4.8) 与 11250(3.7) 之间：
+    # 4.8 + (4500/6750)×(3.7−4.8) = 4.0666…
+    assert abs(
+        float(
+            by_run["expensive"]["val_loss_at_matched_flops"]
+        )
+        - 4.066666666666667
+    ) < 1e-9
+    assert abs(
+        float(
+            by_run["expensive"]["matched_compute_ratio"]
+        )
+        - 2.0 / 3.0
+    ) < 1e-12
+    assert any(
+        item["interpolation"] == "linear_between_evals"
+        for item in matched_report["runs"]
+    )
+
     # ---- 对比分析：t 分布 p 值（无 SciPy 依赖） ----
     # 已知分位点：df=4 时 t_{0.975}=2.776445 对应双侧 p=0.05，
     # t_{0.995}=4.604095 对应 p=0.01。
@@ -19646,6 +20449,118 @@ def run_self_test():
             for cell in duplicate_analysis["duplicate_seed_cells"]
         ), duplicate_analysis["duplicate_seed_cells"]
 
+        # 确定性基线：ngram 的计数与固定窗口评估不依赖 seed。
+        # 三个「不同种子」的运行是同一估计的三份复制，不能
+        # 当独立重复：必须折叠为 1 个观测，否则 std=0 会把
+        # 微小差异做成假显著。
+        ngram_paths = [
+            _write_analysis_run(
+                f"ngram_seed{seed}",
+                "ngram",
+                seed,
+                3e-4,
+                100,
+                0.01,
+                2.80,
+            )
+            for seed in (42, 43, 44)
+        ]
+        ngram_rows = compare_runs(ngram_paths)
+        ngram_aggregates = aggregate_runs(
+            ngram_rows, ["mode"]
+        )
+        assert len(ngram_aggregates) == 1
+        ngram_cell = ngram_aggregates[0]
+        assert ngram_cell["deterministic"] is True
+        assert ngram_cell["effective_seed_count"] == 1
+        assert ngram_cell["val_loss_n"] == 1
+        # 确定性基线折叠后只有 1 个观测，样本标准差
+        # 不可估（None），而不是被人为写成 0。
+        assert ngram_cell["val_loss_std"] is None
+        assert (
+            len(ngram_cell["deterministic_repeat_runs"]) == 3
+        )
+        assert "deterministic_repeat_conflicts" not in ngram_cell
+
+        conflict_ngram_path = _write_analysis_run(
+            "ngram_conflict_seed45",
+            "ngram",
+            45,
+            3e-4,
+            100,
+            0.01,
+            2.79,
+        )
+        conflict_analysis = print_comparison_analysis(
+            compare_runs(ngram_paths + [conflict_ngram_path]),
+            metric="val_loss",
+        )
+        assert "val_loss" in conflict_analysis[
+            "deterministic_conflict_cells"
+        ][0]["metrics"]
+
+        combined_aggregates = aggregate_runs(
+            compare_runs(run_paths + ngram_paths),
+            ["mode"],
+        )
+        ngram_contrasts = [
+            contrast
+            for contrast in factor_contrasts(
+                combined_aggregates,
+                ["mode"],
+                "val_loss",
+            )
+            if "ngram"
+            in (
+                contrast["baseline_value"],
+                contrast["variant_value"],
+            )
+        ]
+        assert ngram_contrasts
+        for ngram_contrast in ngram_contrasts:
+            assert (
+                ngram_contrast["test"] == "insufficient_seeds"
+            )
+            assert ngram_contrast["significant"] is False
+            assert min(
+                ngram_contrast["n_baseline"],
+                ngram_contrast["n_variant"],
+            ) == 1
+
+        # 选型口径一致性：最终模型按 val_loss 选，却用
+        # macro F1 做判定时，对比的不是「假设要检验的模型」；
+        # 分析报告必须显式警告，而不是静默通过。
+        selection_path = _write_analysis_run(
+            "selection_mismatch_seed1",
+            "A",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            precision_recall={"val_macro_f1": 0.50},
+        )
+        with open(
+            Path(selection_path) / "config.json",
+            encoding="utf-8",
+        ) as f:
+            selection_config = json.load(f)
+        selection_config["args"]["selection_metric"] = "val_loss"
+        with open(
+            Path(selection_path) / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(selection_config, f)
+        selection_analysis = print_comparison_analysis(
+            compare_runs([selection_path]),
+            metric="val_macro_f1",
+        )
+        assert (
+            selection_analysis["selection_metric_mismatch"][0]["run"]
+            == "selection_mismatch_seed1"
+        )
+
         # 尘封协议：test 指标绝不能作为跨运行对比口径，
         # 否则「挑 test 最好」会让测试集退化成隐式验证集。
         assert "test_loss" not in COMPARISON_METRIC_KEYS
@@ -20325,6 +21240,19 @@ def run_self_test():
             for message in no_baseline["advisories"]
         )
 
+        # 对比集合缺少 ngram 时，简单基线守卫不能静默通过：
+        # 必须提示无法确认基线强于统计基线。
+        missing_ngram_adequacy = baseline_adequacy(
+            compare_runs([mismatch_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert missing_ngram_adequacy["ngram_missing"] is True
+        assert any(
+            "未包含 n-gram" in message
+            for message in missing_ngram_adequacy["advisories"]
+        )
+
         # 基线收敛性守卫：曲线诊断为 not_converged / underfitting /
         # diverged 的基线是欠训的弱基线，必须点名（不能只看
         # 「有没有调参记录」）。
@@ -20413,15 +21341,79 @@ def run_self_test():
         )
         assert not same_capacity_adequacy["capacity_confounds"]
 
-        # n-gram 对照运行数不足：点估计没有种子间波动，
-        # 必须提示结论可能落在 val 网格搜索噪声内。
+        # dense 基线默认按等激活计算容量（top_k×expert_hidden）
+        # 配置，不是等参数容量；挑战模型参数更多时必须点明
+        # 容量差异，并给出等参数 dense 宽度。
+        dense_base_path = _write_analysis_run(
+            "dense_base_seed1",
+            "dense",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+            n_params=1000,
+            flops=10000,
+            curve_status="healthy",
+        )
+        with open(
+            Path(dense_base_path) / "config.json",
+            encoding="utf-8",
+        ) as f:
+            dense_config = json.load(f)
+        dense_config["config"].update({
+            "top_k": 2,
+            "n_experts": 4,
+            "expert_hidden": 8,
+            "dense_fnn_hidden": None,
+        })
+        with open(
+            Path(dense_base_path) / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(dense_config, f)
+        dense_capacity_adequacy = baseline_adequacy(
+            compare_runs([dense_base_path, big_challenger_path]),
+            "dense",
+            "val_loss",
+        )
+        assert dense_capacity_adequacy["capacity_confounds"]
+        assert (
+            dense_capacity_adequacy["baseline_capacity"][
+                "parameter_matched"
+            ]
+            is False
+        )
+        assert (
+            dense_capacity_adequacy["baseline_capacity"][
+                "parameter_matched_dense_fnn_hidden"
+            ]
+            == 32
+        )
+        assert any(
+            "--dense-fnn-hidden 32" in message
+            for message in dense_capacity_adequacy["advisories"]
+        )
+
+        # n-gram 是确定性基线：不能建议「多种子重跑」来估
+        # 种子噪声，必须提示改用评估窗口/bootstrap 或多次
+        # 时间切分。
         single_ngram_adequacy = baseline_adequacy(
             compare_runs([small_baseline_path, ngram_path]),
             "smelt",
             "val_loss",
         )
+        assert single_ngram_adequacy["ngram_deterministic"] is True
         assert any(
-            "n-gram 对照只有" in message
+            "确定性基线" in message
+            and "bootstrap" in message
+            for message in single_ngram_adequacy["advisories"]
+        )
+        assert not any(
+            "多种子重跑 n-gram" in message
             for message in single_ngram_adequacy["advisories"]
         )
 
@@ -22845,6 +23837,10 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     run_paths = _execute_sweep_plan(base_argv, plan, out_root)
 
     rows = compare_runs(run_paths)
+    # --compare-metric 可以是等计算预算 loss；调参报告必须与
+    # 当前对比指标同口径。调参候选只有学习率不同、每步 FLOPs
+    # 相同，等预算点仍由验证曲线共同预算决定。
+    annotate_compute_matched_metrics(rows)
     report = analyze_baseline_tuning(
         rows,
         metric,
