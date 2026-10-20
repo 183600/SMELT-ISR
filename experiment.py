@@ -14341,7 +14341,9 @@ def factorial_effects(
 
     ``mode`` 或 ``balance_coef`` 不是分组因子（恒定/未变化）时
     返回 ``applicable=False``；组合不完整时把设计列入
-    ``incomplete_designs``，不伪造主效应。
+    ``incomplete_designs``，不伪造主效应。同一上下文出现多个
+    正 ``balance_coef`` 时不能折叠成单一开启臂，设计列入
+    ``confounded_designs`` 并跳过效应估计。
     """
     report: Dict[str, object] = {
         "metric": metric,
@@ -14350,6 +14352,7 @@ def factorial_effects(
         ),
         "designs": [],
         "incomplete_designs": [],
+        "confounded_designs": [],
         "effects": [],
         "advisories": [],
     }
@@ -14443,6 +14446,7 @@ def factorial_effects(
 
     for context in context_order:
         cells_by_key: Dict[tuple, Dict[str, object]] = {}
+        positive_balances: Dict[object, float] = {}
         for aggregate in contexts[context]:
             mode = str(aggregate["keys"].get("mode"))
             if mode not in ("local_base", *_DELAYED_MERGE_MODES):
@@ -14454,8 +14458,51 @@ def factorial_effects(
                 or not math.isfinite(float(balance))
             ):
                 continue
+            if float(balance) > 0.0:
+                positive_balances[
+                    _stable_factor_key(balance)
+                ] = float(balance)
             level = "off" if float(balance) == 0.0 else "on"
             cells_by_key[(mode, level)] = aggregate
+
+        # 「开启臂」必须只有一个明确的均衡强度。若同一上下文里
+        # 同时出现多个正 balance_coef，把它们的均值折叠成一个
+        # "on" 档会让主效应混入均衡强度差异，而且 cells_by_key
+        # 还会用最后出现的单元格静默覆盖前面的值。这里宁可不
+        # 估计，也不输出口径错误的数字。
+        if len(positive_balances) > 1:
+            details = {
+                "context": dict(
+                    zip(context_keys, context)
+                ),
+                "positive_balance_values": sorted(
+                    positive_balances.values()
+                ),
+            }
+            report["confounded_designs"].append(details)
+            report["advisories"].append(
+                "消融上下文 "
+                + (
+                    ", ".join(
+                        f"{key}={_format_factor_value(value)}"
+                        for key, value in zip(
+                            context_keys, context
+                        )
+                    )
+                    or "(无额外上下文)"
+                )
+                + " 出现多个正 balance_coef 取值（"
+                + ", ".join(
+                    format(value, "g")
+                    for value in sorted(
+                        positive_balances.values()
+                    )
+                )
+                + "）：不能把它们折叠成同一个开启臂，"
+                "未估计该上下文的 2×2 主效应/交互；"
+                "请统一均衡强度后重跑"
+            )
+            continue
 
         present_modes = {
             mode
@@ -24563,6 +24610,41 @@ def run_self_test():
                 "mean_effect"
             ] + 0.30
         ) < 1e-9
+
+        # 同一消融上下文里出现多个正 balance_coef 时，不能把
+        # 它们折叠成一个 "on" 档（否则主效应混入均衡强度差异，
+        # 且后写入的单元格会静默覆盖先写入的）。此时宁可不估计
+        # 2×2 效应，也要把混杂写进报告。
+        multi_balance_paths = []
+        for seed in (1, 2, 3):
+            for mode_name in ("local_base", "A"):
+                for coefficient in (0.01, 0.02):
+                    multi_balance_paths.append(
+                        _write_analysis_run(
+                            f"multi_{mode_name}_{coefficient}_s{seed}",
+                            mode_name,
+                            seed,
+                            3e-4,
+                            100,
+                            coefficient,
+                            3.00 - 0.10 * coefficient,
+                        )
+                    )
+        multi_balance_effects = factorial_effects(
+            aggregate_runs(
+                compare_runs(multi_balance_paths),
+                ["mode", "balance_coef"],
+            ),
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        assert not multi_balance_effects["designs"]
+        assert not multi_balance_effects["effects"]
+        assert multi_balance_effects["confounded_designs"]
+        assert any(
+            "多个正 balance_coef" in message
+            for message in multi_balance_effects["advisories"]
+        )
 
         # 计算量混杂：B 的 FLOPs 是 local_base 的 3 倍时，
         # 消融覆盖必须显式点名「主效应混入计算量」。
