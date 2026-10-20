@@ -461,11 +461,11 @@ def _swiglu_backward(
 
     gate_up 是 [.., 2*hidden] 的拼接张量（gate 在前、up 在
     后）。mul 反向给出两路梯度，gate 路再过 silu 反向；两路
-    梯度分别写回一次分配的 grad_gate_up 的对应半区（两半区
-    互不相交且并集完整）。
+    梯度分别写回 grad_gate_up 的对应半区（两半区互不相交且
+    并集完整）。
 
     ``return_hidden=True`` 时同时返回由同一份 ``silu(gate)``
-    重算的隐藏层，供下投影权重的梯度复用。
+    重算的隐藏层，供下投影权重梯度使用。
     """
     gate, up = gate_up.chunk(2, dim=-1)
 
@@ -649,20 +649,16 @@ class Expert(nn.Module):
 # Sparse MoE
 # ============================================================
 
-# 推理路径零填充缓冲缓存的总字节上限：窗口集合跨评估逐位
-# 相同，超限的缓冲不回入缓存（退回逐次分配）。上限在所有
-# MoE 模块间全局共享（按模块弱引用记账，模块回收即释放）。
+# 填充缓冲的全局额度。
 _MOE_PADDED_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
-# 全局填充缓冲账本：{模块: 该模块已缓存字节数}。弱引用键保证
-# 模块被回收后账目自动消失，不会造成跨运行的额度泄漏。
+# 填充缓冲账本：{模块: 已用字节数}。
 _MOE_PADDED_CACHE_REGISTRY: (
     "weakref.WeakKeyDictionary[object, int]"
 ) = weakref.WeakKeyDictionary()
 
 
-# dispatch 行下标缓存的字节上限（每模块）：total 在一次训练里
-# 只有少数几个取值；超限退回逐次分配。
+# dispatch 行下标的额度（每模块）。
 _MOE_ARANGE_CACHE_MAX_BYTES = 1024 * 1024
 
 
@@ -674,23 +670,20 @@ def _dtype_element_size(dtype: torch.dtype) -> int:
 
 class _StackedExpertWeights(torch.autograd.Function):
     """
-    缓存的专家权重 stack 的梯度出口。
+    专家权重 stack 的梯度出口。
 
-    专家权重 stack（[n_experts, ...]）在同一参数版本下被
-    多次 MoE 调用复用（见 SparseMoE._cached_weight_stack），
-    forward 原样返回模块缓存的普通张量；backward 按专家把
-    上游梯度切成逐专家切片返回，与 torch.stack 反向的语义
-    一致。autocast 下缓存 stack 为 autocast dtype（bf16/fp16），
-    反向先把上游梯度一次转换回参数 dtype 再切分，与
-    「参数 -> 转换 -> stack」计算图中转换节点反向的数值
-    完全一致（半精度升到 fp32 是精确转换）。
+    forward 原样返回 stack；backward 按专家把上游梯度切成
+    逐专家切片返回，与 torch.stack 反向的语义一致。autocast
+    下 stack 为 autocast dtype（bf16/fp16），反向先把上游梯度
+    转换回参数 dtype 再切分，与「参数 -> 转换 -> stack」
+    计算图中转换节点反向的数值完全一致。
     """
 
     @staticmethod
     def forward(ctx, stacked: torch.Tensor, *weights: torch.Tensor):
         # 逐专家切片的形状；stack 要求各专家权重同形。
         ctx.shapes = [weight.shape for weight in weights]
-        # 参数 dtype；stack 可能已按 autocast dtype 缓存。
+        # 参数 dtype；stack 可能已是 autocast dtype。
         ctx.weight_dtype = (
             weights[0].dtype if weights else stacked.dtype
         )
@@ -748,7 +741,7 @@ class _MergeExpertOutputs(torch.autograd.Function):
             device=first.device,
         )
 
-        # 散射下标按计数一次切分，与各专家输出、计数对齐；
+        # 散射下标按计数切分，与各专家输出、计数对齐；
         # 空段仍按计数占位，不产生 index_copy_。
         for out, index, count in zip(
             expert_outputs,
@@ -780,12 +773,10 @@ class _GatherPaddedExpertOutputs(torch.autograd.Function):
     """
     把填充缓冲中的各专家有效输出按原始 assignment 顺序取回。
 
-    ``source[a]`` 是原始 assignment a 在填充缓冲中的行号，
-    因此前向只需一次 index_select；反向按同一映射把上游梯度
-    写回填充缓冲，未使用的填充行梯度恒为 0。溢出路径中
-    ``source`` 的溢出行指向专家 scratch 行，这些行的上游梯度
-    在回退结果覆盖后恒为 0。逐专家循环会为每个专家各发一次
-    小拷贝，这里改为一次全长收集。
+    ``source[a]`` 是原始 assignment a 在填充缓冲中的行号；
+    反向按同一映射把上游梯度写回填充缓冲，未使用的填充行
+    梯度恒为 0。溢出路径中 ``source`` 的溢出行指向专家
+    scratch 行，这些行的上游梯度在回退结果覆盖后恒为 0。
     """
 
     @staticmethod
@@ -856,34 +847,26 @@ class SparseMoE(nn.Module):
         # analyze_routing 的诊断前向中挂载。
         self._routing_probe = None
 
-        # 推理路径的零填充缓冲缓存：grad 关闭时按
-        # (device, dtype, rows, dim) 复用填充缓冲；所有模块共享
-        # _MOE_PADDED_CACHE_MAX_BYTES 的全局上限，超限时不缓存。
-        # 训练（grad 开启）时填充缓冲会经 bmm 进入计算图，
-        # 必须每次新建，不使用该缓存。
+        # 推理路径的零填充缓冲：grad 关闭时按
+        # (device, dtype, rows, dim) 取用；训练（grad 开启）时
+        # 填充缓冲会经 bmm 进入计算图，必须每次新建。
         self._padded_buffers: Dict[tuple, torch.Tensor] = {}
 
-        # 批量专家路径的权重 stack 缓存：键为 "gate_up" / "down"，
-        # 值为 (参数版本签名, 失效代数, stack 缓冲)。参数在
-        # forward 与 backward 之间不变，同一张图里的多次 MoE 调用
-        # 可共用同一份 stack；参数被更新后于首次使用时刷新。
+        # 批量专家路径的权重 stack：键为 "gate_up" / "down"，
+        # 值为 (参数版本签名, 失效代数, stack 缓冲)。
         self._weight_stacks: Dict[
             str, Tuple[tuple, int, torch.Tensor]
         ] = {}
 
-        # 失效代数：invalidate_weight_cache 每次递增。缓存的代数
-        # 落后于当前代数时说明参数已被原地更新（fused AdamW 不
-        # 推进版本号），需要把新参数写回既有缓冲。
+        # 失效代数：invalidate_weight_cache 每次递增。
         self._weight_cache_generation = 0
 
-        # 专家权重参数引用缓存。参数对象由模块自身持有，
-        # 缓存不延长其生命周期；仅 _apply 可能
-        # 整体替换参数张量，届时重建。
+        # 专家权重参数引用。
         self._expert_gate_up_weights: List[torch.Tensor] = []
         self._expert_down_weights: List[torch.Tensor] = []
         self._refresh_expert_weight_lists()
 
-        # dispatch 的行下标 arange 缓存：键 (device, n)。
+        # dispatch 的行下标 arange：键 (device, n)。
         self._aranges: Dict[
             Tuple[torch.device, int], torch.Tensor
         ] = {}
@@ -904,11 +887,10 @@ class SparseMoE(nn.Module):
         dtype: torch.dtype = torch.int64,
     ) -> torch.Tensor:
         """
-        dispatch 的行下标 arange 缓存。
+        返回 dispatch 的行下标 arange。
 
-        形状跨调用稳定（total 只有少数几个取值）；缓存张量
-        只被读取（消费它的算术均为 out-of-place），总量受
-        _MOE_ARANGE_CACHE_MAX_BYTES 封顶，_apply 迁移设备时
+        张量只被读取（消费它的算术均为 out-of-place），总量受
+        _MOE_ARANGE_CACHE_MAX_BYTES 限制，_apply 迁移设备时
         清空。CUDA 上用 int32 下标，CPU 保持 int64。
         """
         key = (device, dtype, n)
@@ -928,9 +910,7 @@ class SparseMoE(nn.Module):
 
     def _apply(self, fn, recurse=True):
         # .to() / .float() 等可能整体替换参数张量（版本号不递增），
-        # 权重 stack 缓存必须随之失效；填充缓冲的键含设备/dtype，
-        # 旧键不会再被命中，一并释放。专家权重引用与行下标缓存
-        # 同理在参数/设备更新后重建。
+        # 相关的 stack、填充缓冲与行下标都必须重建。
         self._weight_stacks.clear()
         self.clear_padded_buffer_cache()
         self._aranges.clear()
@@ -940,12 +920,12 @@ class SparseMoE(nn.Module):
         return result
 
     def clear_padded_buffer_cache(self) -> None:
-        """释放当前模块缓存的推理填充缓冲并归还全局额度。"""
+        """释放当前模块的推理填充缓冲并归还全局额度。"""
         self._padded_buffers.clear()
         _MOE_PADDED_CACHE_REGISTRY.pop(self, None)
 
     def invalidate_weight_cache(self) -> None:
-        """声明缓存的 stack 已过期，后续前向在首次使用时刷新。"""
+        """声明 stack 已过期，后续前向在首次使用时刷新。"""
         self._weight_cache_generation += 1
 
     def _cached_weight_stack(
@@ -954,19 +934,17 @@ class SparseMoE(nn.Module):
         weights: List[torch.Tensor],
     ) -> torch.Tensor:
         """
-        返回 [n_experts, ...] 的专家权重 stack，跨调用复用。
+        返回 [n_experts, ...] 的专家权重 stack。
 
-        缓存以 (autocast dtype, 版本号, 数据指针) 为签名：普通
+        stack 以 (autocast dtype, 版本号, 数据指针) 为签名：普通
         原地更新（如 load_state_dict）会推进版本号并触发刷新；
         但 fused AdamW 的原地更新不会推进版本号，因此训练循环
         在 optimizer.step() 后经 invalidate_weight_cache 递增
-        失效代数，首次使用时把新参数写回既有缓冲。缓冲的形状/
-        dtype/设备不变时原地写回既有缓冲；参数张量被替换或
-        迁移设备时由 _apply 清空缓存兜底。CUDA autocast 下
-        缓存 autocast dtype 的 stack。
-        需要反向时经 _StackedExpertWeights 把梯度按专家散回
-        参数，与「torch.stack + bmm」在 autocast 下的计算图
-        语义相同。
+        失效代数，首次使用时把新参数写回既有缓冲。参数张量被
+        替换或迁移设备时由 _apply 重建。CUDA autocast 下 stack
+        使用 autocast dtype。需要反向时经 _StackedExpertWeights
+        把梯度按专家散回参数，与「torch.stack + bmm」在 autocast
+        下的计算图语义相同。
         """
         first = weights[0]
         target_dtype = self._autocast_target_dtype(first)
@@ -1017,8 +995,8 @@ class SparseMoE(nn.Module):
                         dtype=target_dtype,
                         device=first.device,
                     )
-                # 转换语义与 stack 后 .to() 相同；_foreach_copy_ 一次
-                # 完成逐专家拷贝（不可用时回退循环）。
+                # 转换语义与 stack 后 .to() 相同；_foreach_copy_
+                # 逐专家拷贝（不可用时回退循环）。
                 if hasattr(torch, "_foreach_copy_"):
                     torch._foreach_copy_(
                         list(stacked.unbind(0)),
@@ -1114,8 +1092,8 @@ class SparseMoE(nn.Module):
         else:
             aux_loss = router_logits.new_zeros(())
 
-        # 路由诊断（RQ3/RQ4）：只在显式挂载探针的分析前向中记录，
-        # 训练路径上 _routing_probe 为 None，仅一次属性判空。
+        # 路由诊断（RQ3/RQ4）：只在显式挂载探针的分析前向中记录；
+        # 训练路径上 _routing_probe 为 None。
         if self._routing_probe is not None:
             self._routing_probe.record(
                 self,
@@ -1170,8 +1148,8 @@ class SparseMoE(nn.Module):
         dim: int,
     ) -> Optional[torch.Tensor]:
         """
-        grad 关闭时返回可复用的填充缓冲（按形状缓存），否则
-        返回 None（训练时填充缓冲会进入计算图，必须新建）。
+        grad 关闭时返回填充缓冲，否则返回 None（训练时填充缓冲
+        会进入计算图，必须新建）。
 
         评估路径只读取被 index_copy_ 写入的行（其余行的 bmm
         输出不会被收集），旧缓冲中的陈旧值（含 NaN/Inf）不会
@@ -1196,7 +1174,7 @@ class SparseMoE(nn.Module):
             return None
 
         # inference_mode(False) 保证缓冲不携带 inference 标记，
-        # 之后可在 inference_mode 与 no_grad 下原地复用。
+        # 可在 inference_mode 与 no_grad 下使用。
         with torch.inference_mode(False), torch.no_grad():
             buffer = torch.zeros(
                 rows,
@@ -1219,11 +1197,9 @@ class SparseMoE(nn.Module):
         对 [n_experts, rows, dim] 的批量输入执行专家计算。
 
         各专家权重 stack 成批量矩阵后用 bmm 完成两层 GEMM；
-        stack 缓冲按参数版本跨调用复用（见
-        _cached_weight_stack），反向按切片把梯度散回各专家
-        参数，参数与检查点格式不变。SwiGLU 语义与
-        Expert.forward 完全一致。填充行的输入是精确的 0：
-        其前向输出为 0，对权重梯度的贡献也恒为精确的 0。
+        反向按切片把梯度散回各专家参数，参数与检查点格式不变。
+        SwiGLU 语义与 Expert.forward 完全一致。填充行的输入是
+        精确的 0：其前向输出为 0，对权重梯度的贡献也恒为 0。
         """
         gate_up_weight = self._cached_weight_stack(
             "gate_up",
@@ -1264,7 +1240,7 @@ class SparseMoE(nn.Module):
         一般路径（n_experts > 1 且 top_k != n_experts）给每个
         专家分配容量 cap（均衡路由下即实际最大桶，倾斜路由
         下为有界的均值上界，见下方注释）：排序后的专家段散射
-        进 [n_experts, cap, dim] 的零填充缓冲，一次 bmm 完成
+        进 [n_experts, cap, dim] 的零填充缓冲，经批量 bmm 完成
         容量内的全部专家；超出容量的 assignment 由对应专家的
         2D 前向单独计算。语义与逐专家循环一致（容量内
         为 bmm、溢出为逐专家线性层，均为精确结果）。
@@ -1283,8 +1259,8 @@ class SparseMoE(nn.Module):
             if top_k == 1:
                 return self.experts[0].forward(expert_flat).unsqueeze(1)
 
-            # 所有 assignment 指向同一专家：对 [N, dim] 计算
-            # 一次再 expand 出 slot 维。
+            # 所有 assignment 指向同一专家：对 [N, dim] 计算后
+            # expand 出 slot 维。
             # expand 是 stride=0 视图，后面用 reshape 而不能用 view。
             return self.experts[0].forward(expert_flat).unsqueeze(
                 1
@@ -1296,7 +1272,7 @@ class SparseMoE(nn.Module):
 
         # 稠密路由（top_k == n_experts）：每个 token 被分配给
         # 所有专家。所有专家共用同一份输入，expand 出
-        # 批量维后一次 bmm 完成全部专家计算，再按路由下标
+        # 批量维后经批量 bmm 完成全部专家计算，再按路由下标
         # gather 回 [token, slot] 位置。
         if top_k == self.n_experts:
             expert_flat = self._cast_for_autocast(flat)
@@ -1355,15 +1331,13 @@ class SparseMoE(nn.Module):
 
         # 容量上界：基础容量取均值上界 ceil(total / n_experts)，
         # 再加 1 倍标准差的静态余量（只依赖 assignment 总数）。
-        # 实际容量再按本步最大桶收紧，并按 32 对齐以便推理缓冲
-        # 跨批次复用。多出的行是精确 0 填充，不改变任何输出；
-        # 最大桶超过静态上界时，下面的逐专家回退路径保证语义
-        # 不变，因此余量无需取到 4σ。
+        # 实际容量再按本步最大桶收紧，并按 32 对齐。多出的行是
+        # 精确 0 填充，不改变任何输出；最大桶超过静态上界时，
+        # 下面的逐专家回退路径保证语义不变。
         static_cap = -(-total // n_experts)
         static_cap += math.isqrt(max(1, static_cap)) + 1
 
-        # 各专家段在排序序列中的起始行（cumsum 结果原地减去
-        # counts 得到 exclusive 前缀和，少一次小张量分配）。
+        # 各专家段在排序序列中的起始行（exclusive 前缀和）。
         starts = torch.cumsum(counts, dim=0)
         starts.sub_(counts)
 
@@ -1379,8 +1353,7 @@ class SparseMoE(nn.Module):
 
         # 溢出判定只需要看每专家的 assignment 数：同一专家的段在
         # 排序序列中连续，段内局部行号为 0..counts[e]-1，因此
-        # 「存在溢出」等价于 counts 的最大值超过容量。逐专家
-        # 计数同时供容量收紧与溢出回退复用。
+        # 「存在溢出」等价于 counts 的最大值超过容量。
         counts_list = counts.tolist()
         bucket = max(counts_list) if counts_list else 0
         cap = static_cap
@@ -1391,7 +1364,7 @@ class SparseMoE(nn.Module):
             )
         has_overflow = bucket > cap
 
-        # 行下标经 _cached_arange 复用（形状跨调用稳定）。
+        # 行下标。
         row_ids = self._cached_arange(
             device,
             total,
@@ -1400,15 +1373,11 @@ class SparseMoE(nn.Module):
 
         # 每个专家在填充缓冲中的跨度。有溢出时额外留一行
         # scratch：溢出行写入该专家的 scratch 行（有效行不受
-        # 影响），其输出随后被回退结果覆盖，因此无需先构造
-        # in-cap 掩码再裁剪索引/输入。
+        # 影响），其输出随后被回退结果覆盖。
         stride = cap + 1 if has_overflow else cap
 
-        # 目标行号 dest[j] = seg_id[j] * stride + local[j]。
-        # 无溢出时 local 就是 j - starts[seg_id[j]]，展开为
-        # j + (seg_id[j] * stride - starts[seg_id[j]])，每专家
-        # 的偏移只算 E 项；溢出路径把 local 夹到 cap，让溢出行
-        # 落到 scratch 行。
+        # 目标行号 dest[j] = seg_id[j] * stride + local[j]；
+        # 溢出路径把 local 夹到 cap，让溢出行落到 scratch 行。
         if has_overflow:
             local = (
                 row_ids
@@ -1453,10 +1422,8 @@ class SparseMoE(nn.Module):
             padded.view(n_experts, stride, dim)
         ).view(n_experts * stride, dim)
 
-        # 直接散射回原始（未排序）assignment 顺序：perm[j] 是排序
+        # 散射回原始（未排序）assignment 顺序：perm[j] 是排序
         # 行 j 的原始位置，因此 source[perm[j]] = dest[j]。
-        # 一次散点写入下标、一次 index_select 完成全部输出；
-        # 反向复用同一 source，不需要中间 gather 缓冲。
         source = dest.new_empty(total)
         source.scatter_(0, perm, dest)
         final = _GatherPaddedExpertOutputs.apply(
@@ -1466,8 +1433,7 @@ class SparseMoE(nn.Module):
 
         # 溢出回退：容量外的 assignment 由对应专家的 2D 前向计算
         # 后写入同一缓冲。排序后每个专家的段连续，溢出行恰为段
-        # 尾的 count-cap 行，直接切片即可；无需逐专家构造布尔
-        # 掩码，也不触发 GPU 同步的 rows.any()。
+        # 尾的 count-cap 行。
         if has_overflow:
             experts = self.experts
             segment_start = 0
@@ -1960,7 +1926,7 @@ def _autocast_snapshot() -> List[Tuple[str, bool, torch.dtype, bool]]:
 
 class _BlockCheckpoint(torch.autograd.Function):
     """
-    Block 前向的轻量非重入 activation checkpointing。
+    Block 前向的非重入 activation checkpointing。
 
     与 torch.utils.checkpoint(use_reentrant=False) 语义一致：
     前向在梯度开启下按原样执行——依赖梯度状态的算子（如
@@ -1970,10 +1936,8 @@ class _BlockCheckpoint(torch.autograd.Function):
     同一算子顺序重算前向，并把梯度同时回传给输入与重算图
     中的参数叶子。
 
-    所有 Block 内都没有 dropout 等随机算子（通用实现中相应
-    地关闭了 RNG 状态保存），输出固定为张量元组，因此不需要
-    通用实现的逐张量持有器、重算元数据比对与按图任务惰性
-    重算。
+    所有 Block 内都没有 dropout 等随机算子，输出固定为张量
+    元组。
     """
 
     @staticmethod
@@ -2781,15 +2745,7 @@ def _snap_group_split(
     找不到合法组合时抛出 ValueError（宁可报错，也不产生一个
     拆散群组的划分）。
 
-    实现为单次流式扫描：外层枚举 val 右端，滑动窗口保存尚不能
-    作为 train 右端的边界（cut_val - min_len 之后的边界），窗口
-    大小受 min_len 限制（边界至少相隔 1 字节），因此额外空间是
-    O(seq_len) 而不是 O(群组数)。每个 cut_val 只需比较窗口之外
-    「nominal_train 左右最近的边界」与「窗口外最右边界」三个
-    候选，即可取到该 cut_val 下最优的 train 右端；对候选组合按
-    偏离量取全局最小。相比只尝试名义位置左右各一个候选的旧
-    实现，不会再漏掉其他可行组合而误报划分失败，也不会选出
-    偏离更大的次优划分。
+    对全部候选组合按偏离量取全局最小。
     """
     if buf.find(separator) < 0:
         raise ValueError(
@@ -2882,8 +2838,7 @@ def _snap_group_split(
     return best
 
 
-# 固定评估批设备侧缓存的总字节上限：窗口集合跨评估逐位
-# 相同；超限退回逐次收集。
+# 固定评估批设备侧结果的总字节上限。
 _EVAL_BATCH_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -3157,13 +3112,13 @@ class ByteDataset:
                 1,
             )
 
-        # 固定评估起点缓存按 split 分开保存。
+        # 固定评估起点按 split 分开保存。
         self._fixed_starts: Dict[str, Dict[str, object]] = {}
 
-        # 固定评估批的结果缓存（设备侧）：键为
+        # 固定评估批的结果（设备侧）：键为
         # (split, batches, batch_size, batch_index, device)，
         # 值为 (x, y)；累计字节受 _EVAL_BATCH_CACHE_MAX_BYTES
-        # 封顶。
+        # 限制。
         self._fixed_batch_cache: Dict[
             tuple, Tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -3204,7 +3159,7 @@ class ByteDataset:
         slot = self._stage_slots[self._stage_index]
         self._stage_index ^= 1
 
-        # 复用前确认上一次拷贝已完成。
+        # 使用槽位前确认上一次拷贝已完成。
         event = slot[1]
         if event is None:
             event = torch.cuda.Event()
@@ -3231,7 +3186,7 @@ class ByteDataset:
 
         chunks = staged.to(device, non_blocking=True)
 
-        # 复用该槽位的事件记录完成时点，下次复用前先等待。
+        # 记录该槽位的完成时点。
         with torch.cuda.device(device):
             event.record()
 
@@ -3371,10 +3326,9 @@ class ByteDataset:
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合
         完全相同。请求窗口多于合法起点时仅取一遍无重复起点。
 
-        固定窗口在多次评估间逐位相同，结果张量在设备侧缓存
-        复用；缓存总量受 _EVAL_BATCH_CACHE_MAX_BYTES 封顶，
-        超限时退回逐次收集路径。所有调用方只读返回的
-        x/y，不修改缓存内容。
+        固定窗口在多次评估间逐位相同，结果张量在设备侧保存；
+        总量受 _EVAL_BATCH_CACHE_MAX_BYTES 限制。所有调用方只读
+        返回的 x/y。
         """
         windows, data = self._eval_windows(split)
 
@@ -3440,11 +3394,10 @@ class ByteDataset:
 
     def clear_eval_batch_cache(self) -> None:
         """
-        释放固定评估批的设备侧缓存。
+        释放固定评估批的设备侧结果。
 
-        缓存跨评估逐位复用、总量受 _EVAL_BATCH_CACHE_MAX_BYTES
-        封顶；评估协议结束后（最终/测试评估完成）显式清空。
-        评估起点缓存（_fixed_starts）只是 CPU 索引，保留。
+        评估协议结束后（最终/测试评估完成）显式清空；评估起点
+        （_fixed_starts）只是 CPU 索引，保留。
         """
         self._fixed_batch_cache.clear()
         self._fixed_batch_cache_bytes = 0
@@ -3713,8 +3666,8 @@ def probe_data_pipeline(
                 "错位）"
             )
 
-        # 清空结果缓存后重建必须逐位一致：固定评估窗口跨
-        # 进程/跨调用不依赖任何随机状态。
+        # 清空结果后重建必须逐位一致：固定评估窗口跨进程/
+        # 跨调用不依赖任何随机状态。
         dataset.clear_eval_batch_cache()
         repeat_x, repeat_y = dataset.fixed_eval_batch(
             "val",
@@ -4105,8 +4058,8 @@ def audit_data_splits(
 
         begin, end = dataset.split_bounds[split]
         # 训练前审计与解封测试集时的审计都会扫描 train/val；
-        # 数据在运行期间不可变，按 (起点, 长度, 窗口, 上限) 缓存
-        # 扫描结果，避免最终审计重复做一次全量哈希。
+        # 数据在运行期间不可变，按 (起点, 长度, 窗口, 上限)
+        # 复用扫描结果。
         scan_cache = getattr(
             dataset, "_audit_scan_cache", None
         )
@@ -4485,19 +4438,14 @@ def print_data_audit(report: Dict[str, object]) -> None:
 # macro AUC 只纳入 support 达到该阈值的字节类。
 _AUC_MIN_SUPPORT = 20
 
-# AUC 计算最多保留的评估位置数（positions × 256 类的
-# 概率矩阵会随该上限线性增长；默认验证窗口约 8 万位置，
-# 不会触顶）。超出时按窗口顺序截断并在结果中注明。
+# AUC 计算最多保留的评估位置数，超出时按窗口顺序截断并在
+# 结果中注明。
 _AUC_MAX_TOKENS = 100_000
 
-# AUC 收集按行分块做 fp32 softmax 与 D2H：每块最多这么多行，
-# 避免一次性物化 [剩余 token, vocab] 的 fp32 概率矩阵
-#（100k × 256 × 4B ≈ 100MB）。逐行 softmax 与整批结果逐位一致。
+# AUC 收集每次处理的最大行数；分块 softmax 与整批结果逐位一致。
 _AUC_SOFTMAX_CHUNK_ROWS = 8192
 
-# AUC 分块排序的块大小上限（纳入类数 × 评估位置数）：
-# 块内一次批量排序，块规模固定使中间量有界（10 万位置
-# 时每块 16 个类）。
+# AUC 分块排序的块大小上限（纳入类数 × 评估位置数）。
 _AUC_SORT_CHUNK_ELEMENTS = 1_600_000
 
 
@@ -4911,8 +4859,8 @@ def evaluate(
     )
     evaluated_tokens = 0
 
-    # 混淆矩阵 [目标类, 预测类]，在评估设备上以 int64 累积
-    #（逐批只做整数加法），收尾时一次性转 fp64。
+    # 混淆矩阵 [目标类, 预测类]，在评估设备上以 int64 累积，
+    # 收尾时转 fp64。
     confusion = torch.zeros(
         (vocab_size, vocab_size),
         device=device,
@@ -4920,14 +4868,13 @@ def evaluate(
     )
 
     # AUC 需要全部位置的预测概率；只在最终/测试评估时收集，
-    # 并按 _AUC_MAX_TOKENS 封顶。收集缓冲按固定窗口的实际
-    # 位置数预分配（不超过封顶值），逐批写入。
+    # 并按 _AUC_MAX_TOKENS 限制。收集缓冲按固定窗口的实际
+    # 位置数分配，逐批写入。
     auc_probs: Optional[torch.Tensor] = None
     auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
 
-    # CUDA 下收集缓冲异步回传，全部批次结束后统一同步一次；
-    # CPU 路径保持同步语义。
+    # CUDA 路径在全部批次结束后统一同步；CPU 路径保持同步语义。
     auc_async = compute_auc and device.type == "cuda"
 
     if compute_auc:
@@ -5035,8 +4982,7 @@ def evaluate(
                             flat_logits[start:stop].float(),
                             dim=-1,
                         )
-                        # 直接 D2H 拷入 CPU 收集缓冲；锁页
-                        # 缓冲下异步执行，循环结束统一同步。
+                        # 拷入 CPU 收集缓冲，循环结束统一同步。
                         auc_probs[
                             auc_tokens + start:
                             auc_tokens + stop
@@ -5081,7 +5027,7 @@ def evaluate(
         metrics[f"{split}_{key}"] = value
 
     if compute_auc:
-        # 异步 D2H 全部入队后，在读取 CPU 收集缓冲前统一等待。
+        # 读取 CPU 收集缓冲前统一等待。
         if auc_async and auc_tokens > 0:
             torch.cuda.synchronize(device)
 
@@ -5544,10 +5490,9 @@ class NgramBaseline:
         """
         逐阶的 alpha 无关查表结果（ctx 计数与 (ctx, c) 对计数）。
 
-        网格调优中这些查表只依赖窗口与训练计数，与平滑系数
-        alpha 无关，跨 alpha 档位预计算一次即可复用；positions
-        为空（窗口比阶还短）的阶记为 None，由插值阶段整阶
-        保持低阶回退值。
+        查表只依赖窗口与训练计数，与平滑系数 alpha 无关；
+        positions 为空（窗口比阶还短）的阶记为 None，由插值
+        阶段整阶保持低阶回退值。
         """
         targets = windows[
             :, 1:
@@ -5779,7 +5724,7 @@ def _ngram_eval_batches(
 ) -> List[torch.Tensor]:
     """
     收集指定评估 split 的全部固定窗口（CPU uint8，
-    [batch, seq_len + 1]），供 n-gram 评估复用。
+    [batch, seq_len + 1]）。
     """
     cpu = torch.device("cpu")
     windows: List[torch.Tensor] = []
@@ -5832,8 +5777,8 @@ def _ngram_extended_metrics(
         dtype=torch.float64,
     )
 
-    # 与神经模型评估同口径：按窗口总位置数预分配收集缓冲
-    # （不超过封顶值），逐窗口写入。
+    # 与神经模型评估同口径：按窗口总位置数分配收集缓冲
+    # （不超过上限），逐窗口写入。
     auc_capacity = min(
         _AUC_MAX_TOKENS,
         sum(
@@ -6009,8 +5954,7 @@ def run_statistical_baseline(
     })
 
     # ---- 网格调优：α 每档一遍窗口，同时拿到所有阶数损失 ----
-    # 逐阶查表只依赖窗口与训练计数，与 α 无关：
-    # 每个窗口预计算一次，全部 α 档位复用。
+    # 逐阶查表只依赖窗口与训练计数，与 α 无关。
     val_tables = [
         model._per_level_tables(window)
         for window in val_windows
@@ -7345,8 +7289,7 @@ class _BadCaseCollector:
 
     ``evaluate`` 与 ``analyze_bad_cases`` 使用完全相同的固定
     窗口与预测口径；最终评估时把收集器传入 ``evaluate``，即可
-    复用同一次前向，避免为坏案例分析再跑一遍验证/测试集。
-    收集器只保留逐 token 标量与 top-N 窗口。
+    得到同样的前向统计。收集器只保留逐 token 标量与 top-N 窗口。
     """
 
     def __init__(
@@ -7647,8 +7590,8 @@ def analyze_bad_cases(
     ``{"step": "bad_cases", ...}`` 记录，完整报告另存
     bad_cases.json，作为提出新改进思路的证据来源。
 
-    ``collector`` 非 None 时直接复用最终 ``evaluate`` 已完成的
-    同窗口前向统计，不再重复跑一遍模型。
+    ``collector`` 非 None 时直接使用最终 ``evaluate`` 已完成的
+    同窗口前向统计。
     """
     if collector is not None:
         return collector.report(
@@ -7669,16 +7612,14 @@ def analyze_bad_cases(
     # 输入 x 与目标 y 各 seq_len 个位置。
     sequence_length = dataset.seq_len
 
-    # 全量统计缓冲：每个 token 只保留紧凑标量（loss fp32 +
-    # target uint8 + predicted int16 + confidence/margin fp16，
-    # 约 10 字节/token），不对评估窗口做全量物化；统计口径与
-    # evaluate 的固定窗口评估完全一致。缓冲按固定窗口的实际
-    # 位置数一次预分配、逐批写入。
+    # 全量统计缓冲：每个 token 保留 loss fp32、target uint8、
+    # predicted int16、confidence/margin fp16；统计口径与 evaluate
+    # 的固定窗口评估完全一致。缓冲按固定窗口的实际位置数分配、
+    # 逐批写入。
     _, eval_data = dataset._eval_windows(split)
     num_starts = len(eval_data) - sequence_length
     capacity = min(batches * batch_size, num_starts) * sequence_length
-    # CUDA 下用锁页缓冲异步 D2H：紧凑标量转移与下一批前向
-    # 重叠，全部批次结束后统一次同步。CPU 路径保持同步语义。
+    # CUDA 路径在全部批次结束后统一同步。CPU 路径保持同步语义。
     async_copy = device.type == "cuda"
     loss_buffer = torch.empty(
         capacity, dtype=torch.float32, pin_memory=async_copy
@@ -7793,8 +7734,8 @@ def analyze_bad_cases(
                     batch_top_losses, batch_top_indices = (
                         torch.topk(batch_loss, k=batch_k)
                     )
-                    # 一次同步取回本批候选损失，随后按索引一次性
-                    # 取回候选标量与窗口行，避免逐个元素同步。
+                    # 取回本批候选损失，随后按索引取回候选标量
+                    # 与窗口行。
                     batch_top_losses = (
                         batch_top_losses.cpu().tolist()
                     )
@@ -7855,7 +7796,7 @@ def analyze_bad_cases(
                         )
                         del top_candidates[top_n:]
 
-        # 异步 D2H 全部入队后，读取 CPU 缓冲前统一等待。
+        # 读取 CPU 缓冲前统一等待。
         if async_copy and written > 0:
             torch.cuda.synchronize(device)
 
@@ -8061,8 +8002,8 @@ class RoutingProbe:
     """
     RQ3/RQ4 的路由探针：在分析前向中按调用顺序记录每次 route()。
 
-    只由 analyze_routing 挂载/卸载；route() 在探针为 None 时
-    只付出一次属性判空，训练路径不受影响。
+    只由 analyze_routing 挂载/卸载；探针为 None 时 route()
+    不记录。
     """
 
     def __init__(self, cfg: Config, batch_size: int):
@@ -8149,8 +8090,7 @@ class RoutingProbe:
 
         pair_means = torch.stack(pair_tensors)
 
-        # 保持为 0 维设备张量，由 build_report 一次性取回；
-        # 避免每次 route 记录都触发一次设备同步。
+        # 保持为 0 维设备张量，由 build_report 取回。
         return pair_means.mean(), pair_means.min()
 
     def record(
@@ -8255,9 +8195,7 @@ class RoutingProbe:
                     self._branch_cosine_stats(x, branch_dim)
                 )
 
-            # 统计量全部留在设备上，build_report 时一次取回；
-            # 逐条记录内不做 .tolist()/.cpu()，避免每次 route
-            # 都触发一次 CUDA 同步。
+            # 统计量留在设备上，由 build_report 取回。
             scalar_values = [
                 router_entropy.to(torch.float64),
                 load_entropy.to(torch.float64),
@@ -8578,11 +8516,9 @@ class RoutingProbe:
 
     def _materialize_events(self) -> None:
         """
-        把 record 阶段留在设备上的小张量一次性取回并写回事件。
+        把 record 阶段留在设备上的小张量取回并写回事件。
 
-        单次 stack/concat 后统一 D2H，避免 O(route 调用数) 的
-        隐式同步；取回后的事件结构与旧实现完全一致，下游报告
-        代码无需改动。重复调用是幂等的。
+        重复调用是幂等的。
         """
         if not self.events:
             return
@@ -16386,10 +16322,8 @@ def run_sanity_overfit(
     损失迅速趋近 0 或下一 token 准确率接近 100%。
 
     通过条件同时要求「确实学到了东西」：最终损失相对第一次
-    前向（任何优化器更新之前）至少下降 min_relative_improvement。
-    仅有绝对阈值不够——若损失实现错误、返回一个恒定的小值，
-    旧判定会误通过；现在必须观察到下降，且满足绝对阈值或准确率
-    阈值之一，二者同时成立才算通过。
+    前向（任何优化器更新之前）至少下降 min_relative_improvement，
+    且满足绝对阈值或准确率阈值之一，二者同时成立才算通过。
 
     第一步反向之后还会先做梯度探针（见 _probe_gradient_flow）：
     损失必须连在计算图上、梯度必须有限、至少一个参数收到非零
@@ -17309,15 +17243,12 @@ def _snapshot_to_cpu(value: object) -> object:
     """
     递归把 state_dict 类负载中的张量拷成 CPU 快照。
 
-    活参数/优化器状态可能是设备张量：torch.save 逐张量隐式
-    D2H 并持有视图，先把整个负载显式快照到 CPU，序列化阶段
-    就与训练设备解耦（值、dtype、键结构不变）。
+    快照与训练设备解耦（值、dtype、键结构不变）。
 
     同一段底层存储常被多个键共享（如绑定权重
     ``lm_head.weight`` 与 ``token_embedding.weight``），快照
     按（存储地址、偏移、dtype、形状、步幅）去重：共享张量
-    只复制一次并复用同一 CPU 副本，让 torch.save 仍能对
-    存储去重。
+    使用同一 CPU 副本，torch.save 仍可对存储去重。
     """
     memo: Dict[Tuple[object, ...], torch.Tensor] = {}
 
@@ -19856,8 +19787,8 @@ def run_self_test():
         "latency_ms_per_forward"
     ] == 1.5
 
-    # 损坏的 config.json（config 为 truthy 非 dict）不能让对比
-    # 直接崩溃：旧运行/手写配置可能没有结构化 config。
+    # config.json 的 config 为 truthy 非 dict 时，对比按缺省
+    # 字段处理。
     with tempfile.TemporaryDirectory() as malformed_dir:
         malformed_run = Path(malformed_dir) / "malformed"
         malformed_run.mkdir()
@@ -19882,8 +19813,8 @@ def run_self_test():
     assert malformed_rows[0].get("mode") is None
     assert malformed_rows[0]["selection_metric"] == "val_loss"
 
-    # 损坏的 routing_analysis（内层字段非 dict）同样不能让
-    # 对比崩溃：路由指标退化为 None，而不是虚报。
+    # routing_analysis 的内层字段非 dict 时，路由指标退化为
+    # None，而不是虚报。
     with tempfile.TemporaryDirectory() as malformed_routing_dir:
         routing_run = Path(malformed_routing_dir) / "routing"
         routing_run.mkdir()
@@ -25768,7 +25699,7 @@ def main():
         dataset,
         include_test=False,
         # 仅当本次运行会解封测试集时才保留扫描结果，供最终
-        # 审计复用；避免普通训练长期占用签名缓存的系统内存。
+        # 审计复用。
         cache_scans=args.evaluate_test,
     )
     print_data_audit(data_audit)
