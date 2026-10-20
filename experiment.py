@@ -3865,8 +3865,11 @@ def probe_data_pipeline(
         report["group_boundaries_checked"] = True
         separator = dataset.group_separator
 
-        for split, (begin, _) in bounds.items():
-            if begin <= 0:
+        for split, (begin, end) in bounds.items():
+            # 空 split（如 test_fraction=0 时的 test）没有群组，
+            # 其起点可能恰为文件末尾，不应要求末尾再有一个
+            # 分组分隔符。
+            if begin <= 0 or end <= begin:
                 continue
             prefix = bytes(
                 dataset._raw[
@@ -21348,6 +21351,36 @@ def run_self_test():
         "test": 1,
     }
     assert grouped_audit["violations"] == []
+
+    # test_fraction=0 时 test split 为空且起点可能等于文件末尾
+    #（语料末尾没有分隔符）。数据探针不能把这个空 split 误判为
+    # 「群组被拆到两侧」而拒绝训练。
+    with tempfile.NamedTemporaryFile() as no_test_file:
+        no_test_file.write(separator.join(groups))
+        no_test_file.flush()
+
+        no_test_dataset = ByteDataset(
+            no_test_file.name,
+            seq_len=8,
+            val_fraction=0.2,
+            test_fraction=0.0,
+            group_separator=separator,
+        )
+        assert not no_test_dataset.has_test
+        assert (
+            no_test_dataset.split_bounds["test"][0]
+            == no_test_dataset.split_bounds["test"][1]
+            == no_test_dataset.num_bytes
+        )
+
+        no_test_probe = probe_data_pipeline(
+            no_test_dataset,
+            eval_device,
+            batch_size=2,
+            batches=1,
+        )
+
+    assert no_test_probe["ok"], no_test_probe["failures"]
 
     # 训练集群组去重必须走真实 ByteDataset 路径：规划函数需要
     # 可 find 的原始缓冲区，而不是只读 memoryview。
