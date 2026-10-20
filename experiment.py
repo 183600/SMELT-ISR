@@ -12332,11 +12332,49 @@ _TRAIN_FLOPS_MULTIPLIER = 3.0
 _COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
 
 # 选型偏差的无偏对照：从周期验证曲线取共同训练步数处的即时
-# val_loss。``final`` 的 val 指标来自验证集选中的 checkpoint
+# 指标。``final`` 的 val 指标来自验证集选中的 checkpoint
 # （best_val），同一批数据既选型又判定，最优值噪声会被当成
 # 方法差异；周期验证点是「当时模型」的即时指标，不经过
 # checkpoint 选择。与等计算量 loss 一样，它是分析期派生指标。
+#
+# 只给 loss 提供无偏口径是不够的：类别不平衡时项目建议用
+# macro F1 / PR-AUC 判定，假设也可能预注册 accuracy、precision
+# 或 recall；这些指标同样会被 checkpoint 选择抬高。因此凡是
+# 周期验证实际计算的 val 指标，都生成一份共同步数派生指标。
+_COMMON_STEP_METRIC_SUFFIX = "_at_common_step"
+_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "val_token_accuracy",
+    "val_micro_f1",
+    "val_macro_f1",
+    "val_weighted_f1",
+    "val_precision_macro",
+    "val_precision_weighted",
+    "val_recall_macro",
+    "val_recall_weighted",
+)
+_COMMON_STEP_METRICS: Tuple[str, ...] = tuple(
+    base + _COMMON_STEP_METRIC_SUFFIX
+    for base in _COMMON_STEP_BASE_METRICS
+)
 _COMMON_STEP_METRIC = "val_loss_at_common_step"
+
+
+def _common_step_metric_name(base_metric: str) -> Optional[str]:
+    """周期指标名 → 共同步数派生指标名；非周期指标返回 None。"""
+    if base_metric not in _COMMON_STEP_BASE_METRICS:
+        return None
+    return base_metric + _COMMON_STEP_METRIC_SUFFIX
+
+
+def _common_step_metric_base(metric: str) -> Optional[str]:
+    """共同步数派生指标名 → 原始周期指标名。"""
+    if not metric.endswith(_COMMON_STEP_METRIC_SUFFIX):
+        return None
+    base = metric[: -len(_COMMON_STEP_METRIC_SUFFIX)]
+    return base if base in _COMMON_STEP_BASE_METRICS else None
 
 # local_base 的第二轮为了与 A/B 对齐计算量，把 k1 个分支合并
 # 成一次宽度 min(n_experts, k1*k2) 的路由；均衡损失约随路由
@@ -12427,13 +12465,16 @@ def _val_curve_points(
 
 def _val_step_curve_points(
     run_dir: Path,
+    metric: str = "val_loss",
 ) -> List[Tuple[float, float]]:
     """
-    从 metrics.jsonl 读出 (训练步数, 即时 val_loss) 验证曲线点。
+    从 metrics.jsonl 读出 (训练步数, 即时验证指标) 曲线点。
 
     与 ``_val_curve_points`` 相同，只使用周期验证记录；``final``
     记录是验证集最优 checkpoint 的指标，混入曲线会把选型偏差
     带进「共同步数」对照。同一步有多条记录时保留最后一条。
+    ``metric`` 必须是周期验证实际写出的键；缺该键的记录跳过，
+    不从其他指标换算，避免把不可得的口径伪装成观测。
     """
     points: Dict[float, float] = {}
 
@@ -12441,10 +12482,10 @@ def _val_step_curve_points(
         run_dir / "metrics.jsonl"
     ):
         step = _finite_float(record.get("step"))
-        loss = _finite_float(record.get("val_loss"))
-        if step is None or step <= 0.0 or loss is None:
+        value = _finite_float(record.get(metric))
+        if step is None or step <= 0.0 or value is None:
             continue
-        points[float(step)] = loss
+        points[float(step)] = value
 
     return sorted(points.items())
 
@@ -12638,8 +12679,8 @@ def annotate_common_step_metrics(
     rows: List[Dict[str, object]],
 ) -> Dict[str, object]:
     """
-    为每个运行计算「共同训练步数」处的即时验证 loss，并写回
-    行级指标 ``val_loss_at_common_step``。
+    为每个运行计算「共同训练步数」处的即时验证指标，并写回
+    行级派生指标 ``<metric>_at_common_step``。
 
     动机：``final`` 的 val 指标是验证集选中的最优 checkpoint
     的指标。同一批 val 数据既参与 checkpoint 选择/早停，又参与
@@ -12649,11 +12690,16 @@ def annotate_common_step_metrics(
     指标，不经过 checkpoint 选择，适合做方法对比的无偏口径。
 
     协议：
-    - 只使用周期验证记录（数值 step + 有限 val_loss），排除
+    - 只使用周期验证记录（数值 step + 有限指标值），排除
       ``final``；
-    - 共同步数取所有可比运行「最后一个周期验证步」的最小值，
+    - 共同步数以各运行最后一个周期验证步的最小值为准（以
+      val_loss 曲线确定评估步，保证所有指标对齐同一点），
       保证每个运行都在自己的曲线范围内，不做外推；
     - 命中共有评估步则精确取值，否则在相邻评估点间线性插值；
+    - 覆盖周期验证实际计算的全部 val 指标：loss / ppl / bpb /
+      token accuracy / micro、macro、weighted F1 / precision /
+      recall。AUC 与路由诊断只在最终评估计算，没有周期曲线，
+      不能伪造共同步数口径；
     - 这是分析期派生指标，不用于训练期选型/早停；可直接作为
       ``--compare-metric`` 或预注册主指标。
 
@@ -12662,24 +12708,28 @@ def annotate_common_step_metrics(
     """
     report: Dict[str, object] = {
         "metric": _COMMON_STEP_METRIC,
+        "metrics": list(_COMMON_STEP_METRICS),
         "target_step": None,
         "target_note": None,
+        "metric_reports": {},
         "runs": [],
         "excluded_runs": [],
         "advisories": [],
         "selection_bias_note": (
-            "该指标取自周期验证曲线，不经过验证集 checkpoint "
-            "选择；与 final 的 val_loss 不同，不受选型偏差影响"
+            "这些指标取自周期验证曲线，不经过验证集 checkpoint "
+            "选择；与 final 的 val 指标不同，不受选型偏差影响"
         ),
         "ok": False,
     }
 
-    curves: Dict[int, List[Tuple[float, float]]] = {}
-    for index, row in enumerate(rows):
-        row.pop(_COMMON_STEP_METRIC, None)
+    for row in rows:
+        for metric in _COMMON_STEP_METRICS:
+            row.pop(metric, None)
         row.pop("common_step_target_step", None)
         row.pop("common_step_ratio", None)
 
+    loss_curves: Dict[int, List[Tuple[float, float]]] = {}
+    for index, row in enumerate(rows):
         points = _val_step_curve_points(
             Path(str(row.get("path")))
         )
@@ -12692,52 +12742,98 @@ def annotate_common_step_metrics(
                 ),
             })
             continue
-        curves[index] = points
+        loss_curves[index] = points
 
-    if not curves:
+    if not loss_curves:
         report["advisories"].append(
             "没有任何运行具备周期验证曲线：无法计算共同步数"
-            "处的无偏 val_loss；请用未跳过周期验证的新版运行重跑"
+            "处的无偏验证指标；请用未跳过周期验证的新版运行重跑"
         )
         return report
 
-    target_step = min(points[-1][0] for points in curves.values())
+    target_step = min(
+        points[-1][0] for points in loss_curves.values()
+    )
     report["target_step"] = target_step
     report["target_note"] = (
         "共同步数 = 可比运行最后一个周期验证步的最小值；"
-        "取各运行在该步的即时 val_loss（不做外推）"
+        "取各运行在该步的即时验证指标（不做外推）"
     )
 
-    for index, points in curves.items():
-        row = rows[index]
-        value, method = _interpolate_curve(points, target_step)
-        if value is None:
-            report["excluded_runs"].append({
-                "run": row.get("run"),
-                "reason": method,
-            })
+    metric_reports: Dict[str, Dict[str, object]] = {}
+    for base_metric in _COMMON_STEP_BASE_METRICS:
+        derived_metric = _common_step_metric_name(base_metric)
+        if derived_metric is None:
             continue
 
-        row[_COMMON_STEP_METRIC] = value
-        row["common_step_target_step"] = target_step
-        row["common_step_ratio"] = (
-            target_step / points[-1][0]
-            if points[-1][0] > 0.0
-            else None
-        )
-        report["runs"].append({
-            "run": row.get("run"),
-            "mode": row.get("mode"),
-            "seed": row.get("seed"),
-            "value": value,
-            "interpolation": method,
-            "last_curve_step": points[-1][0],
-            "step_ratio": row["common_step_ratio"],
-            "selected_model": row.get("selected_model"),
-        })
+        curves: Dict[int, List[Tuple[float, float]]] = {}
+        metric_excluded: List[Dict[str, object]] = []
+        for index, row in enumerate(rows):
+            if base_metric == "val_loss":
+                points = loss_curves.get(index)
+            else:
+                points = _val_step_curve_points(
+                    Path(str(row.get("path"))),
+                    base_metric,
+                )
+            if not points:
+                metric_excluded.append({
+                    "run": row.get("run"),
+                    "reason": (
+                        "没有可用的周期验证曲线"
+                        f"（metrics.jsonl 缺数值 step + {base_metric}）"
+                    ),
+                })
+                continue
+            curves[index] = points
+
+        metric_runs: List[Dict[str, object]] = []
+        for index, points in curves.items():
+            row = rows[index]
+            value, method = _interpolate_curve(
+                points,
+                target_step,
+            )
+            if value is None:
+                metric_excluded.append({
+                    "run": row.get("run"),
+                    "reason": method,
+                })
+                continue
+
+            step_ratio = (
+                target_step / points[-1][0]
+                if points[-1][0] > 0.0
+                else None
+            )
+            row[derived_metric] = value
+            row["common_step_target_step"] = target_step
+            row["common_step_ratio"] = step_ratio
+            metric_runs.append({
+                "run": row.get("run"),
+                "mode": row.get("mode"),
+                "seed": row.get("seed"),
+                "value": value,
+                "interpolation": method,
+                "last_curve_step": points[-1][0],
+                "step_ratio": step_ratio,
+                "selected_model": row.get("selected_model"),
+            })
+
+        metric_reports[derived_metric] = {
+            "base_metric": base_metric,
+            "ok": bool(metric_runs),
+            "runs": metric_runs,
+            "excluded_runs": metric_excluded,
+        }
+        if base_metric == "val_loss":
+            report["runs"] = metric_runs
+            report["excluded_runs"] = metric_excluded
+
+    report["metric_reports"] = metric_reports
+    report["ok"] = bool(report["runs"])
 
     if report["runs"]:
-        report["ok"] = True
         ratios = [
             float(item["step_ratio"])
             for item in report["runs"]
@@ -12766,6 +12862,17 @@ def annotate_common_step_metrics(
             )
         )
 
+    incomplete = [
+        derived_metric
+        for derived_metric, metric_report in metric_reports.items()
+        if metric_report["excluded_runs"]
+    ]
+    if incomplete:
+        report["advisories"].append(
+            "以下共同步数指标未能覆盖全部运行（不虚报缺记录）: "
+            + ", ".join(incomplete)
+        )
+
     return report
 
 
@@ -12781,7 +12888,7 @@ def selection_bias_report(
     而 ``best.pt`` 正是按同一验证集指标（默认 val_loss）选出的。
     同一批数据既用于选型又用于判定时，点估计和显著性检验都会
     带乐观偏差，且偏差大小随各运行的种子噪声变化。报告必须
-    点名这一风险，并给出可执行的无偏口径（共同步数 loss）。
+    点名这一风险，并给出可执行的无偏口径（共同步数指标）。
 
     只把明确记录为 ``selected_model=best_val`` 的运行计入
     ``biased_runs``；旧运行缺选型记录时列入 unknown，不虚报。
@@ -12794,6 +12901,7 @@ def selection_bias_report(
         "unknown_selection_runs": [],
         "unbiased_metric": None,
         "unbiased_runs": 0,
+        "available_unbiased_metrics": [],
         "advisory": None,
     }
 
@@ -12817,9 +12925,27 @@ def selection_bias_report(
         else:
             report["unknown_selection_runs"].append(name)
 
-    if metric == "val_loss" and common_step is not None:
-        report["unbiased_metric"] = _COMMON_STEP_METRIC
-        report["unbiased_runs"] = len(common_step.get("runs", []))
+    metric_reports = (
+        _as_dict(common_step).get("metric_reports")
+        if common_step is not None
+        else None
+    )
+    metric_reports = _as_dict(metric_reports)
+    report["available_unbiased_metrics"] = sorted(
+        derived_metric
+        for derived_metric, metric_report in metric_reports.items()
+        if _as_dict(metric_report).get("ok")
+    )
+    unbiased_metric = _common_step_metric_name(metric)
+    if unbiased_metric is not None:
+        unbiased_report = _as_dict(
+            metric_reports.get(unbiased_metric)
+        )
+        if unbiased_report.get("ok"):
+            report["unbiased_metric"] = unbiased_metric
+            report["unbiased_runs"] = len(
+                unbiased_report.get("runs", [])
+            )
 
     if report["biased_runs"]:
         detail = (
@@ -13603,15 +13729,16 @@ DEFAULT_COMPARISON_FACTORS = (
 # --compare 阶段从各运行 metrics.jsonl 的验证曲线插值出的
 # 「等训练计算量」loss（见 annotate_compute_matched_metrics）：
 # 延迟合并 B/A 每步 FLOPs 高于 smelt，等步数比较会把机制收益
-# 与额外计算混在一起。val_loss_at_common_step 同样来自周期
+# 与额外计算混在一起。``*_at_common_step`` 系列同样来自周期
 # 验证曲线，但按共同训练步数对齐，用来避开 final 指标的
-# checkpoint 选型偏差（见 annotate_common_step_metrics）。
-# 两者都与 val_loss 同单位、同方向，可直接作为
-# --compare-metric 或预注册主指标做显著性检验。
+# checkpoint 选型偏差（见 annotate_common_step_metrics）。它们
+# 与对应周期指标同单位、同方向，可直接作为 --compare-metric
+# 或预注册主指标做显著性检验；不能只给 loss 提供无偏口径，
+# 否则以 macro F1 / accuracy 判定时仍会落入 winner's curse。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
     "val_loss_at_matched_flops",
-    "val_loss_at_common_step",
+    *_COMMON_STEP_METRICS,
     "val_ppl",
     "val_bits_per_byte",
     "val_token_accuracy",
@@ -13655,9 +13782,16 @@ COMPARISON_METRIC_KEYS = COMPARISON_METRIC_KEYS + _ROUTING_ROW_FIELDS
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
     "val_loss_at_matched_flops",
-    "val_loss_at_common_step",
     "val_ppl",
     "val_bits_per_byte",
+    *(
+        base + _COMMON_STEP_METRIC_SUFFIX
+        for base in (
+            "val_loss",
+            "val_ppl",
+            "val_bits_per_byte",
+        )
+    ),
     # RQ3：第二轮选择与第一轮不同的专家（重合度越低越独立）；
     # RQ4：死专家越少越好、分支轨迹越分化（cosine 越低）说明
     # 延迟合并确实产生了独立计算。
@@ -13670,22 +13804,19 @@ _LOWER_IS_BETTER_METRICS = {
 }
 
 # ``final`` 中来源于验证集选中模型的 val 指标：它们都会被
-# checkpoint 选择影响。等计算量/共同步数 loss 是曲线派生值，
-# 不在其中。
+# checkpoint 选择影响。等计算量与全部共同步数指标是曲线
+# 派生值，不在其中。
 _SELECTION_BIASED_METRICS = frozenset(
     key
     for key in COMPARISON_METRIC_KEYS
-    if key
-    not in {
-        _COMPUTE_MATCHED_METRIC,
-        _COMMON_STEP_METRIC,
-    }
+    if key != _COMPUTE_MATCHED_METRIC
+    and key not in _COMMON_STEP_METRICS
 )
 
 # 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
 # 依据：AUC 只在最终/测试评估时计算，路由诊断要等训练结束后的
-# 一次专门前向，等计算量 loss 更是 --compare 阶段才插值得到，
-# 训练过程中拿不到，不能用于选型。
+# 一次专门前向，等计算量 / 共同步数指标更是 --compare 阶段才
+# 从曲线派生，训练过程中拿不到，不能用于选型。
 _SELECTION_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
@@ -13695,30 +13826,27 @@ _SELECTION_METRIC_KEYS = tuple(
         "val_pr_auc_macro",
         "val_roc_auc_macro",
         "val_loss_at_matched_flops",
-        "val_loss_at_common_step",
+        *_COMMON_STEP_METRICS,
     }
 )
 
 # 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
-# 才计算的 AUC 与等计算量 loss），但不含路由诊断——dense/ngram
-# 基线没有路由记录，在这些指标上“调参”无法执行。
+# 才计算的 AUC），但不含路由诊断与共同步数派生指标——调参
+# 必须用训练时真实产生、可直接优化/选择的最终 val 指标；
+# 派生指标只用于分析期无偏复核，不能反过来充当调参目标。
 _BASELINE_TUNING_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
     if key not in _ROUTING_ROW_FIELDS
-    and key != "val_loss_at_common_step"
+    and key not in _COMMON_STEP_METRICS
 )
 
 # n-gram 基线没有训练曲线，无法定义「等训练计算量」或
-# 「共同步数」loss；其余与简单神经基线共用同一组口径。
+# 「共同步数」指标；其余与简单神经基线共用同一组口径。
 _NGRAM_TUNING_METRIC_KEYS = tuple(
     key
     for key in _BASELINE_TUNING_METRIC_KEYS
-    if key
-    not in {
-        "val_loss_at_matched_flops",
-        "val_loss_at_common_step",
-    }
+    if key != "val_loss_at_matched_flops"
 )
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
@@ -18281,6 +18409,19 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_roc_auc_macro": "unigram_roc_auc_macro",
 }
 
+# 共同步数派生指标与原始周期指标同单位，稻草人参考沿用同一
+# unigram 字段（例如 val_macro_f1_at_common_step 对应
+# unigram_macro_f1）；否则基线守卫会在派生指标上静默失效。
+for _base_metric in _COMMON_STEP_BASE_METRICS:
+    _derived_metric = _common_step_metric_name(_base_metric)
+    if (
+        _derived_metric is not None
+        and _derived_metric not in _TRIVIAL_REFERENCE_FIELDS
+    ):
+        _TRIVIAL_REFERENCE_FIELDS[_derived_metric] = (
+            _TRIVIAL_REFERENCE_FIELDS[_base_metric]
+        )
+
 # 类别不平衡提示阈值：最高频类的 support 占比达到第一个值时，
 # accuracy / micro 口径已被「永远预测多数类」的常数预测器
 # 主导；超过第二个值时 accuracy 的参考价值已经有限；达到
@@ -18317,10 +18458,14 @@ def _trivial_reference_value(
     if not math.isfinite(value):
         return None
 
-    # unigram_loss 换算到其他口径时与 evaluate / 曲线诊断一致。
-    if metric == "val_ppl":
+    # unigram_loss 换算到其他口径时与 evaluate / 曲线诊断一致；
+    # 共同步数派生指标沿用其原始指标的换算口径。
+    base_metric = (
+        _common_step_metric_base(metric) or metric
+    )
+    if base_metric == "val_ppl":
         return math.exp(min(value, 80.0))
-    if metric == "val_bits_per_byte":
+    if base_metric == "val_bits_per_byte":
         return value / math.log(2.0)
     return value
 
@@ -21196,7 +21341,7 @@ def print_comparison_analysis(
     # 「当时模型」，不经过选型。
     print()
     print(
-        "[common-step] 共同训练步数处的即时验证 loss"
+        "[common-step] 共同训练步数处的即时验证指标"
         "（不经过验证集 checkpoint 选择，用于无偏复核）"
     )
     if not common_step["runs"]:
@@ -21220,10 +21365,34 @@ def print_comparison_analysis(
                 f"{ratio_text}"
                 f" [{item['interpolation']}]"
             )
+        current_derived = (
+            metric
+            if metric in _COMMON_STEP_METRICS
+            else _common_step_metric_name(metric)
+        )
+        if (
+            current_derived is not None
+            and current_derived != _COMMON_STEP_METRIC
+        ):
+            metric_report = _as_dict(
+                _as_dict(
+                    common_step.get("metric_reports")
+                ).get(current_derived)
+            )
+            print(
+                f"  判定指标 {current_derived} 的共同步数取值："
+            )
+            for item in metric_report.get("runs", []):
+                print(
+                    f"  {str(item.get('run'))[:36]:<37} "
+                    f"mode={str(item.get('mode')):<10} "
+                    f"value={float(item['value']):.4f}"
+                    f" [{item['interpolation']}]"
+                )
         print(
-            "  可用 --compare-metric val_loss_at_common_step "
-            "把它作为判定指标做聚合与显著性检验；该点只代表"
-            "共同步数处，不等于完整训练结束时的排序"
+            "  可用 --compare-metric <metric>_at_common_step "
+            "把对应指标作为判定口径做聚合与显著性检验；该点"
+            "只代表共同步数处，不等于完整训练结束时的排序"
         )
     for message in common_step["advisories"]:
         print(f"  [note] {message}")
@@ -27022,6 +27191,100 @@ def run_self_test():
         "val_loss_at_common_step",
         common_report,
     )["applicable"]
+
+    # 类别指标同样需要无偏口径：以 macro F1 判定时不能只有
+    # loss 的共同步数版本。两个运行的 macro F1 在共同步数处
+    # 精确/插值取值，且选型偏差报告必须指向对应派生指标。
+    assert "val_macro_f1_at_common_step" in COMPARISON_METRIC_KEYS
+    assert (
+        "val_macro_f1_at_common_step"
+        not in _SELECTION_METRIC_KEYS
+    )
+    assert (
+        "val_macro_f1_at_common_step"
+        not in _NGRAM_TUNING_METRIC_KEYS
+    )
+    with tempfile.TemporaryDirectory() as metric_dir:
+        metric_paths = []
+        for name, curve in (
+            ("short", [(10, 0.50), (20, 0.60)]),
+            ("long", [(10, 0.45), (20, 0.55), (30, 0.65)]),
+        ):
+            run_dir = Path(metric_dir) / name
+            run_dir.mkdir()
+            with open(
+                run_dir / "config.json",
+                "w", encoding="utf-8",
+            ) as f:
+                json.dump(
+                    {
+                        "config": {"mode": "A"},
+                        "args": {"seed": 1},
+                    },
+                    f,
+                )
+            for step, score in curve:
+                write_jsonl_record(
+                    run_dir / "metrics.jsonl",
+                    {
+                        "step": step,
+                        "val_loss": 1.0,
+                        "val_macro_f1": score,
+                    },
+                )
+            write_jsonl_record(
+                run_dir / "metrics.jsonl",
+                {
+                    "step": "final",
+                    "val_loss": 0.5,
+                    "val_macro_f1": 0.99,
+                    "selected_model": "best_val",
+                    "selected_step": 20,
+                    "trained_steps": 20,
+                },
+            )
+            metric_paths.append(str(run_dir))
+
+        metric_rows = compare_runs(metric_paths)
+        metric_common = annotate_common_step_metrics(
+            metric_rows
+        )
+        metric_by_run = {
+            str(row["run"]): row for row in metric_rows
+        }
+        assert abs(
+            float(
+                metric_by_run["short"][
+                    "val_macro_f1_at_common_step"
+                ]
+            )
+            - 0.60
+        ) < 1e-12
+        # 长臂在 step 20 命中评估点，不取 final 的 0.99。
+        assert abs(
+            float(
+                metric_by_run["long"][
+                    "val_macro_f1_at_common_step"
+                ]
+            )
+            - 0.55
+        ) < 1e-12
+        macro_bias = selection_bias_report(
+            metric_rows,
+            "val_macro_f1",
+            metric_common,
+        )
+        assert macro_bias["applicable"]
+        assert macro_bias["unbiased_metric"] == (
+            "val_macro_f1_at_common_step"
+        )
+        assert macro_bias["unbiased_runs"] == 2
+        assert macro_bias["advisory"]
+        assert not selection_bias_report(
+            metric_rows,
+            "val_macro_f1_at_common_step",
+            metric_common,
+        )["applicable"]
 
     # ---- local_base 均衡强度折算 ----
     # 第二轮实际宽度 min(n_experts, k1*k2) 只用于计算量对齐；

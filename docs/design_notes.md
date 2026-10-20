@@ -322,6 +322,15 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   次数，0 关闭）。它量化「换一批同分布评估窗口」的抽样
   波动，与跨种子方差是两种不同的不确定性来源；窗口数为 1
   或指标退化时区间退化为点估计而不是虚构精度。
+  **选型偏差的无偏口径**：final 的 val 指标来自验证集选中的
+  checkpoint，同一批数据既选型又判定会产生 winner's curse。
+  `--compare` 对所有周期验证实际计算的指标（loss / ppl / bpb /
+  accuracy / micro、macro、weighted F1 / precision / recall）
+  生成 `<metric>_at_common_step` 派生指标：在各运行最后一个
+  周期验证步的最小值处精确取值或线性插值，不经过选型，可作为
+  `--compare-metric` 做聚合、显著性检验与因子效应。AUC 与路由
+  诊断只在最终评估计算，没有周期曲线，不伪造该口径；旧运行
+  缺周期指标时显式列入未覆盖而不是虚报。
   **确定性基线**：ngram 的计数与固定窗口评估不消耗随机性，
   换 seed 重跑只是同一估计的复制，不是独立重复。聚合层按
   `deterministic` 标记把同一单元的多个 seed 折叠为 1 个观测
