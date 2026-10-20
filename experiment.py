@@ -11349,6 +11349,11 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
 # （ngram，无优化器、无训练轮数）分开：受控变量检查只在
 # 同一 family 内部进行。
 COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
+    # mode 是最核心的结构差异：它默认是实验因子，但调用方一旦
+    # 用 --compare-factors 收窄因子列表而漏掉 mode，跨模式运行
+    # 就会绕过受控变量核对。把它写进协议后，只有显式声明为
+    # 因子时才允许不同。
+    "mode",
     "optimizer",
     "optimizer_betas",
     "optimizer_eps",
@@ -11759,6 +11764,9 @@ def build_comparison_protocol(
     """
     return {
         "comparison_family": "neural",
+        # 模型模式是结构差异本身；默认作为实验因子，但一旦
+        # 因子列表没有它，就必须按受控变量核对。
+        "mode": cfg.mode,
         # 优化器固定为 AdamW（betas/eps 使用 PyTorch 默认值），
         # 显式记录以便未来更换优化器时立即被对比检查发现。
         "optimizer": "AdamW",
@@ -11866,6 +11874,10 @@ def experiment_protocol_from_payload(
             if cfg.get("mode") == "ngram"
             else "neural"
         ),
+        # 旧运行没有把 mode 写进协议时，config.json 的 mode
+        # 是唯一确定的实际模式；用它回填，避免跨模式对比在
+        # 因子列表漏掉 mode 时静默通过。
+        "mode": cfg.get("mode"),
         # 代码历史上只有一种优化器与一种调度，能唯一确定时
         # 回退；否则留 None。
         "optimizer": "AdamW" if has_training else None,
@@ -23403,6 +23415,20 @@ def run_self_test():
         )
         assert controlled["ok"], controlled["violations"]
         assert "lr" in controlled["checked_keys"]
+        # mode 默认是实验因子，但收窄因子列表后必须退化为
+        # 受控变量：否则跨模式运行会绕过检查，报告仍显示 OK。
+        assert analysis_rows[0]["protocol"]["mode"] == "local_base"
+        narrow_factors = parse_factor_spec(
+            "k1,k2,balance_coef,seed,dense_fnn_hidden"
+        )
+        mode_controlled = check_controlled_variables(
+            analysis_rows,
+            narrow_factors,
+        )
+        assert any(
+            violation["key"] == "mode"
+            for violation in mode_controlled["violations"]
+        ), mode_controlled["violations"]
         # 有效训练长度与数值设置也必须是受控变量：中止触发
         # （early stop 容忍度）与 AMP/设备/梯度检查点/编译在
         # 两臂间不同会让「方法收益」混入训练过程差异。
