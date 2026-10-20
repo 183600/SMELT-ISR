@@ -3990,6 +3990,26 @@ _AUDIT_NUL_WARN = 1e-4
 _AUDIT_SPLIT_FRACTION_DRIFT = 0.2
 _AUDIT_SPLIT_FRACTION_MIN_ABS = 0.01
 
+# 内容定义分块审计的最小/最大块长与边界概率掩码。分块边界
+# 由块内局部内容的滚动哈希决定，而不是全局固定偏移，因此
+# 同一段内容即使整体错位复制也会在后续块上重新对齐。最小
+# 块长同时限制为至少 seq_len + 1：共享块足以覆盖一个完整
+# 训练/评估窗口，才能作为跨 split 泄露证据。
+_AUDIT_CHUNK_MIN_BYTES = 32
+_AUDIT_CHUNK_MAX_BYTES = 512
+_AUDIT_CHUNK_BOUNDARY_MASK = 0x3F
+_AUDIT_CHUNK_GEAR_TABLE = tuple(
+    int.from_bytes(
+        hashlib.blake2b(
+            bytes((value,)),
+            digest_size=8,
+        ).digest(),
+        "little",
+    )
+    for value in range(256)
+)
+_AUDIT_CHUNK_UINT64_MASK = (1 << 64) - 1
+
 
 def _js_distance(
     p: torch.Tensor,
@@ -4010,6 +4030,259 @@ def _js_distance(
 
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
     return math.sqrt(max(0.0, float(js)))
+
+
+def _subtract_byte_intervals(
+    begin: int,
+    end: int,
+    excluded_spans: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """
+    返回 [begin, end) 内扣除排除区间后的连续内容区间。
+    """
+    result: List[Tuple[int, int]] = []
+    cursor = begin
+
+    for excluded_start, excluded_end in _merge_byte_intervals(
+        excluded_spans
+    ):
+        if excluded_end <= begin or excluded_start >= end:
+            continue
+        if cursor < excluded_start:
+            result.append(
+                (cursor, min(excluded_start, end))
+            )
+        cursor = max(cursor, excluded_end)
+        if cursor >= end:
+            break
+
+    if cursor < end:
+        result.append((cursor, end))
+
+    return [
+        (start, stop)
+        for start, stop in result
+        if stop > start
+    ]
+
+
+def _content_defined_chunk_scan(
+    raw: memoryview,
+    intervals: List[Tuple[int, int]],
+    min_chunk: int,
+    max_chunk: int,
+) -> Dict[str, object]:
+    """
+    对若干内容区间做 content-defined chunking 并返回块指纹。
+
+    每个块的有效内容指纹与它出现的绝对位置无关；共享同一
+    指纹即表示两个 split 含有相同的连续字节片段。分块只读取
+    原始字节，不参与任何特征计算。
+    """
+    chunks: Dict[bytes, List[Tuple[int, int]]] = {}
+    total_chunks = 0
+    total_bytes = 0
+    shortest: Optional[int] = None
+    longest = 0
+
+    if min_chunk <= 0 or max_chunk < min_chunk:
+        raise ValueError(
+            "内容定义分块要求 0 < min_chunk <= max_chunk"
+        )
+
+    for begin, end in intervals:
+        chunk_start = begin
+        rolling = 0
+
+        for position in range(begin, end):
+            rolling = (
+                (rolling << 1)
+                + _AUDIT_CHUNK_GEAR_TABLE[raw[position]]
+            ) & _AUDIT_CHUNK_UINT64_MASK
+            length = position - chunk_start + 1
+
+            if length < min_chunk:
+                continue
+
+            if (
+                length >= max_chunk
+                or (
+                    rolling
+                    & _AUDIT_CHUNK_BOUNDARY_MASK
+                ) == 0
+            ):
+                digest = hashlib.blake2b(
+                    raw[chunk_start:position + 1],
+                    digest_size=16,
+                ).digest()
+                chunks.setdefault(digest, []).append(
+                    (chunk_start, position + 1)
+                )
+                total_chunks += 1
+                total_bytes += length
+                shortest = (
+                    length
+                    if shortest is None
+                    else min(shortest, length)
+                )
+                longest = max(longest, length)
+                chunk_start = position + 1
+                rolling = 0
+
+        tail_length = end - chunk_start
+        if tail_length >= min_chunk:
+            digest = hashlib.blake2b(
+                raw[chunk_start:end],
+                digest_size=16,
+            ).digest()
+            chunks.setdefault(digest, []).append(
+                (chunk_start, end)
+            )
+            total_chunks += 1
+            total_bytes += tail_length
+            shortest = (
+                tail_length
+                if shortest is None
+                else min(shortest, tail_length)
+            )
+            longest = max(longest, tail_length)
+
+    return {
+        "chunks": chunks,
+        "total_chunks": total_chunks,
+        "total_bytes": total_bytes,
+        "unique_chunks": len(chunks),
+        "within_duplicates": total_chunks - len(chunks),
+        "min_chunk_bytes": shortest,
+        "max_chunk_bytes": longest,
+    }
+
+
+def _content_chunk_duplicate_audit(
+    dataset: ByteDataset,
+    split_names: List[str],
+) -> Dict[str, object]:
+    """
+    跨 split 内容定义分块重复审计。
+
+    这是窗口签名扫描的独立补充：窗口扫描受采样步长限制，
+    错位复制的长片段可能没有任何一个采样窗口完全相同；分块
+    指纹由局部内容决定，错位后仍会重新对齐。群组分隔符本身
+    是结构字节，分块只在群组内容上进行，避免把重复的分隔符
+    误报为内容泄露。
+    """
+    min_chunk = max(
+        _AUDIT_CHUNK_MIN_BYTES,
+        dataset.seq_len + 1,
+    )
+    max_chunk = max(
+        _AUDIT_CHUNK_MAX_BYTES,
+        min_chunk * 4,
+    )
+
+    excluded = set(dataset.train_excluded_spans)
+    indices: Dict[str, Dict[bytes, List[Tuple[int, int]]]] = {}
+    per_split: Dict[str, Dict[str, object]] = {}
+
+    for split in split_names:
+        begin, end = dataset.split_bounds[split]
+        if end <= begin:
+            continue
+
+        if dataset.group_separator is None:
+            intervals = _subtract_byte_intervals(
+                begin,
+                end,
+                (
+                    dataset.train_excluded_spans
+                    if split == "train"
+                    else []
+                ),
+            )
+        else:
+            intervals = [
+                (span_start, span_end)
+                for span_start, span_end in _iter_group_spans(
+                    dataset._raw_buffer,
+                    dataset.group_separator,
+                    begin,
+                    end,
+                )
+                if not (
+                    split == "train"
+                    and (span_start, span_end) in excluded
+                )
+            ]
+
+        scan = _content_defined_chunk_scan(
+            dataset._raw,
+            intervals,
+            min_chunk,
+            max_chunk,
+        )
+        indices[split] = scan["chunks"]
+        per_split[split] = {
+            "content_bytes": sum(
+                stop - start for start, stop in intervals
+            ),
+            "chunks": scan["total_chunks"],
+            "unique_chunks": scan["unique_chunks"],
+            "within_split_duplicates": scan[
+                "within_duplicates"
+            ],
+            "chunk_bytes": scan["total_bytes"],
+        }
+
+    cross_split: Dict[str, object] = {}
+
+    for left, right in (
+        ("train", "val"),
+        ("train", "test"),
+        ("val", "test"),
+    ):
+        if left not in indices or right not in indices:
+            continue
+
+        left_index = indices[left]
+        right_index = indices[right]
+        common = left_index.keys() & right_index.keys()
+
+        shared_chunks = 0
+        shared_bytes = 0
+        examples = []
+
+        for digest in common:
+            left_occurrences = left_index[digest]
+            right_occurrences = right_index[digest]
+            matched = min(
+                len(left_occurrences),
+                len(right_occurrences),
+            )
+            length = (
+                left_occurrences[0][1]
+                - left_occurrences[0][0]
+            )
+            shared_chunks += matched
+            shared_bytes += matched * length
+            if len(examples) < 3:
+                examples.append([
+                    left_occurrences[0][0],
+                    right_occurrences[0][0],
+                    length,
+                ])
+
+        cross_split[f"{left}_{right}"] = {
+            "shared_chunks": shared_chunks,
+            "shared_bytes": shared_bytes,
+            "examples": examples,
+        }
+
+    return {
+        "min_chunk_bytes": min_chunk,
+        "max_chunk_bytes": max_chunk,
+        "per_split": per_split,
+        "cross_split": cross_split,
+    }
 
 
 def _window_signature_scan(
@@ -4273,6 +4546,9 @@ def audit_data_splits(
       train↔test、val↔test）之间的 JS 距离，用于发现分布偏移；
     - 对滑动窗口做有界签名扫描，检测跨 split 重复内容与 split
       内部重复；
+    - 用内容定义分块指纹补齐窗口抽样漏掉的错位/近似重复：分块
+      边界由局部内容决定，长片段整体偏移后仍会产生相同块指纹；
+      跨 split 共享块是泄露级问题；
     - 群组划分（传入 group_separator 时）报告每个 split 的完整
       群组数与分隔符，供追踪「群组整体不跨界」的协议。
 
@@ -4676,6 +4952,24 @@ def audit_data_splits(
                 violations.append(message)
                 leakage_violations.append(message)
 
+    content_chunks = _content_chunk_duplicate_audit(
+        dataset,
+        split_names,
+    )
+
+    for pair, info in content_chunks["cross_split"].items():
+        if info["shared_chunks"] <= 0:
+            continue
+        message = (
+            f"{pair}: 内容定义分块检测到 "
+            f"{info['shared_chunks']} 个相同的"
+            f"连续字节块（共享 {info['shared_bytes']} 字节，"
+            "错位/近似重复内容的跨 split 泄露风险）"
+        )
+        warnings.append(message)
+        violations.append(message)
+        leakage_violations.append(message)
+
     return {
         "max_windows": max_windows,
         "splits": splits_report,
@@ -4686,6 +4980,7 @@ def audit_data_splits(
         "dataset_split_fractions": dataset.split_fractions,
         "distribution_shift": distribution_shift,
         "duplicate_windows": duplicate_windows,
+        "content_chunks": content_chunks,
         "groups": groups_report,
         "warnings": warnings,
         "violations": violations,
@@ -4698,8 +4993,9 @@ def enforce_data_leakage_gate(
     context: str = "",
 ) -> bool:
     """
-    跨 split 泄露的默认硬门：只要审计发现内容重复（窗口级或
-    群组级跨 split 重复），就拒绝继续，而不是仅打印警告。
+    跨 split 泄露的默认硬门：只要审计发现内容重复（窗口级、
+    群组级或内容定义分块级的跨 split 重复），就拒绝继续，
+    而不是仅打印警告。
 
     与 ``enforce_strict_data_audit`` 的分工：
     - 本函数默认启用，只拦截「泄露」这一类问题；
@@ -4830,6 +5126,17 @@ def print_data_audit(report: Dict[str, object]) -> None:
             print(
                 f"[data]   {key} 共享窗口签名数 = "
                 f"{info['shared_signatures']}"
+            )
+
+    chunks = report.get("content_chunks") or {}
+    for key, info in (
+        chunks.get("cross_split") or {}
+    ).items():
+        if info.get("shared_chunks", 0) > 0:
+            print(
+                f"[data]   {key} 共享内容定义块 = "
+                f"{info['shared_chunks']} "
+                f"({info['shared_bytes']}B)"
             )
 
     violation_set = set(report.get("violations", []))
@@ -21311,6 +21618,12 @@ def run_self_test():
     )
     assert clean_audit["leakage_violations"] == []
     assert enforce_data_leakage_gate(clean_audit)
+    assert all(
+        info["shared_chunks"] == 0
+        for info in clean_audit["content_chunks"][
+            "cross_split"
+        ].values()
+    )
     # 这份合成语料覆盖 0..255 全部字节值（含大量非 UTF-8
     # 字节），严格审计会把它标记为标签噪声来源；这不影响
     # 上面的重复检测断言。
@@ -21357,6 +21670,83 @@ def run_self_test():
     assert repeated_audit["leakage_violations"]
     assert not enforce_data_leakage_gate(repeated_audit)
     assert not enforce_strict_data_audit(repeated_audit)
+
+    # 内容定义分块审计：窗口抽样步长漏掉的错位重复仍必须被
+    # 抓住。这里让 train/val 各含同一段 512 字节内容，但把
+    # max_windows 压到 1，使窗口签名扫描只看到每个 split 的
+    # 第一个窗口（不含重复片段）；分块指纹必须独立检出。
+    chunk_rng = random.Random(20241021)
+    chunk_duplicate = chunk_rng.randbytes(512)
+    chunk_train = chunk_rng.randbytes(5400)
+    chunk_train = (
+        chunk_train[:500]
+        + chunk_duplicate
+        + chunk_train[1012:]
+    )
+    chunk_val = chunk_rng.randbytes(100) + chunk_duplicate
+    chunk_test = chunk_rng.randbytes(300)
+    chunk_payload = chunk_train + chunk_val + chunk_test
+
+    with tempfile.NamedTemporaryFile() as chunk_file:
+        chunk_file.write(chunk_payload)
+        chunk_file.flush()
+
+        chunk_dataset = ByteDataset(
+            chunk_file.name,
+            seq_len=8,
+            val_fraction=len(chunk_val) / len(chunk_payload),
+            test_fraction=len(chunk_test) / len(chunk_payload),
+        )
+        assert chunk_dataset.split_bounds == {
+            "train": (0, len(chunk_train)),
+            "val": (len(chunk_train), len(chunk_train) + len(chunk_val)),
+            "test": (
+                len(chunk_train) + len(chunk_val),
+                len(chunk_payload),
+            ),
+        }
+
+        chunk_audit = audit_data_splits(
+            chunk_dataset,
+            include_test=True,
+            max_windows=1,
+        )
+
+    assert (
+        chunk_audit["duplicate_windows"]["train_val"][
+            "shared_signatures"
+        ]
+        == 0
+    )
+    assert (
+        chunk_audit["content_chunks"]["cross_split"][
+            "train_val"
+        ]["shared_chunks"]
+        > 0
+    )
+    assert (
+        chunk_audit["content_chunks"]["cross_split"][
+            "train_val"
+        ]["shared_bytes"]
+        >= chunk_dataset.seq_len + 1
+    )
+    assert any(
+        "内容定义分块" in violation
+        for violation in chunk_audit["leakage_violations"]
+    )
+    assert not enforce_data_leakage_gate(chunk_audit)
+    assert (
+        chunk_audit["content_chunks"]["cross_split"][
+            "train_test"
+        ]["shared_chunks"]
+        == 0
+    )
+    assert (
+        chunk_audit["content_chunks"]["cross_split"][
+            "val_test"
+        ]["shared_chunks"]
+        == 0
+    )
 
     # 单个字节占主导的退化语料必须被标记（异常值检查）。
     with tempfile.NamedTemporaryFile() as padded_file:
@@ -21689,6 +22079,12 @@ def run_self_test():
     )
     assert dedup_audit["splits"]["train"]["effective_bytes"] == 28
     assert dedup_audit["splits"]["train"]["bytes"] == 48
+    assert all(
+        info["shared_chunks"] == 0
+        for info in dedup_audit["content_chunks"][
+            "cross_split"
+        ].values()
+    )
 
     dedup_probe = probe_data_pipeline(
         dedup_dataset,
