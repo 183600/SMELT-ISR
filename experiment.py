@@ -19861,7 +19861,11 @@ def baseline_adequacy(
     elif ngram_rows:
         ngram_independent_seeds = _independent_seed_count(
             len(ngram_rows),
-            [row.get("seed") for row in ngram_rows],
+            [
+                row.get("seed")
+                for row in ngram_rows
+                if row.get("seed") is not None
+            ],
         )
         if ngram_independent_seeds < _RECOMMENDED_SEEDS:
             report["advisories"].append(
@@ -37830,7 +37834,11 @@ def main():
         # 实际有效训练长度：早停与 non-finite 跳步会让
         # 「计划步数相同」的两臂实际训练量不同，跨运行对比
         # 必须能核对（--compare 注入 comparison_protocol）。
-        "trained_steps": max(0, int(end_step) - int(start_step)),
+        # 该长度是累计口径：resume 后的 run 必须报告从头到尾
+        # 实际执行的总步数，否则「跑满 200 步」与「从 100 步
+        # 续跑到 200 步」会都记成 100，受控变量核对被骗过；
+        # 与累计的 optimizer_steps 保持同一口径。
+        "trained_steps": max(0, int(end_step)),
         "optimizer_steps": optimizer_steps_completed,
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
