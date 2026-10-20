@@ -16030,11 +16030,37 @@ def aggregate_runs(
             aggregate[f"{metric}_n"] = len(values)
             aggregate["samples"][metric] = samples
 
+            # 单元均值的 95% CI（t 分布，自由度 n-1）：std 只
+            # 描述种子间离散度，不是均值本身的不确定性；n 很小
+            # 时 t 临界值很宽，区间会把「种子不够」直接暴露出来。
+            # n<2 或 std 不可用时不给区间，避免把点估计伪装成
+            # 零宽度的精确估计。
+            ci: Optional[Dict[str, object]] = None
+            if mean is not None and std is not None and len(values) >= 2:
+                critical = _t_critical(float(len(values) - 1))
+                if critical is not None:
+                    half_width = (
+                        critical * std / math.sqrt(len(values))
+                    )
+                    ci = {
+                        "low": mean - half_width,
+                        "high": mean + half_width,
+                        "t_critical": critical,
+                        "df": len(values) - 1,
+                        "method": "t_interval",
+                    }
+                    aggregate[f"{metric}_ci95_low"] = ci["low"]
+                    aggregate[f"{metric}_ci95_high"] = ci["high"]
+            aggregate.setdefault("ci95", {})[metric] = ci
+
             # 没有样本的指标从 JSON 报告中省略，避免大量 null。
             if mean is None:
                 aggregate.pop(f"{metric}_mean", None)
                 aggregate.pop(f"{metric}_std", None)
                 aggregate.pop(f"{metric}_n", None)
+                aggregate.pop(f"{metric}_ci95_low", None)
+                aggregate.pop(f"{metric}_ci95_high", None)
+                aggregate["ci95"].pop(metric, None)
                 aggregate["samples"].pop(metric, None)
 
         aggregates.append(aggregate)
@@ -21054,7 +21080,8 @@ def print_comparison_analysis(
     print()
     print(
         "[aggregate] 按实验单元聚合（Mean ± Std，样本标准差；"
-        "std 反映不同随机种子的方差）"
+        "std 反映不同随机种子的方差；CI 为均值的 t 分布 95% "
+        "置信区间，n<2 或确定性折叠后不给出）"
     )
     if selection_metric_mismatch:
         print(
@@ -21096,7 +21123,7 @@ def print_comparison_analysis(
         header = (
             f"{'cell':<40} {'n':>3} "
             + " ".join(
-                f"{column:>19}" for column in metric_columns
+                f"{column:>39}" for column in metric_columns
             )
         )
         print(
@@ -21115,16 +21142,28 @@ def print_comparison_analysis(
             if mean is None:
                 return "-"
             std = aggregate.get(f"{base_metric}_std")
-            if std is None:
-                return f"{float(mean):.4f}"
-            return f"{float(mean):.4f}±{float(std):.4f}"
+            text = (
+                f"{float(mean):.4f}"
+                if std is None
+                else f"{float(mean):.4f}±{float(std):.4f}"
+            )
+            # 均值的 95% CI 与 std 是两件事：std 描述种子间
+            # 离散度，CI 描述均值本身的不确定度。n 很小时区间
+            # 明显变宽，读者能直接看到「种子不够」。
+            ci = (aggregate.get("ci95") or {}).get(base_metric)
+            if ci:
+                text += (
+                    f" CI[{float(ci['low']):.4f},"
+                    f"{float(ci['high']):.4f}]"
+                )
+            return text
 
         for aggregate in aggregates:
             print(
                 f"{str(aggregate['label'])[:39]:<40} "
                 f"{int(aggregate['n_runs']):>3} "
                 + " ".join(
-                    f"{_stat(aggregate, column):>19}"
+                    f"{_stat(aggregate, column):>39}"
                     for column in metric_columns
                 )
             )
@@ -31578,6 +31617,37 @@ def run_self_test():
     )
     assert numerical_report["excluded_run_count"] == 1
     assert numerical_report["advisory"]
+
+    # 单元均值的 95% CI 必须是 t 分布区间：宽度随 n 变小而
+    # 变宽；n<2 时不给区间，避免把点估计伪装成零宽度估计。
+    ci_rows = [
+        {
+            "run": f"cell_seed{seed}",
+            "mode": "A",
+            "seed": seed,
+            "val_loss": value,
+        }
+        for seed, value in enumerate([3.0, 2.0, 1.0], start=1)
+    ]
+    ci_aggregate = aggregate_runs(ci_rows, ["mode"])[0]
+    ci_block = ci_aggregate["ci95"]["val_loss"]
+    assert ci_block is not None, ci_block
+    ci_mean = ci_aggregate["val_loss_mean"]
+    ci_std = ci_aggregate["val_loss_std"]
+    assert ci_mean == 2.0 and ci_std == 1.0
+    expected_half = (
+        ci_block["t_critical"] * ci_std / math.sqrt(3)
+    )
+    assert ci_block["df"] == 2
+    assert abs(ci_block["low"] - (ci_mean - expected_half)) < 1e-9
+    assert ci_block["low"] < ci_mean < ci_block["high"]
+    assert (
+        ci_aggregate["val_loss_ci95_low"] == ci_block["low"]
+        and ci_aggregate["val_loss_ci95_high"] == ci_block["high"]
+    )
+    ci_single = aggregate_runs(ci_rows[:1], ["mode"])[0]
+    assert ci_single["ci95"]["val_loss"] is None
+    assert "val_loss_ci95_low" not in ci_single
 
     with tempfile.TemporaryDirectory() as numerical_dir:
         failed_run = Path(numerical_dir) / "failed_run"
