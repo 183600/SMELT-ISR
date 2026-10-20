@@ -13685,6 +13685,19 @@ _COST_FIELD_LABELS = {
     "peak_memory_mb": "峰值占用",
 }
 
+# 计时字段：它们的成本倍率可能由单次测量的噪声/负载波动
+# 驱动，跨运行解读时必须带离散度；结构字段（参数/FLOPs）
+# 对同一实现是确定量。
+_COST_TIMING_FIELDS: Tuple[str, ...] = (
+    "latency_ms_per_forward",
+    "training_ms_per_step",
+)
+
+# 成本倍率的 95% 置信区间用 delta 方法近似（对数尺度），
+# 离散度超过该阈值时明确标注「计时噪声可能主导」。
+_COST_RATIO_CI_Z = 1.96
+_COST_NOISE_CV_LIMIT = 0.10
+
 # 需要运行结束测量的效率字段（参数量是结构属性，旧运行也
 # 常有；这些字段全缺说明该运行没有做效率测量，精度与效率的
 # 权衡无法评估，必须显式点出而不是静默跳过）。
@@ -13727,6 +13740,40 @@ def _cell_cost_mean(
     if mean is None:
         return None
     return float(mean)
+
+
+def _cell_cost_std(
+    cell: Dict[str, object],
+    field: str,
+) -> Optional[float]:
+    """取一个实验单元在某效率字段上的样本标准差。"""
+    costs = cell.get("costs")
+    if not isinstance(costs, dict):
+        return None
+    entry = costs.get(field)
+    if not isinstance(entry, dict):
+        return None
+    std = entry.get("std")
+    if std is None:
+        return None
+    return float(std)
+
+
+def _cell_cost_n(
+    cell: Dict[str, object],
+    field: str,
+) -> int:
+    """取一个实验单元在某效率字段上的有效观测数。"""
+    costs = cell.get("costs")
+    if not isinstance(costs, dict):
+        return 0
+    entry = costs.get(field)
+    if not isinstance(entry, dict):
+        return 0
+    count = entry.get("n")
+    if isinstance(count, int) and count > 0:
+        return count
+    return 0
 
 
 def _device_type_of(value) -> Optional[str]:
@@ -15640,9 +15687,27 @@ def aggregate_runs(
             ]
             field_mean = _mean(values)
             if field_mean is not None:
+                field_std = _sample_std(values)
                 aggregate["costs"][field] = {
                     "mean": field_mean,
+                    # 跨种子/跨运行的离散度：成本倍率只看均值
+                    # 无法判断差异是否只是计时噪声。n_params/
+                    # FLOPs 对同一结构应为 0；计时字段的 std
+                    # 直接反映测量稳定性。
+                    "std": field_std,
+                    "min": min(values),
+                    "max": max(values),
                     "n": len(values),
+                    "values": [
+                        round(float(value), 6)
+                        for value in values
+                    ],
+                    "coefficient_of_variation": (
+                        round(field_std / field_mean, 6)
+                        if field_std is not None
+                        and field_mean > 0.0
+                        else None
+                    ),
                 }
 
         for metric in metric_keys:
@@ -15844,6 +15909,9 @@ def _cost_comparison(
     baseline_costs: Dict[str, float] = {}
     variant_costs: Dict[str, float] = {}
     cost_ratios: Dict[str, float] = {}
+    cost_uncertainty: Dict[str, Dict[str, object]] = {}
+    timing_noise_fields: List[str] = []
+    unverifiable_timing_fields: List[str] = []
 
     for field in _COST_FIELDS:
         cost_a = _cell_cost_mean(cell_a, field)
@@ -15852,8 +15920,64 @@ def _cost_comparison(
             continue
         baseline_costs[field] = cost_a
         variant_costs[field] = cost_b
-        if cost_a > 0.0:
-            cost_ratios[field] = cost_b / cost_a
+        if cost_a <= 0.0:
+            continue
+        ratio = cost_b / cost_a
+        cost_ratios[field] = ratio
+
+        std_a = _cell_cost_std(cell_a, field)
+        std_b = _cell_cost_std(cell_b, field)
+        n_a = _cell_cost_n(cell_a, field)
+        n_b = _cell_cost_n(cell_b, field)
+        detail: Dict[str, object] = {
+            "baseline_n": n_a,
+            "variant_n": n_b,
+            "baseline_std": std_a,
+            "variant_std": std_b,
+        }
+
+        if (
+            std_a is not None
+            and std_b is not None
+            and n_a >= 2
+            and n_b >= 2
+        ):
+            # 对数尺度的 delta 方法：相对标准误由两侧的
+            # 变异系数与独立观测数共同决定。
+            relative_variance = (
+                (std_a / cost_a) ** 2 / n_a
+                + (std_b / cost_b) ** 2 / n_b
+            )
+            relative_se = math.sqrt(relative_variance)
+            low = ratio * math.exp(
+                -_COST_RATIO_CI_Z * relative_se
+            )
+            high = ratio * math.exp(
+                _COST_RATIO_CI_Z * relative_se
+            )
+            detail["relative_se"] = round(relative_se, 6)
+            detail["ratio_ci95"] = [
+                round(low, 6),
+                round(high, 6),
+            ]
+            detail["ci_excludes_one"] = bool(
+                low > 1.0 or high < 1.0
+            )
+            detail["resolvable"] = True
+            if field in _COST_TIMING_FIELDS and (
+                relative_se > _COST_NOISE_CV_LIMIT
+                or not detail["ci_excludes_one"]
+            ):
+                timing_noise_fields.append(field)
+        else:
+            detail["relative_se"] = None
+            detail["ratio_ci95"] = None
+            detail["ci_excludes_one"] = None
+            detail["resolvable"] = False
+            if field in _COST_TIMING_FIELDS:
+                unverifiable_timing_fields.append(field)
+
+        cost_uncertainty[field] = detail
 
     cost_verdict = _cost_verdict_from_ratios(
         cost_ratios,
@@ -15868,6 +15992,11 @@ def _cost_comparison(
             "baseline": baseline_costs,
             "variant": variant_costs,
             "ratios": cost_ratios,
+            "uncertainty": cost_uncertainty,
+            "timing_noise_fields": timing_noise_fields,
+            "unverifiable_timing_fields": (
+                unverifiable_timing_fields
+            ),
             "baseline_missing_measured_fields": (
                 _cell_missing_measured_costs(cell_a)
             ),
@@ -17170,16 +17299,66 @@ def _contrast_display(
     ratios = cost.get("ratios") if isinstance(cost, dict) else None
     cost_text = ""
     if isinstance(ratios, dict) and ratios:
+        uncertainty = (
+            cost.get("uncertainty")
+            if isinstance(cost, dict)
+            else None
+        )
         ratio_parts = []
         for field in _COST_FIELDS:
             if field not in ratios:
                 continue
-            ratio_parts.append(
+            part = (
                 f"{_COST_FIELD_LABELS[field]}"
                 f"×{float(ratios[field]):.2f}"
             )
+            detail = (
+                uncertainty.get(field)
+                if isinstance(uncertainty, dict)
+                else None
+            )
+            if isinstance(detail, dict):
+                interval = detail.get("ratio_ci95")
+                if isinstance(interval, list):
+                    part += (
+                        f" [{float(interval[0]):.2f},"
+                        f"{float(interval[1]):.2f}]"
+                    )
+                elif field in _COST_TIMING_FIELDS:
+                    part += "（无重复计时）"
+            ratio_parts.append(part)
         if ratio_parts:
             cost_text = "  效率倍率: " + " ".join(ratio_parts)
+
+    if isinstance(cost, dict):
+        timing_noise = cost.get("timing_noise_fields")
+        if timing_noise:
+            caveat += (
+                "（计时倍率 "
+                + "、".join(
+                    _COST_FIELD_LABELS.get(
+                        str(field), str(field)
+                    )
+                    for field in timing_noise
+                )
+                + " 的 95%CI 跨过 1 或相对误差过大："
+                "该倍率可能由计时噪声/负载波动驱动，不能单独"
+                "作为效率结论）"
+            )
+        unverifiable = cost.get(
+            "unverifiable_timing_fields"
+        )
+        if unverifiable:
+            caveat += (
+                "（计时字段缺重复测量，无法估计倍率不确定性："
+                + "、".join(
+                    _COST_FIELD_LABELS.get(
+                        str(field), str(field)
+                    )
+                    for field in unverifiable
+                )
+                + "；建议多种子/多次测量后再下效率结论）"
+            )
 
     # 涨点/变差但缺效率数据（没有可比倍率）：只报指标差值
     # 等于回避精度与效率的权衡，必须点出权衡缺失，而不是让
@@ -30815,6 +30994,72 @@ def run_self_test():
         )
         assert "效率倍率:" in cost_display
         assert "取舍" in cost_display
+        # 合成运行的计时值逐种子相同，因此 std=0、CI 退化到
+        # 点估计；展示仍必须带区间，不能只给倍率。
+        assert (
+            "推理计时×2.00 [2.00,2.00]" in cost_display
+        ), cost_display
+        assert base_costs["flops_per_forward"]["n"] == 3
+        assert base_costs["flops_per_forward"]["std"] == 0.0
+        assert (
+            base_costs["flops_per_forward"][
+                "coefficient_of_variation"
+            ]
+            == 0.0
+        )
+
+    # 计时离散度直接进入倍率不确定性：高噪声且 CI 跨 1 时，
+    # 效率结论必须被标记为「可能由噪声驱动」。
+    noisy_cell_a = {
+        "costs": {
+            "training_ms_per_step": {
+                "mean": 100.0,
+                "std": 30.0,
+                "n": 3,
+            },
+        },
+    }
+    noisy_cell_b = {
+        "costs": {
+            "training_ms_per_step": {
+                "mean": 120.0,
+                "std": 30.0,
+                "n": 3,
+            },
+        },
+    }
+    noisy_cost, _ = _cost_comparison(
+        noisy_cell_a,
+        noisy_cell_b,
+        "improvement",
+        True,
+    )
+    noisy_detail = noisy_cost["uncertainty"][
+        "training_ms_per_step"
+    ]
+    assert noisy_detail["resolvable"] is True
+    low, high = noisy_detail["ratio_ci95"]
+    assert low < 1.0 < high, noisy_detail
+    assert (
+        "training_ms_per_step"
+        in noisy_cost["timing_noise_fields"]
+    )
+    noisy_text = _contrast_display(
+        {
+            "factor": "mode",
+            "baseline": "a",
+            "variant": "b",
+            "metric": "val_loss",
+            "samples_a": [{"seed": 1, "value": 3.0}],
+            "samples_b": [{"seed": 1, "value": 2.8}],
+            "delta": -0.2,
+            "verdict": "改善",
+            "cost": noisy_cost,
+            "cost_verdict": "gain_balanced",
+        },
+        "val_loss",
+    )
+    assert "计时噪声" in noisy_text, noisy_text
 
     # 指标变差且效率更低：严格劣于基线，必须显式点出。
     with tempfile.TemporaryDirectory() as dominated_dir:
