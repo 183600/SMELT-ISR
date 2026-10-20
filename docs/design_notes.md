@@ -150,6 +150,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   非中心 t 分布功效的数值积分（对 chi 分布做自适应 Simpson
   积分，按 df 缓存节点）、80% 功效的最小可检出效应（MDE）
   与按当前种子间波动检出观测效应所需的近似种子数。
+- `_attach_sd_uncertainty_note`：登记所需种子数为 sd 点估计
+  外推的插件估计，并给出 sd 的相对标准误 1/√(2(n-1))。
 - `_hedges_g_correction`：效应量小样本偏倚校正因子
   J ≈ 1−3/(4·df−1)（Cohen's d → Hedges g）。
 - `_attach_family_power`、`_observed_seed_sd`：按家族规模
@@ -368,7 +370,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `equivalence_margin_needed_bonferroni`（家族 m=1 时与未校正
   口径相等）。报告的 `[power]` 行给出家族规模与 α/m，展示层
   在「不确定」结论后补一句保守口径的 MDE 与所需种子数，种子
-  规划按保守口径而不是未校正口径。等价界必须
+  规划按保守口径而不是未校正口径。**所需种子数是插件估计**：
+  `seeds_to_detect` / `equivalence_seeds_to_achieve` 都把当前
+  种子间标准差 s 当成真实 σ 代入 se=σ/√n 外推，而 s 自身也是
+  估计——正态假设下其相对标准误 ≈ 1/√(2(n-1))（n=3 时约 50%），
+  所需种子数 ∝ σ² 会把该不确定度平方放大。报告以
+  `seeds_to_detect_basis="sd_point_estimate"` 登记口径，并给出
+  `seeds_to_detect_sd_relative_se`；展示层给出全局提示，规划
+  种子时要留余量。等价界必须
   事先声明：看到数据后再放宽界可以「制造」等价结论。功效
   积分对 chi 分布做自适应 Simpson 数值积分（按 df 缓存），
   δ=0 时功效恰为 alpha，大 df 退化为正态近似，自测覆盖这些

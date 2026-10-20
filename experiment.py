@@ -15745,6 +15745,33 @@ def _tost_test(
     }
 
 
+def _attach_sd_uncertainty_note(
+    contrast: Dict[str, object],
+) -> None:
+    """
+    标注「所需种子数」是按种子间标准差点估计外推的插件估计。
+
+    ``seeds_to_detect`` / ``equivalence_seeds_to_achieve`` 都把
+    当前 s 当成真实 σ 代入 se = σ/√n 外推，但 s 自身也是估计：
+    正态假设下其相对标准误 ≈ 1/√(2(n-1))（n=3 时约 50%），
+    而所需种子数 ∝ σ²，σ 的不确定度会被平方放大。不标注会让
+    「约需 12 个种子」读起来像精确规划值。
+
+    字段：``seeds_to_detect_basis`` = "sd_point_estimate"，
+    ``seeds_to_detect_sd_relative_se`` = 1/√(2(n-1))（n<2 时
+    省略）。重复调用只补缺失字段，保持幂等。
+    """
+    contrast["seeds_to_detect_basis"] = "sd_point_estimate"
+    if contrast.get("seeds_to_detect_sd_relative_se") is not None:
+        return
+    current_n = _current_seed_count(contrast)
+    if current_n is None or current_n <= 1.0:
+        return
+    contrast["seeds_to_detect_sd_relative_se"] = 1.0 / math.sqrt(
+        2.0 * (current_n - 1.0)
+    )
+
+
 def _hedges_g_correction(
     df: object,
 ) -> Optional[float]:
@@ -15975,6 +16002,7 @@ def _attach_power_equivalence(
             )
             if seeds_needed is not None:
                 contrast["seeds_to_detect"] = seeds_needed
+                _attach_sd_uncertainty_note(contrast)
 
     if equivalence_margin is None or delta is None:
         return
@@ -16049,6 +16077,7 @@ def _attach_power_equivalence(
                         ** 2
                     )
                 )
+                _attach_sd_uncertainty_note(contrast)
         else:
             contrast["equivalence_blocker"] = None
 
@@ -22026,6 +22055,20 @@ def print_comparison_analysis(
             "seeds_to_detect_bonferroni / "
             "equivalence_margin_needed_bonferroni；"
             "规划种子数与等价界时按后者）"
+        )
+
+    if any(
+        contrast.get("seeds_to_detect") is not None
+        or contrast.get("equivalence_seeds_to_achieve") is not None
+        for contrast in contrasts
+    ):
+        print(
+            "  [note] 所需种子数（seeds_to_detect / "
+            "equivalence_seeds_to_achieve）按当前种子间标准差的"
+            "点估计外推（seeds_to_detect_basis="
+            "\"sd_point_estimate\"）；sd 自身估计不稳，其相对"
+            "标准误 ≈ 1/√(2(n-1))（n=3 时约 50%）且被平方进"
+            "所需种子数，实际所需可能明显更多，规划时留余量"
         )
 
     if not contrasts:
@@ -28943,6 +28986,44 @@ def run_self_test():
             "val_loss",
         )
         assert "Hedges g=" in display_with_g
+
+        # 所需种子数是「sd 点估计」的插件估计：必须登记口径，
+        # 并给出 sd 的相对标准误 1/√(2(n-1))（n=3 时约 50%），
+        # 否则规划值会被当成精确值。
+        assert (
+            powered_contrast["seeds_to_detect_basis"]
+            == "sd_point_estimate"
+        )
+        rel_se = powered_contrast[
+            "seeds_to_detect_sd_relative_se"
+        ]
+        assert rel_se is not None
+        assert abs(float(rel_se) - 0.5) < 1e-9
+
+        # 展示层必须带全局口径提示，否则读者只看到「约需 N 个
+        # 种子」的精确数字。
+        class _PowerCapture:
+            def __init__(self) -> None:
+                self.chunks: List[str] = []
+
+            def write(self, text: str) -> int:
+                self.chunks.append(text)
+                return len(text)
+
+            def flush(self) -> None:
+                return None
+
+        power_capture = _PowerCapture()
+        with contextlib.redirect_stdout(power_capture):
+            print_comparison_analysis(
+                analysis_rows,
+                factors=["mode"],
+                metric="val_loss",
+                equivalence_margin=0.01,
+            )
+        power_text = "".join(power_capture.chunks)
+        assert "sd_point_estimate" in power_text
+        assert "所需种子数" in power_text
 
         assert "95%CI" in _contrast_display(
             powered_contrast,
