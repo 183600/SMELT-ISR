@@ -20673,7 +20673,7 @@ def sanity_repeat_report(
                     "repeat": repeat_index,
                     "key": key,
                     "first": first_value,
-                    "repeat": repeat_value,
+                    "repeat_value": repeat_value,
                 })
 
         first_probe = first.get("grad_probe")
@@ -20693,7 +20693,7 @@ def sanity_repeat_report(
                 "repeat": repeat_index,
                 "key": "grad_probe.grad_norm",
                 "first": first_norm,
-                "repeat": repeat_norm,
+                "repeat_value": repeat_norm,
             })
 
     return {
@@ -24104,9 +24104,14 @@ def run_self_test():
         mismatched,
     ])
     assert changed_repeat["identical"] is False
-    assert any(
-        item["key"] == "final_lm_loss"
+    loss_mismatch = next(
+        item
         for item in changed_repeat["mismatches"]
+        if item["key"] == "final_lm_loss"
+    )
+    assert loss_mismatch["repeat"] == 2
+    assert loss_mismatch["repeat_value"] == (
+        mismatched["final_lm_loss"]
     )
     # 只运行一次时没有复现性证据，必须是 None 而不是虚报 True。
     assert sanity_repeat_report([sanity_metrics])["identical"] is None
@@ -32622,7 +32627,7 @@ def main():
                     f"  - repeat {mismatch['repeat']} "
                     f"{mismatch['key']}: "
                     f"{mismatch['first']!r} != "
-                    f"{mismatch['repeat']!r}"
+                    f"{mismatch['repeat_value']!r}"
                 )
             print(
                 "这通常意味着仍有未固定的随机源、非确定性算子"
