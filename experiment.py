@@ -15196,6 +15196,7 @@ def ablation_coverage(
     rows: List[Dict[str, object]],
     factors: List[str],
     ablation_modes: Optional[List[str]] = None,
+    allow_partial: bool = False,
 ) -> Dict[str, object]:
     """
     消融完整性检查：延迟合并（立即合并对照 local_base → 各延迟
@@ -15206,8 +15207,13 @@ def ablation_coverage(
     的关闭臂）会被显式列为缺失。
 
     预期覆盖的方案由 ``ablation_modes`` 显式声明
-    （--suite-ablation --ablation-modes）；未声明（只读
-    --compare）时按运行集中实际出现的延迟合并方案推断。
+    （--suite-ablation --ablation-modes）。未声明时不能按
+    「运行集中实际出现的方案」推断，否则只跑了 A 的对比会把
+    自己当成完整消融；只要运行集涉及延迟合并（存在 local_base
+    或 A/B），默认按项目声明的全部方案 A、B 核对，缺少的
+    方案会进入 missing_cells。``allow_partial`` 只用于显式
+    允许阶段性消融：此时仍记录 ``partial`` 与未覆盖的项目方案，
+    报告不会把部分覆盖说成全部创新点都已验证。
 
     报告缺失的组合、种子数不足的单元、会让主效应无法归因的
     结构混杂（各单元之间 k1/k2/top_k/residual_scale 不一致
@@ -15244,6 +15250,10 @@ def ablation_coverage(
             "mode" in factor_set or "balance_coef" in factor_set
         ),
         "expected_delayed_modes": [],
+        "project_delayed_modes": list(_DELAYED_MERGE_MODES),
+        "undeclared_project_modes": [],
+        "partial": False,
+        "partial_allowed": bool(allow_partial),
         "expected_cells": [],
         "present_cells": [],
         "missing_cells": [],
@@ -15550,6 +15560,17 @@ def ablation_coverage(
 
     if declared is not None:
         expected_delayed = list(declared)
+    elif (
+        "mode" in factor_set
+        and any(
+            mode in modes_present
+            for mode in ("local_base", *_DELAYED_MERGE_MODES)
+        )
+    ):
+        # 未显式声明时不能只按实际出现的方案推断：项目声明了
+        # A 与 B 两个延迟合并创新点，只跑 A 的对比必须点名
+        # 缺少 B，否则部分覆盖会被误当成完整消融。
+        expected_delayed = list(_DELAYED_MERGE_MODES)
     else:
         expected_delayed = [
             mode
@@ -15557,7 +15578,27 @@ def ablation_coverage(
             if mode in modes_present
         ]
 
+    undeclared_project_modes = [
+        mode
+        for mode in _DELAYED_MERGE_MODES
+        if mode not in expected_delayed
+    ]
     report["expected_delayed_modes"] = expected_delayed
+    report["undeclared_project_modes"] = undeclared_project_modes
+    report["partial"] = bool(undeclared_project_modes)
+    if undeclared_project_modes:
+        report["advisories"].append(
+            "本轮未覆盖项目声明的延迟合并方案 "
+            + ", ".join(undeclared_project_modes)
+            + "：结论只能支持已覆盖方案，不能支撑"
+            "「全部创新点各自有用」。"
+            + (
+                "已显式允许部分消融（--allow-partial-ablation），"
+                "报告会保留 partial 标记。"
+                if allow_partial
+                else "请补齐这些方案，或显式声明为部分消融。"
+            )
+        )
 
     if (
         rows
@@ -15660,6 +15701,7 @@ def ablation_coverage(
         and len(merge_pair_cells) == expected_cell_count
         and not report["missing_cells"]
         and not report["structural_confounds"]
+        and not report["partial"]
     ):
         report["advisories"].append(
             f"{1 + len(expected_delayed)}×2 全因子组合齐全且"
@@ -17659,6 +17701,7 @@ def print_comparison_analysis(
     metric: str = "val_loss",
     ablation_modes: Optional[List[str]] = None,
     equivalence_margin: Optional[float] = _DEFAULT_EQUIVALENCE_MARGIN,
+    allow_partial_ablation: bool = False,
 ) -> Dict[str, object]:
     """
     打印完整的对比分析：受控变量检查、按种子聚合的
@@ -17722,7 +17765,12 @@ def print_comparison_analysis(
         metric,
         equivalence_margin=equivalence_margin,
     )
-    coverage = ablation_coverage(rows, factors, ablation_modes)
+    coverage = ablation_coverage(
+        rows,
+        factors,
+        ablation_modes,
+        allow_partial=allow_partial_ablation,
+    )
     factorial = factorial_effects(aggregates, group_keys, metric)
     # 等计算量指标本身已按共同训练 FLOPs 对齐，不能再把
     # FLOPs/专家宽度差异当成该指标的混杂；否则会错误地把
@@ -18596,6 +18644,13 @@ def print_comparison_analysis(
         f"[ablation] 消融覆盖检查（{shape_text}："
         f"{coverage['legend']}）"
     )
+    if coverage.get("partial"):
+        print(
+            "  [partial] 本轮是显式允许的部分消融："
+            "未覆盖项目方案 "
+            + ", ".join(coverage.get("undeclared_project_modes", []))
+            + "，结论不能支撑全部创新点各自有用"
+        )
     if coverage["missing_cells"]:
         for message in coverage["missing_cells"]:
             print(f"  [missing] {message}")
@@ -18650,6 +18705,7 @@ def print_comparison_analysis(
         "mode" in factors
         and "balance_coef" in factors
         and bool(expected_cells)
+        and not coverage.get("partial")
         and len(coverage["present_cells"]) == len(expected_cells)
     )
     compute_parity_ok = all(
@@ -24114,11 +24170,24 @@ def run_self_test():
         # 关闭臂组合，必须被标记为缺失。
         coverage = ablation_coverage(analysis_rows, factors)
         assert coverage["applicable"]
-        assert len(coverage["missing_cells"]) == 2, coverage
+        # 运行集只有 A/local_base 时，不能按「实际出现过的
+        # 方案」推断成完整消融：项目声明的 B 必须被点名。
+        assert not coverage["partial"]
+        assert coverage["undeclared_project_modes"] == []
         assert any(
-            "b=off" in message
+            "缺少延迟合并方案 B" in message
             for message in coverage["missing_cells"]
-        )
+        ), coverage["missing_cells"]
+        for expected_missing in (
+            "local_base/b=off",
+            "A/b=off",
+            "B/b=off",
+            "B/b=on",
+        ):
+            assert any(
+                expected_missing in message
+                for message in coverage["missing_cells"]
+            ), coverage["missing_cells"]
 
         # 补齐 balance=0 的两格后，2×2 组合齐全（但种子
         # 数不足会被单独提示，不会误报为缺失）。
@@ -24145,9 +24214,20 @@ def run_self_test():
         full_coverage = ablation_coverage(
             compare_runs(full_paths),
             factors,
+            ["A"],
+            allow_partial=True,
         )
         assert not full_coverage["missing_cells"], full_coverage
         assert not full_coverage["structural_confounds"]
+        # 部分消融必须如实标记：A 的 2×2 齐全不等于项目
+        # 全部创新点都已验证。
+        assert full_coverage["partial"]
+        assert full_coverage["partial_allowed"]
+        assert full_coverage["undeclared_project_modes"] == ["B"]
+        assert not any(
+            "全因子组合齐全" in message
+            for message in full_coverage["advisories"]
+        )
         assert any(
             "只有 1 个种子" in message
             for message in full_coverage["low_replicate_cells"]
@@ -24171,6 +24251,8 @@ def run_self_test():
         confounded_coverage = ablation_coverage(
             compare_runs(confounded_paths),
             factors,
+            ["A"],
+            allow_partial=True,
         )
         assert not confounded_coverage["missing_cells"]
         assert confounded_coverage["structural_confounds"], (
@@ -27117,6 +27199,7 @@ _SWEEP_BOOL_FLAGS = (
     "--suite-ablation",
     "--suite-baseline-tuning",
     "--allow-underpowered",
+    "--allow-partial-ablation",
 )
 
 # 基线调参协议：简单基线（默认 dense）先在 val 上做预注册的
@@ -28349,6 +28432,9 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             else None
         ),
         equivalence_margin=args.equivalence_margin,
+        allow_partial_ablation=bool(
+            args.allow_partial_ablation
+        ),
     )
     # 种子计划随报告落盘：事后能核对本轮结论是在几个种子上
     # 得出的、是否使用了低统计功效豁免。
@@ -28804,6 +28890,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allow-partial-ablation",
+        action="store_true",
+        help=(
+            "显式允许 --suite-ablation 只覆盖 --ablation-modes "
+            "声明的部分延迟合并方案（阶段性调试用）。报告会"
+            "记录 partial 与未覆盖的项目方案；正式结论仍须"
+            "覆盖 A 与 B 全部方案"
+        ),
+    )
+    parser.add_argument(
         "--allow-underpowered",
         action="store_true",
         help=(
@@ -29215,6 +29311,26 @@ def main():
             "--ablation-modes 存在重复的延迟合并方案"
             "（重复方案会重复运行同一消融单元、覆盖输出目录）"
         )
+    if args.allow_partial_ablation and not args.suite_ablation:
+        parser.error(
+            "--allow-partial-ablation 只适用于 "
+            "--suite-ablation（用于显式允许阶段性部分消融）"
+        )
+    if args.suite_ablation and args.ablation_modes is not None:
+        omitted_modes = [
+            mode
+            for mode in _DELAYED_MERGE_MODES
+            if mode not in args.ablation_modes
+        ]
+        if omitted_modes and not args.allow_partial_ablation:
+            parser.error(
+                "--ablation-modes 未覆盖项目声明的延迟合并方案 "
+                + ", ".join(omitted_modes)
+                + "：只跑部分方案不能支撑「全部创新点各自"
+                "有用」。如确需阶段性部分消融，请显式加 "
+                "--allow-partial-ablation（报告会记录 partial "
+                "与未覆盖方案）"
+            )
     if args.allow_underpowered and not (
         args.suite_modes
         or args.suite_ablation
