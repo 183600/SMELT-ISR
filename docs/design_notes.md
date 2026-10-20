@@ -115,8 +115,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   统计全部目标 token（不做随机下采样），把错误案例按歧义、
   系统性混淆、疑似标签噪声、不确定四类原因归类；top-N 最差样本
   用「每批 top-N + 跨批截断」精确维护，窗口只为入选样本保留。
-- `measure_efficiency`、`print_efficiency`：参数量与前向 FLOPs
-  （线性层实测 + 注意力估计）。
+- `measure_efficiency`、`print_efficiency`：参数量与前向 FLOPs。
 - `compare_runs`、`print_comparison`：汇总多个运行目录的
   config 与最终指标。
 - `build_comparison_protocol`、`check_controlled_variables`：
@@ -175,9 +174,6 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   避免「最高损失样本恰好同类」把结论带偏；完整报告写入
   `out_dir/bad_cases.json`。测试集解封的唯一一次评估会附带
   test 坏案例。
-- **效率口径**：FLOPs 线性层部分用 `FlopCounterMode` 实测，
-  注意力按 4·B·T²·D 在 Block 级 hook 估计（SMELT 中间层
-  执行两轮，按真实执行次数累计）。
 - **早停与选型**：`--early-stop-patience` 启用；NaN 验证损失不算
   「改善」；`--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑
   语义一致。最优验证点同时是模型选择依据（`best.pt`），final/test
@@ -277,15 +273,6 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   确定性 seed 运行给出不同指标，`deterministic_conflict_cells`
   点名该单元：确定性管线本应逐位一致，差异来自数据/评估而非
   随机性，不能按种子重复解读。
-- **等训练计算预算对比**：A/B 每步 FLOPs 高于 smelt，等步数
-  比较会把机制收益与额外计算混在一起。`--compare` 从各运行
-  `metrics.jsonl` 的周期验证曲线按 `step × 3 × flops_per_forward`
-  估算累计训练 FLOPs，在所有可比运行都能覆盖的共同预算点线性
-  插值出 `val_loss_at_matched_flops`（不向曲线终点外推）；该
-  派生指标可作 `--compare-metric` 或预注册主指标参与聚合与
-  检验，终端打印 `[compute-matched]`，报告写入
-  `compute_matched`。共同预算只覆盖最贵运行不足一半训练预算
-  时显式提示结论只适用于该预算点。
 - **基线合理性（稻草人守卫）**：`--compare-baseline MODE`
   在给出相对差值之外，还核对基线本身是否值得战胜：基线在
   主指标上必须真的优于无上下文 unigram 参考（各运行
@@ -303,8 +290,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   对比集合没有 ngram 时显式提示简单基线守卫退化为只看
   unigram 参考；确定性 ngram 的多个 seed 不计入独立种子，
   也不建议用「多种子重跑」估计其不确定性。
-  **调参预算对称性**：基线做了学习率网格、挑战臂却使用默认
-  lr 且没有独立调参来源时，`tuning_budget_parity` 单独提示：
+  **调参对称性**：基线做了学习率网格、挑战臂却使用默认
+  lr 且没有独立调参来源时，报告单独提示：
   落败不能排除调参不足，胜出只是保守下界。
   未指定基线或缺少参考记录时给出提示而不是虚报通过。
 - **简单基线的调参协议**：`--suite-baseline-tuning`（配合
@@ -390,7 +377,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   运行不能混在一起比较）。`--compare` 再次核对运行记录的
   `selection_metric` 与当前 `--compare-metric`：当前指标本身
   可用于选型却不一致时，`selection_metric_mismatch` 明确警告
-  「最终模型不是按假设的判定口径选出的」；等计算预算 loss、
+  「最终模型不是按假设的判定口径选出的」；等计算量 loss、
   AUC 等只能离线计算的指标不触发该警告。恢复训练时选型
   指标按检查点恢复，避免中途换指标重新解释历史评估点。
 - **基线欠训与容量混淆守卫**：`baseline_adequacy` 除核对
@@ -401,7 +388,7 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
     「欠训的弱基线不说明方法更强」，要求在相同训练配置下
     先调强基线；
   - 挑战模型相对基线的参数量 / 前向 FLOPs 超过
-    `_COST_RATIO_MATERIAL`（1.5×）时提示容量混淆，要求报告
+    1.5× 阈值时提示容量混淆，要求报告
     等参数（`--dense-fnn-hidden n_experts×expert_hidden`）
     或等计算（`smelt` / `local_base`）对照，区分容量与机制；
   - dense 基线默认 `dense_fnn_hidden=None` 解析为

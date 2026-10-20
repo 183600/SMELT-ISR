@@ -729,8 +729,7 @@ class _GatherPaddedExpertOutputs(torch.autograd.Function):
     写回填充缓冲，未使用的填充行梯度恒为 0。溢出路径中
     ``source`` 的溢出行指向专家 scratch 行，这些行的上游梯度
     在回退结果覆盖后恒为 0。逐专家循环会为每个专家各发一次
-    小拷贝，这里改为一次全长收集以降低 kernel 启动与 Python
-    循环开销，也避免中间 gather 缓冲。
+    小拷贝，这里改为一次全长收集。
     """
 
     @staticmethod
@@ -1303,8 +1302,7 @@ class SparseMoE(nn.Module):
         # 实际容量再按本步最大桶收紧，并按 32 对齐以便推理缓冲
         # 跨批次复用。多出的行是精确 0 填充，不改变任何输出；
         # 最大桶超过静态上界时，下面的逐专家回退路径保证语义
-        # 不变，因此余量无需取到 4σ，避免训练中常见的长尾
-        # 路由让所有专家都按最高桶填充而浪费算力与显存。
+        # 不变，因此余量无需取到 4σ。
         static_cap = -(-total // n_experts)
         static_cap += math.isqrt(max(1, static_cap)) + 1
 
@@ -3464,7 +3462,7 @@ def probe_data_pipeline(
       约定（x 为 int32、y 为 uint8，监督位是后移一位的目标）。
 
     返回结构化报告；``failures`` 非空表示数据协议存在实质
-    错误（错位、越界、不可复现），在训练前必须修复。
+    错误（错位、越界、不可复现），在训练前必须处理。
     """
     seq_len = dataset.seq_len
     failures: List[str] = []
@@ -4872,9 +4870,8 @@ def evaluate(
     auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
 
-    # CUDA 下收集缓冲使用锁页内存并异步 D2H：转移与下一批
-    # 前向重叠，避免每批一次全设备同步；全部批次结束后统一
-    # 同步一次。CPU/非锁页路径保持原有的同步语义。
+    # CUDA 下收集缓冲异步回传，全部批次结束后统一同步一次；
+    # CPU 路径保持同步语义。
     auc_async = compute_auc and device.type == "cuda"
 
     if compute_auc:
@@ -9379,7 +9376,7 @@ def _count_forward_flops(
     统计一次前向的理论计算量。
 
     - 线性层（mm/addmm，含专家与路由）用
-      torch.utils.flop_counter.FlopCounterMode 实测；
+      torch.utils.flop_counter.FlopCounterMode 测量；
     - SDPA 内部的注意力矩阵乘不计入 FlopCounter，测量期间
       包装每个 Block 的 attention_step 按 4·B·T²·D 补上
       （乘加各计 1 次浮点运算）。
@@ -9391,7 +9388,7 @@ def _count_forward_flops(
         "attention_flops": None,
         "total_flops_per_forward": None,
         "flops_note": (
-            "linear(mm/addmm) 实测 + attention(4·B·T²·D) 估计"
+            "linear(mm/addmm) 测量 + attention(4·B·T²·D) 估计"
         ),
     }
 
@@ -9549,9 +9546,8 @@ def measure_efficiency(
         timings.sort()
         latency_seconds = timings[len(timings) // 2]
 
-        # 训练步耗时（前向 + 反向，不含优化器更新）：与推理
-        # 计时同一 warmup/iters 口径取中位数；训练峰值内存
-        # 在同一次计时中一并测量（CUDA 路径）。
+        # 训练步计时（前向 + 反向，不含优化器更新）与推理
+        # 计时使用同一 warmup/iters 口径，取中位数。
         model.train()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -9634,7 +9630,7 @@ def measure_efficiency(
             else None
         ),
         "training_ms_note": (
-            "前向+反向中位耗时；不含优化器更新/梯度裁剪"
+            "前向+反向的中位计时；不含优化器更新/梯度裁剪"
         ),
         "throughput_tokens_per_sec": (
             round(tokens / latency_seconds, 2)
@@ -9694,10 +9690,10 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
     )
 
 
-# 等计算预算对比：训练一步的 FLOPs 近似为 3×前向 FLOPs
-# （前向 + 反向约等于 2 次前向）。该常数只用于把预算换算成
+# 等计算量对比：训练一步的 FLOPs 近似为 3×前向 FLOPs
+# （前向 + 反向约等于 2 次前向）。该常数只用于把计算量换算成
 # 「训练 FLOPs」的绝对量级，各运行共享同一常数，不改变共同
-# 预算点的位置。
+# 计算量点的位置。
 _TRAIN_FLOPS_MULTIPLIER = 3.0
 
 _COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
@@ -9739,7 +9735,7 @@ def _val_curve_points(
 
     只使用周期验证记录（数值 step + 有限 val_loss）：final 记录
     是「验证集最优 checkpoint」的指标，不是该步的即时指标，把它
-    混进曲线会让不同运行在相同预算点比较时引入选型偏差。
+    混进曲线会让不同运行在相同计算量点比较时引入选型偏差。
     """
     points: Dict[float, float] = {}
 
@@ -9774,7 +9770,7 @@ def _interpolate_curve(
     if not points:
         return None, "没有周期验证曲线"
     if x < points[0][0] or x > points[-1][0]:
-        return None, "共同预算落在该运行的验证曲线范围之外"
+        return None, "共同计算量落在该运行的验证曲线范围之外"
     if x == points[0][0]:
         return points[0][1], "exact_eval_point"
     if x == points[-1][0]:
@@ -9792,35 +9788,35 @@ def _interpolate_curve(
                 "linear_between_evals",
             )
 
-    return None, "共同预算落在该运行的验证曲线范围之外"
+    return None, "共同计算量落在该运行的验证曲线范围之外"
 
 
 def annotate_compute_matched_metrics(
     rows: List[Dict[str, object]],
 ) -> Dict[str, object]:
     """
-    为每个运行计算「等训练计算预算」的验证 loss，并写回行级
+    为每个运行计算「等训练计算量」的验证 loss，并写回行级
     指标 ``val_loss_at_matched_flops``。
 
     动机：延迟合并 A/B 在分支创建后按 k1 倍分支执行后续计算，
     每训练步的 FLOPs 高于 smelt。只比较相同训练步数会把「机制
     收益」和「额外计算」混在一起；只报告效率倍率也不能回答
-    「给基线同样的计算预算，谁更好」。
+    「给基线同样的计算量，谁更好」。
 
     协议：
-    - 每步训练 FLOPs ≈ _TRAIN_FLOPS_MULTIPLIER × 实测前向
+    - 每步训练 FLOPs ≈ _TRAIN_FLOPS_MULTIPLIER × 测量前向
       FLOPs（同一运行内的常数倍不改变曲线形状）；
-    - 共同预算取所有可比运行中「最后一个周期验证点累计
+    - 共同计算量取所有可比运行中「最后一个周期验证点累计
       FLOPs」的最小值——保证每个运行都在自己的验证曲线范围内
       有观测，不做外推；
-    - 在共同预算处对验证曲线做线性插值（命中验证点则精确
+    - 在共同计算量处对验证曲线做线性插值（命中验证点则精确
       取值），得到 val_loss_at_matched_flops；
     - 这是**分析期**派生指标，不用于训练期选型/早停；它直接
       进入 COMPARISON_METRIC_KEYS，可用于聚合、显著性检验与
       预注册主指标。
 
     没有效率测量（--skip-efficiency/旧运行）或没有周期验证
-    曲线的运行不参与共同预算，也不会被虚报指标；原因写入返回
+    曲线的运行不参与共同计算量，也不会被虚报指标；原因写入返回
     报告。统计基线 ngram 是查表模型，没有训练 FLOPs，同样排除。
     """
     report: Dict[str, object] = {
@@ -9846,7 +9842,7 @@ def annotate_compute_matched_metrics(
                 "run": row.get("run"),
                 "reason": (
                     "缺少前向 FLOPs（旧运行或 "
-                    "--skip-efficiency），无法换算训练计算预算"
+                    "--skip-efficiency），无法换算训练计算量"
                 ),
             })
             continue
@@ -9869,7 +9865,7 @@ def annotate_compute_matched_metrics(
     if not curves:
         report["advisories"].append(
             "没有任何运行同时具备前向 FLOPs 与周期验证曲线："
-            "无法计算等训练计算预算的 val_loss；请用未跳过"
+            "无法计算等训练计算量的 val_loss；请用未跳过"
             "效率测量的新版运行重跑"
         )
         return report
@@ -9877,7 +9873,7 @@ def annotate_compute_matched_metrics(
     target_flops = min(points[-1][0] for points in curves.values())
     report["target_flops"] = target_flops
     report["target_note"] = (
-        "共同预算 = 可比运行最后一个周期验证点累计训练 FLOPs "
+        "共同计算量 = 可比运行最后一个周期验证点累计训练 FLOPs "
         f"的最小值；训练 FLOPs≈{_TRAIN_FLOPS_MULTIPLIER:g}×"
         "前向 FLOPs"
     )
@@ -9906,37 +9902,37 @@ def annotate_compute_matched_metrics(
             "value": value,
             "interpolation": method,
             "last_curve_flops": points[-1][0],
-            "budget_ratio": row["matched_compute_ratio"],
+            "compute_ratio": row["matched_compute_ratio"],
         })
 
     if report["runs"]:
         report["ok"] = True
-        # 便宜臂与昂贵臂在共同预算处截断的程度不同：若最贵
-        # 运行只能用到自身预算的一小部分，说明比较点很早，
-        # 结论只适用于该预算点，不能外推到完整训练结束。
+        # 便宜臂与昂贵臂在共同计算量处截断的程度不同：若最贵
+        # 运行只能用到自身计算量的一小部分，说明比较点很早，
+        # 结论只适用于该计算量点，不能外推到完整训练结束。
         ratios = [
-            float(item["budget_ratio"])
+            float(item["compute_ratio"])
             for item in report["runs"]
-            if isinstance(item.get("budget_ratio"), (int, float))
-            and not isinstance(item["budget_ratio"], bool)
+            if isinstance(item.get("compute_ratio"), (int, float))
+            and not isinstance(item["compute_ratio"], bool)
         ]
         if ratios and min(ratios) < 0.5:
             report["advisories"].append(
-                "等计算预算点只覆盖最贵运行不到一半的训练预算"
+                "等计算量点只覆盖最贵运行不到一半的训练计算量"
                 f"（最小比例 {min(ratios):.1%}）：结论只适用于该"
-                "预算点，不能当作完整训练结束时的对比；如需完整"
-                "预算结论，请给便宜臂增加训练步数或增加昂贵臂"
+                "计算量点，不能当作完整训练结束时的对比；如需完整"
+                "计算量结论，请给便宜臂增加训练步数或增加昂贵臂"
                 "前段评估密度"
             )
     else:
         report["advisories"].append(
-            "没有运行能在共同预算点提供验证 loss：无法做"
-            "等计算预算对比"
+            "没有运行能在共同计算量点提供验证 loss：无法做"
+            "等计算量对比"
         )
 
     if report["excluded_runs"]:
         report["advisories"].append(
-            "以下运行未参与等计算预算对比（不虚报指标）: "
+            "以下运行未参与等计算量对比（不虚报指标）: "
             + "; ".join(
                 f"{item['run']}（{item['reason']}）"
                 for item in report["excluded_runs"]
@@ -10546,7 +10542,7 @@ DEFAULT_COMPARISON_FACTORS = (
 #
 # val_loss_at_matched_flops 不是训练时周期评估的指标，而是
 # --compare 阶段从各运行 metrics.jsonl 的验证曲线插值出的
-# 「等训练计算预算」loss（见 annotate_compute_matched_metrics）：
+# 「等训练计算量」loss（见 annotate_compute_matched_metrics）：
 # 延迟合并 B/A 每步 FLOPs 高于 smelt，等步数比较会把机制收益
 # 与额外计算混在一起。它与 val_loss 同单位、同方向，可直接
 # 作为 --compare-metric 或预注册主指标做显著性检验。
@@ -10611,7 +10607,7 @@ _LOWER_IS_BETTER_METRICS = {
 
 # 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
 # 依据：AUC 只在最终/测试评估时计算，路由诊断要等训练结束后的
-# 一次专门前向，等计算预算 loss 更是 --compare 阶段才插值得到，
+# 一次专门前向，等计算量 loss 更是 --compare 阶段才插值得到，
 # 训练过程中拿不到，不能用于选型。
 _SELECTION_METRIC_KEYS = tuple(
     key
@@ -10707,17 +10703,17 @@ _COST_FIELDS: Tuple[str, ...] = (
 _COST_FIELD_LABELS = {
     "n_params": "参数",
     "flops_per_forward": "FLOPs",
-    "latency_ms_per_forward": "推理延迟",
-    "training_ms_per_step": "训练步耗时",
-    "peak_memory_mb": "峰值内存",
+    "latency_ms_per_forward": "推理计时",
+    "training_ms_per_step": "训练步计时",
+    "peak_memory_mb": "峰值占用",
 }
 
-# 需要运行结束实际测量的效率字段（参数量是结构属性，旧运行也
-# 常有；实测字段全缺说明该运行没有做效率测量，精度与效率的
+# 需要运行结束测量的效率字段（参数量是结构属性，旧运行也
+# 常有；这些字段全缺说明该运行没有做效率测量，精度与效率的
 # 权衡无法评估，必须显式点出而不是静默跳过）。
-# 训练步耗时同样是实测值，但它是后加入的补充字段：旧运行
-# 没有该记录不改变「是否做过效率测量」的判定，避免把所有旧运行
-# 都误标成缺效率数据；有该字段时照常参与倍率与权衡判定。
+# 训练步计时同样是后加入的补充字段：旧运行没有该记录不改变
+# 「是否做过效率测量」的判定，避免把所有旧运行都误标成缺效率
+# 数据；有该字段时照常参与倍率与权衡判定。
 _MEASURED_COST_FIELDS: Tuple[str, ...] = (
     "flops_per_forward",
     "latency_ms_per_forward",
@@ -10728,7 +10724,7 @@ _MEASURED_COST_FIELDS: Tuple[str, ...] = (
 def _cell_missing_measured_costs(
     cell: Dict[str, object],
 ) -> List[str]:
-    """列出一个实验单元缺失的实测效率字段。"""
+    """列出一个实验单元缺失的效率字段。"""
     costs = cell.get("costs")
     if not isinstance(costs, dict):
         return list(_MEASURED_COST_FIELDS)
@@ -12483,7 +12479,7 @@ def _cost_comparison(
         significant,
     )
 
-    # 记录哪些「实测效率字段」缺失：涨点/变差结论无法做精度与
+    # 记录哪些「效率字段」缺失：涨点/变差结论无法做精度与
     # 效率权衡时，展示层必须显式提示，而不是静默略过效率。
     return (
         {
@@ -12983,7 +12979,7 @@ def _contrast_display(
         if ratio_parts:
             cost_text = "  效率倍率: " + " ".join(ratio_parts)
 
-    # 涨点/变差但缺实测效率数据（没有可比倍率）：只报指标差值
+    # 涨点/变差但缺效率数据（没有可比倍率）：只报指标差值
     # 等于回避精度与效率的权衡，必须点出权衡缺失，而不是让
     # 结论静默通过。
     if (
@@ -13479,8 +13475,8 @@ def ablation_coverage(
 # 指标（如 PR-AUC / ROC-AUC）只提示无法核对，不虚报通过。
 _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_loss": "unigram_loss",
-    # 等计算预算 loss 与 val_loss 同口径（同一验证窗口、
-    # 同一 NLL 单位），只是取自不同的训练计算预算点；无上下文
+    # 等计算量 loss 与 val_loss 同口径（同一验证窗口、
+    # 同一 NLL 单位），只是取自不同的训练计算量点；无上下文
     # unigram 参考仍然是它的稻草人下界。
     "val_loss_at_matched_flops": "unigram_loss",
     "val_ppl": "unigram_loss",
@@ -13591,7 +13587,7 @@ def baseline_adequacy(
         "capacity_confounds": [],
         "baseline_capacity": None,
         "ngram_missing": False,
-        "tuning_budget_parity": None,
+        "tuning_parity": None,
         "ok": None,
     }
 
@@ -13890,11 +13886,11 @@ def baseline_adequacy(
                 report["untuned"].append(message)
                 report["straw_man"].append(message)
 
-    # 3b) 调参预算对称性：基线做了学习率网格搜索、挑战臂却
+    # 3b) 调参对称性：基线做了学习率网格搜索、挑战臂却
     #     沿用默认学习率时，「基线被调强、挑战臂没调」会让
     #     差值无法归因到机制。基线仍可能确实是强基线（3a 的
     #     结论不受影响），所以这里只给混杂提示，不把基线判为
-    #     straw-man：挑战臂若在预算不对称下仍胜出，结论是保守
+    #     straw-man：挑战臂若在调参不对称下仍胜出，结论是保守
     #     下界；若落败，则不能排除挑战臂只是没调好。
     parity: Dict[str, object] = {
         "baseline_winner_lrs": [],
@@ -13904,7 +13900,7 @@ def baseline_adequacy(
         "advisories": [],
         "ok": None,
     }
-    report["tuning_budget_parity"] = parity
+    report["tuning_parity"] = parity
 
     if baseline_mode != "ngram":
         baseline_tuned_lrs: List[float] = []
@@ -13931,7 +13927,7 @@ def baseline_adequacy(
                 "基线运行的调参 winner 学习率不一致（"
                 + ", ".join(format(lr, "g") for lr in unique_lrs)
                 + "）：各基线运行不是同一条调过参的配置，"
-                "调参预算对称性无法核对"
+                "调参对称性无法核对"
             )
             parity["advisories"].append(message)
             report["advisories"].append(message)
@@ -14026,7 +14022,7 @@ def baseline_adequacy(
                     ]
                 )
                 message = (
-                    "调参预算不对称：基线已在 val 上做学习率网格"
+                    "调参不对称：基线已在 val 上做学习率网格"
                     f"搜索（winner lr={format(baseline_lr, 'g')}），"
                     "以下挑战臂却使用不同学习率且没有自己的调参"
                     f"来源：{details}。若挑战臂落败，不能排除只是"
@@ -15211,7 +15207,7 @@ def print_comparison_analysis(
             + "）"
         )
 
-    # 等训练计算预算的 loss：A/B 每步 FLOPs 高于 smelt，等步数
+    # 等训练计算量的 loss：A/B 每步 FLOPs 高于 smelt，等步数
     # 对比会把机制收益和额外计算混在一起。该派生指标在本函数
     # 入口统一注入行级字段，后续聚合/检验/基线检查一并使用。
     compute_matched = annotate_compute_matched_metrics(rows)
@@ -15277,7 +15273,7 @@ def print_comparison_analysis(
     imbalance = imbalance_metric_advisory(rows, metric)
     # 选型口径一致性：checkpoint 按 val_loss 选、结论却按
     # macro F1 判定时，最终模型不是假设要检验的那个模型。
-    # 只在当前指标本身可用于选型时检查（等计算预算 loss /
+    # 只在当前指标本身可用于选型时检查（等计算量 loss /
     # AUC 等只能离线计算的指标不适用）。
     selection_metric_mismatch = (
         [
@@ -15665,7 +15661,7 @@ def print_comparison_analysis(
             )
 
     # 缺效率测量数据的实验单元必须点名：旧版本运行或
-    # --skip-efficiency 的运行没有实测效率字段，涉及这些
+    # --skip-efficiency 的运行没有效率字段，涉及这些
     # 单元的涨点结论无法做精度与效率的权衡（统计基线 ngram
     # 是查表模型、本来就无该口径，不计入）。
     missing_efficiency_cells = [
@@ -15682,26 +15678,26 @@ def print_comparison_analysis(
             + "; ".join(missing_efficiency_cells)
         )
 
-    # 等计算预算对比：只比较相同训练步数时，B/A 的额外分支
+    # 等计算量对比：只比较相同训练步数时，B/A 的额外分支
     # 计算会被误读成机制收益。这里把各运行的验证曲线按累计
-    # 训练 FLOPs 对齐到共同预算点，给出 val_loss_at_matched_flops。
+    # 训练 FLOPs 对齐到共同计算量点，给出 val_loss_at_matched_flops。
     print()
     print(
-        "[compute-matched] 等训练计算预算的验证 loss"
-        "（训练 FLOPs≈3×前向；共同预算取各运行最后一个周期"
+        "[compute-matched] 等训练计算量的验证 loss"
+        "（训练 FLOPs≈3×前向；共同计算量取各运行最后一个周期"
         "验证点的最小值，不做外推）"
     )
     if not compute_matched["runs"]:
-        print("  无可用的等计算预算对比")
+        print("  无可用的等计算量对比")
     else:
         print(
-            "  共同预算 FLOPs="
+            "  共同计算量 FLOPs="
             f"{float(compute_matched['target_flops']):.3e}"
         )
         for item in compute_matched["runs"]:
-            ratio = item.get("budget_ratio")
+            ratio = item.get("compute_ratio")
             ratio_text = (
-                f"（用自身预算的 {float(ratio):.1%}）"
+                f"（用自身计算量的 {float(ratio):.1%}）"
                 if isinstance(ratio, (int, float))
                 else ""
             )
@@ -15715,7 +15711,7 @@ def print_comparison_analysis(
         print(
             "  可用 --compare-metric val_loss_at_matched_flops "
             "把它作为判定指标做聚合与显著性检验；该点只代表"
-            "共同预算处，不等于完整训练结束时的排序"
+            "共同计算量处，不等于完整训练结束时的排序"
         )
     for message in compute_matched["advisories"]:
         print(f"  [note] {message}")
@@ -16005,13 +16001,13 @@ def print_comparison_analysis(
                 continue
             print(f"  [note] {message}")
 
-        parity = adequacy.get("tuning_budget_parity") or {}
+        parity = adequacy.get("tuning_parity") or {}
         parity_mismatches = parity.get(
             "challengers_without_tuning_parity"
         ) or []
         if parity.get("baseline_winner_lrs"):
             print(
-                "  [tuning-budget] 基线调参 winner lr="
+                "  [tuning-parity] 基线调参 winner lr="
                 + ", ".join(
                     format(float(lr), "g")
                     for lr in parity["baseline_winner_lrs"]
@@ -16023,8 +16019,8 @@ def print_comparison_analysis(
             )
         if parity_mismatches:
             print(
-                "  [tuning-budget] [warn] 以下挑战臂的学习率与"
-                "调参基线不一致且没有独立调参来源：调参预算"
+                "  [tuning-parity] [warn] 以下挑战臂的学习率与"
+                "调参基线不一致且没有独立调参来源：调参"
                 "不对称，落败不能排除调参不足、胜出是保守下界"
             )
             for item in parity_mismatches:
@@ -19562,7 +19558,7 @@ def run_self_test():
     )
     assert efficiency["latency_ms_per_forward"] is not None
     assert float(efficiency["latency_ms_per_forward"]) > 0.0
-    # 训练步耗时（前向+反向）必须实测为正。
+    # 训练步计时（前向+反向）必须为正。
     assert efficiency["training_ms_per_step"] is not None
     assert float(efficiency["training_ms_per_step"]) > 0.0
     assert (
@@ -19659,9 +19655,9 @@ def run_self_test():
         "latency_ms_per_forward"
     ] == 1.5
 
-    # ---- 等训练计算预算（val_loss_at_matched_flops） ----
-    # 便宜臂与昂贵臂的每步 FLOPs 不同：共同预算取两者最后
-    # 验证点累计 FLOPs 的较小值，昂贵臂在较早的预算点被插值，
+    # ---- 等训练计算量（val_loss_at_matched_flops） ----
+    # 便宜臂与昂贵臂的每步 FLOPs 不同：共同计算量取两者最后
+    # 验证点累计 FLOPs 的较小值，昂贵臂在较早的计算量点被插值，
     # 而不是拿各自训练结束时的 loss 直接比较。
     assert "val_loss_at_matched_flops" in COMPARISON_METRIC_KEYS
     with tempfile.TemporaryDirectory() as matched_dir:
@@ -19708,7 +19704,7 @@ def run_self_test():
         )
 
     assert matched_report["ok"], matched_report
-    # 共同预算 = 便宜臂最后一个验证点：30×3×100 = 9000。
+    # 共同计算量 = 便宜臂最后一个验证点：30×3×100 = 9000。
     assert abs(
         float(matched_report["target_flops"]) - 9000.0
     ) < 1e-9
@@ -23837,9 +23833,9 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     run_paths = _execute_sweep_plan(base_argv, plan, out_root)
 
     rows = compare_runs(run_paths)
-    # --compare-metric 可以是等计算预算 loss；调参报告必须与
+    # --compare-metric 可以是等计算量 loss；调参报告必须与
     # 当前对比指标同口径。调参候选只有学习率不同、每步 FLOPs
-    # 相同，等预算点仍由验证曲线共同预算决定。
+    # 相同，等计算量点仍由验证曲线共同计算量决定。
     annotate_compute_matched_metrics(rows)
     report = analyze_baseline_tuning(
         rows,
@@ -25316,12 +25312,12 @@ def main():
     else:
         print(
             "[data-protocol] FAILED: 数据管线存在实质错误，"
-            "在修复前拒绝开始训练："
+            "在问题排除前拒绝开始训练："
         )
         for failure in data_protocol_check["failures"]:
             print(f"  - {failure}")
         raise SystemExit(
-            "数据管线检查未通过：请先修复输入/标签错位、切分"
+            "数据管线检查未通过：请先检查输入/标签错位、切分"
             "越界或不可复现的采样逻辑，再开始全量训练。"
         )
 
