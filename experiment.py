@@ -26593,6 +26593,33 @@ def run_self_test():
             for issue in config_break_controlled["issues"]
         )
 
+        partial_protocol_rows = compare_runs(tuning_paths)
+        missing_protocol_key = "warmup_steps"
+        assert all(
+            missing_protocol_key in row["protocol"]
+            for row in partial_protocol_rows
+        )
+        partial_protocol_rows[0]["protocol"].pop(
+            missing_protocol_key
+        )
+        partial_protocol_report = analyze_baseline_tuning(
+            partial_protocol_rows,
+            "val_loss",
+            "dense",
+            [1e-4, 3e-4],
+            [42, 43, 44],
+        )
+        assert (
+            partial_protocol_report["training_config"][
+                missing_protocol_key
+            ]
+            is None
+        )
+        assert any(
+            "部分候选运行缺少训练协议字段" in issue
+            for issue in partial_protocol_report["issues"]
+        )
+
         # winner 必须来自调参报告的并列选择协议：均值更优但
         # 与更小 lr 的差距落在种子波动内时，保守选择小 lr，
         # 且 winner_selection 如实记录；边界 winner 要有提示。
@@ -27773,6 +27800,9 @@ def analyze_baseline_tuning(
     protocol_values: Dict[str, set] = {
         key: set() for key in _BASELINE_TUNING_PROTOCOL_KEYS
     }
+    protocol_value_counts = {
+        key: 0 for key in _BASELINE_TUNING_PROTOCOL_KEYS
+    }
     recorded_protocol = 0
     for row in rows:
         protocol = row.get("protocol")
@@ -27783,6 +27813,7 @@ def analyze_baseline_tuning(
             value = protocol.get(key)
             if value is None:
                 continue
+            protocol_value_counts[key] += 1
             protocol_values[key].add(
                 json.dumps(
                     value,
@@ -27804,14 +27835,27 @@ def analyze_baseline_tuning(
             + "）：调参结果与「训练得更久 / 换了优化协议或"
             "数据划分」混杂，不可用于选择基线超参数"
         )
+    partial_protocol_keys = []
     if recorded_protocol:
         # 记录每个键的（唯一）取值；缺记录或候选间不一致的
         # 键保持 None，由来源核对阶段显式拒绝。
         for key, values in protocol_values.items():
-            if len(values) == 1:
+            if (
+                len(values) == 1
+                and protocol_value_counts[key] == recorded_protocol
+            ):
                 report["training_config"][key] = json.loads(
                     next(iter(values))
                 )
+            elif len(values) == 1:
+                partial_protocol_keys.append(key)
+    if partial_protocol_keys:
+        report["issues"].append(
+            "部分候选运行缺少训练协议字段（"
+            + ", ".join(partial_protocol_keys)
+            + "）：无法确认所有候选使用同一训练协议，"
+            "winner 不能作为「调优过的基线」证据"
+        )
 
     def _row_lr(row: Dict[str, object]) -> Optional[float]:
         protocol = row.get("protocol")
