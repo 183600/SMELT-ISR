@@ -65,7 +65,7 @@ from split bounds only (without reading test content); before unsealing,
 the fixed test windows are independently verified for bit-exact input/target
 alignment.
 
-**Strict data audit**: with `--strict-data-audit`, leakage-class findings (cross-split duplicate windows, out-of-range tokens, UTF-8/NUL corruption above threshold) abort training; when unsealing the test set, the same problems in test refuse the unsealing (no `test` record is written). By default these are warnings only, so you can inspect the data before deciding how to clean it.
+**Leakage is a hard gate by default**: if the audit finds cross-split duplicate windows or duplicate groups, training refuses to start; when unsealing the test set, the same findings in test refuse the unsealing (no `test` record is written). Only an explicit `--allow-data-leakage` overrides the gate, and the override is recorded in `config.json` and the comparison protocol, so a leaky run cannot silently pass as leak-free evidence. Label noise (out-of-range tokens, UTF-8/NUL corruption above threshold) is controlled by `--strict-data-audit`: with it, such findings also abort training/unsealing; by default they are warnings so you can inspect the data before deciding how to clean it.
 
 Whenever a new best validation loss is reached, the weights are written to `best.pt`. The `final` record and the single test evaluation both use this validation-selected model (the selection policy is recorded in `model_selection` inside `config.json`); if `best.pt` is missing (e.g., resuming from an older checkpoint), the script says so explicitly and falls back to the last-step parameters.
 

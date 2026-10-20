@@ -4277,6 +4277,11 @@ def audit_data_splits(
     被 ``--strict-data-audit`` 视为致命的问题（越界 token、
     跨 split 重复内容、超出阈值的 UTF-8/NUL 损坏）——这些
     问题直接对应数据泄露或标签噪声，严格模式下拒绝训练。
+    ``leakage_violations`` 是 ``violations`` 中「跨 split 内容
+    重复」这一类纯泄露问题：默认训练入口也会拒绝它们，除非
+    显式传入 ``--allow-data-leakage``。损坏/标签噪声仍由
+    ``--strict-data-audit`` 控制，避免把「数据脏」和「数据泄露」
+    混为同一个开关。
 
     test 只在 include_test=True（最终评估解封时）才参与统计，
     训练期间默认只审计 train/val。审计只做诊断，不参与任何
@@ -4291,6 +4296,7 @@ def audit_data_splits(
     splits_report: Dict[str, object] = {}
     warnings: List[str] = []
     violations: List[str] = []
+    leakage_violations: List[str] = []
 
     for split in split_names:
         tokens = getattr(dataset, split)
@@ -4615,6 +4621,7 @@ def audit_data_splits(
             )
             warnings.append(message)
             violations.append(message)
+            leakage_violations.append(message)
 
     groups_report: Optional[Dict[str, object]] = None
 
@@ -4664,6 +4671,7 @@ def audit_data_splits(
                 )
                 warnings.append(message)
                 violations.append(message)
+                leakage_violations.append(message)
 
     return {
         "max_windows": max_windows,
@@ -4678,7 +4686,45 @@ def audit_data_splits(
         "groups": groups_report,
         "warnings": warnings,
         "violations": violations,
+        "leakage_violations": leakage_violations,
     }
+
+
+def enforce_data_leakage_gate(
+    report: Dict[str, object],
+    context: str = "",
+) -> bool:
+    """
+    跨 split 泄露的默认硬门：只要审计发现内容重复（窗口级或
+    群组级跨 split 重复），就拒绝继续，而不是仅打印警告。
+
+    与 ``enforce_strict_data_audit`` 的分工：
+    - 本函数默认启用，只拦截「泄露」这一类问题；
+    - 越界 token、UTF-8/NUL 损坏等标签噪声仍由
+      ``--strict-data-audit`` 控制，避免默认行为因少量脏字节
+      直接中断；
+    - ``--allow-data-leakage`` 是显式豁免，用于确认重复内容
+      在业务上不是泄露的场景；豁免会写入运行协议，跨运行
+      对比时不会被静默忽略。
+
+    返回 False 表示调用方必须拒绝训练/拒绝解封测试集。
+    """
+    leakage = report.get("leakage_violations") or []
+
+    if not leakage:
+        return True
+
+    where = f"（{context}）" if context else ""
+    print(f"[data] 跨 split 泄露检查未通过{where}：")
+    for violation in leakage:
+        print(f"[data]   泄露: {violation}")
+    print(
+        "[data] 默认拒绝在泄露数据上继续。请先去重/清洗数据；"
+        "若已确认这些重复内容不构成泄露，可显式传 "
+        "--allow-data-leakage（会被记录进配置）。"
+    )
+
+    return False
 
 
 def enforce_strict_data_audit(
@@ -6918,14 +6964,25 @@ def run_statistical_baseline(
         )
         print_data_audit(test_audit)
 
-        if args.strict_data_audit and not enforce_strict_data_audit(
-            test_audit,
-            "test",
-        ):
+        leakage_blocked = (
+            not args.allow_data_leakage
+            and not enforce_data_leakage_gate(
+                test_audit,
+                "test",
+            )
+        )
+        strict_blocked = (
+            args.strict_data_audit
+            and not enforce_strict_data_audit(
+                test_audit,
+                "test",
+            )
+        )
+        if leakage_blocked or strict_blocked:
             # 统计基线同样不能在泄露/损坏的测试集上报告指标；
             # 不写 test 记录，名额未消耗。
             print(
-                "[test] 严格数据审计在测试集上发现泄露/损坏"
+                "[test] 数据审计在测试集上发现泄露/损坏"
                 "问题：拒绝解封测试集（不写入 test 记录）。"
                 "请先清洗数据后重跑。"
             )
@@ -11340,6 +11397,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
+    # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
+    "allow_data_leakage",
     "eval_interval",
     "eval_batches",
     "data_sha256",
@@ -11365,6 +11425,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    "allow_data_leakage",
     "batch_size",
     "eval_batches",
     "data_augmentation",
@@ -11748,6 +11809,9 @@ def build_comparison_protocol(
         "deduplicate_train_groups": bool(
             getattr(args, "deduplicate_train_groups", False)
         ),
+        "allow_data_leakage": bool(
+            getattr(args, "allow_data_leakage", False)
+        ),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
@@ -11867,6 +11931,11 @@ def experiment_protocol_from_payload(
         ),
         "deduplicate_train_groups": bool(
             run_args.get("deduplicate_train_groups", False)
+            if has_training
+            else False
+        ),
+        "allow_data_leakage": bool(
+            run_args.get("allow_data_leakage", False)
             if has_training
             else False
         ),
@@ -19356,6 +19425,9 @@ def write_run_config(
                     False,
                 )
             ),
+            "allow_data_leakage": bool(
+                getattr(args, "allow_data_leakage", False)
+            ),
         },
         "data_audit": data_audit,
         "data_protocol_check": data_protocol_check,
@@ -21008,6 +21080,8 @@ def run_self_test():
         "重复" in warning
         for warning in clean_audit["warnings"]
     )
+    assert clean_audit["leakage_violations"] == []
+    assert enforce_data_leakage_gate(clean_audit)
     # 这份合成语料覆盖 0..255 全部字节值（含大量非 UTF-8
     # 字节），严格审计会把它标记为标签噪声来源；这不影响
     # 上面的重复检测断言。
@@ -21049,6 +21123,10 @@ def run_self_test():
         "重复" in violation
         for violation in repeated_audit["violations"]
     )
+    # 跨 split 重复是纯泄露：即使不开 --strict-data-audit，
+    # 默认泄露门也必须拒绝。
+    assert repeated_audit["leakage_violations"]
+    assert not enforce_data_leakage_gate(repeated_audit)
     assert not enforce_strict_data_audit(repeated_audit)
 
     # 单个字节占主导的退化语料必须被标记（异常值检查）。
@@ -21116,6 +21194,11 @@ def run_self_test():
     )
     assert corrupt_audit["violations"]
     assert not enforce_strict_data_audit(corrupt_audit)
+    # UTF-8/NUL 损坏属于标签噪声而非跨 split 泄露：
+    # 默认泄露门放行，严格审计拒绝。两类问题不能混用一个
+    # 开关，否则要么漏掉泄露，要么被少量脏字节误伤。
+    assert corrupt_audit["leakage_violations"] == []
+    assert enforce_data_leakage_gate(corrupt_audit)
 
     # 多字节 UTF-8 字符横跨 split 边界不能产生假阳性「标签
     # 噪声」：文件整体合法，切分只是诊断视角。字符「€」的
@@ -28355,10 +28438,20 @@ def main():
         action="store_true",
         help=(
             "严格数据审计：训练前的 train/val 审计或解封测试集"
-            "时的审计只要发现越界 token、跨 split 重复内容、"
-            "群组级跨 split 重复或超阈值的 UTF-8/NUL 损坏，"
-            "就拒绝开始训练/拒绝解封测试集（默认只警告并"
-            "照常继续）"
+            "时的审计只要发现越界 token 或超阈值的 UTF-8/NUL "
+            "损坏等标签噪声，就拒绝开始训练/拒绝解封测试集"
+            "（跨 split 重复内容已由默认泄露门拦截）"
+        ),
+    )
+    parser.add_argument(
+        "--allow-data-leakage",
+        action="store_true",
+        help=(
+            "显式允许跨 split 重复内容继续运行：默认情况下"
+            "只要审计发现 train/val/test 之间的重复窗口或"
+            "重复群组（泄露级问题），训练入口和测试集解封"
+            "都会直接拒绝。仅在你确认这些重复在业务上不是"
+            "泄露时使用；豁免会记录进 config.json"
         ),
     )
 
@@ -29666,9 +29759,33 @@ def main():
     )
     print_data_audit(data_audit)
 
-    # 严格数据审计：发现泄露/标签噪声时拒绝开始训练。检查放在
+    # 跨 split 泄露默认硬门：泄露级问题（重复窗口/重复群组）
+    # 会直接终止训练，而不是只在日志里留一行警告。检查放在
     # 所有入口（神经训练与统计基线）之前，两种运行都不能在
-    # 已泄露的数据上产出结论。
+    # 已泄露的数据上产出结论。--allow-data-leakage 是显式豁免。
+    if (
+        not args.allow_data_leakage
+        and not enforce_data_leakage_gate(
+            data_audit,
+            "train/val",
+        )
+    ):
+        raise SystemExit(
+            "跨 split 泄露检查未通过：请先清洗数据"
+            "（用 --group-separator/--deduplicate-train-groups "
+            "去掉重复内容），或确认不是泄露后显式传 "
+            "--allow-data-leakage。"
+        )
+    if args.allow_data_leakage and data_audit.get(
+        "leakage_violations"
+    ):
+        print(
+            "[data] [warn] 已通过 --allow-data-leakage 显式豁免"
+            "跨 split 泄露拦截；本次结果不能作为无泄露证据。"
+        )
+
+    # 严格数据审计：发现越界 token、编码/NUL 损坏等标签噪声
+    # 时拒绝开始训练（泄露问题已由上面的默认门拦截）。
     if args.strict_data_audit and not enforce_strict_data_audit(
         data_audit,
         "train/val",
@@ -31214,14 +31331,25 @@ def main():
             )
             print_data_audit(test_audit)
 
-            if args.strict_data_audit and not enforce_strict_data_audit(
-                test_audit,
-                "test",
-            ):
+            leakage_blocked = (
+                not args.allow_data_leakage
+                and not enforce_data_leakage_gate(
+                    test_audit,
+                    "test",
+                )
+            )
+            strict_blocked = (
+                args.strict_data_audit
+                and not enforce_strict_data_audit(
+                    test_audit,
+                    "test",
+                )
+            )
+            if leakage_blocked or strict_blocked:
                 # 在已泄露/损坏的测试集上报告指标毫无意义，还会
                 # 留下唯一的 test 记录；直接拒绝解封。
                 print(
-                    "[test] 严格数据审计在测试集上发现泄露/"
+                    "[test] 数据审计在测试集上发现泄露/"
                     "损坏问题：为避免在污染数据上产出最终结论，"
                     "本次拒绝解封测试集（不写入 test 记录，"
                     "名额未消耗）。请先清洗数据后重跑。"
