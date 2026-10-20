@@ -35616,6 +35616,14 @@ def main():
     # nonfinite 事件数跨 resume 累加：一段曾在第 120 步出现过
     # NaN、续跑到第 300 步的运行，最终记录不能只报续跑段的 0。
     nonfinite_events = _saved_counter("nonfinite_events")
+    # 优化器实际推进次数是跨 resume 的累计量。nonfinite_events
+    # 本身也跨恢复累计，不能再用「本段 step 数 - 累计事件数」，
+    # 否则恢复前的跳步会被重复扣除。start_step 是恢复点前已
+    # 尝试过的总步数，据此还原此前的有效更新数。
+    optimizer_steps_completed = max(
+        0,
+        int(start_step) - int(nonfinite_events),
+    )
     consecutive_nonfinite = 0
     numerical_stop = False
     numerical_polluted = False
@@ -35828,6 +35836,7 @@ def main():
             else:
                 optimizer.step()
             scheduler.step()
+            optimizer_steps_completed += 1
             # fused AdamW 不推进参数版本号，显式使专家权重
             # stack 缓存失效，确保下一步前向使用新参数。
             model.invalidate_weight_caches()
@@ -35901,10 +35910,7 @@ def main():
             "step": step + 1,
             # 截至本步累计真正推进优化器的次数：等计算量对比
             # 用它而不是 step，避免把 NaN 跳步算成训练量。
-            "optimizer_steps": max(
-                0,
-                int(step + 1) - int(nonfinite_events),
-            ),
+            "optimizer_steps": optimizer_steps_completed,
             "lr": current_lr,
             "grad_norm": (
                 grad_norm_value if finite_grad else None
@@ -36263,10 +36269,7 @@ def main():
         # 「计划步数相同」的两臂实际训练量不同，跨运行对比
         # 必须能核对（--compare 注入 comparison_protocol）。
         "trained_steps": max(0, int(end_step) - int(start_step)),
-        "optimizer_steps": max(
-            0,
-            int(end_step) - int(start_step) - int(nonfinite_events),
-        ),
+        "optimizer_steps": optimizer_steps_completed,
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
         "numerical_polluted": numerical_polluted,
