@@ -15709,6 +15709,11 @@ def _attach_power_equivalence(
       （相对基线均值）与 TOST 结果；``equivalent`` 为未校正
       的原始判定，家族校正由
       ``_apply_multiple_comparison_correction`` 统一完成。
+    - ``equivalence_margin_needed``：在当前精度下主张等价所需的
+      最小对称界（|Δ̂| + t_{1-α}·se）；``equivalence_blocker``
+      区分「效应本身超界」与「精度不足」，后者额外给出
+      ``equivalence_seeds_to_achieve``（近似所需种子数），
+      避免把「TOST 未通过」一律读成「两者不同」。
     """
     se = test.get("se")
     df = test.get("df")
@@ -15808,6 +15813,48 @@ def _attach_power_equivalence(
     contrast["equivalent"] = bool(
         float(tost["tost_p_value"]) <= _SIGNIFICANCE_LEVEL
     )
+
+    # 主张「等价」所需的最小对称界：TOST 通过当且仅当
+    # (1-2α) 置信区间整体落在 ±margin 内，因此
+    # margin_needed = |Δ̂| + t_{1-α}(df)·se。它把「TOST 未通过」
+    # 拆成两种完全不同的情况：点估计本身已超出界（效应真实，
+    # 加种子只会让「不等价」更确定），还是点估计在界内但噪声
+    # 太大（精度不足，加种子可以判定）。不给这个量时，
+    # 「TOST 未通过」会被一律读成「两者不同」。
+    critical = _t_critical(df_value)
+    if critical is not None:
+        noise_half_width = critical * se_value
+        margin_needed = abs(float(delta)) + noise_half_width
+        contrast["equivalence_margin_needed"] = margin_needed
+        if baseline_abs is not None:
+            contrast["equivalence_margin_needed_relative"] = (
+                margin_needed / baseline_abs
+            )
+        if abs(float(delta)) >= margin_abs:
+            # 点估计已经在界外：这不是功效问题，是效应本身
+            # 超出实际意义界。
+            contrast["equivalence_blocker"] = (
+                "effect_exceeds_margin"
+            )
+        elif margin_needed > margin_abs:
+            contrast["equivalence_blocker"] = "insufficient_precision"
+            # 在种子间标准差不变的近似下，se ∝ 1/√n，要把噪声
+            # 半宽从 (needed-|Δ|) 压到 (margin-|Δ|)，需要
+            # n_needed = n·((needed-|Δ|)/(margin-|Δ|))^2。
+            current_n = _current_seed_count(contrast)
+            if current_n is not None and current_n > 0:
+                contrast["equivalence_seeds_to_achieve"] = int(
+                    math.ceil(
+                        current_n
+                        * (
+                            noise_half_width
+                            / (margin_abs - abs(float(delta)))
+                        )
+                        ** 2
+                    )
+                )
+        else:
+            contrast["equivalence_blocker"] = None
 
 
 def _holm_bonferroni(
@@ -21712,6 +21759,18 @@ def print_comparison_analysis(
                 ),
                 "equivalent_raw": contrast.get("equivalent_raw"),
                 "equivalent": contrast.get("equivalent"),
+                "equivalence_margin_needed": contrast.get(
+                    "equivalence_margin_needed"
+                ),
+                "equivalence_margin_needed_relative": contrast.get(
+                    "equivalence_margin_needed_relative"
+                ),
+                "equivalence_blocker": contrast.get(
+                    "equivalence_blocker"
+                ),
+                "equivalence_seeds_to_achieve": contrast.get(
+                    "equivalence_seeds_to_achieve"
+                ),
             })
 
     print()
@@ -21795,6 +21854,30 @@ def print_comparison_analysis(
                         f"（当前 "
                         f"{_format_seed_count(current_seeds)} 个）"
                     )
+                blocker = entry.get("equivalence_blocker")
+                if blocker == "effect_exceeds_margin":
+                    needed_text = (
+                        "（点估计本身已超出等价界：这不是种子"
+                        "不够，增加种子只会让「不等价」更确定）"
+                    )
+                elif blocker == "insufficient_precision":
+                    needed_text = (
+                        "（点估计在界内但噪声半宽越界：把界至少"
+                        "放宽到 ±"
+                        f"{float(entry['equivalence_margin_needed']):.4f}"
+                        " 才可能主张等价"
+                    )
+                    seeds_to_achieve = entry.get(
+                        "equivalence_seeds_to_achieve"
+                    )
+                    if isinstance(seeds_to_achieve, int):
+                        needed_text += (
+                            f"，或在当前种子波动下约需 "
+                            f"{seeds_to_achieve} 个种子"
+                        )
+                    needed_text += "）"
+                else:
+                    needed_text = ""
                 delta = entry.get("delta")
                 delta_text = (
                     f"Δ={float(delta):+.4f}"
@@ -21804,7 +21887,37 @@ def print_comparison_analysis(
                 print(
                     f"  [inconclusive] {entry['baseline']}→"
                     f"{entry['variant']}  {delta_text}  {mde_text}"
-                    f"{seeds_text}：不显著也说明不了等价"
+                    f"{seeds_text}{needed_text}：不显著也说明不了等价"
+                )
+            precision_limited = [
+                entry
+                for entry in equivalence_entries
+                if entry.get("equivalence_blocker")
+                == "insufficient_precision"
+                and not entry.get("equivalent")
+            ]
+            if precision_limited:
+                print(
+                    "  [warn] 以下对比的等价判定卡在精度而不是"
+                    "效应：点估计落在等价界内，但种子噪声把置信"
+                    "区间推出了界外——TOST 未通过不能读成「两者"
+                    "不同」，应增加种子（而不是放宽等价界）: "
+                    + "; ".join(
+                        f"{entry['baseline']}→{entry['variant']}"
+                        + (
+                            f"（约需 "
+                            f"{entry['equivalence_seeds_to_achieve']}"
+                            " 个种子）"
+                            if isinstance(
+                                entry.get(
+                                    "equivalence_seeds_to_achieve"
+                                ),
+                                int,
+                            )
+                            else ""
+                        )
+                        for entry in precision_limited
+                    )
                 )
             if not equivalent_entries and not inconclusive_entries:
                 print(
@@ -28408,6 +28521,59 @@ def run_self_test():
         )
         assert "TOST 等价" in equivalent_display
         assert "无实质差异" in equivalent_display
+        # 等价已确立时没有阻塞项，且所需最小界不超过声明界。
+        assert equivalent_contrast["equivalence_blocker"] is None
+        assert (
+            equivalent_contrast["equivalence_margin_needed"]
+            <= equivalent_contrast["equivalence_margin_abs"]
+        )
+
+        # 点估计本身超出等价界（真实差异）：必须归因为「效应
+        # 超界」，而不是「种子不够」——加种子只会更确定地
+        # 拒绝等价。
+        assert (
+            powered_contrast["equivalence_blocker"]
+            == "effect_exceeds_margin"
+        )
+        assert (
+            "equivalence_seeds_to_achieve" not in powered_contrast
+        )
+
+        # 点估计在界内但噪声把区间推出界外：这是精度问题，
+        # 报告必须给出「加多少种子才可能主张等价」。
+        noisy_rows = [
+            {
+                "run": f"{mode}_seed{seed}",
+                "mode": mode,
+                "seed": seed,
+                "val_loss": value,
+            }
+            for mode, values in (
+                ("local_base", [3.0, 3.5, 2.5]),
+                ("A", [3.05, 3.45, 2.55]),
+            )
+            for seed, value in enumerate(values, start=1)
+        ]
+        precision_contrast = factor_contrasts(
+            aggregate_runs(noisy_rows, ["mode"]),
+            ["mode"],
+            "val_loss",
+            equivalence_margin=0.01,
+        )[0]
+        assert precision_contrast["equivalent"] is False
+        assert (
+            precision_contrast["equivalence_blocker"]
+            == "insufficient_precision"
+        )
+        assert (
+            precision_contrast["equivalence_margin_needed"]
+            > precision_contrast["equivalence_margin_abs"]
+        )
+        seeds_to_achieve = precision_contrast[
+            "equivalence_seeds_to_achieve"
+        ]
+        assert isinstance(seeds_to_achieve, int)
+        assert seeds_to_achieve > 3
 
         # 不显著且等价性未确立：展示层必须同时给出
         # 「未显著 ≠ 等价」与 80% 功效 MDE，不能只写「无差异」。

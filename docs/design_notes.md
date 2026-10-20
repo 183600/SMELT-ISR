@@ -152,7 +152,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   与按当前种子间波动检出观测效应所需的近似种子数。
 - `_tost_test`、`_t_cdf`、`_attach_power_equivalence`：TOST
   等价性检验（等价界相对基线均值，`--equivalence-margin`）、
-  t 分布 CDF 与对比记录的功效/等价性字段挂载。
+  t 分布 CDF 与对比记录的功效/等价性字段挂载，含主张等价所需
+  的最小界 `equivalence_margin_needed`、阻塞原因
+  `equivalence_blocker` 与精度受限时的近似所需种子数
+  `equivalence_seeds_to_achieve`。
 - `_bootstrap_eval_intervals`、`_percentile_interval`：对固定
   评估窗口做有放回重采样（默认 500 次，`--eval-bootstrap`，
   0 关闭），给出 loss / ppl / token accuracy / macro F1 的
@@ -320,7 +323,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   家族校正：Holm 校正后仍通过才能在报告中主张「无实质差异」
   （`equivalent`，未校正判定留档于 `equivalent_raw`）；不显著
   且等价性未确立时结论只能是「不确定」，展示层打印 MDE 与
-  所需种子数，区分「效应太小」与「种子太少」。等价界必须
+  所需种子数，区分「效应太小」与「种子太少」。每个对比还
+  记录在当前精度下主张等价所需的最小对称界
+  `equivalence_margin_needed` = |Δ̂| + t_{1−α}(df)·se（及相对
+  基线均值的 `equivalence_margin_needed_relative`），并用
+  `equivalence_blocker` 把「TOST 未通过」拆成两种不可混为一谈
+  的情况：`effect_exceeds_margin`（点估计本身已超出声明界，
+  增加种子只会更确定地拒绝等价）与 `insufficient_precision`
+  （点估计在界内、噪声半宽把置信区间推出界外，属精度不足，
+  额外给出近似所需种子数 `equivalence_seeds_to_achieve`）。
+  展示层对后者单独发 `[warn]`，明确「TOST 未通过 ≠ 两者不同，
+  应加种子而不是放宽等价界」，避免把精度不足的检验失败读成
+  方法之间确实存在差异。等价界必须
   事先声明：看到数据后再放宽界可以「制造」等价结论。功效
   积分对 chi 分布做自适应 Simpson 数值积分（按 df 缓存），
   δ=0 时功效恰为 alpha，大 df 退化为正态近似，自测覆盖这些
