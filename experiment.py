@@ -16895,7 +16895,9 @@ def hypothesis_preregistration_error(
     - ``--primary-metric`` 必须是评估管线真正计算的对比指标
       （COMPARISON_METRIC_KEYS），且在 ``--hypothesis`` 文本
       里被点名（假设与判定口径必须对齐）；
-    - 统计基线 / 只读对比 / 结构自检不使用这套预注册。
+    - 统计基线不参与方向/最小效应预注册，但允许用
+      ``--primary-metric`` 指定 n-gram 的 val 调参口径；
+    - 只读对比 / 结构自检不使用这套预注册。
 
     返回错误消息（应交给 parser.error 报告）或 None。
     """
@@ -16906,17 +16908,30 @@ def hypothesis_preregistration_error(
     if primary_metric is None and direction is None and min_effect is None:
         return None
 
-    if (
-        args.compare is not None
-        or args.statistical_baseline
-        or args.sanity_only
-    ):
+    if args.compare is not None or args.sanity_only:
         return (
             "--primary-metric / --hypothesis-direction / "
             "--hypothesis-min-effect 只适用于训练入口："
-            "--compare 只读分析、--statistical-baseline 与 "
-            "--sanity-only 不训练神经模型"
+            "--compare 只读分析与 --sanity-only 结构自检"
+            "不训练神经模型"
         )
+
+    if args.statistical_baseline:
+        if direction is not None or min_effect is not None:
+            return (
+                "--hypothesis-direction / --hypothesis-min-effect "
+                "不适用于 --statistical-baseline：统计基线没有"
+                "训练臂，方向与最小效应无法由该入口验证；"
+                "可只用 --primary-metric 指定 n-gram 的 val "
+                "调参口径"
+            )
+        if primary_metric not in COMPARISON_METRIC_KEYS:
+            return (
+                f"--primary-metric={primary_metric} 不是评估管线"
+                "计算的对比指标；可选："
+                + ", ".join(COMPARISON_METRIC_KEYS)
+            )
+        return None
 
     if primary_metric is None:
         return (
@@ -25784,6 +25799,25 @@ def run_self_test():
                 primary_metric="val_loss",
             )
         ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                statistical_baseline=True,
+                primary_metric="val_loss",
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                statistical_baseline=True,
+                primary_metric="val_macro_f1",
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                statistical_baseline=True,
+                primary_metric="val_loss",
+                hypothesis_direction="decrease",
+            )
+        ) is not None
 
         # 预注册主指标与当前分析指标不一致：metric shopping
         # 守卫必须点名。
@@ -28783,7 +28817,9 @@ def main():
             "预注册的主判定指标（--compare-metric 的候选之一）："
             "训练开始前声明本轮以哪个指标判定成败，"
             "对比阶段若分析指标与预注册主指标不一致会提示"
-            "「事后换指标」；未预注册则无法排除指标选择偏差"
+            "「事后换指标」；未预注册则无法排除指标选择偏差。"
+            "--statistical-baseline 时仅用于指定 n-gram 的 "
+            "val 调参口径"
         ),
     )
     parser.add_argument(
