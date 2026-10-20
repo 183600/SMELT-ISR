@@ -169,6 +169,32 @@ class Config:
 MAX_SEED = 2**32 - 1
 
 
+def resume_data_change_error(
+    saved_sha256: Optional[str],
+    current_sha256: Optional[str],
+) -> Optional[str]:
+    """
+    检查续跑检查点与当前数据文件是否仍是同一份内容。
+
+    数据指纹不同意味着 train/val/test 的切分内容已经变化，
+    检查点里的优化器状态、采样 RNG 与「验证集选出的最优步」
+    都对应旧数据；继续训练会把两个数据版本混成一条训练轨迹，
+    任何指标都无法归因。旧检查点没有数据指纹时无法核对，
+    返回 None 由调用方保留兼容提示。
+    """
+    if not saved_sha256 or not current_sha256:
+        return None
+    if saved_sha256 == current_sha256:
+        return None
+    return (
+        "resume 数据文件内容已变化（数据指纹 "
+        f"{saved_sha256[:12]}... -> {current_sha256[:12]}...）："
+        "检查点的参数/优化器状态与采样轨迹对应旧数据，"
+        "续跑会把两个数据版本混成一条训练轨迹。请换用全新的 "
+        "--out 目录与检查点从头训练。"
+    )
+
+
 def seed_error(seed: int) -> Optional[str]:
     """
     校验随机种子的统一合法域；返回错误消息或 None。
@@ -22691,6 +22717,18 @@ def run_self_test():
         torch.tensor(rebuilt_lrs),
     )
 
+    # resume 数据指纹不一致必须返回明确错误；旧检查点没有
+    # 指纹或指纹相同则放行，由调用方保留兼容行为。
+    assert (
+        resume_data_change_error(None, "abc") is None
+    )
+    assert (
+        resume_data_change_error("abc", "abc") is None
+    )
+    assert (
+        resume_data_change_error("abc", "def") is not None
+    )
+
     # set_seed 必须让 Python / NumPy / PyTorch 的随机流可复现。
     set_seed(2024)
     first_draw = (
@@ -30809,16 +30847,12 @@ def main():
     args.data_val_fraction = dataset.val_fraction
     args.data_test_fraction = dataset.test_fraction
 
-    if (
-        saved_data_sha256 is not None
-        and saved_data_sha256 != dataset.data_sha256
-    ):
-        print(
-            "resume data file content changed "
-            f"({saved_data_sha256[:12]}... -> "
-            f"{dataset.data_sha256[:12]}...); "
-            "采样轨迹与原运行不再一致"
-        )
+    data_change_error = resume_data_change_error(
+        saved_data_sha256,
+        dataset.data_sha256,
+    )
+    if data_change_error is not None:
+        parser.error(data_change_error)
     elif saved_data_sha256 is not None and (
         saved_data_val_fraction is None
         or saved_data_test_fraction is None
