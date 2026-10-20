@@ -17610,7 +17610,9 @@ def annotate_factorial_confounds(
     训练步数，或消融单元之间 k1/top_k 不同，或 B 的 FLOPs 远高
     于 local_base，这个差异就不能归因到待验证的组件。此时把
     ``claim`` 从「支持/有害/交互显著」降级为 ``confounded`` 或
-    ``compute_confounded``，保留原始统计量供复核。
+    ``compute_confounded``，保留原始统计量供复核。若部分协议项
+    在所有运行中都未记录，则降级为 ``unverified_controls``：
+    「没记录」不等于「一致」，不能据此归因。
     """
     factorial["controlled_variables_ok"] = bool(
         controlled.get("ok")
@@ -17632,10 +17634,31 @@ def annotate_factorial_confounds(
             "声称组件有效"
         )
 
+    unchecked_controls = [
+        str(key)
+        for key in (controlled.get("unchecked_keys") or [])
+    ]
+    if unchecked_controls:
+        factorial["unchecked_control_keys"] = unchecked_controls
+        for effect in factorial.get("effects", []):
+            effect["uncontrolled_keys"] = list(
+                unchecked_controls
+            )
+            if effect.get("claim") in positive_claims:
+                effect["claim"] = "unverified_controls"
+        factorial.setdefault("advisories", []).append(
+            "以下控制项在所有运行中都没有记录，无法确认一致："
+            + ", ".join(unchecked_controls)
+            + "；把「未记录」当作「已控制」会把未知差异算进"
+            "组件效应，显著结果不能归因"
+        )
+
     if coverage.get("structural_confounds"):
         for effect in factorial.get("effects", []):
             effect["structural_confounded"] = True
-            if effect.get("claim") in positive_claims:
+            if effect.get("claim") in positive_claims | {
+                "unverified_controls"
+            }:
                 effect["claim"] = "confounded"
         factorial.setdefault("advisories", []).append(
             "消融单元之间存在结构设置混杂：主效应/交互不能"
@@ -17658,7 +17681,8 @@ def annotate_factorial_confounds(
                 continue
             effect["compute_confounded"] = True
             if effect.get("claim") in positive_claims | {
-                "confounded"
+                "confounded",
+                "unverified_controls",
             }:
                 effect["claim"] = "compute_confounded"
         factorial.setdefault("advisories", []).append(
@@ -17698,6 +17722,19 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         )
     if effect.get("controlled_variables_ok") is False:
         qualifiers.append("受控变量检查未通过")
+    if effect.get("uncontrolled_keys"):
+        qualifiers.append(
+            "未记录协议项: "
+            + ", ".join(
+                str(key)
+                for key in effect["uncontrolled_keys"][:6]
+            )
+            + (
+                " 等"
+                if len(effect["uncontrolled_keys"]) > 6
+                else ""
+            )
+        )
     if effect.get("structural_confounded"):
         qualifiers.append("消融结构设置混杂")
     if effect.get("compute_confounded"):
@@ -17710,6 +17747,9 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
             "harms_component": "该组件显著变差",
             "interaction_detected": "交互显著",
             "confounded": "显著但受控变量/结构混杂，不能归因",
+            "unverified_controls": (
+                "显著但关键协议项未记录，不能归因"
+            ),
             "compute_confounded": (
                 "显著但计算量不匹配，需等计算量复核"
             ),
@@ -24841,6 +24881,50 @@ def run_self_test():
         assert (
             clean_factorial["effects"][0]["claim"]
             == "supports_component"
+        )
+
+        # 「所有运行都没记录」不等于「这些控制项一致」。显著
+        # 效应必须降级为 unverified_controls，且只影响正结论，
+        # 不能把原本不显著的效应当成新发现。
+        unverified_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                },
+                {
+                    "delayed_mode": "A",
+                    "claim": "not_significant",
+                },
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            unverified_factorial,
+            {
+                "ok": True,
+                "unchecked_keys": [
+                    "device_type",
+                    "warmup_steps",
+                ],
+            },
+            {"structural_confounds": [], "compute_parity": []},
+        )
+        assert (
+            unverified_factorial["effects"][0]["claim"]
+            == "unverified_controls"
+        )
+        assert (
+            unverified_factorial["effects"][0]["uncontrolled_keys"]
+            == ["device_type", "warmup_steps"]
+        )
+        assert (
+            unverified_factorial["effects"][1]["claim"]
+            == "not_significant"
+        )
+        assert any(
+            "都没有记录" in message
+            for message in unverified_factorial["advisories"]
         )
 
         # smelt vs B 一旦出现 B，就不能当「与消融无关」：缺
