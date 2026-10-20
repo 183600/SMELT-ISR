@@ -4679,8 +4679,8 @@ def audit_data_splits(
 
     返回的 ``warnings`` 是全部提醒；``violations`` 是其中会
     被 ``--strict-data-audit`` 视为致命的问题（越界 token、
-    跨 split 重复内容、超出阈值的 UTF-8/NUL 损坏）——这些
-    问题直接对应数据泄露或标签噪声，严格模式下拒绝训练。
+    跨 split 重复内容、任何 UTF-8/NUL 损坏）——这些问题直接
+    对应数据泄露或标签噪声，严格模式下拒绝训练。
     ``leakage_violations`` 是 ``violations`` 中「跨 split 内容
     重复」这一类纯泄露问题：默认训练入口也会拒绝它们，除非
     显式传入 ``--allow-data-leakage``。损坏/标签噪声仍由
@@ -4880,10 +4880,7 @@ def audit_data_splits(
         replacement_share = (
             integrity["utf8_replacements"] / split_bytes
         )
-        if (
-            integrity["utf8_replacements"] > 0
-            and replacement_share > _AUDIT_UTF8_REPLACE_WARN
-        ):
+        if integrity["utf8_replacements"] > 0:
             message = (
                 f"{split}: 检测到 "
                 f"{integrity['utf8_replacements']} 处无法按"
@@ -4891,20 +4888,22 @@ def audit_data_splits(
                 f"（占比 {replacement_share:.4f}），"
                 "疑似语料损坏（字节级标签噪声）"
             )
-            warnings.append(message)
+            # 严格模式对任何标签噪声都必须拒绝：低频损坏同样会
+            # 污染监督位。默认模式只在占比超过告警阈值时打印
+            # 警告，但严格判定不依赖该阈值。
+            if replacement_share > _AUDIT_UTF8_REPLACE_WARN:
+                warnings.append(message)
             violations.append(message)
 
         nul_share = integrity["nul_bytes"] / split_bytes
-        if (
-            integrity["nul_bytes"] > 0
-            and nul_share > _AUDIT_NUL_WARN
-        ):
+        if integrity["nul_bytes"] > 0:
             message = (
                 f"{split}: 检测到 {integrity['nul_bytes']} 个"
                 f"NUL 字节（占比 {nul_share:.4f}），"
                 "疑似二进制/填充污染"
             )
-            warnings.append(message)
+            if nul_share > _AUDIT_NUL_WARN:
+                warnings.append(message)
             violations.append(message)
 
         top_byte_share = float(top_share[0])
@@ -22083,6 +22082,42 @@ def run_self_test():
     assert corrupt_audit["leakage_violations"] == []
     assert enforce_data_leakage_gate(corrupt_audit)
 
+    # 低频标签噪声：占比低于告警阈值时默认不打印警告，但严格
+    # 模式必须仍然拒绝训练（不能用比例阈值把少量脏标签洗白）。
+    low_noise_rng = random.Random(20241021)
+    low_noise_body = bytes(
+        low_noise_rng.choice(
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+        for _ in range(20000)
+    )
+    low_noise_body = (
+        low_noise_body[:10000] + b"\xff" + low_noise_body[10000:]
+    )
+    with tempfile.NamedTemporaryFile() as low_noise_file:
+        low_noise_file.write(low_noise_body)
+        low_noise_file.flush()
+
+        low_noise_dataset = ByteDataset(
+            low_noise_file.name,
+            seq_len=8,
+        )
+        low_noise_audit = audit_data_splits(
+            low_noise_dataset,
+            include_test=True,
+        )
+
+    assert (
+        low_noise_audit["splits"]["train"]["utf8_replacements"] == 1
+    )
+    assert low_noise_audit["violations"]
+    assert not any(
+        "UTF-8" in warning
+        for warning in low_noise_audit["warnings"]
+    )
+    assert not enforce_strict_data_audit(low_noise_audit)
+    assert low_noise_audit["leakage_violations"] == []
+
     # 多字节 UTF-8 字符横跨 split 边界不能产生假阳性「标签
     # 噪声」：文件整体合法，切分只是诊断视角。字符「€」的
     # 三个字节中，前两个落在 train 末尾、最后一个落在 val 开头。
@@ -29608,7 +29643,7 @@ def main():
         action="store_true",
         help=(
             "严格数据审计：训练前的 train/val 审计或解封测试集"
-            "时的审计只要发现越界 token 或超阈值的 UTF-8/NUL "
+            "时的审计只要发现越界 token 或任何 UTF-8/NUL "
             "损坏等标签噪声，就拒绝开始训练/拒绝解封测试集"
             "（跨 split 重复内容已由默认泄露门拦截）"
         ),
