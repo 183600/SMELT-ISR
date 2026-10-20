@@ -2635,7 +2635,7 @@ def _valid_window_start_intervals(
 
 
 def _plan_train_group_dedup(
-    raw: memoryview,
+    raw: bytearray,
     separator: bytes,
     train_end: int,
     eval_ranges: Dict[str, Tuple[int, int]],
@@ -3011,7 +3011,7 @@ class ByteDataset:
 
         if deduplicate_train_groups:
             excluded, cleaning_stats = _plan_train_group_dedup(
-                self._raw,
+                self._raw_buffer,
                 group_separator,
                 n_train,
                 {
@@ -20469,6 +20469,51 @@ def run_self_test():
         "test": 1,
     }
     assert grouped_audit["violations"] == []
+
+    # 训练集群组去重必须走真实 ByteDataset 路径：规划函数需要
+    # 可 find 的原始缓冲区，而不是只读 memoryview。
+    dedup_groups = [
+        b"A" * 10,
+        b"B" * 10,
+        b"A" * 10,
+        b"C" * 10,
+        b"B" * 10,
+        b"D" * 10,
+    ]
+    dedup_payload = separator.join(dedup_groups) + separator
+    with tempfile.NamedTemporaryFile() as dedup_file:
+        dedup_file.write(dedup_payload)
+        dedup_file.flush()
+
+        dedup_dataset = ByteDataset(
+            dedup_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+            deduplicate_train_groups=True,
+        )
+
+    assert dedup_dataset.split_bounds["train"] == (0, 48)
+    assert dedup_dataset.train_excluded_spans == [
+        (12, 22),
+        (24, 34),
+    ]
+    assert dedup_dataset.train_cleaning["groups_total"] == 4
+    assert dedup_dataset.train_cleaning["groups_kept"] == 2
+    assert dedup_dataset.train_cleaning[
+        "dropped_duplicate_of"
+    ] == {"val": 1, "test": 0, "train": 1}
+    assert dedup_dataset.train_num_valid_starts == 10
+
+    dedup_x, _ = dedup_dataset.batch(
+        "train",
+        32,
+        torch.Generator().manual_seed(7),
+        eval_device,
+    )
+    assert int(dedup_x.min()) >= 10
+    assert 66 not in set(dedup_x.flatten().tolist())
 
     # 名义位置不落在边界上时必须吸附到最近的群组边界。
     separator_five = b"<END>"
