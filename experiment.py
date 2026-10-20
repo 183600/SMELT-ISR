@@ -4441,6 +4441,14 @@ def audit_data_splits(
             "fraction": actual_fraction,
             "nominal_fraction": nominal_fraction,
             "windows": scans[split]["total"],
+            "effective_windows": (
+                dataset.train_num_valid_starts
+                if (
+                    split == "train"
+                    and dataset.train_excluded_spans
+                )
+                else scans[split]["total"]
+            ),
             "invalid_tokens": invalid,
             "utf8_replacements": integrity["utf8_replacements"],
             "nul_bytes": integrity["nul_bytes"],
@@ -4701,7 +4709,15 @@ def print_data_audit(report: Dict[str, object]) -> None:
     """打印数据审计摘要与全部警告。"""
     splits = report.get("splits", {})
     parts = [
-        f"{name}={info['bytes']}B"
+        (
+            f"{name}={info['bytes']}B"
+            + (
+                f"(有效 {info['effective_bytes']}B)"
+                if info.get("effective_bytes")
+                != info.get("bytes")
+                else ""
+            )
+        )
         for name, info in splits.items()
     ]
     print("[data] 数据审计: " + ", ".join(parts))
