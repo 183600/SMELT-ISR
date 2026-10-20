@@ -6222,6 +6222,13 @@ def confusion_matrix_metrics(
 # 逐 token 重采样会低估不确定性。
 _EVAL_BOOTSTRAP_CI_LEVEL = 0.95
 
+# 评估窗口 lag-1 自相关达到该阈值时，把 bootstrap 区间按
+# AR(1) 方差膨胀因子放宽（见 _bootstrap_eval_intervals）。
+# 0.3 是「明显正自相关」的经验门槛：低于它时样本 ρ̂1 本身
+# 的抽样噪声与调整量同量级，调整反而引入随机扰动；只放宽
+# 不收窄，负相关不用于把区间做窄。
+_EVAL_WINDOW_AUTOCORRELATION = 0.3
+
 
 def _eval_bootstrap_seed(
     data_sha256: str,
@@ -6350,10 +6357,56 @@ def _bootstrap_eval_intervals(
             dtype=torch.float64,
         )
 
+    # 窗口间 lag-1 自相关：bootstrap 把窗口当 i.i.d. 抽样单位，
+    # 但固定窗口沿评估序列排列，窗口指标常随数据顺序渐变（同一
+    # 类块、主题相邻等），正自相关会让区间偏窄。报告 ρ̂1 与
+    # AR(1) 有效窗口数 n·(1-ρ)/(1+ρ)；ρ̂1 达到阈值时按方差
+    # 膨胀因子 √(n/n_eff) 放宽全部区间（以区间中点为中心等比
+    # 放大，一阶近似；只放宽不收窄，负相关不用于缩窄区间）。
+    per_window_loss = (
+        window_loss_sums.to(torch.float64)
+        / window_tokens.to(torch.float64).clamp_min(1.0)
+    )
+    rho1: Optional[float] = None
+    if n_windows >= 4:
+        head = per_window_loss[:-1]
+        tail = per_window_loss[1:]
+        head = head - head.mean()
+        tail = tail - tail.mean()
+        denominator = torch.sqrt(
+            (head * head).sum() * (tail * tail).sum()
+        )
+        if float(denominator) > 0.0:
+            raw_rho = float((head * tail).sum() / denominator)
+            rho1 = max(-1.0, min(1.0, raw_rho))
+
+    effective_windows = float(n_windows)
+    inflation = 1.0
+    if rho1 is not None:
+        if rho1 >= 0.999:
+            effective_windows = 1.0
+        else:
+            effective_windows = max(
+                1.0,
+                min(
+                    float(n_windows),
+                    float(n_windows)
+                    * (1.0 - rho1)
+                    / (1.0 + rho1),
+                ),
+            )
+        if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
+            inflation = math.sqrt(
+                float(n_windows) / effective_windows
+            )
+
     result: Dict[str, object] = {
         "bootstrap_replicates": int(replicates),
         "bootstrap_windows": n_windows,
         "bootstrap_ci_level": float(ci_level),
+        "window_lag1_autocorrelation": rho1,
+        "window_effective_windows": effective_windows,
+        "window_ci_inflation": inflation,
     }
 
     for name, values in (
@@ -6365,6 +6418,11 @@ def _bootstrap_eval_intervals(
         if name == "macro_f1" and not bool(mask.any()):
             continue
         low, high = _percentile_interval(values, ci_level)
+        if inflation > 1.0:
+            midpoint = (low + high) / 2.0
+            half_width = (high - low) / 2.0 * inflation
+            low = midpoint - half_width
+            high = midpoint + half_width
         result[f"{name}_ci95_low"] = low
         result[f"{name}_ci95_high"] = high
 
@@ -21713,6 +21771,36 @@ def print_comparison_analysis(
     for message in imbalance["advisories"]:
         print(f"  [note] {message}")
 
+    # 评估窗口自相关：bootstrap 把窗口当独立抽样单位，窗口指标
+    # 沿序列顺序正自相关时原区间偏窄；报告已按 AR(1) 放宽，这里
+    # 点名受影响的 split，避免读者把放宽后的区间仍当成窗口独立
+    # 前提下的宽度。
+    autocorrelated_splits: Dict[str, float] = {}
+    for row in rows:
+        for key, value in row.items():
+            if not isinstance(key, str) or not key.endswith(
+                "_window_lag1_autocorrelation"
+            ):
+                continue
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value)
+                >= _EVAL_WINDOW_AUTOCORRELATION
+            ):
+                autocorrelated_splits[key] = float(value)
+    if autocorrelated_splits:
+        print(
+            "  [warn] 以下评估 split 的窗口 lag-1 自相关 ρ̂ ≥ "
+            f"{_EVAL_WINDOW_AUTOCORRELATION}（bootstrap 区间已按 "
+            "AR(1) 方差膨胀放宽；窗口不独立时未调整的区间会"
+            "偏窄，跨实验比较请保持同一窗口口径）: "
+            + "; ".join(
+                f"{key}={autocorrelated_splits[key]:.2f}"
+                for key in sorted(autocorrelated_splits)
+            )
+        )
+
     # 效率与精度权衡：涨点必须与参数量/计算量等一起看。
     cost_rows = [
         aggregate
@@ -28169,6 +28257,81 @@ def run_self_test():
     assert abs(
         float(constant_boot["loss_ci95_high"]) - 0.5
     ) < 1e-12
+    # 零窗口间变异 ⇒ 无自相关可估：ρ̂ 记为 None、不调整区间。
+    assert constant_boot["window_lag1_autocorrelation"] is None
+    assert float(constant_boot["window_ci_inflation"]) == 1.0
+    assert (
+        float(constant_boot["window_effective_windows"])
+        == float(windows)
+    )
+
+    # ---- 评估窗口自相关：bootstrap 区间按 AR(1) 放宽 ----
+    # 沿序列单调上升的窗口 loss 是强正自相关（ρ̂1 高），
+    # 区间必须放宽且有效窗口数下降；同一组数值换个顺序
+    # （强负相关）不得放宽——只放宽不收窄。
+    trend_totals = torch.tensor(
+        [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+        dtype=torch.float64,
+    )
+    trend_tokens = torch.full(
+        (8,), 10.0, dtype=torch.float64
+    )
+    shuffled_totals = torch.tensor(
+        [10.0, 80.0, 20.0, 70.0, 30.0, 60.0, 40.0, 50.0],
+        dtype=torch.float64,
+    )
+    trend_tp = torch.zeros((8, 4), dtype=torch.int64)
+    trend_pred = torch.zeros_like(trend_tp)
+    trend_sup = torch.zeros_like(trend_tp)
+    for row in range(8):
+        trend_tp[row, row % 4] = 6
+        trend_pred[row, row % 4] = 6
+        trend_sup[row, row % 4] = 8
+    trend_boot = _bootstrap_eval_intervals(
+        trend_totals,
+        trend_tokens,
+        trend_tp,
+        trend_pred,
+        trend_sup,
+        present,
+        replicates=200,
+        seed=11,
+    )
+    trend_rho = trend_boot["window_lag1_autocorrelation"]
+    assert isinstance(trend_rho, float)
+    assert trend_rho >= _EVAL_WINDOW_AUTOCORRELATION, trend_rho
+    assert float(trend_boot["window_ci_inflation"]) > 1.0
+    trend_effective = float(
+        trend_boot["window_effective_windows"]
+    )
+    assert 1.0 <= trend_effective < 8.0
+    assert (
+        float(trend_boot["loss_ci95_low"])
+        <= float(trend_totals.sum() / trend_tokens.sum())
+        <= float(trend_boot["loss_ci95_high"])
+    )
+    trend_width = (
+        float(trend_boot["loss_ci95_high"])
+        - float(trend_boot["loss_ci95_low"])
+    )
+    shuffled_boot = _bootstrap_eval_intervals(
+        shuffled_totals,
+        trend_tokens,
+        trend_tp,
+        trend_pred,
+        trend_sup,
+        present,
+        replicates=200,
+        seed=11,
+    )
+    assert float(shuffled_boot["window_ci_inflation"]) == 1.0
+    shuffled_width = (
+        float(shuffled_boot["loss_ci95_high"])
+        - float(shuffled_boot["loss_ci95_low"])
+    )
+    assert trend_width > shuffled_width
+    # ρ̂ 只依赖窗口顺序与数值，与 bootstrap 随机数无关。
+    assert float(shuffled_boot["window_effective_windows"]) > 1.0
 
     # ---- 对比分析：多重比较校正与置信区间 ----
     # Holm step-down（FWER）：m=3 时最小的两个 p 值分别乘以

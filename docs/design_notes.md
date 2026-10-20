@@ -170,7 +170,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   与跨种子 t 检验（回答「换训练种子」）互补。同时记录
   `eval_windows` 与 `eval_window_overlap_fraction`：窗口重叠
   时 bootstrap 的重采样单位并不独立，区间会偏窄，读者不能
-  把重叠窗口的区间当作独立样本精度。
+  把重叠窗口的区间当作独立样本精度。窗口不重叠时也检测
+  lag-1 自相关（`window_lag1_autocorrelation`、
+  `window_effective_windows`、`window_ci_inflation`，阈值
+  `_EVAL_WINDOW_AUTOCORRELATION`）：沿评估序列的正相关同样
+  违反窗口独立前提，达到阈值即按 AR(1) 方差膨胀放宽区间。
 - `_paired_sign_flip_test`、`_leave_one_out_effect_stability`：
   配对符号翻转（randomization）检验与 leave-one-out 稳健性。
   n≤12 精确枚举全部 2^n 符号组合，n>12 用固定种子 Monte
@@ -383,7 +387,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   token accuracy / macro F1，`--eval-bootstrap` 控制重采样
   次数，0 关闭）。它量化「换一批同分布评估窗口」的抽样
   波动，与跨种子方差是两种不同的不确定性来源；窗口数为 1
-  或指标退化时区间退化为点估计而不是虚构精度。
+  或指标退化时区间退化为点估计而不是虚构精度。窗口重叠比例
+  （`*_eval_window_overlap_fraction`）已随指标落盘；窗口即便
+  不重叠也可能沿评估序列正自相关（同主题/同类块相邻），而
+  bootstrap 把窗口当 i.i.d. 抽样单位，正自相关会让区间偏窄。
+  因此报告额外给出窗口 loss 率的 lag-1 自相关 `window_lag1_`
+  `autocorrelation` 与 AR(1) 有效窗口数 `window_effective_`
+  `windows` = n·(1−ρ)/(1+ρ)，并在 ρ̂ ≥ 0.3（`_EVAL_WINDOW_`
+  `AUTOCORRELATION`，阈值低于此值时样本 ρ̂ 的抽样噪声与调整
+  量同量级）时按方差膨胀因子 √(n/n_eff) 以区间中点为中心
+  等比放宽全部四个区间（`window_ci_inflation`；只放宽不收窄，
+  负相关不用于把区间做窄），展示层对受影响的 split 发
+  `[warn]`，避免放宽后的区间仍被当成窗口独立前提下的宽度。
   **选型偏差的无偏口径**：final 的 val 指标来自验证集选中的
   checkpoint，同一批数据既选型又判定会产生 winner's curse。
   `--compare` 对所有周期验证实际计算的指标（loss / ppl / bpb /
