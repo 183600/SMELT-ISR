@@ -3161,6 +3161,17 @@ class ByteDataset:
         return "test" in self._windows
 
     @property
+    def split_fractions(self) -> Dict[str, float]:
+        """
+        各 split 的实际字节占比（吸附到群组边界后的真实值）。
+        """
+        total = max(1, self.num_bytes)
+        return {
+            split: (end - begin) / total
+            for split, (begin, end) in self.split_bounds.items()
+        }
+
+    @property
     def effective_train_bytes(self) -> int:
         """
         实际参与训练统计的 train 字节数（扣除被清洗群组）。
@@ -3895,6 +3906,12 @@ _AUDIT_UTF8_REPLACE_WARN = 1e-3
 # （文本语料中 NUL 基本只来自错误编码或文件拼接损坏）。
 _AUDIT_NUL_WARN = 1e-4
 
+# 实际 split 比例相对名义值漂移超过该幅度（且绝对差
+# 至少 _AUDIT_SPLIT_FRACTION_MIN_ABS）时告警：群组边界
+# 吸附可能把验证/测试集缩小到名义比例的一小部分。
+_AUDIT_SPLIT_FRACTION_DRIFT = 0.2
+_AUDIT_SPLIT_FRACTION_MIN_ABS = 0.01
+
 
 def _js_distance(
     p: torch.Tensor,
@@ -4328,6 +4345,17 @@ def audit_data_splits(
                 ]
                 integrity["nul_bytes"] += part["nul_bytes"]
 
+        nominal_fraction = {
+            "train": (
+                1.0
+                - dataset.val_fraction
+                - dataset.test_fraction
+            ),
+            "val": dataset.val_fraction,
+            "test": dataset.test_fraction,
+        }[split]
+        actual_fraction = dataset.split_fractions[split]
+
         splits_report[split] = {
             "bytes": end - begin,
             "effective_bytes": (
@@ -4335,6 +4363,8 @@ def audit_data_splits(
                 if split == "train"
                 else end - begin
             ),
+            "fraction": actual_fraction,
+            "nominal_fraction": nominal_fraction,
             "windows": scans[split]["total"],
             "invalid_tokens": invalid,
             "utf8_replacements": integrity["utf8_replacements"],
@@ -4389,6 +4419,19 @@ def audit_data_splits(
             warnings.append(
                 f"{split}: 最高频字节占比 "
                 f"{top_byte_share:.3f}，疑似填充/退化数据"
+            )
+
+        if nominal_fraction > 0.0 and abs(
+            actual_fraction - nominal_fraction
+        ) > max(
+            _AUDIT_SPLIT_FRACTION_MIN_ABS,
+            _AUDIT_SPLIT_FRACTION_DRIFT * nominal_fraction,
+        ):
+            warnings.append(
+                f"{split}: 实际占比 {actual_fraction:.4f} "
+                f"偏离名义值 {nominal_fraction:.4f}"
+                "（群组边界吸附或语料大小导致），"
+                "评估集规模/统计功效可能与预期不符"
             )
 
     distribution_shift: Dict[str, float] = {}
@@ -4511,6 +4554,10 @@ def audit_data_splits(
     return {
         "max_windows": max_windows,
         "splits": splits_report,
+        "split_fractions": {
+            split: info["fraction"]
+            for split, info in splits_report.items()
+        },
         "distribution_shift": distribution_shift,
         "duplicate_windows": duplicate_windows,
         "groups": groups_report,
@@ -6871,6 +6918,10 @@ def run_statistical_baseline(
                 split: list(bounds)
                 for split, bounds in dataset.split_bounds.items()
             },
+            "split_fractions": dataset.split_fractions,
+            "effective_train_bytes": (
+                dataset.effective_train_bytes
+            ),
             "train_cleaning": dataset.train_cleaning,
             "group_cuts": (
                 dict(dataset.group_cuts)
@@ -19166,6 +19217,12 @@ def write_run_config(
             split: list(bounds)
             for split, bounds in dataset.split_bounds.items()
         }
+        payload["data"]["split_fractions"] = (
+            dataset.split_fractions
+        )
+        payload["data"]["effective_train_bytes"] = (
+            dataset.effective_train_bytes
+        )
         payload["data"]["train_cleaning"] = dataset.train_cleaning
         payload["data"]["group_cuts"] = (
             dict(dataset.group_cuts)
@@ -21110,6 +21167,27 @@ def run_self_test():
         "val": 1,
         "test": 1,
     }
+
+    # 吸附后的真实划分比例必须被记录；明显偏离名义比例
+    #（这里 val/test 名义 0.2、实际 0.25）必须给出告警。
+    assert aligned_dataset.split_fractions == {
+        "train": 0.5,
+        "val": 0.25,
+        "test": 0.25,
+    }
+    aligned_audit = audit_data_splits(
+        aligned_dataset,
+        include_test=True,
+    )
+    assert aligned_audit["split_fractions"] == {
+        "train": 0.5,
+        "val": 0.25,
+        "test": 0.25,
+    }
+    assert any(
+        "偏离名义值" in warning
+        for warning in aligned_audit["warnings"]
+    )
 
     # 群组过大、无法在保证每段最小长度的情况下整体划分：
     # 必须显式报错，而不是拆分群组或产生空 split。
