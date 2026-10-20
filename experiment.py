@@ -11989,6 +11989,85 @@ def _process_peak_rss_mb() -> Optional[float]:
         return None
 
 
+def _percentile(
+    sorted_values: List[float],
+    fraction: float,
+) -> Optional[float]:
+    """线性插值分位数；空列表返回 None。"""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    position = (len(sorted_values) - 1) * fraction
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(sorted_values[lower])
+    weight = position - lower
+    return float(
+        sorted_values[lower] * (1.0 - weight)
+        + sorted_values[upper] * weight
+    )
+
+
+def _timing_summary(
+    timings: List[float],
+    unit_scale: float = 1e3,
+) -> Dict[str, object]:
+    """
+    计时分布摘要：中位数之外还报告 p95/p99、标准差与变异
+    系数。只报单次中位数会把「偶发长尾」隐藏掉——对部署而言
+    p99 延迟和均值稳定性往往比中位数更重要，跨运行的成本
+    倍率也需要离散度才能判断是否只是计时噪声。
+    """
+    if not timings:
+        return {
+            "n": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "p99": None,
+            "min": None,
+            "max": None,
+            "std": None,
+            "coefficient_of_variation": None,
+        }
+
+    ordered = sorted(float(value) for value in timings)
+    count = len(ordered)
+    mean = sum(ordered) / count
+    variance = (
+        sum((value - mean) ** 2 for value in ordered)
+        / (count - 1)
+        if count > 1
+        else 0.0
+    )
+    std = math.sqrt(variance)
+
+    return {
+        "n": count,
+        "mean": round(mean * unit_scale, 6),
+        "median": round(
+            float(_percentile(ordered, 0.5)) * unit_scale,
+            6,
+        ),
+        "p95": round(
+            float(_percentile(ordered, 0.95)) * unit_scale,
+            6,
+        ),
+        "p99": round(
+            float(_percentile(ordered, 0.99)) * unit_scale,
+            6,
+        ),
+        "min": round(ordered[0] * unit_scale, 6),
+        "max": round(ordered[-1] * unit_scale, 6),
+        "std": round(std * unit_scale, 6),
+        "coefficient_of_variation": (
+            round(std / mean, 6) if mean > 0.0 else None
+        ),
+    }
+
+
 def measure_efficiency(
     model: nn.Module,
     dataset: ByteDataset,
@@ -12000,6 +12079,9 @@ def measure_efficiency(
 ) -> Dict[str, object]:
     """
     效率测量：参数量、前向 FLOPs 等模型规模指标。
+
+    计时同时报告中位数与 p95/p99、标准差、变异系数及原始
+    样本，避免用单次中位数掩盖长尾或把计时噪声当成方法差异。
 
     本测量在训练结束时对当前模型测一次，与精度指标一起写入
     config.json 与 metrics.jsonl（``{"step": "efficiency", ...}``）。
@@ -12032,6 +12114,8 @@ def measure_efficiency(
     training_step_seconds = None
     inference_peak_mb = None
     training_peak_mb = None
+    inference_timing_summary = _timing_summary([])
+    training_timing_summary = _timing_summary([])
 
     try:
         model.eval()
@@ -12058,6 +12142,7 @@ def measure_efficiency(
 
         timings.sort()
         latency_seconds = timings[len(timings) // 2]
+        inference_timing_summary = _timing_summary(timings)
 
         # 训练步计时（前向 + 反向，不含优化器更新）与推理
         # 计时使用同一 warmup/iters 口径，取中位数。
@@ -12100,6 +12185,9 @@ def measure_efficiency(
         training_step_seconds = training_timings[
             len(training_timings) // 2
         ]
+        training_timing_summary = _timing_summary(
+            training_timings
+        )
         del output
 
         if device.type == "cuda":
@@ -12145,6 +12233,21 @@ def measure_efficiency(
         "training_ms_note": (
             "前向+反向的中位计时；不含优化器更新/梯度裁剪"
         ),
+        # 完整计时分布（毫秒）：median 之外给 p95/p99、std 与
+        # 变异系数，并保留逐次原始样本供复核。单次中位数无法
+        # 区分「稳定快」与「偶发长尾」。
+        "latency_ms": inference_timing_summary,
+        "training_ms": training_timing_summary,
+        "timing_samples_seconds": {
+            "inference": [
+                round(float(value), 9)
+                for value in timings
+            ],
+            "training": [
+                round(float(value), 9)
+                for value in training_timings
+            ],
+        },
         "throughput_tokens_per_sec": (
             round(tokens / latency_seconds, 2)
             if latency_seconds
@@ -12192,6 +12295,23 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
         f"throughput="
         f"{_format(efficiency.get('throughput_tokens_per_sec'), 'tok/s')}"
     )
+    for label, key in (
+        ("inference", "latency_ms"),
+        ("train_step", "training_ms"),
+    ):
+        summary = efficiency.get(key)
+        if not isinstance(summary, dict) or not summary.get("n"):
+            continue
+        print(
+            f"[efficiency] {label} 分布（n={summary['n']}）: "
+            f"p50={_format(summary.get('median'), 'ms')} "
+            f"p95={_format(summary.get('p95'), 'ms')} "
+            f"p99={_format(summary.get('p99'), 'ms')} "
+            f"std={_format(summary.get('std'), 'ms')} "
+            "CV="
+            f"{_format(summary.get('coefficient_of_variation'), '', '.1%')}"
+            f" max={_format(summary.get('max'), 'ms')}"
+        )
     print(
         "[efficiency] "
         f"inference_peak="
@@ -26042,7 +26162,7 @@ def run_self_test():
         batch_size=2,
         amp_dtype=None,
         warmup=0,
-        iters=1,
+        iters=3,
     )
 
     assert efficiency["n_params_total"] == sum(
@@ -26058,6 +26178,33 @@ def run_self_test():
     # 训练步计时（前向+反向）必须为正。
     assert efficiency["training_ms_per_step"] is not None
     assert float(efficiency["training_ms_per_step"]) > 0.0
+
+    # 效率测量必须给出分布与尾部，而不是只有一个中位数；
+    # p95/p99 不得低于中位数，样本数必须与 iters 一致。
+    for summary_key, expected_n in (
+        ("latency_ms", 3),
+        ("training_ms", 3),
+    ):
+        summary = efficiency[summary_key]
+        assert summary["n"] == expected_n, summary
+        assert summary["median"] is not None
+        assert summary["p95"] >= summary["median"]
+        assert summary["p99"] >= summary["p95"]
+        assert summary["std"] >= 0.0
+        assert summary["max"] >= summary["min"]
+        if summary["mean"] and summary["mean"] > 0:
+            assert (
+                summary["coefficient_of_variation"]
+                is not None
+            )
+    assert len(
+        efficiency["timing_samples_seconds"]["inference"]
+    ) == 3
+    assert len(
+        efficiency["timing_samples_seconds"]["training"]
+    ) == 3
+    assert _percentile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.5
+    assert _percentile([], 0.95) is None
     assert (
         efficiency["flops_per_forward"] is None
         or int(efficiency["flops_per_forward"]) > 0
