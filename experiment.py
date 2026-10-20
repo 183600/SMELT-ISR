@@ -3033,6 +3033,20 @@ class ByteDataset:
                     "test": (n_val_end, len(tokens)),
                 },
             )
+            merged_excluded = _merge_byte_intervals(excluded)
+            if merged_excluded != excluded:
+                raise AssertionError(
+                    "训练集清洗区间必须有序且互不重叠："
+                    "内部错误，拒绝继续"
+                )
+            if any(
+                start < 0 or end > n_train or end <= start
+                for start, end in merged_excluded
+            ):
+                raise AssertionError(
+                    "训练集清洗区间越出 train split："
+                    "内部错误，拒绝继续"
+                )
             self.train_excluded_spans = excluded
             self.train_cleaning = cleaning_stats
 
@@ -3759,6 +3773,104 @@ def probe_data_pipeline(
             )
     except (AssertionError, RuntimeError, ValueError) as error:
         failures.append(f"验证固定窗口检查抛出异常: {error}")
+
+    # ---- 群组边界：独立核对「任何群组不跨 split」----
+    if dataset.group_separator is not None:
+        report["group_boundaries_checked"] = True
+        separator = dataset.group_separator
+
+        for split, (begin, _) in bounds.items():
+            if begin <= 0:
+                continue
+            prefix = bytes(
+                dataset._raw[
+                    begin - len(separator):begin
+                ]
+            )
+            if prefix != separator:
+                failures.append(
+                    f"{split} split 起点不在群组分隔符之后"
+                    "（群组可能被拆到两侧）"
+                )
+
+        if dataset.groups_per_split is not None:
+            recounted = dict(
+                zip(
+                    ("train", "val", "test"),
+                    _count_groups(
+                        dataset._raw_buffer,
+                        separator,
+                        [val_bounds[0], val_bounds[1]],
+                    ),
+                )
+            )
+            if recounted != dataset.groups_per_split:
+                failures.append(
+                    "群组计数与构造记录不一致（群组划分"
+                    "可能被破坏）"
+                )
+
+    # ---- 训练集群组清洗：窗口不得触碰被剔除群组 ----
+    if dataset.train_excluded_spans:
+        report["train_cleaning_checked"] = True
+        merged = _merge_byte_intervals(
+            dataset.train_excluded_spans
+        )
+
+        if merged != list(dataset.train_excluded_spans):
+            failures.append(
+                "训练集清洗区间无序或重叠"
+            )
+
+        if any(
+            start < 0 or end > len(dataset.train)
+            for start, end in merged
+        ):
+            failures.append(
+                "训练集清洗区间越出 train split"
+            )
+
+        cleaning = dataset.train_cleaning or {}
+        dropped_bytes = sum(
+            end - start for start, end in merged
+        )
+        if int(cleaning.get("dropped_bytes", -1)) != dropped_bytes:
+            failures.append(
+                "训练集清洗统计的 dropped_bytes 与"
+                "实际排除区间不一致"
+            )
+        if int(
+            cleaning.get("post_clean_train_bytes", -1)
+        ) != len(dataset.train) - dropped_bytes:
+            failures.append(
+                "训练集清洗统计的剩余字节数不一致"
+            )
+
+        probe_starts = dataset._sample_train_starts(
+            32,
+            torch.Generator().manual_seed(seed + 1),
+        )
+        for start in probe_starts.tolist():
+            window_end = start + seq_len
+            if any(
+                low <= window_end and high > start
+                for low, high in merged
+            ):
+                failures.append(
+                    "训练批采样窗口触碰被清洗群组"
+                    "（清洗内容仍会进入训练）"
+                )
+                break
+
+        if _valid_window_start_intervals(
+            len(dataset.train) - seq_len,
+            seq_len,
+            merged,
+        ) is None:
+            failures.append(
+                "训练集存在清洗区间但没有生成合法"
+                "起点区间"
+            )
 
     report["ok"] = not failures
     return report
@@ -20958,6 +21070,16 @@ def run_self_test():
     )
     assert dedup_audit["splits"]["train"]["effective_bytes"] == 28
     assert dedup_audit["splits"]["train"]["bytes"] == 48
+
+    dedup_probe = probe_data_pipeline(
+        dedup_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert dedup_probe["ok"], dedup_probe["failures"]
+    assert dedup_probe["train_cleaning_checked"]
+    assert dedup_probe["group_boundaries_checked"]
 
     # 名义位置不落在边界上时必须吸附到最近的群组边界。
     separator_five = b"<END>"
