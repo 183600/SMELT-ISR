@@ -9120,6 +9120,21 @@ _BAD_CASE_RARE_TARGET_SHARE = 0.005
 # 视为系统性混淆（模型盲区），而不是孤立个例。
 _BAD_CASE_SYSTEMATIC_COUNT = 3
 
+# 置信度校准：ECE 的分箱数与「高置信度错误」的阈值。ECE 衡量
+# 模型自报概率与真实正确率之间的平均差距；只看 accuracy 会把
+# 「自信地答错」与「不确定地答错」混为一谈。
+_BAD_CASE_CALIBRATION_BINS = 10
+_BAD_CASE_OVERCONFIDENT_THRESHOLD = 0.9
+
+# 标签噪声核验：在训练集里用「目标字节前 K 个字节」作为上下文
+# 查找同一上下文的后续字节。只有训练集中同一上下文反复出现、
+# 且评估目标不是该上下文的主流后续字节时，才有证据把错误标为
+# 疑似标注错误；否则「稀有目标 + 高置信度」更可能是模型盲区
+# 或评估抽样波动，不能仅凭此归因于标注。
+_BAD_CASE_LABEL_CONTEXT = 8
+_BAD_CASE_LABEL_MIN_SUPPORT = 2
+_BAD_CASE_LABEL_TARGET_MAX_SHARE = 0.1
+
 
 def _render_byte(value: int) -> str:
     """把单个字节渲染为可打印文本（不可打印字节用 \\xNN）。"""
@@ -9132,6 +9147,161 @@ def _render_byte(value: int) -> str:
 def _render_bytes(values) -> str:
     """把字节序列渲染为可打印文本。"""
     return "".join(_render_byte(value) for value in values)
+
+
+def _calibration_report(
+    confidence: torch.Tensor,
+    correct: torch.Tensor,
+    num_bins: int = _BAD_CASE_CALIBRATION_BINS,
+) -> Dict[str, object]:
+    """
+    计算 top1 置信度的可靠性（ECE）与过度自信程度。
+
+    ``confidence`` 是每 token 的 top1 概率，``correct`` 是
+    top1 是否命中目标。ECE = Σ (n_bin / N) · |acc_bin − conf_bin|，
+    按等宽概率分箱；它直接回答「模型说 90% 时是否真的对 90%」，
+    这是 accuracy/loss 都看不出来的性质。
+    """
+    confidence = confidence.float().reshape(-1).clamp(0.0, 1.0)
+    correct = correct.float().reshape(-1)
+    total = int(confidence.numel())
+
+    if total == 0:
+        return {
+            "ece": None,
+            "mean_confidence": None,
+            "accuracy": None,
+            "overconfidence": None,
+            "bins": [],
+            "note": "没有可校准的 token。",
+        }
+
+    ece = 0.0
+    bins = []
+    for index in range(num_bins):
+        lower = index / num_bins
+        upper = (index + 1) / num_bins
+        if index == num_bins - 1:
+            mask = (confidence >= lower) & (
+                confidence <= upper
+            )
+        else:
+            mask = (confidence >= lower) & (
+                confidence < upper
+            )
+        count = int(mask.sum().item())
+        if count == 0:
+            bins.append({
+                "lower": round(lower, 6),
+                "upper": round(upper, 6),
+                "count": 0,
+                "mean_confidence": None,
+                "accuracy": None,
+                "gap": None,
+            })
+            continue
+        mean_confidence = float(
+            confidence[mask].mean().item()
+        )
+        accuracy = float(correct[mask].mean().item())
+        gap = accuracy - mean_confidence
+        ece += (count / total) * abs(gap)
+        bins.append({
+            "lower": round(lower, 6),
+            "upper": round(upper, 6),
+            "count": count,
+            "mean_confidence": round(mean_confidence, 6),
+            "accuracy": round(accuracy, 6),
+            "gap": round(gap, 6),
+        })
+
+    mean_confidence = float(confidence.mean().item())
+    accuracy = float(correct.mean().item())
+    return {
+        "ece": round(ece, 6),
+        "mean_confidence": round(mean_confidence, 6),
+        "accuracy": round(accuracy, 6),
+        # 正值 = 过度自信（自报概率高于实际正确率）。
+        "overconfidence": round(
+            mean_confidence - accuracy,
+            6,
+        ),
+        "bins": bins,
+        "note": (
+            "ECE 为 0 表示置信度与正确率完全一致；"
+            "ECE 越大，模型自报概率越不可用于阈值决策。"
+        ),
+    }
+
+
+def _train_next_byte_evidence(
+    dataset: "ByteDataset",
+    contexts: List[bytes],
+) -> Dict[bytes, Dict[str, object]]:
+    """
+    在训练集中查找每个上下文之后实际出现的字节分布。
+
+    只扫描训练段（绝不读取 val/test），并返回支持数、主流后续
+    字节及其占比。用于核验「评估标签与训练监督是否矛盾」：
+    相同上下文在训练中反复以另一个字节为目标，才构成标注
+    可疑的证据；上下文未在训练中出现时只能记为无法核验。
+    """
+    evidence: Dict[bytes, Dict[str, object]] = {}
+    unique_contexts = sorted(set(contexts))
+
+    if not unique_contexts:
+        return evidence
+
+    train_end = dataset.split_bounds["train"][1]
+    train_bytes = bytes(dataset._raw_buffer[:train_end])
+
+    for context in unique_contexts:
+        counts: Dict[int, int] = {}
+        support = 0
+        start = 0
+        while True:
+            position = train_bytes.find(context, start)
+            if position < 0:
+                break
+            next_position = position + len(context)
+            if next_position < len(train_bytes):
+                next_byte = train_bytes[next_position]
+                counts[next_byte] = (
+                    counts.get(next_byte, 0) + 1
+                )
+                support += 1
+            start = position + 1
+
+        if support == 0:
+            evidence[context] = {
+                "support": 0,
+                "majority_byte": None,
+                "majority_share": None,
+                "counts": {},
+            }
+            continue
+
+        majority_byte, majority_count = max(
+            counts.items(),
+            key=lambda item: item[1],
+        )
+        evidence[context] = {
+            "support": support,
+            "majority_byte": int(majority_byte),
+            "majority_share": round(
+                majority_count / support,
+                6,
+            ),
+            "counts": {
+                int(byte): int(count)
+                for byte, count in sorted(
+                    counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            },
+        }
+
+    return evidence
 
 
 def _bad_case_report_from_buffers(
@@ -9149,6 +9319,7 @@ def _bad_case_report_from_buffers(
     context_before: int,
     context_after: int,
     vocab_size: int,
+    dataset: Optional["ByteDataset"] = None,
 ) -> Dict[str, object]:
     """由紧凑逐 token 缓冲生成坏案例报告（供流式收集器复用）。"""
     loss_all = loss_buffer[:written]
@@ -9170,6 +9341,45 @@ def _bad_case_report_from_buffers(
         minlength=vocab_size,
     ).to(torch.float64)
     target_share = target_counts / max(1.0, float(num_tokens))
+
+    # 训练集目标分布：评估 split 中稀少的目标若在训练中很常见，
+    # 更可能是评估抽样波动/上下文特异，而不是标注错误。
+    train_target_counts: Optional[torch.Tensor] = None
+    train_target_share: Optional[torch.Tensor] = None
+    if dataset is not None:
+        train_tokens = int(dataset.train.numel())
+        if train_tokens > 0:
+            train_target_counts = torch.bincount(
+                dataset.train.to(torch.int64),
+                minlength=vocab_size,
+            ).to(torch.float64)
+            train_target_share = (
+                train_target_counts / float(train_tokens)
+            )
+
+    # 标签噪声核验：只对 top-N 候选做训练集上下文查找，避免为
+    # 全量错误 token 建索引；这些候选正是报告里被人工复核的
+    # 样本，核验结果直接决定 label_noise_suspect 归类。
+    context_evidence: Dict[bytes, Dict[str, object]] = {}
+    if dataset is not None and top_candidates:
+        candidate_contexts = []
+        for entry in top_candidates:
+            window_row = entry[2]
+            position = int(entry[3])
+            target_position = position + 1
+            begin = max(
+                0,
+                target_position - _BAD_CASE_LABEL_CONTEXT,
+            )
+            candidate_contexts.append(
+                bytes(
+                    window_row[begin:target_position].tolist()
+                )
+            )
+        context_evidence = _train_next_byte_evidence(
+            dataset,
+            candidate_contexts,
+        )
 
     # 高频混淆对：target * vocab + predicted。
     confusion_index = (
@@ -9251,6 +9461,42 @@ def _bad_case_report_from_buffers(
             ]
         )
 
+        # 窗口 = [x[0]] + y，目标 token 是窗口的第
+        # position+1 个元素（候选构建时已知）。
+        target_position = position + 1
+
+        context_begin = max(
+            0,
+            target_position - _BAD_CASE_LABEL_CONTEXT,
+        )
+        context_key = bytes(
+            window_row[
+                context_begin:target_position
+            ].tolist()
+        )
+        evidence = context_evidence.get(context_key)
+        train_context_target_share: Optional[float] = None
+        label_noise_verified = False
+        if evidence is not None:
+            support = int(evidence["support"])
+            counts = evidence["counts"]
+            if support > 0 and isinstance(counts, dict):
+                train_context_target_share = (
+                    float(counts.get(target, 0)) / support
+                )
+                label_noise_verified = bool(
+                    support >= _BAD_CASE_LABEL_MIN_SUPPORT
+                    and train_context_target_share
+                    <= _BAD_CASE_LABEL_TARGET_MAX_SHARE
+                    and int(evidence["majority_byte"]) != target
+                )
+
+        train_rare = bool(
+            train_target_share is None
+            or float(train_target_share[target])
+            < _BAD_CASE_RARE_TARGET_SHARE
+        )
+
         if margin < _BAD_CASE_AMBIGUOUS_MARGIN:
             category = "ambiguous"
         elif (
@@ -9260,16 +9506,18 @@ def _bad_case_report_from_buffers(
             category = "systematic_confusion"
         elif (
             confidence >= _BAD_CASE_CONFIDENT
+            and train_rare
             and float(target_share[target])
             < _BAD_CASE_RARE_TARGET_SHARE
+            and label_noise_verified
         ):
+            # 「稀有目标 + 高置信度」本身不是标注错误：还必须
+            # 在训练集中找到同一上下文，且训练监督的主流后续
+            # 字节与评估标签不同。
             category = "label_noise_suspect"
         else:
             category = "uncertain"
 
-        # 窗口 = [x[0]] + y，目标 token 是窗口的第
-        # position+1 个元素（候选构建时已知）。
-        target_position = position + 1
         begin = max(0, target_position - context_before)
         end = min(
             window_row.numel(),
@@ -9297,6 +9545,37 @@ def _bad_case_report_from_buffers(
             "margin": round(margin, 6),
             "category": category,
             "confusion_count": pair_count,
+            # 标签噪声核验证据：训练集同一上下文的支持数、
+            # 主流后续字节及其占比、评估目标在该上下文中的
+            # 占比。support=0 表示无法核验，不等于标注正确。
+            "label_noise_verified": label_noise_verified,
+            "train_context_support": (
+                int(evidence["support"])
+                if evidence is not None
+                else 0
+            ),
+            "train_context_majority_byte": (
+                int(evidence["majority_byte"])
+                if evidence is not None
+                and evidence.get("majority_byte") is not None
+                else None
+            ),
+            "train_context_majority_share": (
+                float(evidence["majority_share"])
+                if evidence is not None
+                and evidence.get("majority_share") is not None
+                else None
+            ),
+            "train_context_target_share": (
+                round(train_context_target_share, 6)
+                if train_context_target_share is not None
+                else None
+            ),
+            "train_target_share": (
+                round(float(train_target_share[target]), 6)
+                if train_target_share is not None
+                else None
+            ),
             "context": context,
             "window_text": _render_bytes(
                 window_row.tolist()
@@ -9316,6 +9595,14 @@ def _bad_case_report_from_buffers(
     # 类」把结论带偏。分类规则与逐案例完全一致，优先级为
     # ambiguous > systematic_confusion > label_noise_suspect
     # > uncertain。
+    train_rare_all = (
+        torch.ones_like(target_all, dtype=torch.bool)
+        if train_target_share is None
+        else (
+            train_target_share[target_all]
+            < _BAD_CASE_RARE_TARGET_SHARE
+        )
+    )
     wrong_category_code = torch.full_like(target_all, 3)
     wrong_category_code = torch.where(
         (
@@ -9324,6 +9611,10 @@ def _bad_case_report_from_buffers(
                 target_share[target_all]
                 < _BAD_CASE_RARE_TARGET_SHARE
             )
+            # 全量归因无法逐 token 做上下文查找（成本过高），
+            # 但至少要求目标在训练集同样稀少；否则「评估稀有」
+            # 只是抽样波动，不能归因于标注。
+            & train_rare_all
         ),
         torch.full_like(wrong_category_code, 2),
         wrong_category_code,
@@ -9361,6 +9652,60 @@ def _bad_case_report_from_buffers(
             else None
         )
         for name, count in error_category_counts.items()
+    }
+
+    calibration = _calibration_report(
+        confidence_all,
+        ~wrong_mask,
+    )
+    high_confidence_errors = int(
+        (
+            wrong_mask
+            & (
+                confidence_all
+                >= _BAD_CASE_OVERCONFIDENT_THRESHOLD
+            )
+        ).sum().item()
+    )
+    if wrong_tokens > 0:
+        calibration["high_confidence_error_count"] = (
+            high_confidence_errors
+        )
+        calibration["high_confidence_error_share"] = round(
+            high_confidence_errors / wrong_tokens,
+            6,
+        )
+
+    verified_label_noise = sum(
+        1
+        for case in top_cases
+        if case.get("label_noise_verified")
+    )
+    unverifiable_label_noise = sum(
+        1
+        for case in top_cases
+        if int(case.get("train_context_support") or 0) == 0
+    )
+    label_noise_verification = {
+        "context_length": _BAD_CASE_LABEL_CONTEXT,
+        "min_train_support": _BAD_CASE_LABEL_MIN_SUPPORT,
+        "max_target_share_in_context": (
+            _BAD_CASE_LABEL_TARGET_MAX_SHARE
+        ),
+        "candidates": len(top_cases),
+        "verified": verified_label_noise,
+        "unverified": len(top_cases)
+        - verified_label_noise,
+        "unverifiable_no_train_context": (
+            unverifiable_label_noise
+        ),
+        "note": (
+            "只有训练集中同一上下文有足够支持、且评估目标不是"
+            "主流后续字节时，top-N 案例才标记为 "
+            "label_noise_suspect；support=0 表示无法核验，"
+            "不能据此断定标注正确。全量错误归因只做训练/评估"
+            "目标稀有度交叉核对。"
+        ),
     }
 
     top1 = top_cases[0] if top_cases else None
@@ -9406,6 +9751,10 @@ def _bad_case_report_from_buffers(
         "category_counts": category_counts,
         "error_category_counts": error_category_counts,
         "error_category_shares": error_category_shares,
+        "calibration": calibration,
+        "label_noise_verification": (
+            label_noise_verification
+        ),
         "summary": summary,
     }
 
@@ -9432,6 +9781,7 @@ class _BadCaseCollector:
         context_after: int = 8,
         device: Optional[torch.device] = None,
     ):
+        self.dataset = dataset
         self.split = split
         self.top_n = top_n
         self.context_before = context_before
@@ -9674,6 +10024,7 @@ class _BadCaseCollector:
             self.context_before,
             self.context_after,
             vocab_size,
+            dataset=self.dataset,
         )
 
 
@@ -9703,8 +10054,14 @@ def analyze_bad_cases(
     - 高频混淆对（target→predicted）与逐目标字节错误率；
     - 错误类别统计：ambiguous（样本极其模糊）、
       systematic_confusion（同类混淆反复出现，模型盲区）、
-      label_noise_suspect（目标字节稀少但模型高置信度答错，
-      提示标注可能有误）、uncertain（其余）。
+      label_noise_suspect（目标在训练/评估中都稀少、模型高
+      置信度答错，且训练集同一上下文的主流后续字节与评估
+      标签矛盾）、uncertain（其余）；
+    - 置信度校准：ECE、平均置信度、实际准确率、过度自信
+      幅度与可靠性分箱，回答「模型说 90% 时是否真的对 90%」；
+    - 标签噪声核验：只对 top_n 候选查找训练集同上下文支持，
+      报告 support / 主流后续字节 / 目标占比，无法核验时明确
+      标记而不是默认相信。
 
     统计口径与实现：在固定窗口上流式处理全部目标 token，
     token 准确率、混淆对、逐目标错误率与错误类别归因都基于
@@ -9954,6 +10311,7 @@ def analyze_bad_cases(
             context_before,
             context_after,
             vocab_size,
+            dataset=dataset,
         )
     finally:
         model.train(was_training)
@@ -9997,6 +10355,37 @@ def print_bad_cases(report: Dict[str, object]) -> None:
                 report["category_counts"],
                 ensure_ascii=False,
             )
+        )
+
+    calibration = report.get("calibration")
+    if isinstance(calibration, dict) and calibration.get(
+        "ece"
+    ) is not None:
+        print(
+            "[bad-case] 置信度校准: "
+            f"ECE={calibration['ece']:.4f} "
+            f"平均置信度={calibration['mean_confidence']:.4f} "
+            f"实际准确率={calibration['accuracy']:.4f} "
+            "过度自信="
+            f"{calibration['overconfidence']:+.4f} "
+            "（高置信度错误 "
+            f"{calibration.get('high_confidence_error_count', 0)}"
+            " 个）"
+        )
+
+    verification = report.get(
+        "label_noise_verification"
+    )
+    if isinstance(verification, dict):
+        print(
+            "[bad-case] 标签噪声核验: "
+            f"top-N 候选 {verification['candidates']} 个，"
+            f"训练上下文支持后确认 "
+            f"{verification['verified']} 个，"
+            f"未确认 {verification['unverified']} 个"
+            "（其中 "
+            f"{verification['unverifiable_no_train_context']}"
+            " 个无训练上下文可核验）"
         )
 
     if report.get("error_category_counts"):
@@ -25542,6 +25931,61 @@ def run_self_test():
     assert set(
         bad_case_report["category_counts"].keys()
     ) <= valid_categories
+
+    # 置信度校准：ECE / 过度自信必须随报告输出，且高置信度
+    # 错误不能被 accuracy 掩盖。
+    calibration = bad_case_report["calibration"]
+    assert 0.0 <= float(calibration["ece"]) <= 1.0
+    assert -1.0 <= float(
+        calibration["overconfidence"]
+    ) <= 1.0
+    assert calibration["bins"]
+    assert int(
+        calibration["high_confidence_error_count"]
+    ) >= 0
+
+    # 标签噪声核验：top-N 案例必须带训练上下文证据；只有
+    # verified 的案例才允许归为 label_noise_suspect。
+    label_noise_check = bad_case_report[
+        "label_noise_verification"
+    ]
+    assert label_noise_check["context_length"] == (
+        _BAD_CASE_LABEL_CONTEXT
+    )
+    for case in bad_case_report["top_cases"]:
+        assert "label_noise_verified" in case
+        assert "train_context_support" in case
+        assert "train_target_share" in case
+        if case["category"] == "label_noise_suspect":
+            assert case["label_noise_verified"] is True, case
+
+    # 校准公式定向测试：conf=0.9 两例一错一对、conf=0.1 两例
+    # 一错一对，ECE 应为 0.4。
+    calibration_probe = _calibration_report(
+        torch.tensor([0.9, 0.9, 0.1, 0.1]),
+        torch.tensor([1, 0, 0, 1], dtype=torch.bool),
+    )
+    assert abs(calibration_probe["ece"] - 0.4) < 1e-6, (
+        calibration_probe
+    )
+    assert abs(
+        calibration_probe["overconfidence"] - 0.0
+    ) < 1e-6
+
+    # 训练上下文核验只读 train 段，并能给出主流后续字节。
+    context_evidence = _train_next_byte_evidence(
+        eval_dataset,
+        [bytes([10, 11]), bytes([255, 254])],
+    )
+    assert context_evidence[bytes([10, 11])][
+        "support"
+    ] == 1
+    assert context_evidence[bytes([10, 11])][
+        "majority_byte"
+    ] == 12
+    assert context_evidence[bytes([255, 254])][
+        "support"
+    ] == 0
 
     # 全量错误归因：必须覆盖全部错误 token、类别合法，且份额
     # 之和为 1；这与 top-N 统计是两套口径，不能互相替代。
