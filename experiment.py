@@ -3146,6 +3146,64 @@ class ByteDataset:
         """
         return "test" in self._windows
 
+    @property
+    def effective_train_bytes(self) -> int:
+        """
+        实际参与训练统计的 train 字节数（扣除被清洗群组）。
+
+        神经网络窗口采样已由 ``train_excluded_spans`` 屏蔽；任何
+        在 train 上拟合统计量的基线也必须使用同一口径，否则
+        被清洗的重复群组仍会进入 unigram / n-gram 计数。
+        """
+        excluded = sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                self.train_excluded_spans
+            )
+        )
+        return len(self.train) - excluded
+
+    def effective_train_byte_counts(self) -> torch.Tensor:
+        """
+        统计实际参与训练的 train 字节频次（256 个字节类）。
+
+        被 ``--deduplicate-train-groups`` 剔除的群组区间不计入；
+        返回 int64 张量，供 unigram 参考基线与数据审计的分布
+        偏移统计使用，保证它们与神经网络看到的训练数据一致。
+        """
+        try:
+            counts = torch.bincount(
+                self.train,
+                minlength=256,
+            )
+        except RuntimeError:
+            counts = torch.bincount(
+                self.train.to(torch.int64),
+                minlength=256,
+            )
+
+        for start, end in _merge_byte_intervals(
+            self.train_excluded_spans
+        ):
+            try:
+                dropped = torch.bincount(
+                    self.train[start:end],
+                    minlength=256,
+                )
+            except RuntimeError:
+                dropped = torch.bincount(
+                    self.train[start:end].to(torch.int64),
+                    minlength=256,
+                )
+            counts = counts - dropped
+
+        if bool((counts < 0).any()):
+            raise AssertionError(
+                "训练集清洗区间统计为负：内部错误，拒绝继续"
+            )
+
+        return counts
+
     def _gather_windows(
         self,
         windows: torch.Tensor,
@@ -4037,7 +4095,15 @@ def audit_data_splits(
         # 统计（uint8 天然落在 0..255，越界恒为 0）。其他
         # dtype（若日后扩展管线）回退到 int64 校验路径，
         # 保持诊断语义不变。
-        if tokens.dtype == torch.uint8:
+        if split == "train" and dataset.train_excluded_spans:
+            # 训练集群组清洗后的有效字节：被剔除的重复群组
+            # 不会进入神经网络训练，也不应进入分布偏移统计，
+            # 否则审计描述的是模型从未见过的数据。
+            hist = dataset.effective_train_byte_counts().to(
+                torch.float64
+            )
+            invalid = 0
+        elif tokens.dtype == torch.uint8:
             try:
                 hist = torch.bincount(
                     tokens,
@@ -4152,6 +4218,11 @@ def audit_data_splits(
 
         splits_report[split] = {
             "bytes": end - begin,
+            "effective_bytes": (
+                dataset.effective_train_bytes
+                if split == "train"
+                else end - begin
+            ),
             "windows": scans[split]["total"],
             "invalid_tokens": invalid,
             "utf8_replacements": integrity["utf8_replacements"],
@@ -5367,20 +5438,13 @@ def compute_reference_baselines(
     # 字节级管线的词表固定为 256。
     vocab_size = 256
 
-    # unigram 统计量只在 train 上 fit。字节管线为 uint8 时直接
-    # 统计（bincount 在旧版本 torch 上只接受 int64，失败才转换，
-    # 与 audit_data_splits 的口径一致）。
-    try:
-        train_counts = torch.bincount(
-            dataset.train,
-            minlength=vocab_size,
-        ).double()
-    except RuntimeError:
-        train_counts = torch.bincount(
-            dataset.train.to(torch.int64),
-            minlength=vocab_size,
-        ).double()
+    # unigram 统计量只在 train 上 fit，且与神经网络窗口采样
+    # 使用同一「有效训练字节」口径：被 --deduplicate-train-groups
+    # 清洗掉的重复群组不能进入基线计数，否则基线会通过重复
+    # 内容看到 val/test，比较不再公平。
+    train_counts = dataset.effective_train_byte_counts().double()
     train_total = float(train_counts.sum())
+    raw_train_total = len(dataset.train)
 
     unigram_probs = (
         train_counts + 1.0
@@ -5476,6 +5540,10 @@ def compute_reference_baselines(
         "uniform_loss": loss_uniform,
         "unigram_loss": loss_unigram,
         "unigram_train_bytes": int(train_total),
+        "unigram_train_bytes_raw": int(raw_train_total),
+        "unigram_train_excluded_bytes": int(
+            raw_train_total - train_total
+        ),
         "majority_byte": unigram_prediction,
         "unigram_token_accuracy": class_metrics[
             "token_accuracy"
@@ -5552,6 +5620,7 @@ class NgramBaseline:
         train_bytes: torch.Tensor,
         max_order: int,
         count_cap: int = _NGRAM_COUNT_CAP,
+        exclude_spans: Optional[List[Tuple[int, int]]] = None,
     ):
         if not 1 <= max_order <= _NGRAM_MAX_ORDER:
             raise ValueError(
@@ -5562,46 +5631,98 @@ class NgramBaseline:
 
         self.max_order = max_order
         self.vocab_size = 256
+        self.exclude_spans = list(exclude_spans or [])
 
         data = train_bytes
         n_train = data.numel()
 
         self.levels: Dict[int, Dict[str, torch.Tensor]] = {}
 
+        def _empty_level() -> Dict[str, torch.Tensor]:
+            return {
+                "pair_keys": torch.empty(
+                    0,
+                    dtype=torch.int64,
+                ),
+                "pair_counts": torch.empty(
+                    0,
+                    dtype=torch.int64,
+                ),
+                "ctx_uniq": torch.empty(
+                    0,
+                    dtype=torch.int64,
+                ),
+                "ctx_counts": torch.empty(
+                    0,
+                    dtype=torch.int64,
+                ),
+            }
+
         for order in range(1, max_order + 1):
             if n_train < order:
                 # 语料比阶数还短：该阶没有可计数的窗口，
                 # 查询时自然回退到低阶。
-                self.levels[order] = {
-                    "pair_keys": torch.empty(
-                        0,
-                        dtype=torch.int64,
-                    ),
-                    "pair_counts": torch.empty(
-                        0,
-                        dtype=torch.int64,
-                    ),
-                    "ctx_uniq": torch.empty(
-                        0,
-                        dtype=torch.int64,
-                    ),
-                    "ctx_counts": torch.empty(
-                        0,
-                        dtype=torch.int64,
-                    ),
-                }
+                self.levels[order] = _empty_level()
                 continue
 
             num_windows = n_train - order + 1
-            stride = max(
-                1,
-                math.ceil(num_windows / count_cap),
+            valid_intervals = _valid_window_start_intervals(
+                num_windows,
+                order - 1,
+                self.exclude_spans,
             )
 
-            # data.unfold(0, order, 1) 是 [num_windows, order]
-            # 的滑动窗口视图；按步长取行仍是视图，打包时
-            # 才产生 int64 张量。
-            windows = data.unfold(0, order, 1)[::stride]
+            if valid_intervals is None:
+                stride = max(
+                    1,
+                    math.ceil(num_windows / count_cap),
+                )
+
+                # data.unfold(0, order, 1) 是
+                # [num_windows, order] 的滑动窗口视图；
+                # 按步长取行仍是视图，打包时才产生 int64
+                # 张量。
+                windows = data.unfold(0, order, 1)[::stride]
+            elif not valid_intervals:
+                self.levels[order] = _empty_level()
+                continue
+            else:
+                # 与神经网络训练窗口同一口径：完全落在被
+                # 清洗群组之外的窗口才参与计数，避免统计
+                # 基线通过重复群组看到 val/test。
+                lengths = torch.tensor(
+                    [
+                        high - low + 1
+                        for low, high in valid_intervals
+                    ],
+                    dtype=torch.int64,
+                )
+                total_valid = int(lengths.sum())
+                stride = max(
+                    1,
+                    math.ceil(total_valid / count_cap),
+                )
+                global_index = torch.arange(
+                    0,
+                    total_valid,
+                    stride,
+                    dtype=torch.int64,
+                )
+                cumulative = torch.cumsum(lengths, dim=0)
+                interval = torch.searchsorted(
+                    cumulative,
+                    global_index,
+                    right=True,
+                )
+                offsets = global_index - (
+                    cumulative[interval] - lengths[interval]
+                )
+                lows = torch.tensor(
+                    [low for low, _ in valid_intervals],
+                    dtype=torch.int64,
+                )
+                starts = lows[interval] + offsets
+                windows = data.unfold(0, order, 1)[starts]
 
             keys = windows[:, 0].to(torch.int64)
             for column in range(1, order):
@@ -6218,16 +6339,25 @@ def run_statistical_baseline(
         resolve_ngram_tuning_metric(args)
     )
 
+    excluded_bytes = (
+        dataset.train.numel() - dataset.effective_train_bytes
+    )
     print(
         "[ngram] 在 train split 上计数 "
-        f"({dataset.train.numel():,} 字节, "
-        f"max_order={args.ngram_max_order}, "
+        f"({dataset.effective_train_bytes:,} 有效字节"
+        + (
+            f", 已剔除 {excluded_bytes:,} 字节重复群组"
+            if excluded_bytes > 0
+            else ""
+        )
+        + f", max_order={args.ngram_max_order}, "
         f"count_cap={_NGRAM_COUNT_CAP:,})"
     )
 
     model = NgramBaseline(
         dataset.train,
         max_order=args.ngram_max_order,
+        exclude_spans=dataset.train_excluded_spans,
     )
 
     val_windows = _ngram_eval_batches(
@@ -20794,6 +20924,40 @@ def run_self_test():
     )
     assert int(dedup_x.min()) >= 10
     assert 66 not in set(dedup_x.flatten().tolist())
+
+    # 统计基线/参考基线必须与神经网络窗口使用同一「有效
+    # 训练字节」口径：被清洗的重复群组不能进入计数。
+    assert dedup_dataset.effective_train_bytes == 28
+    dedup_counts = dedup_dataset.effective_train_byte_counts()
+    assert int(dedup_counts.sum()) == 28
+    raw_ngram = NgramBaseline(
+        dedup_dataset.train,
+        max_order=2,
+    )
+    cleaned_ngram = NgramBaseline(
+        dedup_dataset.train,
+        max_order=2,
+        exclude_spans=dedup_dataset.train_excluded_spans,
+    )
+    assert raw_ngram.train_total == 48
+    assert cleaned_ngram.train_total == 28
+
+    dedup_reference = compute_reference_baselines(
+        dedup_dataset,
+        batch_size=2,
+        batches=1,
+        device=eval_device,
+    )
+    assert dedup_reference["unigram_train_bytes"] == 28
+    assert dedup_reference["unigram_train_bytes_raw"] == 48
+    assert dedup_reference["unigram_train_excluded_bytes"] == 20
+
+    dedup_audit = audit_data_splits(
+        dedup_dataset,
+        include_test=True,
+    )
+    assert dedup_audit["splits"]["train"]["effective_bytes"] == 28
+    assert dedup_audit["splits"]["train"]["bytes"] == 48
 
     # 名义位置不落在边界上时必须吸附到最近的群组边界。
     separator_five = b"<END>"
