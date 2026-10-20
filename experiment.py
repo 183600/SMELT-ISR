@@ -16247,7 +16247,7 @@ def aggregate_runs(
             field_mean = _mean(values)
             if field_mean is not None:
                 field_std = _sample_std(values)
-                aggregate["costs"][field] = {
+                cost_entry: Dict[str, object] = {
                     "mean": field_mean,
                     # 跨种子/跨运行的离散度：成本倍率只看均值
                     # 无法判断差异是否只是计时噪声。n_params/
@@ -16268,6 +16268,28 @@ def aggregate_runs(
                         else None
                     ),
                 }
+                # 成本均值的 95% CI（t 分布，自由度 n-1）：与
+                # 精度指标同口径。计时字段的 CI 直接决定「效率
+                # 倍率」是否只是测量噪声（n<2 或 std 不可用时
+                # 不给区间，避免把点估计伪装成零宽度）。
+                if field_std is not None and len(values) >= 2:
+                    cost_critical = _t_critical(float(len(values) - 1))
+                    if cost_critical is not None:
+                        cost_half = (
+                            cost_critical
+                            * field_std
+                            / math.sqrt(len(values))
+                        )
+                        cost_entry["ci95_low"] = field_mean - cost_half
+                        cost_entry["ci95_high"] = field_mean + cost_half
+                        cost_entry["ci95"] = {
+                            "low": field_mean - cost_half,
+                            "high": field_mean + cost_half,
+                            "t_critical": cost_critical,
+                            "df": len(values) - 1,
+                            "method": "t_interval",
+                        }
+                aggregate["costs"][field] = cost_entry
 
         for metric in metric_keys:
             samples = _metric_samples(group_rows, metric)
@@ -21658,6 +21680,46 @@ def print_comparison_analysis(
                 f"{_cost_text(aggregate, 'training_ms_per_step', 1.0, '.1f'):>10} "
                 f"{_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}"
             )
+
+        # 计时均值的 95% CI（t 分布，与精度指标同口径）：倍率
+        # 的不确定性已经进 ratio_ci95，但单元格自身计时的区间
+        # 决定「效率差异」是不是测量噪声。参数量/FLOPs 由结构
+        # 决定（std=0），不重复给区间。
+        timing_ci_lines = []
+        for aggregate in cost_rows:
+            parts = []
+            for key, short in (
+                ("latency_ms_per_forward", "lat"),
+                ("training_ms_per_step", "train"),
+            ):
+                entry = aggregate["costs"].get(key)
+                if not isinstance(entry, dict):
+                    continue
+                low = entry.get("ci95_low")
+                high = entry.get("ci95_high")
+                mean = entry.get("mean")
+                if not (
+                    isinstance(low, (int, float))
+                    and isinstance(high, (int, float))
+                    and isinstance(mean, (int, float))
+                ):
+                    continue
+                parts.append(
+                    f"{short} {float(mean):.3f} "
+                    f"[{float(low):.3f},{float(high):.3f}]"
+                )
+            if parts:
+                timing_ci_lines.append(
+                    f"{aggregate['label']}: " + "  ".join(parts)
+                )
+        if timing_ci_lines:
+            print(
+                "  [efficiency-ci] 计时均值的 95% CI（t 分布；"
+                "区间宽度与均值同量级时，效率差异可能只是"
+                "测量噪声）:"
+            )
+            for line in timing_ci_lines:
+                print(f"    {line}")
 
     # 缺效率测量数据的实验单元必须点名：旧版本运行或
     # --skip-efficiency 的运行没有效率字段，涉及这些
@@ -32182,6 +32244,47 @@ def run_self_test():
             ]
             == 0.0
         )
+
+        # 成本均值与精度指标同口径给 t 95% CI：区间必须包住
+        # 均值、自由度为 n-1；合成计时值逐种子相同（std=0），
+        # 区间退化为点估计但字段仍要存在，不能只在 JSON 里
+        # 留 mean/std。
+        latency_costs = base_costs["latency_ms_per_forward"]
+        assert (
+            float(latency_costs["ci95_low"])
+            <= float(latency_costs["mean"])
+            <= float(latency_costs["ci95_high"])
+        )
+        assert latency_costs["ci95"]["df"] == 2
+        assert latency_costs["ci95"]["method"] == "t_interval"
+        assert abs(
+            float(latency_costs["ci95_low"])
+            - float(latency_costs["ci95_high"])
+        ) < 1e-12
+
+        # 计时 CI 必须真的出现在报告输出里，而不是只写进
+        # JSON 报告（展示层漏了等于没有）。
+        class _Capture:
+            def __init__(self) -> None:
+                self.chunks: List[str] = []
+
+            def write(self, text: str) -> int:
+                self.chunks.append(text)
+                return len(text)
+
+            def flush(self) -> None:
+                return None
+
+        capture = _Capture()
+        with contextlib.redirect_stdout(capture):
+            print_comparison_analysis(
+                compare_runs(cost_paths),
+                factors=["mode"],
+                metric="val_loss",
+            )
+        report_text = "".join(capture.chunks)
+        assert "[efficiency-ci]" in report_text, report_text
+        assert "mode=local_base" in report_text
 
     # 计时离散度直接进入倍率不确定性：高噪声且 CI 跨 1 时，
     # 效率结论必须被标记为「可能由噪声驱动」。
