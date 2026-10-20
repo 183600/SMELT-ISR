@@ -15822,6 +15822,7 @@ def factorial_effects(
     aggregates: List[Dict[str, object]],
     group_keys: List[str],
     metric: str,
+    equivalence_margin: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     全因子消融的主效应、交互与简单效应。
@@ -15840,6 +15841,12 @@ def factorial_effects(
     并在家族内做 Holm 校正。只有校正后仍显著且方向符合
     指标改善方向时，才把主效应标记为支持该组件；交互显著
     只说明「效应随另一因子变化」，不能自动解释为有益。
+
+    ``equivalence_margin`` 给定时（相对参考单元均值的比例），
+    每个效应同时做 TOST 等价性检验：参考均值取该效应所比较
+    的对照单元均值（主效应取两侧对照的均值，简单效应取该
+    水平的对照格）。等价 p 值在同一效应家族内做 Holm/BH
+    校正；``equivalent`` 只在校正后仍显著时成立。
 
     ``mode`` 或 ``balance_coef`` 不是分组因子（恒定/未变化）时
     返回 ``applicable=False``；组合不完整时把设计列入
@@ -15945,6 +15952,19 @@ def factorial_effects(
             "simple",
         ),
     ]
+
+    # TOST 的等价界是相对界，必须给出每条效应所比较的对照
+    # 均值作为尺度：主效应取两侧对照格，简单效应用对应水平的
+    # 对照格。这样 ±margin 在不同效应上保持同一可解释口径。
+    reference_aliases = {
+        "delayed_merge_main": ("L_off", "L_on"),
+        "balance_loss_main": ("L_off", "M_off"),
+        "interaction": ("L_off", "L_on", "M_off", "M_on"),
+        "delayed_merge_at_balance_off": ("L_off",),
+        "delayed_merge_at_balance_on": ("L_on",),
+        "balance_loss_at_local_base": ("L_off",),
+        "balance_loss_at_delayed_merge": ("M_off",),
+    }
 
     for context in context_order:
         cells_by_key: Dict[tuple, Dict[str, object]] = {}
@@ -16100,7 +16120,28 @@ def factorial_effects(
                         if improvement < 0.0
                         else "tie"
                     )
-                report["effects"].append({
+                reference_values = []
+                for alias in reference_aliases.get(
+                    effect_name,
+                    (),
+                ):
+                    mean = cells[alias].get(
+                        f"{metric}_mean"
+                    )
+                    if (
+                        isinstance(mean, (int, float))
+                        and not isinstance(mean, bool)
+                        and math.isfinite(float(mean))
+                    ):
+                        reference_values.append(float(mean))
+                reference_mean = (
+                    sum(reference_values)
+                    / len(reference_values)
+                    if reference_values
+                    else None
+                )
+
+                effect_record = {
                     "design": design_label,
                     "delayed_mode": mode,
                     "context": dict(zip(context_keys, context)),
@@ -16155,10 +16196,21 @@ def factorial_effects(
                     "duplicate_seeds": result.get(
                         "duplicate_seeds", []
                     ),
-                })
-                report["effects"][-1].update(
+                }
+                effect_record.update(
                     _contrast_interval(result)
                 )
+                if reference_mean is not None:
+                    effect_record["mean_baseline"] = (
+                        reference_mean
+                    )
+                    _attach_power_equivalence(
+                        effect_record,
+                        effect_value,
+                        result,
+                        equivalence_margin,
+                    )
+                report["effects"].append(effect_record)
 
     eligible = [
         effect
@@ -16214,6 +16266,38 @@ def factorial_effects(
         item["significant_robust"] = bool(
             item.get("significant")
             and item.get("randomization_significant")
+        )
+
+    # 等价性主张与显著性同属一个推断家族：多个主效应/交互
+    # 同时声称「落在等价界内」也会放大误判概率。TOST p 值做
+    # 同口径的 Holm/BH 校正，只有校正后仍 <= alpha 的
+    # ``equivalent`` 才能作为「无实质差异」的证据。
+    tost_eligible = [
+        item
+        for item in report["effects"]
+        if item.get("tost_p_value") is not None
+    ]
+    tost_holm = _holm_bonferroni([
+        float(item["tost_p_value"])
+        for item in tost_eligible
+    ])
+    tost_bh = _benjamini_hochberg([
+        float(item["tost_p_value"])
+        for item in tost_eligible
+    ])
+    for item, holm_p, bh_p in zip(
+        tost_eligible,
+        tost_holm,
+        tost_bh,
+    ):
+        item["tost_p_value_holm"] = holm_p
+        item["tost_p_value_bh"] = bh_p
+        item["equivalent_raw"] = bool(
+            item.get("equivalent")
+        )
+        item["equivalent"] = bool(
+            holm_p is not None
+            and float(holm_p) <= _SIGNIFICANCE_LEVEL
         )
 
     for effect in report["effects"]:
@@ -19461,6 +19545,24 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append("计算量未对齐")
     if effect.get("duplicate_seeds"):
         qualifiers.append("存在重复随机种子（已折叠）")
+    tost_holm = effect.get("tost_p_value_holm")
+    if tost_holm is not None:
+        margin_abs = effect.get("equivalence_margin_abs")
+        margin_text = (
+            f"±{float(margin_abs):.4f}"
+            if margin_abs is not None
+            else "界=NA"
+        )
+        if effect.get("equivalent"):
+            qualifiers.append(
+                "等价 TOST Holm p="
+                f"{float(tost_holm):.4f}（{margin_text}）"
+            )
+        else:
+            qualifiers.append(
+                "未达等价 TOST Holm p="
+                f"{float(tost_holm):.4f}（{margin_text}）"
+            )
     if effect.get("significant"):
         claim = {
             "supports_component": "支持该组件有效",
@@ -19589,7 +19691,12 @@ def print_comparison_analysis(
         allow_partial=allow_partial_ablation,
     )
     balance_scale = balance_strength_report(rows)
-    factorial = factorial_effects(aggregates, group_keys, metric)
+    factorial = factorial_effects(
+        aggregates,
+        group_keys,
+        metric,
+        equivalence_margin=equivalence_margin,
+    )
     # 等计算量指标本身已按共同训练 FLOPs 对齐，不能再把
     # FLOPs/专家宽度差异当成该指标的混杂；否则会错误地把
     # 「等计算量下仍有效」降级为不可归因。
@@ -19620,6 +19727,7 @@ def print_comparison_analysis(
             aggregates,
             group_keys,
             _COMPUTE_MATCHED_METRIC,
+            equivalence_margin=equivalence_margin,
         )
         matched_coverage = dict(coverage)
         matched_coverage["compute_parity"] = []
@@ -20684,6 +20792,15 @@ def print_comparison_analysis(
             "变化，不能单独解释为有益或有害；主效应结论以"
             " Holm 校正后为准"
         )
+        if any(
+            effect.get("tost_p_value_holm") is not None
+            for effect in factorial["effects"]
+        ):
+            print(
+                "  等价性：TOST p 值同族做 Holm/BH 校正；"
+                "只有校正后仍 <= alpha 才可主张「无实质差异」，"
+                "「不显著」本身不构成等价证据"
+            )
 
     if factorial_compute_matched is not None:
         print()
@@ -27136,6 +27253,7 @@ def run_self_test():
             factorial_aggregates,
             ["mode", "balance_coef"],
             "val_loss",
+            equivalence_margin=0.01,
         )
         assert factorial["applicable"]
         assert len(factorial["designs"]) == 1, factorial
@@ -27152,6 +27270,19 @@ def run_self_test():
         assert delayed_main["aligned_seeds"]
         assert delayed_main["significant"]
         assert delayed_main["claim"] == "supports_component"
+        # 主效应/交互同样做 TOST：等价界相对所比较的对照
+        # 均值，p 值接受家族校正。此处 1% 界（≈0.03）远小于
+        # 0.10 的效应，不能主张等价。
+        assert delayed_main["equivalence_margin"] == 0.01
+        assert delayed_main["equivalence_margin_abs"] is not None
+        assert abs(
+            float(delayed_main["equivalence_margin_abs"])
+            - 0.01 * 2.975
+        ) < 1e-9
+        assert delayed_main["tost_p_value"] is not None
+        assert delayed_main["tost_p_value_holm"] is not None
+        assert not delayed_main["equivalent"]
+        assert delayed_main["equivalent_raw"] is False
         balance_main = effects["balance_loss_main"]
         assert abs(balance_main["mean_effect"] + 0.05) < 1e-9
         assert balance_main["claim"] == "supports_component"
@@ -27285,6 +27416,7 @@ def run_self_test():
             ),
             ["mode", "balance_coef"],
             "val_loss",
+            equivalence_margin=1.0,
         )
         by_effect = {
             effect["effect_name"]: effect
@@ -27296,6 +27428,14 @@ def run_self_test():
         assert by_effect["interaction"]["claim"] == (
             "interaction_detected"
         )
+        # 极宽等价界下所有效应都落在界内：TOST 必须给出
+        # 校正后的等价结论，而不是因为「显著」就拒绝等价。
+        assert by_effect["interaction"]["tost_p_value"] is not None
+        assert (
+            by_effect["interaction"]["tost_p_value_holm"]
+            is not None
+        )
+        assert by_effect["interaction"]["equivalent"]
         assert abs(
             by_effect["delayed_merge_at_balance_off"][
                 "mean_effect"
