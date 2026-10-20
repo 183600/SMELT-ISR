@@ -695,8 +695,9 @@ jobs:
               break
             fi
 
-            # ----- 五个阶段：perf -> bug -> sci -> clean -> apply -----
-            for phase in perf bug sci clean apply; do
+            # ----- 阶段：perf 已停用（perf 的 opencode 调用已注释掉）→ bug -> sci -> clean -> apply -----
+            # for phase in perf bug sci clean apply; do
+            for phase in bug sci clean apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
