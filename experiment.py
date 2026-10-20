@@ -15000,6 +15000,24 @@ def _trivial_reference_value(
     return value
 
 
+def _baseline_tuning_seed_count(
+    seed_plan: object,
+) -> Optional[int]:
+    """
+    读取调参报告 seed_plan 中的独立种子数。
+
+    缺失、bool 或非整数都返回 None，表示无法核对统计功效；
+    调用方不能把「字段缺失」当作「种子数足够」。
+    """
+    if not isinstance(seed_plan, dict):
+        return None
+
+    count = seed_plan.get("n_seeds")
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count
+    return None
+
+
 def baseline_adequacy(
     rows: List[Dict[str, object]],
     baseline_mode: Optional[str],
@@ -15293,14 +15311,19 @@ def baseline_adequacy(
                     "统计功效，不能作为基线已调参的证据"
                 )
                 continue
-            recorded_seeds = record_seed_plan.get("n_seeds")
+            recorded_seeds = _baseline_tuning_seed_count(
+                record_seed_plan
+            )
+            if recorded_seeds is None:
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源 seed_plan 缺少"
+                    "有效的 n_seeds：无法核对调参的独立种子数与"
+                    "统计功效，不能作为基线已调参的证据"
+                )
+                continue
             tuning_underpowered = bool(
                 record_seed_plan.get("underpowered_override")
-            ) or (
-                isinstance(recorded_seeds, int)
-                and not isinstance(recorded_seeds, bool)
-                and recorded_seeds < _MIN_SEEDS_FOR_STATS
-            )
+            ) or recorded_seeds < _MIN_SEEDS_FOR_STATS
             if tuning_underpowered:
                 report["advisories"].append(
                     f"基线 {run_name} 的调参来源在少于 "
@@ -15457,17 +15480,14 @@ def baseline_adequacy(
                     record_lr = _finite_float(record_winner_lr)
                     record_metric = record.get("metric")
                     seed_plan = record.get("seed_plan")
-                    record_seeds = (
-                        seed_plan.get("n_seeds")
-                        if isinstance(seed_plan, dict)
-                        else None
+                    record_seeds = _baseline_tuning_seed_count(
+                        seed_plan
                     )
                     underpowered = bool(
                         isinstance(seed_plan, dict)
                         and seed_plan.get("underpowered_override")
                     ) or (
-                        isinstance(record_seeds, int)
-                        and not isinstance(record_seeds, bool)
+                        record_seeds is not None
                         and record_seeds < _MIN_SEEDS_FOR_STATS
                     )
                     issues = record.get("issues")
@@ -15481,6 +15501,8 @@ def baseline_adequacy(
                     own_tuning = bool(
                         record_mode == row_mode
                         and isinstance(seed_plan, dict)
+                        and record_seeds is not None
+                        and record_seeds >= _MIN_SEEDS_FOR_STATS
                         and record_lr is not None
                         and math.isclose(
                             record_lr,
@@ -23937,6 +23959,36 @@ def run_self_test():
             for message in legacy_tuning_adequacy["advisories"]
         )
 
+        # seed_plan 存在但缺 n_seeds：无法核对功效，不能因为
+        # 字段存在就当成「已充分调参」。
+        missing_count_tuning = dict(good_tuning)
+        missing_count_tuning["seed_plan"] = {
+            "seeds": [1, 2, 3],
+            "min_seeds_for_significance": 3,
+            "underpowered_override": False,
+        }
+        missing_count_path = _write_analysis_run(
+            "missing_count_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.20,
+            reference=good_reference,
+            baseline_tuning=missing_count_tuning,
+        )
+        missing_count_adequacy = baseline_adequacy(
+            compare_runs([missing_count_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert missing_count_adequacy["tuned"] is False
+        assert any(
+            "n_seeds" in message
+            for message in missing_count_adequacy["advisories"]
+        )
+
         # 挑战臂的「独立调参」同样必须能核对功效：缺 seed_plan
         # 的旧记录不能算作调参对称，否则会掩盖基线被调强、
         # 挑战臂没调好的混杂。
@@ -24018,6 +24070,42 @@ def run_self_test():
                 "challengers_without_tuning_parity"
             ]
         ] == ["legacy_challenger_seed1"]
+
+        missing_count_challenger_tuning = dict(
+            challenger_tuning
+        )
+        missing_count_challenger_tuning["seed_plan"] = {
+            "seeds": [1, 2, 3],
+            "min_seeds_for_significance": 3,
+            "underpowered_override": False,
+        }
+        missing_count_challenger_path = _write_analysis_run(
+            "missing_count_challenger_seed1",
+            "B",
+            1,
+            1e-3,
+            100,
+            0.01,
+            4.10,
+            baseline_tuning=missing_count_challenger_tuning,
+        )
+        missing_count_parity = baseline_adequacy(
+            compare_runs([
+                parity_baseline_path,
+                missing_count_challenger_path,
+            ]),
+            "smelt",
+            "val_loss",
+        )["tuning_parity"]
+        assert not missing_count_parity[
+            "challengers_with_own_tuning"
+        ]
+        assert [
+            item["run"]
+            for item in missing_count_parity[
+                "challengers_without_tuning_parity"
+            ]
+        ] == ["missing_count_challenger_seed1"]
 
         # 没有调参记录、但已强于调优好的 n-gram：不标记
         # straw-man，只提示仍应补调参来源（更强基线的证据）。
@@ -25259,6 +25347,23 @@ def run_self_test():
         )
         assert no_seed_plan_error is not None
         assert "seed_plan" in no_seed_plan_error
+        missing_seed_count_payload = dict(tuning_payload)
+        missing_seed_count_payload["seed_plan"] = dict(
+            tuning_payload["seed_plan"]
+        )
+        missing_seed_count_payload["seed_plan"].pop("n_seeds")
+        missing_seed_count_error = (
+            baseline_tuning_provenance_error(
+                missing_seed_count_payload,
+                "dense",
+                1e-4,
+                100,
+                "deadbeef",
+                protocol=sampled_protocol,
+            )
+        )
+        assert missing_seed_count_error is not None
+        assert "n_seeds" in missing_seed_count_error
         provenance_record = baseline_tuning_provenance_record(
             tuning_payload, str(tuning_source)
         )
@@ -26504,11 +26609,16 @@ def baseline_tuning_provenance_error(
             "的独立种子数与统计功效，请用新版 "
             "--suite-baseline-tuning 重新生成调参报告"
         )
-    tuning_seeds = seed_plan.get("n_seeds")
-    if seed_plan.get("underpowered_override") or (
-        isinstance(tuning_seeds, int)
-        and not isinstance(tuning_seeds, bool)
-        and tuning_seeds < _MIN_SEEDS_FOR_STATS
+    tuning_seeds = _baseline_tuning_seed_count(seed_plan)
+    if tuning_seeds is None:
+        return (
+            "调参报告的 seed_plan 缺少有效的 n_seeds：无法核对"
+            "调参的独立种子数与统计功效，请用新版 "
+            "--suite-baseline-tuning 重新生成调参报告"
+        )
+    if (
+        seed_plan.get("underpowered_override")
+        or tuning_seeds < _MIN_SEEDS_FOR_STATS
     ):
         return (
             "调参报告在少于 "
