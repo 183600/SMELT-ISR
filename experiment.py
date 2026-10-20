@@ -720,50 +720,33 @@ class _MergeExpertOutputs(torch.autograd.Function):
         return (None, None) + tuple(segment_grads)
 
 
-class _ScatterPaddedExpertOutputs(torch.autograd.Function):
+class _GatherPaddedExpertOutputs(torch.autograd.Function):
     """
-    把填充缓冲中的各专家有效输出散射回原始 assignment 顺序。
+    把填充缓冲中的各专家有效输出按原始 assignment 顺序取回。
 
-    按专家段整行拷贝写回原始顺序的输出缓冲，与
-    「gather + scatter」语义逐位一致；反向把上游梯度按同样的
-    段映射写回填充缓冲，未使用的填充行梯度恒为 0。
+    ``source[a]`` 是原始 assignment a 在填充缓冲中的行号，
+    因此前向只需一次 index_select；反向按同一映射把上游梯度
+    写回填充缓冲，未使用的填充行梯度恒为 0。溢出路径中
+    ``source`` 的溢出行指向专家 scratch 行，这些行的上游梯度
+    在回退结果覆盖后恒为 0。逐专家循环会为每个专家各发一次
+    小拷贝，这里改为一次全长收集以降低 kernel 启动与 Python
+    循环开销，也避免中间 gather 缓冲。
     """
 
     @staticmethod
     def forward(
         ctx,
         padded: torch.Tensor,
-        perm: torch.Tensor,
-        counts: List[int],
-        cap: int,
+        source: torch.Tensor,
     ) -> torch.Tensor:
-        ctx.cap = int(cap)
-        ctx.counts = tuple(int(count) for count in counts)
         ctx.shape = padded.shape
         ctx.dtype = padded.dtype
         ctx.device = padded.device
 
-        final = torch.empty(
-            perm.numel(),
-            padded.size(-1),
-            dtype=padded.dtype,
-            device=padded.device,
-        )
-        offset = 0
-        for expert, count in enumerate(ctx.counts):
-            if count > 0:
-                final.index_copy_(
-                    0,
-                    perm[offset:offset + count],
-                    padded[
-                        expert * ctx.cap:
-                        expert * ctx.cap + count
-                    ],
-                )
-            offset += count
+        final = padded.index_select(0, source)
 
         if ctx.needs_input_grad[0]:
-            ctx.save_for_backward(perm)
+            ctx.save_for_backward(source)
         return final
 
     @staticmethod
@@ -771,28 +754,16 @@ class _ScatterPaddedExpertOutputs(torch.autograd.Function):
         ctx,
         grad_final: torch.Tensor,
     ) -> tuple:
-        (perm,) = ctx.saved_tensors
+        (source,) = ctx.saved_tensors
 
         grad_padded = torch.zeros(
             ctx.shape,
             dtype=ctx.dtype,
             device=ctx.device,
         )
-        offset = 0
-        for expert, count in enumerate(ctx.counts):
-            if count > 0:
-                grad_padded[
-                    expert * ctx.cap:
-                    expert * ctx.cap + count
-                ].copy_(
-                    grad_final.index_select(
-                        0,
-                        perm[offset:offset + count],
-                    )
-                )
-            offset += count
+        grad_padded.index_copy_(0, source, grad_final)
 
-        return grad_padded, None, None, None
+        return grad_padded, None
 
 
 class SparseMoE(nn.Module):
@@ -1327,12 +1298,15 @@ class SparseMoE(nn.Module):
         device = gathered.device
         n_experts = self.n_experts
 
-        # 静态容量只依赖 assignment 总数（不依赖各专家计数）：
-        # 基础容量取均值上界 ceil(total / n_experts)，余量取
-        # 4 倍标准差。多出的行是精确 0 填充，不改变任何输出；
-        # 万一仍溢出，下面的逐专家回退路径保证语义不变。
-        cap = -(-total // n_experts)
-        cap += 4 * math.isqrt(max(1, cap)) + 1
+        # 容量上界：基础容量取均值上界 ceil(total / n_experts)，
+        # 再加 1 倍标准差的静态余量（只依赖 assignment 总数）。
+        # 实际容量再按本步最大桶收紧，并按 32 对齐以便推理缓冲
+        # 跨批次复用。多出的行是精确 0 填充，不改变任何输出；
+        # 最大桶超过静态上界时，下面的逐专家回退路径保证语义
+        # 不变，因此余量无需取到 4σ，避免训练中常见的长尾
+        # 路由让所有专家都按最高桶填充而浪费算力与显存。
+        static_cap = -(-total // n_experts)
+        static_cap += math.isqrt(max(1, static_cap)) + 1
 
         # 各专家段在排序序列中的起始行（cumsum 结果原地减去
         # counts 得到 exclusive 前缀和，少一次小张量分配）。
@@ -1351,11 +1325,17 @@ class SparseMoE(nn.Module):
 
         # 溢出判定只需要看每专家的 assignment 数：同一专家的段在
         # 排序序列中连续，段内局部行号为 0..counts[e]-1，因此
-        # 「存在溢出」等价于 counts 的最大值超过容量。判定放在
-        # 构造掩码之前：常规无溢出路径不产生掩码，也不需要
-        # clamp 与回退分支。逐专家计数同时供分段散射复用。
+        # 「存在溢出」等价于 counts 的最大值超过容量。逐专家
+        # 计数同时供容量收紧与溢出回退复用。
         counts_list = counts.tolist()
-        has_overflow = max(counts_list) > cap
+        bucket = max(counts_list) if counts_list else 0
+        cap = static_cap
+        if bucket > 0:
+            cap = min(
+                static_cap,
+                -(-bucket // 32) * 32,
+            )
+        has_overflow = bucket > cap
 
         # 行下标经 _cached_arange 复用（形状跨调用稳定）。
         row_ids = self._cached_arange(
@@ -1364,92 +1344,93 @@ class SparseMoE(nn.Module):
             index_dtype,
         )
 
-        # 目标行号 dest[j] = seg_id[j] * cap + (j - starts[seg_id[j]])
-        # 展开为 j + (seg_id[j] * cap - starts[seg_id[j]])：每专家
-        # 的偏移只算 E 项，常规路径因此少两次全长索引算术；溢出
-        # 路径再单独算段内局部行号（罕见）。
-        dest = row_ids + (
-            (
-                self._cached_arange(
-                    device,
-                    n_experts,
-                    index_dtype,
-                ) * cap
-                - starts
-            ).index_select(0, seg_id)
-        )
+        # 每个专家在填充缓冲中的跨度。有溢出时额外留一行
+        # scratch：溢出行写入该专家的 scratch 行（有效行不受
+        # 影响），其输出随后被回退结果覆盖，因此无需先构造
+        # in-cap 掩码再裁剪索引/输入。
+        stride = cap + 1 if has_overflow else cap
 
+        # 目标行号 dest[j] = seg_id[j] * stride + local[j]。
+        # 无溢出时 local 就是 j - starts[seg_id[j]]，展开为
+        # j + (seg_id[j] * stride - starts[seg_id[j]])，每专家
+        # 的偏移只算 E 项；溢出路径把 local 夹到 cap，让溢出行
+        # 落到 scratch 行。
         if has_overflow:
-            # 容量内的行散射进填充缓冲；溢出行只参与裁剪后的
-            # index_copy_（不写入填充缓冲）。
             local = (
                 row_ids
                 - starts.index_select(0, seg_id)
             )
-            overflow = local >= cap
-            in_cap = ~overflow
-            copy_index = dest[in_cap]
-            copy_source = gathered[in_cap]
-            out_index = perm[in_cap]
+            dest = (
+                seg_id.to(index_dtype) * stride
+                + local.clamp_(max=cap)
+            )
         else:
-            copy_index = dest
-            copy_source = gathered
-            out_index = perm
+            expert_offsets = (
+                self._cached_arange(
+                    device,
+                    n_experts,
+                    index_dtype,
+                ) * stride
+                - starts
+            ).index_select(0, seg_id)
+            dest = row_ids + expert_offsets
 
         padded = self._padded_buffer(
             gathered.dtype,
             device,
-            n_experts * cap,
+            n_experts * stride,
             dim,
         )
         if padded is None:
-            padded = gathered.new_zeros(n_experts * cap, dim)
+            padded = gathered.new_zeros(
+                n_experts * stride,
+                dim,
+            )
 
-        padded.index_copy_(0, copy_index, copy_source)
+        padded.index_copy_(0, dest, gathered)
 
         if not has_overflow:
             # 常规路径到此 gathered 的数据不再被任何一方引用
             #（index_select / index_copy_ 的反向只保存下标）；
             # 溢出路径下方回退仍需读取 gathered，保持引用。
-            del gathered, copy_source
+            del gathered
 
         out = self._batched_experts_forward(
-            padded.view(n_experts, cap, dim)
-        ).view(n_experts * cap, dim)
+            padded.view(n_experts, stride, dim)
+        ).view(n_experts * stride, dim)
 
         # 直接散射回原始（未排序）assignment 顺序：perm[j] 是排序
-        # 行 j 的原始位置，因此 final[perm[j]] = 专家输出。
-        if has_overflow:
-            # 溢出路径的 perm/计数不是逐专家完整段，退回通用的
-            # gather + scatter（仅在容量余量不足的罕见步触发）。
-            final = out.new_empty(total, dim)
-            final.index_copy_(
-                0,
-                out_index,
-                out.index_select(0, copy_index),
-            )
-        else:
-            # 常见路径按专家逐段散射。
-            final = _ScatterPaddedExpertOutputs.apply(
-                out,
-                perm,
-                counts_list,
-                cap,
-            )
+        # 行 j 的原始位置，因此 source[perm[j]] = dest[j]。
+        # 一次散点写入下标、一次 index_select 完成全部输出；
+        # 反向复用同一 source，不需要中间 gather 缓冲。
+        source = dest.new_empty(total)
+        source.scatter_(0, perm, dest)
+        final = _GatherPaddedExpertOutputs.apply(
+            out,
+            source,
+        )
 
         # 溢出回退：容量外的 assignment 由对应专家的 2D 前向计算
-        # 后写入同一缓冲（余量下通常不触发）。
+        # 后写入同一缓冲。排序后每个专家的段连续，溢出行恰为段
+        # 尾的 count-cap 行，直接切片即可；无需逐专家构造布尔
+        # 掩码，也不触发 GPU 同步的 rows.any()。
         if has_overflow:
             experts = self.experts
-            for expert_index in range(n_experts):
-                rows = overflow & (seg_id == expert_index)
-                if not bool(rows.any()):
-                    continue
-                final.index_copy_(
-                    0,
-                    perm[rows],
-                    experts[expert_index].forward(gathered[rows]),
-                )
+            segment_start = 0
+            for expert_index, count in enumerate(counts_list):
+                if count > cap:
+                    rows = slice(
+                        segment_start + cap,
+                        segment_start + count,
+                    )
+                    final.index_copy_(
+                        0,
+                        perm[rows],
+                        experts[expert_index].forward(
+                            gathered[rows]
+                        ),
+                    )
+                segment_start += count
 
         return final.view(num_tokens, top_k, dim)
 
