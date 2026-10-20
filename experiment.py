@@ -16658,6 +16658,27 @@ def factor_contrasts(
             independent_a = _collapse_seed_samples(samples_a)
             independent_b = _collapse_seed_samples(samples_b)
 
+            # 完整案例分析（只用有该指标的运行）默认假设「缺指标
+            # 与指标值无关」。两臂缺失数不同时，对比就建立在不同
+            # 的运行子集上：差异可能来自「哪些运行留下了」而不是
+            # 方法本身，必须显式暴露而不是静默丢弃。
+            deterministic_cell = bool(
+                cell_a.get("deterministic")
+                or cell_b.get("deterministic")
+            )
+            expected_a = int(cell_a.get("n_runs", 0) or 0)
+            expected_b = int(cell_b.get("n_runs", 0) or 0)
+            missing_a = (
+                0
+                if deterministic_cell
+                else max(0, expected_a - len(independent_a))
+            )
+            missing_b = (
+                0
+                if deterministic_cell
+                else max(0, expected_b - len(independent_b))
+            )
+
             if delta is None:
                 verdict = "missing_metric"
             else:
@@ -16728,6 +16749,14 @@ def factor_contrasts(
                 "n_pairs": test.get("n_pairs", 0),
                 "n_baseline": len(independent_a),
                 "n_variant": len(independent_b),
+                "n_expected_baseline": expected_a,
+                "n_expected_variant": expected_b,
+                "n_missing_baseline": missing_a,
+                "n_missing_variant": missing_b,
+                "differential_missingness": bool(
+                    (missing_a > 0 or missing_b > 0)
+                    and missing_a != missing_b
+                ),
                 "duplicate_seeds": bool(
                     test.get("duplicate_seeds")
                 ),
@@ -21590,6 +21619,29 @@ def print_comparison_analysis(
             print(
                 "  [cost] 需按效率权衡的对比: "
                 + "; ".join(summaries)
+            )
+
+        # 缺指标的运行被静默丢弃时，两臂可能不再来自同一批
+        # 运行：完整案例分析的结论会混入「哪些运行留下了」。
+        missingness_flagged = [
+            contrast
+            for contrast in contrasts
+            if contrast.get("differential_missingness")
+        ]
+        if missingness_flagged:
+            print(
+                "  [warn] 以下对比两臂缺少该指标的运行数不同"
+                "（完整案例分析建立在不同运行子集上，结论可能"
+                "来自缺测而非方法差异；请核对被排除运行的原因）: "
+                + "; ".join(
+                    f"{contrast['baseline']}→"
+                    f"{contrast['variant']}"
+                    f"（缺 {contrast.get('n_missing_baseline', 0)}"
+                    f" vs {contrast.get('n_missing_variant', 0)}"
+                    f"，有效 {contrast.get('n_baseline', 0)}"
+                    f" vs {contrast.get('n_variant', 0)}）"
+                    for contrast in missingness_flagged
+                )
             )
 
     if baseline_mode:
@@ -28218,6 +28270,40 @@ def run_self_test():
         )
         assert contrast["ci95_excludes_zero"]
         assert "95%CI" in _contrast_display(contrast, "val_loss")
+        assert contrast["n_missing_baseline"] == 0
+        assert contrast["n_missing_variant"] == 0
+        assert contrast["differential_missingness"] is False
+
+        # 差分缺失：一臂有运行缺少判定指标时，完整案例分析的
+        # 两臂不再来自同一批运行，必须显式标记而不是静默丢弃。
+        missing_rows = [
+            {
+                "run": f"{mode}_seed{seed}",
+                "mode": mode,
+                "seed": seed,
+                "val_loss": value,
+            }
+            for mode, values in (
+                ("local_base", [3.0, 3.1, 2.9]),
+                ("A", [2.5, 2.6]),
+            )
+            for seed, value in enumerate(values, start=1)
+        ]
+        missing_rows.append({
+            "run": "A_seed3",
+            "mode": "A",
+            "seed": 3,
+        })
+        missing_contrast = factor_contrasts(
+            aggregate_runs(missing_rows, ["mode"]),
+            ["mode"],
+            "val_loss",
+        )[0]
+        assert missing_contrast["n_baseline"] == 3
+        assert missing_contrast["n_variant"] == 2
+        assert missing_contrast["n_missing_baseline"] == 0
+        assert missing_contrast["n_missing_variant"] == 1
+        assert missing_contrast["differential_missingness"] is True
 
         # 功效/等价性口径：显著的真实差异（Δ=-0.25 vs 等价界
         # ±1%×3.10≈0.031）必须给出 MDE、所需种子数与
