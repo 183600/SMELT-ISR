@@ -12055,6 +12055,49 @@ def parse_factor_spec(spec: str) -> List[str]:
     return keys
 
 
+def suite_factor_error(
+    factors: List[str],
+    suite_modes: Optional[List[str]],
+    suite_ablation: bool,
+) -> Optional[str]:
+    """
+    套件启动前的分析口径校验：套件会不会真的分析它声称的轴。
+
+    ``--suite-ablation`` 的主效应/交互以 mode 与 balance_coef
+    为分组因子；``--suite-modes`` 的跨模式对比以 mode 为分组
+    因子。如果调用方用 ``--compare-factors`` 把这些键收窄成
+    受控变量，训练仍然会跑，但分析阶段不会按该轴分组，套件
+    会产出一份「看起来完成、实际没有检验该轴」的报告。这里
+    在开跑前直接拒绝，避免浪费算力后才发现分析口径不对。
+    """
+    factor_set = set(factors)
+    required: List[Tuple[str, str]] = []
+
+    if suite_ablation:
+        required = [
+            ("mode", "消融方案轴"),
+            ("balance_coef", "均衡损失开/关轴"),
+        ]
+    elif suite_modes:
+        required = [("mode", "跨模式对比轴")]
+
+    missing = [
+        f"{key}（{purpose}）"
+        for key, purpose in required
+        if key not in factor_set
+    ]
+    if not missing:
+        return None
+
+    return (
+        "套件的分析因子被 --compare-factors 排除: "
+        + ", ".join(missing)
+        + "。套件需要这些键作为分组因子才能做对应分析；"
+        "请把它们加入 --compare-factors（例如 "
+        "--compare-factors mode,balance_coef,seed）"
+    )
+
+
 def _stable_factor_key(value):
     """
     把因子值转换成可哈希、可比较的稳定表示。
@@ -26863,6 +26906,40 @@ def run_self_test():
                 + repr(unknown_spec)
             )
 
+    # 套件若把要分析的轴收窄成受控变量，训练仍会跑但分析不会
+    # 按该轴分组；入口必须提前拒绝，而不是产出一份「看起来
+    # 完成、实际没有检验该轴」的报告。
+    assert suite_factor_error(
+        parse_factor_spec("mode,balance_coef,seed"),
+        None,
+        True,
+    ) is None
+    assert suite_factor_error(
+        parse_factor_spec("mode,seed"),
+        ["A", "B"],
+        False,
+    ) is None
+    missing_balance_axis = suite_factor_error(
+        parse_factor_spec("mode,seed"),
+        None,
+        True,
+    )
+    assert missing_balance_axis is not None
+    assert "balance_coef" in missing_balance_axis
+    missing_mode_axis = suite_factor_error(
+        parse_factor_spec("balance_coef,seed"),
+        ["A", "B"],
+        False,
+    )
+    assert missing_mode_axis is not None
+    assert "mode" in missing_mode_axis
+    # 非套件的普通 --compare 不受这条套件校验影响。
+    assert suite_factor_error(
+        parse_factor_spec("seed"),
+        None,
+        False,
+    ) is None
+
     # ---- 可复现性来源核对：代码指纹/环境必须一致 ----
     provenance_mismatch = check_run_provenance([
         {
@@ -29034,9 +29111,20 @@ def main():
     # 对比因子与对比指标必须显式合法，避免拼写错误静默
     # 关闭受控变量检查。
     try:
-        parse_factor_spec(args.compare_factors)
+        parsed_factors = parse_factor_spec(
+            args.compare_factors
+        )
     except ValueError as error:
         parser.error(str(error))
+    # 套件必须真的分析它声称的轴：把 mode/balance_coef 收窄成
+    # 受控变量后，训练仍会跑但主效应/交互根本不会按该轴分组。
+    suite_error = suite_factor_error(
+        parsed_factors,
+        args.suite_modes,
+        bool(args.suite_ablation),
+    )
+    if suite_error is not None:
+        parser.error(suite_error)
     if args.compare_metric not in COMPARISON_METRIC_KEYS:
         parser.error(
             "--compare-metric 必须是以下之一: "
