@@ -130,6 +130,27 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `_tost_test`、`_t_cdf`、`_attach_power_equivalence`：TOST
   等价性检验（等价界相对基线均值，`--equivalence-margin`）、
   t 分布 CDF 与对比记录的功效/等价性字段挂载。
+- `_bootstrap_eval_intervals`、`_percentile_interval`：对固定
+  评估窗口做有放回重采样（默认 500 次，`--eval-bootstrap`，
+  0 关闭），给出 loss / ppl / token accuracy / macro F1 的
+  百分位 95% 置信区间；种子由数据指纹、split、窗口数与
+  窗口长度派生，确定性可复现，且不扰动训练/数据 RNG。
+  置信区间回答「换一批同分布评估窗口，点估计会漂多少」，
+  与跨种子 t 检验（回答「换训练种子」）互补。同时记录
+  `eval_windows` 与 `eval_window_overlap_fraction`：窗口重叠
+  时 bootstrap 的重采样单位并不独立，区间会偏窄，读者不能
+  把重叠窗口的区间当作独立样本精度。
+- `_paired_sign_flip_test`、`_leave_one_out_effect_stability`：
+  配对符号翻转（randomization）检验与 leave-one-out 稳健性。
+  n≤12 精确枚举全部 2^n 符号组合，n>12 用固定种子 Monte
+  Carlo；不依赖差值正态性，适合 3~5 个种子的实验。结果同时
+  记录最小可达 p 值，样本量不足以在 0.05 水平显著时明确
+  提示「不显著 ≠ 无效应」。leave-one-out 逐一去掉一个种子
+  重算效应，方向翻转或归零时提示结论可能由单个种子驱动。
+- `cross_family_protocol_check`：神经运行与 ngram 统计基线
+  之间的数据/评估口径核对（数据指纹、切分比例、评估窗口数、
+  batch size、数据增强等）；口径不一致时禁止把 ngram 当作
+  「基线已足够强」的证据。
 - `_holm_bonferroni`、`_benjamini_hochberg`、`_t_critical`、
   `_contrast_interval`、`_apply_multiple_comparison_correction`：
   检验家族内的多重比较校正（Holm 控制 FWER、BH 控制 FDR）、
@@ -223,7 +244,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   键允许跨运行不同；其余一律按受控变量核对。因子拼写错误会
   直接报错，不会静默关闭检查。统计基线（ngram）没有优化器与
   训练轮数，单独记为 `comparison_family=statistical`，不参与
-  受控变量检查。
+  优化器类受控变量检查；但数据与评估口径（`data_sha256`、
+  `seq_len`、切分比例、`batch_size`、`eval_batches`、数据增强、
+  群组切分/去重设置）仍通过 `cross_family_protocol_check`
+  逐项核对，避免把不同数据/窗口上的 ngram 指标当作基线证据。
 - **统计可靠性**：`--seeds 42 43 44` 对同一命令行配置跑多个
   随机种子，输出写入 `<out>/seed<SEED>`，结束后自动给出每个
   实验单元的 Mean ± Std（样本标准差）与单因子对比检验：种子
@@ -242,7 +266,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两
   对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
   会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
-  3~5。**不显著 ≠ 等价（功效与等价性口径）**：显著性检验
+  3~5。**配对无分布假设检验**：同一批种子上的配对差值还做
+  符号翻转（randomization）检验，n≤12 精确枚举、n>12 固定
+  种子 Monte Carlo；它对差值正态性不作要求，与配对 t 检验
+  互为稳健性对照。两套检验经同一 Holm 家族校正后结论不一致
+  时展示层明确提示「显著性依赖正态性假设或检验功效，不能
+  作为稳健结论」；`significant_robust` 要求两者同时显著。
+  精确检验同时记录最小可达双侧 p 值（2/2^n），n<5 时该值
+  本身大于 0.05，展示层提示该设计在数学上无法达到显著，
+  不能把「不显著」解读为「无效应」。**leave-one-out 稳健性**：
+  逐一去掉一个种子重算效应，若方向翻转或归零，提示结论可能
+  由单个种子驱动；这是描述性检查，不替代显著性检验。
+  **不显著 ≠ 等价（功效与等价性口径）**：显著性检验
   只能回答「有没有证据反对差异为 0」。每个检验过的对比同时
   记录 80% 功效下的最小可检出效应 `mde_80`（含相对基线均值的
   `mde_80_relative`）、观测效应自身的功效 `power_at_effect` 与
@@ -267,6 +302,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   在少于 3 个不同随机种子时直接拒绝运行，冒烟/调试需显式
   加 `--allow-underpowered`；豁免与种子计划（`seed_plan`）
   随报告落盘，避免低功效运行被当作正式结论。
+  **评估窗口不确定性**：final val 与唯一一次 test 评估默认
+  额外报告评估窗口 bootstrap 95% 置信区间（loss / ppl /
+  token accuracy / macro F1，`--eval-bootstrap` 控制重采样
+  次数，0 关闭）。它量化「换一批同分布评估窗口」的抽样
+  波动，与跨种子方差是两种不同的不确定性来源；窗口数为 1
+  或指标退化时区间退化为点估计而不是虚构精度。
   **确定性基线**：ngram 的计数与固定窗口评估不消耗随机性，
   换 seed 重跑只是同一估计的复制，不是独立重复。聚合层按
   `deterministic` 标记把同一单元的多个 seed 折叠为 1 个观测
@@ -292,7 +333,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   （调在 val_loss 上不能证明 macro F1 也强）。
   对比集合没有 ngram 时显式提示简单基线守卫退化为只看
   unigram 参考；确定性 ngram 的多个 seed 不计入独立种子，
-  也不建议用「多种子重跑」估计其不确定性。
+  也不建议用「多种子重跑」估计其不确定性，其误差线应来自
+  评估窗口 bootstrap。ngram 与神经运行的数据指纹、切分
+  比例、评估窗口集合或数据增强不一致时，「基线强于 ngram」
+  的判断被跳过并显式列出 `cross_family` 违规项。
   **调参对称性**：基线做了学习率网格、挑战臂却使用默认
   lr 且没有独立调参来源时，报告单独提示：
   落败不能排除调参不足，胜出只是保守下界。
@@ -520,6 +564,9 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 `--early-stop-min-delta`、`--selection-metric`（验证集选型/
 早停指标，默认 `val_loss`；预注册主指标可周期计算时自动
 跟随）、`--bad-cases`（默认 10，0 关闭）、
+`--eval-bootstrap N`（final/test 评估窗口 bootstrap 重采样
+次数，默认 500，0 关闭；输出 loss/ppl/token accuracy/
+macro F1 的 95% 置信区间）、
 `--skip-efficiency`（跳过结束时的效率测量）、
 `--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
 变量检查、Mean ± Std、显著性检验与功效/等价性分析）、

@@ -7,6 +7,7 @@ import contextlib
 import datetime
 import functools
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -4536,6 +4537,160 @@ def confusion_matrix_metrics(
     }
 
 
+# 评估集不确定性：对固定评估窗口做有放回重采样。窗口是
+# 评估协议的最小独立单位（同一窗口内 token 高度相关），
+# 逐 token 重采样会低估不确定性。
+_EVAL_BOOTSTRAP_CI_LEVEL = 0.95
+
+
+def _eval_bootstrap_seed(
+    data_sha256: str,
+    split: str,
+    batches: int,
+    batch_size: int,
+    seq_len: int,
+) -> int:
+    """
+    由数据指纹与评估协议生成稳定的 bootstrap 随机种子。
+
+    不使用全局 RNG：最终/测试评估的置信区间必须在同一
+    运行内可复现，且不能扰动训练或数据采样轨迹。
+    """
+    material = (
+        f"{data_sha256}|{split}|{batches}|{batch_size}|"
+        f"{seq_len}|bootstrap-v1"
+    ).encode("utf-8")
+    return int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(),
+        "big",
+    )
+
+
+def _percentile_interval(
+    values: torch.Tensor,
+    ci_level: float,
+) -> Tuple[float, float]:
+    """返回 [lower, upper] 分位区间（线性插值）。"""
+    lower = (1.0 - ci_level) / 2.0
+    upper = 1.0 - lower
+    quantiles = torch.quantile(
+        values.to(torch.float64).reshape(-1),
+        torch.tensor(
+            [lower, upper],
+            dtype=torch.float64,
+        ),
+    )
+    return float(quantiles[0]), float(quantiles[1])
+
+
+def _bootstrap_eval_intervals(
+    window_loss_sums: torch.Tensor,
+    window_tokens: torch.Tensor,
+    window_true_positive: torch.Tensor,
+    window_predicted: torch.Tensor,
+    window_support: torch.Tensor,
+    present_classes: torch.Tensor,
+    replicates: int,
+    seed: int,
+    ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
+) -> Dict[str, object]:
+    """
+    对固定评估窗口做有放回 bootstrap，给出评估集层面的
+    95% 置信区间（loss / ppl / token accuracy / macro F1）。
+
+    口径说明：
+    - 重采样单位是完整评估窗口，不是 token：同一窗口内的
+      token 由同一段上下文产生，逐 token 重采样会把相关样本
+      当成独立样本，低估评估不确定性；
+    - macro F1 的类别集合固定为全量评估中 support>0 的类，
+      重采样缺少某个稀有类时不改变指标定义，避免置信区间
+      与点估计口径不一致；
+    - 重采样不进入训练、选型或超参数决策，只用于报告
+      「测试集只评估一次」时点估计本身的抽样误差；
+    - 只覆盖混淆矩阵口径的指标；AUC 等排序指标未纳入。
+
+    返回的键不带 split 前缀，由 ``evaluate`` 统一加前缀。
+    """
+    n_windows = int(window_tokens.numel())
+    if (
+        replicates <= 1
+        or n_windows <= 0
+        or ci_level <= 0.0
+        or ci_level >= 1.0
+    ):
+        return {}
+
+    generator = torch.Generator().manual_seed(int(seed))
+    indices = torch.randint(
+        low=0,
+        high=n_windows,
+        size=(int(replicates), n_windows),
+        generator=generator,
+    )
+
+    loss_sums = window_loss_sums.to(torch.float64)
+    tokens = window_tokens.to(torch.float64)
+    sampled_loss = (
+        loss_sums[indices].sum(dim=1)
+        / tokens[indices].sum(dim=1)
+    )
+    sampled_ppl = torch.exp(sampled_loss.clamp(max=80.0))
+
+    true_positive = window_true_positive.to(torch.float64)
+    predicted = window_predicted.to(torch.float64)
+    support = window_support.to(torch.float64)
+
+    sampled_tp = true_positive[indices].sum(dim=1)
+    sampled_predicted = predicted[indices].sum(dim=1)
+    sampled_support = support[indices].sum(dim=1)
+
+    sampled_accuracy = (
+        sampled_tp.sum(dim=1)
+        / sampled_support.sum(dim=1).clamp_min(1.0)
+    )
+
+    precision = sampled_tp / sampled_predicted.clamp_min(1.0)
+    recall = sampled_tp / sampled_support.clamp_min(1.0)
+    denominator = precision + recall
+    f1 = torch.zeros_like(sampled_tp)
+    nonzero = denominator > 0.0
+    f1[nonzero] = (
+        2.0
+        * precision[nonzero]
+        * recall[nonzero]
+        / denominator[nonzero]
+    )
+    mask = present_classes.to(torch.bool)
+    if bool(mask.any()):
+        sampled_macro_f1 = f1[:, mask].mean(dim=1)
+    else:
+        sampled_macro_f1 = torch.full(
+            (int(replicates),),
+            float("nan"),
+            dtype=torch.float64,
+        )
+
+    result: Dict[str, object] = {
+        "bootstrap_replicates": int(replicates),
+        "bootstrap_windows": n_windows,
+        "bootstrap_ci_level": float(ci_level),
+    }
+
+    for name, values in (
+        ("loss", sampled_loss),
+        ("ppl", sampled_ppl),
+        ("token_accuracy", sampled_accuracy),
+        ("macro_f1", sampled_macro_f1),
+    ):
+        if name == "macro_f1" and not bool(mask.any()):
+            continue
+        low, high = _percentile_interval(values, ci_level)
+        result[f"{name}_ci95_low"] = low
+        result[f"{name}_ci95_high"] = high
+
+    return result
+
+
 def macro_auc_metrics(
     probabilities: torch.Tensor,
     targets: torch.Tensor,
@@ -4790,6 +4945,7 @@ def evaluate(
     compute_auc: bool = False,
     routing_probe: Optional["RoutingProbe"] = None,
     bad_case_collector: Optional["_BadCaseCollector"] = None,
+    bootstrap_replicates: int = 0,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -4819,6 +4975,13 @@ def evaluate(
     - ``{split}_majority_accuracy``：常数预测器（永远
       猜最高频字节）的 accuracy，类别不平衡下解读
       accuracy 的参考下界。
+
+    ``bootstrap_replicates > 0`` 时额外对固定评估窗口做
+    有放回重采样，给出 loss / ppl / token accuracy / macro F1
+    的 95% 置信区间（``{split}_*_ci95_low/high``）。测试集
+    只解封一次，点估计本身无法区分「方法差异」与「评估窗口
+    抽样噪声」；置信区间是评估集层面的不确定性，与跨随机
+    种子的训练方差互补，不参与训练或模型选择。
 
     compute_auc=True 时（最终/测试评估）额外计算
     one-vs-rest 的 ``{split}_pr_auc_macro`` 与
@@ -4873,6 +5036,16 @@ def evaluate(
     auc_probs: Optional[torch.Tensor] = None
     auc_targets: Optional[torch.Tensor] = None
     auc_tokens = 0
+
+    # 评估窗口级 bootstrap 的逐窗口充分统计量：窗口损失和、
+    # token 数，以及每类 TP / 预测数 / support。只在最终与
+    # 测试评估时收集，周期验证保持轻量。
+    bootstrap_enabled = int(bootstrap_replicates) > 1
+    window_loss_sums: List[torch.Tensor] = []
+    window_tokens: List[torch.Tensor] = []
+    window_true_positive: List[torch.Tensor] = []
+    window_predicted: List[torch.Tensor] = []
+    window_support: List[torch.Tensor] = []
 
     # CUDA 路径在全部批次结束后统一同步；CPU 路径保持同步语义。
     auc_async = compute_auc and device.type == "cuda"
@@ -4950,6 +5123,57 @@ def evaluate(
                     vocab_size,
                 )
 
+                if bootstrap_enabled:
+                    # 逐窗口 loss 与混淆充分统计量：用与点估计
+                    # 同一前向的 logits 计算，不额外跑模型。
+                    token_logits = raw_logits.reshape(
+                        -1,
+                        vocab_size,
+                    ).float()
+                    token_losses = F.cross_entropy(
+                        token_logits,
+                        flat_target,
+                        reduction="none",
+                    )
+                    window_loss_sums.append(
+                        token_losses.view(y.shape)
+                        .sum(dim=1)
+                        .detach()
+                        .to(torch.float64)
+                        .cpu()
+                    )
+                    window_tokens.append(
+                        torch.full(
+                            (y.size(0),),
+                            float(y.size(1)),
+                            dtype=torch.float64,
+                        )
+                    )
+                    for row in range(y.size(0)):
+                        target_row = y[row].to(torch.int64)
+                        predicted_row = predicted[row].to(
+                            torch.int64
+                        )
+                        correct = target_row == predicted_row
+                        window_true_positive.append(
+                            torch.bincount(
+                                target_row[correct],
+                                minlength=vocab_size,
+                            ).cpu()
+                        )
+                        window_predicted.append(
+                            torch.bincount(
+                                predicted_row,
+                                minlength=vocab_size,
+                            ).cpu()
+                        )
+                        window_support.append(
+                            torch.bincount(
+                                target_row,
+                                minlength=vocab_size,
+                            ).cpu()
+                        )
+
                 if compute_auc and (
                     auc_tokens < _AUC_MAX_TOKENS
                 ):
@@ -5025,6 +5249,43 @@ def evaluate(
 
     for key, value in class_metrics.items():
         metrics[f"{split}_{key}"] = value
+
+    if bootstrap_enabled and window_loss_sums:
+        present_classes = confusion.sum(dim=1) > 0
+        bootstrap_metrics = _bootstrap_eval_intervals(
+            torch.cat(window_loss_sums),
+            torch.cat(window_tokens),
+            torch.stack(window_true_positive),
+            torch.stack(window_predicted),
+            torch.stack(window_support),
+            present_classes.cpu(),
+            int(bootstrap_replicates),
+            _eval_bootstrap_seed(
+                dataset.data_sha256,
+                split,
+                batches,
+                batch_size,
+                dataset.seq_len,
+            ),
+        )
+        for key, value in bootstrap_metrics.items():
+            metrics[f"{split}_{key}"] = value
+
+        # 评估窗口可能因 split 较短而重叠：重叠窗口不是独立
+        # 抽样单位，bootstrap 区间会偏窄。把重叠比例随指标
+        # 落盘，报告可据此判断区间是否被高估。
+        starts = (
+            dataset._fixed_starts.get(split, {}).get("starts")
+        )
+        if starts is not None and len(starts) > 1:
+            gaps = starts[1:] - starts[:-1]
+            overlap_count = int(
+                (gaps < dataset.seq_len).sum().item()
+            )
+            metrics[f"{split}_eval_windows"] = int(len(starts))
+            metrics[f"{split}_eval_window_overlap_fraction"] = (
+                overlap_count / (len(starts) - 1)
+            )
 
     if compute_auc:
         # 读取 CPU 收集缓冲前统一等待。
@@ -10488,6 +10749,23 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "selection_metric",
 )
 
+# 跨 family 对比（神经模型 vs ngram 统计基线）共用的
+# 数据与评估口径：优化器/训练轮数可以不同（ngram 没有这些
+# 概念），但训练/验证/测试切分、评估窗口集合与数据增强必须
+# 一致，否则「神经基线强于 ngram」的结论会把数据差异误当成
+# 方法差异。
+_CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
+    "data_sha256",
+    "seq_len",
+    "val_fraction",
+    "test_fraction",
+    "group_separator",
+    "deduplicate_train_groups",
+    "batch_size",
+    "eval_batches",
+    "data_augmentation",
+)
+
 # 对比运行的「可复现性来源」核对项：代码指纹与数值环境。
 # 与受控变量协议不同，这些项不是训练超参数，但同样决定结果
 # 能否归因：同一份代码、同一个 Python/torch/CUDA/cuDNN 与
@@ -11135,6 +11413,102 @@ def _format_factor_value(value) -> str:
     return str(value)
 
 
+def cross_family_protocol_check(
+    rows: List[Dict[str, object]],
+    factors: List[str],
+) -> Dict[str, object]:
+    """
+    核对神经网络运行与统计基线（ngram）是否使用同一份数据与
+    同一组评估窗口。
+
+    COMPARISON_PROTOCOL_KEYS 里的优化器/训练轮数对 ngram 不
+    适用，因此主受控变量检查按 family 分开；但「基线是否强于
+    ngram」这一判断仍然要求 data_sha256、切分比例、评估窗口
+    数、批量大小、数据增强等口径一致。这里只比较这些跨 family
+    共用项，不一致时返回 violation，供对比报告拒绝归因。
+    """
+    neural: List[Tuple[str, object]] = []
+    statistical: List[Tuple[str, object]] = []
+
+    for row in rows:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            protocol = {}
+        family = protocol.get("comparison_family") or "neural"
+        target = statistical if family == "statistical" else neural
+        target.append((str(row.get("run")), protocol))
+
+    checked: List[str] = []
+    unchecked: List[str] = []
+    violations: List[Dict[str, object]] = []
+
+    if not neural or not statistical:
+        return {
+            "checked_keys": checked,
+            "unchecked_keys": unchecked,
+            "violations": violations,
+            "ok": True,
+        }
+
+    for key in _CROSS_FAMILY_PROTOCOL_KEYS:
+        if key in factors:
+            continue
+
+        neural_values = [
+            (run, protocol.get(key))
+            for run, protocol in neural
+        ]
+        statistical_values = [
+            (run, protocol.get(key))
+            for run, protocol in statistical
+        ]
+        all_values = neural_values + statistical_values
+        present = [
+            (run, value)
+            for run, value in all_values
+            if value is not None
+        ]
+        missing_runs = [
+            run for run, value in all_values if value is None
+        ]
+
+        if not present:
+            unchecked.append(key)
+            continue
+        if not any(
+            value is not None for _, value in neural_values
+        ) or not any(
+            value is not None for _, value in statistical_values
+        ):
+            unchecked.append(key)
+            continue
+
+        checked.append(key)
+        distinct = {
+            repr(_stable_factor_key(value))
+            for _, value in present
+        }
+        if len(distinct) > 1 or missing_runs:
+            violations.append({
+                "key": key,
+                "values": {
+                    run: value for run, value in all_values
+                },
+                "missing_runs": missing_runs,
+                "note": (
+                    "神经运行与 ngram 统计基线使用了不同的"
+                    "数据/评估口径，两者不能直接比较"
+                ),
+            })
+
+    return {
+        "checked_keys": checked,
+        "unchecked_keys": unchecked,
+        "violations": violations,
+        "ok": not violations,
+    }
+
+
 def check_controlled_variables(
     rows: List[Dict[str, object]],
     factors: List[str],
@@ -11219,6 +11593,8 @@ def check_controlled_variables(
                 "missing_runs": missing_runs,
             })
 
+    cross_family = cross_family_protocol_check(rows, factors)
+
     return {
         "factors": list(factors),
         "checked_keys": checked,
@@ -11226,7 +11602,17 @@ def check_controlled_variables(
         "violations": violations,
         "n_neural_runs": len(neural),
         "statistical_runs": statistical,
-        "ok": not violations,
+        "cross_family_checked_keys": cross_family[
+            "checked_keys"
+        ],
+        "cross_family_unchecked_keys": cross_family[
+            "unchecked_keys"
+        ],
+        "cross_family_violations": cross_family[
+            "violations"
+        ],
+        "ok": not violations
+        and not cross_family["violations"],
     }
 
 
@@ -11495,6 +11881,164 @@ def _paired_t_test(
         "p_value": _two_sided_t_p_value(abs(t), float(n - 1)),
         "effect": mean,
         "se": std / math.sqrt(n),
+    }
+
+
+# 配对符号翻转检验：n 不超过该值时穷举全部 2^n 种符号
+# 组合（精确 p 值），否则用固定种子的 Monte Carlo 近似。
+_RANDOMIZATION_EXACT_MAX_N = 12
+_RANDOMIZATION_MONTE_CARLO_REPLICATES = 20000
+
+
+def _randomization_seed(differences: List[float]) -> int:
+    """由配对差值生成稳定的随机化种子（不触碰全局 RNG）。"""
+    material = repr(
+        [float(value) for value in differences]
+    ).encode("utf-8")
+    return int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(),
+        "big",
+    )
+
+
+def _paired_sign_flip_test(
+    differences: List[float],
+) -> Dict[str, object]:
+    """
+    配对符号翻转（randomization/sign-flip）检验。
+
+    零假设：配对差值的分布关于 0 对称。检验统计量为差值的
+    均值；穷举/抽样全部符号组合，得到双侧精确 p 值
+    P(|mean(s_i·d_i)| >= |mean(d_i)|)。与配对 t 检验相比，
+    它不要求差值服从正态分布，适合种子数很少（3~5）的
+    机器学习实验重复。
+
+    n <= 12 时穷举 2^n 种组合（n=12 为 4096 次，成本可忽略）；
+    更大样本用 20000 次固定种子的 Monte Carlo，并采用
+    (count+1)/(R+1) 的保守估计避免零 p 值。符号翻转以
+    「配对」为前提：非配对比较不适用。
+    """
+    n = len(differences)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {"test": "insufficient_seeds"}
+
+    values = [float(value) for value in differences]
+    if any(not math.isfinite(value) for value in values):
+        return {"test": "invalid_values"}
+
+    mean = sum(values) / n
+    observed = abs(mean)
+    tolerance = 1e-12 * max(1.0, observed)
+
+    if observed <= tolerance:
+        return {
+            "test": "paired_sign_flip",
+            "p_value": 1.0,
+            "method": "degenerate",
+            "n_permutations": 1,
+            "effect": mean,
+        }
+
+    if n <= _RANDOMIZATION_EXACT_MAX_N:
+        count = 0
+        for signs in itertools.product((1.0, -1.0), repeat=n):
+            statistic = abs(
+                sum(
+                    sign * value
+                    for sign, value in zip(signs, values)
+                )
+            ) / n
+            if statistic >= observed - tolerance:
+                count += 1
+        permutations = 2 ** n
+        p_value = count / permutations
+        method = "exact"
+    else:
+        generator = torch.Generator().manual_seed(
+            _randomization_seed(values)
+        )
+        replicates = _RANDOMIZATION_MONTE_CARLO_REPLICATES
+        signs = torch.randint(
+            low=0,
+            high=2,
+            size=(replicates, n),
+            generator=generator,
+            dtype=torch.int8,
+        ).to(torch.float64) * 2.0 - 1.0
+        tensor = torch.tensor(values, dtype=torch.float64)
+        statistics = (
+            signs * tensor
+        ).sum(dim=1).abs() / n
+        count = int(
+            (statistics >= observed - tolerance).sum().item()
+        )
+        permutations = replicates
+        p_value = (count + 1) / (replicates + 1)
+        method = "monte_carlo"
+
+    # 精确枚举的最小可达双侧 p 值：两个极端符号组合（全正/
+    # 全负）对应 |mean| 最大，n 很小时 2/2^n 可能本身就大于
+    # 0.05，此时设计在数学上不可能得到显著结果，必须提示，
+    # 不能把「不显著」解读为「无效应」。
+    min_attainable_p = (
+        2.0 / permutations if permutations > 0 else None
+    )
+
+    return {
+        "test": "paired_sign_flip",
+        "p_value": p_value,
+        "method": method,
+        "n_permutations": permutations,
+        "min_attainable_p": min_attainable_p,
+        "can_reach_significance": (
+            min_attainable_p is not None
+            and min_attainable_p <= _SIGNIFICANCE_LEVEL
+        ),
+        "effect": mean,
+    }
+
+
+def _leave_one_out_effect_stability(
+    values: List[float],
+) -> Dict[str, object]:
+    """
+    逐一去掉一个观测（种子）后重算效应，检查方向是否稳定。
+
+    小样本（3~5 个种子）下，配对 t 检验显著也可能是由单个
+    种子驱动的。若去掉某一种子后效应方向翻转或归零，说明
+    结论不具备 leave-one-out 稳健性，展示层必须提示；这不是
+    新的显著性检验，而是对「效应是否只来自一个运行」的
+    描述性稳健性检查。
+    """
+    n = len(values)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {}
+    numeric = [float(value) for value in values]
+    if any(not math.isfinite(value) for value in numeric):
+        return {}
+
+    total = sum(numeric)
+    full_effect = total / n
+    leave_one_out = [
+        (total - value) / (n - 1)
+        for value in numeric
+    ]
+    tolerance = 1e-12 * max(1.0, abs(full_effect))
+    if abs(full_effect) <= tolerance:
+        stable = all(
+            abs(value) <= tolerance
+            for value in leave_one_out
+        )
+    else:
+        stable = all(
+            value * full_effect > 0.0
+            for value in leave_one_out
+        )
+
+    return {
+        "leave_one_out_effect_min": min(leave_one_out),
+        "leave_one_out_effect_max": max(leave_one_out),
+        "leave_one_out_sign_stable": stable,
     }
 
 
@@ -12414,6 +12958,30 @@ def _contrast_test(
         ]
         result = _paired_t_test(differences)
         result["n_pairs"] = len(common_seeds)
+        result.update(
+            _leave_one_out_effect_stability(differences)
+        )
+        # 小样本的配对 t 检验依赖差值正态性；符号翻转检验
+        # 提供无分布假设的稳健性对照，二者结论不一致时展示层
+        # 必须提示，不能只挑支持结论的那个。
+        randomization = _paired_sign_flip_test(differences)
+        if randomization.get("p_value") is not None:
+            result["randomization"] = randomization
+            result["randomization_p_value"] = randomization.get(
+                "p_value"
+            )
+            result["randomization_method"] = randomization.get(
+                "method"
+            )
+            result["randomization_permutations"] = (
+                randomization.get("n_permutations")
+            )
+            result["randomization_min_attainable_p"] = (
+                randomization.get("min_attainable_p")
+            )
+            result["randomization_can_reach_significance"] = (
+                randomization.get("can_reach_significance")
+            )
         return result
 
     values_a = [float(sample["value"]) for sample in samples_a]
@@ -12567,6 +13135,48 @@ def _apply_multiple_comparison_correction(
                 str(contrast.get("verdict")),
                 corrected,
             )
+
+    # 符号翻转检验与 t 检验同属一个显著性家族：它只在配对
+    # 对比上执行，但同样要受多重比较约束。展示层用二者是否
+    # 一致来提示「结论依赖正态性假设」的风险。
+    randomization_eligible = [
+        contrast
+        for contrast in contrasts
+        if contrast.get("randomization_p_value") is not None
+    ]
+    randomization_values = [
+        float(contrast["randomization_p_value"])
+        for contrast in randomization_eligible
+    ]
+    randomization_holm = _holm_bonferroni(
+        randomization_values
+    )
+    randomization_bh = _benjamini_hochberg(
+        randomization_values
+    )
+    for contrast, holm_p, bh_p in zip(
+        randomization_eligible,
+        randomization_holm,
+        randomization_bh,
+    ):
+        contrast["randomization_p_value_holm"] = holm_p
+        contrast["randomization_p_value_bh"] = bh_p
+        if "randomization_significant_raw" not in contrast:
+            contrast["randomization_significant_raw"] = bool(
+                float(contrast["randomization_p_value"])
+                <= _SIGNIFICANCE_LEVEL
+            )
+        contrast["randomization_significant"] = bool(
+            holm_p is not None
+            and float(holm_p) <= _SIGNIFICANCE_LEVEL
+        )
+        # 稳健显著：两种检验在家族校正后都显著。任一方不显著
+        # 时，显著性结论依赖分布假设或检验功效，不能当作
+        # 稳健结论。
+        contrast["significant_robust"] = bool(
+            contrast.get("significant")
+            and contrast.get("randomization_significant")
+        )
 
     # 等价性（TOST）主张同样构成检验家族：对 m 个对比都声称
     # 「差异落在等价界内」，至少一个误判的概率同样随家族规模
@@ -12733,6 +13343,30 @@ def factor_contrasts(
                 "t": test.get("t"),
                 "df": test.get("df"),
                 "p_value": test.get("p_value"),
+                "randomization_p_value": test.get(
+                    "randomization_p_value"
+                ),
+                "randomization_method": test.get(
+                    "randomization_method"
+                ),
+                "randomization_permutations": test.get(
+                    "randomization_permutations"
+                ),
+                "randomization_min_attainable_p": test.get(
+                    "randomization_min_attainable_p"
+                ),
+                "randomization_can_reach_significance": test.get(
+                    "randomization_can_reach_significance"
+                ),
+                "leave_one_out_effect_min": test.get(
+                    "leave_one_out_effect_min"
+                ),
+                "leave_one_out_effect_max": test.get(
+                    "leave_one_out_effect_max"
+                ),
+                "leave_one_out_sign_stable": test.get(
+                    "leave_one_out_sign_stable"
+                ),
                 "n_pairs": test.get("n_pairs", 0),
                 "n_baseline": len(independent_a),
                 "n_variant": len(independent_b),
@@ -12857,15 +13491,43 @@ def _paired_linear_effect(
             key=_factor_sort_rank,
         )
         result = _paired_t_test(effect_values)
+        randomization = _paired_sign_flip_test(effect_values)
+        stability = _leave_one_out_effect_stability(
+            effect_values
+        )
         effect = result.get("effect")
         if effect is None:
             effect = _mean(effect_values)
         return {
             "effect": effect,
             "test": result.get("test"),
+            "leave_one_out_effect_min": stability.get(
+                "leave_one_out_effect_min"
+            ),
+            "leave_one_out_effect_max": stability.get(
+                "leave_one_out_effect_max"
+            ),
+            "leave_one_out_sign_stable": stability.get(
+                "leave_one_out_sign_stable"
+            ),
             "t": result.get("t"),
             "df": result.get("df"),
             "p_value": result.get("p_value"),
+            "randomization_p_value": randomization.get(
+                "p_value"
+            ),
+            "randomization_method": randomization.get(
+                "method"
+            ),
+            "randomization_permutations": randomization.get(
+                "n_permutations"
+            ),
+            "randomization_min_attainable_p": randomization.get(
+                "min_attainable_p"
+            ),
+            "randomization_can_reach_significance": (
+                randomization.get("can_reach_significance")
+            ),
             "se": result.get("se"),
             "n_pairs": len(effect_values),
             "aligned_seeds": aligned,
@@ -13161,6 +13823,30 @@ def factorial_effects(
                     "t": result.get("t"),
                     "df": result.get("df"),
                     "p_value": result.get("p_value"),
+                    "randomization_p_value": result.get(
+                        "randomization_p_value"
+                    ),
+                    "randomization_method": result.get(
+                        "randomization_method"
+                    ),
+                    "randomization_permutations": result.get(
+                        "randomization_permutations"
+                    ),
+                    "randomization_min_attainable_p": result.get(
+                        "randomization_min_attainable_p"
+                    ),
+                    "randomization_can_reach_significance": result.get(
+                        "randomization_can_reach_significance"
+                    ),
+                    "leave_one_out_effect_min": result.get(
+                        "leave_one_out_effect_min"
+                    ),
+                    "leave_one_out_effect_max": result.get(
+                        "leave_one_out_effect_max"
+                    ),
+                    "leave_one_out_sign_stable": result.get(
+                        "leave_one_out_sign_stable"
+                    ),
                     "n_pairs": result.get("n_pairs", 0),
                     "aligned_seeds": bool(
                         result.get("aligned_seeds")
@@ -13204,6 +13890,34 @@ def factorial_effects(
             effect["claim"] = "harms_component"
         else:
             effect["claim"] = "not_significant"
+
+    # 符号翻转检验与 t 检验同家族校正；两者结论不一致时
+    # 主效应/交互的显著性依赖分布假设，不能作为稳健结论。
+    randomization_eligible = [
+        item
+        for item in report["effects"]
+        if item.get("randomization_p_value") is not None
+    ]
+    randomization_holm = _holm_bonferroni([
+        float(item["randomization_p_value"])
+        for item in randomization_eligible
+    ])
+    for item, randomization_adjusted in zip(
+        randomization_eligible,
+        randomization_holm,
+    ):
+        item["randomization_p_value_holm"] = (
+            randomization_adjusted
+        )
+        item["randomization_significant"] = bool(
+            randomization_adjusted is not None
+            and float(randomization_adjusted)
+            <= _SIGNIFICANCE_LEVEL
+        )
+        item["significant_robust"] = bool(
+            item.get("significant")
+            and item.get("randomization_significant")
+        )
 
     for effect in report["effects"]:
         if effect.get("test") == "no_common_seeds":
@@ -13325,6 +14039,35 @@ def _contrast_display(
             and abs(float(p_holm) - float(p_value)) > 1e-9
         ):
             p_text += f"(Holm {float(p_holm):.4f})"
+        randomization_p = contrast.get(
+            "randomization_p_value"
+        )
+        if randomization_p is not None:
+            randomization_holm = contrast.get(
+                "randomization_p_value_holm"
+            )
+            randomization_text = (
+                f"符号翻转 p={float(randomization_p):.4f}"
+            )
+            if (
+                randomization_holm is not None
+                and abs(
+                    float(randomization_holm)
+                    - float(randomization_p)
+                ) > 1e-9
+            ):
+                randomization_text += (
+                    f"(Holm {float(randomization_holm):.4f})"
+                )
+            # 只在小样本精确检验或两种检验结论不一致时展示，
+            # 避免每行都堆叠两种 p 值；不一致是必须暴露的
+            # 方法学风险。
+            if (
+                contrast.get("randomization_method") == "exact"
+                or contrast.get("significant")
+                != contrast.get("randomization_significant")
+            ):
+                p_text += f" [无分布假设: {randomization_text}]"
 
     star = "*" if contrast.get("significant") else ""
 
@@ -13386,6 +14129,36 @@ def _contrast_display(
         caveat = (
             "（种子数不足，未做显著性检验，"
             "不能据此声称差异）"
+        )
+
+    if (
+        contrast.get("randomization_p_value") is not None
+        and contrast.get("significant")
+        != contrast.get("randomization_significant")
+    ):
+        caveat += (
+            "（配对 t 与无分布假设的符号翻转检验经 Holm "
+            "校正后结论不一致：显著性依赖正态性假设或检验"
+            "功效，不能作为稳健结论）"
+        )
+
+    if contrast.get("leave_one_out_sign_stable") is False:
+        caveat += (
+            "（逐一去掉一个种子后效应方向翻转或归零："
+            "结论可能由单个种子驱动，leave-one-out 稳健性不足）"
+        )
+
+    if (
+        contrast.get("randomization_method") == "exact"
+        and contrast.get("randomization_can_reach_significance")
+        is False
+    ):
+        minimum = contrast.get("randomization_min_attainable_p")
+        caveat += (
+            "（精确符号翻转检验的最小可达双侧 p="
+            f"{float(minimum):.3f}（n={contrast.get('n_pairs')}），"
+            "该样本量在数学上无法达到 0.05 显著；"
+            "不显著不能解读为无效应，请增加独立种子）"
         )
 
     # 不显著 ≠ 等价：未校正的显著性检验只能回答「有没有
@@ -13595,6 +14368,30 @@ def compare_cells_to_baseline(
             "t": result.get("t"),
             "df": result.get("df"),
             "p_value": result.get("p_value"),
+            "randomization_p_value": result.get(
+                "randomization_p_value"
+            ),
+            "randomization_method": result.get(
+                "randomization_method"
+            ),
+            "randomization_permutations": result.get(
+                "randomization_permutations"
+            ),
+            "randomization_min_attainable_p": result.get(
+                "randomization_min_attainable_p"
+            ),
+            "randomization_can_reach_significance": result.get(
+                "randomization_can_reach_significance"
+            ),
+            "leave_one_out_effect_min": result.get(
+                "leave_one_out_effect_min"
+            ),
+            "leave_one_out_effect_max": result.get(
+                "leave_one_out_effect_max"
+            ),
+            "leave_one_out_sign_stable": result.get(
+                "leave_one_out_sign_stable"
+            ),
             "n_pairs": result.get("n_pairs", 0),
             "n_baseline": len(
                 _collapse_seed_samples(
@@ -14248,6 +15045,8 @@ def baseline_adequacy(
         "capacity_confounds": [],
         "baseline_capacity": None,
         "ngram_missing": False,
+        "ngram_protocol_compatible": None,
+        "ngram_protocol_violations": [],
         "tuning_parity": None,
         "ok": None,
     }
@@ -14388,6 +15187,32 @@ def baseline_adequacy(
         and math.isfinite(float(row[metric]))
     ]
     baseline_better_than_ngram: Optional[bool] = None
+    # ngram 与神经运行必须使用同一份数据、同一组评估窗口，
+    # 否则「基线强于 ngram」把数据差异误当成方法差异。
+    ngram_cross_family = cross_family_protocol_check(
+        ngram_rows + baseline_rows,
+        [],
+    )
+    if ngram_rows and baseline_rows:
+        report["ngram_protocol_compatible"] = ngram_cross_family[
+            "ok"
+        ]
+        report["ngram_protocol_violations"] = (
+            ngram_cross_family["violations"]
+        )
+        if ngram_cross_family["violations"]:
+            keys = ", ".join(
+                str(item["key"])
+                for item in ngram_cross_family["violations"]
+            )
+            message = (
+                "ngram 统计基线与神经运行的数据/评估口径不一致"
+                f"（{keys}）：两者不能直接比较，"
+                "「基线强于/不劣于 ngram」的判断已跳过；"
+                "请在同一 --data / 切分比例 / --eval-batches / "
+                "数据增强设置下重跑 ngram"
+            )
+            report["advisories"].append(message)
     if baseline_mode != "ngram" and not ngram_rows:
         report["ngram_missing"] = True
         report["advisories"].append(
@@ -14396,7 +15221,11 @@ def baseline_adequacy(
             "unigram 参考；请用 --statistical-baseline 在同一"
             "数据/评估口径下训练 ngram，并把该运行加入 --compare"
         )
-    if ngram_rows and baseline_mode != "ngram":
+    if (
+        ngram_rows
+        and baseline_mode != "ngram"
+        and report["ngram_protocol_compatible"] is not False
+    ):
         ngram_mean = _mean(
             [float(row[metric]) for row in ngram_rows]
         )
@@ -16149,8 +16978,8 @@ def print_comparison_analysis(
 
     if controlled["statistical_runs"]:
         print(
-            "  统计基线（ngram，无优化器与训练轮数）"
-            "不参与受控变量检查: "
+            "  统计基线（ngram，无优化器与训练轮数）不参与"
+            "优化器类受控变量检查，但数据/评估口径仍需一致: "
             + ", ".join(controlled["statistical_runs"])
         )
 
@@ -16180,6 +17009,37 @@ def print_comparison_analysis(
         print(
             "  [warn] 以下协议项所有运行都未记录，无法核对"
             "一致性: " + ", ".join(controlled["unchecked_keys"])
+        )
+
+    cross_violations = controlled.get(
+        "cross_family_violations"
+    ) or []
+    if cross_violations:
+        for violation in cross_violations:
+            values_text = ", ".join(
+                f"{run}={_format_factor_value(value)}"
+                for run, value in violation["values"].items()
+            )
+            print(
+                "  [violation] 跨 family "
+                f"{violation['key']}: {values_text}"
+            )
+        print(
+            "  神经运行与 ngram 统计基线的数据/评估口径不一致："
+            "跨 family 的基线强弱判断无效，请先统一口径重跑"
+        )
+    elif controlled.get("cross_family_checked_keys"):
+        print(
+            f"  OK：跨 family 的 "
+            f"{len(controlled['cross_family_checked_keys'])} 项"
+            "数据/评估口径一致"
+        )
+    if controlled.get("cross_family_unchecked_keys"):
+        print(
+            "  [warn] 以下跨 family 口径项缺少记录，无法核对: "
+            + ", ".join(
+                controlled["cross_family_unchecked_keys"]
+            )
         )
 
     provenance = check_run_provenance(rows)
@@ -19293,6 +20153,49 @@ def run_self_test():
     assert "val_loss" in val_metrics
     assert "val_ppl" in val_metrics
 
+    # 评估窗口 bootstrap：字段齐全、可复现，且点估计落在
+    # 置信区间内；bootstrap 不改变任何点估计指标。
+    boot_metrics_a = evaluate(
+        eval_model,
+        eval_dataset,
+        2,
+        1,
+        eval_device,
+        bootstrap_replicates=64,
+    )
+    boot_metrics_b = evaluate(
+        eval_model,
+        eval_dataset,
+        2,
+        1,
+        eval_device,
+        bootstrap_replicates=64,
+    )
+    assert boot_metrics_a == boot_metrics_b
+    assert boot_metrics_a["val_loss"] == val_metrics["val_loss"]
+    assert boot_metrics_a["val_bootstrap_replicates"] == 64
+    assert (
+        float(boot_metrics_a["val_loss_ci95_low"])
+        <= float(boot_metrics_a["val_loss"])
+        <= float(boot_metrics_a["val_loss_ci95_high"])
+    )
+    assert (
+        float(boot_metrics_a["val_ppl_ci95_low"])
+        <= float(boot_metrics_a["val_ppl"])
+        <= float(boot_metrics_a["val_ppl_ci95_high"])
+    )
+    assert (
+        float(boot_metrics_a["val_token_accuracy_ci95_low"])
+        <= float(boot_metrics_a["val_token_accuracy"])
+        <= float(boot_metrics_a["val_token_accuracy_ci95_high"])
+    )
+    # 窗口重叠比例必须随 bootstrap 一起落盘，且落在 [0, 1]；
+    # 重叠窗口不是独立抽样单位，读者据此判断区间是否偏窄。
+    assert boot_metrics_a["val_eval_windows"] >= 1
+    assert 0.0 <= float(
+        boot_metrics_a["val_eval_window_overlap_fraction"]
+    ) <= 1.0
+
     test_metrics = evaluate(
         eval_model,
         eval_dataset,
@@ -20898,6 +21801,176 @@ def run_self_test():
         - (_two_sided_t_p_value(-2.0, 7.0) or 0.0)
     ) < 1e-12
 
+    # ---- 对比分析：无分布假设的配对符号翻转检验 ----
+    # n=3、差值全为正时，8 种符号组合里只有全正/全负两种
+    # 与观测均值同向或更强，精确双侧 p=2/8=0.25。
+    sign_flip = _paired_sign_flip_test([1.0, 2.0, 3.0])
+    assert sign_flip["method"] == "exact"
+    assert abs(float(sign_flip["p_value"]) - 0.25) < 1e-12
+    # n=3 的精确检验最小可达 p=0.25，设计上不可能在 0.05
+    # 水平显著；必须显式标记，避免把不显著误读成无效应。
+    assert abs(
+        float(sign_flip["min_attainable_p"]) - 0.25
+    ) < 1e-12
+    assert sign_flip["can_reach_significance"] is False
+    # 差值绝对值的符号对称分布：所有符号组合的 |均值| 都不小于
+    # 观测值，p=1。
+    sign_flip_null = _paired_sign_flip_test([1.0, -1.0, 1.0])
+    assert abs(float(sign_flip_null["p_value"]) - 1.0) < 1e-12
+    # 全零差值：p=1（退化情形，不能变成显著）。
+    sign_flip_zero = _paired_sign_flip_test([0.0, 0.0, 0.0])
+    assert float(sign_flip_zero["p_value"]) == 1.0
+    # n>12 走 Monte Carlo，且同一输入必须给出逐位相同的结果。
+    large_diffs = [0.1 * (index + 1) for index in range(15)]
+    sign_flip_mc_a = _paired_sign_flip_test(large_diffs)
+    sign_flip_mc_b = _paired_sign_flip_test(large_diffs)
+    assert sign_flip_mc_a["method"] == "monte_carlo"
+    assert (
+        float(sign_flip_mc_a["p_value"])
+        == float(sign_flip_mc_b["p_value"])
+    )
+    assert 0.0 < float(sign_flip_mc_a["p_value"]) < 1.0
+
+    # leave-one-out 稳健性：差值同号时去掉任一种子方向不变；
+    # 一个极端离群种子会让去它之后的效应翻转，必须被识别。
+    stable_loo = _leave_one_out_effect_stability([1.0, 2.0, 3.0])
+    assert stable_loo["leave_one_out_sign_stable"] is True
+    unstable_loo = _leave_one_out_effect_stability(
+        [10.0, -1.0, -1.0]
+    )
+    assert unstable_loo["leave_one_out_sign_stable"] is False
+    assert abs(
+        float(unstable_loo["leave_one_out_effect_min"]) + 1.0
+    ) < 1e-12
+
+    # 配对对比必须携带无分布假设检验与 leave-one-out 字段。
+    paired_contrast = _contrast_test(
+        [
+            {"seed": 1, "value": 3.0},
+            {"seed": 2, "value": 3.0},
+            {"seed": 3, "value": 3.0},
+        ],
+        [
+            {"seed": 1, "value": 2.0},
+            {"seed": 2, "value": 2.0},
+            {"seed": 3, "value": 2.0},
+        ],
+    )
+    assert paired_contrast["test"] == "paired_t"
+    assert paired_contrast["randomization_method"] == "exact"
+    assert paired_contrast["leave_one_out_sign_stable"] is True
+    assert (
+        paired_contrast["randomization_can_reach_significance"]
+        is False
+    )
+    small_n_display = _contrast_display(
+        {
+            "factor": "mode",
+            "baseline_value": "local_base",
+            "variant_value": "A",
+            "baseline": "mode=local_base",
+            "delta": -0.10,
+            "p_value": 0.01,
+            "test": "paired_t",
+            "randomization_p_value": 0.25,
+            "randomization_method": "exact",
+            "randomization_min_attainable_p": 0.25,
+            "randomization_can_reach_significance": False,
+            "leave_one_out_sign_stable": True,
+            "n_pairs": 3,
+            "verdict": "improvement",
+            "significant": True,
+            "randomization_significant": False,
+            "delta_over_noise": 3.0,
+        },
+        "val_loss",
+    )
+    assert "无法达到 0.05 显著" in small_n_display
+
+    # ---- 评估窗口 bootstrap 置信区间 ----
+    windows = 6
+    tokens_per_window = 10.0
+    loss_totals = torch.tensor(
+        [10.0, 12.0, 11.0, 13.0, 9.0, 15.0],
+        dtype=torch.float64,
+    )
+    token_totals = torch.full(
+        (windows,),
+        tokens_per_window,
+        dtype=torch.float64,
+    )
+    tp_per_window = torch.zeros(
+        (windows, 4),
+        dtype=torch.int64,
+    )
+    predicted_per_window = torch.zeros_like(tp_per_window)
+    support_per_window = torch.zeros_like(tp_per_window)
+    for row in range(windows):
+        tp_per_window[row, row % 4] = 6
+        predicted_per_window[row, row % 4] = 6
+        support_per_window[row, row % 4] = 6
+        tp_per_window[row, (row + 1) % 4] = 1
+        predicted_per_window[row, (row + 1) % 4] = 2
+        support_per_window[row, (row + 1) % 4] = 2
+        support_per_window[row, (row + 2) % 4] = 2
+    present = torch.ones(4, dtype=torch.bool)
+    boot_a = _bootstrap_eval_intervals(
+        loss_totals,
+        token_totals,
+        tp_per_window,
+        predicted_per_window,
+        support_per_window,
+        present,
+        replicates=300,
+        seed=12345,
+    )
+    boot_b = _bootstrap_eval_intervals(
+        loss_totals,
+        token_totals,
+        tp_per_window,
+        predicted_per_window,
+        support_per_window,
+        present,
+        replicates=300,
+        seed=12345,
+    )
+    assert boot_a == boot_b
+    point_loss = float(
+        loss_totals.sum() / token_totals.sum()
+    )
+    assert boot_a["bootstrap_windows"] == windows
+    assert boot_a["bootstrap_replicates"] == 300
+    assert (
+        float(boot_a["loss_ci95_low"])
+        <= point_loss
+        <= float(boot_a["loss_ci95_high"])
+    )
+    assert (
+        float(boot_a["token_accuracy_ci95_low"])
+        <= float(boot_a["token_accuracy_ci95_high"])
+    )
+    assert (
+        float(boot_a["macro_f1_ci95_low"])
+        <= float(boot_a["macro_f1_ci95_high"])
+    )
+    # 所有窗口完全相同（零窗口间变异）时置信区间退化为一个点。
+    constant_boot = _bootstrap_eval_intervals(
+        torch.full((windows,), 5.0, dtype=torch.float64),
+        token_totals,
+        tp_per_window,
+        predicted_per_window,
+        support_per_window,
+        present,
+        replicates=200,
+        seed=7,
+    )
+    assert abs(
+        float(constant_boot["loss_ci95_low"]) - 0.5
+    ) < 1e-12
+    assert abs(
+        float(constant_boot["loss_ci95_high"]) - 0.5
+    ) < 1e-12
+
     # ---- 对比分析：多重比较校正与置信区间 ----
     # Holm step-down（FWER）：m=3 时最小的两个 p 值分别乘以
     # 3、2 并做单调化；BH（FDR）从大 p 值一侧做单调化，结果
@@ -21876,6 +22949,54 @@ def run_self_test():
         assert all(
             violation["key"] != "k1"
             for violation in declared_k1["violations"]
+        )
+
+        # 跨 family（神经 vs ngram）只核对数据/评估口径；
+        # 数据指纹不同必须报违规，一致时不能误报。
+        neural_cross = {
+            "run": "neural",
+            "protocol": {
+                "comparison_family": "neural",
+                "data_sha256": "abc",
+                "seq_len": 64,
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+                "batch_size": 4,
+                "eval_batches": 8,
+                "data_augmentation": "none",
+            },
+        }
+        ngram_cross = {
+            "run": "ngram",
+            "protocol": {
+                "comparison_family": "statistical",
+                "data_sha256": "abc",
+                "seq_len": 64,
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+                "batch_size": 4,
+                "eval_batches": 8,
+                "data_augmentation": "none",
+            },
+        }
+        cross_ok = cross_family_protocol_check(
+            [neural_cross, ngram_cross],
+            [],
+        )
+        assert cross_ok["ok"], cross_ok
+        assert "data_sha256" in cross_ok["checked_keys"]
+        mismatched_ngram = json.loads(
+            json.dumps(ngram_cross)
+        )
+        mismatched_ngram["protocol"]["data_sha256"] = "def"
+        cross_bad = cross_family_protocol_check(
+            [neural_cross, mismatched_ngram],
+            [],
+        )
+        assert not cross_bad["ok"]
+        assert any(
+            violation["key"] == "data_sha256"
+            for violation in cross_bad["violations"]
         )
 
         # 消融覆盖：只跑了 balance=0.01 的开启臂，缺 2×2 的
@@ -25719,7 +26840,7 @@ def main():
         default=None,
         metavar="REL",
         help=(
-            "预注册的最小有意义相对效应（如 0.02 = 2%，相对"
+            "预注册的最小有意义相对效应（如 0.02 = 2%%，相对"
             "对照臂均值）：观测效应达到该幅度才支持假设；"
             "必须与 --primary-metric 和 --hypothesis-direction "
             "一起使用。事先声明的最小效应可以区分「方向对但"
@@ -25851,6 +26972,20 @@ def main():
 
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--eval-batches", type=int, default=20)
+    parser.add_argument(
+        "--eval-bootstrap",
+        type=int,
+        default=500,
+        metavar="N",
+        help=(
+            "最终验证与（唯一一次）测试评估的评估窗口 bootstrap "
+            "重采样次数（默认 500，0=关闭）：报告 loss/ppl/"
+            "token accuracy/macro F1 的 95%% 置信区间，区分"
+            "方法差异与评估窗口抽样噪声。重采样单位是固定"
+            "评估窗口（不是 token），使用由数据指纹派生的"
+            "确定性种子，不扰动训练 RNG"
+        ),
+    )
     parser.add_argument("--save-interval", type=int, default=500)
 
     parser.add_argument(
@@ -26176,6 +27311,8 @@ def main():
         parser.error("--eval-interval 必须为正整数")
     if args.eval_batches <= 0:
         parser.error("--eval-batches 必须为正整数")
+    if args.eval_bootstrap < 0:
+        parser.error("--eval-bootstrap 不能为负")
     if args.save_interval <= 0:
         parser.error("--save-interval 必须为正整数")
     if args.warmup_steps < 0:
@@ -28321,6 +29458,9 @@ def main():
         compute_auc=True,
         routing_probe=routing_probe,
         bad_case_collector=val_bad_case_collector,
+        bootstrap_replicates=getattr(
+            args, "eval_bootstrap", 0
+        ),
     )
 
     # 最优验证损失仍按历史口径单独汇总（选型指标可能是
@@ -28694,6 +29834,9 @@ def main():
                     split="test",
                     compute_auc=True,
                     bad_case_collector=test_bad_case_collector,
+                    bootstrap_replicates=getattr(
+                        args, "eval_bootstrap", 0
+                    ),
                 )
 
                 # 坏案例分析随唯一一次解封一起做（val 分析照常）。
