@@ -22162,6 +22162,93 @@ def _snapshot_to_cpu(value: object) -> object:
     return snapshot(value)
 
 
+def _nonfinite_named_tensors(
+    value: object,
+    prefix: str = "",
+    limit: Optional[int] = None,
+) -> List[str]:
+    """
+    递归列出负载中的非有限浮点/复数张量路径。
+
+    整数张量（如 step、num_batches_tracked）天然有限，不参与
+    检查；只扫描浮点/复数张量，避免把合法整数状态误判为污染。
+    ``limit`` 限制返回条数，检查大模型时不必构造完整列表。
+    """
+    found: List[str] = []
+
+    def visit(item: object, path: str) -> None:
+        if limit is not None and len(found) >= limit:
+            return
+        if torch.is_tensor(item):
+            if not (
+                item.is_floating_point()
+                or item.is_complex()
+            ):
+                return
+            if not bool(torch.isfinite(item.detach()).all()):
+                found.append(path or "<tensor>")
+            return
+        if isinstance(item, dict):
+            for key, entry in item.items():
+                visit(entry, f"{path}.{key}" if path else str(key))
+            return
+        if isinstance(item, (list, tuple)):
+            for index, entry in enumerate(item):
+                visit(entry, f"{path}[{index}]")
+
+    visit(value, prefix)
+    return found
+
+
+def _nonfinite_checkpoint_parts(
+    payload: Dict[str, object],
+    limit: int = 5,
+) -> Dict[str, List[str]]:
+    """
+    检查检查点中模型/优化器/缩放器状态的数值完整性。
+
+    返回非空列表的部件名 → 前几个非有限张量路径。参数或优化器
+    动量/方差已被 NaN/Inf 污染时，续跑只会把污染带进新轨迹；
+    评估也会失去意义，因此这类检查点必须被明确拒绝，而不是
+    靠后续 loss 偶然发现。
+    """
+    parts: Dict[str, List[str]] = {}
+
+    for key in ("model", "optimizer", "scaler"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        nonfinite = _nonfinite_named_tensors(
+            value,
+            limit=limit,
+        )
+        if nonfinite:
+            parts[key] = nonfinite
+
+    return parts
+
+
+def _checkpoint_numerical_error(
+    payload: Dict[str, object],
+) -> Optional[str]:
+    """把检查点数值污染转换为可直接展示的拒绝理由。"""
+    parts = _nonfinite_checkpoint_parts(payload)
+    if not parts:
+        return None
+
+    details = "; ".join(
+        f"{name}: " + ", ".join(paths)
+        for name, paths in parts.items()
+    )
+    return (
+        "检查点包含 NaN/Inf（"
+        + details
+        + "）：受污染的参数/优化器状态不能恢复训练或用于"
+        "最终评估；请从污染前的检查点恢复，并先处理数据、"
+        "数值稳定性或学习率问题"
+    )
+
+
 def save_checkpoint(
     filename: str,
     model: LanguageModel,
@@ -22171,7 +22258,16 @@ def save_checkpoint(
     step: int,
     train_generator_state: torch.Tensor,
     args: argparse.Namespace,
-):
+    numerical_state: Optional[Dict[str, object]] = None,
+) -> bool:
+    """
+    保存断点检查点；模型/优化器/缩放器状态任何非有限值都会
+    拒绝写入并返回 False。
+
+    写入前做数值完整性检查：一次异常的参数更新或优化器状态
+    溢出若被存进 last.pt，后续 --resume 会把污染当作正常起点，
+    并使最终评估/测试集解封失去意义。拒绝时保留旧检查点不变。
+    """
     # torch.compile 包装后 state_dict 带有 "_orig_mod." 前缀，
     # 存档时解包。
     raw_model = getattr(model, "_orig_mod", model)
@@ -22204,7 +22300,19 @@ def save_checkpoint(
         "script_sha256": _script_sha256(),
         "git_commit": _git_output("rev-parse", "HEAD"),
         "args": vars(args),
+        # 数值事件与停止/污染标记随检查点存档：resume 不能把
+        # 原运行的 nonfinite 历史清零，测试集解封也必须能看见
+        # 「这次运行曾在数值上失败」。
+        "numerical_state": numerical_state,
     }
+
+    numerical_error = _checkpoint_numerical_error(payload)
+    if numerical_error is not None:
+        print(
+            "[checkpoint] 拒绝写出受污染的检查点（保留旧文件）："
+            f"{numerical_error}"
+        )
+        return False
 
     path = Path(filename)
     temporary = path.with_name(
@@ -22218,6 +22326,8 @@ def save_checkpoint(
     finally:
         if temporary.exists():
             temporary.unlink()
+
+    return True
 
 
 def load_checkpoint(
@@ -22244,7 +22354,7 @@ def save_selected_model(
     args: argparse.Namespace,
     selection_metric: Optional[str] = None,
     selection_value: Optional[float] = None,
-) -> None:
+) -> bool:
     """
     保存「验证集选定」的模型权重（不含优化器状态）。
 
@@ -22278,6 +22388,14 @@ def save_selected_model(
         "args": vars(args),
     }
 
+    numerical_error = _checkpoint_numerical_error(payload)
+    if numerical_error is not None:
+        print(
+            "[select] 拒绝把受污染的权重写入 best.pt"
+            "（保留旧文件）：" + numerical_error
+        )
+        return False
+
     path = Path(filename)
     temporary = path.with_name(
         path.name + ".tmp"
@@ -22290,6 +22408,8 @@ def save_selected_model(
     finally:
         if temporary.exists():
             temporary.unlink()
+
+    return True
 
 
 def load_selected_model(
@@ -25457,6 +25577,84 @@ def run_self_test():
         == expected_attention_flops[0]
     )
     assert efficiency["measurement"]["mode"] == "B"
+
+    # 检查点数值完整性：有限状态可写且带 numerical_state；
+    # 参数一旦被 NaN/Inf 污染，save_checkpoint 必须拒绝写入，
+    # 保留旧检查点不被覆盖。
+    with tempfile.TemporaryDirectory() as ckpt_dir:
+        ckpt_model = LanguageModel(
+            Config(**common, mode="A")
+        )
+        ckpt_optimizer = torch.optim.AdamW(
+            ckpt_model.parameters(),
+            lr=1e-3,
+        )
+        ckpt_scheduler = build_lr_schedule(
+            ckpt_optimizer,
+            0,
+            1,
+        )
+        ckpt_path = Path(ckpt_dir) / "last.pt"
+        ckpt_generator = torch.Generator().manual_seed(0)
+        ckpt_args = argparse.Namespace(seed=7)
+        assert save_checkpoint(
+            str(ckpt_path),
+            ckpt_model,
+            ckpt_optimizer,
+            None,
+            ckpt_scheduler,
+            0,
+            ckpt_generator.get_state(),
+            ckpt_args,
+            numerical_state={
+                "nonfinite_events": 2,
+                "numerical_stop": True,
+            },
+        )
+        saved_payload = load_checkpoint(
+            str(ckpt_path),
+            torch.device("cpu"),
+        )
+        assert saved_payload["numerical_state"][
+            "nonfinite_events"
+        ] == 2
+        assert _checkpoint_numerical_error(saved_payload) is None
+
+        with torch.no_grad():
+            next(ckpt_model.parameters()).view(-1)[0] = float(
+                "nan"
+            )
+        assert not save_checkpoint(
+            str(ckpt_path),
+            ckpt_model,
+            ckpt_optimizer,
+            None,
+            ckpt_scheduler,
+            1,
+            ckpt_generator.get_state(),
+            ckpt_args,
+        )
+        assert not (Path(str(ckpt_path) + ".tmp")).exists()
+        # 旧检查点必须保持原样，不能被受污染的新状态覆盖。
+        assert load_checkpoint(
+            str(ckpt_path),
+            torch.device("cpu"),
+        )["step"] == 0
+
+    polluted_payload = {
+        "model": {"weight": torch.tensor([1.0, float("nan")])},
+        "optimizer": {"state": {}},
+    }
+    assert "NaN/Inf" in str(
+        _checkpoint_numerical_error(polluted_payload)
+    )
+    assert _checkpoint_numerical_error(
+        {"model": {"weight": torch.tensor([1.0, 2.0])}}
+    ) is None
+    # 整数状态（step 等）不是浮点张量，不能被误判为污染。
+    assert _checkpoint_numerical_error(
+        {"model": {"step": torch.tensor([3], dtype=torch.int64)}}
+    ) is None
 
     # 运行对比：从 config.json / metrics.jsonl 读出汇总行。
     with tempfile.TemporaryDirectory() as compare_dir:
@@ -32744,6 +32942,7 @@ def main():
     saved_data_val_fraction = None
     saved_data_test_fraction = None
     saved_data_split_sha256 = None
+    saved_numerical_state: Dict[str, object] = {}
 
     if args.resume is not None:
         # 检查点先载入 CPU，再按目标设备分别搬运。读取失败
@@ -32772,6 +32971,33 @@ def main():
                 f"--resume 检查点 {args.resume} 缺少"
                 " config/model/optimizer 必需字段："
                 "不是由本脚本 save_checkpoint 产生的存档"
+            )
+
+        # 数值完整性是恢复训练的前置条件：参数或优化器状态
+        # 一旦含 NaN/Inf，继续训练只会把污染带进新轨迹，最终
+        # 评估/测试也会失去意义。旧检查点没有该检查时同样
+        # 适用（直接扫描张量，不依赖新字段）。
+        numerical_error = _checkpoint_numerical_error(
+            rng_payload
+        )
+        if numerical_error is not None:
+            parser.error(
+                f"--resume 拒绝恢复 {args.resume}: "
+                f"{numerical_error}"
+            )
+
+        saved_numerical_state = (
+            rng_payload.get("numerical_state")
+            if isinstance(
+                rng_payload.get("numerical_state"), dict
+            )
+            else {}
+        )
+        if saved_numerical_state.get("numerical_polluted"):
+            parser.error(
+                f"--resume 检查点 {args.resume} 标记为数值已污染："
+                "不能把受污染运行当作新的训练起点；请使用污染前"
+                "的检查点或换全新目录重跑"
             )
 
         # 检查点带有保存时的代码指纹（script_sha256 / git
@@ -34157,12 +34383,47 @@ def main():
     selected_model_path = out_dir / _SELECTED_MODEL_FILENAME
 
     early_stopped = False
-    nonfinite_events = 0
+
+    def _saved_counter(name: str) -> int:
+        value = saved_numerical_state.get(name)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        ):
+            return value
+        return 0
+
+    # nonfinite 事件数跨 resume 累加：一段曾在第 120 步出现过
+    # NaN、续跑到第 300 步的运行，最终记录不能只报续跑段的 0。
+    nonfinite_events = _saved_counter("nonfinite_events")
     consecutive_nonfinite = 0
     numerical_stop = False
     numerical_polluted = False
+    prior_numerical_stop = bool(
+        saved_numerical_state.get("numerical_stop")
+    )
+    if prior_numerical_stop:
+        print(
+            "[nan] [warn] 检查点记录显示原运行曾在数值上停止"
+            f"（nonfinite_events={nonfinite_events}）：本次续跑"
+            "会累计该历史；该运行不再具备解封测试集的资格"
+        )
     nan_diagnosis: Optional[Dict[str, object]] = None
     nan_record_pending = False
+
+    def checkpoint_numerical_state() -> Dict[str, object]:
+        """当前数值状态随检查点存档，供 resume 与审计读取。"""
+        return {
+            "nonfinite_events": int(nonfinite_events),
+            "consecutive_nonfinite": int(
+                consecutive_nonfinite
+            ),
+            "numerical_stop": bool(numerical_stop),
+            "numerical_polluted": bool(numerical_polluted),
+            "prior_numerical_stop": bool(prior_numerical_stop),
+            "nan_diagnosis": nan_diagnosis,
+        }
 
     # metrics_file 在整个训练期间持续打开。
     # resume 时追加到原日志末尾；全新训练截断重写。
@@ -34522,10 +34783,7 @@ def main():
                 metric_higher_is_better(args.selection_metric),
                 args.early_stop_min_delta,
             ):
-                best_selection_value = float(selection_value)
-                best_selection_step = step + 1
-                evals_without_improvement = 0
-                save_selected_model(
+                saved_selected = save_selected_model(
                     str(selected_model_path),
                     model,
                     step + 1,
@@ -34537,8 +34795,21 @@ def main():
                     ),
                     args,
                     selection_metric=args.selection_metric,
-                    selection_value=best_selection_value,
+                    selection_value=float(selection_value),
                 )
+                if not saved_selected:
+                    # 选型指标有限但权重含 NaN/Inf：这不是
+                    # 「没有刷新最优」，而是参数已不可信。
+                    numerical_polluted = True
+                    numerical_stop = True
+                    print(
+                        "[nan] 验证指标有限但模型权重含 "
+                        "NaN/Inf，拒绝写入 best.pt，停止训练"
+                    )
+                    break
+                best_selection_value = float(selection_value)
+                best_selection_step = step + 1
+                evals_without_improvement = 0
             else:
                 evals_without_improvement += 1
 
@@ -34564,7 +34835,7 @@ def main():
         if (step + 1) % args.save_interval == 0:
             # 存档不一定位于 eval 点上，先落盘保证顺序。
             flush_records()
-            save_checkpoint(
+            saved_checkpoint = save_checkpoint(
                 str(out_dir / "last.pt"),
                 model,
                 optimizer,
@@ -34574,8 +34845,20 @@ def main():
                 # 本步存档应记录的采样起点（见循环顶部的注释）。
                 checkpoint_gen_state,
                 args,
+                numerical_state=checkpoint_numerical_state(),
             )
-            last_saved_step = step + 1
+            if saved_checkpoint:
+                last_saved_step = step + 1
+            else:
+                # 参数/优化器状态已被污染：旧检查点保持不动，
+                # 继续训练只会重复跳过更新或扩散污染。
+                numerical_polluted = True
+                numerical_stop = True
+                print(
+                    "[nan] 存档前数值检查失败，停止训练并保留"
+                    "污染前的 last.pt"
+                )
+                break
 
     # 先把暂存的逐步记录落盘，保持文件内 step 顺序。
     flush_records()
@@ -34586,7 +34869,7 @@ def main():
     end_step = last_completed_step
 
     if last_saved_step != end_step and not numerical_polluted:
-        save_checkpoint(
+        saved_checkpoint = save_checkpoint(
             str(out_dir / "last.pt"),
             model,
             optimizer,
@@ -34603,7 +34886,15 @@ def main():
                 else train_generator.get_state()
             ),
             args,
+            numerical_state=checkpoint_numerical_state(),
         )
+        if not saved_checkpoint:
+            numerical_polluted = True
+            numerical_stop = True
+            print(
+                "[nan] 训练结束存档前数值检查失败：不写出受污染"
+                "的 last.pt，并使用已有 best.pt 做评估"
+            )
 
     # 按验证集选定模型：final / test 评估之前，把权重恢复为
     # best.pt（选型指标最优的评估点）。这样「最终模型」由
@@ -34742,6 +35033,16 @@ def main():
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
         "numerical_polluted": numerical_polluted,
+        # 原运行（本段 resume 之前）是否曾在数值上停止：
+        # 续跑不能把这段历史洗掉，测试集解封与跨运行对比
+        # 都必须能看见。
+        "prior_numerical_stop": prior_numerical_stop,
+        "numerical_integrity_ok": bool(
+            not numerical_stop
+            and not numerical_polluted
+            and not prior_numerical_stop
+            and nonfinite_events == 0
+        ),
         # 最终结果自带实验追踪字段：metrics.jsonl 即使脱离
         # config.json 单独复制/归档，也能定位「哪份代码、哪个
         # 种子、哪份数据、何时跑完」，不至于无法追溯。
@@ -34976,15 +35277,29 @@ def main():
     # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
     # 完全结束后解封，且同一次运行只允许评估一次；重复传入也
     # 不会让测试集变成隐式验证集，需要新的结论应使用全新目录。
-    if args.evaluate_test and numerical_polluted:
-        # 参数已被 NaN/Inf 污染时模型输出不可信，评估测试集只会
-        # 消耗该目录唯一一次解封名额；保持尘封，数值问题
-        # 处理后再从污染前的检查点恢复或换全新目录评估。
+    numerical_block = (
+        numerical_polluted
+        or numerical_stop
+        or prior_numerical_stop
+    )
+    if args.evaluate_test and numerical_block:
+        # 参数污染、连续非有限导致的数值停止、或续跑前原运行
+        # 已停止过：这些都是「训练过程在数值上失败」的证据。
+        # 测试集评估只会消耗该目录唯一一次解封名额，并把失败
+        # 运行包装成看似有效的最终结论；保持尘封。
+        reason = (
+            "参数/优化器状态已被 NaN/Inf 污染"
+            if numerical_polluted
+            else (
+                "本次训练因连续非有限损失/梯度而数值停止"
+                if numerical_stop
+                else "续跑前的原运行曾在数值上停止"
+            )
+        )
         print(
-            "[test] 参数/优化器状态已被 NaN/Inf 污染，"
-            "本次不消耗唯一的测试集评估名额：测试集保持尘封。"
-            "请从污染前的检查点恢复并处理数值问题后，"
-            "再显式 --evaluate-test。"
+            f"[test] {reason}：本次不消耗唯一的测试集评估名额，"
+            "测试集保持尘封。请从污染前的检查点恢复、修复数值"
+            "稳定性后，再显式 --evaluate-test。"
         )
     elif args.evaluate_test:
         if test_evaluation_sealed(out_dir):
