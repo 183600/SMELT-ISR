@@ -2,12 +2,12 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  # 每 5 分钟一次「心跳」：配合下方 concurrency 排队，任何时刻最多 1 个 running + 1 个 pending。
+  # 每 15 分钟一次「心跳」：配合下方 concurrency 排队，任何时刻最多 1 个 running + 1 个 pending。
   # 当前 run 无论以何种方式结束（成功/失败/被取消/runner 意外宕机——宕机时连
   # if: always() 步骤都会被 GitHub 跳过，self-dispatch 无法执行），
-  # 队列中的下一个 run 都会在几秒内开始，心跳也能在 ≤5 分钟内补位，链条永不断。
+  # 队列中的下一个 run 都会在几秒内开始，心跳也能在 ≤15 分钟内补位，链条永不断。
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
 
 # ⭐ 关键 1：同一时间只允许一个 run，新的排队等待（不取消旧的）
 # 上一个 run 一结束，队列里的下一个立刻开始 → "上一个结束立刻触发下一个"
@@ -31,10 +31,10 @@ env:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    # ⭐ 关键 3：硬超时 330 分钟（GitHub 单 job 上限 360 分钟）。
-    # 实际时长由「Run opencode loop」里的工作窗口控制：约 4h45m 的连续工作
-    # + 前置安装约 5 分钟 + 收尾约 3 分钟 → 单次 job 约 5 小时。
-    timeout-minutes: 330
+    # ⭐ 关键 3：硬超时 200 分钟（GitHub 单 job 上限 360 分钟）。
+    # 实际时长由「Run opencode loop」里的工作窗口控制：约 2h50m 的连续工作
+    # + 前置安装约 5 分钟 + 收尾约 3 分钟 → 单次 job 约 3 小时。
+    timeout-minutes: 200
     permissions:
       contents: write
       actions: write   # gh workflow run 需要
@@ -92,7 +92,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "[loop][warn] 未能确认后继 run；收尾的 next-run job 与 */5 心跳会补位"
+          echo "[loop][warn] 未能确认后继 run；收尾的 next-run job 与 */15 心跳会补位"
           exit 0
 
       - name: Checkout
@@ -114,6 +114,24 @@ jobs:
           sudo apt-get clean
           echo "=== disk after cleanup ==="
           df -h /
+
+      - name: Setup Python (pip cache)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      # npm 全局包缓存：本仓库没有 package-lock.json，无法用 setup-node 的 `cache: npm`
+      # （它要求 lock 文件存在），因此直接缓存 ~/.npm，`npm i -g` 会复用其中的 tarball。
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+          key: ${{ runner.os }}-npm-smelt-isr-${{ hashFiles('requirements-ci.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-smelt-isr-
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -169,6 +187,14 @@ jobs:
           swapon --show
           df -h /
 
+      - name: Install Python test deps (cached)
+        run: |
+          set +e
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            || echo "[warn] requirements-ci.txt 安装失败，跳过（不影响后续步骤）"
+
       - name: Install opencode
         run: npm i -g opencode-ai
 
@@ -180,8 +206,8 @@ jobs:
           git config i18n.commitEncoding utf-8
           git config core.quotepath false
 
-      - name: Run opencode for ~5 hours (5 phases per iteration)
-        timeout-minutes: 300
+      - name: Run opencode for ~3 hours (phases per iteration)
+        timeout-minutes: 180
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
@@ -189,7 +215,10 @@ jobs:
           set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-main}"
           OUT=/tmp/oc_out.log
-          DEADLINE=$(( $(date +%s) + 5*3600 - 900 ))
+          # 单次 run 的硬预算：3 小时（step 上限 180 分钟，job 上限 200 分钟，
+          # 这里留 10 分钟给收尾的清理 / 最终提交 / 推送）
+          RUN_HOURS=3
+          DEADLINE=$(( $(date +%s) + RUN_HOURS*3600 - 600 ))
 
           # ================= 五阶段提示词 =================
           PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
@@ -215,31 +244,36 @@ jobs:
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
           # ================= 模型策略：独立双家族（失效只在家族内级联，不跨家族） =================
-          # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
+          # NVIDIA 家族：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
           #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1，
-          #             需要仓库 secret NVIDIA_API_KEY）；两者都不可用时保持本家族重试，
-          #             绝不切换到 opencode 家族。
-          # opencode 家族（80%）：opencode 自带的免费 deepseek（Zen 网关
+          #             需要仓库 secret NVIDIA_API_KEY）。
+          # opencode 家族：opencode 自带的免费 deepseek（Zen 网关
           #             deepseek-v4.1-flash-free，客户端内免鉴权，支持 tool call 与
-          #             reasoning effort）→ big-pickle；两者都不可用时保持本家族重试，
-          #             绝不切换到 NVIDIA 家族。
-          # 家族由 run_phase 在每个阶段开始时掷骰确定（NVIDIA_PROB%），阶段内固定。
+          #             reasoning effort）→ big-pickle。
+          # 候选顺序由 detect_provider 在 run 开始时按 NVIDIA_PROB 掷一次骰子决定，
+          # 选定后整个 run 固定（不再逐阶段探测/切换）。
           # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
+          # 实测：连续 13/13 个 NVIDIA 阶段全部被阶段预算杀掉，一次都没在预算内返回；
+          # 单个工具调用延迟约 121s，5 分钟只走 2~3 步；历史提交里 NVIDIA 只占约 4%。
+          # 默认关闭，需要时再打开。
+          NVIDIA_PROB=0
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
           # opencode 家族内兜底：免费 deepseek 不可用（限流/下线/调用失败）时，
           #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
           PICKLE_MODEL="opencode/big-pickle"
-          NVIDIA_PROB=20
           NVIDIA_MODEL=""
           NVIDIA_FLASH_MODEL=""
           CURRENT_PROVIDER=""
-          PROVIDER_BROKEN=""
+          BROKEN_PROVIDERS=""
+          # 本次 run 内选定的模型（探测只在 run 开始时做一次，见 detect_provider）
+          SELECTED_MODEL=""
+          SELECTED_PROVIDER=""
 
           mark_broken() {
-            case ",$PROVIDER_BROKEN," in *",$1,"*) ;; *) PROVIDER_BROKEN="$PROVIDER_BROKEN${PROVIDER_BROKEN:+,}$1" ;; esac
+            case ",$BROKEN_PROVIDERS," in *",$1,"*) ;; *) BROKEN_PROVIDERS="$BROKEN_PROVIDERS${BROKEN_PROVIDERS:+,}$1" ;; esac
           }
           is_broken() {
-            case ",$PROVIDER_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+            case ",$BROKEN_PROVIDERS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
           }
 
           # ---------- NVIDIA GLM 探测（NVIDIA 家族内两级：glm-5.3 → glm-5.3-flash） ----------
@@ -353,42 +387,68 @@ jobs:
             CURRENT_PROVIDER="$1"
           }
 
-          # ---------- provider 家族化选择（独立级联，不跨家族） ----------
-          # NVIDIA 家族：glm-5.3 → glm-5.3-flash；opencode 家族：免费 deepseek → big-pickle。
-          # 任一家族全链失效时只重置本家族重试，绝不回退到另一个家族。
-          pick_provider() {
-            local fam="${1:-free}" round
-            for round in 1 2; do
-              if [ "$fam" = "nvidia" ]; then
-                if ! is_broken nvidia && probe_nvidia primary; then
-                  switch_provider nvidia
-                  echo "[info] NVIDIA 家族：使用 glm-5.3（$NVIDIA_MODEL）"
-                  return 0
-                fi
-                if ! is_broken nvidia_flash && probe_nvidia flash; then
-                  switch_provider nvidia_flash
-                  echo "[info] NVIDIA 家族：glm-5.3 不可用，降级 glm-5.3-flash（$NVIDIA_FLASH_MODEL）"
-                  return 0
-                fi
+          # ---------- 一次性模型探测（每个 run 只做一次） ----------
+          # run 开始时探测一次，选定 SELECTED_MODEL；之后所有阶段直接
+          #   opencode run -m "$SELECTED_MODEL" "$prompt"
+          # 只有收到 429 / 5xx / 连接失败 / 非零退出时，才重新探测并跳过已判定失效的候选。
+          # 候选顺序：按 NVIDIA_PROB 掷一次骰子决定 NVIDIA 家族是否优先，否则 opencode 家族优先。
+          # 注意：只看模型目录不够——必须真跑一次冒烟调用，否则会选中“连得上但永远跑不完”的
+          # 端点（实测 NVIDIA glm-5.3 单步 121s，13/13 个阶段全部被预算杀掉）。
+          smoke_test() {
+            local m="$1" extra=""
+            case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+            # shellcheck disable=SC2086
+            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+          }
+
+          detect_provider() {
+            local pass cand model order
+            for pass in 1 2; do
+              if [ "$NVIDIA_PROB" -gt 0 ] && [ $((RANDOM % 100)) -lt "$NVIDIA_PROB" ]; then
+                order="nvidia nvidia_flash free pickle"
               else
-                if ! is_broken free; then
-                  switch_provider free
-                  return 0
-                fi
-                if ! is_broken pickle; then
-                  switch_provider pickle
-                  echo "[info] opencode 家族：免费 deepseek 不可用，改用 big-pickle 兜底（$PICKLE_MODEL）"
-                  return 0
-                fi
+                order="free pickle nvidia nvidia_flash"
               fi
-              # 本家族成员全部失效：清空失效标记后再探一轮（第二轮仍失败则返回失败）
-              [ "$round" -eq 1 ] && PROVIDER_BROKEN=""
+              for cand in $order; do
+                case "$cand" in
+                  nvidia|nvidia_flash) [ "$NVIDIA_PROB" -gt 0 ] || continue ;;
+                esac
+                is_broken "$cand" && continue
+                case "$cand" in
+                  nvidia)
+                    probe_nvidia primary || { mark_broken nvidia; continue; }
+                    switch_provider nvidia
+                    model="nvidia/$NVIDIA_MODEL"
+                    ;;
+                  nvidia_flash)
+                    probe_nvidia flash || { mark_broken nvidia_flash; continue; }
+                    switch_provider nvidia_flash
+                    model="nvidia/$NVIDIA_FLASH_MODEL"
+                    ;;
+                  free)
+                    switch_provider free
+                    model="$FREE_MODEL"
+                    ;;
+                  pickle)
+                    switch_provider pickle
+                    model="$PICKLE_MODEL"
+                    ;;
+                esac
+                if smoke_test "$model"; then
+                  SELECTED_MODEL="$model"
+                  SELECTED_PROVIDER="$cand"
+                  export SELECTED_MODEL
+                  echo "[provider] 选定 $model（$cand），本次 run 内固定使用，不再逐阶段探测"
+                  return 0
+                fi
+                echo "[warn] $model 冒烟测试失败/超时，换下一个候选"
+                mark_broken "$cand"
+              done
+              # 第一轮全部失效：清空失效标记再试一轮（可能是瞬时故障）
+              [ "$pass" -eq 1 ] && BROKEN_PROVIDERS=""
             done
-            if [ "$fam" = "nvidia" ]; then
-              echo "[warn] NVIDIA 家族（glm-5.3 / glm-5.3-flash）均不可用——独立策略不切换 opencode 家族，稍后重试"
-            else
-              echo "[warn] opencode 家族（免费 deepseek / big-pickle）均不可用——独立策略不切换 NVIDIA 家族，稍后重试"
-            fi
+            SELECTED_MODEL=""
+            SELECTED_PROVIDER=""
             return 1
           }
 
@@ -425,7 +485,9 @@ jobs:
             NONE)     VARIANT="" ;;
             *)        VARIANT="max" ;;
           esac
-          echo "[info] 独立双家族：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% | opencode(免费deepseek→big-pickle)=$((100-NVIDIA_PROB))% | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] 候选顺序：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% 优先 / opencode(免费deepseek→big-pickle) 优先；免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          # run 开始时探测一次；失败也不阻塞，run_phase 需要时会再试
+          if detect_provider; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
 
           i=0
 
@@ -498,16 +560,15 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（每阶段掷骰定家族，家族内独立级联，反复重试） ----------
+          # ---------- 单阶段执行 ----------
+          # 每个 run 只在 detect_provider 里探测一次；这里直接用 SELECTED_MODEL 调用。
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
             local attempt=0
-            PROVIDER_BROKEN=""
-            # 家族掷骰（每阶段一次，阶段内固定）：NVIDIA 家族与 opencode 家族相互独立
-            local fam_roll=$((RANDOM % 100)) PHASE_FAMILY
-            if [ "$fam_roll" -lt "$NVIDIA_PROB" ]; then PHASE_FAMILY="nvidia"; else PHASE_FAMILY="free"; fi
+            # 整个阶段（含所有重试）共用的硬上限：重试不得让总时长超过 budget
+            local phase_end=$(( $(date +%s) + budget ))
 
             while :; do
               attempt=$((attempt+1))
@@ -518,47 +579,32 @@ jobs:
                 return 1
               fi
               local REMAIN=$(( DEADLINE - NOW ))
-              [ "$budget" -gt "$REMAIN" ] && budget="$REMAIN"
-              if [ "$budget" -le 60 ]; then
+              local budget_now=$(( phase_end - NOW ))
+              [ "$budget_now" -gt "$REMAIN" ] && budget_now="$REMAIN"
+              if [ "$budget_now" -le 60 ]; then
                 echo "[info] phase=$phase 剩余时间不足，跳过"
                 return 1
               fi
 
-              if ! pick_provider "$PHASE_FAMILY"; then
-                echo "[warn] phase=$phase 家族=$PHASE_FAMILY 本轮全部不可用，180s 后重试 (attempt=$attempt)"
-                sleep 180
-                continue
+              # 正常路径：run 开始时已选定模型，这里不会发起任何网络探测
+              if [ -z "$SELECTED_MODEL" ]; then
+                if ! detect_provider; then
+                  echo "[warn] phase=$phase 暂时没有可用模型，180s 后重试 (attempt=$attempt)"
+                  sleep 180
+                  continue
+                fi
               fi
-              local MODEL_DESC="$FREE_MODEL"
-              case "$CURRENT_PROVIDER" in
-                nvidia)       MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
-                nvidia_flash) MODEL_DESC="nvidia/$NVIDIA_FLASH_MODEL" ;;
-                pickle)       MODEL_DESC="$PICKLE_MODEL" ;;
-              esac
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$MODEL_DESC ==========="
 
-              # 防止 agent 写入的 opencode 配置干扰后续调用：
-              # nvidia / nvidia_flash 路径恢复探测生成的模板，free 路径确保无自定义配置
-              # （switch_provider 已处理 ~/.config/opencode/，这里只清仓库内残留）
+              # 防止 agent 写入的 opencode 配置干扰后续调用
               rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
-              if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
-                record_model "nvidia/$NVIDIA_MODEL"
-                timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
-              elif [ "$CURRENT_PROVIDER" = "nvidia_flash" ]; then
-                record_model "nvidia/$NVIDIA_FLASH_MODEL"
-                timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_FLASH_MODEL" "$prompt" 2>&1 | tee "$OUT"
-              elif [ "$CURRENT_PROVIDER" = "pickle" ]; then
-                # big-pickle 无 reasoning effort 档位，不传 --variant
-                record_model "$PICKLE_MODEL"
-                timeout --kill-after=180 "$budget" opencode run -m "$PICKLE_MODEL" "$prompt" 2>&1 | tee "$OUT"
-              elif [ -n "$VARIANT" ]; then
-                record_model "$FREE_MODEL"
-                timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
-              else
-                record_model "$FREE_MODEL"
-                timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
-              fi
+              local extra=""
+              case "$SELECTED_MODEL" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+
+              record_model "$SELECTED_MODEL"
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$SELECTED_MODEL ==========="
+              # shellcheck disable=SC2086
+              timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $extra "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -572,22 +618,21 @@ jobs:
                 return $EC
               fi
 
-              # 限流 / 免费额度限制：标记当前 provider 本阶段失效，换边重试
-              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
-                mark_broken "$CURRENT_PROVIDER"
-                echo "[warn] phase=$phase 命中限流/免费额度限制 (provider=$CURRENT_PROVIDER)，180s 后换 provider 重试 (attempt=$attempt)"
-                sleep 180
+              # 429 限流 / 5xx / 连接失败：丢弃当前模型，下一次循环重新探测（并跳过它）
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
+                echo "[warn] phase=$phase 限流/5xx/连接失败（$SELECTED_MODEL），重新探测 provider (attempt=$attempt)"
+                mark_broken "$SELECTED_PROVIDER"
+                SELECTED_MODEL=""
+                sleep 60
                 continue
               fi
 
-              # 其它失败：标记当前 provider 本阶段失效，换边重试，
-              # 直到阶段预算或全局时间用尽
-              mark_broken "$CURRENT_PROVIDER"
-              echo "[warn] phase=$phase provider=$CURRENT_PROVIDER 调用失败 (exit=$EC)，60s 后换 provider 重试 (attempt=$attempt)"
+              # 其它非零退出：同样丢弃当前模型并重新探测，直到阶段预算或全局时间用尽
+              echo "[warn] phase=$phase 调用失败 (exit=$EC, model=$SELECTED_MODEL)，重新探测 provider (attempt=$attempt)"
+              mark_broken "$SELECTED_PROVIDER"
+              SELECTED_MODEL=""
               sleep 60
             done
-
-            return 1
           }
 
           # ================= 单次调用内“先定位、再修复” =================
@@ -597,24 +642,22 @@ jobs:
           ISSUES_FILE=".opencode_issues.md"
           fast_prompt() {
             case "$1" in
-              perf) printf '先用不超过 5-8 分钟快速扫描性能热点（可写入 `%s`，该临时清单不是报告），然后持续优化；在本阶段预算内尽可能多完成高价值、可验证的优化，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
-              bug)  printf '先快速定位 bug（可把要点写入 `%s`，该临时清单不是报告），然后持续修复；在本阶段预算内尽可能多修复高价值、可验证的 bug，不要只修一个就停，也不要为了赶时间提前结束。每个修复后运行自检；修完删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
-              sci)  printf '先用不超过 5-8 分钟选出高价值实验方法问题（可写入 `%s`，该临时清单不是报告），然后持续改进；在本阶段预算内尽可能多完成实质性改进，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              perf) printf '先用不超过 5-8 分钟快速扫描性能热点（可写入 `%s`，该临时清单不是报告），然后持续优化；在本阶段预算内尽可能多完成高价值、可验证的优化，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              bug)  printf '先快速定位 bug（可把要点写入 `%s`，该临时清单不是报告），然后持续修复；在本阶段预算内尽可能多修复高价值、可验证的 bug，不要只修一个就停，也不要为了赶时间提前结束。每个修复后运行自检；修完删除该临时清单。每完成一个可验证的修复就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
+              sci)  printf '先用不超过 5-8 分钟选出高价值实验方法问题（可写入 `%s`，该临时清单不是报告），然后持续改进；在本阶段预算内尽可能多完成实质性改进，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
             esac
           }
 
-          # ================= 新增：概率测试门（20% 执行 / 80% 跳过）=================
-          # 在「修复 bug 的 opencode 调用」提交之后触发（调用点见主循环 phase=bug 守卫）。
-          # 掷骰子 1..100：≤20 才执行本步（80% 直接跳过）——跑一遍本仓库的测试；
-          # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main/master。
+          # ================= 测试门（bug / sci 阶段提交后都执行）=================
+          # 在写代码阶段（bug / sci）的 opencode 调用提交之后触发（调用点见主循环的
+          # case "$phase" in bug|sci）。
+          # 不再掷骰抽样——每次都跑一遍本仓库的测试；
+          # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main。
           maybe_run_tests() {
             local iter="$1"
-            local TG_ROLL=$(( (RANDOM % 100) + 1 ))
-            if [ "$TG_ROLL" -gt 20 ]; then
-              echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 > 20，本轮不跑测试（80%）"
-              return 0
-            fi
-            echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 ≤ 20，本轮执行测试（20%）"
+            # 实测本仓库的测试门只是 `python3 -m py_compile`（全量语法检查），几秒内完成，
+            # 成本可忽略：每次提交后都跑，不再按 20% 抽样（原先 80% 的提交从未被验证过）。
+            echo "[test-gate] iter #$iter 执行全量测试"
             local TG_REMAIN=$(( DEADLINE - $(date +%s) ))
             if [ "$TG_REMAIN" -lt 1200 ]; then
               echo "[test-gate] 剩余时间不足 20 分钟，放弃本次测试"
@@ -695,9 +738,9 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 已停用（perf 的 opencode 调用已注释掉）→ bug -> sci -> clean -> apply -----
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> apply（clean 的清理工作交给收尾的 shell 步骤）-----
             # for phase in perf bug sci clean apply; do
-            for phase in bug sci clean apply; do
+            for phase in bug sci apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
@@ -736,10 +779,10 @@ jobs:
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
-              # ⭐ 概率测试门（新增）：bug 阶段提交后 20% 概率跑测试，详见 maybe_run_tests
-              if [ "$phase" = "bug" ]; then
-                maybe_run_tests "$i"
-              fi
+              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
+              case "$phase" in
+                bug|sci) maybe_run_tests "$i" ;;
+              esac
 
               sleep 5
             done
@@ -803,7 +846,7 @@ jobs:
   # ⭐ 立刻续跑（下）：独立的收尾 job。
   # needs + if: always()：工作 job 无论成功、失败、超时被取消，这个 job 都会紧接着启动（已实测验证）。
   # 这里无条件派发一个新的后继 run：它在组内排队，本 run 退出的一瞬间就被调度。
-  # 万一这个 job 连启动都没机会（整个 run 被强杀），*/5 心跳会兜底。
+  # 万一这个 job 连启动都没机会（整个 run 被强杀），*/15 心跳会兜底。
   next-run:
     needs: [run-opencode]
     if: always()
@@ -835,5 +878,5 @@ jobs:
             echo "[loop][warn] 派发失败（attempt ${attempt}）10s 后重试"
             sleep 10
           done
-          echo "[loop][warn] 派发失败；下一次 */5 心跳会补位"
+          echo "[loop][warn] 派发失败；下一次 */15 心跳会补位"
           exit 0
