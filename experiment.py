@@ -161,7 +161,33 @@ class Config:
 # Reproducibility
 # ============================================================
 
-def set_seed(seed: int):
+# NumPy 的 legacy RandomState 只接受 [0, 2**32 - 1]。把 --seed
+# 的合法域统一到这个范围，保证 Python / NumPy / torch 三个随机
+# 流拿到的是同一个种子；否则负值或更大值会在 NumPy 播种时抛错，
+# 而此前 Python/torch 已经被播种，进程会停在部分初始化的状态。
+MAX_SEED = 2**32 - 1
+
+
+def seed_error(seed: int) -> Optional[str]:
+    """
+    校验随机种子的统一合法域；返回错误消息或 None。
+    """
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        return "随机种子必须是整数"
+    if seed < 0 or seed > MAX_SEED:
+        return (
+            f"随机种子必须落在 [0, {MAX_SEED}]（NumPy "
+            "RandomState 的合法范围；Python/torch/CUDA 也使用"
+            "同一个值以保持随机流一致）"
+        )
+    return None
+
+
+def set_seed(
+    seed: int,
+    *,
+    strict_determinism: bool = False,
+):
     """
     固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子。
 
@@ -170,9 +196,17 @@ def set_seed(seed: int):
     train_generator）：其初始种子同样来自 --seed，当前状态随
     检查点一起存档，恢复训练时逐位还原。
 
+    strict_determinism=True 时，遇到没有确定性实现的算子直接
+    报错（而不是只告警），供正式复现实验 fail-fast；默认
+    warn_only 以兼容尚缺确定性内核的算子。
+
     跨硬件架构仍可能因浮点归约顺序产生微小差异；同一台机器
     上的多次运行应保持一致。
     """
+    error = seed_error(seed)
+    if error is not None:
+        raise ValueError(error)
+
     random.seed(seed)
 
     if np is not None:
@@ -205,8 +239,12 @@ def set_seed(seed: int):
 
     # 要求 PyTorch 优先选用确定性实现。bincount、attention
     # 反向等 CUDA 算子若不存在确定性实现会明确告警，而不是
-    # 静默产生跨重启不可复现的微小差异。
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    # 静默产生跨重启不可复现的微小差异。严格模式直接失败，
+    # 避免「带告警继续跑」的实验被误当成可复现结果。
+    torch.use_deterministic_algorithms(
+        True,
+        warn_only=not strict_determinism,
+    )
 
     # 本文件所有 torch.empty 缓冲在使用前都会被完整写入，
     # 不依赖未初始化缓冲的 NaN 填充来保证结果确定性。
@@ -237,6 +275,24 @@ def pythonhashseed_error(
             "无法保证"
         )
     return None
+
+
+def configure_cpu_threads(num_threads: Optional[int]) -> None:
+    """
+    固定 PyTorch CPU 线程数（None=保持环境默认）。
+
+    CPU 上的并行归约顺序可能随线程数变化，同一台机器上
+    改变 OMP/MKL 线程数也可能让「同种子」结果出现末位差异。
+    正式复现实验可显式固定线程数；实际生效值随 run_metadata
+    存档，即使不固定也能追溯到当时的线程环境。
+    """
+    if num_threads is None:
+        return
+
+    if isinstance(num_threads, bool) or num_threads <= 0:
+        raise ValueError("CPU 线程数必须为正整数")
+
+    torch.set_num_threads(int(num_threads))
 
 
 def _capture_rng_state() -> Dict[str, object]:
@@ -5883,7 +5939,10 @@ def run_statistical_baseline(
     # 确定性的），但所有入口统一固定全部 RNG 种子：未来任何
     # 采样/初始化改动不会让本入口在无感知的情况下失去
     # 可复现性，config.json 里的种子也始终对应真实生效值。
-    set_seed(args.seed)
+    set_seed(
+        args.seed,
+        strict_determinism=args.strict_determinism,
+    )
 
     alpha_grid: List[float] = list(args.ngram_alpha_grid)
 
@@ -10507,6 +10566,9 @@ _REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
     "platform",
     "device_name",
     "deterministic_algorithms",
+    "deterministic_algorithms_warn_only",
+    "torch_num_threads",
+    "torch_num_interop_threads",
     "cudnn_deterministic",
     "cudnn_benchmark",
     "cublas_workspace_config",
@@ -16310,8 +16372,10 @@ def run_sanity_overfit(
     lr: float,
     loss_threshold: float,
     acc_threshold: float,
+    min_relative_improvement: float = 0.5,
     seed: int,
     grad_checkpoint: bool = False,
+    strict_determinism: bool = False,
 ) -> Dict[str, object]:
     """
     过拟合小批量数据的 sanity check。
@@ -16320,6 +16384,12 @@ def run_sanity_overfit(
     关闭负载均衡辅助损失、weight decay、梯度裁剪、warmup 等
     一切正则化（数据管线本身没有 dropout / 数据增强），要求训练
     损失迅速趋近 0 或下一 token 准确率接近 100%。
+
+    通过条件同时要求「确实学到了东西」：最终损失相对第一次
+    前向（任何优化器更新之前）至少下降 min_relative_improvement。
+    仅有绝对阈值不够——若损失实现错误、返回一个恒定的小值，
+    旧判定会误通过；现在必须观察到下降，且满足绝对阈值或准确率
+    阈值之一，二者同时成立才算通过。
 
     第一步反向之后还会先做梯度探针（见 _probe_gradient_flow）：
     损失必须连在计算图上、梯度必须有限、至少一个参数收到非零
@@ -16344,7 +16414,10 @@ def run_sanity_overfit(
     saved_rng_state = _capture_rng_state()
 
     try:
-        set_seed(seed)
+        set_seed(
+            seed,
+            strict_determinism=strict_determinism,
+        )
 
         # balance_coef=0：关闭辅助负载均衡损失（正则项）。
         sanity_cfg = replace(cfg, balance_coef=0.0)
@@ -16400,6 +16473,12 @@ def run_sanity_overfit(
 
                 result = model(x, y)
                 loss = result["lm_loss"]
+
+                # 在任何优化器更新之前记录初始损失：它是「模型
+                # 是否真的在学习」的参照。恒定/错误的损失实现
+                # 无法靠绝对阈值区分，必须看到相对下降。
+                if step == 1:
+                    initial_loss = float(loss.detach())
 
                 # 损失必须连在计算图上；否则 backward 必然失败
                 # 或训练空转，直接停下。
@@ -16468,9 +16547,6 @@ def run_sanity_overfit(
                         ).float().mean()
                     )
 
-                    if initial_loss is None:
-                        initial_loss = final_loss
-
                     print(
                         f"[sanity] step {step}/{steps} "
                         f"lm_loss={final_loss:.4f} "
@@ -16493,10 +16569,44 @@ def run_sanity_overfit(
                     )
                     break
 
-        passed = (
+        # 相对下降证据：绝对阈值/准确率只能说明最终状态，
+        # 不能排除「损失实现错误导致恒定小值」这类假通过。
+        loss_reduction: Optional[float] = None
+        if (
+            initial_loss is not None
+            and math.isfinite(initial_loss)
+            and initial_loss > 0.0
+            and math.isfinite(final_loss)
+        ):
+            loss_reduction = (
+                initial_loss - final_loss
+            ) / initial_loss
+
+        learned = bool(
+            loss_reduction is not None
+            and loss_reduction >= min_relative_improvement
+        )
+
+        metric_ok = (
             final_loss <= loss_threshold
             or final_acc >= acc_threshold
         )
+
+        passed = metric_ok and learned
+
+        if initial_loss is not None:
+            reduction_text = (
+                f"{loss_reduction:.1%}"
+                if loss_reduction is not None
+                else "无法计算（初始/最终损失非有限或不正）"
+            )
+            print(
+                "[sanity] 学习证据: "
+                f"initial_lm_loss={initial_loss:.4f}, "
+                f"final_lm_loss={final_loss:.4f}, "
+                f"relative_reduction={reduction_text}, "
+                f"required>={min_relative_improvement:.1%}"
+            )
 
         if grad_probe is not None:
             if grad_probe["failures"]:
@@ -16526,12 +16636,16 @@ def run_sanity_overfit(
             "lr": lr,
             "seed": seed,
             "grad_checkpoint": grad_checkpoint,
+            "strict_determinism": strict_determinism,
             "amp_dtype": (
                 str(amp_dtype) if amp_dtype is not None else None
             ),
             "initial_lm_loss": initial_loss,
             "final_lm_loss": final_loss,
             "final_token_accuracy": final_acc,
+            "loss_reduction": loss_reduction,
+            "min_relative_improvement": min_relative_improvement,
+            "learned": learned,
             "loss_threshold": loss_threshold,
             "acc_threshold": acc_threshold,
             "gradient_flow_ok": (
@@ -16659,6 +16773,9 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "deterministic_algorithms": (
             torch.are_deterministic_algorithms_enabled()
         ),
+        "deterministic_algorithms_warn_only": (
+            torch.is_deterministic_algorithms_warn_only_enabled()
+        ),
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "cublas_workspace_config": os.environ.get(
@@ -16666,6 +16783,12 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         ),
         "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
         "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        # CPU 并行归约顺序可能随线程数变化；即使未显式固定，
+        # 也要记录当时实际生效的线程环境，供复现/对比追溯。
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
     }
 
 
@@ -18927,6 +19050,60 @@ def run_self_test():
     if np is not None:
         assert first_draw[2] == second_draw[2]
 
+    # 非法种子必须在改动任何随机流之前被拒绝；合法域与 NumPy
+    # 的 RandomState 一致，避免 Python/torch 已播种而 NumPy
+    # 抛错留下的半初始化状态。
+    set_seed(2024)
+    saved_torch_state = torch.get_rng_state()
+    saved_python_state = random.getstate()
+    for invalid_seed in (-1, MAX_SEED + 1):
+        try:
+            set_seed(invalid_seed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"非法种子 {invalid_seed} 必须被拒绝"
+            )
+    assert torch.equal(
+        torch.get_rng_state(),
+        saved_torch_state,
+    )
+    assert random.getstate() == saved_python_state
+
+    # RNG 捕获/恢复必须逐位还原 Python / torch / NumPy 三个
+    # 随机流：sanity check 与临时代码依赖它不改变主训练轨迹。
+    set_seed(777)
+    captured_rng = _capture_rng_state()
+    expected_rng_draw = (
+        random.random(),
+        torch.rand(3),
+        (
+            float(np.random.rand())
+            if np is not None
+            else None
+        ),
+    )
+    _restore_rng_state(captured_rng)
+    assert random.random() == expected_rng_draw[0]
+    assert torch.equal(
+        torch.rand(3),
+        expected_rng_draw[1],
+    )
+    if np is not None:
+        assert (
+            float(np.random.rand())
+            == expected_rng_draw[2]
+        )
+
+    # strict_determinism 必须真正关闭 warn_only，而不只是换
+    # 一个配置字段。
+    set_seed(11, strict_determinism=True)
+    assert torch.are_deterministic_algorithms_enabled()
+    assert not torch.is_deterministic_algorithms_warn_only_enabled()
+    set_seed(11, strict_determinism=False)
+    assert torch.is_deterministic_algorithms_warn_only_enabled()
+
     # sanity check 必须能在小批量上过拟合，且结束后恢复调用前的
     # RNG 状态（不影响主训练轨迹）。启用 grad_checkpoint 跑通
     # 检查：主训练带 --grad-checkpoint 时，sanity check 必须
@@ -18956,6 +19133,11 @@ def run_self_test():
     assert sanity_metrics["passed"], sanity_metrics
     assert sanity_metrics["grad_checkpoint"] is True
     assert "amp_dtype" in sanity_metrics
+    assert sanity_metrics["learned"] is True, sanity_metrics
+    assert (
+        sanity_metrics["loss_reduction"]
+        >= sanity_metrics["min_relative_improvement"]
+    ), sanity_metrics
     assert torch.equal(
         torch.get_rng_state(),
         rng_before,
@@ -19072,6 +19254,7 @@ def run_self_test():
     )
 
     assert not failed_metrics["passed"]
+    assert failed_metrics["learned"] is False
     assert failed_metrics["grad_checkpoint"] is False
 
     # 运行元数据必须包含代码版本与随机种子相关的追踪字段。
@@ -19080,6 +19263,12 @@ def run_self_test():
     assert "git_commit" in metadata
     assert "torch_version" in metadata
     assert "deterministic_algorithms" in metadata
+    assert "deterministic_algorithms_warn_only" in metadata
+    assert metadata["torch_num_threads"] == torch.get_num_threads()
+    assert (
+        metadata["torch_num_interop_threads"]
+        == torch.get_num_interop_threads()
+    )
     # 代码指纹三层记录：script_sha256 不依赖 git（压缩包运行
     # / 脏工作区时它是唯一能定位代码版本的记录），且必须与
     # 当前脚本文件的实际内容一致。
@@ -24586,6 +24775,25 @@ def main():
             "未设置时直接报错退出，用于严格逐位复现的正式运行"
         ),
     )
+    parser.add_argument(
+        "--strict-determinism",
+        action="store_true",
+        help=(
+            "遇到没有确定性实现的 PyTorch 算子时直接报错"
+            "（默认仅告警并继续）；正式复现实验建议开启"
+        ),
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "固定 PyTorch CPU 线程数（默认沿用环境设置）。"
+            "CPU 归约顺序可能随线程数变化，严格复现时显式固定；"
+            "实际生效值写入 config.json 的 run_metadata"
+        ),
+    )
     parser.add_argument("--sanity-batch-size", type=int, default=4)
     parser.add_argument("--sanity-steps", type=int, default=300)
     parser.add_argument("--sanity-lr", type=float, default=3e-3)
@@ -24598,6 +24806,18 @@ def main():
         "--sanity-acc-threshold",
         type=float,
         default=0.99,
+    )
+    parser.add_argument(
+        "--sanity-min-loss-reduction",
+        type=float,
+        default=0.5,
+        metavar="REL",
+        help=(
+            "sanity check 要求最终 loss 相对第一次前向至少下降"
+            "的比例（默认 0.5 = 50%%）：只满足绝对阈值或准确率"
+            "阈值还不够，必须观察到真实的学习信号，避免恒定小"
+            "损失等实现错误假通过"
+        ),
     )
     parser.add_argument(
         "--note",
@@ -24623,6 +24843,17 @@ def main():
     )
     if hashseed_error:
         parser.error(hashseed_error)
+
+    seed_message = seed_error(args.seed)
+    if seed_message:
+        parser.error("--seed 无效: " + seed_message)
+
+    try:
+        configure_cpu_threads(args.torch_threads)
+    except (RuntimeError, ValueError) as error:
+        parser.error(
+            f"--torch-threads 无法生效: {error}"
+        )
 
     # 在入口处校验参数合法性。
     if args.steps <= 0:
@@ -24676,6 +24907,13 @@ def main():
     if not 0.0 < args.sanity_acc_threshold <= 1.0:
         parser.error(
             "--sanity-acc-threshold 必须落在 (0, 1]"
+        )
+    if (
+        not math.isfinite(args.sanity_min_loss_reduction)
+        or not 0.0 <= args.sanity_min_loss_reduction < 1.0
+    ):
+        parser.error(
+            "--sanity-min-loss-reduction 必须落在 [0, 1)"
         )
     if (
         not math.isfinite(args.val_fraction)
@@ -24754,8 +24992,12 @@ def main():
     if args.seeds is not None:
         if len(set(args.seeds)) != len(args.seeds):
             parser.error("--seeds 存在重复的随机种子")
-        if any(seed < 0 for seed in args.seeds):
-            parser.error("--seeds 必须是非负整数")
+        for seed in args.seeds:
+            seed_message = seed_error(seed)
+            if seed_message:
+                parser.error(
+                    f"--seeds 中的 {seed} 无效: {seed_message}"
+                )
         if args.compare is not None:
             parser.error(
                 "--seeds 不能与 --compare 同时使用"
@@ -25679,7 +25921,9 @@ def main():
             f"lr={args.sanity_lr}, "
             f"grad_checkpoint={args.grad_checkpoint}, "
             f"loss<={args.sanity_loss_threshold} "
-            f"或 acc>={args.sanity_acc_threshold}"
+            f"或 acc>={args.sanity_acc_threshold}, "
+            f"且 loss 相对初始值下降"
+            f">={args.sanity_min_loss_reduction:.1%}"
         )
 
         sanity_result = run_sanity_overfit(
@@ -25692,8 +25936,12 @@ def main():
             lr=args.sanity_lr,
             loss_threshold=args.sanity_loss_threshold,
             acc_threshold=args.sanity_acc_threshold,
+            min_relative_improvement=(
+                args.sanity_min_loss_reduction
+            ),
             seed=args.seed,
             grad_checkpoint=args.grad_checkpoint,
+            strict_determinism=args.strict_determinism,
         )
 
         sanity_record = {
@@ -25712,10 +25960,14 @@ def main():
         else:
             print(
                 "[sanity] FAILED: 模型未能在小批量上过拟合 "
-                f"(final lm_loss="
+                f"(initial lm_loss="
+                f"{sanity_result['initial_lm_loss']}, "
+                f"final lm_loss="
                 f"{sanity_result['final_lm_loss']:.4f}, "
                 f"token_acc="
-                f"{sanity_result['final_token_accuracy']:.4f})。"
+                f"{sanity_result['final_token_accuracy']:.4f}, "
+                f"relative_reduction="
+                f"{sanity_result['loss_reduction']})。"
                 "这通常意味着梯度没有反向传播、损失计算错误、"
                 "优化器或学习率配置有严重问题；请先排查再开始"
                 "全量训练。确需跳过可用 --skip-sanity-check。"
@@ -25768,7 +26020,10 @@ def main():
 
         return
 
-    set_seed(args.seed)
+    set_seed(
+        args.seed,
+        strict_determinism=args.strict_determinism,
+    )
 
     model = LanguageModel(cfg).to(device)
     model.grad_checkpoint = args.grad_checkpoint
@@ -26026,6 +26281,48 @@ def main():
                 "(周期验证步点是验证协议的一部分)"
             )
             args.eval_interval = saved_eval_interval
+
+        # 确定性实现开关与 CPU 线程数会改变浮点行为；resume
+        # 时按存档恢复，避免「同一随机流 + 不同数值环境」的
+        # 续跑轨迹与原运行分叉。
+        saved_strict = rng_payload.get(
+            "args",
+            {},
+        ).get("strict_determinism")
+
+        if (
+            saved_strict is not None
+            and bool(saved_strict) != bool(
+                args.strict_determinism
+            )
+        ):
+            print(
+                "resume restored strict_determinism "
+                f"{args.strict_determinism} -> {saved_strict} "
+                "(确定性实现开关是数值环境的一部分)"
+            )
+            args.strict_determinism = bool(saved_strict)
+            torch.use_deterministic_algorithms(
+                True,
+                warn_only=not args.strict_determinism,
+            )
+
+        saved_threads = rng_payload.get(
+            "args",
+            {},
+        ).get("torch_threads")
+
+        if (
+            saved_threads is not None
+            and saved_threads != args.torch_threads
+        ):
+            print(
+                "resume restored torch_threads "
+                f"{args.torch_threads} -> {saved_threads} "
+                "(CPU 线程数影响浮点归约顺序)"
+            )
+            args.torch_threads = saved_threads
+            configure_cpu_threads(saved_threads)
 
     scheduler = build_lr_schedule(
         optimizer,
