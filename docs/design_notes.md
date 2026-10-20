@@ -137,8 +137,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   以 Holm 校正后为准，等价性（TOST）主张做同口径校正。
 - `ablation_coverage`：(1+N)×2 全因子消融覆盖检查（默认
   N=A/B 两个延迟合并方案；含消融单元之间
-  `k1/k2/top_k/residual_scale` 结构一致性与均衡强度一致性
-  的混杂检查）。
+  `k1/k2/top_k/residual_scale` 结构一致性、均衡强度一致性、
+  共同种子对齐与 B/local_base 计算量倍率的混杂检查）。
+- `factorial_effects`、`annotate_factorial_confounds`：2×2
+  主效应、交互与简单效应的共同种子配对检验（Holm 校正、
+  95% CI、MDE），并按受控变量/结构/计算量混杂降级结论。
 - `print_comparison_analysis`、`write_comparison_report`：
   完整的对比分析输出与 `comparison_analysis.json` 落盘。
 - `strip_sweep_args`、`build_sweep_plan`、`run_experiment_sweep`：
@@ -423,9 +426,36 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   强度混杂，同样以 `[confounded]` 标出且不声明「全因子齐全」。
   出现 B 时还会提示与 smelt 的计算量不等价，要求同时报告
   等计算对照。
+- **主效应与交互的统计推断**：覆盖齐全只证明「组合跑过」，
+  不证明「各自有用」。`factorial_effects` 对每个延迟合并方案
+  与 `local_base` 的 2×2 设计计算：延迟合并主效应
+  `½(M_off−L_off)+½(M_on−L_on)`、均衡损失主效应
+  `½(L_on−L_off)+½(M_on−M_off)`、交互
+  `(M_on−M_off)−(L_on−L_off)`，以及四个简单效应。所有效应
+  在**共同随机种子**上按同一线性组合计算后做配对 t 检验，
+  同一家族内做 Holm 校正并给出 95% CI 与 MDE；只有校正后
+  显著且方向符合指标改善方向，才标记为支持该组件。交互显著
+  只说明一个因子的效应随另一个因子变化，不自动解释为有益。
+  各 2×2 单元格的共同种子数、种子集合是否对齐与重复种子都会
+  核验并写入 `comparison_analysis.json`；配对种子不足时只报
+  点估计，不能声称显著。
+- **消融中的计算量控制**：B 直通整个中间区域，FLOPs 高于
+  `local_base`；即使组合齐全，B 的主效应也会混入额外计算。
+  覆盖检查从运行记录读取前向 FLOPs（缺省回退参数量），
+  倍率达到 `1.5×` 时以 `[confounded]` 点名；A 的
+  `k1×k2 > n_experts` 时 `local_base` 第二轮宽度被截断，
+  即使实测倍率未达阈值也会以 `width_confounds` 点名。
+  两种情况都要求用
+  `--compare-metric val_loss_at_matched_flops` 在等训练
+  计算量点复核。分析入口会自动在该派生指标上重跑一遍因子
+  主效应/交互（单独成族并标注只适用于共同计算量点），
+  避免只给警告、不给出可执行的复核结果；同时存在其他受控
+  变量违规或结构混杂时，已显著的因子效应会从「支持该组件」
+  降级为「不能归因」。
 - **汇总报告**：套件运行结束后把受控变量检查、聚合统计、
-  单因子对比与消融覆盖写入 `<out>/comparison_analysis.json`；
-  `--compare` 只读运行目录、不写文件。
+  单因子对比、消融覆盖、因子主效应/交互与混杂降级结果写入
+  `<out>/comparison_analysis.json`；`--compare` 只读运行
+  目录、不写文件。
 
 ## 可复现性与实验追踪
 

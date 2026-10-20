@@ -12760,6 +12760,490 @@ def factor_contrasts(
     return contrasts
 
 
+def _cell_seed_values(
+    cell: Dict[str, object],
+    metric: str,
+) -> Tuple[
+    Dict[object, Tuple[object, float]],
+    bool,
+    List[object],
+]:
+    """
+    把一个实验单元在某指标上的样本整理成 seed → (原始 seed, 值)。
+
+    返回 ``(mapping, complete, duplicate_seeds)``：``complete``
+    为 False 表示该单元存在未记录种子的样本，无法参与按种子
+    配对；``duplicate_seeds`` 列出同一 seed 出现多次的种子，
+    这些复制运行虽被折叠成一个观测，但不能当作额外独立重复。
+    """
+    samples = cell.get("samples", {}).get(metric, [])
+    collapsed = _collapse_seed_samples(samples)
+    seed_counts: Dict[object, int] = {}
+    for sample in samples:
+        seed = sample.get("seed")
+        if seed is None:
+            continue
+        key = _stable_factor_key(seed)
+        seed_counts[key] = seed_counts.get(key, 0) + 1
+    duplicate_seeds = [
+        seed_key
+        for seed_key, count in seed_counts.items()
+        if count > 1
+    ]
+    mapping: Dict[object, Tuple[object, float]] = {}
+    complete = True
+    for sample in collapsed:
+        seed = sample.get("seed")
+        if seed is None:
+            complete = False
+            continue
+        mapping[_stable_factor_key(seed)] = (
+            seed,
+            float(sample["value"]),
+        )
+    return mapping, complete, duplicate_seeds
+
+
+def _paired_linear_effect(
+    cells: Dict[str, Dict[str, object]],
+    coefficients: Dict[str, float],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    计算若干实验单元的线性组合效应，并在共同种子上做配对检验。
+
+    主效应与交互都是单元格均值的线性组合（如 A/B 全因子中的
+    ``M_on - M_off - L_on + L_off``）。只有在同一组随机种子上
+    计算每条线性组合，配对 t 检验才回答「该效应是否稳定地
+    偏离 0」；直接在聚合均值上做 Welch 检验会把不同种子的
+    方差当成独立噪声，低估交互的不确定性。
+    """
+    maps: Dict[str, Dict[object, Tuple[object, float]]] = {}
+    complete = True
+    duplicate_seeds: List[object] = []
+    for key in coefficients:
+        if key not in cells:
+            return {"test": "missing_cell"}
+        mapping, cell_complete, cell_duplicates = (
+            _cell_seed_values(cells[key], metric)
+        )
+        maps[key] = mapping
+        complete = complete and cell_complete
+        duplicate_seeds.extend(cell_duplicates)
+
+    if not maps:
+        return {"test": "missing_cell"}
+
+    common = set.intersection(
+        *(set(mapping) for mapping in maps.values())
+    )
+    aligned = all(
+        set(mapping) == common for mapping in maps.values()
+    )
+    effect_values: List[float] = []
+    raw_seeds: List[object] = []
+    seed_keys = sorted(common, key=str)
+    first_cell = next(iter(maps.values()))
+    for seed_key in seed_keys:
+        total = 0.0
+        for cell_key, coefficient in coefficients.items():
+            total += coefficient * maps[cell_key][seed_key][1]
+        effect_values.append(total)
+        raw_seeds.append(first_cell[seed_key][0])
+
+    if effect_values:
+        raw_seeds = sorted(
+            raw_seeds,
+            key=_factor_sort_rank,
+        )
+        result = _paired_t_test(effect_values)
+        effect = result.get("effect")
+        if effect is None:
+            effect = _mean(effect_values)
+        return {
+            "effect": effect,
+            "test": result.get("test"),
+            "t": result.get("t"),
+            "df": result.get("df"),
+            "p_value": result.get("p_value"),
+            "se": result.get("se"),
+            "n_pairs": len(effect_values),
+            "aligned_seeds": aligned,
+            "common_seeds": raw_seeds,
+            "complete_seed_records": complete,
+            "duplicate_seeds": duplicate_seeds,
+        }
+
+    # 没有共同种子：仍给出由聚合均值组合的点估计，但明确
+    # 标记不能做配对检验（缺失/不同种子不能伪造显著性）。
+    means = [
+        cells[key].get(f"{metric}_mean")
+        for key in coefficients
+    ]
+    if any(mean is None for mean in means):
+        return {
+            "test": "missing_metric",
+            "aligned_seeds": False,
+            "n_pairs": 0,
+        }
+    effect = sum(
+        coefficient * float(mean)
+        for coefficient, mean in zip(
+            coefficients.values(), means
+        )
+    )
+    return {
+        "effect": effect,
+        "test": "no_common_seeds",
+        "p_value": None,
+        "se": None,
+        "df": None,
+        "n_pairs": 0,
+        "aligned_seeds": False,
+        "common_seeds": [],
+        "complete_seed_records": complete,
+        "duplicate_seeds": duplicate_seeds,
+    }
+
+
+def factorial_effects(
+    aggregates: List[Dict[str, object]],
+    group_keys: List[str],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    全因子消融的主效应、交互与简单效应。
+
+    对每个延迟合并方案 M ∈ {A, B}，与立即合并对照 L =
+    ``local_base`` 组成 2×2 设计（mode ∈ {L, M} × balance ∈
+    {off, on}）：
+
+    - 延迟合并主效应 = ½(M_off − L_off) + ½(M_on − L_on)；
+    - 均衡损失主效应 = ½(L_on − L_off) + ½(M_on − M_off)；
+    - 交互 = (M_on − M_off) − (L_on − L_off)；
+    - 四个简单效应用于解释交互：M−L 在 off/on 两档、
+      on−off 在 L/M 两档。
+
+    所有效应都在共同随机种子上按线性组合后做配对 t 检验，
+    并在家族内做 Holm 校正。只有校正后仍显著且方向符合
+    指标改善方向时，才把主效应标记为支持该组件；交互显著
+    只说明「效应随另一因子变化」，不能自动解释为有益。
+
+    ``mode`` 或 ``balance_coef`` 不是分组因子（恒定/未变化）时
+    返回 ``applicable=False``；组合不完整时把设计列入
+    ``incomplete_designs``，不伪造主效应。
+    """
+    report: Dict[str, object] = {
+        "metric": metric,
+        "applicable": (
+            "mode" in group_keys and "balance_coef" in group_keys
+        ),
+        "designs": [],
+        "incomplete_designs": [],
+        "effects": [],
+        "advisories": [],
+    }
+
+    if not report["applicable"]:
+        report["advisories"].append(
+            "mode 与 balance_coef 未同时作为分组因子："
+            "无法估计延迟合并 × 均衡损失的主效应与交互"
+        )
+        return report
+
+    context_keys = [
+        key
+        for key in group_keys
+        if key not in ("mode", "balance_coef")
+    ]
+    contexts: Dict[tuple, List[Dict[str, object]]] = {}
+    context_order: List[tuple] = []
+    for aggregate in aggregates:
+        context = tuple(
+            _stable_factor_key(
+                aggregate["keys"].get(key)
+            )
+            for key in context_keys
+        )
+        if context not in contexts:
+            contexts[context] = []
+            context_order.append(context)
+        contexts[context].append(aggregate)
+
+    higher_is_better = metric_higher_is_better(metric)
+    effect_specs = [
+        (
+            "delayed_merge_main",
+            "延迟合并主效应",
+            {
+                "L_off": -0.5,
+                "L_on": -0.5,
+                "M_off": 0.5,
+                "M_on": 0.5,
+            },
+            "main",
+        ),
+        (
+            "balance_loss_main",
+            "均衡损失主效应",
+            {
+                "L_off": -0.5,
+                "L_on": 0.5,
+                "M_off": -0.5,
+                "M_on": 0.5,
+            },
+            "main",
+        ),
+        (
+            "interaction",
+            "延迟合并 × 均衡损失交互",
+            {
+                "L_off": 1.0,
+                "L_on": -1.0,
+                "M_off": -1.0,
+                "M_on": 1.0,
+            },
+            "interaction",
+        ),
+        (
+            "delayed_merge_at_balance_off",
+            "仅延迟合并（balance=off）",
+            {"L_off": -1.0, "M_off": 1.0},
+            "simple",
+        ),
+        (
+            "delayed_merge_at_balance_on",
+            "仅延迟合并（balance=on）",
+            {"L_on": -1.0, "M_on": 1.0},
+            "simple",
+        ),
+        (
+            "balance_loss_at_local_base",
+            "仅均衡损失（立即合并对照）",
+            {"L_off": -1.0, "L_on": 1.0},
+            "simple",
+        ),
+        (
+            "balance_loss_at_delayed_merge",
+            "仅均衡损失（延迟合并方案）",
+            {"M_off": -1.0, "M_on": 1.0},
+            "simple",
+        ),
+    ]
+
+    for context in context_order:
+        cells_by_key: Dict[tuple, Dict[str, object]] = {}
+        for aggregate in contexts[context]:
+            mode = str(aggregate["keys"].get("mode"))
+            if mode not in ("local_base", *_DELAYED_MERGE_MODES):
+                continue
+            balance = aggregate["keys"].get("balance_coef")
+            if (
+                not isinstance(balance, (int, float))
+                or isinstance(balance, bool)
+                or not math.isfinite(float(balance))
+            ):
+                continue
+            level = "off" if float(balance) == 0.0 else "on"
+            cells_by_key[(mode, level)] = aggregate
+
+        present_modes = {
+            mode
+            for mode, _ in cells_by_key
+        }
+        for mode in _DELAYED_MERGE_MODES:
+            required = {
+                ("local_base", "off"): "L_off",
+                ("local_base", "on"): "L_on",
+                (mode, "off"): "M_off",
+                (mode, "on"): "M_on",
+            }
+            missing = [
+                f"{cell_mode}/{cell_level}"
+                for (cell_mode, cell_level) in required
+                if (cell_mode, cell_level) not in cells_by_key
+            ]
+            if missing and (mode in present_modes):
+                report["incomplete_designs"].append({
+                    "delayed_mode": mode,
+                    "context": dict(zip(context_keys, context)),
+                    "missing_cells": missing,
+                })
+                continue
+            if missing:
+                continue
+
+            cells = {
+                alias: cells_by_key[cell_key]
+                for cell_key, alias in required.items()
+            }
+            design_label = (
+                f"{mode} vs local_base"
+                + (
+                    "（"
+                    + ", ".join(
+                        f"{key}={_format_factor_value(value)}"
+                        for key, value in zip(context_keys, context)
+                    )
+                    + "）"
+                    if context_keys
+                    else ""
+                )
+            )
+            report["designs"].append({
+                "delayed_mode": mode,
+                "context": dict(zip(context_keys, context)),
+                "labels": {
+                    alias: cell["label"]
+                    for alias, cell in cells.items()
+                },
+            })
+
+            for effect_name, description, coefficients, kind in (
+                effect_specs
+            ):
+                result = _paired_linear_effect(
+                    cells,
+                    coefficients,
+                    metric,
+                )
+                effect = result.get("effect")
+                if effect is None:
+                    continue
+                effect_value = float(effect)
+                mde = None
+                if (
+                    result.get("se") is not None
+                    and result.get("df") is not None
+                ):
+                    mde = _minimum_detectable_effect(
+                        float(result["se"]),
+                        float(result["df"]),
+                    )
+                if kind == "interaction":
+                    direction = (
+                        "positive"
+                        if effect_value > 0.0
+                        else "negative"
+                        if effect_value < 0.0
+                        else "zero"
+                    )
+                else:
+                    improvement = (
+                        effect_value
+                        if higher_is_better
+                        else -effect_value
+                    )
+                    direction = (
+                        "improvement"
+                        if improvement > 0.0
+                        else "regression"
+                        if improvement < 0.0
+                        else "tie"
+                    )
+                report["effects"].append({
+                    "design": design_label,
+                    "delayed_mode": mode,
+                    "context": dict(zip(context_keys, context)),
+                    "effect_name": effect_name,
+                    "description": description,
+                    "kind": kind,
+                    "coefficients": coefficients,
+                    "cells": {
+                        alias: cell["label"]
+                        for alias, cell in cells.items()
+                    },
+                    "mean_effect": effect_value,
+                    "delta": effect_value,
+                    "direction": direction,
+                    "mde_80": mde,
+                    "test": result.get("test"),
+                    "t": result.get("t"),
+                    "df": result.get("df"),
+                    "p_value": result.get("p_value"),
+                    "n_pairs": result.get("n_pairs", 0),
+                    "aligned_seeds": bool(
+                        result.get("aligned_seeds")
+                    ),
+                    "common_seeds": result.get("common_seeds", []),
+                    "complete_seed_records": bool(
+                        result.get("complete_seed_records")
+                    ),
+                    "duplicate_seeds": result.get(
+                        "duplicate_seeds", []
+                    ),
+                })
+                report["effects"][-1].update(
+                    _contrast_interval(result)
+                )
+
+    eligible = [
+        effect
+        for effect in report["effects"]
+        if effect.get("p_value") is not None
+    ]
+    holm = _holm_bonferroni([
+        float(effect["p_value"]) for effect in eligible
+    ])
+    for effect, adjusted in zip(eligible, holm):
+        effect["p_value_holm"] = adjusted
+        effect["significant_raw"] = bool(
+            float(effect["p_value"]) <= _SIGNIFICANCE_LEVEL
+        )
+        effect["significant"] = bool(
+            adjusted is not None
+            and float(adjusted) <= _SIGNIFICANCE_LEVEL
+        )
+        if not effect["significant"]:
+            effect["claim"] = "not_significant"
+        elif effect["kind"] == "interaction":
+            effect["claim"] = "interaction_detected"
+        elif effect["direction"] == "improvement":
+            effect["claim"] = "supports_component"
+        elif effect["direction"] == "regression":
+            effect["claim"] = "harms_component"
+        else:
+            effect["claim"] = "not_significant"
+
+    for effect in report["effects"]:
+        if effect.get("test") == "no_common_seeds":
+            report["advisories"].append(
+                f"{effect['design']} 的 {effect['description']}"
+                "没有共同随机种子：只给出点估计，未做配对"
+                "检验，不能据此声称主效应/交互显著"
+            )
+        elif not effect.get("aligned_seeds"):
+            report["advisories"].append(
+                f"{effect['design']} 的 {effect['description']}"
+                "种子集合不完全对齐：仅在共同种子上估计，"
+                "结论只覆盖该子集"
+            )
+        if effect.get("n_pairs", 0) < _MIN_SEEDS_FOR_STATS:
+            report["advisories"].append(
+                f"{effect['design']} 的 {effect['description']}"
+                f"只有 {effect.get('n_pairs', 0)} 对共同种子"
+                f"（< {_MIN_SEEDS_FOR_STATS}）：统计功效不足"
+            )
+        if effect.get("duplicate_seeds"):
+            report["advisories"].append(
+                f"{effect['design']} 的 {effect['description']}"
+                "所在单元存在重复随机种子（"
+                + ", ".join(
+                    str(seed)
+                    for seed in effect["duplicate_seeds"]
+                )
+                + "）：复制运行已折叠为一个观测，不能算独立重复"
+            )
+
+    if report["incomplete_designs"]:
+        report["advisories"].append(
+            "存在不完整的 2×2 设计：缺格时不能估计对应"
+            "方案的主效应或交互"
+        )
+
+    return report
+
+
 def _current_seed_count(
     contrast: Dict[str, object],
 ) -> Optional[float]:
@@ -13220,6 +13704,9 @@ def ablation_coverage(
         "missing_cells": [],
         "low_replicate_cells": [],
         "structural_confounds": [],
+        "width_confounds": [],
+        "seed_alignment": [],
+        "compute_parity": [],
         "advisories": [],
         "n_rows": len(rows),
     }
@@ -13235,6 +13722,7 @@ def ablation_coverage(
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
     merge_pair_seeds: Dict[tuple, List[object]] = {}
+    rows_by_mode: Dict[str, List[Dict[str, object]]] = {}
     structural_signatures: Dict[str, int] = {}
     balance_values_on: set = set()
     unknown_balance = False
@@ -13247,6 +13735,7 @@ def ablation_coverage(
         mode = str(_row_factor_value(row, "mode"))
         balance = _row_factor_value(row, "balance_coef")
         modes_present[mode] = modes_present.get(mode, 0) + 1
+        rows_by_mode.setdefault(mode, []).append(row)
         if mode in ablation_related:
             # 精确签名：用稳定键而不是 %g 文本，浮点细微差异
             # 不能被格式化抹平；缺失值显式记录，不能把「未记录」
@@ -13342,6 +13831,169 @@ def ablation_coverage(
             + "）：各消融单元之间的比较混杂了均衡强度差异，"
             "方案收益无法与均衡损失强度分离"
         )
+
+    # 主效应/交互的配对推断要求四个单元格共享同一组种子。
+    # 每格种子数达标不代表可以做配对：若各格跑的是不同种子，
+    # 交互只能在不同种子的独立样本上估计，方差会明显变大。
+    coverage_modes = (
+        list(declared)
+        if declared is not None
+        else [
+            merge_mode
+            for merge_mode in _DELAYED_MERGE_MODES
+            if merge_mode in modes_present
+        ]
+    )
+    for mode in coverage_modes:
+        cell_keys = [
+            (mode, "off"),
+            (mode, "on"),
+            ("local_base", "off"),
+            ("local_base", "on"),
+        ]
+        if not all(key in merge_pair_cells for key in cell_keys):
+            continue
+        raw_by_key: Dict[object, object] = {}
+        seed_sets = []
+        for key in cell_keys:
+            seeds = merge_pair_seeds.get(key, [])
+            seed_sets.append({
+                _stable_factor_key(seed) for seed in seeds
+            })
+            for seed in seeds:
+                raw_by_key.setdefault(
+                    _stable_factor_key(seed), seed
+                )
+        common = set.intersection(*seed_sets)
+        aligned = all(seed_set == common for seed_set in seed_sets)
+        common_raw = sorted(
+            (raw_by_key[key] for key in common),
+            key=_factor_sort_rank,
+        )
+        report["seed_alignment"].append({
+            "delayed_mode": mode,
+            "cells": [
+                f"{cell_mode}/b={level}"
+                for cell_mode, level in cell_keys
+            ],
+            "common_seeds": common_raw,
+            "n_common_seeds": len(common),
+            "aligned": aligned,
+        })
+        if len(common) < _MIN_SEEDS_FOR_STATS:
+            report["low_replicate_cells"].append(
+                f"{mode} 的 2×2 消融只有 {len(common)} 个"
+                "共同随机种子"
+                f"（< {_MIN_SEEDS_FOR_STATS}）：主效应/交互"
+                "无法做配对检验，不能据此声称各组件有效"
+            )
+        elif not aligned:
+            report["advisories"].append(
+                f"{mode} 的 2×2 消融各单元格种子集合不一致"
+                f"（共同种子 {len(common)} 个）：主效应/交互"
+                "只在该共同子集上可配对，未对齐的种子不能"
+                "当作额外重复"
+            )
+
+    # 计算量也是受控变量：B 在整个中间区域按 k1 个分支执行，
+    # 与立即合并对照 local_base 的 FLOPs 天然不同。B 相对
+    # local_base 的差异若直接解释为延迟合并收益，会把额外
+    # 计算一并算进方法本身。这里从运行记录核对倍率，要求
+    # 用等训练计算量指标复核。
+    def _rows_cost_mean(
+        mode_name: str,
+        field: str,
+    ) -> Optional[float]:
+        values = [
+            float(row[field])
+            for row in rows_by_mode.get(mode_name, [])
+            if isinstance(row.get(field), (int, float))
+            and not isinstance(row.get(field), bool)
+            and math.isfinite(float(row[field]))
+            and float(row[field]) > 0.0
+        ]
+        return _mean(values)
+
+    for mode in coverage_modes:
+        if (
+            "local_base" not in modes_present
+            or mode not in modes_present
+        ):
+            continue
+        field = None
+        for candidate in (
+            "flops_per_forward",
+            "n_params",
+        ):
+            if (
+                _rows_cost_mean("local_base", candidate)
+                is not None
+                and _rows_cost_mean(mode, candidate)
+                is not None
+            ):
+                field = candidate
+                break
+        if field is None:
+            continue
+        baseline_cost = _rows_cost_mean("local_base", field)
+        variant_cost = _rows_cost_mean(mode, field)
+        if (
+            baseline_cost is None
+            or variant_cost is None
+            or baseline_cost <= 0.0
+        ):
+            continue
+        ratio = variant_cost / baseline_cost
+        matched = ratio < _COST_RATIO_MATERIAL
+        report["compute_parity"].append({
+            "delayed_mode": mode,
+            "field": field,
+            "baseline_value": baseline_cost,
+            "variant_value": variant_cost,
+            "ratio": ratio,
+            "matched": matched,
+        })
+        if not matched:
+            report["advisories"].append(
+                f"{mode} 的 {field} 是 local_base 的 "
+                f"{ratio:.2f} 倍：全因子中 {mode} vs "
+                "local_base 的差异混入了计算量，不能直接"
+                "归因于延迟合并；请用 "
+                "--compare-metric val_loss_at_matched_flops "
+                "在等训练计算量点复核，或报告等计算对照"
+            )
+
+    # A 的第二轮宽度是 k1 个分支各路由 k2 个专家，而
+    # local_base 的单分支宽度被截断到 min(n_experts, k1*k2)。
+    # k1*k2 超过专家总数时，两者不再严格等计算；即使实测
+    # FLOPs 倍率未达到 1.5×，也不能把差值全部归因于延迟合并。
+    for mode in ("A",):
+        if mode not in rows_by_mode or "local_base" not in rows_by_mode:
+            continue
+        row = rows_by_mode[mode][0]
+        k1_value = row.get("k1")
+        k2_value = row.get("k2")
+        n_experts_value = row.get("n_experts")
+        if not all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            for value in (k1_value, k2_value, n_experts_value)
+        ):
+            continue
+        if int(k1_value) * int(k2_value) > int(n_experts_value):
+            report["width_confounds"].append({
+                "delayed_mode": mode,
+                "k1_times_k2": int(k1_value) * int(k2_value),
+                "n_experts": int(n_experts_value),
+            })
+            report["advisories"].append(
+                "A 的第二轮专家宽度 k1×k2="
+                f"{int(k1_value) * int(k2_value)} 超过专家总数 "
+                f"n_experts={int(n_experts_value)}：local_base 的"
+                "第二轮宽度被截断，两者不再严格等计算，"
+                "A vs local_base 的差值混入计算量差异"
+            )
 
     if "B" in modes_present and "smelt" in modes_present:
         report["advisories"].append(
@@ -15181,6 +15833,149 @@ def imbalance_metric_advisory(
     return report
 
 
+def annotate_factorial_confounds(
+    factorial: Dict[str, object],
+    controlled: Dict[str, object],
+    coverage: Dict[str, object],
+) -> None:
+    """
+    把受控变量违规、结构混杂与计算量不匹配挂到因子效应上。
+
+    统计显著只说明数据里存在差异；若某个臂换了优化器/学习率/
+    训练步数，或消融单元之间 k1/top_k 不同，或 B 的 FLOPs 远高
+    于 local_base，这个差异就不能归因到待验证的组件。此时把
+    ``claim`` 从「支持/有害/交互显著」降级为 ``confounded`` 或
+    ``compute_confounded``，保留原始统计量供复核。
+    """
+    factorial["controlled_variables_ok"] = bool(
+        controlled.get("ok")
+    )
+    positive_claims = {
+        "supports_component",
+        "harms_component",
+        "interaction_detected",
+    }
+
+    if not controlled.get("ok"):
+        for effect in factorial.get("effects", []):
+            effect["controlled_variables_ok"] = False
+            if effect.get("claim") in positive_claims:
+                effect["claim"] = "confounded"
+        factorial.setdefault("advisories", []).append(
+            "受控变量检查存在违规：主效应/交互的差值混入了"
+            "优化器/学习率/训练步数等非实验因子，不能据此"
+            "声称组件有效"
+        )
+
+    if coverage.get("structural_confounds"):
+        for effect in factorial.get("effects", []):
+            effect["structural_confounded"] = True
+            if effect.get("claim") in positive_claims:
+                effect["claim"] = "confounded"
+        factorial.setdefault("advisories", []).append(
+            "消融单元之间存在结构设置混杂：主效应/交互不能"
+            "归因到待验证设计"
+        )
+
+    compute_confounds = {
+        entry.get("delayed_mode")
+        for entry in coverage.get("compute_parity", [])
+        if not entry.get("matched")
+    }
+    compute_confounds.update(
+        entry.get("delayed_mode")
+        for entry in coverage.get("width_confounds", [])
+    )
+    compute_confounds.discard(None)
+    if compute_confounds:
+        for effect in factorial.get("effects", []):
+            if effect.get("delayed_mode") not in compute_confounds:
+                continue
+            effect["compute_confounded"] = True
+            if effect.get("claim") in positive_claims | {
+                "confounded"
+            }:
+                effect["claim"] = "compute_confounded"
+        factorial.setdefault("advisories", []).append(
+            "部分方案与 local_base 的计算量不匹配：这些方案的"
+            "主效应混入计算量，须在等训练计算量指标上复核"
+        )
+
+
+def _format_factorial_effect(effect: Dict[str, object]) -> str:
+    """把一条因子效应格式化为控制台行（主分析/等计算量分析共用）。"""
+    p_holm = effect.get("p_value_holm")
+    if p_holm is not None:
+        p_text = f"Holm p={float(p_holm):.4f}"
+    elif effect.get("p_value") is not None:
+        p_text = f"p={float(effect['p_value']):.4f}"
+    else:
+        p_text = "p=NA"
+    ci_text = ""
+    if (
+        effect.get("ci95_low") is not None
+        and effect.get("ci95_high") is not None
+    ):
+        ci_text = (
+            " 95%CI=["
+            f"{float(effect['ci95_low']):+.4f},"
+            f"{float(effect['ci95_high']):+.4f}]"
+        )
+    qualifiers = []
+    if effect.get("test") == "no_common_seeds":
+        qualifiers.append("无共同种子，未做配对检验")
+    elif not effect.get("aligned_seeds"):
+        qualifiers.append("种子集合未完全对齐，仅共同子集")
+    if effect.get("n_pairs", 0) < _MIN_SEEDS_FOR_STATS:
+        qualifiers.append(
+            f"配对种子 {effect.get('n_pairs', 0)} < "
+            f"{_MIN_SEEDS_FOR_STATS}"
+        )
+    if effect.get("controlled_variables_ok") is False:
+        qualifiers.append("受控变量检查未通过")
+    if effect.get("structural_confounded"):
+        qualifiers.append("消融结构设置混杂")
+    if effect.get("compute_confounded"):
+        qualifiers.append("计算量未对齐")
+    if effect.get("duplicate_seeds"):
+        qualifiers.append("存在重复随机种子（已折叠）")
+    if effect.get("significant"):
+        claim = {
+            "supports_component": "支持该组件有效",
+            "harms_component": "该组件显著变差",
+            "interaction_detected": "交互显著",
+            "confounded": "显著但受控变量/结构混杂，不能归因",
+            "compute_confounded": (
+                "显著但计算量不匹配，需等计算量复核"
+            ),
+        }.get(str(effect.get("claim")), "显著")
+    else:
+        claim = "不显著"
+        if effect.get("mde_80") is not None:
+            qualifiers.append(
+                "80% 功效 MDE="
+                f"{float(effect['mde_80']):.4f}"
+            )
+    if effect.get("test") in (
+        "paired_t",
+        "welch_t",
+    ) and effect.get("p_value") is not None:
+        test_text = f"配对 t(n={effect.get('n_pairs', 0)})"
+    else:
+        test_text = "未检验"
+    return (
+        f"  [{effect['kind']}] {effect['design']} "
+        f"{effect['description']}  "
+        f"Δ={float(effect['mean_effect']):+.4f}  "
+        f"{test_text} {p_text}{ci_text}  {claim}"
+        + (
+            "（" + "；".join(qualifiers) + "）"
+            if qualifiers
+            else ""
+        )
+    )
+
+
 def print_comparison_analysis(
     rows: List[Dict[str, object]],
     factors: Optional[List[str]] = None,
@@ -15252,6 +16047,46 @@ def print_comparison_analysis(
         equivalence_margin=equivalence_margin,
     )
     coverage = ablation_coverage(rows, factors, ablation_modes)
+    factorial = factorial_effects(aggregates, group_keys, metric)
+    # 等计算量指标本身已按共同训练 FLOPs 对齐，不能再把
+    # FLOPs/专家宽度差异当成该指标的混杂；否则会错误地把
+    # 「等计算量下仍有效」降级为不可归因。
+    factorial_coverage = coverage
+    if metric == _COMPUTE_MATCHED_METRIC:
+        factorial_coverage = dict(coverage)
+        factorial_coverage["compute_parity"] = []
+        factorial_coverage["width_confounds"] = []
+    annotate_factorial_confounds(
+        factorial,
+        controlled,
+        factorial_coverage,
+    )
+    # 出现计算量不匹配时，自动在等训练计算量口径上重估主效应/
+    # 交互。该派生指标只对齐共同计算量点，不替代完整训练曲线；
+    # 因此单独成节、单独校正，并保留原口径结论供对照。
+    factorial_compute_matched = None
+    compute_parity_failed = any(
+        not entry.get("matched")
+        for entry in coverage.get("compute_parity", [])
+    )
+    if (
+        metric != _COMPUTE_MATCHED_METRIC
+        and compute_parity_failed
+        and compute_matched.get("target_flops") is not None
+    ):
+        factorial_compute_matched = factorial_effects(
+            aggregates,
+            group_keys,
+            _COMPUTE_MATCHED_METRIC,
+        )
+        matched_coverage = dict(coverage)
+        matched_coverage["compute_parity"] = []
+        matched_coverage["width_confounds"] = []
+        annotate_factorial_confounds(
+            factorial_compute_matched,
+            controlled,
+            matched_coverage,
+        )
     # 伪重复：同一实验单元里同一随机种子出现多次（如复制运行
     # 目录）不是独立重复实验，必须点名，不能让它悄悄抬高样本数、
     # 压低种子间方差。
@@ -16065,6 +16900,36 @@ def print_comparison_analysis(
         print(f"  已覆盖组合: {present}")
     for message in coverage.get("structural_confounds", []):
         print(f"  [confounded] {message}")
+    for entry in coverage.get("seed_alignment", []):
+        seeds_text = ", ".join(
+            str(seed) for seed in entry["common_seeds"]
+        )
+        if entry["aligned"]:
+            print(
+                "  种子对齐: "
+                f"{entry['delayed_mode']} 的 2×2 各格共享 "
+                f"{entry['n_common_seeds']} 个种子"
+                + (f"（{seeds_text}）" if seeds_text else "")
+            )
+        else:
+            print(
+                "  [warn] 种子未对齐: "
+                f"{entry['delayed_mode']} 的 2×2 各格种子"
+                f"集合不同，仅在 {entry['n_common_seeds']} 个"
+                "共同种子上可配对"
+            )
+    for entry in coverage.get("compute_parity", []):
+        if entry["matched"]:
+            continue
+        print(
+            "  [confounded] 计算量不匹配: "
+            f"{entry['delayed_mode']} 的 {entry['field']} 是 "
+            "local_base 的 "
+            f"{float(entry['ratio']):.2f} 倍，"
+            "该方案的主效应混入计算量；请用 "
+            "--compare-metric val_loss_at_matched_flops "
+            "在等训练计算量点复核"
+        )
     if coverage["low_replicate_cells"]:
         for message in coverage["low_replicate_cells"]:
             print(f"  [warn] {message}")
@@ -16080,16 +16945,96 @@ def print_comparison_analysis(
         and bool(expected_cells)
         and len(coverage["present_cells"]) == len(expected_cells)
     )
+    compute_parity_ok = all(
+        entry.get("matched")
+        for entry in coverage.get("compute_parity", [])
+    )
+    width_parity_ok = not coverage.get("width_confounds")
+    compute_aligned = metric == _COMPUTE_MATCHED_METRIC or (
+        compute_parity_ok and width_parity_ok
+    )
     if (
         full_factorial
         and not coverage["missing_cells"]
         and not coverage["low_replicate_cells"]
         and not coverage.get("structural_confounds")
+        and compute_aligned
     ):
+        aligned_text = (
+            "当前指标已按共同训练计算量对齐"
+            if metric == _COMPUTE_MATCHED_METRIC
+            else "计算量对齐"
+        )
         print(
             f"  OK：{len(expected_cells) // 2}×2 全因子组合齐全"
-            "且种子数达标"
+            f"、种子数达标且{aligned_text}"
         )
+    elif (
+        full_factorial
+        and not coverage["missing_cells"]
+        and not coverage["low_replicate_cells"]
+        and not coverage.get("structural_confounds")
+        and not compute_aligned
+    ):
+        print(
+            f"  [warn] {len(expected_cells) // 2}×2 组合齐全且"
+            "种子数达标，但计算量/专家宽度不匹配：主效应须在"
+            "等训练计算量指标上复核后才能归因"
+        )
+
+    if factorial["designs"] or factorial["incomplete_designs"]:
+        print()
+        print(
+            "[factorial] 全因子效应（按共同种子配对；"
+            "主效应/交互同属一个检验家族，做 Holm 校正）"
+        )
+        for design in factorial["designs"]:
+            print(
+                "  设计: "
+                + f"{design['delayed_mode']} vs local_base"
+                + (
+                    "（"
+                    + ", ".join(
+                        f"{key}={_format_factor_value(value)}"
+                        for key, value
+                        in design["context"].items()
+                    )
+                    + "）"
+                    if design["context"]
+                    else ""
+                )
+            )
+        for design in factorial["incomplete_designs"]:
+            print(
+                "  [missing] "
+                + f"{design['delayed_mode']} vs local_base"
+                + " 缺格: " + ", ".join(design["missing_cells"])
+            )
+        for effect in factorial["effects"]:
+            print(_format_factorial_effect(effect))
+        for advisory in factorial["advisories"]:
+            print(f"  [warn] {advisory}")
+        print(
+            "  注：交互显著只说明一个因子的效应随另一个因子"
+            "变化，不能单独解释为有益或有害；主效应结论以"
+            " Holm 校正后为准"
+        )
+
+    if factorial_compute_matched is not None:
+        print()
+        print(
+            "[factorial compute-matched] 在 "
+            f"{_COMPUTE_MATCHED_METRIC} 上重估全因子效应"
+            "（已对齐共同训练计算量；单独成族，不替代"
+            "完整训练曲线的排序）"
+        )
+        if factorial_compute_matched["effects"]:
+            for effect in factorial_compute_matched["effects"]:
+                print(_format_factorial_effect(effect))
+        else:
+            print("  无可用效应（等计算量指标缺少数值或共同种子）")
+        for advisory in factorial_compute_matched["advisories"]:
+            print(f"  [warn] {advisory}")
 
     return {
         "factors": factors,
@@ -16109,6 +17054,10 @@ def print_comparison_analysis(
         "selection_metric_mismatch": selection_metric_mismatch,
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
+        "factorial_effects": factorial,
+        "factorial_effects_compute_matched": (
+            factorial_compute_matched
+        ),
         "missing_efficiency_cells": missing_efficiency_cells,
         "compute_matched": compute_matched,
         "equivalence_margin": equivalence_margin,
@@ -20170,7 +21119,7 @@ def run_self_test():
                 "d_model": 16,
                 "n_heads": 4,
                 "n_layers": 4,
-                "n_experts": 3,
+                "n_experts": 4,
                 "expert_hidden": 24,
                 "top_k": 2,
                 "residual_scale": 1.0,
@@ -20196,6 +21145,8 @@ def run_self_test():
                     "k2": k2,
                     "balance_coef": balance,
                     "dense_fnn_hidden": None,
+                    "n_experts": protocol.get("n_experts"),
+                    "expert_hidden": protocol.get("expert_hidden"),
                     "seq_len": 8,
                     "d_model": 16,
                 },
@@ -21065,6 +22016,436 @@ def run_self_test():
             "3×2 全因子组合齐全" in message
             for message in b_full_coverage["advisories"]
         ), b_full_coverage["advisories"]
+
+        # ---- 全因子主效应/交互：按共同种子配对推断 ----
+        # A/local_base × balance 的 2×2，三个种子。构造无交互的
+        # 数据：延迟合并恒定 -0.10，均衡损失恒定 -0.05，
+        # 交互每种子恰好为 0。主效应应显著、交互不显著。
+        factorial_paths = []
+        for seed, offset in ((1, 0.0), (2, 0.02), (3, -0.02)):
+            factorial_paths.extend([
+                _write_analysis_run(
+                    f"fact_local_off_s{seed}",
+                    "local_base",
+                    seed,
+                    3e-4,
+                    100,
+                    0.0,
+                    3.00 + offset,
+                ),
+                _write_analysis_run(
+                    f"fact_A_off_s{seed}",
+                    "A",
+                    seed,
+                    3e-4,
+                    100,
+                    0.0,
+                    2.90 + offset,
+                ),
+                _write_analysis_run(
+                    f"fact_local_on_s{seed}",
+                    "local_base",
+                    seed,
+                    3e-4,
+                    100,
+                    0.01,
+                    2.95 + offset,
+                ),
+                _write_analysis_run(
+                    f"fact_A_on_s{seed}",
+                    "A",
+                    seed,
+                    3e-4,
+                    100,
+                    0.01,
+                    2.85 + offset,
+                ),
+            ])
+        factorial_aggregates = aggregate_runs(
+            compare_runs(factorial_paths),
+            ["mode", "balance_coef"],
+        )
+        factorial = factorial_effects(
+            factorial_aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        assert factorial["applicable"]
+        assert len(factorial["designs"]) == 1, factorial
+        assert not factorial["incomplete_designs"]
+        effects = {
+            effect["effect_name"]: effect
+            for effect in factorial["effects"]
+            if effect["delayed_mode"] == "A"
+        }
+        assert "delayed_merge_main" in effects, factorial
+        delayed_main = effects["delayed_merge_main"]
+        assert abs(delayed_main["mean_effect"] + 0.10) < 1e-9
+        assert delayed_main["n_pairs"] == 3
+        assert delayed_main["aligned_seeds"]
+        assert delayed_main["significant"]
+        assert delayed_main["claim"] == "supports_component"
+        balance_main = effects["balance_loss_main"]
+        assert abs(balance_main["mean_effect"] + 0.05) < 1e-9
+        assert balance_main["claim"] == "supports_component"
+        interaction = effects["interaction"]
+        assert abs(interaction["mean_effect"]) < 1e-9
+        assert not interaction["significant"]
+        assert interaction["claim"] == "not_significant"
+        # 因子效应报告必须能安全落盘（seed/元组等不泄露到 JSON）。
+        json.dumps(
+            _json_safe(factorial),
+            ensure_ascii=False,
+        )
+
+        # 有交互分支：B 的均衡损失收益（-0.30）明显大于
+        # local_base（-0.10），交互效应 -0.20 必须被检出，
+        # 且简单效应按 balance 档位分别报告。
+        interaction_paths = [
+            _write_analysis_run(
+                "ix_local_off_s7",
+                "local_base",
+                7,
+                3e-4,
+                100,
+                0.0,
+                3.00,
+            ),
+            _write_analysis_run(
+                "ix_B_off_s7",
+                "B",
+                7,
+                3e-4,
+                100,
+                0.0,
+                2.90,
+            ),
+            _write_analysis_run(
+                "ix_local_on_s7",
+                "local_base",
+                7,
+                3e-4,
+                100,
+                0.01,
+                2.90,
+            ),
+            _write_analysis_run(
+                "ix_B_on_s7",
+                "B",
+                7,
+                3e-4,
+                100,
+                0.01,
+                2.60,
+            ),
+            _write_analysis_run(
+                "ix_local_off_s8",
+                "local_base",
+                8,
+                3e-4,
+                100,
+                0.0,
+                3.01,
+            ),
+            _write_analysis_run(
+                "ix_B_off_s8",
+                "B",
+                8,
+                3e-4,
+                100,
+                0.0,
+                2.91,
+            ),
+            _write_analysis_run(
+                "ix_local_on_s8",
+                "local_base",
+                8,
+                3e-4,
+                100,
+                0.01,
+                2.91,
+            ),
+            _write_analysis_run(
+                "ix_B_on_s8",
+                "B",
+                8,
+                3e-4,
+                100,
+                0.01,
+                2.61,
+            ),
+            _write_analysis_run(
+                "ix_local_off_s9",
+                "local_base",
+                9,
+                3e-4,
+                100,
+                0.0,
+                2.99,
+            ),
+            _write_analysis_run(
+                "ix_B_off_s9",
+                "B",
+                9,
+                3e-4,
+                100,
+                0.0,
+                2.89,
+            ),
+            _write_analysis_run(
+                "ix_local_on_s9",
+                "local_base",
+                9,
+                3e-4,
+                100,
+                0.01,
+                2.89,
+            ),
+            _write_analysis_run(
+                "ix_B_on_s9",
+                "B",
+                9,
+                3e-4,
+                100,
+                0.01,
+                2.59,
+            ),
+        ]
+        interaction_effects = factorial_effects(
+            aggregate_runs(
+                compare_runs(interaction_paths),
+                ["mode", "balance_coef"],
+            ),
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        by_effect = {
+            effect["effect_name"]: effect
+            for effect in interaction_effects["effects"]
+        }
+        assert abs(
+            by_effect["interaction"]["mean_effect"] + 0.20
+        ) < 1e-9, by_effect["interaction"]
+        assert by_effect["interaction"]["claim"] == (
+            "interaction_detected"
+        )
+        assert abs(
+            by_effect["delayed_merge_at_balance_off"][
+                "mean_effect"
+            ] + 0.10
+        ) < 1e-9
+        assert abs(
+            by_effect["delayed_merge_at_balance_on"][
+                "mean_effect"
+            ] + 0.30
+        ) < 1e-9
+        assert abs(
+            by_effect["balance_loss_at_local_base"][
+                "mean_effect"
+            ] + 0.10
+        ) < 1e-9
+        assert abs(
+            by_effect["balance_loss_at_delayed_merge"][
+                "mean_effect"
+            ] + 0.30
+        ) < 1e-9
+
+        # 计算量混杂：B 的 FLOPs 是 local_base 的 3 倍时，
+        # 消融覆盖必须显式点名「主效应混入计算量」。
+        parity_paths = factorial_paths + [
+            _write_analysis_run(
+                "fact_B_off_s1_cost",
+                "B",
+                1,
+                3e-4,
+                100,
+                0.0,
+                2.80,
+                flops=3000,
+            ),
+        ] + [
+            _write_analysis_run(
+                f"fact_local_off_cost_s{seed}",
+                "local_base",
+                seed,
+                3e-4,
+                100,
+                0.0,
+                3.00,
+                flops=1000,
+            )
+            for seed in (1, 2, 3)
+        ]
+        parity_coverage = ablation_coverage(
+            compare_runs(parity_paths),
+            factors,
+        )
+        parity_entries = [
+            entry
+            for entry in parity_coverage["compute_parity"]
+            if entry["delayed_mode"] == "B"
+        ]
+        assert parity_entries, parity_coverage["compute_parity"]
+        assert not parity_entries[0]["matched"]
+        assert abs(parity_entries[0]["ratio"] - 3.0) < 1e-9
+        assert any(
+            "计算量" in message
+            for message in parity_coverage["advisories"]
+        )
+
+        # 种子未对齐：A 的 2×2 各格种子集合不同（有的多一个
+        # 种子），必须在 seed_alignment 中报告且只按共同种子
+        # 配对，不能把未对齐的种子当成额外重复。
+        misaligned_paths = factorial_paths + [
+            _write_analysis_run(
+                f"fact_A_on_extra_s{seed}",
+                "A",
+                seed,
+                3e-4,
+                100,
+                0.01,
+                2.85,
+            )
+            for seed in (7, 8)
+        ]
+        misaligned_coverage = ablation_coverage(
+            compare_runs(misaligned_paths),
+            factors,
+        )
+        alignment_entries = [
+            entry
+            for entry in misaligned_coverage["seed_alignment"]
+            if entry["delayed_mode"] == "A"
+        ]
+        assert alignment_entries
+        assert alignment_entries[0]["n_common_seeds"] == 3
+        assert not alignment_entries[0]["aligned"]
+        assert any(
+            "种子集合不一致" in message
+            for message in misaligned_coverage["advisories"]
+        )
+
+        # 受控变量违规 / 结构混杂 / 计算量不匹配时，显著效应
+        # 必须从「支持组件」降级，不能把混杂差异当成机制收益。
+        confound_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                },
+                {
+                    "delayed_mode": "B",
+                    "claim": "interaction_detected",
+                },
+                {
+                    "delayed_mode": "A",
+                    "claim": "not_significant",
+                },
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            confound_factorial,
+            {"ok": False},
+            {
+                "structural_confounds": ["k1 不一致"],
+                "compute_parity": [
+                    {"delayed_mode": "B", "matched": False}
+                ],
+            },
+        )
+        assert (
+            confound_factorial["effects"][0]["claim"]
+            == "confounded"
+        )
+        assert (
+            confound_factorial["effects"][1]["claim"]
+            == "compute_confounded"
+        )
+        assert (
+            confound_factorial["effects"][2]["claim"]
+            == "not_significant"
+        )
+        assert len(confound_factorial["advisories"]) == 3
+
+        # A 的 k1*k2 超过 n_experts 时，local_base 的第二轮宽度
+        # 被截断，二者不再严格等计算；即使实测 FLOPs 未达 1.5×，
+        # 覆盖报告也必须给出混杂提示。
+        wide_a_path = _write_analysis_run(
+            "wide_a",
+            "A",
+            1,
+            0.001,
+            10,
+            0.01,
+            val_loss=2.0,
+            k1=3,
+            k2=2,
+            flops=1200,
+        )
+        wide_base_path = _write_analysis_run(
+            "wide_base",
+            "local_base",
+            1,
+            0.001,
+            10,
+            0.0,
+            val_loss=2.1,
+            k1=3,
+            k2=2,
+            flops=1200,
+        )
+        wide_coverage = ablation_coverage(
+            compare_runs([wide_a_path, wide_base_path]),
+            {"mode", "balance_coef"},
+            ["A"],
+        )
+        assert any(
+            "第二轮专家宽度" in message
+            for message in wide_coverage["advisories"]
+        )
+        assert wide_coverage["width_confounds"], wide_coverage
+        assert (
+            wide_coverage["width_confounds"][0]["delayed_mode"]
+            == "A"
+        )
+        width_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                }
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            width_factorial,
+            {"ok": True},
+            wide_coverage,
+        )
+        assert (
+            width_factorial["effects"][0]["claim"]
+            == "compute_confounded"
+        )
+
+        clean_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                }
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            clean_factorial,
+            {"ok": True},
+            {"structural_confounds": [], "compute_parity": []},
+        )
+        assert (
+            clean_factorial["effects"][0]["claim"]
+            == "supports_component"
+        )
 
         # smelt vs B 一旦出现 B，就不能当「与消融无关」：缺
         # 立即合并对照与关闭臂时必须点名，并给出计算量提醒
