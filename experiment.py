@@ -216,6 +216,29 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+def pythonhashseed_error(
+    require_pythonhashseed: bool,
+) -> Optional[str]:
+    """
+    --require-pythonhashseed 的合法性检查：返回错误消息或
+    None。当前解释器的哈希种子在进程启动时已确定，set_seed
+    的 setdefault 无法追溯固定；需要严格逐位复现的正式运行
+    必须由用户在命令行显式设置。
+    """
+    if (
+        require_pythonhashseed
+        and _PYTHONHASHSEED_AT_START is None
+    ):
+        return (
+            "--require-pythonhashseed 要求进程启动前显式设置 "
+            "PYTHONHASHSEED（例如 "
+            "PYTHONHASHSEED=42 python experiment.py ...）；"
+            "当前进程的 hash 随机化未被固定，严格逐位复现"
+            "无法保证"
+        )
+    return None
+
+
 def _capture_rng_state() -> Dict[str, object]:
     """
     捕获当前进程的全部随机数状态，供临时代码（如 sanity check）
@@ -3409,8 +3432,277 @@ class ByteDataset:
 
 
 # ============================================================
-# Data audit (leakage / distribution checks)
+# Pre-training data pipeline probe
 # ============================================================
+
+def _expected_window_pairs(
+    data: torch.Tensor,
+    starts: torch.Tensor,
+    seq_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    按窗口起点从原始 split 字节张量重建 (x, y)。
+
+    x 是窗口去除最后一个字节的输入，y 是窗口去除第一个字节的
+    目标（下一 token 监督位）。这是数据协议对 (x, y) 的定义，
+    独立于 ByteDataset 的 unfold/index_select 实现，用于核对
+    两者的逐位一致性。
+    """
+    positions = starts.to(torch.long).unsqueeze(1) + torch.arange(
+        seq_len + 1,
+        dtype=torch.long,
+    )
+    windows = data[positions]
+    return windows[:, :-1].to(torch.int32), windows[:, 1:]
+
+
+def probe_data_pipeline(
+    dataset: ByteDataset,
+    device: torch.device,
+    *,
+    batch_size: int = 4,
+    batches: int = 2,
+    seed: int = 20240607,
+) -> Dict[str, object]:
+    """
+    训练前的数据管线完整性质检（中间结果检查）。
+
+    过拟合小批量只能证明「模型在本数据管线的输出上可以学到
+    东西」：如果 x/y 错位、标签映射错误或切分越界，模型可以
+    照样把固定小批次背下来，sanity check 无法发现。这里用
+    独立重建的方式逐位核对数据协议：
+
+    - 三段切分边界连续、长度与字节总数一致，train/val/test
+      互不重叠（窗口不跨越 split 边界）；
+    - 训练批的采样起点可复现，且 ``batch()`` 返回的 (x, y)
+      与「从原始 train 字节按起点直接切片」逐位一致（覆盖
+      群组去重后的合法起点区间路径）；
+    - 验证固定窗口的起点可复现，且 ``fixed_eval_batch()``
+      的 (x, y) 同样逐位一致；
+    - 输入 token 落在 [0, vocab_size) 内、dtype 与形状符合
+      约定（x 为 int32、y 为 uint8，监督位是后移一位的目标）。
+
+    返回结构化报告；``failures`` 非空表示数据协议存在实质
+    错误（错位、越界、不可复现），在训练前必须修复。
+    """
+    seq_len = dataset.seq_len
+    failures: List[str] = []
+
+    report: Dict[str, object] = {
+        "ok": True,
+        "failures": failures,
+        "seq_len": seq_len,
+        "train_checked": False,
+        "val_fixed_checked": False,
+        "split_bounds": {
+            split: list(bounds)
+            for split, bounds in dataset.split_bounds.items()
+        },
+    }
+
+    bounds = dataset.split_bounds
+    train_bounds = bounds["train"]
+    val_bounds = bounds["val"]
+    test_bounds = bounds["test"]
+
+    if not (
+        train_bounds[0] == 0
+        and train_bounds[1] == val_bounds[0]
+        and val_bounds[1] == test_bounds[0]
+        and test_bounds[1] == dataset.num_bytes
+    ):
+        failures.append(
+            "split 边界不连续（train/val/test 必须首尾相接且"
+            "覆盖全部字节）"
+        )
+
+    split_lengths = (
+        train_bounds[1] - train_bounds[0]
+        + (val_bounds[1] - val_bounds[0])
+        + (test_bounds[1] - test_bounds[0])
+    )
+    if split_lengths != dataset.num_bytes:
+        failures.append(
+            "split 长度之和与字节总数不一致"
+        )
+
+    if len(dataset.train) != train_bounds[1] - train_bounds[0]:
+        failures.append("训练集长度与切分边界不一致")
+    if len(dataset.val) != val_bounds[1] - val_bounds[0]:
+        failures.append("验证集长度与切分边界不一致")
+    if dataset.has_test and (
+        len(dataset.test) != test_bounds[1] - test_bounds[0]
+    ):
+        failures.append("测试集长度与切分边界不一致")
+
+    max_train_start = len(dataset.train) - seq_len
+    if max_train_start < 1:
+        failures.append("训练集没有合法窗口起点")
+
+    # ---- 训练批：采样起点 + x/y 逐位对齐 ----
+    try:
+        probe_generator = torch.Generator().manual_seed(seed)
+        starts = dataset._sample_train_starts(
+            batch_size,
+            probe_generator,
+        )
+
+        if int(starts.numel()) != batch_size:
+            failures.append("训练批采样起点数量与 batch_size 不一致")
+
+        if int(starts.min()) < 0 or int(starts.max()) > max_train_start - 1:
+            failures.append(
+                "训练批采样起点越界（窗口会跨越训练 split 边界）"
+            )
+
+        expected_x, expected_y = _expected_window_pairs(
+            dataset.train,
+            starts,
+            seq_len,
+        )
+
+        batch_generator = torch.Generator().manual_seed(seed)
+        x, y = dataset.batch(
+            "train",
+            batch_size,
+            batch_generator,
+            device,
+        )
+
+        report["train_checked"] = True
+
+        if x.cpu().dtype != torch.int32:
+            failures.append(
+                f"训练批 x dtype 为 {x.dtype}，期望 int32"
+            )
+        if y.cpu().dtype != torch.uint8:
+            failures.append(
+                f"训练批 y dtype 为 {y.dtype}，期望 uint8"
+            )
+
+        if tuple(x.shape) != tuple(expected_x.shape):
+            failures.append(
+                f"训练批 x 形状 {tuple(x.shape)} 与期望 "
+                f"{tuple(expected_x.shape)} 不一致"
+            )
+        elif not torch.equal(x.cpu(), expected_x):
+            failures.append(
+                "训练批 x 与原始字节切片不一致（输入窗口错位）"
+            )
+
+        if tuple(y.shape) != tuple(expected_y.shape):
+            failures.append(
+                f"训练批 y 形状 {tuple(y.shape)} 与期望 "
+                f"{tuple(expected_y.shape)} 不一致"
+            )
+        elif not torch.equal(y.cpu(), expected_y):
+            failures.append(
+                "训练批 y 与原始字节切片不一致（下一 token "
+                "标签错位）"
+            )
+
+        # 同一 seed 的第二次采样必须逐位一致：训练批采样
+        # 不允许依赖生成器之外的任何隐式状态。
+        repeat_x, repeat_y = dataset.batch(
+            "train",
+            batch_size,
+            torch.Generator().manual_seed(seed),
+            device,
+        )
+        if not (
+            torch.equal(x.cpu(), repeat_x.cpu())
+            and torch.equal(y.cpu(), repeat_y.cpu())
+        ):
+            failures.append(
+                "训练批采样不可复现（同一 seed 两次采样结果"
+                "不同）"
+            )
+
+        if x.numel() > 0 and (
+            int(x.min()) < 0 or int(x.max()) >= 256
+        ):
+            failures.append(
+                "训练批输入 token 超出 [0, 256) 字节范围"
+            )
+    except (AssertionError, RuntimeError, ValueError) as error:
+        failures.append(f"训练批检查抛出异常: {error}")
+
+    # ---- 验证固定窗口：起点可复现 + x/y 逐位对齐 ----
+    num_starts = len(dataset.val) - seq_len
+    try:
+        total_batches = min(batches * batch_size, num_starts)
+        fixed_starts_all = torch.linspace(
+            0,
+            num_starts - 1,
+            steps=total_batches,
+            dtype=torch.float64,
+        ).round().long()
+        # batch_index=0 只返回前 batch_size 个固定起点。
+        fixed_starts = fixed_starts_all[:batch_size]
+
+        expected_x, expected_y = _expected_window_pairs(
+            dataset.val,
+            fixed_starts,
+            seq_len,
+        )
+
+        dataset.clear_eval_batch_cache()
+        x, y = dataset.fixed_eval_batch(
+            "val",
+            0,
+            batches,
+            batch_size,
+            device,
+        )
+
+        report["val_fixed_checked"] = True
+
+        if tuple(x.shape) != tuple(expected_x.shape):
+            failures.append(
+                f"验证固定窗口 x 形状 {tuple(x.shape)} 与期望 "
+                f"{tuple(expected_x.shape)} 不一致"
+            )
+        elif not torch.equal(x.cpu(), expected_x):
+            failures.append(
+                "验证固定窗口 x 与原始字节切片不一致（固定评估"
+                "窗口不可复现或输入错位）"
+            )
+        if tuple(y.shape) != tuple(expected_y.shape):
+            failures.append(
+                f"验证固定窗口 y 形状 {tuple(y.shape)} 与期望 "
+                f"{tuple(expected_y.shape)} 不一致"
+            )
+        elif not torch.equal(y.cpu(), expected_y):
+            failures.append(
+                "验证固定窗口 y 与原始字节切片不一致（评估标签"
+                "错位）"
+            )
+
+        # 清空结果缓存后重建必须逐位一致：固定评估窗口跨
+        # 进程/跨调用不依赖任何随机状态。
+        dataset.clear_eval_batch_cache()
+        repeat_x, repeat_y = dataset.fixed_eval_batch(
+            "val",
+            0,
+            batches,
+            batch_size,
+            device,
+        )
+        if not (
+            torch.equal(x.cpu(), repeat_x.cpu())
+            and torch.equal(y.cpu(), repeat_y.cpu())
+        ):
+            failures.append(
+                "验证固定窗口重复构建不可复现（结果依赖调用"
+                "顺序或随机状态）"
+            )
+    except (AssertionError, RuntimeError, ValueError) as error:
+        failures.append(f"验证固定窗口检查抛出异常: {error}")
+
+    report["ok"] = not failures
+    return report
+
+
 
 # 重复窗口扫描的采样上限：窗口数超过该值时按等间距抽样。
 _AUDIT_MAX_WINDOWS = 100000
@@ -5599,6 +5891,7 @@ def run_statistical_baseline(
     out_dir: Path,
     device: torch.device,
     data_audit: Optional[Dict[str, object]],
+    data_protocol_check: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     统计基线入口：计数（train）→ val 网格调优
@@ -5933,8 +6226,24 @@ def run_statistical_baseline(
             "val_fraction": dataset.val_fraction,
             "test_fraction": dataset.test_fraction,
             "group_separator": getattr(args, "group_separator", None),
+            "split_bounds": {
+                split: list(bounds)
+                for split, bounds in dataset.split_bounds.items()
+            },
+            "train_cleaning": dataset.train_cleaning,
+            "group_cuts": (
+                dict(dataset.group_cuts)
+                if dataset.group_cuts is not None
+                else None
+            ),
+            "groups_per_split": (
+                dict(dataset.groups_per_split)
+                if dataset.groups_per_split is not None
+                else None
+            ),
         },
         "data_audit": data_audit,
+        "data_protocol_check": data_protocol_check,
         "reference_baselines": reference,
         "run_metadata": collect_run_metadata(
             torch.device("cpu")
@@ -9550,6 +9859,24 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             config_payload
         )
 
+        # 可复现性来源：代码指纹与数值环境（来自各运行
+        # config.json 的 run_metadata）。跨代码版本或跨
+        # Python/torch/CUDA/设备比较时，方法差异无法与实现/
+        # 环境差异分离，对比分析必须能发现。
+        metadata = config_payload.get("run_metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        row["provenance"] = {
+            key: metadata.get(key)
+            for key in (
+                *_REPRODUCIBILITY_HARD_KEYS,
+                *_REPRODUCIBILITY_INFO_KEYS,
+            )
+        }
+        row["provenance"]["pythonhashseed_at_start"] = (
+            metadata.get("pythonhashseed_at_start")
+        )
+
         row["n_params"] = config_payload.get("n_params")
 
         efficiency = config_payload.get("efficiency") or {}
@@ -9901,6 +10228,35 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # macro F1 等分类指标时必须能按同一指标选 checkpoint，
     # 否则最终模型不是按假设的判定口径选出来的。
     "selection_metric",
+)
+
+# 对比运行的「可复现性来源」核对项：代码指纹与数值环境。
+# 与受控变量协议不同，这些项不是训练超参数，但同样决定结果
+# 能否归因：同一份代码、同一个 Python/torch/CUDA/cuDNN 与
+# 设备上的两次运行才谈得上「方法差异」。旧运行缺记录时保持
+# 未核对，不虚报一致。
+_REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
+    "script_sha256",
+    "python_version",
+    "torch_version",
+    "cuda_version",
+    "cudnn_version",
+    "platform",
+    "device_name",
+    "deterministic_algorithms",
+    "cudnn_deterministic",
+    "cudnn_benchmark",
+    "cublas_workspace_config",
+    "allow_tf32_matmul",
+    "allow_tf32_cudnn",
+)
+
+# 信息性字段：允许不同，只提示（同一脚本指纹下的 git commit
+# 差异通常来自文档/CI 等与本实验无关的改动）。
+_REPRODUCIBILITY_INFO_KEYS: Tuple[str, ...] = (
+    "git_commit",
+    "git_dirty",
+    "git_diff_sha256",
 )
 
 # 允许声明为实验因子（跨运行允许不同）的键：行级字段 +
@@ -10599,6 +10955,105 @@ def check_controlled_variables(
         "n_neural_runs": len(neural),
         "statistical_runs": statistical,
         "ok": not violations,
+    }
+
+
+def check_run_provenance(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    可复现性来源核对：同一次对比的运行必须来自同一份实验
+    代码与同一数值环境（Python/torch/CUDA/cuDNN/设备与
+    确定性开关）。
+
+    与受控变量检查一样，只在有记录可核对的运行之间判定；
+    旧运行缺记录时列为「未核对」，不虚报一致。git commit /
+    dirty 状态单独作为信息项：同一脚本指纹下的 commit 差异
+    可能只是文档/CI 改动，不直接判违规。
+    """
+    values_by_key: Dict[str, List[Tuple[str, object]]] = {
+        key: []
+        for key in (
+            *_REPRODUCIBILITY_HARD_KEYS,
+            *_REPRODUCIBILITY_INFO_KEYS,
+            "pythonhashseed_at_start",
+        )
+    }
+
+    for row in rows:
+        provenance = row.get("provenance")
+        if not isinstance(provenance, dict):
+            provenance = {}
+        name = str(row.get("run"))
+        for key in values_by_key:
+            values_by_key[key].append(
+                (name, provenance.get(key))
+            )
+
+    checked: List[str] = []
+    unchecked: List[str] = []
+    mismatches: List[Dict[str, object]] = []
+
+    for key in _REPRODUCIBILITY_HARD_KEYS:
+        values = values_by_key[key]
+        present = [
+            (name, value)
+            for name, value in values
+            if value is not None
+        ]
+        missing_runs = [
+            name for name, value in values if value is None
+        ]
+
+        if not present:
+            if rows:
+                unchecked.append(key)
+            continue
+
+        checked.append(key)
+
+        distinct = {
+            repr(_stable_factor_key(value))
+            for _, value in present
+        }
+
+        if len(distinct) > 1 or missing_runs:
+            mismatches.append({
+                "key": key,
+                "values": {
+                    name: value for name, value in values
+                },
+                "missing_runs": missing_runs,
+            })
+
+    hashseed_values = values_by_key["pythonhashseed_at_start"]
+    hashseed_unset_runs = [
+        name
+        for name, value in hashseed_values
+        if value is None
+    ]
+
+    git_commits = {
+        repr(_stable_factor_key(value))
+        for _, value in values_by_key["git_commit"]
+        if value is not None
+    }
+    script_hashes = {
+        repr(_stable_factor_key(value))
+        for _, value in values_by_key["script_sha256"]
+        if value is not None
+    }
+
+    return {
+        "keys": list(_REPRODUCIBILITY_HARD_KEYS),
+        "checked_keys": checked,
+        "unchecked_keys": unchecked,
+        "mismatches": mismatches,
+        "hashseed_unset_runs": hashseed_unset_runs,
+        "commits_differ": (
+            len(git_commits) > 1 and len(script_hashes) <= 1
+        ),
+        "ok": not mismatches,
     }
 
 
@@ -14289,6 +14744,53 @@ def print_comparison_analysis(
             "一致性: " + ", ".join(controlled["unchecked_keys"])
         )
 
+    provenance = check_run_provenance(rows)
+
+    print()
+    print(
+        "[provenance] 代码版本与数值环境核对：对比结论要求"
+        "同一份实验代码、同一 Python/torch/CUDA/cuDNN 与设备"
+        "（跨实现/环境比较无法归因到方法本身）"
+    )
+    if not rows:
+        print("  无运行目录可分析")
+    elif provenance["mismatches"]:
+        for mismatch in provenance["mismatches"]:
+            values_text = ", ".join(
+                f"{run}={_format_factor_value(value)}"
+                for run, value in mismatch["values"].items()
+            )
+            print(
+                f"  [violation] {mismatch['key']}: {values_text}"
+            )
+        print(
+            "  以上差异来自代码版本或运行环境，不是待验证的"
+            "实验因子；请在同一份代码与同一环境下重跑后再比较"
+        )
+    elif provenance["checked_keys"]:
+        print(
+            f"  OK：{len(provenance['checked_keys'])} 项代码/"
+            "环境记录完全一致"
+        )
+    if provenance["unchecked_keys"]:
+        print(
+            "  [warn] 以下代码/环境项所有运行都未记录，无法"
+            "核对: " + ", ".join(provenance["unchecked_keys"])
+        )
+    if provenance["hashseed_unset_runs"]:
+        print(
+            "  [warn] 以下运行启动时未固定 PYTHONHASHSEED"
+            "（set_seed 的 setdefault 无法追溯地固定当前解释器；"
+            "严格逐位复现请在命令行显式设置）: "
+            + ", ".join(provenance["hashseed_unset_runs"])
+        )
+    if provenance["commits_differ"]:
+        print(
+            "  [note] 各运行的 git commit 不同但实验脚本指纹"
+            "一致（差异来自与本实验无关的文件）；如需严格的"
+            "同代码版本对比，请在同一 commit 上重跑。"
+        )
+
     print()
     print(
         "[hypothesis] 科学假设登记（每个改动前写明预期效果与"
@@ -14886,6 +15388,7 @@ def print_comparison_analysis(
         "factors": factors,
         "metric": metric,
         "controlled": controlled,
+        "provenance": provenance,
         "hypothesis_registry": hypotheses,
         "hypothesis_alignment": alignment,
         "aggregates": aggregates,
@@ -15482,12 +15985,15 @@ def write_run_config(
     data_audit: Optional[Dict[str, object]] = None,
     reference_baselines: Optional[Dict[str, object]] = None,
     baseline_tuning: Optional[Dict[str, object]] = None,
+    data_protocol_check: Optional[Dict[str, object]] = None,
+    dataset: Optional[ByteDataset] = None,
 ) -> None:
     """
     写出 config.json：结构配置、完整超参数、参数量、数据指纹、
     数据划分与审计结果、代码版本/运行环境、sanity check 结果、
-    本轮实验的科学假设（--hypothesis/--rq）、参考基线
-    （uniform / unigram）与基线调参来源（--baseline-tuning-from）。
+    数据管线完整性质检结果、本轮实验的科学假设（--hypothesis/--rq）、
+    参考基线（uniform / unigram）与基线调参来源
+    （--baseline-tuning-from）。
     """
     payload = {
         "config": asdict(cfg),
@@ -15552,9 +16058,30 @@ def write_run_config(
             ),
         },
         "data_audit": data_audit,
+        "data_protocol_check": data_protocol_check,
         "run_metadata": run_metadata,
         "sanity_check": sanity_result,
     }
+
+    # 数据切分的精确边界与组切分：仅凭 sha256 + 比例无法在
+    # 数据文件以外完整还原「哪些字节属于训练/验证/测试」，
+    # 边界与去重/组切分记录是数据版本的一部分。
+    if dataset is not None:
+        payload["data"]["split_bounds"] = {
+            split: list(bounds)
+            for split, bounds in dataset.split_bounds.items()
+        }
+        payload["data"]["train_cleaning"] = dataset.train_cleaning
+        payload["data"]["group_cuts"] = (
+            dict(dataset.group_cuts)
+            if dataset.group_cuts is not None
+            else None
+        )
+        payload["data"]["groups_per_split"] = (
+            dict(dataset.groups_per_split)
+            if dataset.groups_per_split is not None
+            else None
+        )
 
     # resume 会重写 config.json；保留上次运行结束时补充的
     # efficiency 测量结果与调参来源记录。只有续跑才允许继承：
@@ -15624,6 +16151,27 @@ def write_run_config(
                 payload["hypothesis_preregistration"] = (
                     current_prereg
                 )
+
+            # resume 会重写 run_metadata（新的 timestamp/command/
+            # 环境快照）。保留最初运行的元数据快照与续跑次数，
+            # 避免「原始运行时间、原始命令、当时的环境」在多次
+            # 续跑后丢失；否则一份从检查点续跑而来的结果，其
+            # 溯源信息只能指向最后一次续跑。
+            original_metadata = previous.get(
+                "original_run_metadata"
+            )
+            if not isinstance(original_metadata, dict):
+                original_metadata = previous.get("run_metadata")
+            if isinstance(original_metadata, dict):
+                payload["original_run_metadata"] = (
+                    original_metadata
+                )
+            payload["resume_count"] = (
+                int(previous.get("resume_count", 0)) + 1
+            )
+            payload["resumed_at_utc"] = run_metadata.get(
+                "timestamp_utc"
+            )
 
     # 假设的判定指标以最终生效的假设文本为准（resume 可能从
     # 原运行恢复了假设），不能沿用命令行空文本的解析结果。
@@ -15998,6 +16546,11 @@ def save_checkpoint(
         # NumPy 全局随机状态：只含基本类型，torch.load 在
         # weights_only=True 下也能安全读取。
         "numpy_rng_state": _numpy_rng_state_payload(),
+        # 代码指纹：resume 时与当前脚本/commit 比对，跨代码
+        # 版本续跑会明确警告并写入 config.json，避免把两次
+        # 不同实现的训练轨迹冒充成同一实验。
+        "script_sha256": _script_sha256(),
+        "git_commit": _git_output("rev-parse", "HEAD"),
         "args": vars(args),
     }
 
@@ -16920,6 +17473,53 @@ def run_self_test():
             batch_size=2,
             device=eval_device,
         )
+
+        # 数据管线完整性质检：合法数据集必须通过，且覆盖
+        # 训练批与验证固定窗口两条路径。
+        probe_report = probe_data_pipeline(
+            eval_dataset,
+            eval_device,
+            batch_size=4,
+            batches=2,
+        )
+        assert probe_report["ok"], probe_report["failures"]
+        assert probe_report["train_checked"]
+        assert probe_report["val_fixed_checked"]
+
+        # 标签错位必须被探针抓住（sanity check 无法发现这类
+        # 数据协议错误：模型可以把错位标签照样背下来）。
+        class _ShiftedLabelDataset(ByteDataset):
+            def batch(
+                self,
+                split,
+                batch_size,
+                generator,
+                device,
+            ):
+                x, y = ByteDataset.batch(
+                    self,
+                    split,
+                    batch_size,
+                    generator,
+                    device,
+                )
+                return x, torch.roll(y, shifts=1, dims=1)
+
+        shifted_dataset = _ShiftedLabelDataset(
+            data_file.name,
+            seq_len=8,
+        )
+        shifted_report = probe_data_pipeline(
+            shifted_dataset,
+            eval_device,
+            batch_size=4,
+            batches=2,
+        )
+        assert not shifted_report["ok"]
+        assert any(
+            "标签错位" in failure
+            for failure in shifted_report["failures"]
+        ), shifted_report["failures"]
 
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
@@ -21134,6 +21734,81 @@ def run_self_test():
                 + repr(unknown_spec)
             )
 
+    # ---- 可复现性来源核对：代码指纹/环境必须一致 ----
+    provenance_mismatch = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "torch_version": "2.0.0",
+                "cuda_version": None,
+                "platform": "linux",
+            },
+        },
+        {
+            "run": "r2",
+            "provenance": {
+                "script_sha256": "b" * 64,
+                "torch_version": "2.0.0",
+                "cuda_version": None,
+                "platform": "linux",
+            },
+        },
+    ])
+    assert not provenance_mismatch["ok"]
+    assert any(
+        mismatch["key"] == "script_sha256"
+        for mismatch in provenance_mismatch["mismatches"]
+    ), provenance_mismatch["mismatches"]
+
+    same_provenance = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "torch_version": "2.0.0",
+                "platform": "linux",
+            },
+        },
+        {
+            "run": "r2",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "torch_version": "2.0.0",
+                "platform": "linux",
+            },
+        },
+    ])
+    assert same_provenance["ok"], same_provenance["mismatches"]
+    assert "script_sha256" in same_provenance["checked_keys"]
+
+    # --require-pythonhashseed：启动前未设置时给出明确错误；
+    # 已设置（当前解释器）或未要求时不报错。
+    assert pythonhashseed_error(False) is None
+    if _PYTHONHASHSEED_AT_START is None:
+        assert pythonhashseed_error(True)
+    else:
+        assert pythonhashseed_error(True) is None
+
+    # 套件子进程环境：未设置 PYTHONHASHSEED 时按 seed 固定；
+    # 用户显式设置时尊重原值（不静默覆盖）。
+    saved_hashseed = os.environ.pop("PYTHONHASHSEED", None)
+    try:
+        child_env = _sweep_child_env(7)
+        assert child_env["PYTHONHASHSEED"] == "7"
+        assert (
+            child_env["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+        )
+        assert os.environ.get("PYTHONHASHSEED") is None
+
+        os.environ["PYTHONHASHSEED"] = "1234"
+        explicit_env = _sweep_child_env(7)
+        assert explicit_env["PYTHONHASHSEED"] == "1234"
+    finally:
+        os.environ.pop("PYTHONHASHSEED", None)
+        if saved_hashseed is not None:
+            os.environ["PYTHONHASHSEED"] = saved_hashseed
+
     print("self-test passed")
 
 
@@ -21395,6 +22070,26 @@ def build_baseline_tuning_plan(
     return plan
 
 
+def _sweep_child_env(seed: int) -> Dict[str, str]:
+    """
+    套件子进程的环境变量：显式固定 PYTHONHASHSEED。
+
+    父进程的 PYTHONHASHSEED 若未设置，每个子进程在启动时会
+    各自随机化 hash（set_seed 里的 setdefault 无法追溯地固定
+    当前解释器），同一种子的两次运行会因 dict/set 迭代顺序
+    不同而产生不可复现的差异。子进程按本次运行的 seed 固定该
+    变量，使「同一种子 = 同一随机环境」。父进程已显式设置时
+    尊重原值（所有子进程共享同一固定种子）。
+
+    CUBLAS_WORKSPACE_CONFIG 同样在子进程中兜底设置：确定性
+    cuBLAS 工作区必须在 CUDA 上下文创建前生效。
+    """
+    env = os.environ.copy()
+    env.setdefault("PYTHONHASHSEED", str(int(seed)))
+    env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    return env
+
+
 def _execute_sweep_plan(
     base_argv: List[str],
     plan: List[Dict[str, object]],
@@ -21404,6 +22099,10 @@ def _execute_sweep_plan(
     逐运行以独立子进程执行计划中的每个条目；覆盖 --seed/--out
     以及条目声明的 --mode/--balance-coef/--lr。任一运行失败即
     停止并退出（可用 --compare 分析已完成的目录）。
+
+    每个子进程都带上按 seed 固定的 PYTHONHASHSEED 环境
+    （见 ``_sweep_child_env``），避免同种子运行因 hash 随机化
+    产生差异。
     """
     run_paths: List[str] = []
 
@@ -21435,7 +22134,10 @@ def _execute_sweep_plan(
             f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
         )
 
-        completed = subprocess.run(command)
+        completed = subprocess.run(
+            command,
+            env=_sweep_child_env(int(item["seed"])),
+        )
 
         if completed.returncode != 0:
             print(
@@ -22744,6 +23446,15 @@ def main():
         action="store_true",
         help="只运行 sanity check 并写出结果，不开始全量训练",
     )
+    parser.add_argument(
+        "--require-pythonhashseed",
+        action="store_true",
+        help=(
+            "要求进程启动前显式设置 PYTHONHASHSEED（set_seed 的 "
+            "setdefault 无法追溯地固定当前解释器的哈希随机化）；"
+            "未设置时直接报错退出，用于严格逐位复现的正式运行"
+        ),
+    )
     parser.add_argument("--sanity-batch-size", type=int, default=4)
     parser.add_argument("--sanity-steps", type=int, default=300)
     parser.add_argument("--sanity-lr", type=float, default=3e-3)
@@ -22775,6 +23486,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    hashseed_error = pythonhashseed_error(
+        args.require_pythonhashseed
+    )
+    if hashseed_error:
+        parser.error(hashseed_error)
 
     # 在入口处校验参数合法性。
     if args.steps <= 0:
@@ -23225,6 +23942,57 @@ def main():
                 " config/model/optimizer 必需字段："
                 "不是由本脚本 save_checkpoint 产生的存档"
             )
+
+        # 检查点带有保存时的代码指纹（script_sha256 / git
+        # commit）：跨代码版本 resume 会把两次不同实现的参数
+        # 接在一起，训练轨迹不再是任何单一代码版本的产物。
+        # 明确警告并把两侧指纹写进 config.json，而不是静默继续。
+        checkpoint_script_sha256 = rng_payload.get(
+            "script_sha256"
+        )
+        checkpoint_git_commit = rng_payload.get("git_commit")
+        current_script_sha256 = _script_sha256()
+        current_git_commit = _git_output("rev-parse", "HEAD")
+        code_changed = bool(
+            isinstance(checkpoint_script_sha256, str)
+            and isinstance(current_script_sha256, str)
+            and checkpoint_script_sha256
+            and current_script_sha256
+            and checkpoint_script_sha256
+            != current_script_sha256
+        )
+        if code_changed:
+            print(
+                "[repro] [warn] resume 检查点由另一份 "
+                "experiment.py 保存（checkpoint "
+                f"script_sha256={checkpoint_script_sha256[:12]}..., "
+                f"current={current_script_sha256[:12]}...）："
+                "两次不同代码版本的参数被接在一起，训练轨迹"
+                "不是任何单一代码版本的产物；如需可归因的"
+                "结论，请用全新 --out 目录从头训练。"
+            )
+        if (
+            isinstance(checkpoint_git_commit, str)
+            and isinstance(current_git_commit, str)
+            and checkpoint_git_commit
+            and current_git_commit
+            and checkpoint_git_commit != current_git_commit
+            and not code_changed
+        ):
+            print(
+                "[repro] [note] resume checkpoint git commit "
+                f"{checkpoint_git_commit[:12]}... 与当前 "
+                f"{current_git_commit[:12]}... 不同（实验脚本"
+                "内容一致）；请确认差异来自与本实验无关的文件。"
+            )
+        args.resume_code_provenance = {
+            "checkpoint_script_sha256": checkpoint_script_sha256,
+            "checkpoint_git_commit": checkpoint_git_commit,
+            "current_script_sha256": current_script_sha256,
+            "current_git_commit": current_git_commit,
+            "code_changed": code_changed,
+        }
+
         saved_args = rng_payload.get("args", {})
         saved_data_sha256 = saved_args.get("data_sha256")
         saved_data_val_fraction = saved_args.get(
@@ -23558,6 +24326,28 @@ def main():
             "采样轨迹与原运行不再一致"
         )
 
+    # 训练/基线运行之前的数据管线完整性质检：sanity check 只能
+    # 证明「模型能背下这个小批次」，x/y 错位、标签映射错误或
+    # 切分越界都能骗过它；这里独立重建 (x, y) 并逐位核对，
+    # 结果写入 config.json 的 data_protocol_check 字段。
+    data_protocol_check = probe_data_pipeline(dataset, device)
+    if data_protocol_check["ok"]:
+        print(
+            "[data-protocol] 数据管线检查通过：训练批采样与"
+            "固定评估窗口的 (x, y) 均与原始字节切片逐位一致"
+        )
+    else:
+        print(
+            "[data-protocol] FAILED: 数据管线存在实质错误，"
+            "在修复前拒绝开始训练："
+        )
+        for failure in data_protocol_check["failures"]:
+            print(f"  - {failure}")
+        raise SystemExit(
+            "数据管线检查未通过：请先修复输入/标签错位、切分"
+            "越界或不可复现的采样逻辑，再开始全量训练。"
+        )
+
     # 基线调参来源（--baseline-tuning-from）：核对本次基线的
     # 模式/学习率/训练步数/数据指纹与完整训练协议确实复用了
     # 调参报告的 winner，并把来源写入 config.json 的
@@ -23632,6 +24422,7 @@ def main():
             out_dir,
             device,
             data_audit,
+            data_protocol_check,
         )
         return
 
@@ -23815,6 +24606,8 @@ def main():
             data_audit=data_audit,
             reference_baselines=reference_baselines,
             baseline_tuning=baseline_tuning_record,
+            data_protocol_check=data_protocol_check,
+            dataset=dataset,
         )
         if args.resume is None:
             # 全新运行：参考基线记录是 metrics.jsonl 的首行；
@@ -24178,17 +24971,21 @@ def main():
 
     # config.json 记录完整实验追踪信息：结构配置、超参数、种子、
     # 数据指纹与划分、数据审计、代码版本/运行环境、sanity check
-    # 结果、科学假设、参考基线与基线调参来源。
+    # 结果、数据管线完整性质检结果、科学假设、参考基线与基线
+    # 调参来源。
+    run_metadata = collect_run_metadata(device)
     write_run_config(
         out_dir,
         cfg,
         args,
         n_params,
-        collect_run_metadata(device),
+        run_metadata,
         config_sanity_result,
         data_audit=data_audit,
         reference_baselines=reference_baselines,
         baseline_tuning=baseline_tuning_record,
+        data_protocol_check=data_protocol_check,
+        dataset=dataset,
     )
 
     metrics_path = out_dir / "metrics.jsonl"
@@ -24832,6 +25629,18 @@ def main():
         "nonfinite_events": nonfinite_events,
         "numerical_stop": numerical_stop,
         "numerical_polluted": numerical_polluted,
+        # 最终结果自带实验追踪字段：metrics.jsonl 即使脱离
+        # config.json 单独复制/归档，也能定位「哪份代码、哪个
+        # 种子、哪份数据、何时跑完」，不至于无法追溯。
+        "seed": args.seed,
+        "data_sha256": dataset.data_sha256,
+        "script_sha256": run_metadata.get("script_sha256"),
+        "git_commit": run_metadata.get("git_commit"),
+        "git_dirty": run_metadata.get("git_dirty"),
+        "run_started_utc": run_metadata.get("timestamp_utc"),
+        "run_completed_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
     }
     metrics_file.write(
         json.dumps(
@@ -25205,6 +26014,15 @@ def main():
                     "step": "test",
                     **test_metrics,
                     "data_audit": test_audit,
+                    "seed": args.seed,
+                    "data_sha256": dataset.data_sha256,
+                    "script_sha256": run_metadata.get(
+                        "script_sha256"
+                    ),
+                    "git_commit": run_metadata.get("git_commit"),
+                    "run_completed_utc": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
                 }
                 metrics_file.write(
                     json.dumps(
