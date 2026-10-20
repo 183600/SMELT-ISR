@@ -17405,11 +17405,16 @@ def hypothesis_preregistration_error(
                 "可只用 --primary-metric 指定 n-gram 的 val "
                 "调参口径"
             )
-        if primary_metric not in COMPARISON_METRIC_KEYS:
+        # 统计基线的调参口径必须落在 n-gram 真正会计算的
+        # 指标集合内：路由诊断/等计算量 loss 只存在于神经
+        # 模型评估中，放行后会被 resolve_ngram_tuning_metric
+        # 静默回退到 val_loss，预注册的主指标与实际调参口径
+        # 不一致（形同未预注册）。
+        if primary_metric not in _NGRAM_TUNING_METRIC_KEYS:
             return (
-                f"--primary-metric={primary_metric} 不是评估管线"
-                "计算的对比指标；可选："
-                + ", ".join(COMPARISON_METRIC_KEYS)
+                f"--primary-metric={primary_metric} 不是 "
+                "n-gram 统计基线可计算的调参指标；可选："
+                + ", ".join(_NGRAM_TUNING_METRIC_KEYS)
             )
         return None
 
@@ -26468,6 +26473,18 @@ def run_self_test():
                 primary_metric="val_macro_f1",
             )
         ) is None
+        # n-gram 不训练、没有路由诊断/训练曲线：这些指标不能
+        # 作为它的调参口径，否则会被静默回退成 val_loss。
+        for uncomputable in (
+            "routing_jaccard_branch",
+            "val_loss_at_matched_flops",
+        ):
+            assert hypothesis_preregistration_error(
+                _prereg_args(
+                    statistical_baseline=True,
+                    primary_metric=uncomputable,
+                )
+            ) is not None, uncomputable
         assert hypothesis_preregistration_error(
             _prereg_args(
                 statistical_baseline=True,
