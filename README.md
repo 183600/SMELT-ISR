@@ -71,6 +71,14 @@ split 边界。当前字节级管线不涉及标准化/归一化/缺失值填充
 记录每个 split 的完整群组数。吸附后无法保证每段最小长度时（如单个
 群组过大）会显式报错，而不是悄悄拆分群组。
 
+**训练集去重**：`--deduplicate-train-groups`（需配合群组分隔符）会从
+train 中整体剔除与 val/test 或更早 train 群组内容完全相同的群组，
+val/test 的字节与切分位置保持不变。被剔除内容不会进入神经网络窗口，
+也不会进入 unigram / n-gram 统计基线的计数或分布审计；`data_audit`
+记录 `effective_bytes` / `effective_windows`，`config.data` 记录实际
+切分比例与清洗统计。训练期审计只用切分边界核对 test 实际占比，不读取
+test 内容；解封前还会独立核对 test 固定窗口的输入/标签是否逐位对齐。
+
 **严格数据审计**：加上 `--strict-data-audit` 后，审计发现的泄露级问题
 （跨 split 重复窗口、越界 token、超阈值的 UTF-8/NUL 损坏）会直接
 拒绝开始训练；解封测试集时若测试集本身有同类问题也会拒绝解封（不写入

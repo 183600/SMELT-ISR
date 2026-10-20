@@ -53,6 +53,18 @@ The pipeline is strictly leakage-safe: **split first, then process**. The corpus
 
 **Grouped data must stay on one side**: if the corpus is a concatenation of groups (the same document / user / object producing multiple records), pass `--group-separator` (e.g., `--group-separator '<|doc|>'` or `--group-separator '\n\n'`; `\n`, `\xHH`, `\uXXXX` escapes are supported). Split positions are snapped to group boundaries, so no group is ever cut across two splits and train/val/test never cross. The audit records the number of whole groups per split. When snapping cannot satisfy the minimum length of every split (e.g., a single oversized group), the script raises an explicit error instead of silently splitting a group.
 
+**Training-set deduplication**: `--deduplicate-train-groups` (requires a
+group separator) removes whole training groups whose content is identical
+to a val/test group or to an earlier training group; val/test bytes and
+split positions are left untouched. Removed content enters neither neural
+training windows nor the unigram / n-gram statistical baselines or the
+distribution audit. `data_audit` records `effective_bytes` /
+`effective_windows`, and `config.data` records the actual split fractions
+and cleaning statistics. The training-time audit checks the test fraction
+from split bounds only (without reading test content); before unsealing,
+the fixed test windows are independently verified for bit-exact input/target
+alignment.
+
 **Strict data audit**: with `--strict-data-audit`, leakage-class findings (cross-split duplicate windows, out-of-range tokens, UTF-8/NUL corruption above threshold) abort training; when unsealing the test set, the same problems in test refuse the unsealing (no `test` record is written). By default these are warnings only, so you can inspect the data before deciding how to clean it.
 
 Whenever a new best validation loss is reached, the weights are written to `best.pt`. The `final` record and the single test evaluation both use this validation-selected model (the selection policy is recorded in `model_selection` inside `config.json`); if `best.pt` is missing (e.g., resuming from an older checkpoint), the script says so explicitly and falls back to the last-step parameters.

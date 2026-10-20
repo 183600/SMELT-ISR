@@ -72,6 +72,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `seq_len + 1` 字节（如单个群组过大）则显式报错，不拆分群组。
   `data_audit.groups` 记录分隔符与每个 split 的完整群组数；
   `comparison_protocol.group_separator` 把分隔符纳入受控变量。
+- **训练集去重**：`--deduplicate-train-groups` 只从 train 剔除与
+  val/test 或更早 train 群组内容完全相同的群组，val/test 字节与切分
+  位置不变；被剔除内容不进入神经窗口、unigram / n-gram 计数或分布
+  审计，`data_audit` 的 `effective_bytes` / `effective_windows` 与
+  `config.data.split_fractions` 记录清洗后的真实训练口径。训练期只用
+  切分边界核对 test 占比（不读 test 内容）；解封前独立探针再核对
+  test 固定窗口的输入/标签逐位对齐。
 - **严格审计**：`--strict-data-audit` 把泄露级问题（跨 split 重复
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
