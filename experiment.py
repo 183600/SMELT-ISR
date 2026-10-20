@@ -195,6 +195,48 @@ def resume_data_change_error(
     )
 
 
+def resume_split_change_error(
+    saved_split_sha256: Optional[object],
+    current_split_sha256: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """
+    检查续跑检查点记录的逐 split 内容指纹与当前划分是否一致。
+
+    数据文件整体 sha256 相同、划分比例也相同，仍可能因为群组
+    吸附、去重/清洗开关或切分实现变化而产生不同的 train/val/
+    test 字节段。整体 sha256 无法发现这种情况；逐 split 指纹
+    不同意味着检查点的 RNG/优化器状态对应另一批训练样本，必须
+    拒绝续跑而不是把两套划分混成一条轨迹。
+    """
+    if not isinstance(saved_split_sha256, dict):
+        return None
+    if not isinstance(current_split_sha256, dict):
+        return None
+
+    mismatched = [
+        split
+        for split, saved_hash in saved_split_sha256.items()
+        if (
+            split in current_split_sha256
+            and isinstance(saved_hash, str)
+            and saved_hash
+            and saved_hash != current_split_sha256[split]
+        )
+    ]
+    if not mismatched:
+        return None
+
+    return (
+        "resume 数据划分内容指纹已变化（split: "
+        + ", ".join(sorted(mismatched))
+        + "）：整体数据 sha256 虽相同，但 train/val/test 的"
+        "实际字节段不同（群组吸附、清洗开关或切分实现变化）。"
+        "检查点的参数/优化器状态对应旧划分，续跑会把两套"
+        "数据混成一条训练轨迹。请换用全新的 --out 目录与"
+        "检查点从头训练。"
+    )
+
+
 def seed_error(seed: int) -> Optional[str]:
     """
     校验随机种子的统一合法域；返回错误消息或 None。
@@ -3058,6 +3100,17 @@ class ByteDataset:
             "train": (0, n_train),
             "val": (n_train, n_val_end),
             "test": (n_val_end, len(tokens)),
+        }
+
+        # 逐 split 内容指纹：整体数据 sha256 相同时，群组吸附/
+        # 清洗/切分实现变化仍可能改变各段实际字节范围。把每段
+        # 内容单独指纹化，resume 与跨运行核对才能确认 train/val/
+        # test 仍是同一批字节，而不是只看整体文件与比例。
+        self.split_sha256 = {
+            split: hashlib.sha256(
+                self._raw[begin:end]
+            ).hexdigest()
+            for split, (begin, end) in self.split_bounds.items()
         }
 
         dedup_excluded: List[Tuple[int, int]] = []
@@ -7664,6 +7717,9 @@ def run_statistical_baseline(
                         "test_fraction": (
                             dataset.test_fraction
                         ),
+                        "split_sha256": dict(
+                            dataset.split_sha256
+                        ),
                         "model": "ngram",
                     },
                 )
@@ -7780,6 +7836,7 @@ def run_statistical_baseline(
                 for split, bounds in dataset.split_bounds.items()
             },
             "split_fractions": dataset.split_fractions,
+            "split_sha256": dict(dataset.split_sha256),
             "effective_train_bytes": (
                 dataset.effective_train_bytes
             ),
@@ -20344,6 +20401,9 @@ def write_run_config(
         payload["data"]["split_fractions"] = (
             dataset.split_fractions
         )
+        payload["data"]["split_sha256"] = dict(
+            dataset.split_sha256
+        )
         payload["data"]["effective_train_bytes"] = (
             dataset.effective_train_bytes
         )
@@ -22497,6 +22557,12 @@ def run_self_test():
         )
 
     assert dedup_dataset.split_bounds["train"] == (0, 48)
+    for split_name, (begin, end) in (
+        dedup_dataset.split_bounds.items()
+    ):
+        assert dedup_dataset.split_sha256[split_name] == (
+            hashlib.sha256(dedup_payload[begin:end]).hexdigest()
+        )
     assert dedup_dataset.train_excluded_spans == [
         (12, 22),
         (24, 34),
@@ -23069,6 +23135,24 @@ def run_self_test():
     assert (
         resume_data_change_error("abc", "def") is not None
     )
+
+    # 逐 split 内容指纹：数据整体 sha256 相同时，划分/群组吸附
+    # 或清洗变化仍必须被识别并拒绝续跑。
+    assert resume_split_change_error(None, {"train": "a"}) is None
+    assert resume_split_change_error({}, {"train": "a"}) is None
+    assert (
+        resume_split_change_error(
+            {"train": "a", "val": "b"},
+            {"train": "a", "val": "b"},
+        )
+        is None
+    )
+    split_change_error = resume_split_change_error(
+        {"train": "a", "val": "b"},
+        {"train": "a", "val": "c"},
+    )
+    assert split_change_error is not None
+    assert "val" in split_change_error
 
     # set_seed 必须让 Python / NumPy / PyTorch 的随机流可复现。
     set_seed(2024)
@@ -30831,6 +30915,7 @@ def main():
     saved_data_sha256 = None
     saved_data_val_fraction = None
     saved_data_test_fraction = None
+    saved_data_split_sha256 = None
 
     if args.resume is not None:
         # 检查点先载入 CPU，再按目标设备分别搬运。读取失败
@@ -30918,6 +31003,9 @@ def main():
         )
         saved_data_test_fraction = saved_args.get(
             "data_test_fraction"
+        )
+        saved_data_split_sha256 = saved_args.get(
+            "data_split_sha256"
         )
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
@@ -31244,6 +31332,7 @@ def main():
     args.data_bytes = dataset.num_bytes
     args.data_val_fraction = dataset.val_fraction
     args.data_test_fraction = dataset.test_fraction
+    args.data_split_sha256 = dict(dataset.split_sha256)
 
     data_change_error = resume_data_change_error(
         saved_data_sha256,
@@ -31251,7 +31340,23 @@ def main():
     )
     if data_change_error is not None:
         parser.error(data_change_error)
+
+    split_change_error = resume_split_change_error(
+        saved_data_split_sha256,
+        dataset.split_sha256,
+    )
+    if split_change_error is not None:
+        parser.error(split_change_error)
     elif saved_data_sha256 is not None and (
+        saved_data_split_sha256 is None
+    ):
+        print(
+            "resume checkpoint predates per-split content "
+            "fingerprints; 仅凭整体 sha256 与比例无法确认 "
+            "train/val/test 的实际字节段未变"
+        )
+
+    if saved_data_sha256 is not None and (
         saved_data_val_fraction is None
         or saved_data_test_fraction is None
     ):
@@ -32989,6 +33094,9 @@ def main():
                     {
                         "dataset_sha256": dataset.data_sha256,
                         "test_fraction": dataset.test_fraction,
+                        "split_sha256": dict(
+                            dataset.split_sha256
+                        ),
                     },
                 )
 
