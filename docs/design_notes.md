@@ -26,6 +26,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   均匀路由时约为 `top_k`，均衡强度随路由宽度线性增大；跨
   `k1`/`k2`/`top_k` 比较实验时应按比例折算系数（保持
   `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
+  `local_base` 第二轮为对齐计算量使用宽度
+  `min(n_experts, k1*k2)`，实现会把该轮 aux 按
+  `k2 / min(n_experts, k1*k2)` 折算回 A/B 的单分支宽度；
+  `comparison_protocol.balance_width_normalization` 记录该口径，
+  用于区分未折算的旧运行。对比分析另有
+  `balance_strength_report` 核对 `balance_coef × 有效路由宽度`，
+  宽度不同而强度未抵消时以 `[balance-scale]` 警告。
 - `residual_scale`：残差缩放系数，全局作用于所有区域、所有子层的残差
   更新（Attention 与 MoE 一致，循环区域内/外一致），默认 1.0。SMELT
   论文对循环区域内的子层残差更新按循环次数 $r$ 缩放 $1/r$（循环两次

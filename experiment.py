@@ -1851,7 +1851,10 @@ class TransformerBlock(nn.Module):
         _BlockCheckpoint 的「输出是张量元组」约定一致。
 
         local_base:
-            第一轮 MoE 后立即合并。
+            第一轮 MoE 后立即合并。第二轮宽度
+            min(n_experts, k1*k2) 只用于对齐 A 的计算量；
+            返回的 aux2 已按 k2/matched_k2 折算回单分支
+            宽度，避免均衡强度随实现细节变化。
 
         A:
             第一轮专家输出先保留为分支；
@@ -1870,6 +1873,15 @@ class TransformerBlock(nn.Module):
             )
             x, aux1 = self.moe_step(x, k1)
             x, aux2 = self.moe_step(x, matched_k2)
+            # 第二轮宽度是计算量对齐的产物；aux loss 约随
+            # 路由宽度线性增长（见 SparseMoE.route 注释）。
+            # 把 local_base 的 aux2 折算回 A/B 的单分支宽度
+            # k2，保证全因子消融中 balance_coef 代表同一均衡
+            # 强度，而不是让「立即合并」臂意外多受均衡压力。
+            if matched_k2 != k2:
+                aux2 = aux2 * (
+                    float(k2) / float(matched_k2)
+                )
             return x, aux1, aux2
 
         expert_outputs, gates, _, aux1 = self.moe.unmerged(
@@ -11776,6 +11788,15 @@ _COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
 # checkpoint 选择。与等计算量 loss 一样，它是分析期派生指标。
 _COMMON_STEP_METRIC = "val_loss_at_common_step"
 
+# local_base 的第二轮为了与 A/B 对齐计算量，把 k1 个分支合并
+# 成一次宽度 min(n_experts, k1*k2) 的路由；均衡损失约随路由
+# 宽度线性增长，直接沿用会让「立即合并」臂的均衡强度高于
+# 延迟合并臂。该常量记录本轮实现已把 local_base 第二轮的
+# aux loss 折算回单分支宽度 k2，供受控变量核对区分新旧运行。
+_BALANCE_WIDTH_NORMALIZATION = (
+    "local_base_second_round_scaled_to_k2"
+)
+
 
 def _is_deterministic_run(row: Dict[str, object]) -> bool:
     """
@@ -12796,6 +12817,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "k1",
     "k2",
     "balance_coef",
+    # 均衡项是否按有效路由宽度折算：旧实现直接使用 local_base
+    # 第二轮的计算对齐宽度，均衡强度会高于 A/B；新旧运行混在
+    # 一起比较时该字段必须暴露差异。
+    "balance_width_normalization",
     "dense_fnn_hidden",
     "residual_scale",
     "val_fraction",
@@ -13238,6 +13263,9 @@ def build_comparison_protocol(
         "k1": cfg.k1,
         "k2": cfg.k2,
         "balance_coef": cfg.balance_coef,
+        "balance_width_normalization": (
+            _BALANCE_WIDTH_NORMALIZATION
+        ),
         "dense_fnn_hidden": cfg.dense_fnn_hidden,
         "residual_scale": cfg.residual_scale,
         "val_fraction": getattr(args, "val_fraction", None),
@@ -13384,6 +13412,11 @@ def experiment_protocol_from_payload(
         "k1": cfg.get("k1"),
         "k2": cfg.get("k2"),
         "balance_coef": cfg.get("balance_coef"),
+        # 旧运行没有该字段：历史实现不做宽度折算，必须显式
+        # 记为 "none"，否则无法与新运行区分。
+        "balance_width_normalization": (
+            "none" if has_training else None
+        ),
         "dense_fnn_hidden": cfg.get("dense_fnn_hidden"),
         "residual_scale": cfg.get("residual_scale"),
         "val_fraction": _pick(
@@ -13505,7 +13538,12 @@ def parse_factor_spec(spec: str) -> List[str]:
     locked = [
         key
         for key in keys
-        if key in {"model_selection", "selection_metric"}
+        if key
+        in {
+            "model_selection",
+            "selection_metric",
+            "balance_width_normalization",
+        }
     ]
     if locked:
         raise ValueError(
@@ -19179,6 +19217,200 @@ def annotate_factorial_confounds(
         )
 
 
+def _balance_width_profile(
+    protocol: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    """
+    估计一条运行的有效均衡宽度（每次路由调用的平均 top-k）。
+
+    辅助损失在每次 ``SparseMoE.route`` 调用上约为 k（均匀路由
+    下 E·sum(f_i P_i)=k），一个 Block 的 aux 是各次调用的均值：
+    - smelt：每层一次路由，宽度 top_k；
+    - A/B：第一轮 k1、第二轮每分支 k2，均值 (k1+k2)/2；
+    - local_base：第一轮 k1、第二轮为对齐计算量的
+      min(n_experts, k1*k2)；新实现把第二轮 aux 折算回 k2，
+      旧实现（normalization="none"）未折算。
+    该值是用于发现混杂的一阶近似，不替代实测路由统计。
+    """
+    if not isinstance(protocol, dict):
+        return None
+
+    mode = str(protocol.get("mode") or "")
+    if mode not in {"smelt", "A", "B", "local_base"}:
+        return None
+
+    try:
+        balance_coef = float(protocol.get("balance_coef"))
+    except (TypeError, ValueError):
+        return None
+    if balance_coef < 0.0:
+        return None
+
+    def _as_int(key: str) -> Optional[int]:
+        value = protocol.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    if mode == "smelt":
+        top_k = _as_int("top_k")
+        if top_k is None:
+            return None
+        return {
+            "mode": mode,
+            "balance_coef": balance_coef,
+            "effective_width": float(top_k),
+            "normalization": "not_applicable",
+        }
+
+    k1 = _as_int("k1")
+    k2 = _as_int("k2")
+    if k1 is None or k2 is None:
+        return None
+
+    if mode in {"A", "B"}:
+        width = 0.5 * (k1 + k2)
+        normalization = "not_applicable"
+    else:
+        normalization = str(
+            protocol.get("balance_width_normalization")
+            or "none"
+        )
+        if normalization == _BALANCE_WIDTH_NORMALIZATION:
+            second_width = k2
+        else:
+            n_experts = _as_int("n_experts")
+            if n_experts is None:
+                return None
+            second_width = min(n_experts, k1 * k2)
+        width = 0.5 * (k1 + second_width)
+
+    return {
+        "mode": mode,
+        "balance_coef": balance_coef,
+        "effective_width": width,
+        "normalization": normalization,
+    }
+
+
+def balance_strength_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    核对跨运行的均衡损失强度 ``balance_coef × 有效路由宽度``。
+
+    路由宽度不同本身不是问题（k1/k2 可以作为实验因子），但
+    若宽度变化而均衡强度没有相应折算，方法效应就会与均衡
+    压力混杂。系数为 0 的消融臂不施加均衡压力，不参与该
+    强度比较（其全因子作用仍由消融覆盖检查负责）。
+    """
+    report: Dict[str, object] = {
+        "applicable": False,
+        "width_varied": False,
+        "strength_varied": False,
+        "confounded": False,
+        "profiles": [],
+        "advisories": [],
+        "note": (
+            "均衡强度 = balance_coef × 平均每次路由的 top-k；"
+            "跨路由宽度比较时必须保持该乘积一致"
+        ),
+    }
+
+    for row in rows:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            continue
+        profile = _balance_width_profile(protocol)
+        if profile is None:
+            continue
+        strength = (
+            float(profile["balance_coef"])
+            * float(profile["effective_width"])
+        )
+        report["profiles"].append({
+            "run": str(row.get("run")),
+            "mode": profile["mode"],
+            "balance_coef": profile["balance_coef"],
+            "effective_width": profile["effective_width"],
+            "balance_strength": strength,
+            "normalization": profile["normalization"],
+        })
+
+    profiles = report["profiles"]
+    if len(profiles) < 2:
+        return report
+
+    widths = [
+        float(profile["effective_width"])
+        for profile in profiles
+    ]
+    strengths = [
+        float(profile["balance_strength"])
+        for profile in profiles
+    ]
+    width_span = max(widths) - min(widths)
+    strength_span = max(strengths) - min(strengths)
+    strength_scale = max(
+        1.0,
+        max(abs(value) for value in strengths),
+    )
+    width_varied = width_span > 1e-9 * max(
+        1.0,
+        max(abs(value) for value in widths),
+    )
+    strength_varied = strength_span > 1e-9 * strength_scale
+
+    report["width_varied"] = width_varied
+    report["strength_varied"] = strength_varied
+    report["applicable"] = width_varied
+
+    if not width_varied or not strength_varied:
+        return report
+
+    report["confounded"] = True
+    lowest = min(
+        profiles,
+        key=lambda item: float(item["balance_strength"]),
+    )
+    highest = max(
+        profiles,
+        key=lambda item: float(item["balance_strength"]),
+    )
+    ratio = (
+        float(highest["balance_strength"])
+        / float(lowest["balance_strength"])
+        if float(lowest["balance_strength"]) > 0.0
+        else None
+    )
+    report["strength_ratio"] = ratio
+    report["advisories"].append(
+        "均衡强度随路由宽度变化但未被抵消："
+        f"{lowest['run']}（mode={lowest['mode']}, "
+        f"coef={float(lowest['balance_coef']):g}, "
+        f"width={float(lowest['effective_width']):g}, "
+        f"strength={float(lowest['balance_strength']):g}）"
+        " vs "
+        f"{highest['run']}（mode={highest['mode']}, "
+        f"coef={float(highest['balance_coef']):g}, "
+        f"width={float(highest['effective_width']):g}, "
+        f"strength={float(highest['balance_strength']):g}）"
+        + (
+            f"，最高/最低={ratio:.2f}×"
+            if ratio is not None
+            else ""
+        )
+        + "。请按宽度折算 balance_coef（保持 "
+        "balance_coef × width 不变）后重跑，否则路由宽度会"
+        "与均衡强度混杂"
+    )
+    return report
+
+
 def _format_factorial_effect(effect: Dict[str, object]) -> str:
     """把一条因子效应格式化为控制台行（主分析/等计算量分析共用）。"""
     p_holm = effect.get("p_value_holm")
@@ -19356,6 +19588,7 @@ def print_comparison_analysis(
         ablation_modes,
         allow_partial=allow_partial_ablation,
     )
+    balance_scale = balance_strength_report(rows)
     factorial = factorial_effects(aggregates, group_keys, metric)
     # 等计算量指标本身已按共同训练 FLOPs 对齐，不能再把
     # FLOPs/专家宽度差异当成该指标的混杂；否则会错误地把
@@ -20391,6 +20624,29 @@ def print_comparison_analysis(
             "等训练计算量指标上复核后才能归因"
         )
 
+    print()
+    print(
+        "[balance-scale] 均衡损失强度核对"
+        "（balance_coef × 平均路由宽度）"
+    )
+    if not balance_scale["profiles"]:
+        print("  无可用运行（缺 mode/k1/k2/top_k/balance_coef 记录）")
+    elif balance_scale["confounded"]:
+        for advisory in balance_scale["advisories"]:
+            print(f"  [warn] {advisory}")
+    elif balance_scale["width_varied"]:
+        print(
+            "  OK：路由宽度不同，但 balance_coef 已按宽度折算，"
+            "均衡强度一致"
+        )
+    elif balance_scale["strength_varied"]:
+        print(
+            "  OK：路由宽度一致；balance_coef 差异是显式实验"
+            "因子，不构成宽度混杂"
+        )
+    else:
+        print("  OK：各运行的有效路由宽度与均衡强度一致")
+
     if factorial["designs"] or factorial["incomplete_designs"]:
         print()
         print(
@@ -20463,6 +20719,7 @@ def print_comparison_analysis(
         "selection_metric_mismatch": selection_metric_mismatch,
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
+        "balance_scale": balance_scale,
         "factorial_effects": factorial,
         "factorial_effects_compute_matched": (
             factorial_compute_matched
@@ -25377,6 +25634,57 @@ def run_self_test():
         common_report,
     )["applicable"]
 
+    # ---- local_base 均衡强度折算 ----
+    # 第二轮实际宽度 min(n_experts, k1*k2) 只用于计算量对齐；
+    # 返回给总损失的 aux2 必须折算回 k2，否则立即合并臂的
+    # 均衡压力高于 A/B。
+    class _BalanceScaleMoe:
+        n_experts = 4
+
+    class _BalanceScaleStub:
+        moe = _BalanceScaleMoe()
+
+        def __init__(self):
+            self.calls = []
+
+        def attention_step(self, value):
+            return value
+
+        def moe_step(self, value, top_k):
+            self.calls.append(top_k)
+            return value, torch.tensor(float(top_k))
+
+    balance_stub = _BalanceScaleStub()
+    _, aux1, aux2 = TransformerBlock.local_two_stage(
+        balance_stub,
+        torch.zeros(1, 1, 4),
+        2,
+        2,
+        False,
+    )
+    assert balance_stub.calls == [2, 4]
+    assert abs(float(aux1) - 2.0) < 1e-9
+    # 第二轮原始 aux≈4，按 k2/matched_k2=0.5 折算回 2。
+    assert abs(float(aux2) - 2.0) < 1e-9
+    assert _balance_width_profile({
+        "mode": "local_base",
+        "k1": 2,
+        "k2": 2,
+        "n_experts": 4,
+        "balance_coef": 0.01,
+        "balance_width_normalization": (
+            _BALANCE_WIDTH_NORMALIZATION
+        ),
+    })["effective_width"] == 2.0
+    assert _balance_width_profile({
+        "mode": "local_base",
+        "k1": 2,
+        "k2": 2,
+        "n_experts": 4,
+        "balance_coef": 0.01,
+        "balance_width_normalization": "none",
+    })["effective_width"] == 3.0
+
     # ---- 对比分析：t 分布 p 值（无 SciPy 依赖） ----
     # 已知分位点：df=4 时 t_{0.975}=2.776445 对应双侧 p=0.05，
     # t_{0.995}=4.604095 对应 p=0.01。
@@ -27152,6 +27460,90 @@ def run_self_test():
             confound_factorial["effects"][0]["claim"]
             == "confounded"
         )
+
+        # 均衡强度核对：旧 local_base 直接用第二轮宽度
+        # min(n_experts, k1*k2)=4，强度是 A（宽度 2）的 1.5 倍；
+        # 新实现折算回 k2 后两者一致。按宽度折算系数的 A 臂
+        # 即使 k2 不同，也不应误报为混杂。
+        balance_a_path = _write_analysis_run(
+            "balance_scale_a",
+            "A",
+            1,
+            0.001,
+            10,
+            0.01,
+            val_loss=2.0,
+            k1=2,
+            k2=2,
+        )
+        balance_old_base_path = _write_analysis_run(
+            "balance_scale_old_base",
+            "local_base",
+            1,
+            0.001,
+            10,
+            0.01,
+            val_loss=2.1,
+            k1=2,
+            k2=2,
+        )
+        old_balance_report = balance_strength_report(
+            compare_runs([
+                balance_a_path,
+                balance_old_base_path,
+            ])
+        )
+        assert old_balance_report["confounded"]
+        assert abs(
+            float(old_balance_report["strength_ratio"]) - 1.5
+        ) < 1e-9
+        assert old_balance_report["advisories"]
+
+        balance_new_base_path = _write_analysis_run(
+            "balance_scale_new_base",
+            "local_base",
+            1,
+            0.001,
+            10,
+            0.01,
+            val_loss=2.1,
+            k1=2,
+            k2=2,
+            protocol_overrides={
+                "balance_width_normalization": (
+                    _BALANCE_WIDTH_NORMALIZATION
+                ),
+            },
+        )
+        new_balance_report = balance_strength_report(
+            compare_runs([
+                balance_a_path,
+                balance_new_base_path,
+            ])
+        )
+        assert not new_balance_report["confounded"]
+        assert not new_balance_report["width_varied"]
+
+        wide_balance_a_path = _write_analysis_run(
+            "balance_scale_wide_a",
+            "A",
+            1,
+            0.001,
+            10,
+            0.01 * 2.0 / 3.0,
+            val_loss=2.0,
+            k1=2,
+            k2=4,
+        )
+        compensated_balance = balance_strength_report(
+            compare_runs([
+                balance_a_path,
+                wide_balance_a_path,
+            ])
+        )
+        assert compensated_balance["width_varied"]
+        assert not compensated_balance["confounded"]
+        assert not compensated_balance["strength_varied"]
         assert (
             confound_factorial["effects"][1]["claim"]
             == "compute_confounded"
