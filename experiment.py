@@ -2421,7 +2421,13 @@ def parse_group_separator(text: str) -> bytes:
         char = text[index]
 
         if char != "\\":
-            result.extend(char.encode("utf-8"))
+            try:
+                result.extend(char.encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise ValueError(
+                    "分隔符包含无法编码为 UTF-8 的字符: "
+                    f"U+{ord(char):04X}"
+                ) from error
             index += 1
             continue
 
@@ -2450,7 +2456,15 @@ def parse_group_separator(text: str) -> bytes:
                 )
             codepoint = int(hex_part, 16)
             if escape == "u":
-                result.extend(chr(codepoint).encode("utf-8"))
+                try:
+                    result.extend(
+                        chr(codepoint).encode("utf-8")
+                    )
+                except UnicodeEncodeError as error:
+                    raise ValueError(
+                        "\\u 转义指向无法编码为 UTF-8 的"
+                        f"码点: U+{codepoint:04X}"
+                    ) from error
             else:
                 result.append(codepoint)
             index += 2 + digits
@@ -20646,7 +20660,14 @@ def run_self_test():
     )
     assert parse_group_separator("\\\\n") == b"\\n"
 
-    for invalid in ("", "\\", "\\x1", "\\q"):
+    for invalid in (
+        "",
+        "\\",
+        "\\x1",
+        "\\q",
+        "\\ud800",
+        "\ud800",
+    ):
         try:
             parse_group_separator(invalid)
         except ValueError:
