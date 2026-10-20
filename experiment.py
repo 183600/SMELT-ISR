@@ -17797,8 +17797,10 @@ def print_comparison_analysis(
     TOST 等价性检验，以及消融覆盖检查。
 
     ``ablation_modes`` 声明本轮消融必须覆盖的延迟合并方案
-    （--suite-ablation --ablation-modes）；为 None 时按运行
-    集中实际出现的方案推断。
+    （--suite-ablation --ablation-modes）；为 None 且运行集
+    涉及延迟合并时默认核对项目声明的全部方案（A、B）。
+    ``allow_partial_ablation`` 显式允许阶段性部分消融，但报告
+    仍记录 ``partial`` 与未覆盖方案，不会把部分覆盖说成完整。
 
     ``equivalence_margin`` 是相对基线均值的等价界比例
     （--equivalence-margin，默认 1%）：报告用 TOST 区分
@@ -17968,10 +17970,18 @@ def print_comparison_analysis(
     if not rows:
         print("  无运行目录可分析")
     elif not controlled["violations"]:
-        print(
-            f"  OK：{len(controlled['checked_keys'])} 项协议"
-            "在声明因子之外完全一致"
-        )
+        if controlled.get("unchecked_keys"):
+            print(
+                f"  已核对 {len(controlled['checked_keys'])} 项"
+                "协议；另有 "
+                f"{len(controlled['unchecked_keys'])} 项在所有"
+                "运行中都未记录，不能算作已控制"
+            )
+        else:
+            print(
+                f"  OK：{len(controlled['checked_keys'])} 项协议"
+                "在声明因子之外完全一致"
+            )
     else:
         for violation in controlled["violations"]:
             values_text = ", ".join(
