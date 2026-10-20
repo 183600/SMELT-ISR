@@ -15687,6 +15687,30 @@ def _tost_test(
     }
 
 
+def _hedges_g_correction(
+    df: object,
+) -> Optional[float]:
+    """
+    Hedges g 的小样本偏倚校正因子 J ≈ 1 - 3/(4·df - 1)。
+
+    Cohen's d（= |Δ|/合并标准差）在小样本下系统性高估真实效应：
+    每臂 3 个种子时偏倚约 13%，配对口径 df=2 时约 43%。校正后
+    的 g 是 d 的无偏近似，报告必须同时给两者，否则小种子数的
+    效应量会被当成真实效应大小。df 不可用或校正因子非正时
+    返回 None。
+    """
+    try:
+        df_value = float(df)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(df_value) or df_value <= 1.0:
+        return None
+    correction = 1.0 - 3.0 / (4.0 * df_value - 1.0)
+    if correction <= 0.0:
+        return None
+    return correction
+
+
 def _observed_seed_sd(
     contrast: Dict[str, object],
     se_value: float,
@@ -16842,6 +16866,17 @@ def factor_contrasts(
                 noise_ratio = abs(delta) / pooled_std
 
             test = _contrast_test(samples_a, samples_b)
+
+            # Hedges g：Cohen's d（噪声比）的小样本无偏近似。
+            # n=3 时 d 高估约 13%（配对口径约 43%），报告同时
+            # 给 g 才不会把小种子数的效应量当成真实效应大小。
+            hedges_correction = _hedges_g_correction(test.get("df"))
+            hedges_g = (
+                noise_ratio * hedges_correction
+                if noise_ratio is not None
+                and hedges_correction is not None
+                else None
+            )
             # 展示的样本数按独立种子口径（伪重复折叠后），
             # 与检验使用的 n/df 保持同一单位。
             independent_a = _collapse_seed_samples(samples_a)
@@ -16909,6 +16944,7 @@ def factor_contrasts(
                 "std_variant": std_b,
                 "delta": delta,
                 "delta_over_noise": noise_ratio,
+                "hedges_g": hedges_g,
                 "test": test.get("test"),
                 "t": test.get("t"),
                 "df": test.get("df"),
@@ -17792,6 +17828,11 @@ def _contrast_display(
         if noise is not None
         else ""
     )
+    # Hedges g：噪声比的小样本无偏近似。二者差距在 n=3 时可
+    # 达 43%，同时展示才不会把 d 当成真实效应大小。
+    hedges = contrast.get("hedges_g")
+    if noise is not None and hedges is not None:
+        noise_text += f"（Hedges g={float(hedges):.2f}）"
 
     ci_low = contrast.get("ci95_low")
     ci_high = contrast.get("ci95_high")
@@ -18135,6 +18176,32 @@ def compare_cells_to_baseline(
             significant,
         )
 
+        # 噪声比与 Hedges g：与单因子对比同口径（|Δ|/合并
+        # 标准差 + 小样本偏倚校正），--compare-baseline 的直接
+        # 对比同样要能读出「效应相对种子噪声有多大」。
+        std_reference = reference.get(f"{metric}_std")
+        std_current = aggregate.get(f"{metric}_std")
+        pooled_std = None
+        if isinstance(std_reference, (int, float)) and isinstance(
+            std_current, (int, float)
+        ):
+            pooled_std = math.sqrt(
+                (float(std_reference) ** 2 + float(std_current) ** 2)
+                / 2.0
+            )
+        noise_ratio = (
+            abs(delta) / pooled_std
+            if delta is not None and pooled_std
+            else None
+        )
+        hedges_correction = _hedges_g_correction(result.get("df"))
+        hedges_g = (
+            noise_ratio * hedges_correction
+            if noise_ratio is not None
+            and hedges_correction is not None
+            else None
+        )
+
         entry = {
             "factor": "mode",
             "baseline": reference["label"],
@@ -18146,7 +18213,8 @@ def compare_cells_to_baseline(
             "std_baseline": reference.get(f"{metric}_std"),
             "std_variant": aggregate.get(f"{metric}_std"),
             "delta": delta,
-            "delta_over_noise": None,
+            "delta_over_noise": noise_ratio,
+            "hedges_g": hedges_g,
             "test": result.get("test"),
             "t": result.get("t"),
             "df": result.get("df"),
@@ -28690,6 +28758,29 @@ def run_self_test():
             > _SIGNIFICANCE_LEVEL
         )
         assert "tost_p_value" in powered_contrast
+
+        # 效应量小样本偏倚：噪声比是 Cohen's d（|Δ|/合并标准差），
+        # 小样本下系统性高估真实效应，必须同时给 Hedges g =
+        # J·d（J = 1-3/(4·df-1)），且 |g| < |d|。
+        noise_ratio = powered_contrast["delta_over_noise"]
+        hedges = powered_contrast["hedges_g"]
+        assert noise_ratio is not None
+        assert hedges is not None
+        expected_correction = _hedges_g_correction(
+            powered_contrast["df"]
+        )
+        assert expected_correction is not None
+        assert 0.0 < expected_correction < 1.0
+        assert abs(
+            float(hedges) - float(noise_ratio) * expected_correction
+        ) < 1e-12
+        assert abs(float(hedges)) < abs(float(noise_ratio))
+        display_with_g = _contrast_display(
+            powered_contrast,
+            "val_loss",
+        )
+        assert "Hedges g=" in display_with_g
+
         assert "95%CI" in _contrast_display(
             powered_contrast,
             "val_loss",
