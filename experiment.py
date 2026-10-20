@@ -12400,8 +12400,21 @@ def _val_curve_points(
         loss = _finite_float(record.get("val_loss"))
         if step is None or step <= 0.0 or loss is None:
             continue
+        # 实际推进过优化器的步数才是有效训练计算量：非有限
+        # loss/梯度会跳过 optimizer.step，按 step 计算会虚增
+        # 便宜/昂贵臂的累计 FLOPs。旧记录没有该字段时退回
+        # step（并保留 note 说明口径）。
+        optimizer_steps = _finite_float(
+            record.get("optimizer_steps")
+        )
+        compute_steps = (
+            optimizer_steps
+            if optimizer_steps is not None
+            and optimizer_steps >= 0.0
+            else step
+        )
         cumulative = (
-            step
+            compute_steps
             * _TRAIN_FLOPS_MULTIPLIER
             * flops_per_forward
         )
@@ -12553,7 +12566,8 @@ def annotate_compute_matched_metrics(
     report["target_note"] = (
         "共同计算量 = 可比运行最后一个周期验证点累计训练 FLOPs "
         f"的最小值；训练 FLOPs≈{_TRAIN_FLOPS_MULTIPLIER:g}×"
-        "前向 FLOPs"
+        "前向 FLOPs；累计步数优先用 optimizer_steps（非有限"
+        "跳步不计入），旧记录退回训练 step"
     )
 
     for index, points in curves.items():
@@ -26876,6 +26890,27 @@ def run_self_test():
         for item in matched_report["runs"]
     )
 
+    # 非有限步跳过 optimizer.step：等计算量必须按有效更新数
+    # 累计，而不是按训练 step 虚增计算量。
+    with tempfile.TemporaryDirectory() as effective_dir:
+        effective_path = Path(effective_dir) / "metrics.jsonl"
+        write_jsonl_record(
+            effective_path,
+            {"step": 10, "optimizer_steps": 5, "val_loss": 5.0},
+        )
+        write_jsonl_record(
+            effective_path,
+            {"step": 20, "optimizer_steps": 10, "val_loss": 4.0},
+        )
+        effective_points = _val_curve_points(
+            Path(effective_dir),
+            100.0,
+        )
+        assert effective_points == [
+            (1500.0, 5.0),
+            (3000.0, 4.0),
+        ], effective_points
+
     # ---- 共同步数即时验证 loss（避开选型偏差） ----
     # final 是验证集最优 checkpoint 的指标，不能混入共同步数
     # 曲线；共同步数取两运行最后一个周期验证步的最小值，短臂
@@ -35864,6 +35899,12 @@ def main():
 
         pending_records.append({
             "step": step + 1,
+            # 截至本步累计真正推进优化器的次数：等计算量对比
+            # 用它而不是 step，避免把 NaN 跳步算成训练量。
+            "optimizer_steps": max(
+                0,
+                int(step + 1) - int(nonfinite_events),
+            ),
             "lr": current_lr,
             "grad_norm": (
                 grad_norm_value if finite_grad else None
