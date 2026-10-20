@@ -21161,11 +21161,21 @@ def run_self_test():
     # 文本完整性审计：无法 UTF-8 解码的字节（标签噪声来源）与
     # NUL 字节必须被检测到并给出警告。
     with tempfile.NamedTemporaryFile() as corrupt_file:
+        # 正文必须是逐位唯一的，否则固定短语的重复 8 字节窗口
+        # 会被重复内容扫描判定为跨 split 泄露，掩盖本用例要
+        # 验证的「损坏字节只触发标签噪声、不触发泄露门」。
+        corrupt_rng = random.Random(20241020)
+        corrupt_body = bytes(
+            corrupt_rng.choice(
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            )
+            for _ in range(1800)
+        )
         corrupt_file.write(
-            b"valid utf-8 text " * 30
+            corrupt_body[:600]
             + b"\xff\xfe"
             + b"\x00" * 4
-            + b"tail text " * 30
+            + corrupt_body[600:]
         )
         corrupt_file.flush()
 
