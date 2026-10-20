@@ -25124,6 +25124,26 @@ def run_self_test():
             )
             is None
         )
+        # 最终基线在开跑前只能提供计划配置：trained_steps /
+        # optimizer_steps / model_selection 是训练结果注入的
+        # 运行时字段，不能要求此时就知道，否则该功能永远
+        # 无法使用。
+        planned_protocol = {
+            key: value
+            for key, value in sampled_protocol.items()
+            if key not in _BASELINE_TUNING_RUNTIME_KEYS
+        }
+        assert (
+            baseline_tuning_provenance_error(
+                tuning_payload,
+                "dense",
+                1e-4,
+                100,
+                "deadbeef",
+                protocol=planned_protocol,
+            )
+            is None
+        )
         assert (
             baseline_tuning_provenance_error(
                 tuning_payload,
@@ -25727,6 +25747,21 @@ _DEFAULT_BASELINE_TUNING_LRS: Tuple[float, ...] = (
 # steps/batch/数据指纹不足以证明「受控变量」没被悄悄改掉。
 _BASELINE_TUNING_PROTOCOL_KEYS: Tuple[str, ...] = tuple(
     key for key in COMPARISON_PROTOCOL_KEYS if key != "lr"
+)
+
+# 调参来源核对时无法在训练前知道、由训练结果注入的协议项：
+# trained_steps / optimizer_steps 取决于早停与非有限事件，
+# model_selection 取决于 best.pt 是否存在；它们属于结果而非
+# 训练配置，不能要求最终基线在开跑前就与调参报告一致。
+_BASELINE_TUNING_RUNTIME_KEYS: Tuple[str, ...] = (
+    "trained_steps",
+    "optimizer_steps",
+    "model_selection",
+)
+_BASELINE_TUNING_PROVENANCE_KEYS: Tuple[str, ...] = tuple(
+    key
+    for key in _BASELINE_TUNING_PROTOCOL_KEYS
+    if key not in _BASELINE_TUNING_RUNTIME_KEYS
 )
 
 
@@ -26508,7 +26543,7 @@ def baseline_tuning_provenance_error(
     # 护身符。显式要求重新生成完整报告。
     missing_keys = [
         key
-        for key in _BASELINE_TUNING_PROTOCOL_KEYS
+        for key in _BASELINE_TUNING_PROVENANCE_KEYS
         if key not in config
         or (
             config.get(key) is None
@@ -26570,7 +26605,7 @@ def baseline_tuning_provenance_error(
     # grad_clip / val/test_fraction / group_separator /
     # eval_batches / amp_dtype 等任何一项不同都说明「最终基线」
     # 不是在调参时的受控条件下训练的。
-    for key in _BASELINE_TUNING_PROTOCOL_KEYS:
+    for key in _BASELINE_TUNING_PROVENANCE_KEYS:
         record_value = config.get(key)
         current_value = protocol.get(key)
         if _protocol_value_text(
