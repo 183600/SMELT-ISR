@@ -6021,12 +6021,17 @@ def _ngram_extended_metrics(
     alpha: float,
     order: int,
     split: str,
+    include_auc: bool = True,
 ) -> Dict[str, object]:
     """
     用调优好的 (order, alpha) 在固定窗口上计算与神经模型
     evaluate() 完全同口径的指标：loss / ppl / bits_per_byte、
     token accuracy（micro）、macro / weighted F1、多数类
     参考，以及 one-vs-rest 的 macro PR-AUC / ROC-AUC。
+
+    ``include_auc=False`` 时跳过 AUC（网格调参只需要
+    accuracy/F1 等分类指标时不收集整张概率矩阵，显著降低
+    候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
     """
     vocab_size = model.vocab_size
 
@@ -6039,24 +6044,29 @@ def _ngram_extended_metrics(
     )
 
     # 与神经模型评估同口径：按窗口总位置数分配收集缓冲
-    # （不超过上限），逐窗口写入。
-    auc_capacity = min(
-        _AUC_MAX_TOKENS,
-        sum(
-            int(window.size(0)) * (int(window.size(1)) - 1)
-            for window in windows
-        ),
-    )
-    auc_probs = torch.empty(
-        auc_capacity,
-        vocab_size,
-        dtype=torch.float32,
-    )
-    auc_targets = torch.empty(
-        auc_capacity,
-        dtype=torch.int64,
-    )
+    # （不超过上限），逐窗口写入。不做 AUC 时不分配缓冲区。
+    auc_capacity = 0
+    auc_probs = None
+    auc_targets = None
     auc_tokens = 0
+    if include_auc:
+        auc_capacity = min(
+            _AUC_MAX_TOKENS,
+            sum(
+                int(window.size(0))
+                * (int(window.size(1)) - 1)
+                for window in windows
+            ),
+        )
+        auc_probs = torch.empty(
+            auc_capacity,
+            vocab_size,
+            dtype=torch.float32,
+        )
+        auc_targets = torch.empty(
+            auc_capacity,
+            dtype=torch.int64,
+        )
 
     for window in windows:
         distributions = model.position_distributions(
@@ -6087,7 +6097,11 @@ def _ngram_extended_metrics(
             minlength=vocab_size ** 2,
         ).view(vocab_size, vocab_size).double()
 
-        if auc_tokens < _AUC_MAX_TOKENS:
+        if (
+            auc_probs is not None
+            and auc_targets is not None
+            and auc_tokens < _AUC_MAX_TOKENS
+        ):
             # 最后一个窗口可能超出封顶：按剩余上限截断，
             # 保证收集的 token 数严格不超过上限。
             remaining = _AUC_MAX_TOKENS - auc_tokens
@@ -6113,7 +6127,12 @@ def _ngram_extended_metrics(
     for key, value in class_metrics.items():
         metrics[f"{split}_{key}"] = value
 
-    if auc_tokens > 0:
+    if (
+        include_auc
+        and auc_tokens > 0
+        and auc_probs is not None
+        and auc_targets is not None
+    ):
         auc_metrics = macro_auc_metrics(
             auc_probs[:auc_tokens],
             auc_targets[:auc_tokens],
@@ -6123,6 +6142,36 @@ def _ngram_extended_metrics(
             metrics[f"{split}_{key}"] = value
 
     return metrics
+
+
+def resolve_ngram_tuning_metric(
+    args: argparse.Namespace,
+) -> Tuple[str, str]:
+    """
+    决定 n-gram 基线选择 (order, alpha) 的目标指标。
+
+    与简单神经基线同一纪律：预注册主指标优先于默认的
+    val_loss；显式 --ngram-tuning-metric 优先于两者。主指标
+    是路由诊断等 n-gram 无法计算的指标时回退到 val_loss 并
+    说明原因，而不是静默换口径。
+    """
+    explicit = getattr(args, "ngram_tuning_metric", None)
+    if explicit is not None:
+        return str(explicit), "explicit"
+
+    primary = getattr(args, "primary_metric", None)
+    if primary is not None:
+        if primary in _NGRAM_TUNING_METRIC_KEYS:
+            return str(primary), "primary_metric"
+        print(
+            "[ngram] 预注册主指标 "
+            f"{primary} 不是 n-gram 基线可计算的指标，"
+            "回退到 val_loss 选择 (order, alpha)；"
+            "如需按分类指标调参请显式传 "
+            "--ngram-tuning-metric"
+        )
+
+    return "val_loss", "default_loss"
 
 
 def run_statistical_baseline(
@@ -6151,6 +6200,9 @@ def run_statistical_baseline(
     )
 
     alpha_grid: List[float] = list(args.ngram_alpha_grid)
+    tuning_metric, tuning_metric_source = (
+        resolve_ngram_tuning_metric(args)
+    )
 
     print(
         "[ngram] 在 train split 上计数 "
@@ -6222,6 +6274,25 @@ def run_statistical_baseline(
     ]
 
     candidates: List[Dict[str, object]] = []
+    loss_like_metrics = (
+        "val_loss",
+        "val_ppl",
+        "val_bits_per_byte",
+    )
+    metric_higher_is_better = metric_higher_is_better(
+        tuning_metric
+    )
+    print(
+        "[ngram] (order, alpha) 的选择指标: "
+        f"{tuning_metric}"
+        f"（来源={tuning_metric_source}，"
+        + (
+            "越高越好"
+            if metric_higher_is_better
+            else "越低越好"
+        )
+        + "；test 集不参与）"
+    )
 
     for alpha in alpha_grid:
         # log_probs 是 float64（见 _interpolate_log_probs）；累加器
@@ -6260,32 +6331,92 @@ def run_statistical_baseline(
                 "val_bits_per_byte": val_loss
                 / math.log(2.0),
                 "tokens_evaluated": tokens,
+                "tuning_metric": tuning_metric,
             }
+
+            if tuning_metric not in loss_like_metrics:
+                # 分类/AUC 指标必须看完整的 argmax/概率分布：
+                # 在 val_loss 上选出的 (order, alpha) 不能证明
+                # 它在 macro F1 / PR-AUC 上也最优。
+                candidate_metrics = _ngram_extended_metrics(
+                    model,
+                    val_windows,
+                    alpha,
+                    order,
+                    split="val",
+                    include_auc=tuning_metric
+                    in ("val_pr_auc_macro", "val_roc_auc_macro"),
+                )
+                for key in (
+                    "val_loss",
+                    "val_ppl",
+                    "val_bits_per_byte",
+                ):
+                    if key in candidate_metrics:
+                        record[key] = candidate_metrics[key]
+                value = candidate_metrics.get(tuning_metric)
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                ):
+                    record[tuning_metric] = float(value)
+
+            record["tuning_value"] = record.get(tuning_metric)
             _write(record)
             candidates.append(record)
+
+        def _display_value(row: Dict[str, object]) -> str:
+            value = row.get(tuning_metric)
+            if not (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            ):
+                return "NA"
+            return f"{float(value):.4f}"
 
         print(
             "[ngram] alpha="
             f"{alpha:g}: "
             + ", ".join(
                 f"order {row['order']}="
-                f"{row['val_loss']:.4f}"
+                + _display_value(row)
                 for row in candidates[
                     -model.max_order:
                 ]
             )
+            + f" ({tuning_metric})"
         )
 
     # val 上选最优；并列时偏向更小的阶数与更小的 alpha
     # （简单优先，避免在验证集上过拟合出复杂配置）。
-    best = min(
-        candidates,
-        key=lambda row: (
-            row["val_loss"],
+    def _candidate_rank(row: Dict[str, object]):
+        value = row.get(tuning_metric)
+        if not (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            return (1, 0.0, row["order"], row["alpha"])
+        value = float(value)
+        return (
+            0,
+            -value if metric_higher_is_better else value,
             row["order"],
             row["alpha"],
-        ),
-    )
+        )
+
+    valid_candidates = [
+        row for row in candidates if _candidate_rank(row)[0] == 0
+    ]
+    if not valid_candidates:
+        raise SystemExit(
+            f"n-gram 调参没有任何候选提供可用的 {tuning_metric}："
+            "无法按当前指标选出 (order, alpha)；请检查指标"
+            "是否适用于该评估集，或显式改用 val_loss"
+        )
+    best = min(candidates, key=_candidate_rank)
 
     best_order = int(best["order"])
     best_alpha = float(best["alpha"])
@@ -6293,6 +6424,8 @@ def run_statistical_baseline(
     print(
         "[ngram] val 调优结果: order="
         f"{best_order}, alpha={best_alpha:g}, "
+        f"{tuning_metric}="
+        f"{float(best[tuning_metric]):.4f}, "
         f"val_loss={best['val_loss']:.4f}"
     )
 
@@ -6311,6 +6444,8 @@ def run_statistical_baseline(
         "ngram_order": best_order,
         "ngram_alpha": best_alpha,
         "ngram_max_order": args.ngram_max_order,
+        "ngram_tuning_metric": tuning_metric,
+        "ngram_tuning_metric_source": tuning_metric_source,
         **final_metrics,
     }
 
@@ -6397,6 +6532,7 @@ def run_statistical_baseline(
                 "model": "ngram",
                 "ngram_order": best_order,
                 "ngram_alpha": best_alpha,
+                "ngram_tuning_metric": tuning_metric,
                 **test_metrics,
                 "data_audit": test_audit,
             })
@@ -6423,6 +6559,10 @@ def run_statistical_baseline(
             "ngram_alpha_grid": alpha_grid,
             "ngram_order": best_order,
             "ngram_alpha": best_alpha,
+            "ngram_tuning_metric": tuning_metric,
+            "ngram_tuning_metric_source": (
+                tuning_metric_source
+            ),
         },
         # 统计基线没有优化器与训练轮数；comparison_family 让
         # 受控变量检查只在神经网络运行之间进行。
@@ -10247,6 +10387,9 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         run_config = config_payload.get("config") or {}
         if isinstance(run_config, dict):
             row["mode"] = run_config.get("mode")
+            row["ngram_tuning_metric"] = run_config.get(
+                "ngram_tuning_metric"
+            )
             row["top_k"] = run_config.get("top_k")
             row["k1"] = run_config.get("k1")
             row["k2"] = run_config.get("k2")
@@ -10915,6 +11058,14 @@ _BASELINE_TUNING_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
     if key not in _ROUTING_ROW_FIELDS
+)
+
+# n-gram 基线没有训练曲线，无法定义「等训练计算量」loss；
+# 其余与简单神经基线共用同一组口径。
+_NGRAM_TUNING_METRIC_KEYS = tuple(
+    key
+    for key in _BASELINE_TUNING_METRIC_KEYS
+    if key != "val_loss_at_matched_flops"
 )
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
@@ -15074,6 +15225,7 @@ def baseline_adequacy(
         "ngram_missing": False,
         "ngram_protocol_compatible": None,
         "ngram_protocol_violations": [],
+        "ngram_tuning_metric_mismatch": [],
         "tuning_parity": None,
         "ok": None,
     }
@@ -15213,6 +15365,41 @@ def baseline_adequacy(
         and not isinstance(row.get(metric), bool)
         and math.isfinite(float(row[metric]))
     ]
+
+    def _ngram_tuning_metric_of(
+        row: Dict[str, object],
+    ) -> str:
+        # 旧版统计基线只在 val_loss 上选 (order, alpha)，
+        # 没有记录时按这一历史口径处理，不虚报为已按当前
+        # 指标调强。
+        value = row.get("ngram_tuning_metric")
+        return str(value) if isinstance(value, str) else "val_loss"
+
+    ngram_metric_mismatches = []
+    for row in ngram_rows:
+        ngram_metric = _ngram_tuning_metric_of(row)
+        if ngram_metric != metric:
+            ngram_metric_mismatches.append({
+                "run": row.get("run"),
+                "tuning_metric": ngram_metric,
+                "comparison_metric": metric,
+            })
+    if ngram_metric_mismatches:
+        report["ngram_tuning_metric_mismatch"] = (
+            ngram_metric_mismatches
+        )
+        details = "; ".join(
+            f"{item['run']}（调参口径={item['tuning_metric']}）"
+            for item in ngram_metric_mismatches
+        )
+        report["advisories"].append(
+            "n-gram 基线的 (order, alpha) 不是在当前判定口径"
+            f"{metric} 上选出的（{details}）："
+            "它在该指标上不能被称为「调优好的简单基线」；"
+            "请用 --ngram-tuning-metric "
+            f"{metric} --statistical-baseline 重跑"
+        )
+
     baseline_better_than_ngram: Optional[bool] = None
     # ngram 与神经运行必须使用同一份数据、同一组评估窗口，
     # 否则「基线强于 ngram」把数据差异误当成方法差异。
@@ -15262,15 +15449,26 @@ def baseline_adequacy(
             else baseline_mean < float(ngram_mean)
         )
         baseline_better_than_ngram = baseline_better
+        ngram_label = (
+            "调优好的 n-gram"
+            if not ngram_metric_mismatches
+            else "n-gram 统计基线"
+        )
         if baseline_better:
             report["advisories"].append(
                 f"基线 {baseline_mode}（{baseline_mean:.4f}）"
-                f"优于调优好的 n-gram（{float(ngram_mean):.4f}）"
+                f"优于{ngram_label}（{float(ngram_mean):.4f}）"
                 "：这是一个值得战胜的基线"
+                + (
+                    ""
+                    if not ngram_metric_mismatches
+                    else "（注意：该 n-gram 未在当前口径上调参，"
+                    "此比较只说明它不构成更强的简单基线）"
+                )
             )
         else:
             report["straw_man"].append(
-                f"调优好的字节级 n-gram 统计基线在 {metric} 上"
+                f"{ngram_label}在 {metric} 上"
                 f"（{float(ngram_mean):.4f}）已不劣于所选基线 "
                 f"{baseline_mode}（{baseline_mean:.4f}）：先对基线"
                 "充分调参（学习率/模型宽度/训练步数），再比较"
@@ -15283,7 +15481,9 @@ def baseline_adequacy(
     #    baseline_tuning 字段；统计基线（ngram）自身就在 val 上
     #    做过 阶数 × 平滑系数 网格调优，不做此检查。
     if baseline_mode == "ngram":
-        report["tuned"] = True
+        # 只有 (order, alpha) 确实按当前对比指标选出时，才能
+        # 把统计基线当作「在当前口径上调过参」的证据。
+        report["tuned"] = not ngram_metric_mismatches
     else:
         tuning_evidence = False
         for row in baseline_rows:
@@ -22276,6 +22476,7 @@ def run_self_test():
             curve_status: Optional[str] = None,
             n_params: Optional[int] = None,
             flops: Optional[int] = None,
+            ngram_tuning_metric: Optional[str] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -22326,6 +22527,7 @@ def run_self_test():
                     "expert_hidden": protocol.get("expert_hidden"),
                     "seq_len": 8,
                     "d_model": 16,
+                    "ngram_tuning_metric": ngram_tuning_metric,
                 },
                 "args": {
                     "seed": seed,
@@ -25335,6 +25537,89 @@ def run_self_test():
             for issue in tuning_report["issues"]
         )
 
+        # n-gram 的 (order, alpha) 也必须按当前判定口径选择：
+        # 在 val_loss 上调好的统计基线不能证明 PR-AUC 也被调强。
+        resolved_ngram_metric = resolve_ngram_tuning_metric(
+            argparse.Namespace(
+                ngram_tuning_metric=None,
+                primary_metric="val_macro_f1",
+            )
+        )
+        assert resolved_ngram_metric == (
+            "val_macro_f1",
+            "primary_metric",
+        )
+        explicit_ngram_metric = resolve_ngram_tuning_metric(
+            argparse.Namespace(
+                ngram_tuning_metric="val_pr_auc_macro",
+                primary_metric="val_macro_f1",
+            )
+        )
+        assert explicit_ngram_metric == (
+            "val_pr_auc_macro",
+            "explicit",
+        )
+        fallback_ngram_metric = resolve_ngram_tuning_metric(
+            argparse.Namespace(
+                ngram_tuning_metric=None,
+                primary_metric="routing_jaccard_branch",
+            )
+        )
+        assert fallback_ngram_metric == (
+            "val_loss",
+            "default_loss",
+        )
+
+        ngram_mismatch_path = _write_analysis_run(
+            "ngram_loss_tuned_seed1",
+            "ngram",
+            1,
+            3e-4,
+            100,
+            0.0,
+            4.50,
+            reference=auc_reference,
+            pr_auc=0.02,
+            pr_auc_chance=0.001,
+            ngram_tuning_metric="val_loss",
+        )
+        ngram_mismatch_adequacy = baseline_adequacy(
+            compare_runs([ngram_mismatch_path]),
+            "ngram",
+            "val_pr_auc_macro",
+        )
+        assert ngram_mismatch_adequacy["tuned"] is False
+        assert ngram_mismatch_adequacy[
+            "ngram_tuning_metric_mismatch"
+        ]
+        assert any(
+            "ngram-tuning-metric" in message
+            for message in ngram_mismatch_adequacy["advisories"]
+        )
+
+        ngram_aligned_path = _write_analysis_run(
+            "ngram_pr_tuned_seed1",
+            "ngram",
+            1,
+            3e-4,
+            100,
+            0.0,
+            4.50,
+            reference=auc_reference,
+            pr_auc=0.02,
+            pr_auc_chance=0.001,
+            ngram_tuning_metric="val_pr_auc_macro",
+        )
+        ngram_aligned_adequacy = baseline_adequacy(
+            compare_runs([ngram_aligned_path]),
+            "ngram",
+            "val_pr_auc_macro",
+        )
+        assert ngram_aligned_adequacy["tuned"] is True
+        assert not ngram_aligned_adequacy[
+            "ngram_tuning_metric_mismatch"
+        ]
+
         # 调参报告落盘 → 读回 → 来源核对：模式 / winner lr /
         # steps / 数据指纹 / 完整训练协议任一不一致都必须拒绝。
         tuning_source = write_baseline_tuning_report(
@@ -27304,6 +27589,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ngram-tuning-metric",
+        type=str,
+        default=None,
+        choices=_NGRAM_TUNING_METRIC_KEYS,
+        metavar="METRIC",
+        help=(
+            "n-gram 基线选择 (order, alpha) 的 val 指标；"
+            "缺省时优先跟随 --primary-metric，否则用 val_loss。"
+            "在 val_loss 上调好的统计基线不能证明它在 macro "
+            "F1 / PR-AUC 上也已调强"
+        ),
+    )
+    parser.add_argument(
         "--hypothesis",
         type=str,
         default="",
@@ -27950,6 +28248,15 @@ def main():
     if not args.ngram_alpha_grid:
         parser.error(
             "--ngram-alpha-grid 至少需要一个候选值"
+        )
+    if (
+        args.ngram_tuning_metric is not None
+        and not args.statistical_baseline
+    ):
+        parser.error(
+            "--ngram-tuning-metric 只适用于 "
+            "--statistical-baseline：神经模型的调参口径请用 "
+            "--baseline-tuning-metric / --primary-metric"
         )
 
     # 对比因子与对比指标必须显式合法，避免拼写错误静默
