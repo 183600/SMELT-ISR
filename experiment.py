@@ -323,6 +323,24 @@ def set_seed(
     torch.backends.cudnn.benchmark = False
 
 
+def configure_cuda_precision(allow_tf32: bool = False) -> None:
+    """
+    配置 CUDA 的 fp32 矩阵乘精度。
+
+    TF32 用 10 位尾数代替 fp32 的 23 位尾数，能加速 Ampere 及
+    更新架构上的矩阵乘，但会改变数值结果，且不同 GPU 架构 /
+    cuBLAS 版本的 TF32 实现不完全一致。默认关闭（完整 fp32），
+    需要吞吐量时用 --allow-tf32 显式开启；两种状态都会写入
+    run_metadata 的 allow_tf32_matmul / allow_tf32_cudnn，供
+    --compare 的复现性来源检查核对。
+
+    CPU 或 MPS 路径同样可以安全调用：这两个后端标志始终存在，
+    只是不生效。
+    """
+    torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+    torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+
+
 def pythonhashseed_error(
     require_pythonhashseed: bool,
 ) -> Optional[str]:
@@ -12518,6 +12536,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 改写反传/内核路径，跨运行对比时应完全一致。
     "amp_dtype",
     "device_type",
+    "allow_tf32",
     "grad_checkpoint",
     "compile",
     "seq_len",
@@ -12934,6 +12953,9 @@ def build_comparison_protocol(
         "device_type": _device_type_of(
             getattr(args, "device", None)
         ),
+        "allow_tf32": bool(
+            getattr(args, "allow_tf32", False)
+        ),
         "grad_checkpoint": bool(
             getattr(args, "grad_checkpoint", False)
         ),
@@ -12998,6 +13020,7 @@ def experiment_protocol_from_payload(
     cfg = payload.get("config") or {}
     run_args = payload.get("args") or {}
     data = payload.get("data") or {}
+    run_metadata = payload.get("run_metadata") or {}
 
     if not isinstance(cfg, dict):
         cfg = {}
@@ -13005,6 +13028,8 @@ def experiment_protocol_from_payload(
         run_args = {}
     if not isinstance(data, dict):
         data = {}
+    if not isinstance(run_metadata, dict):
+        run_metadata = {}
 
     def _pick(*values):
         for value in values:
@@ -13058,6 +13083,23 @@ def experiment_protocol_from_payload(
         ),
         "amp_dtype": run_args.get("amp_dtype"),
         "device_type": _device_type_of(run_args.get("device")),
+        # 旧运行的 args 没有 allow_tf32；run_metadata 里记录了
+        # 当时实际生效的 matmul/cudnn TF32 状态。两者一致时才
+        # 能唯一回填，否则留 None 由检查器标记缺记录。
+        "allow_tf32": (
+            run_args.get("allow_tf32")
+            if run_args.get("allow_tf32") is not None
+            else (
+                bool(run_metadata.get("allow_tf32_matmul"))
+                if (
+                    run_metadata.get("allow_tf32_matmul")
+                    == run_metadata.get("allow_tf32_cudnn")
+                    and run_metadata.get("allow_tf32_matmul")
+                    is not None
+                )
+                else None
+            )
+        ),
         "grad_checkpoint": (
             run_args.get("grad_checkpoint")
             if has_training
@@ -20584,6 +20626,85 @@ def run_sanity_overfit(
             torch.cuda.empty_cache()
 
 
+_SANITY_REPEAT_KEYS: Tuple[str, ...] = (
+    "initial_lm_loss",
+    "final_lm_loss",
+    "final_token_accuracy",
+    "loss_reduction",
+    "learned",
+    "gradient_flow_ok",
+)
+
+
+def sanity_repeat_report(
+    reports: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    核对同一配置 / 同一种子的多次 sanity 运行是否逐位一致。
+
+    固定种子只说明「随机流的起点相同」；若数据采样、模型
+    初始化或反传路径仍然依赖未固定的全局状态、非确定性
+    算子或异步执行顺序，第二次训练就会偏离。这里以第一次
+    运行为基准，逐项比较初始/最终损失、准确率、相对下降与
+    梯度探针的范数；任何差异都视为可复现性问题，正式训练
+    不应在缺少解释的情况下开始。
+
+    只比较确定性检查关心的标量，不比较路径/时间等元数据。
+    """
+    if not reports:
+        return {
+            "repeats": 0,
+            "identical": None,
+            "mismatches": [],
+        }
+
+    first = reports[0]
+    mismatches: List[Dict[str, object]] = []
+
+    for repeat_index, report in enumerate(
+        reports[1:],
+        start=2,
+    ):
+        for key in _SANITY_REPEAT_KEYS:
+            first_value = first.get(key)
+            repeat_value = report.get(key)
+            if first_value != repeat_value:
+                mismatches.append({
+                    "repeat": repeat_index,
+                    "key": key,
+                    "first": first_value,
+                    "repeat": repeat_value,
+                })
+
+        first_probe = first.get("grad_probe")
+        repeat_probe = report.get("grad_probe")
+        first_norm = (
+            first_probe.get("grad_norm")
+            if isinstance(first_probe, dict)
+            else None
+        )
+        repeat_norm = (
+            repeat_probe.get("grad_norm")
+            if isinstance(repeat_probe, dict)
+            else None
+        )
+        if first_norm != repeat_norm:
+            mismatches.append({
+                "repeat": repeat_index,
+                "key": "grad_probe.grad_norm",
+                "first": first_norm,
+                "repeat": repeat_norm,
+            })
+
+    return {
+        "repeats": len(reports),
+        "identical": (
+            None if len(reports) < 2 else not mismatches
+        ),
+        "mismatches": mismatches,
+    }
+
+
 # ============================================================
 # Experiment tracking
 # ============================================================
@@ -20629,6 +20750,24 @@ def _script_sha256() -> Optional[str]:
     return hashlib.sha256(source).hexdigest()
 
 
+def _cpu_model_name() -> Optional[str]:
+    """
+    读取 CPU 型号，供跨机器复现时核对硬件差异。
+
+    优先解析 Linux 的 /proc/cpuinfo；其他平台回退到
+    platform.processor()/machine()。读取失败不影响实验。
+    """
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    return platform.processor() or platform.machine() or None
+
+
 def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     """
     收集本轮实验的代码版本与运行环境信息，写入 config.json，
@@ -20655,9 +20794,19 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             git_diff_sha256 = _sha256_text(diff)
 
     device_name = None
+    cuda_capability = None
+    cuda_total_memory_mb = None
     if device.type == "cuda" and torch.cuda.is_available():
         try:
+            properties = torch.cuda.get_device_properties(device)
             device_name = torch.cuda.get_device_name(device)
+            cuda_capability = (
+                f"{properties.major}.{properties.minor}"
+            )
+            cuda_total_memory_mb = round(
+                float(properties.total_memory) / (1024 ** 2),
+                1,
+            )
         except (AssertionError, RuntimeError, ValueError):
             device_name = None
 
@@ -20670,6 +20819,9 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
+        "torch_git_version": getattr(
+            torch.version, "git_version", None
+        ),
         "numpy_version": (
             getattr(np, "__version__", None)
             if np is not None
@@ -20684,6 +20836,10 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             else 0
         ),
         "device_name": device_name,
+        "cuda_capability": cuda_capability,
+        "cuda_total_memory_mb": cuda_total_memory_mb,
+        "cpu_model": _cpu_model_name(),
+        "cpu_count": os.cpu_count(),
         "git_commit": commit,
         "git_dirty": git_dirty,
         "git_diff_sha256": git_diff_sha256,
@@ -20705,6 +20861,11 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         ),
         "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
         "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "float32_matmul_precision": (
+            torch.get_float32_matmul_precision()
+            if hasattr(torch, "get_float32_matmul_precision")
+            else None
+        ),
         # CPU 并行归约顺序可能随线程数变化；即使未显式固定，
         # 也要记录当时实际生效的线程环境，供复现/对比追溯。
         "torch_num_threads": torch.get_num_threads(),
@@ -23832,6 +23993,21 @@ def run_self_test():
     set_seed(11, strict_determinism=False)
     assert torch.is_deterministic_algorithms_warn_only_enabled()
 
+    # TF32 默认必须关闭；显式配置能真正切换两个后端标志，并
+    # 在测试结束后恢复原状态（自测不能污染后续运行的数值环境）。
+    saved_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
+    saved_tf32_cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        configure_cuda_precision(False)
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        configure_cuda_precision(True)
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        assert torch.backends.cudnn.allow_tf32 is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved_tf32_matmul
+        torch.backends.cudnn.allow_tf32 = saved_tf32_cudnn
+
     # sanity check 必须能在小批量上过拟合，且结束后恢复调用前的
     # RNG 状态（不影响主训练轨迹）。启用 grad_checkpoint 跑通
     # 检查：主训练带 --grad-checkpoint 时，sanity check 必须
@@ -23911,6 +24087,29 @@ def run_self_test():
         repeated_metrics["grad_probe"]["grad_norm"]
         == grad_probe["grad_norm"]
     )
+
+    # 重复运行报告必须能识别真正的一致/不一致，而不是恒真。
+    same_repeat = sanity_repeat_report([
+        sanity_metrics,
+        repeated_metrics,
+    ])
+    assert same_repeat["identical"] is True, same_repeat
+    assert same_repeat["repeats"] == 2
+    mismatched = dict(repeated_metrics)
+    mismatched["final_lm_loss"] = (
+        float(repeated_metrics["final_lm_loss"]) + 1.0
+    )
+    changed_repeat = sanity_repeat_report([
+        sanity_metrics,
+        mismatched,
+    ])
+    assert changed_repeat["identical"] is False
+    assert any(
+        item["key"] == "final_lm_loss"
+        for item in changed_repeat["mismatches"]
+    )
+    # 只运行一次时没有复现性证据，必须是 None 而不是虚报 True。
+    assert sanity_repeat_report([sanity_metrics])["identical"] is None
 
     # 人为破坏梯度（非专家参数 grad 置 None）时探针必须报错，
     # 确认梯度检查不是恒真。
@@ -23992,6 +24191,11 @@ def run_self_test():
     assert "torch_version" in metadata
     assert "deterministic_algorithms" in metadata
     assert "deterministic_algorithms_warn_only" in metadata
+    assert "allow_tf32_matmul" in metadata
+    assert "allow_tf32_cudnn" in metadata
+    assert "float32_matmul_precision" in metadata
+    assert metadata["cpu_model"]
+    assert metadata["cpu_count"] is None or metadata["cpu_count"] > 0
     assert metadata["torch_num_threads"] == torch.get_num_threads()
     assert (
         metadata["torch_num_interop_threads"]
@@ -30990,9 +31194,33 @@ def main():
             "实际生效值写入 config.json 的 run_metadata"
         ),
     )
+    parser.add_argument(
+        "--allow-tf32",
+        action="store_true",
+        help=(
+            "允许 CUDA fp32 矩阵乘使用 TF32（默认关闭）。"
+            "TF32 只保留 10 位尾数，会改变数值结果，且不同 "
+            "GPU 架构上的实现不完全一致；关闭时使用完整 fp32，"
+            "同一台机器上的同种子结果更稳定。开启状态会写入 "
+            "run_metadata 并参与 --compare 的复现性核对"
+        ),
+    )
     parser.add_argument("--sanity-batch-size", type=int, default=4)
     parser.add_argument("--sanity-steps", type=int, default=300)
     parser.add_argument("--sanity-lr", type=float, default=3e-3)
+    parser.add_argument(
+        "--sanity-repeats",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "sanity check 的重复运行次数（默认 2）：第一次通过后"
+            "再用完全相同的模型/批次/种子训练一次，要求初始与"
+            "最终损失、准确率和梯度范数逐位一致，作为「同一台"
+            "机器上同种子可复现」的运行时证据；不一致会拒绝"
+            "开始全量训练。设为 1 可关闭重复校验"
+        ),
+    )
     parser.add_argument(
         "--sanity-loss-threshold",
         type=float,
@@ -31093,6 +31321,8 @@ def main():
         parser.error("--sanity-batch-size 必须为正整数")
     if args.sanity_steps <= 0:
         parser.error("--sanity-steps 必须为正整数")
+    if args.sanity_repeats <= 0:
+        parser.error("--sanity-repeats 必须为正整数")
     if not math.isfinite(args.sanity_lr) or args.sanity_lr <= 0:
         parser.error("--sanity-lr 必须是有限正数")
     if (
@@ -31461,9 +31691,9 @@ def main():
             "请改用 --device cpu 或在带 GPU 的环境运行"
         )
 
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # TF32 默认关闭：它改变 fp32 矩阵乘的有效精度，跨 GPU
+    # 架构的可复现性也最差。需要吞吐量时显式 --allow-tf32。
+    configure_cuda_precision(args.allow_tf32)
 
     # AMP dtype 由设备与硬件能力决定：bf16 无需 GradScaler，
     # fp16 需要梯度缩放。在 sanity check 与主训练之前统一确定。
@@ -31860,6 +32090,79 @@ def main():
                 "(选型/早停必须与存档口径一致)"
             )
             args.selection_metric = saved_selection_metric
+
+        # 数值/实现环境必须随检查点恢复，而不是沿用当前命令行：
+        # TF32、CPU 线程数、activation checkpointing 与 compile
+        # 都会改变浮点归约或反传路径，续跑时换掉它们会让前后
+        # 两段训练不再属于同一条可复现轨迹。
+        saved_allow_tf32 = saved_args.get("allow_tf32")
+        if (
+            isinstance(saved_allow_tf32, bool)
+            and saved_allow_tf32 != args.allow_tf32
+        ):
+            print(
+                "resume restored allow_tf32 "
+                f"{args.allow_tf32} -> {saved_allow_tf32} "
+                "(数值精度是训练轨迹的一部分)"
+            )
+            args.allow_tf32 = saved_allow_tf32
+
+        saved_threads = saved_args.get("torch_threads")
+        if (
+            saved_threads is not None
+            and saved_threads != args.torch_threads
+        ):
+            try:
+                configure_cpu_threads(saved_threads)
+            except (RuntimeError, ValueError) as error:
+                parser.error(
+                    "resume 无法恢复检查点中的 CPU 线程数 "
+                    f"{saved_threads!r}: {error}"
+                )
+            print(
+                "resume restored torch_threads "
+                f"{args.torch_threads} -> {saved_threads} "
+                "(CPU 归约顺序是训练轨迹的一部分)"
+            )
+            args.torch_threads = saved_threads
+        elif (
+            saved_threads is None
+            and args.torch_threads is not None
+        ):
+            print(
+                "[repro] [warn] 检查点未固定 CPU 线程数，本次"
+                f"续跑显式固定为 {args.torch_threads}：原运行的"
+                "归约顺序可能不同，严格复现请用全新目录从头"
+                "训练。"
+            )
+
+        for key in ("grad_checkpoint", "compile"):
+            saved_value = saved_args.get(key)
+            if (
+                isinstance(saved_value, bool)
+                and saved_value != getattr(args, key)
+            ):
+                print(
+                    f"resume restored {key} "
+                    f"{getattr(args, key)} -> {saved_value} "
+                    "(实现路径是训练轨迹的一部分)"
+                )
+                setattr(args, key, saved_value)
+
+        saved_strict = saved_args.get("strict_determinism")
+        if (
+            isinstance(saved_strict, bool)
+            and saved_strict != args.strict_determinism
+        ):
+            print(
+                "resume restored strict_determinism "
+                f"{args.strict_determinism} -> {saved_strict} "
+                "(确定性检查口径必须与存档一致)"
+            )
+            args.strict_determinism = saved_strict
+
+        # 恢复后的 TF32 状态可能来自检查点，重新应用。
+        configure_cuda_precision(args.allow_tf32)
 
     # 选型指标解析：默认 val_loss；预注册主指标且周期验证能算
     # 时跟随主指标（假设按什么判定，checkpoint 就按什么选）。
@@ -32262,6 +32565,7 @@ def main():
             f"batch_size={args.sanity_batch_size}, "
             f"steps={args.sanity_steps}, "
             f"lr={args.sanity_lr}, "
+            f"repeats={args.sanity_repeats}, "
             f"grad_checkpoint={args.grad_checkpoint}, "
             f"loss<={args.sanity_loss_threshold} "
             f"或 acc>={args.sanity_acc_threshold}, "
@@ -32269,23 +32573,69 @@ def main():
             f">={args.sanity_min_loss_reduction:.1%}"
         )
 
-        sanity_result = run_sanity_overfit(
-            cfg,
-            dataset,
-            device,
-            amp_dtype=amp_dtype,
-            batch_size=args.sanity_batch_size,
-            steps=args.sanity_steps,
-            lr=args.sanity_lr,
-            loss_threshold=args.sanity_loss_threshold,
-            acc_threshold=args.sanity_acc_threshold,
-            min_relative_improvement=(
-                args.sanity_min_loss_reduction
-            ),
-            seed=args.seed,
-            grad_checkpoint=args.grad_checkpoint,
-            strict_determinism=args.strict_determinism,
-        )
+        sanity_reports: List[Dict[str, object]] = []
+
+        for repeat_index in range(args.sanity_repeats):
+            if repeat_index > 0:
+                print(
+                    "[sanity] 复现性重复 "
+                    f"{repeat_index + 1}/{args.sanity_repeats}"
+                    "（同模型、同批次、同种子）"
+                )
+
+            repeated_result = run_sanity_overfit(
+                cfg,
+                dataset,
+                device,
+                amp_dtype=amp_dtype,
+                batch_size=args.sanity_batch_size,
+                steps=args.sanity_steps,
+                lr=args.sanity_lr,
+                loss_threshold=args.sanity_loss_threshold,
+                acc_threshold=args.sanity_acc_threshold,
+                min_relative_improvement=(
+                    args.sanity_min_loss_reduction
+                ),
+                seed=args.seed,
+                grad_checkpoint=args.grad_checkpoint,
+                strict_determinism=args.strict_determinism,
+            )
+            sanity_reports.append(repeated_result)
+
+            # 第一次就没通过时先报告学习/梯度问题，不必浪费
+            # 时间重复一个已经失败的配置。
+            if not repeated_result["passed"]:
+                break
+
+        sanity_result = sanity_reports[0]
+        reproducibility = sanity_repeat_report(sanity_reports)
+        sanity_result["reproducibility"] = reproducibility
+
+        if reproducibility["identical"] is False:
+            sanity_result["passed"] = False
+            print(
+                "[sanity] FAILED: 同一配置 / 同一种子的重复运行"
+                "结果不一致（同一台机器上不可复现）。差异项："
+            )
+            for mismatch in reproducibility["mismatches"]:
+                print(
+                    f"  - repeat {mismatch['repeat']} "
+                    f"{mismatch['key']}: "
+                    f"{mismatch['first']!r} != "
+                    f"{mismatch['repeat']!r}"
+                )
+            print(
+                "这通常意味着仍有未固定的随机源、非确定性算子"
+                "（可加 --strict-determinism 定位）、异步执行"
+                "顺序或 CUDA 精度设置差异；在解释清楚之前不要"
+                "开始全量训练。"
+            )
+        elif reproducibility["identical"] is True:
+            print(
+                "[sanity] 复现性检查通过："
+                f"{reproducibility['repeats']} 次同种子运行"
+                "的初始/最终损失、准确率与梯度范数逐位一致"
+            )
 
         sanity_record = {
             "step": "sanity",
@@ -32300,7 +32650,7 @@ def main():
                 f"token_acc="
                 f"{sanity_result['final_token_accuracy']:.4f}"
             )
-        else:
+        elif reproducibility["identical"] is not False:
             print(
                 "[sanity] FAILED: 模型未能在小批量上过拟合 "
                 f"(initial lm_loss="
