@@ -4434,6 +4434,37 @@ def audit_data_splits(
                 "评估集规模/统计功效可能与预期不符"
             )
 
+    # test 在训练期间保持尘封：这里只根据切分边界核对它的
+    # 实际占比，不读取任何 test 内容。这样吸附导致的测试集
+    # 缩水在训练前就能被发现。
+    nominal_by_split = {
+        "train": (
+            1.0
+            - dataset.val_fraction
+            - dataset.test_fraction
+        ),
+        "val": dataset.val_fraction,
+        "test": dataset.test_fraction,
+    }
+    for split, actual_fraction in (
+        dataset.split_fractions.items()
+    ):
+        if split in splits_report:
+            continue
+        nominal_fraction = nominal_by_split[split]
+        if nominal_fraction > 0.0 and abs(
+            actual_fraction - nominal_fraction
+        ) > max(
+            _AUDIT_SPLIT_FRACTION_MIN_ABS,
+            _AUDIT_SPLIT_FRACTION_DRIFT * nominal_fraction,
+        ):
+            warnings.append(
+                f"{split}: 实际占比 {actual_fraction:.4f} "
+                f"偏离名义值 {nominal_fraction:.4f}"
+                "（群组边界吸附或语料大小导致；"
+                "test 内容仍保持尘封）"
+            )
+
     distribution_shift: Dict[str, float] = {}
 
     for left, right in (
@@ -4558,6 +4589,7 @@ def audit_data_splits(
             split: info["fraction"]
             for split, info in splits_report.items()
         },
+        "dataset_split_fractions": dataset.split_fractions,
         "distribution_shift": distribution_shift,
         "duplicate_windows": duplicate_windows,
         "groups": groups_report,
@@ -4598,6 +4630,16 @@ def print_data_audit(report: Dict[str, object]) -> None:
         for name, info in splits.items()
     ]
     print("[data] 数据审计: " + ", ".join(parts))
+
+    fractions = report.get("dataset_split_fractions") or {}
+    if fractions:
+        print(
+            "[data]   实际 split 占比: "
+            + ", ".join(
+                f"{name}:{value:.4f}"
+                for name, value in fractions.items()
+            )
+        )
 
     groups = report.get("groups")
     if isinstance(groups, dict):
@@ -21187,6 +21229,21 @@ def run_self_test():
     assert any(
         "偏离名义值" in warning
         for warning in aligned_audit["warnings"]
+    )
+
+    # 训练期间审计不解封 test，但仍能根据切分边界发现
+    # test 实际占比漂移。
+    sealed_aligned_audit = audit_data_splits(
+        aligned_dataset,
+        include_test=False,
+    )
+    assert "test" not in sealed_aligned_audit["splits"]
+    assert sealed_aligned_audit[
+        "dataset_split_fractions"
+    ]["test"] == 0.25
+    assert any(
+        "test: 实际占比" in warning
+        for warning in sealed_aligned_audit["warnings"]
     )
 
     # 群组过大、无法在保证每段最小长度的情况下整体划分：
