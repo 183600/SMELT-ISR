@@ -20804,6 +20804,44 @@ def run_self_test():
         )
         assert test_probe_report["test_fixed_checked"]
 
+        class _ShiftedTestDataset(ByteDataset):
+            def fixed_eval_batch(
+                self,
+                split,
+                batch_index,
+                batches,
+                batch_size,
+                device,
+            ):
+                x, y = ByteDataset.fixed_eval_batch(
+                    self,
+                    split,
+                    batch_index,
+                    batches,
+                    batch_size,
+                    device,
+                )
+                if split == "test":
+                    y = torch.roll(y, shifts=1, dims=1)
+                return x, y
+
+        shifted_test_dataset = _ShiftedTestDataset(
+            data_file.name,
+            seq_len=8,
+        )
+        shifted_test_probe = probe_data_pipeline(
+            shifted_test_dataset,
+            eval_device,
+            batch_size=4,
+            batches=2,
+            include_test=True,
+        )
+        assert not shifted_test_probe["ok"]
+        assert any(
+            "测试标签错位" in failure
+            for failure in shifted_test_probe["failures"]
+        ), shifted_test_probe["failures"]
+
         # 标签错位必须被探针抓住（sanity check 无法发现这类
         # 数据协议错误：模型可以把错位标签照样背下来）。
         class _ShiftedLabelDataset(ByteDataset):
