@@ -11792,7 +11792,7 @@ _COMMON_STEP_METRIC = "val_loss_at_common_step"
 # 成一次宽度 min(n_experts, k1*k2) 的路由；均衡损失约随路由
 # 宽度线性增长，直接沿用会让「立即合并」臂的均衡强度高于
 # 延迟合并臂。该常量记录本轮实现已把 local_base 第二轮的
-# aux loss 折算回单分支宽度 k2，供受控变量核对区分新旧运行。
+# aux loss 折算回单分支宽度 k2，供均衡强度审计区分新旧运行。
 _BALANCE_WIDTH_NORMALIZATION = (
     "local_base_second_round_scaled_to_k2"
 )
@@ -12817,10 +12817,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "k1",
     "k2",
     "balance_coef",
-    # 均衡项是否按有效路由宽度折算：旧实现直接使用 local_base
-    # 第二轮的计算对齐宽度，均衡强度会高于 A/B；新旧运行混在
-    # 一起比较时该字段必须暴露差异。
-    "balance_width_normalization",
+    # 注意：balance_width_normalization 依 mode 而变（只有
+    # local_base 有折算问题），不能作为跨模式受控变量；
+    # 新旧 local_base 的均衡强度差异由 balance_strength_report
+    # 在有效宽度/强度层面点名。
     "dense_fnn_hidden",
     "residual_scale",
     "val_fraction",
@@ -13265,6 +13265,8 @@ def build_comparison_protocol(
         "balance_coef": cfg.balance_coef,
         "balance_width_normalization": (
             _BALANCE_WIDTH_NORMALIZATION
+            if cfg.mode == "local_base"
+            else "not_applicable"
         ),
         "dense_fnn_hidden": cfg.dense_fnn_hidden,
         "residual_scale": cfg.residual_scale,
@@ -13412,10 +13414,17 @@ def experiment_protocol_from_payload(
         "k1": cfg.get("k1"),
         "k2": cfg.get("k2"),
         "balance_coef": cfg.get("balance_coef"),
-        # 旧运行没有该字段：历史实现不做宽度折算，必须显式
-        # 记为 "none"，否则无法与新运行区分。
+        # 旧运行没有该字段：历史 local_base 不做宽度折算，必须
+        # 显式记为 "none" 才能与新运行区分；其余模式没有该
+        # 折算问题，记为 "not_applicable"，避免把「旧 A/B 与
+        # 新 A/B 语义没变」误报成协议差异。mode 也缺失时留
+        # None，由检查器标为未核对。
         "balance_width_normalization": (
-            "none" if has_training else None
+            "none"
+            if has_training and cfg.get("mode") == "local_base"
+            else "not_applicable"
+            if has_training and cfg.get("mode") is not None
+            else None
         ),
         "dense_fnn_hidden": cfg.get("dense_fnn_hidden"),
         "residual_scale": cfg.get("residual_scale"),
@@ -13539,11 +13548,7 @@ def parse_factor_spec(spec: str) -> List[str]:
         key
         for key in keys
         if key
-        in {
-            "model_selection",
-            "selection_metric",
-            "balance_width_normalization",
-        }
+        in {"model_selection", "selection_metric"}
     ]
     if locked:
         raise ValueError(
