@@ -3712,6 +3712,13 @@ def probe_data_pipeline(
             failures.append(
                 "训练批输入 token 超出 [0, 256) 字节范围"
             )
+
+        if y.numel() > 0 and (
+            int(y.min()) < 0 or int(y.max()) >= 256
+        ):
+            failures.append(
+                "训练批标签 token 超出 [0, 256) 字节范围"
+            )
     except (AssertionError, RuntimeError, ValueError) as error:
         failures.append(f"训练批检查抛出异常: {error}")
 
@@ -3745,6 +3752,15 @@ def probe_data_pipeline(
 
         report["val_fixed_checked"] = True
 
+        if x.cpu().dtype != torch.int32:
+            failures.append(
+                f"验证固定窗口 x dtype 为 {x.dtype}，期望 int32"
+            )
+        if y.cpu().dtype != torch.uint8:
+            failures.append(
+                f"验证固定窗口 y dtype 为 {y.dtype}，期望 uint8"
+            )
+
         if tuple(x.shape) != tuple(expected_x.shape):
             failures.append(
                 f"验证固定窗口 x 形状 {tuple(x.shape)} 与期望 "
@@ -3764,6 +3780,19 @@ def probe_data_pipeline(
             failures.append(
                 "验证固定窗口 y 与原始字节切片不一致（评估标签"
                 "错位）"
+            )
+
+        if x.numel() > 0 and (
+            int(x.min()) < 0 or int(x.max()) >= 256
+        ):
+            failures.append(
+                "验证固定窗口输入 token 超出 [0, 256) 字节范围"
+            )
+        if y.numel() > 0 and (
+            int(y.min()) < 0 or int(y.max()) >= 256
+        ):
+            failures.append(
+                "验证固定窗口标签 token 超出 [0, 256) 字节范围"
             )
 
         # 清空结果后重建必须逐位一致：固定评估窗口跨进程/
@@ -3820,6 +3849,17 @@ def probe_data_pipeline(
 
             report["test_fixed_checked"] = True
 
+            if x.cpu().dtype != torch.int32:
+                failures.append(
+                    f"测试固定窗口 x dtype 为 {x.dtype}，"
+                    "期望 int32"
+                )
+            if y.cpu().dtype != torch.uint8:
+                failures.append(
+                    f"测试固定窗口 y dtype 为 {y.dtype}，"
+                    "期望 uint8"
+                )
+
             if tuple(x.shape) != tuple(expected_x.shape):
                 failures.append(
                     "测试固定窗口 x 形状与期望不一致"
@@ -3838,6 +3878,21 @@ def probe_data_pipeline(
                 failures.append(
                     "测试固定窗口 y 与原始测试字节不一致"
                     "（测试标签错位）"
+                )
+
+            if x.numel() > 0 and (
+                int(x.min()) < 0 or int(x.max()) >= 256
+            ):
+                failures.append(
+                    "测试固定窗口输入 token 超出 [0, 256) "
+                    "字节范围"
+                )
+            if y.numel() > 0 and (
+                int(y.min()) < 0 or int(y.max()) >= 256
+            ):
+                failures.append(
+                    "测试固定窗口标签 token 超出 [0, 256) "
+                    "字节范围"
                 )
 
             dataset.clear_eval_batch_cache()
@@ -21484,6 +21539,43 @@ def run_self_test():
             "标签错位" in failure
             for failure in shifted_report["failures"]
         ), shifted_report["failures"]
+
+        class _OutOfRangeEvalDataset(ByteDataset):
+            def fixed_eval_batch(
+                self,
+                split,
+                batch_index,
+                batches,
+                batch_size,
+                device,
+            ):
+                x, y = ByteDataset.fixed_eval_batch(
+                    self,
+                    split,
+                    batch_index,
+                    batches,
+                    batch_size,
+                    device,
+                )
+                if split == "val":
+                    x = x + 256
+                return x, y
+
+        out_of_range_dataset = _OutOfRangeEvalDataset(
+            data_file.name,
+            seq_len=8,
+        )
+        out_of_range_probe = probe_data_pipeline(
+            out_of_range_dataset,
+            eval_device,
+            batch_size=4,
+            batches=2,
+        )
+        assert not out_of_range_probe["ok"]
+        assert any(
+            "验证固定窗口输入 token 超出" in failure
+            for failure in out_of_range_probe["failures"]
+        ), out_of_range_probe["failures"]
 
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
