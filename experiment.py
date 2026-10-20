@@ -12831,6 +12831,55 @@ def selection_bias_report(
     return report
 
 
+def numerical_failure_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    跨运行暴露数值失败状态，并说明其不进入聚合/检验。
+
+    一个训练到 NaN/Inf 或触发数值停止的运行，其最终 val 指标
+    可能来自 fallback checkpoint，甚至已被跳过；把它与正常
+    运行一起求均值/做 t 检验，相当于把故障当成方法效应。
+    """
+    failed = [
+        {
+            "run": str(row.get("run")),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "curve_status": row.get("curve_status"),
+            "nonfinite_events": row.get("nonfinite_events"),
+            "numerical_stop": row.get("numerical_stop"),
+            "numerical_polluted": row.get(
+                "numerical_polluted"
+            ),
+            "prior_numerical_stop": row.get(
+                "prior_numerical_stop"
+            ),
+        }
+        for row in rows
+        if row.get("numerical_status") == "failed"
+    ]
+    unknown = [
+        str(row.get("run"))
+        for row in rows
+        if row.get("numerical_status") == "unknown"
+    ]
+    report: Dict[str, object] = {
+        "failed": failed,
+        "excluded_run_count": len(failed),
+        "unknown": unknown,
+        "advisory": None,
+    }
+    if failed:
+        report["advisory"] = (
+            f"{len(failed)} 个运行存在 NaN/Inf、数值停止、污染"
+            "检查点续跑或 diverged 曲线：已从聚合与显著性检验中"
+            "排除（不是方法效果）；请修复数值问题或从干净检查点"
+            "重跑后再比较"
+        )
+    return report
+
+
 def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
     """
     汇总多个运行目录的 config 与最终指标。
@@ -13156,6 +13205,65 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if curve_record is not None
             else None
         )
+
+        # 数值完整性：失败的运行不能进入均值与显著性检验。
+        # 旧记录没有新字段时用曲线里的 nonfinite 事件与
+        # diverged 状态兜底；完全无记录则标 unknown，不臆测。
+        def _record_value(name: str):
+            if final_record is not None and name in final_record:
+                return final_record.get(name)
+            return None
+
+        row["numerical_stop"] = _record_value(
+            "numerical_stop"
+        )
+        row["numerical_polluted"] = _record_value(
+            "numerical_polluted"
+        )
+        row["prior_numerical_stop"] = _record_value(
+            "prior_numerical_stop"
+        )
+        final_nonfinite = _record_value("nonfinite_events")
+        curve_nonfinite = (
+            curve_record.get("n_nonfinite_events")
+            if curve_record is not None
+            else None
+        )
+        nonfinite_events = (
+            final_nonfinite
+            if final_nonfinite is not None
+            else curve_nonfinite
+        )
+        row["nonfinite_events"] = nonfinite_events
+        integrity = _record_value("numerical_integrity_ok")
+        if integrity is not None:
+            integrity = bool(integrity)
+        failed = bool(
+            row["numerical_stop"]
+            or row["numerical_polluted"]
+            or row["prior_numerical_stop"]
+            or row["curve_status"] == "diverged"
+            or (
+                isinstance(nonfinite_events, int)
+                and not isinstance(nonfinite_events, bool)
+                and nonfinite_events > 0
+            )
+        )
+        if integrity is False or failed:
+            row["numerical_status"] = "failed"
+        elif integrity is True:
+            row["numerical_status"] = "ok"
+        else:
+            row["numerical_status"] = "unknown"
+        row["numerical_integrity_ok"] = (
+            False
+            if row["numerical_status"] == "failed"
+            else (
+                True
+                if row["numerical_status"] == "ok"
+                else None
+            )
+        )
         row["early_stopped"] = (
             final_record.get("early_stopped")
             if final_record is not None
@@ -13220,7 +13328,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
         f"{'val_loss':>9} {'val_bpb':>8} {'acc':>6} "
         f"{'macroF1':>8} "
         f"{'lat(ms)':>9} {'train(ms)':>10} {'GFLOPs':>8} "
-        f"{'mem(MB)':>9} {'curve':<18}"
+        f"{'mem(MB)':>9} {'numerical':<10} {'curve':<18}"
     )
     print(header)
     print("-" * len(header))
@@ -13249,6 +13357,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{_value(row.get('training_ms_per_step'), '.1f'):>10} "
             f"{gflops:>8} "
             f"{_value(row.get('peak_memory_mb'), '.1f'):>9} "
+            f"{str(row.get('numerical_status')):<10} "
             f"{str(row.get('curve_status')):<18}"
         )
 
@@ -15594,6 +15703,28 @@ def aggregate_runs(
     重复实验；std 反映种子间方差。桶内只有 1 个种子时 std
     为 None，分析阶段会提示统计可靠性不足。
     """
+    # 数值失败/发散运行不参与均值、方差与显著性检验：把 NaN/
+    # 停止运行的最终指标混进「方法效果」会把故障当成效应。
+    # 它们单独列出，保证被排除这件事可见而不是静默消失。
+    failed_rows = [
+        row
+        for row in rows
+        if row.get("numerical_status") == "failed"
+    ]
+    usable_rows = [
+        row
+        for row in rows
+        if row.get("numerical_status") != "failed"
+    ]
+    failed_by_key: Dict[tuple, List[Dict[str, object]]] = {}
+    for row in failed_rows:
+        key = tuple(
+            _stable_factor_key(_row_factor_value(row, name))
+            for name in group_keys
+        )
+        failed_by_key.setdefault(key, []).append(row)
+    rows = usable_rows
+
     groups: Dict[tuple, List[Dict[str, object]]] = {}
     order: List[tuple] = []
 
@@ -15671,6 +15802,25 @@ def aggregate_runs(
             ),
             "samples": {},
             "costs": {},
+            "numerical_failures": [
+                {
+                    "run": str(row.get("run")),
+                    "curve_status": row.get("curve_status"),
+                    "nonfinite_events": row.get(
+                        "nonfinite_events"
+                    ),
+                    "numerical_stop": row.get(
+                        "numerical_stop"
+                    ),
+                    "numerical_polluted": row.get(
+                        "numerical_polluted"
+                    ),
+                    "prior_numerical_stop": row.get(
+                        "prior_numerical_stop"
+                    ),
+                }
+                for row in failed_by_key.get(key, [])
+            ],
         }
 
         # 效率指标随精度指标一起聚合：评价改进必须同时给出
@@ -20606,6 +20756,7 @@ def print_comparison_analysis(
         )
 
     provenance = check_run_provenance(rows)
+    numerical_failures = numerical_failure_report(rows)
 
     print()
     print(
@@ -20651,6 +20802,32 @@ def print_comparison_analysis(
             "一致（差异来自与本实验无关的文件）；如需严格的"
             "同代码版本对比，请在同一 commit 上重跑。"
         )
+
+    print()
+    print(
+        "[numerical] 数值完整性：NaN/Inf、数值停止、污染检查点"
+        "续跑或 diverged 运行不进入聚合与显著性检验"
+    )
+    if numerical_failures["failed"]:
+        for item in numerical_failures["failed"]:
+            print(
+                f"  [excluded] {item['run']}"
+                f"（mode={item['mode']}, seed={item['seed']}）"
+                f" curve={item['curve_status']}"
+                f" nonfinite={item['nonfinite_events']}"
+                f" stop={item['numerical_stop']}"
+                f" polluted={item['numerical_polluted']}"
+                f" prior_stop={item['prior_numerical_stop']}"
+            )
+        print("  [warn] " + str(numerical_failures["advisory"]))
+    elif numerical_failures["unknown"]:
+        print(
+            "  [note] 以下运行缺少数值完整性记录（旧运行），"
+            "无法确认是否发生过 NaN/Inf: "
+            + ", ".join(numerical_failures["unknown"])
+        )
+    else:
+        print("  OK：所有运行都记录了数值完整性且未发现失败")
 
     print()
     print(
@@ -21557,6 +21734,7 @@ def print_comparison_analysis(
         "metric": metric,
         "controlled": controlled,
         "provenance": provenance,
+        "numerical_failures": numerical_failures,
         "hypothesis_registry": hypotheses,
         "hypothesis_alignment": alignment,
         "aggregates": aggregates,
@@ -31060,6 +31238,82 @@ def run_self_test():
         "val_loss",
     )
     assert "计时噪声" in noisy_text, noisy_text
+
+    # 数值失败运行必须被排除出均值/检验，并单独列出。
+    numerical_rows = [
+        {
+            "run": "ok1",
+            "mode": "A",
+            "seed": 1,
+            "val_loss": 3.0,
+            "numerical_status": "ok",
+        },
+        {
+            "run": "ok2",
+            "mode": "A",
+            "seed": 2,
+            "val_loss": 2.0,
+            "numerical_status": "ok",
+        },
+        {
+            "run": "diverged",
+            "mode": "A",
+            "seed": 3,
+            "val_loss": 9.0,
+            "curve_status": "diverged",
+            "nonfinite_events": 4,
+            "numerical_status": "failed",
+        },
+    ]
+    numerical_aggregate = aggregate_runs(
+        numerical_rows,
+        ["mode"],
+    )[0]
+    assert numerical_aggregate["n_runs"] == 2
+    assert numerical_aggregate["val_loss_mean"] == 2.5
+    assert (
+        numerical_aggregate["numerical_failures"][0]["run"]
+        == "diverged"
+    )
+    numerical_report = numerical_failure_report(
+        numerical_rows
+    )
+    assert numerical_report["excluded_run_count"] == 1
+    assert numerical_report["advisory"]
+
+    with tempfile.TemporaryDirectory() as numerical_dir:
+        failed_run = Path(numerical_dir) / "failed_run"
+        failed_run.mkdir()
+        with open(
+            failed_run / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "config": {"mode": "A"},
+                    "args": {"seed": 1},
+                    "n_params": 10,
+                },
+                f,
+            )
+        write_jsonl_record(
+            failed_run / "metrics.jsonl",
+            {
+                "step": "final",
+                "val_loss": 3.0,
+                "nonfinite_events": 2,
+                "numerical_stop": True,
+                "numerical_polluted": False,
+                "prior_numerical_stop": False,
+            },
+        )
+        failed_row = compare_runs(
+            [str(failed_run)]
+        )[0]
+        assert failed_row["numerical_status"] == "failed"
+        assert failed_row["nonfinite_events"] == 2
+        assert failed_row["numerical_integrity_ok"] is False
 
     # 指标变差且效率更低：严格劣于基线，必须显式点出。
     with tempfile.TemporaryDirectory() as dominated_dir:
