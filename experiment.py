@@ -4027,6 +4027,11 @@ _AUDIT_MAX_WINDOWS = 100000
 # train/val(/test) 字节分布 JS 距离超过该值时报分布偏移警告。
 _AUDIT_SHIFT_WARN = 0.1
 
+# 字节二元组分布偏移的告警阈值：只看单字节频率会漏掉
+# 「词表相同但上下文/顺序变了」的偏移，例如训练集是
+# abab...、评估集是 baba...；二元组 JS 距离对这类偏移敏感。
+_AUDIT_BIGRAM_SHIFT_WARN = 0.1
+
 # 单个字节占比超过该阈值时疑似填充/退化数据（异常值检查）。
 _AUDIT_TOP_BYTE_WARN = 0.5
 
@@ -4064,6 +4069,43 @@ _AUDIT_CHUNK_GEAR_TABLE = tuple(
     for value in range(256)
 )
 _AUDIT_CHUNK_UINT64_MASK = (1 << 64) - 1
+
+
+def _byte_bigram_counts(
+    tokens: torch.Tensor,
+    excluded_spans: Optional[List[Tuple[int, int]]] = None,
+) -> torch.Tensor:
+    """
+    统计 split 内相邻字节对的频次（256×256 展平）。
+
+    排除区间两侧的字节不能组成跨越清洗内容的虚假二元组：
+    只在每个连续有效内容区间内部计数，与训练窗口/统计基线
+    的有效训练口径一致。
+    """
+    vocab_size = 256
+    counts = torch.zeros(
+        vocab_size * vocab_size,
+        dtype=torch.int64,
+    )
+
+    intervals = _subtract_byte_intervals(
+        0,
+        int(tokens.numel()),
+        list(excluded_spans or []),
+    )
+
+    for begin, end in intervals:
+        if end - begin < 2:
+            continue
+        left = tokens[begin:end - 1].to(torch.int64)
+        right = tokens[begin + 1:end].to(torch.int64)
+        pairs = left * vocab_size + right
+        counts += torch.bincount(
+            pairs,
+            minlength=vocab_size * vocab_size,
+        )
+
+    return counts
 
 
 def _js_distance(
@@ -4597,8 +4639,10 @@ def audit_data_splits(
       编码错误）；
     - 扫描文本完整性（无法 UTF-8 解码的字节序列、NUL 字节），
       作为字节级标签噪声与语料损坏的清洗检查；
-    - 统计每个 split 的字节直方图，并计算 train↔val（可选包含
-      train↔test、val↔test）之间的 JS 距离，用于发现分布偏移；
+    - 统计每个 split 的字节直方图与字节二元组直方图，并计算
+      train↔val（可选包含 train↔test、val↔test）之间的 JS
+      距离：单字节频率发现词表/频率偏移，二元组发现「词表
+      相同但上下文顺序改变」的偏移；
     - 对滑动窗口做有界签名扫描，检测跨 split 重复内容与 split
       内部重复；
     - 用内容定义分块指纹补齐窗口抽样漏掉的错位/近似重复：分块
@@ -4888,28 +4932,66 @@ def audit_data_splits(
                 "test 内容仍保持尘封）"
             )
 
+    bigram_histograms: Dict[str, torch.Tensor] = {}
+
+    for split in split_names:
+        counts = _byte_bigram_counts(
+            getattr(dataset, split),
+            (
+                dataset.train_excluded_spans
+                if split == "train"
+                else None
+            ),
+        )
+        total = int(counts.sum())
+        if total > 0:
+            bigram_histograms[split] = (
+                counts.to(torch.float64) / total
+            )
+
     distribution_shift: Dict[str, float] = {}
+    distribution_shift_bigram: Dict[str, float] = {}
 
     for left, right in (
         ("train", "val"),
         ("train", "test"),
         ("val", "test"),
     ):
-        if left not in histograms or right not in histograms:
-            continue
-
-        distance = _js_distance(
-            histograms[left],
-            histograms[right],
-        )
         key = f"{left}_{right}"
-        distribution_shift[key] = round(distance, 6)
 
-        if distance > _AUDIT_SHIFT_WARN:
-            warnings.append(
-                f"{key}: 字节分布偏移较大"
-                f"（JS 距离 {distance:.4f}）"
+        if left in histograms and right in histograms:
+            distance = _js_distance(
+                histograms[left],
+                histograms[right],
             )
+            distribution_shift[key] = round(distance, 6)
+
+            if distance > _AUDIT_SHIFT_WARN:
+                warnings.append(
+                    f"{key}: 字节分布偏移较大"
+                    f"（JS 距离 {distance:.4f}）"
+                )
+
+        if (
+            left in bigram_histograms
+            and right in bigram_histograms
+        ):
+            bigram_distance = _js_distance(
+                bigram_histograms[left],
+                bigram_histograms[right],
+            )
+            distribution_shift_bigram[key] = round(
+                bigram_distance,
+                6,
+            )
+
+            if bigram_distance > _AUDIT_BIGRAM_SHIFT_WARN:
+                warnings.append(
+                    f"{key}: 字节二元组分布偏移较大"
+                    f"（JS 距离 {bigram_distance:.4f}）："
+                    "单字节词表可能相同，但上下文/顺序分布"
+                    "已发生变化"
+                )
 
     duplicate_windows: Dict[str, object] = {}
 
@@ -5034,6 +5116,7 @@ def audit_data_splits(
         },
         "dataset_split_fractions": dataset.split_fractions,
         "distribution_shift": distribution_shift,
+        "distribution_shift_bigram": distribution_shift_bigram,
         "duplicate_windows": duplicate_windows,
         "content_chunks": content_chunks,
         "groups": groups_report,
@@ -5172,6 +5255,15 @@ def print_data_audit(report: Dict[str, object]) -> None:
         {},
     ).items():
         print(f"[data]   {key} 字节分布 JS 距离 = {distance:.4f}")
+
+    for key, distance in report.get(
+        "distribution_shift_bigram",
+        {},
+    ).items():
+        print(
+            f"[data]   {key} 字节二元组分布 JS 距离 = "
+            f"{distance:.4f}"
+        )
 
     for key, info in report.get(
         "duplicate_windows",
@@ -21868,6 +21960,45 @@ def run_self_test():
     ].values():
         assert math.isfinite(distance)
         assert 0.0 <= distance <= 1.0
+
+    for distance in clean_audit[
+        "distribution_shift_bigram"
+    ].values():
+        assert math.isfinite(distance)
+        assert 0.0 <= distance <= 1.0
+
+    # 单字节频率相同、但相邻字节顺序完全相反时，一元分布
+    # JS 距离应为 0，二元组分布必须报告显著偏移。只看词表
+    # 频率会漏掉这种上下文分布变化。
+    order_train = bytes(range(128)) * 8
+    order_val = bytes(reversed(range(128))) * 8
+
+    with tempfile.NamedTemporaryFile() as order_file:
+        order_file.write(order_train + order_val)
+        order_file.flush()
+
+        order_dataset = ByteDataset(
+            order_file.name,
+            seq_len=8,
+            val_fraction=0.5,
+            test_fraction=0.0,
+        )
+        order_audit = audit_data_splits(order_dataset)
+
+    assert (
+        order_audit["distribution_shift"]["train_val"]
+        == 0.0
+    )
+    assert (
+        order_audit["distribution_shift_bigram"][
+            "train_val"
+        ]
+        > _AUDIT_BIGRAM_SHIFT_WARN
+    )
+    assert any(
+        "二元组分布偏移" in warning
+        for warning in order_audit["warnings"]
+    )
 
     # 文本完整性审计：无法 UTF-8 解码的字节（标签噪声来源）与
     # NUL 字节必须被检测到并给出警告。
