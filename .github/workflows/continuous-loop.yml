@@ -237,11 +237,11 @@ jobs:
           PROMPT_APPLY='确保算力申请.md没有错误。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
           # 每阶段单次调用的最大时长（秒）
-          PERF_TIMEOUT=$((60*60))     # 1h（性能与显存优化）
-          BUG_TIMEOUT=$((60*60))      # 1h
-          SCI_TIMEOUT=$((60*60))      # 1h（改进科研方法，随机选一个提示词）
-          CLEAN_TIMEOUT=$((30*60))    # 30m
-          APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
+          PERF_TIMEOUT=$((3*3600))     # 3h
+          BUG_TIMEOUT=$((3*3600))      # 3h
+          SCI_TIMEOUT=$((3*3600))      # 3h
+          CLEAN_TIMEOUT=$((3*3600))    # 3h
+          APPLY_TIMEOUT=$((3*3600))    # 3h
 
           # ================= 模型策略：独立双家族（失效只在家族内级联，不跨家族） =================
           # NVIDIA 家族：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
@@ -697,7 +697,7 @@ jobs:
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
               return 0
             fi
-            if [ "$TG_FIX_BUDGET" -gt 2700 ]; then TG_FIX_BUDGET=2700; fi
+            if [ "$TG_FIX_BUDGET" -gt 10800 ]; then TG_FIX_BUDGET=10800; fi
             {
               echo '本仓库的测试跑不通，请修复。复现方式：在仓库根目录运行 bash /tmp/tg_run.sh。'
               echo
