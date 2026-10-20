@@ -150,6 +150,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   非中心 t 分布功效的数值积分（对 chi 分布做自适应 Simpson
   积分，按 df 缓存节点）、80% 功效的最小可检出效应（MDE）
   与按当前种子间波动检出观测效应所需的近似种子数。
+- `_attach_family_power`、`_observed_seed_sd`：按家族规模
+  α/m 补算 MDE/功效/所需种子/所需等价界的保守口径，并由检验
+  标准误还原（近似）种子间标准差。
 - `_tost_test`、`_t_cdf`、`_attach_power_equivalence`：TOST
   等价性检验（等价界相对基线均值，`--equivalence-margin`）、
   t 分布 CDF 与对比记录的功效/等价性字段挂载，含主张等价所需
@@ -334,7 +337,19 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   额外给出近似所需种子数 `equivalence_seeds_to_achieve`）。
   展示层对后者单独发 `[warn]`，明确「TOST 未通过 ≠ 两者不同，
   应加种子而不是放宽等价界」，避免把精度不足的检验失败读成
-  方法之间确实存在差异。等价界必须
+  方法之间确实存在差异。**功效口径与家族校正一致**：
+  `mde_80`、`power_at_effect`、`seeds_to_detect` 与所需等价界
+  原本都按未校正的 α=0.05 计算，而 `significant`/`equivalent`
+  用的是 Holm 校正后的 p 值——家族越大，「能检出/能主张等价的
+  效应」被说得越乐观。`_attach_family_power` 按 Holm 第一步
+  阈值 α/m（Bonferroni，Holm 阈值下界）补算同口径保守量：
+  `significance_family_size`、`alpha_bonferroni`、
+  `mde_80_bonferroni`、`power_at_effect_bonferroni`、
+  `seeds_to_detect_bonferroni`、
+  `equivalence_margin_needed_bonferroni`（家族 m=1 时与未校正
+  口径相等）。报告的 `[power]` 行给出家族规模与 α/m，展示层
+  在「不确定」结论后补一句保守口径的 MDE 与所需种子数，种子
+  规划按保守口径而不是未校正口径。等价界必须
   事先声明：看到数据后再放宽界可以「制造」等价结论。功效
   积分对 chi 分布做自适应 Simpson 数值积分（按 df 缓存），
   δ=0 时功效恰为 alpha，大 df 退化为正态近似，自测覆盖这些

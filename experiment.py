@@ -15687,6 +15687,144 @@ def _tost_test(
     }
 
 
+def _observed_seed_sd(
+    contrast: Dict[str, object],
+    se_value: float,
+) -> Optional[float]:
+    """
+    由检验口径的标准误还原观测到的（近似）种子间标准差。
+
+    配对设计 se = sd/√n，直接 sd = se·√n。Welch 两臂样本量
+    不等时，把「等臂规划下与当前 se 等价的每臂种子数」取调和
+    均值 n_eq = 2·n_a·n_b/(n_a+n_b)，对应 sd = se·√n_eq；用
+    min(n_a, n_b) 会把所需种子数说得比实际乐观。无法确定口径
+    时返回 None。
+    """
+    n_pairs = contrast.get("n_pairs")
+    n_baseline = contrast.get("n_baseline")
+    n_variant = contrast.get("n_variant")
+    if (
+        isinstance(n_pairs, int)
+        and not isinstance(n_pairs, bool)
+        and n_pairs >= _MIN_SEEDS_FOR_STATS
+    ):
+        return se_value * math.sqrt(n_pairs)
+    if (
+        isinstance(n_baseline, int)
+        and not isinstance(n_baseline, bool)
+        and isinstance(n_variant, int)
+        and not isinstance(n_variant, bool)
+        and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
+    ):
+        n_equivalent = (
+            2.0 * n_baseline * n_variant
+            / (n_baseline + n_variant)
+        )
+        return se_value * math.sqrt(n_equivalent)
+    return None
+
+
+def _attach_family_power(
+    contrast: Dict[str, object],
+    family_size: int,
+) -> None:
+    """
+    把家族校正口径下的功效量挂到对比记录上（原地更新）。
+
+    MDE、观测效应功效、检出所需种子数与「主张等价所需的最小
+    界」在 ``_attach_power_equivalence`` 里都按未校正的
+    alpha=0.05 计算，而报告的 ``significant`` / ``equivalent``
+    判定用的是 Holm 校正后的 p 值。二者口径不一致会系统性地
+    高估现有实验的可判定性：Holm 第一步的阈值是 alpha/m，
+    家族越大，能被判定为显著/等价的效应就必须越大。
+
+    这里按最保守的第一步阈值 alpha/m（Bonferroni，Holm 阈值
+    的下界）补算一组对应口径的量：
+
+    - ``significance_family_size``：家族规模 m（实际执行的
+      检验数）；``alpha_bonferroni`` = alpha/m（m=1 时退化为
+      alpha）。
+    - ``mde_80_bonferroni`` / ``power_at_effect_bonferroni`` /
+      ``seeds_to_detect_bonferroni``：同一 se/df 下按
+      alpha/m 计算的 MDE、观测效应功效与所需种子数。
+    - ``equivalence_margin_needed_bonferroni``：按
+      alpha/m 主张等价所需的最小对称界。
+
+    家族规模为 1 时这些量与未校正口径相同，报告不会因此变长。
+    """
+    contrast["significance_family_size"] = int(family_size)
+    size = int(family_size)
+    alpha_family = (
+        _SIGNIFICANCE_LEVEL / size if size > 1 else _SIGNIFICANCE_LEVEL
+    )
+    contrast["alpha_bonferroni"] = alpha_family
+
+    se = contrast.get("se")
+    df = contrast.get("df")
+    try:
+        se_value = float(se)  # type: ignore[arg-type]
+        df_value = float(df)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return
+    if (
+        not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or se_value <= 0.0
+        or df_value <= 0.0
+    ):
+        return
+
+    mde = _minimum_detectable_effect(
+        se_value, df_value, alpha=alpha_family
+    )
+    if mde is not None:
+        contrast["mde_80_bonferroni"] = mde
+
+    delta = contrast.get("delta")
+    try:
+        delta_value = abs(float(delta))
+    except (TypeError, ValueError):
+        delta_value = None
+    if delta_value is not None and math.isfinite(delta_value):
+        power = _t_power(
+            delta_value, se_value, df_value, alpha_family
+        )
+        if power is not None:
+            contrast["power_at_effect_bonferroni"] = power
+        sd_observed = _observed_seed_sd(contrast, se_value)
+        if sd_observed is not None and delta_value > 0.0:
+            seeds_needed = _seeds_to_detect(
+                delta_value,
+                sd_observed,
+                alpha=alpha_family,
+            )
+            if seeds_needed is not None:
+                contrast["seeds_to_detect_bonferroni"] = seeds_needed
+
+    if contrast.get("equivalence_margin_abs") is None:
+        return
+    if delta_value is None:
+        return
+    critical = _t_critical(df_value, 2.0 * alpha_family)
+    if critical is None:
+        return
+    margin_needed = delta_value + critical * se_value
+    contrast["equivalence_margin_needed_bonferroni"] = margin_needed
+    baseline_abs = None
+    baseline_mean = contrast.get("mean_baseline")
+    if (
+        isinstance(baseline_mean, (int, float))
+        and not isinstance(baseline_mean, bool)
+        and math.isfinite(float(baseline_mean))
+        and abs(float(baseline_mean)) > 0.0
+    ):
+        baseline_abs = abs(float(baseline_mean))
+    if baseline_abs is not None:
+        contrast["equivalence_margin_needed_bonferroni_relative"] = (
+            margin_needed / baseline_abs
+        )
+
+
 def _attach_power_equivalence(
     contrast: Dict[str, object],
     delta: Optional[float],
@@ -15747,33 +15885,7 @@ def _attach_power_equivalence(
         if power is not None:
             contrast["power_at_effect"] = power
 
-        # 还原观测到的重复间标准差：配对设计 se = sd/√n，直接
-        # sd = se·√n。Welch 两臂样本量不等时，把「等臂规划下与
-        # 当前 se 等价的每臂种子数」取调和均值
-        # n_eq = 2·n_a·n_b/(n_a+n_b)，对应 sd = se·√n_eq；
-        # 用 min(n_a, n_b) 会把所需种子数说得比实际乐观。
-        n_pairs = contrast.get("n_pairs")
-        n_baseline = contrast.get("n_baseline")
-        n_variant = contrast.get("n_variant")
-        sd_observed = None
-        if (
-            isinstance(n_pairs, int)
-            and not isinstance(n_pairs, bool)
-            and n_pairs >= _MIN_SEEDS_FOR_STATS
-        ):
-            sd_observed = se_value * math.sqrt(n_pairs)
-        elif (
-            isinstance(n_baseline, int)
-            and not isinstance(n_baseline, bool)
-            and isinstance(n_variant, int)
-            and not isinstance(n_variant, bool)
-            and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
-        ):
-            n_equivalent = (
-                2.0 * n_baseline * n_variant
-                / (n_baseline + n_variant)
-            )
-            sd_observed = se_value * math.sqrt(n_equivalent)
+        sd_observed = _observed_seed_sd(contrast, se_value)
         if sd_observed is not None and delta_value != 0.0:
             seeds_needed = _seeds_to_detect(
                 delta_value,
@@ -16515,6 +16627,12 @@ def _apply_multiple_comparison_correction(
     holm_values = _holm_bonferroni(p_values)
     bh_values = _benjamini_hochberg(p_values)
 
+    # 功效口径与家族校正口径必须一致：MDE/所需种子/所需等价界
+    # 按 Holm 第一步阈值 alpha/m 补算，否则报告一边用校正后
+    # 判定、一边用未校正功效，会高估现有实验的可判定性。
+    for contrast in eligible:
+        _attach_family_power(contrast, len(eligible))
+
     for contrast, holm_p, bh_p in zip(
         eligible,
         holm_values,
@@ -16772,6 +16890,7 @@ def factor_contrasts(
                 "test": test.get("test"),
                 "t": test.get("t"),
                 "df": test.get("df"),
+                "se": test.get("se"),
                 "p_value": test.get("p_value"),
                 "randomization_p_value": test.get(
                     "randomization_p_value"
@@ -17348,6 +17467,7 @@ def factorial_effects(
                     "test": result.get("test"),
                     "t": result.get("t"),
                     "df": result.get("df"),
+                    "se": result.get("se"),
                     "p_value": result.get("p_value"),
                     "randomization_p_value": result.get(
                         "randomization_p_value"
@@ -17405,6 +17525,10 @@ def factorial_effects(
         for effect in report["effects"]
         if effect.get("p_value") is not None
     ]
+    # 主效应/交互家族的功效口径同步按家族规模校正（与下方
+    # Holm 判定同口径），见 _attach_family_power。
+    for effect in eligible:
+        _attach_family_power(effect, len(eligible))
     holm = _holm_bonferroni([
         float(effect["p_value"]) for effect in eligible
     ])
@@ -17781,6 +17905,24 @@ def _contrast_display(
                     f"{seeds_needed} 个种子，当前 "
                     f"{_format_seed_count(current_seeds)} 个）"
                 )
+            family_size = contrast.get("significance_family_size")
+            mde_family = contrast.get("mde_80_bonferroni")
+            if (
+                isinstance(family_size, int)
+                and not isinstance(family_size, bool)
+                and family_size > 1
+                and isinstance(mde_family, (int, float))
+            ):
+                family_text = (
+                    f"（家族 m={family_size} 的保守口径：Holm 首步"
+                    f"alpha/m 下 MDE={float(mde_family):.4f}"
+                )
+                seeds_family = contrast.get(
+                    "seeds_to_detect_bonferroni"
+                )
+                if isinstance(seeds_family, int):
+                    family_text += f"，约需 {seeds_family} 个种子"
+                caveat += family_text + "）"
 
     # 伪重复：同一单元里同一随机种子出现多次（复制的运行）
     # 不是独立重复实验，配对检验不可用，结论的统计功效存疑。
@@ -17986,6 +18128,7 @@ def compare_cells_to_baseline(
             "test": result.get("test"),
             "t": result.get("t"),
             "df": result.get("df"),
+            "se": result.get("se"),
             "p_value": result.get("p_value"),
             "randomization_p_value": result.get(
                 "randomization_p_value"
@@ -21640,6 +21783,32 @@ def print_comparison_analysis(
         "（每个对比只改变一个因子；p 为原始值，显著性判定用"
         "家族内 Holm 校正后的 p）"
     )
+
+    # 功效口径提示：mde_80 / power_at_effect / seeds_to_detect
+    # 与所需等价界按未校正 alpha 计算，而最终判定用 Holm 校正
+    # 后的 p 值——家族越大，「能检出/能主张等价的效应」被说得
+    # 越乐观。这里显式给出家族规模与保守口径字段，规划种子数
+    # 应按后者。
+    family_sizes = sorted({
+        int(size)
+        for size in (
+            contrast.get("significance_family_size")
+            for contrast in contrasts
+        )
+        if isinstance(size, int) and not isinstance(size, bool)
+    })
+    if any(size > 1 for size in family_sizes):
+        largest_family = max(family_sizes)
+        print(
+            f"  [power] 本分析家族最多 m={largest_family} 个检验；"
+            f"MDE/功效/所需种子与所需等价界默认按未校正 "
+            f"alpha={_SIGNIFICANCE_LEVEL:g} 计算，Holm 首步阈值为 "
+            f"alpha/m={_SIGNIFICANCE_LEVEL / largest_family:.4f}"
+            "（同口径保守值见 mde_80_bonferroni / "
+            "seeds_to_detect_bonferroni / "
+            "equivalence_margin_needed_bonferroni；"
+            "规划种子数与等价界时按后者）"
+        )
 
     if not contrasts:
         print("  无单因子对比（至少需要两个不同的实验单元）")
@@ -28608,6 +28777,60 @@ def run_self_test():
         assert wider_tost
         assert (
             float(wider_tost["tost_p_value"]) < _SIGNIFICANCE_LEVEL
+        )
+
+        # 家族校正口径与判定口径一致：显著性/等价用 Holm 校正后
+        # 的 p 值，功效口径也必须按 Holm 首步阈值 alpha/m 补算，
+        # 且补算值只可能更保守（MDE 更大、所需种子更多、所需
+        # 等价界更宽）。家族规模为 1 时两者必须相等。
+        assert (
+            powered_contrast["significance_family_size"] >= 1
+        )
+        assert (
+            float(powered_contrast["alpha_bonferroni"])
+            <= _SIGNIFICANCE_LEVEL
+        )
+        assert (
+            float(powered_contrast["mde_80_bonferroni"])
+            >= float(powered_contrast["mde_80"]) - 1e-12
+        )
+        assert (
+            int(powered_contrast["seeds_to_detect_bonferroni"])
+            >= int(powered_contrast["seeds_to_detect"])
+        )
+        assert (
+            float(
+                powered_contrast["equivalence_margin_needed_bonferroni"]
+            )
+            >= float(powered_contrast["equivalence_margin_needed"])
+            - 1e-12
+        )
+        assert (
+            equivalent_contrast["significance_family_size"] == 1
+        )
+        assert (
+            equivalent_contrast["alpha_bonferroni"]
+            == _SIGNIFICANCE_LEVEL
+        )
+        assert (
+            abs(
+                float(equivalent_contrast["mde_80_bonferroni"])
+                - float(equivalent_contrast["mde_80"])
+            )
+            < 1e-15
+        )
+        assert (
+            abs(
+                float(
+                    equivalent_contrast[
+                        "equivalence_margin_needed_bonferroni"
+                    ]
+                )
+                - float(
+                    equivalent_contrast["equivalence_margin_needed"]
+                )
+            )
+            < 1e-12
         )
 
         # 不显著且等价性未确立：展示层必须同时给出
