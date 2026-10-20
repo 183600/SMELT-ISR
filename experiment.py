@@ -21306,6 +21306,9 @@ def run_self_test():
     assert dedup_dataset.effective_train_bytes == 28
     dedup_counts = dedup_dataset.effective_train_byte_counts()
     assert int(dedup_counts.sum()) == 28
+    # B 群组在 train 中的唯一一次出现与 val 重复，已被清洗；
+    # 有效训练字节中不应再有 B。
+    assert int(dedup_counts[ord("B")]) == 0
     raw_ngram = NgramBaseline(
         dedup_dataset.train,
         max_order=2,
