@@ -15625,10 +15625,13 @@ def ablation_coverage(
             if mode in modes_present
         ]
 
+    ablation_in_scope = any(
+        mode in modes_present for mode in ablation_related
+    )
     undeclared_project_modes = [
         mode
         for mode in _DELAYED_MERGE_MODES
-        if mode not in expected_delayed
+        if ablation_in_scope and mode not in expected_delayed
     ]
     report["expected_delayed_modes"] = expected_delayed
     report["undeclared_project_modes"] = undeclared_project_modes
@@ -25005,8 +25008,13 @@ def run_self_test():
             factors,
         )
         assert not irrelevant_coverage["missing_cells"]
+        assert not irrelevant_coverage["partial"]
         assert any(
             "消融覆盖不适用" in message
+            for message in irrelevant_coverage["advisories"]
+        )
+        assert not any(
+            "未覆盖项目声明的延迟合并方案" in message
             for message in irrelevant_coverage["advisories"]
         )
 
