@@ -9726,6 +9726,11 @@ def _finite_float(value: object) -> Optional[float]:
     return value
 
 
+def _as_dict(value: object) -> Dict[str, object]:
+    """dict 原样返回；其余值（旧/损坏 config 字段）当空 dict。"""
+    return value if isinstance(value, dict) else {}
+
+
 def _val_curve_points(
     run_dir: Path,
     flops_per_forward: float,
@@ -10004,7 +10009,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             # 选型指标：旧运行没有该字段，历史行为是在
             # val_loss 上选 checkpoint；ngram 不训练，保持
             # None，不参与选型一致性检查。
-            if str(run_config.get("mode")) == "ngram":
+            if str(row.get("mode")) == "ngram":
                 row["selection_metric"] = None
             else:
                 row["selection_metric"] = (
@@ -10066,15 +10071,21 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         for key in _ROUTING_ROW_FIELDS:
             row[key] = None
         if isinstance(routing, dict):
-            rq3 = (
-                routing.get("rq3_expert_overlap") or {}
-            ).get("summary") or {}
-            rq4 = (
-                routing.get("rq4_load_and_entropy") or {}
-            ).get("summary") or {}
-            divergence = (
-                routing.get("branch_divergence") or {}
-            ).get("summary") or {}
+            rq3 = _as_dict(
+                _as_dict(
+                    routing.get("rq3_expert_overlap")
+                ).get("summary")
+            )
+            rq4 = _as_dict(
+                _as_dict(
+                    routing.get("rq4_load_and_entropy")
+                ).get("summary")
+            )
+            divergence = _as_dict(
+                _as_dict(
+                    routing.get("branch_divergence")
+                ).get("summary")
+            )
             row["routing_jaccard_branch"] = rq3.get(
                 "second_round_jaccard_mean"
             )
@@ -10087,8 +10098,8 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["routing_branch_self_reuse"] = rq3.get(
                 "branch_self_reuse_share"
             )
-            round1 = rq4.get("round1") or {}
-            round2 = rq4.get("round2") or {}
+            round1 = _as_dict(rq4.get("round1"))
+            round2 = _as_dict(rq4.get("round2"))
             row["routing_r1_load_entropy"] = round1.get(
                 "load_entropy"
             )
@@ -13990,6 +14001,7 @@ def baseline_adequacy(
                     )
                     own_tuning = bool(
                         record_mode == row_mode
+                        and isinstance(seed_plan, dict)
                         and record_lr is not None
                         and math.isclose(
                             record_lr,
@@ -19655,6 +19667,70 @@ def run_self_test():
         "latency_ms_per_forward"
     ] == 1.5
 
+    # 损坏的 config.json（config 为 truthy 非 dict）不能让对比
+    # 直接崩溃：旧运行/手写配置可能没有结构化 config。
+    with tempfile.TemporaryDirectory() as malformed_dir:
+        malformed_run = Path(malformed_dir) / "malformed"
+        malformed_run.mkdir()
+        with open(
+            malformed_run / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "config": ["not", "a", "dict"],
+                    "args": {"seed": 1},
+                },
+                f,
+            )
+        write_jsonl_record(
+            malformed_run / "metrics.jsonl",
+            {"step": "final", "val_loss": 3.1},
+        )
+        malformed_rows = compare_runs([str(malformed_run)])
+    assert len(malformed_rows) == 1
+    assert malformed_rows[0].get("mode") is None
+    assert malformed_rows[0]["selection_metric"] == "val_loss"
+
+    # 损坏的 routing_analysis（内层字段非 dict）同样不能让
+    # 对比崩溃：路由指标退化为 None，而不是虚报。
+    with tempfile.TemporaryDirectory() as malformed_routing_dir:
+        routing_run = Path(malformed_routing_dir) / "routing"
+        routing_run.mkdir()
+        with open(
+            routing_run / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "config": {"mode": "A"},
+                    "args": {"seed": 1},
+                    "routing_analysis": {
+                        "rq3_expert_overlap": ["not", "a", "dict"],
+                        "rq4_load_and_entropy": {
+                            "summary": {
+                                "round1": "bad",
+                                "round2": 7,
+                            },
+                        },
+                        "branch_divergence": {
+                            "summary": 3,
+                        },
+                    },
+                },
+                f,
+            )
+        write_jsonl_record(
+            routing_run / "metrics.jsonl",
+            {"step": "final", "val_loss": 3.2},
+        )
+        routing_rows = compare_runs([str(routing_run)])
+    assert routing_rows[0]["routing_available"] is True
+    for key in _ROUTING_ROW_FIELDS:
+        assert routing_rows[0][key] is None
+
     # ---- 等训练计算量（val_loss_at_matched_flops） ----
     # 便宜臂与昂贵臂的每步 FLOPs 不同：共同计算量取两者最后
     # 验证点累计 FLOPs 的较小值，昂贵臂在较早的计算量点被插值，
@@ -21193,6 +21269,88 @@ def run_self_test():
             "seed_plan" in message
             for message in legacy_tuning_adequacy["advisories"]
         )
+
+        # 挑战臂的「独立调参」同样必须能核对功效：缺 seed_plan
+        # 的旧记录不能算作调参对称，否则会掩盖基线被调强、
+        # 挑战臂没调好的混杂。
+        challenger_tuning = {
+            "comparison_family": "baseline_tuning",
+            "source": "baseline_tuning.json",
+            "mode": "B",
+            "metric": "val_loss",
+            "winner_lr": 1e-3,
+            "winner_mean": 4.2,
+            "n_candidates": 9,
+            "seed_plan": {
+                "seeds": [1, 2, 3],
+                "n_seeds": 3,
+                "min_seeds_for_significance": 3,
+                "underpowered_override": False,
+            },
+        }
+        parity_baseline_path = _write_analysis_run(
+            "parity_baseline_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+        )
+        tuned_challenger_path = _write_analysis_run(
+            "tuned_challenger_seed1",
+            "B",
+            1,
+            1e-3,
+            100,
+            0.01,
+            4.10,
+            baseline_tuning=challenger_tuning,
+        )
+        tuned_parity = baseline_adequacy(
+            compare_runs([
+                parity_baseline_path,
+                tuned_challenger_path,
+            ]),
+            "smelt",
+            "val_loss",
+        )["tuning_parity"]
+        assert tuned_parity["challengers_with_own_tuning"] == [
+            "tuned_challenger_seed1"
+        ]
+        assert not tuned_parity[
+            "challengers_without_tuning_parity"
+        ]
+
+        legacy_challenger_tuning = dict(challenger_tuning)
+        legacy_challenger_tuning.pop("seed_plan")
+        legacy_challenger_path = _write_analysis_run(
+            "legacy_challenger_seed1",
+            "B",
+            1,
+            1e-3,
+            100,
+            0.01,
+            4.10,
+            baseline_tuning=legacy_challenger_tuning,
+        )
+        legacy_parity = baseline_adequacy(
+            compare_runs([
+                parity_baseline_path,
+                legacy_challenger_path,
+            ]),
+            "smelt",
+            "val_loss",
+        )["tuning_parity"]
+        assert not legacy_parity["challengers_with_own_tuning"]
+        assert [
+            item["run"]
+            for item in legacy_parity[
+                "challengers_without_tuning_parity"
+            ]
+        ] == ["legacy_challenger_seed1"]
 
         # 没有调参记录、但已强于调优好的 n-gram：不标记
         # straw-man，只提示仍应补调参来源（更强基线的证据）。
