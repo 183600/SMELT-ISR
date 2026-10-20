@@ -6279,7 +6279,7 @@ def run_statistical_baseline(
         "val_ppl",
         "val_bits_per_byte",
     )
-    metric_higher_is_better = metric_higher_is_better(
+    higher_is_better = metric_higher_is_better(
         tuning_metric
     )
     print(
@@ -6288,7 +6288,7 @@ def run_statistical_baseline(
         f"（来源={tuning_metric_source}，"
         + (
             "越高越好"
-            if metric_higher_is_better
+            if higher_is_better
             else "越低越好"
         )
         + "；test 集不参与）"
@@ -6402,7 +6402,7 @@ def run_statistical_baseline(
         value = float(value)
         return (
             0,
-            -value if metric_higher_is_better else value,
+            -value if higher_is_better else value,
             row["order"],
             row["alpha"],
         )
