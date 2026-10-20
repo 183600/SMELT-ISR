@@ -15816,12 +15816,14 @@ def _attach_power_equivalence(
 
     # 主张「等价」所需的最小对称界：TOST 通过当且仅当
     # (1-2α) 置信区间整体落在 ±margin 内，因此
-    # margin_needed = |Δ̂| + t_{1-α}(df)·se。它把「TOST 未通过」
+    # margin_needed = |Δ̂| + t_{1-α}(df)·se（_t_critical 的
+    # alpha 是双侧口径，故这里传 2α 取到单侧 t_{1-α}）。它把
+    # 「TOST 未通过」
     # 拆成两种完全不同的情况：点估计本身已超出界（效应真实，
     # 加种子只会让「不等价」更确定），还是点估计在界内但噪声
     # 太大（精度不足，加种子可以判定）。不给这个量时，
     # 「TOST 未通过」会被一律读成「两者不同」。
-    critical = _t_critical(df_value)
+    critical = _t_critical(df_value, 2.0 * _SIGNIFICANCE_LEVEL)
     if critical is not None:
         noise_half_width = critical * se_value
         margin_needed = abs(float(delta)) + noise_half_width
@@ -28574,6 +28576,39 @@ def run_self_test():
         ]
         assert isinstance(seeds_to_achieve, int)
         assert seeds_to_achieve > 3
+
+        # 边界一致性：把等价界恰好设为「所需最小界」时，TOST
+        # 的 p 值必须回到显著性水平，界再窄一点点就不再通过。
+        # 这保证 equivalence_margin_needed 与 TOST 判据同源
+        # （用同一个单侧 t 临界值），而不是另一套口径。
+        _se, _df, _delta = 0.2, 5.0, 0.05
+        needed_boundary = (
+            abs(_delta)
+            + _t_critical(_df, 2.0 * _SIGNIFICANCE_LEVEL) * _se
+        )
+        boundary_tost = _tost_test(_delta, _se, _df, needed_boundary)
+        assert boundary_tost
+        assert (
+            abs(
+                float(boundary_tost["tost_p_value"])
+                - _SIGNIFICANCE_LEVEL
+            )
+            < 1e-9
+        )
+        tighter_tost = _tost_test(
+            _delta, _se, _df, needed_boundary * 0.9999
+        )
+        assert tighter_tost
+        assert (
+            float(tighter_tost["tost_p_value"]) > _SIGNIFICANCE_LEVEL
+        )
+        wider_tost = _tost_test(
+            _delta, _se, _df, needed_boundary * 1.0001
+        )
+        assert wider_tost
+        assert (
+            float(wider_tost["tost_p_value"]) < _SIGNIFICANCE_LEVEL
+        )
 
         # 不显著且等价性未确立：展示层必须同时给出
         # 「未显著 ≠ 等价」与 80% 功效 MDE，不能只写「无差异」。
