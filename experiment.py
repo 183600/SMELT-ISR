@@ -3549,6 +3549,7 @@ def probe_data_pipeline(
     batch_size: int = 4,
     batches: int = 2,
     seed: int = 20240607,
+    include_test: bool = False,
 ) -> Dict[str, object]:
     """
     训练前的数据管线完整性质检（中间结果检查）。
@@ -3580,6 +3581,7 @@ def probe_data_pipeline(
         "seq_len": seq_len,
         "train_checked": False,
         "val_fixed_checked": False,
+        "test_fixed_checked": False,
         "split_bounds": {
             split: list(bounds)
             for split, bounds in dataset.split_bounds.items()
@@ -3784,6 +3786,79 @@ def probe_data_pipeline(
             )
     except (AssertionError, RuntimeError, ValueError) as error:
         failures.append(f"验证固定窗口检查抛出异常: {error}")
+
+    # ---- 测试固定窗口：只在最终解封时核对 ----
+    if include_test and dataset.has_test:
+        num_starts = len(dataset.test) - seq_len
+        try:
+            total_batches = min(
+                batches * batch_size,
+                num_starts,
+            )
+            fixed_starts_all = torch.linspace(
+                0,
+                num_starts - 1,
+                steps=total_batches,
+                dtype=torch.float64,
+            ).round().long()
+            fixed_starts = fixed_starts_all[:batch_size]
+
+            expected_x, expected_y = _expected_window_pairs(
+                dataset.test,
+                fixed_starts,
+                seq_len,
+            )
+
+            dataset.clear_eval_batch_cache()
+            x, y = dataset.fixed_eval_batch(
+                "test",
+                0,
+                batches,
+                batch_size,
+                device,
+            )
+
+            report["test_fixed_checked"] = True
+
+            if tuple(x.shape) != tuple(expected_x.shape):
+                failures.append(
+                    "测试固定窗口 x 形状与期望不一致"
+                )
+            elif not torch.equal(x.cpu(), expected_x):
+                failures.append(
+                    "测试固定窗口 x 与原始测试字节不一致"
+                    "（测试输入错位或窗口越界）"
+                )
+
+            if tuple(y.shape) != tuple(expected_y.shape):
+                failures.append(
+                    "测试固定窗口 y 形状与期望不一致"
+                )
+            elif not torch.equal(y.cpu(), expected_y):
+                failures.append(
+                    "测试固定窗口 y 与原始测试字节不一致"
+                    "（测试标签错位）"
+                )
+
+            dataset.clear_eval_batch_cache()
+            repeat_x, repeat_y = dataset.fixed_eval_batch(
+                "test",
+                0,
+                batches,
+                batch_size,
+                device,
+            )
+            if not (
+                torch.equal(x.cpu(), repeat_x.cpu())
+                and torch.equal(y.cpu(), repeat_y.cpu())
+            ):
+                failures.append(
+                    "测试固定窗口重复构建不可复现"
+                )
+        except (AssertionError, RuntimeError, ValueError) as error:
+            failures.append(
+                f"测试固定窗口检查抛出异常: {error}"
+            )
 
     # ---- 群组边界：独立核对「任何群组不跨 split」----
     if dataset.group_separator is not None:
@@ -6840,28 +6915,48 @@ def run_statistical_baseline(
             )
             test_windows = None
         else:
-            # 与神经训练路径同一封存协议：先落 test_started
-            # 记录与持久封条，再访问测试窗口；评估中途崩溃也
-            # 不能重复解封。
-            _write({
-                "step": "test_started",
-                "split": "test",
-                "model": "ngram",
-            })
-            write_test_evaluation_seal(
-                out_dir,
-                {
-                    "dataset_sha256": dataset.data_sha256,
-                    "test_fraction": dataset.test_fraction,
-                    "model": "ngram",
-                },
-            )
-            test_windows = _ngram_eval_batches(
+            test_protocol_check = probe_data_pipeline(
                 dataset,
-                "test",
-                args.batch_size,
-                args.eval_batches,
+                torch.device("cpu"),
+                include_test=True,
             )
+            if not test_protocol_check["ok"]:
+                print(
+                    "[test] 测试集数据管线检查未通过，"
+                    "拒绝解封（不写入 test 记录）："
+                )
+                for failure in test_protocol_check[
+                    "failures"
+                ]:
+                    print(f"  - {failure}")
+                test_windows = None
+            else:
+                # 与神经训练路径同一封存协议：先落
+                # test_started 记录与持久封条，再访问测试
+                # 窗口；评估中途崩溃也不能重复解封。
+                _write({
+                    "step": "test_started",
+                    "split": "test",
+                    "model": "ngram",
+                })
+                write_test_evaluation_seal(
+                    out_dir,
+                    {
+                        "dataset_sha256": (
+                            dataset.data_sha256
+                        ),
+                        "test_fraction": (
+                            dataset.test_fraction
+                        ),
+                        "model": "ngram",
+                    },
+                )
+                test_windows = _ngram_eval_batches(
+                    dataset,
+                    "test",
+                    args.batch_size,
+                    args.eval_batches,
+                )
 
         if test_windows is not None:
             test_metrics = _ngram_extended_metrics(
@@ -6880,6 +6975,7 @@ def run_statistical_baseline(
                 "ngram_tuning_metric": tuning_metric,
                 **test_metrics,
                 "data_audit": test_audit,
+                "data_protocol_check": test_protocol_check,
             })
 
             print(
@@ -20676,6 +20772,21 @@ def run_self_test():
         assert probe_report["ok"], probe_report["failures"]
         assert probe_report["train_checked"]
         assert probe_report["val_fixed_checked"]
+        assert not probe_report["test_fixed_checked"]
+
+        # 只有最终解封时才核对 test 固定窗口；检查不读取
+        # test 内容之外的任何东西，也不改变 split。
+        test_probe_report = probe_data_pipeline(
+            eval_dataset,
+            eval_device,
+            batch_size=4,
+            batches=2,
+            include_test=True,
+        )
+        assert test_probe_report["ok"], (
+            test_probe_report["failures"]
+        )
+        assert test_probe_report["test_fixed_checked"]
 
         # 标签错位必须被探针抓住（sanity check 无法发现这类
         # 数据协议错误：模型可以把错位标签照样背下来）。
@@ -31059,6 +31170,29 @@ def main():
                     "名额未消耗）。请先清洗数据后重跑。"
                 )
             else:
+                # 解封前最后一道中间结果检查：独立核对测试固定
+                # 窗口确实来自 test split、x/y 逐位对齐且可复现。
+                # 检查失败时保持尘封（尚未写 test_started/封条），
+                # 避免在错位标签上消耗唯一一次测试评估名额。
+                test_protocol_check = probe_data_pipeline(
+                    dataset,
+                    device,
+                    include_test=True,
+                )
+                if not test_protocol_check["ok"]:
+                    print(
+                        "[test] 测试集数据管线检查未通过，"
+                        "拒绝解封："
+                    )
+                    for failure in test_protocol_check[
+                        "failures"
+                    ]:
+                        print(f"  - {failure}")
+                    raise SystemExit(
+                        "测试集数据管线检查未通过：请先修复"
+                        "输入/标签错位或窗口越界，再评估测试集。"
+                    )
+
                 # 解封不可回滚：正式评估前先把 test_started 标记
                 # 落盘并 flush。评估中途崩溃时，标记会让同目录的
                 # 后续运行（含 --resume）拒绝再次解封，而不是因为
@@ -31173,6 +31307,9 @@ def main():
                     "step": "test",
                     **test_metrics,
                     "data_audit": test_audit,
+                    "data_protocol_check": (
+                        test_protocol_check
+                    ),
                     "seed": args.seed,
                     "data_sha256": dataset.data_sha256,
                     "script_sha256": run_metadata.get(
