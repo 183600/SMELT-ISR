@@ -6383,7 +6383,12 @@ def _bootstrap_eval_intervals(
     effective_windows = float(n_windows)
     inflation = 1.0
     if rho1 is not None:
-        if rho1 >= 0.999:
+        if rho1 <= 0.0:
+            # 负相关按文档只用于「不缩窄」：AR(1) 公式
+            # n·(1-ρ)/(1+ρ) 在 ρ→-1 时发散甚至除零（完全交替
+            # 的窗口序列 ρ̂1 恰为 -1.0），此时直接取 n。
+            effective_windows = float(n_windows)
+        elif rho1 >= 0.999:
             effective_windows = 1.0
         else:
             effective_windows = max(
@@ -21004,13 +21009,25 @@ def balance_strength_report(
     if len(profiles) < 2:
         return report
 
+    # 均衡强度比较只看施加了均衡压力的臂：balance_coef=0 的
+    # 对照臂强度恒为 0，把它算进极差会让「已按宽度折算 coef」
+    # 的正确做法仍被误报为混杂（其全因子作用由消融覆盖检查
+    # 负责）。少于两个有效臂时无法比较强度，直接返回。
+    active_profiles = [
+        profile
+        for profile in profiles
+        if float(profile["balance_coef"]) > 0.0
+    ]
+    if len(active_profiles) < 2:
+        return report
+
     widths = [
         float(profile["effective_width"])
-        for profile in profiles
+        for profile in active_profiles
     ]
     strengths = [
         float(profile["balance_strength"])
-        for profile in profiles
+        for profile in active_profiles
     ]
     width_span = max(widths) - min(widths)
     strength_span = max(strengths) - min(strengths)
@@ -21033,11 +21050,11 @@ def balance_strength_report(
 
     report["confounded"] = True
     lowest = min(
-        profiles,
+        active_profiles,
         key=lambda item: float(item["balance_strength"]),
     )
     highest = max(
-        profiles,
+        active_profiles,
         key=lambda item: float(item["balance_strength"]),
     )
     ratio = (
@@ -23802,6 +23819,79 @@ def write_jsonl_record(
             )
             + "\n"
         )
+
+
+def _records_at_or_before_step(
+    records: List[Dict[str, object]],
+    step: int,
+) -> List[Dict[str, object]]:
+    """
+    只保留 ``step <= step`` 的数值步记录，供 resume 恢复状态。
+
+    metrics.jsonl 每个评估点都会落盘，但检查点只在存档点写入，
+    两者节奏不一致（如 --eval-interval 2 --save-interval 4）时，
+    崩溃前可能已写入「比 last.pt 更新的步」的评估记录。resume 若
+    把这些尚未重新执行的记录也算进早停/选型/曲线状态，就会加入
+    幻影验证点并产生重复 step；必须按恢复点过滤。非数值 step
+    （reference_baselines / curve_monitor / final 等字符串记录）
+    会由调用方按需自行过滤，这里只保留可比较的数值 step。
+    """
+    threshold = int(step)
+    kept: List[Dict[str, object]] = []
+    for record in records:
+        record_step = record.get("step")
+        if (
+            isinstance(record_step, int)
+            and not isinstance(record_step, bool)
+            and record_step <= threshold
+        ):
+            kept.append(record)
+    return kept
+
+
+def _truncate_metrics_after_step(path: Path, step: int) -> None:
+    """
+    删除 metrics.jsonl 中 step 大于恢复点的数值记录行。
+
+    只重写「需要保留」的行（数值 step <= 恢复点，或非数值 step 的
+    说明性记录如 reference_baselines / curve_monitor），保持其余
+    行字节原样。文件不存在或无需裁剪时不改动。
+    """
+    if not path.exists():
+        return
+    threshold = int(step)
+    kept_lines: List[str] = []
+    dropped = 0
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                kept_lines.append(line)
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                kept_lines.append(line)
+                continue
+            record_step = (
+                record.get("step")
+                if isinstance(record, dict)
+                else None
+            )
+            if (
+                isinstance(record_step, int)
+                and not isinstance(record_step, bool)
+                and record_step > threshold
+            ):
+                dropped += 1
+                continue
+            kept_lines.append(line)
+    if dropped == 0:
+        return
+    temp_path = path.with_name(path.name + ".resume_tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        handle.writelines(kept_lines)
+    os.replace(temp_path, path)
 
 
 def read_metrics_records(path: Path) -> List[Dict[str, object]]:
@@ -28375,6 +28465,32 @@ def run_self_test():
     assert trend_width > shuffled_width
     # ρ̂ 只依赖窗口顺序与数值，与 bootstrap 随机数无关。
     assert float(shuffled_boot["window_effective_windows"]) > 1.0
+
+    # 完全交替的窗口序列 ρ̂1 恰为 -1.0：AR(1) 公式 n·(1-ρ)/(1+ρ)
+    # 在此处除以 0，旧的钳制保留 -1.0 会直接抛 ZeroDivisionError
+    # 中断最终/测试评估。必须安全退化为「不缩窄」（n_eff=n、无膨胀）。
+    alternating_totals = torch.tensor(
+        [10.0, -10.0, 10.0, -10.0, 10.0, -10.0, 10.0, -10.0],
+        dtype=torch.float64,
+    )
+    alternating_boot = _bootstrap_eval_intervals(
+        alternating_totals,
+        trend_tokens,
+        trend_tp,
+        trend_pred,
+        trend_sup,
+        present,
+        replicates=200,
+        seed=11,
+    )
+    assert (
+        float(alternating_boot["window_lag1_autocorrelation"]) == -1.0
+    )
+    assert float(alternating_boot["window_ci_inflation"]) == 1.0
+    assert (
+        float(alternating_boot["window_effective_windows"])
+        == float(alternating_totals.numel())
+    )
 
     # ---- 对比分析：多重比较校正与置信区间 ----
     # Holm step-down（FWER）：m=3 时最小的两个 p 值分别乘以
@@ -36979,8 +37095,14 @@ def main():
     # 训练期间的内存内 metrics 记录（resume 时先载入历史），
     # 每个验证点在线复用 analyze_training_curve；只在状态变化时
     # 打印/记录，训练中途即可发现过拟合、欠拟合或发散。
+    # resume 时只保留恢复点及之前的记录：崩溃前可能已为「比
+    # last.pt 更靠后的步」写入评估记录，把它们算进曲线/早停状态
+    # 会引入幻影验证点（详见 _records_at_or_before_step）。
     curve_records: List[Dict[str, object]] = (
-        read_metrics_records(metrics_path)
+        _records_at_or_before_step(
+            read_metrics_records(metrics_path),
+            start_step,
+        )
         if args.resume is not None
         else []
     )
@@ -37022,7 +37144,10 @@ def main():
             best_selection_step,
             evals_without_improvement,
         ) = early_stop_state_from_records(
-            read_metrics_records(metrics_path),
+            _records_at_or_before_step(
+                read_metrics_records(metrics_path),
+                start_step,
+            ),
             args.early_stop_min_delta,
             metric=args.selection_metric,
         )
@@ -37085,6 +37210,12 @@ def main():
 
     # metrics_file 在整个训练期间持续打开。
     # resume 时追加到原日志末尾；全新训练截断重写。
+    # 追加前先把「比恢复点更靠后的步」的评估记录裁掉：那些记录
+    # 对应的参数更新并未写进 last.pt，重新执行后会在同一 step 上
+    # 产生重复条目，污染后续曲线诊断与 --compare（详见
+    # _records_at_or_before_step）。
+    if args.resume is not None:
+        _truncate_metrics_after_step(metrics_path, start_step)
     metrics_file = open(
         metrics_path,
         "a" if args.resume is not None else "w",
