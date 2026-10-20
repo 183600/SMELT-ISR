@@ -8597,6 +8597,13 @@ def analyze_training_curve(
             "diagnose_non_finite 输出的 nan_diagnosis 记录）。"
         )
 
+    # 警告签名用布尔类别而不是完整文本：文本包含计数/百分比，
+    # 每次验证都会变化，在线监控会退化成每点重复打印。
+    analysis["warning_flags"] = {
+        "nonfinite": bool(nonfinite_steps),
+        "gap_widening": False,
+    }
+
     if (recent_nonfinite or last_eval_nonfinite) and (
         eval_points or train_points
     ):
@@ -8751,6 +8758,9 @@ def analyze_training_curve(
         and generalization_gap_ratio >= _CURVE_GENERALIZATION_GAP
     )
     analysis["gap_widening_warning"] = bool(gap_widening)
+    analysis["warning_flags"]["gap_widening"] = bool(
+        gap_widening
+    )
     if gap_widening:
         warnings.append(
             "泛化 gap 相对首个验证点扩大 "
@@ -8957,17 +8967,20 @@ def monitor_training_curve(
     records: List[Dict[str, object]],
     baseline_loss: Optional[float],
     previous_status: Optional[str],
+    previous_warning_flags: Optional[Dict[str, bool]] = None,
 ) -> Tuple[Dict[str, object], Optional[str]]:
     """
     训练期间的在线曲线监控：每个周期验证点复用
-    analyze_training_curve 的判定，只在状态发生变化时报告。
+    analyze_training_curve 的判定，在状态迁移或警告前兆出现时
+    报告。
 
-    返回 ``(analysis, new_status)``；状态与上一次相同或验证点
-    还不足以判断（``insufficient_data``）时 ``new_status`` 为
-    None，表示不需要重复记录/打印。这样过拟合、欠拟合、
-    双平台（学习率/容量/数据管道问题）或发散能在训练过程中
-    就被发现并采取动作（加正则化、早停、调学习率），而不是
-    等训练全部结束后从最终数值里事后发现。
+    返回 ``(analysis, new_status)``；状态与上一次相同且警告
+    签名没有新增时 ``new_status`` 为 None，表示不需要重复记录/
+    打印。只比较状态会漏掉「状态仍为 healthy、但泛化 gap 已
+    快速扩大」这类前兆——那正是最值得在训练中途介入的时刻，
+    因此 warning_flags 的新增 True 也触发一次报告
+    （``analysis["monitor_trigger"]`` 标为 warning_change）。
+    验证点不足以判断（``insufficient_data``）时不触发。
     """
     analysis = analyze_training_curve(
         records,
@@ -8975,10 +8988,38 @@ def monitor_training_curve(
     )
     status = str(analysis.get("status"))
 
-    if status == "insufficient_data" or status == previous_status:
+    if status == "insufficient_data":
         return analysis, None
 
-    return analysis, status
+    warning_flags = analysis.get("warning_flags")
+    if not isinstance(warning_flags, dict):
+        warning_flags = {}
+    analysis["warning_flags"] = {
+        str(key): bool(value)
+        for key, value in warning_flags.items()
+    }
+
+    if status != previous_status:
+        analysis["monitor_trigger"] = "status_change"
+        return analysis, status
+
+    # 调用方未提供上一次签名时（旧记录/旧调用）不推断新增
+    # 警告，保持「仅状态迁移」的兼容语义。
+    if previous_warning_flags is None:
+        return analysis, None
+
+    previous_flags = previous_warning_flags
+    appeared = [
+        key
+        for key, value in analysis["warning_flags"].items()
+        if value and not bool(previous_flags.get(key, False))
+    ]
+    if appeared:
+        analysis["monitor_trigger"] = "warning_change"
+        analysis["new_warning_flags"] = appeared
+        return analysis, status
+
+    return analysis, None
 
 
 def selection_improved(
@@ -25240,6 +25281,51 @@ def run_self_test():
     )
     assert early_status is None
 
+    # 状态不变但警告前兆出现时也必须触发：泛化 gap 快速扩大
+    # 而验证损失尚未回升时，状态仍是 healthy，旧实现会把这条
+    # 最值得介入的警告静默吞掉。
+    gap_monitor_records = [
+        {"step": 10, "train_loss": 4.0, "val_loss": 5.0},
+        {"step": 20, "train_loss": 3.8, "val_loss": 4.8},
+        {"step": 30, "train_loss": 3.6, "val_loss": 4.6},
+        {"step": 40, "train_loss": 2.8, "val_loss": 4.5},
+        {"step": 50, "train_loss": 2.0, "val_loss": 4.45},
+    ]
+    gap_initial, gap_initial_status = monitor_training_curve(
+        gap_monitor_records[:3],
+        baseline,
+        None,
+    )
+    assert gap_initial_status == "healthy", gap_initial
+    assert gap_initial["warning_flags"] == {
+        "nonfinite": False,
+        "gap_widening": False,
+    }, gap_initial
+
+    gap_warning, gap_warning_status = monitor_training_curve(
+        gap_monitor_records[:4],
+        baseline,
+        "healthy",
+        gap_initial["warning_flags"],
+    )
+    assert gap_warning_status == "healthy", gap_warning
+    assert (
+        gap_warning["monitor_trigger"] == "warning_change"
+    ), gap_warning
+    assert gap_warning["warning_flags"]["gap_widening"] is True
+    assert "gap_widening" in gap_warning[
+        "new_warning_flags"
+    ], gap_warning
+
+    # 同一警告类别已经报过时，后续验证点不重复触发。
+    _, repeated_gap_status = monitor_training_curve(
+        gap_monitor_records[:5],
+        baseline,
+        "healthy",
+        gap_warning["warning_flags"],
+    )
+    assert repeated_gap_status is None
+
     # 早停状态恢复：最优值与连续未改善次数必须与历史一致。
     (
         early_best,
@@ -34343,15 +34429,23 @@ def main():
         else []
     )
     last_curve_status: Optional[str] = None
+    last_curve_warning_flags: Optional[Dict[str, bool]] = None
     if curve_records:
-        prior_status = str(
-            analyze_training_curve(
-                curve_records,
-                baseline_loss=curve_baseline_loss,
-            ).get("status")
+        prior_analysis = analyze_training_curve(
+            curve_records,
+            baseline_loss=curve_baseline_loss,
         )
+        prior_status = str(prior_analysis.get("status"))
         if prior_status != "insufficient_data":
             last_curve_status = prior_status
+            prior_flags = prior_analysis.get(
+                "warning_flags"
+            )
+            if isinstance(prior_flags, dict):
+                last_curve_warning_flags = {
+                    str(key): bool(value)
+                    for key, value in prior_flags.items()
+                }
 
     # 近期有限梯度范数窗口：NaN/Inf 诊断用失败前的梯度水平
     # 判断「梯度爆炸/学习率过大」是否有证据。
@@ -34741,16 +34835,28 @@ def main():
                 curve_records,
                 curve_baseline_loss,
                 last_curve_status,
+                last_curve_warning_flags,
             )
             if live_status is not None:
                 previous_status = last_curve_status
                 last_curve_status = live_status
+                prior_flags = live_analysis.get(
+                    "warning_flags"
+                )
+                if isinstance(prior_flags, dict):
+                    last_curve_warning_flags = {
+                        str(key): bool(value)
+                        for key, value in prior_flags.items()
+                    }
                 print_curve_analysis(live_analysis)
                 metrics_file.write(
                     json.dumps(
                         _json_safe({
                             "step": "curve_monitor",
-                            "trigger": "status_change",
+                            "trigger": live_analysis.get(
+                                "monitor_trigger",
+                                "status_change",
+                            ),
                             "previous_status": previous_status,
                             "reference_baseline_loss":
                                 curve_baseline_loss,
