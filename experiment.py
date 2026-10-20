@@ -2915,6 +2915,7 @@ class ByteDataset:
         device: Optional[torch.device] = None,
         group_separator: Optional[bytes] = None,
         deduplicate_train_groups: bool = False,
+        drop_train_corrupt_groups: bool = False,
     ):
         data_path = Path(filename)
 
@@ -2975,6 +2976,16 @@ class ByteDataset:
                 "没有显式的群组边界就无法在不改动 val/test 的"
                 "前提下做内容级去重"
             )
+
+        if drop_train_corrupt_groups and group_separator is None:
+            raise ValueError(
+                "drop_train_corrupt_groups 需要 group_separator："
+                "没有显式的群组边界就无法在不改动 val/test 的"
+                "前提下整组剔除标签噪声"
+            )
+        self.drop_train_corrupt_groups = bool(
+            drop_train_corrupt_groups
+        )
 
         # 训练集清洗（可选的群组级去重）：只剔除 train 中与
         # val/test 或更早训练群组完全重复的群组。被剔除的字节
@@ -3049,32 +3060,92 @@ class ByteDataset:
             "test": (n_val_end, len(tokens)),
         }
 
+        dedup_excluded: List[Tuple[int, int]] = []
+        dedup_stats: Optional[Dict[str, object]] = None
+
         if deduplicate_train_groups:
-            excluded, cleaning_stats = _plan_train_group_dedup(
-                self._raw_buffer,
-                group_separator,
-                n_train,
-                {
-                    "val": (n_train, n_val_end),
-                    "test": (n_val_end, len(tokens)),
-                },
+            dedup_excluded, dedup_stats = (
+                _plan_train_group_dedup(
+                    self._raw_buffer,
+                    group_separator,
+                    n_train,
+                    {
+                        "val": (n_train, n_val_end),
+                        "test": (n_val_end, len(tokens)),
+                    },
+                )
             )
-            merged_excluded = _merge_byte_intervals(excluded)
-            if merged_excluded != excluded:
-                raise AssertionError(
-                    "训练集清洗区间必须有序且互不重叠："
-                    "内部错误，拒绝继续"
+
+        corrupt_excluded: List[Tuple[int, int]] = []
+        corrupt_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_corrupt_groups:
+            corrupt_excluded, corrupt_stats = (
+                _plan_train_corruption_cleaning(
+                    self._raw_buffer,
+                    group_separator,
+                    n_train,
+                    dedup_excluded,
                 )
-            if any(
-                start < 0 or end > n_train or end <= start
+            )
+
+        combined_excluded = sorted(
+            dedup_excluded + corrupt_excluded
+        )
+        merged_excluded = _merge_byte_intervals(
+            combined_excluded
+        )
+        if merged_excluded != combined_excluded:
+            raise AssertionError(
+                "训练集清洗区间必须有序且互不重叠："
+                "内部错误，拒绝继续"
+            )
+        if any(
+            start < 0 or end > n_train or end <= start
+            for start, end in merged_excluded
+        ):
+            raise AssertionError(
+                "训练集清洗区间越出 train split："
+                "内部错误，拒绝继续"
+            )
+
+        if dedup_stats is not None or corrupt_stats is not None:
+            dropped_bytes = sum(
+                end - start
                 for start, end in merged_excluded
+            )
+            if dedup_stats is not None:
+                combined_stats = dict(dedup_stats)
+            else:
+                combined_stats = dict(corrupt_stats or {})
+
+            if corrupt_stats is not None:
+                combined_stats["corruption"] = corrupt_stats
+
+            if (
+                dedup_stats is not None
+                and corrupt_stats is not None
             ):
-                raise AssertionError(
-                    "训练集清洗区间越出 train split："
-                    "内部错误，拒绝继续"
+                combined_stats["groups_dropped"] = (
+                    int(dedup_stats["groups_dropped"])
+                    + int(corrupt_stats["groups_dropped"])
                 )
-            self.train_excluded_spans = excluded
-            self.train_cleaning = cleaning_stats
+                combined_stats["groups_kept"] = (
+                    int(dedup_stats["groups_total"])
+                    - int(combined_stats["groups_dropped"])
+                )
+                combined_stats["policy"] = (
+                    "drop train groups duplicated in val/test or "
+                    "earlier in train, and train groups containing "
+                    "invalid UTF-8/NUL bytes; val/test untouched"
+                )
+
+            combined_stats["dropped_bytes"] = dropped_bytes
+            combined_stats["post_clean_train_bytes"] = (
+                n_train - dropped_bytes
+            )
+            self.train_excluded_spans = merged_excluded
+            self.train_cleaning = combined_stats
 
         self.train = tokens[:n_train]
         self.val = tokens[n_train:n_val_end]
@@ -3112,7 +3183,7 @@ class ByteDataset:
             )
             if not valid_intervals:
                 raise ValueError(
-                    "训练集群组去重后没有剩余任何合法训练窗口："
+                    "训练集群组清洗后没有剩余任何合法训练窗口："
                     "清洗比例过高（几乎全部训练群组都与 val/test "
                     "重复或互为重复），请检查语料/群组分隔符，"
                     "而不是在去重后继续训练"
@@ -4558,6 +4629,96 @@ def _scan_text_integrity(
         "utf8_replacements": replacements,
         "nul_bytes": nul_bytes,
     }
+
+
+def _plan_train_corruption_cleaning(
+    raw: bytearray,
+    separator: bytes,
+    train_end: int,
+    already_excluded: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划训练集标签噪声清洗：只从 train 中剔除「整组包含非法
+    UTF-8 或 NUL 字节」的群组，绝不改动 val/test。
+
+    字节级语言模型的监督位就是原始字节，无法解码的字节或 NUL
+    就是标签噪声。这里整组剔除而不是修补字节：修补会凭空发明
+    标签，整组剔除则能保证该群组不会以任何窗口形式进入训练。
+    判定口径与 audit_data_splits 的文本完整性扫描一致（逐群组
+    独立解码，不把用户配置的分隔符计入损坏）。已经被去重清洗
+    剔除的群组不会重复扫描/统计。
+    """
+    excluded_set = set(already_excluded)
+    excluded: List[Tuple[int, int]] = []
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "policy": (
+            "drop train groups containing invalid UTF-8 or NUL "
+            "bytes; val/test untouched"
+        ),
+        "groups_total": 0,
+        "groups_scanned": 0,
+        "groups_already_excluded": 0,
+        "groups_dropped": 0,
+        "dropped_bytes": 0,
+        "groups_with_invalid_utf8": 0,
+        "groups_with_nul": 0,
+        "invalid_utf8_replacements": 0,
+        "nul_bytes": 0,
+        "examples": [],
+    }
+
+    for span_start, span_end in _iter_group_spans(
+        raw,
+        separator,
+        0,
+        train_end,
+    ):
+        stats["groups_total"] += 1
+
+        if (span_start, span_end) in excluded_set:
+            stats["groups_already_excluded"] += 1
+            continue
+
+        stats["groups_scanned"] += 1
+        integrity = _scan_text_integrity(
+            memoryview(raw),
+            span_start,
+            span_end - span_start,
+            final=True,
+            warmup=False,
+        )
+
+        if (
+            integrity["utf8_replacements"] <= 0
+            and integrity["nul_bytes"] <= 0
+        ):
+            continue
+
+        if integrity["utf8_replacements"] > 0:
+            stats["groups_with_invalid_utf8"] += 1
+        if integrity["nul_bytes"] > 0:
+            stats["groups_with_nul"] += 1
+
+        stats["invalid_utf8_replacements"] += integrity[
+            "utf8_replacements"
+        ]
+        stats["nul_bytes"] += integrity["nul_bytes"]
+        stats["groups_dropped"] += 1
+        stats["dropped_bytes"] += span_end - span_start
+        excluded.append((span_start, span_end))
+        if len(stats["examples"]) < 5:
+            stats["examples"].append([
+                span_start,
+                span_end,
+                integrity["utf8_replacements"],
+                integrity["nul_bytes"],
+            ])
+
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
 
 
 def _group_content_duplicate_audit(
@@ -7581,6 +7742,13 @@ def run_statistical_baseline(
                 getattr(
                     args,
                     "deduplicate_train_groups",
+                    False,
+                )
+            ),
+            "drop_train_corrupt_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_corrupt_groups",
                     False,
                 )
             ),
@@ -11884,6 +12052,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    "drop_train_corrupt_groups",
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
@@ -11912,6 +12081,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    "drop_train_corrupt_groups",
     "allow_data_leakage",
     "batch_size",
     "eval_batches",
@@ -12299,6 +12469,9 @@ def build_comparison_protocol(
         "deduplicate_train_groups": bool(
             getattr(args, "deduplicate_train_groups", False)
         ),
+        "drop_train_corrupt_groups": bool(
+            getattr(args, "drop_train_corrupt_groups", False)
+        ),
         "allow_data_leakage": bool(
             getattr(args, "allow_data_leakage", False)
         ),
@@ -12425,6 +12598,11 @@ def experiment_protocol_from_payload(
         ),
         "deduplicate_train_groups": bool(
             run_args.get("deduplicate_train_groups", False)
+            if has_training
+            else False
+        ),
+        "drop_train_corrupt_groups": bool(
+            run_args.get("drop_train_corrupt_groups", False)
             if has_training
             else False
         ),
@@ -20138,6 +20316,13 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_corrupt_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_corrupt_groups",
+                    False,
+                )
+            ),
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
             ),
@@ -22384,6 +22569,122 @@ def run_self_test():
     assert dedup_probe["ok"], dedup_probe["failures"]
     assert dedup_probe["train_cleaning_checked"]
     assert dedup_probe["group_boundaries_checked"]
+
+    # 训练集标签噪声清洗：只整组剔除 train 中含非法 UTF-8/NUL
+    # 的群组，val/test 的字节与切分位置完全不变；清洗后的窗口
+    # 采样、统计基线口径与审计必须一致。
+    corrupt_groups = [
+        b"A" * 10,
+        b"B" * 10,
+        b"\xff" + b"C" * 9,
+        b"D" * 10,
+        b"E" * 10,
+        b"F" * 10,
+    ]
+    corrupt_payload = separator.join(corrupt_groups) + separator
+    with tempfile.NamedTemporaryFile() as corrupt_clean_file:
+        corrupt_clean_file.write(corrupt_payload)
+        corrupt_clean_file.flush()
+
+        raw_corrupt_dataset = ByteDataset(
+            corrupt_clean_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+        )
+        cleaned_corrupt_dataset = ByteDataset(
+            corrupt_clean_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+            deduplicate_train_groups=True,
+            drop_train_corrupt_groups=True,
+        )
+
+        raw_corrupt_audit = audit_data_splits(
+            raw_corrupt_dataset,
+            include_test=True,
+        )
+        cleaned_corrupt_audit = audit_data_splits(
+            cleaned_corrupt_dataset,
+            include_test=True,
+        )
+
+    assert raw_corrupt_audit["splits"]["train"][
+        "utf8_replacements"
+    ] > 0
+    assert not enforce_strict_data_audit(raw_corrupt_audit)
+
+    assert cleaned_corrupt_dataset.split_bounds == (
+        raw_corrupt_dataset.split_bounds
+    )
+    assert cleaned_corrupt_dataset.train_excluded_spans == [
+        (24, 34)
+    ]
+    assert cleaned_corrupt_dataset.train_cleaning[
+        "groups_dropped"
+    ] == 1
+    assert cleaned_corrupt_dataset.train_cleaning[
+        "dropped_duplicate_of"
+    ] == {"val": 0, "test": 0, "train": 0}
+    assert cleaned_corrupt_dataset.train_cleaning[
+        "corruption"
+    ]["groups_dropped"] == 1
+    assert cleaned_corrupt_dataset.train_cleaning[
+        "corruption"
+    ]["groups_with_invalid_utf8"] == 1
+    assert cleaned_corrupt_dataset.effective_train_bytes == 38
+    assert cleaned_corrupt_dataset.train_num_valid_starts == 22
+
+    cleaned_corrupt_x, _ = cleaned_corrupt_dataset.batch(
+        "train",
+        32,
+        torch.Generator().manual_seed(11),
+        eval_device,
+    )
+    assert 255 not in set(cleaned_corrupt_x.flatten().tolist())
+
+    cleaned_corrupt_counts = (
+        cleaned_corrupt_dataset.effective_train_byte_counts()
+    )
+    assert int(cleaned_corrupt_counts.sum()) == 38
+    assert int(cleaned_corrupt_counts[ord("C")]) == 0
+
+    cleaned_ngram = NgramBaseline(
+        cleaned_corrupt_dataset.train,
+        max_order=2,
+        exclude_spans=(
+            cleaned_corrupt_dataset.train_excluded_spans
+        ),
+    )
+    assert cleaned_ngram.train_total == 38
+
+    cleaned_reference = compute_reference_baselines(
+        cleaned_corrupt_dataset,
+        batch_size=2,
+        batches=1,
+        device=eval_device,
+    )
+    assert cleaned_reference["unigram_train_bytes"] == 38
+
+    assert cleaned_corrupt_audit["splits"]["train"][
+        "utf8_replacements"
+    ] == 0
+    assert enforce_strict_data_audit(cleaned_corrupt_audit)
+    assert cleaned_corrupt_audit["leakage_violations"] == []
+
+    cleaned_corrupt_probe = probe_data_pipeline(
+        cleaned_corrupt_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert cleaned_corrupt_probe["ok"], cleaned_corrupt_probe[
+        "failures"
+    ]
+    assert cleaned_corrupt_probe["train_cleaning_checked"]
 
     # 名义位置不落在边界上时必须吸附到最近的群组边界。
     separator_five = b"<END>"
@@ -29639,6 +29940,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-corrupt-groups",
+        action="store_true",
+        help=(
+            "训练集标签噪声清洗（需要 --group-separator）："
+            "只从 train 中整组剔除包含非法 UTF-8 或 NUL 字节"
+            "的群组，被剔除的字节不进入训练窗口、n-gram/"
+            "参考基线或分布审计；val/test 的字节与切分位置"
+            "完全不变。用于实际清洗标签噪声，而不只是拒绝"
+            "或告警"
+        ),
+    )
+    parser.add_argument(
         "--strict-data-audit",
         action="store_true",
         help=(
@@ -30762,6 +31075,26 @@ def main():
                 )
                 args.deduplicate_train_groups = saved_dedup
 
+        # 标签噪声清洗同样改变实际参与训练的样本集合，是采样
+        # 轨迹的一部分；按存档恢复，避免续跑悄悄换回含损坏标签
+        # 的另一套训练数据。
+        if "drop_train_corrupt_groups" in saved_args:
+            saved_corrupt_drop = bool(
+                saved_args.get("drop_train_corrupt_groups")
+            )
+            if saved_corrupt_drop != bool(
+                args.drop_train_corrupt_groups
+            ):
+                print(
+                    "resume restored drop_train_corrupt_groups "
+                    f"{bool(args.drop_train_corrupt_groups)} -> "
+                    f"{saved_corrupt_drop} (训练集清洗是采样轨迹"
+                    "的一部分)"
+                )
+                args.drop_train_corrupt_groups = (
+                    saved_corrupt_drop
+                )
+
         # seed 决定数据采样顺序与初始化噪声，是采样轨迹的
         # 核心变量；resume 时按存档恢复，避免续跑换了随机流。
         saved_seed = saved_args.get("seed")
@@ -30867,6 +31200,16 @@ def main():
             "val/test"
         )
 
+    if (
+        args.drop_train_corrupt_groups
+        and group_separator_bytes is None
+    ):
+        parser.error(
+            "--drop-train-corrupt-groups 需要 --group-separator："
+            "没有显式群组边界时无法只清洗 train 而不改动 "
+            "val/test"
+        )
+
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
@@ -30880,6 +31223,9 @@ def main():
             group_separator=group_separator_bytes,
             deduplicate_train_groups=(
                 args.deduplicate_train_groups
+            ),
+            drop_train_corrupt_groups=(
+                args.drop_train_corrupt_groups
             ),
         )
     except (OSError, ValueError) as error:
