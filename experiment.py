@@ -9274,6 +9274,13 @@ def run_statistical_baseline(
                     False,
                 )
             ),
+            "drop_train_corrupt_bytes": bool(
+                getattr(
+                    args,
+                    "drop_train_corrupt_bytes",
+                    False,
+                )
+            ),
             "drop_train_degenerate_groups": bool(
                 getattr(
                     args,
@@ -9281,9 +9288,17 @@ def run_statistical_baseline(
                     False,
                 )
             ),
+            "allow_data_leakage": bool(
+                getattr(args, "allow_data_leakage", False)
+            ),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
             "data_sha256": dataset.data_sha256,
+            # 与神经运行相同：逐 split 内容指纹用于核对
+            # ngram 与神经运行是否真的看到同一组 train/val/test
+            # 字节段；只比整体文件指纹无法发现群组吸附/清洗/
+            # 切分实现差异。
+            "split_sha256": dict(dataset.split_sha256) or None,
         },
         "args": {
             key: value
@@ -15899,30 +15914,25 @@ def experiment_protocol_from_payload(
             data.get("group_separator"),
             run_args.get("group_separator"),
         ),
+        # 数据清洗/泄露豁免对统计基线同样生效：ByteDataset 在
+        # 两个入口之前统一构建，ngram 也读取清洗后的 train 与
+        # 泄露审计结果。旧运行没有记录这些键时才回退 False，
+        # 不能因为「ngram 没有优化器」就丢弃它实际使用的数据
+        # 口径。
         "deduplicate_train_groups": bool(
             run_args.get("deduplicate_train_groups", False)
-            if has_training
-            else False
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
-            if has_training
-            else False
         ),
         "drop_train_corrupt_bytes": bool(
             run_args.get("drop_train_corrupt_bytes", False)
-            if has_training
-            else False
         ),
         "drop_train_degenerate_groups": bool(
             run_args.get("drop_train_degenerate_groups", False)
-            if has_training
-            else False
         ),
         "allow_data_leakage": bool(
             run_args.get("allow_data_leakage", False)
-            if has_training
-            else False
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
@@ -32434,6 +32444,41 @@ def run_self_test():
         "drop_train_corrupt_bytes"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    # 旧 ngram 运行的 comparison_protocol 缺少清洗/泄露键时，
+    # 必须从 args 回填它实际使用的数据口径；不能因为统计基线
+    # 没有优化器就把这些键一律当成 False，否则会伪造「与神经
+    # 运行口径一致」。
+    legacy_statistical_protocol = experiment_protocol_from_payload({
+        "config": {"mode": "ngram"},
+        "args": {
+            "seed": 7,
+            "deduplicate_train_groups": True,
+            "drop_train_corrupt_groups": True,
+            "drop_train_corrupt_bytes": True,
+            "drop_train_degenerate_groups": True,
+            "allow_data_leakage": True,
+        },
+        "data": {
+            "sha256": "deadbeef",
+            "split_sha256": {"train": "a", "val": "b", "test": "c"},
+        },
+        "comparison_protocol": {
+            "comparison_family": "statistical",
+            "data_sha256": "deadbeef",
+        },
+    })
+    assert (
+        legacy_statistical_protocol["comparison_family"]
+        == "statistical"
+    )
+    for key in (
+        "deduplicate_train_groups",
+        "drop_train_corrupt_groups",
+        "drop_train_corrupt_bytes",
+        "drop_train_degenerate_groups",
+        "allow_data_leakage",
+    ):
+        assert legacy_statistical_protocol[key] is True, key
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
             name: str,
