@@ -88,6 +88,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `config.data.split_fractions` 记录清洗后的真实训练口径。训练期只用
   切分边界核对 test 占比（不读 test 内容）；解封前独立探针再核对
   test 固定窗口的输入/标签逐位对齐。
+- **跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
+  群组分隔符）用与审计相同的内容定义分块指纹，把与 val/test 共享
+  连续字节块的整个训练群组从 train 剔除；val/test 字节、切分位置与
+  内容指纹逐位不变，清洗后同一审计必须归零。它补上「精确群组指纹
+  抓不到嵌入片段」的空档，与 `--deduplicate-train-groups` 可叠加。
 - **连续字节流标签噪声清洗**：无群组分隔符时，
   `--drop-train-corrupt-bytes` 只从 train 剔除非法 UTF-8 字节与
   NUL 字节本身（不修补、不发明标签），val/test 字节与切分位置
@@ -95,6 +100,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   分块与分布审计，`data_audit.effective_bytes` 与
   `config.data.train_cleaning` 记录清洗口径。有群组边界时应使用
   `--drop-train-corrupt-groups` 以保持群组完整。
+- **连续字节流异常值清洗**：无群组分隔符时，
+  `--drop-train-degenerate-runs` 只从 train 剔除长度达到阈值
+  （64B）的单一字节连续段（填充、重复字符、错误拼接的常见形态），
+  同样不修补字节；`data_audit.degenerate_runs` 记录退化段计数、
+  字节数与最大段长，清洗后归零。有群组边界时应使用
+  `--drop-train-degenerate-groups` 以保持群组完整。
 - **分布偏移硬门**：`--max-byte-shift` / `--max-bigram-shift` /
   `--max-conditional-shift` 可把字节、二元组、条件标签 JS 距离
   变成显式阈值；train/val（解封时含 test）任一对 split 超限即
@@ -104,6 +115,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
   解封且不写 test 记录。默认只警告，便于先诊断再清洗。
+- **测试集标签完整性硬门**：test 不参与任何清洗，因此带标签噪声的
+  test 上得出的最终指标不可信。解封时（神经与统计基线两条路径）
+  只要 test 存在越界 token、非法 UTF-8 或 NUL 就默认拒绝解封；
+  只有显式传入 `--allow-corrupt-test-labels` 才会放行，且豁免写入
+  `config.json` 与对比协议。分布偏移阈值对统计基线解封同样生效。
 - **扫描覆盖与残余风险**：窗口签名扫描在窗口数超过上限时按 stride
   等间距抽样，因此「未发现跨 split 重复窗口」只是采样范围内的负
   结果。`data_audit.leakage_scan_coverage` 记录各 split 的

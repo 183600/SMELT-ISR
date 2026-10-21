@@ -2991,6 +2991,7 @@ class ByteDataset:
         drop_train_corrupt_groups: bool = False,
         drop_train_corrupt_bytes: bool = False,
         drop_train_degenerate_groups: bool = False,
+        drop_train_degenerate_runs: bool = False,
     ):
         data_path = Path(filename)
 
@@ -3083,6 +3084,20 @@ class ByteDataset:
             )
         self.drop_train_corrupt_bytes = bool(
             drop_train_corrupt_bytes
+        )
+
+        if (
+            drop_train_degenerate_runs
+            and group_separator is not None
+        ):
+            raise ValueError(
+                "drop_train_degenerate_runs 仅用于无 "
+                "--group-separator 的连续字节流；有群组边界时"
+                "请使用 --drop-train-degenerate-groups 以保持"
+                "群组完整"
+            )
+        self.drop_train_degenerate_runs = bool(
+            drop_train_degenerate_runs
         )
 
         if (
@@ -3249,6 +3264,20 @@ class ByteDataset:
                 n_train,
             )
 
+        degenerate_run_excluded: List[Tuple[int, int]] = []
+        degenerate_run_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_degenerate_runs:
+            (
+                degenerate_run_excluded,
+                degenerate_run_stats,
+            ) = _plan_train_degenerate_run_cleaning(
+                self._raw_buffer,
+                n_train,
+                _AUDIT_DEGENERATE_RUN_MIN_BYTES,
+                corrupt_byte_excluded,
+            )
+
         degenerate_excluded: List[Tuple[int, int]] = []
         degenerate_stats: Optional[Dict[str, object]] = None
 
@@ -3266,21 +3295,20 @@ class ByteDataset:
                 )
             )
 
-        combined_excluded = sorted(
-            dedup_excluded
-            + shared_chunk_excluded
-            + corrupt_excluded
-            + corrupt_byte_excluded
-            + degenerate_excluded
-        )
-        merged_excluded = _merge_byte_intervals(
-            combined_excluded
-        )
-        if merged_excluded != combined_excluded:
-            raise AssertionError(
-                "训练集清洗区间必须有序且互不重叠："
-                "内部错误，拒绝继续"
+        # 不同清洗项可能产生相邻区间（例如损坏字节后面紧跟
+        # 退化段）；相邻区间合并是等价的排除集合，因此这里统一
+        # 归并，而不是要求各规划器拼出的列表恰好首尾不相接。
+        combined_excluded = _merge_byte_intervals(
+            sorted(
+                dedup_excluded
+                + shared_chunk_excluded
+                + corrupt_excluded
+                + corrupt_byte_excluded
+                + degenerate_run_excluded
+                + degenerate_excluded
             )
+        )
+        merged_excluded = combined_excluded
         if any(
             start < 0 or end > n_train or end <= start
             for start, end in merged_excluded
@@ -3296,6 +3324,7 @@ class ByteDataset:
             or corrupt_stats is not None
             or degenerate_stats is not None
             or corrupt_byte_stats is not None
+            or degenerate_run_stats is not None
         ):
             dropped_bytes = sum(
                 end - start
@@ -3355,6 +3384,10 @@ class ByteDataset:
                 )
             if degenerate_stats is not None:
                 combined_stats["degenerate"] = degenerate_stats
+            if degenerate_run_stats is not None:
+                combined_stats["degenerate_runs"] = (
+                    degenerate_run_stats
+                )
 
             cleaning_kinds: List[str] = []
             if dedup_stats is not None:
@@ -3367,6 +3400,8 @@ class ByteDataset:
                 cleaning_kinds.append("degenerate")
             if corrupt_byte_stats is not None:
                 cleaning_kinds.append("corrupt_bytes")
+            if degenerate_run_stats is not None:
+                cleaning_kinds.append("degenerate_runs")
             combined_stats["cleaning_kinds"] = cleaning_kinds
 
             policy_parts: List[str] = []
@@ -3382,6 +3417,12 @@ class ByteDataset:
             if corrupt_byte_stats is not None:
                 policy_parts.append(
                     "drop train bytes with invalid UTF-8 or NUL"
+                )
+            if degenerate_run_stats is not None:
+                policy_parts.append(
+                    "drop train byte runs of one value with "
+                    "length >= "
+                    f"{_AUDIT_DEGENERATE_RUN_MIN_BYTES}"
                 )
             combined_stats["policy"] = (
                 "; ".join(policy_parts)
@@ -4400,6 +4441,11 @@ _AUDIT_NUL_WARN = 1e-4
 _AUDIT_DEGENERATE_GROUP_MIN_BYTES = 64
 _AUDIT_DEGENERATE_GROUP_TOP_SHARE = 0.99
 
+# 无群组连续字节流的异常值：长度至少为该值的同字节连续段
+# 视为低信息/退化段（填充、错误拼接），可用
+# --drop-train-degenerate-runs 只从 train 剔除。
+_AUDIT_DEGENERATE_RUN_MIN_BYTES = 64
+
 # 实际 split 比例相对名义值漂移超过该幅度（且绝对差
 # 至少 _AUDIT_SPLIT_FRACTION_MIN_ABS）时告警：群组边界
 # 吸附可能把验证/测试集缩小到名义比例的一小部分。
@@ -5374,6 +5420,142 @@ def _plan_train_degenerate_cleaning(
     return excluded, stats
 
 
+def _degenerate_run_spans(
+    raw: memoryview,
+    begin: int,
+    end: int,
+    min_bytes: int,
+) -> List[Tuple[int, int, int]]:
+    """返回 [begin, end) 内长度 >= min_bytes 的同字节连续段。"""
+    spans: List[Tuple[int, int, int]] = []
+    position = begin
+
+    while position < end:
+        value = raw[position]
+        stop = position + 1
+        while stop < end and raw[stop] == value:
+            stop += 1
+        if stop - position >= min_bytes:
+            spans.append((position, stop, int(value)))
+        position = stop
+
+    return spans
+
+
+def _plan_train_degenerate_run_cleaning(
+    raw: bytearray,
+    train_end: int,
+    min_bytes: int,
+    already_excluded: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划无群组连续字节流的训练集异常值清洗：只从 train 剔除
+    长度达到阈值的单一字节连续段（填充、重复字符、错误拼接的
+    常见形态），绝不修补字节，也绝不动 val/test。
+
+    与群组版异常值清洗同一防御目标；连续流没有群组边界，
+    只能按退化段本身剔除。与已经被其他清洗剔除的区间重叠的
+    段不重复统计，避免组合清洗区间重叠。
+    """
+    merged_excluded = _merge_byte_intervals(
+        list(already_excluded)
+    )
+    excluded: List[Tuple[int, int]] = []
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "scope": "bytes",
+        "policy": (
+            f"drop train byte runs of one value with length "
+            f">= {min_bytes}; val/test untouched"
+        ),
+        "min_bytes": min_bytes,
+        "runs_dropped": 0,
+        "dropped_bytes": 0,
+        "max_run_bytes": 0,
+        "examples": [],
+    }
+
+    for start, end, value in _degenerate_run_spans(
+        memoryview(raw),
+        0,
+        train_end,
+        min_bytes,
+    ):
+        if any(
+            start < excluded_end and end > excluded_start
+            for excluded_start, excluded_end in merged_excluded
+        ):
+            continue
+
+        stats["runs_dropped"] += 1
+        stats["dropped_bytes"] += end - start
+        stats["max_run_bytes"] = max(
+            int(stats["max_run_bytes"]),
+            end - start,
+        )
+        excluded.append((start, end))
+        if len(stats["examples"]) < 5:
+            stats["examples"].append([
+                start,
+                end,
+                value,
+            ])
+
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
+
+
+def _train_degenerate_run_audit(
+    dataset: ByteDataset,
+) -> Optional[Dict[str, object]]:
+    """
+    无群组连续字节流的训练集异常值审计：统计长度达到阈值的
+    同字节连续段。只看 train，并跳过已被清洗剔除的区间；
+    val/test 不参与统计。清洗需要显式
+    --drop-train-degenerate-runs。
+    """
+    if dataset.group_separator is not None:
+        return None
+
+    begin, end = dataset.split_bounds["train"]
+    intervals = _subtract_byte_intervals(
+        begin,
+        end,
+        dataset.train_excluded_spans,
+    )
+    stats: Dict[str, object] = {
+        "min_bytes": _AUDIT_DEGENERATE_RUN_MIN_BYTES,
+        "runs": 0,
+        "degenerate_bytes": 0,
+        "max_run_bytes": 0,
+        "examples": [],
+    }
+
+    for interval_begin, interval_end in intervals:
+        for start, stop, value in _degenerate_run_spans(
+            dataset._raw,
+            interval_begin,
+            interval_end,
+            _AUDIT_DEGENERATE_RUN_MIN_BYTES,
+        ):
+            stats["runs"] += 1
+            stats["degenerate_bytes"] += stop - start
+            stats["max_run_bytes"] = max(
+                int(stats["max_run_bytes"]),
+                stop - start,
+            )
+            if len(stats["examples"]) < 5:
+                stats["examples"].append([
+                    start,
+                    stop,
+                    value,
+                ])
+
+    return stats
+
+
 def _plan_train_shared_chunk_cleaning(
     raw: bytearray,
     separator: bytes,
@@ -6206,6 +6388,22 @@ def audit_data_splits(
                 violations.append(message)
                 leakage_violations.append(message)
 
+    degenerate_runs = _train_degenerate_run_audit(dataset)
+
+    if (
+        degenerate_runs is not None
+        and degenerate_runs["runs"] > 0
+    ):
+        warnings.append(
+            "train: 检测到 "
+            f"{degenerate_runs['runs']} 个低信息/退化连续段"
+            "（长度 >= "
+            f"{degenerate_runs['min_bytes']}B 的单一字节段，"
+            f"共 {degenerate_runs['degenerate_bytes']} 字节，"
+            "疑似填充/重复字符污染/异常值）；可检查后用 "
+            "--drop-train-degenerate-runs 只清洗 train"
+        )
+
     content_chunks = _content_chunk_duplicate_audit(
         dataset,
         split_names,
@@ -6243,6 +6441,7 @@ def audit_data_splits(
         "duplicate_windows": duplicate_windows,
         "leakage_scan_coverage": scan_coverage,
         "content_chunks": content_chunks,
+        "degenerate_runs": degenerate_runs,
         "groups": groups_report,
         "warnings": warnings,
         "violations": violations,
@@ -10160,6 +10359,13 @@ def run_statistical_baseline(
                 getattr(
                     args,
                     "drop_train_degenerate_groups",
+                    False,
+                )
+            ),
+            "drop_train_degenerate_runs": bool(
+                getattr(
+                    args,
+                    "drop_train_degenerate_runs",
                     False,
                 )
             ),
@@ -16125,6 +16331,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
+    "drop_train_degenerate_runs",
     # 源文件指纹相同不等于实际进入各 split 的字节段相同：
     # 群组吸附、清洗实现或切分代码变化都会改变 train/val/test
     # 的内容。逐 split 指纹把「同一文件 + 同一比例」背后的
@@ -16166,6 +16373,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
+    "drop_train_degenerate_runs",
     "allow_data_leakage",
     "batch_size",
     "eval_batches",
@@ -16687,6 +16895,9 @@ def build_comparison_protocol(
         "drop_train_degenerate_groups": bool(
             getattr(args, "drop_train_degenerate_groups", False)
         ),
+        "drop_train_degenerate_runs": bool(
+            getattr(args, "drop_train_degenerate_runs", False)
+        ),
         "allow_data_leakage": bool(
             getattr(args, "allow_data_leakage", False)
         ),
@@ -16868,6 +17079,9 @@ def experiment_protocol_from_payload(
         ),
         "drop_train_degenerate_groups": bool(
             run_args.get("drop_train_degenerate_groups", False)
+        ),
+        "drop_train_degenerate_runs": bool(
+            run_args.get("drop_train_degenerate_runs", False)
         ),
         "allow_data_leakage": bool(
             run_args.get("allow_data_leakage", False)
@@ -27414,6 +27628,13 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_degenerate_runs": bool(
+                getattr(
+                    args,
+                    "drop_train_degenerate_runs",
+                    False,
+                )
+            ),
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
             ),
@@ -30640,6 +30861,141 @@ def run_self_test():
         batches=1,
     )
     assert shared_probe["ok"], shared_probe["failures"]
+
+    # 无群组连续字节流的异常值清洗：只从 train 剔除长同字节
+    # 退化段（填充/重复字符污染），val/test 的字节与切分位置
+    # 完全不变；长段不得跨 split 被「修补」。
+    run_rng = random.Random(20241024)
+    run_symbols = (
+        b"abcdefghijklmnopqrstuvwxyz"
+        b"ABCDEFGHIJKLMNOPQRSTUVWXY"
+    )
+
+    def _run_random(length: int) -> bytes:
+        return bytes(
+            run_rng.choice(run_symbols) for _ in range(length)
+        )
+
+    run_payload = (
+        _run_random(64)
+        + b"\x00" * 200
+        + _run_random(640)
+        + b"\x5a" * 96
+        + _run_random(1400)
+    )
+    assert len(run_payload) == 2400
+    with tempfile.NamedTemporaryFile() as run_file:
+        run_file.write(run_payload)
+        run_file.flush()
+
+        raw_run_dataset = ByteDataset(
+            run_file.name,
+            seq_len=8,
+            val_fraction=0.1,
+            test_fraction=0.1,
+        )
+        cleaned_run_dataset = ByteDataset(
+            run_file.name,
+            seq_len=8,
+            val_fraction=0.1,
+            test_fraction=0.1,
+            drop_train_degenerate_runs=True,
+        )
+
+        raw_run_audit = audit_data_splits(
+            raw_run_dataset,
+            include_test=True,
+        )
+        cleaned_run_audit = audit_data_splits(
+            cleaned_run_dataset,
+            include_test=True,
+        )
+
+        try:
+            ByteDataset(
+                run_file.name,
+                seq_len=8,
+                val_fraction=0.1,
+                test_fraction=0.1,
+                group_separator=separator,
+                drop_train_degenerate_runs=True,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "drop_train_degenerate_runs 必须拒绝群组模式："
+                "否则会改动群组边界内的字节"
+            )
+
+    assert raw_run_dataset.split_bounds == {
+        "train": (0, 1920),
+        "val": (1920, 2160),
+        "test": (2160, 2400),
+    }
+    assert raw_run_audit["degenerate_runs"]["runs"] == 2
+    assert raw_run_audit["degenerate_runs"]["degenerate_bytes"] == 296
+    assert any(
+        "退化连续段" in warning
+        for warning in raw_run_audit["warnings"]
+    )
+    assert (
+        cleaned_run_dataset.split_bounds
+        == raw_run_dataset.split_bounds
+    )
+    assert cleaned_run_dataset.train_excluded_spans == [
+        (64, 264),
+        (904, 1000),
+    ]
+    assert cleaned_run_dataset.train_cleaning[
+        "cleaning_kinds"
+    ] == ["degenerate_runs"]
+    assert cleaned_run_dataset.train_cleaning[
+        "degenerate_runs"
+    ]["runs_dropped"] == 2
+    assert cleaned_run_dataset.train_cleaning[
+        "degenerate_runs"
+    ]["dropped_bytes"] == 296
+    assert cleaned_run_dataset.effective_train_bytes == 1624
+    for split_name in ("val", "test"):
+        assert (
+            cleaned_run_dataset.split_sha256[split_name]
+            == raw_run_dataset.split_sha256[split_name]
+        )
+    assert cleaned_run_audit["degenerate_runs"]["runs"] == 0
+    assert enforce_strict_data_audit(cleaned_run_audit)
+    assert cleaned_run_audit["leakage_violations"] == []
+
+    cleaned_run_x, _ = cleaned_run_dataset.batch(
+        "train",
+        64,
+        torch.Generator().manual_seed(17),
+        eval_device,
+    )
+    cleaned_run_values = set(
+        cleaned_run_x.flatten().tolist()
+    )
+    assert 0 not in cleaned_run_values
+    assert 90 not in cleaned_run_values
+
+    cleaned_run_ngram = NgramBaseline(
+        cleaned_run_dataset.train,
+        max_order=2,
+        exclude_spans=(
+            cleaned_run_dataset.train_excluded_spans
+        ),
+    )
+    assert cleaned_run_ngram.train_total == 1624
+
+    cleaned_run_probe = probe_data_pipeline(
+        cleaned_run_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert cleaned_run_probe["ok"], cleaned_run_probe["failures"]
+
+    assert grouped_audit["degenerate_runs"] is None
 
     # 训练集标签噪声清洗：只整组剔除 train 中含非法 UTF-8/NUL
     # 的群组，val/test 的字节与切分位置完全不变；清洗后的窗口
@@ -43081,6 +43437,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-degenerate-runs",
+        action="store_true",
+        help=(
+            "训练集异常值清洗（无 --group-separator 的连续"
+            "字节流）：只从 train 中剔除长度 >= "
+            f"{_AUDIT_DEGENERATE_RUN_MIN_BYTES}B 的单一字节"
+            "连续段（填充/重复字符污染），val/test 的字节与"
+            "切分位置完全不变；有群组边界时请改用 "
+            "--drop-train-degenerate-groups"
+        ),
+    )
+    parser.add_argument(
         "--strict-data-audit",
         action="store_true",
         help=(
@@ -44453,6 +44821,21 @@ def main():
                     saved_degenerate_drop
                 )
 
+        if "drop_train_degenerate_runs" in saved_args:
+            saved_run_drop = bool(
+                saved_args.get("drop_train_degenerate_runs")
+            )
+            if saved_run_drop != bool(
+                args.drop_train_degenerate_runs
+            ):
+                print(
+                    "resume restored drop_train_degenerate_runs "
+                    f"{bool(args.drop_train_degenerate_runs)} -> "
+                    f"{saved_run_drop} (训练集清洗是采样轨迹"
+                    "的一部分)"
+                )
+                args.drop_train_degenerate_runs = saved_run_drop
+
         # seed 决定数据采样顺序与初始化噪声，是采样轨迹的
         # 核心变量；resume 时按存档恢复，避免续跑换了随机流。
         saved_seed = saved_args.get("seed")
@@ -44687,6 +45070,16 @@ def main():
             "train 而不改动 val/test"
         )
 
+    if (
+        args.drop_train_degenerate_runs
+        and group_separator_bytes is not None
+    ):
+        parser.error(
+            "--drop-train-degenerate-runs 仅用于无 "
+            "--group-separator 的连续字节流；有群组边界时请用 "
+            "--drop-train-degenerate-groups 以保持群组完整"
+        )
+
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
@@ -44712,6 +45105,9 @@ def main():
             ),
             drop_train_degenerate_groups=(
                 args.drop_train_degenerate_groups
+            ),
+            drop_train_degenerate_runs=(
+                args.drop_train_degenerate_runs
             ),
         )
     except (OSError, ValueError) as error:

@@ -79,6 +79,12 @@ val/test 的字节与切分位置保持不变。被剔除内容不会进入神�
 切分比例与清洗统计。训练期审计只用切分边界核对 test 实际占比，不读取
 test 内容；解封前还会独立核对 test 固定窗口的输入/标签是否逐位对齐。
 
+**跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
+`--group-separator`）按内容定义分块指纹，把与 val/test 共享连续字节块
+的整个训练群组剔除，val/test 的字节、切分位置与内容指纹逐位不变；
+清洗后同一审计必须归零。它补上精确群组指纹抓不到的「嵌入片段」空档，
+可与 `--deduplicate-train-groups` 叠加。
+
 **连续字节流的标签噪声清洗**：没有群组分隔符时，可用
 `--drop-train-corrupt-bytes` 只从 train 中剔除无法按 UTF-8 解码的
 字节与 NUL 字节本身（不做任何字节修补）；val/test 的字节与切分位置
@@ -86,6 +92,13 @@ test 内容；解封前还会独立核对 test 固定窗口的输入/标签是�
 审计，`data_audit.effective_bytes` 与 `config.data.train_cleaning`
 记录实际清洗口径。有 `--group-separator` 时请改用
 `--drop-train-corrupt-groups`，避免破坏群组完整性。
+
+**连续字节流的异常值清洗**：没有群组分隔符时，可用
+`--drop-train-degenerate-runs` 只从 train 中剔除长度达到阈值（64B）
+的单一字节连续段（填充/重复字符/错误拼接的常见形态），同样不做字节
+修补；`data_audit.degenerate_runs` 记录退化段计数、字节数与最大段长，
+清洗后归零。有 `--group-separator` 时请改用
+`--drop-train-degenerate-groups`，避免破坏群组完整性。
 
 **默认泄露硬门**：审计一旦发现跨 split 重复窗口或重复群组（泄露级
 问题），训练入口会直接拒绝启动；解封测试集时发现同类问题也会拒绝
@@ -98,10 +111,13 @@ test 内容；解封前还会独立核对 test 固定窗口的输入/标签是�
 （穷尽扫描）可兜底被 stride 漏掉的错位重复。越界 token、超阈值的
 UTF-8/NUL 损坏等标签噪声由
 `--strict-data-audit` 控制：加上后同样拒绝训练/解封；默认仅警告并继续，
-方便先看清数据问题再决定清洗策略。若希望把分布偏移也变成硬门，可显式
-设置 `--max-byte-shift` / `--max-bigram-shift` / `--max-conditional-shift`
+方便先看清数据问题再决定清洗策略。test 不参与任何清洗，因此解封时
+只要 test 存在越界 token、非法 UTF-8 或 NUL 就默认拒绝解封（神经与
+统计基线两条路径一致），只有显式传入 `--allow-corrupt-test-labels`
+才放行，豁免写入配置。若希望把分布偏移也变成硬门，可显式设置
+`--max-byte-shift` / `--max-bigram-shift` / `--max-conditional-shift`
 （JS 距离，0~1）：train/val 或解封时任意一对 split 超过对应阈值就拒绝
-训练/拒绝解封；不设置时保留警告模式。
+训练/拒绝解封（统计基线解封同样受此约束）；不设置时保留警告模式。
 
 训练期间每次刷新最优验证损失都会把权重写入 `best.pt`。训练结束后的
 `final` 与唯一一次测试集评估都在这份「验证集选定」的模型上进行
