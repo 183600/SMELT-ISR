@@ -6721,6 +6721,8 @@ def _bootstrap_eval_intervals(
       类按 F1=0 计入，区间会系统性偏低，甚至不覆盖点估计；
     - 重采样不进入训练、选型或超参数决策，只用于报告
       「测试集只评估一次」时点估计本身的抽样误差；
+    - AR(1) 方差膨胀是一阶近似，膨胀后的区间会夹到指标的
+      物理取值域（loss≥0、ppl≥1、比例类∈[0,1]）；
     - 只覆盖混淆矩阵口径的指标；AUC 等排序指标未纳入。
 
     返回的键不带 split 前缀，由 ``evaluate`` 统一加前缀。
@@ -6810,6 +6812,17 @@ def _bootstrap_eval_intervals(
         "window_ci_inflation": inflation,
     }
 
+    # 指标的物理取值域：AR(1) 膨胀是一阶近似，膨胀后可能
+    # 把区间推到指标不可能出现的范围（如负准确率、loss<0）。
+    # 写出报告前夹回域内，避免读者把不可能的边界当成有效
+    # 估计；夹取只放宽到域边界，不会把区间缩窄到点估计之外。
+    metric_bounds = {
+        "loss": (0.0, None),
+        "ppl": (1.0, None),
+        "token_accuracy": (0.0, 1.0),
+        "macro_f1": (0.0, 1.0),
+    }
+
     for name, values in (
         ("loss", sampled_loss),
         ("ppl", sampled_ppl),
@@ -6824,6 +6837,11 @@ def _bootstrap_eval_intervals(
             half_width = (high - low) / 2.0 * inflation
             low = midpoint - half_width
             high = midpoint + half_width
+        lower_bound, upper_bound = metric_bounds[name]
+        if lower_bound is not None:
+            low = max(low, lower_bound)
+        if upper_bound is not None:
+            high = min(high, upper_bound)
         result[f"{name}_ci95_low"] = low
         result[f"{name}_ci95_high"] = high
 
