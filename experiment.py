@@ -15605,9 +15605,14 @@ def _window_per_token_loss(
         loss_sum, bool
     ):
         return None
+    if not math.isfinite(float(tokens)):
+        return None
+    if not math.isfinite(float(loss_sum)):
+        return None
     if float(tokens) <= 0.0:
         return None
-    return float(loss_sum) / float(tokens)
+    value = float(loss_sum) / float(tokens)
+    return value if math.isfinite(value) else None
 
 
 def _window_accuracy(
@@ -15621,9 +15626,16 @@ def _window_accuracy(
         correct, bool
     ):
         return None
+    if not math.isfinite(float(tokens)):
+        return None
+    if not math.isfinite(float(correct)):
+        return None
     if float(tokens) <= 0.0:
         return None
-    return float(correct) / float(tokens)
+    if float(correct) < 0.0 or float(correct) > float(tokens):
+        return None
+    value = float(correct) / float(tokens)
+    return value if math.isfinite(value) else None
 
 
 def _paired_window_bootstrap_ci(
@@ -15729,20 +15741,37 @@ def paired_window_comparison(
 
     loss_differences: List[float] = []
     accuracy_differences: List[float] = []
-    for window_a, window_b in zip(windows_a, windows_b):
+    invalid_loss_windows: List[int] = []
+    for index, (window_a, window_b) in enumerate(
+        zip(windows_a, windows_b)
+    ):
         loss_a = _window_per_token_loss(window_a)
         loss_b = _window_per_token_loss(window_b)
         if loss_a is not None and loss_b is not None:
-            loss_differences.append(loss_b - loss_a)
+            difference = loss_b - loss_a
+            if math.isfinite(difference):
+                loss_differences.append(difference)
+            else:
+                invalid_loss_windows.append(index)
+        else:
+            invalid_loss_windows.append(index)
         accuracy_a = _window_accuracy(window_a)
         accuracy_b = _window_accuracy(window_b)
         if accuracy_a is not None and accuracy_b is not None:
             accuracy_differences.append(accuracy_b - accuracy_a)
 
-    if not loss_differences:
+    if invalid_loss_windows:
         return {
             "status": "missing_windows",
-            "reason": "窗口记录缺少损失/命中信息，无法逐窗口配对",
+            "invalid_window_indices": invalid_loss_windows,
+            "reason": (
+                "窗口记录缺少有效损失或损失非有限（窗口下标："
+                + ", ".join(
+                    str(index) for index in invalid_loss_windows
+                )
+                + "）：无法完整逐窗口配对，不能只对剩余窗口"
+                "选择性比较"
+            ),
         }
 
     n_windows = len(loss_differences)
@@ -30785,6 +30814,24 @@ def run_self_test():
         assert "split_sha256" in window_split_mismatch[
             "mismatched_keys"
         ]
+
+        # 个别窗口记录损坏或损失非有限时不能静默丢弃、只对
+        # 剩余窗口做配对：这会选择性缩小样本且可能污染均值。
+        invalid_window_b = _window_payload(
+            "deadbeef", [3.0, 3.1, 3.2]
+        )
+        invalid_window_b["windows"][0]["loss_sum"] = float("nan")
+        invalid_window_b["windows"][1].pop("loss_sum")
+        invalid_window_result = paired_window_comparison(
+            _window_payload("deadbeef", [4.0, 4.1, 4.2]),
+            invalid_window_b,
+        )
+        assert invalid_window_result["status"] == "missing_windows"
+        assert invalid_window_result["invalid_window_indices"] == [
+            0,
+            1,
+        ]
+        assert "不能只对剩余窗口" in invalid_window_result["reason"]
 
         # 没有窗口记录时（旧运行）必须显式说明不可用，不能静默
         # 当成「没有差异」。
