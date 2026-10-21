@@ -19830,27 +19830,68 @@ def _baseline_tuning_axis_error(
     报告仍可能因为学习率轴有 winner 而被读回，但缺失轴并没有
     被调过参。调用方不能把这种不完整报告当成「基线已充分调参」
     的证据。单轴旧报告没有 axes 字段，返回 None 保持兼容。
+
+    完整报告的 ``axes`` 含逐轴 winner；写入 config.json 的紧凑
+    来源记录不重复保存完整轴记录，只保存 ``axis_winners`` 与
+    ``recommended_config``——此时逐个核对推荐配置里的轴是否都有
+    winner，避免紧凑记录绕过同一检查。
     """
+    multi_axis = (
+        record.get("multi_axis") is True
+        or record.get("design") == "coordinate"
+    )
     axis_reports = record.get("axes")
-    if not isinstance(axis_reports, list) or not axis_reports:
+    if axis_reports is not None:
+        if not isinstance(axis_reports, list):
+            return "调参报告的 axes 格式非法：无法核对每个轴是否都有 winner"
+        if not axis_reports:
+            if multi_axis:
+                return "调参报告声明为多轴设计但 axes 为空：无法核对调参轴"
+            return None
+        for axis_report in axis_reports:
+            if not isinstance(axis_report, dict):
+                return "调参报告的轴记录格式非法：无法核对每个轴是否都有 winner"
+            key = axis_report.get("protocol_key")
+            if not isinstance(key, str) or not key:
+                return "调参报告存在缺少 protocol_key 的轴记录：无法核对调参轴"
+            axis_winner = axis_report.get("winner")
+            if (
+                not isinstance(axis_winner, dict)
+                or axis_winner.get("value") is None
+            ):
+                label = str(axis_report.get("label", key))
+                return (
+                    f"调参报告的轴 {label}（{key}）没有有效 winner："
+                    "该轴没有可用的候选结果，推荐配置只是回退到"
+                    "基线值，不能作为该轴已调参的证据"
+                )
         return None
-    for axis_report in axis_reports:
-        if not isinstance(axis_report, dict):
-            return "调参报告的轴记录格式非法：无法核对每个轴是否都有 winner"
-        key = axis_report.get("protocol_key")
-        if not isinstance(key, str) or not key:
-            return "调参报告存在缺少 protocol_key 的轴记录：无法核对调参轴"
-        axis_winner = axis_report.get("winner")
-        if (
-            not isinstance(axis_winner, dict)
-            or axis_winner.get("value") is None
-        ):
-            label = str(axis_report.get("label", key))
-            return (
-                f"调参报告的轴 {label}（{key}）没有有效 winner："
-                "该轴没有可用的候选结果，推荐配置只是回退到"
-                "基线值，不能作为该轴已调参的证据"
-            )
+
+    if not multi_axis:
+        return None
+
+    axis_winners = record.get("axis_winners")
+    recommended = record.get("recommended_config")
+    if not isinstance(axis_winners, dict) or not axis_winners:
+        return "调参报告声明为多轴设计但缺少 axis_winners：无法核对调参轴"
+    if not isinstance(recommended, dict) or not recommended:
+        return (
+            "多轴调参来源缺少 recommended_config：无法核对推荐配置"
+            "中的每个轴是否都有 winner"
+        )
+    missing = [
+        str(name)
+        for name in recommended
+        if name not in axis_winners
+        or axis_winners.get(name) is None
+    ]
+    if missing:
+        return (
+            "多轴调参来源缺少轴 "
+            + ", ".join(missing)
+            + " 的有效 winner：推荐配置在该轴只是回退到基线值，"
+            "该轴实际没有调参证据"
+        )
     return None
 
 
@@ -33969,6 +34010,7 @@ def run_self_test():
             "weight_decay": 0.2,
         }
         assert multi_record["recommended_config_evaluated"] is False
+        assert _baseline_tuning_axis_error(multi_record) is None
 
         # 某个轴没有 winner 的坐标式报告不能作为来源：推荐配置
         # 在该轴只是回退到基线值，实际没有调过该轴。
@@ -33994,8 +34036,33 @@ def run_self_test():
         assert "dense_fnn_hidden" in incomplete_error
         assert "没有有效 winner" in incomplete_error
 
-        incomplete_record = dict(multi_record)
-        incomplete_record["axes"] = incomplete_axes
+        # 声明为多轴但 axes 整个缺失时，不能退回只看 lr 的旧
+        # 单轴逻辑。
+        missing_axes_report = dict(multi_report)
+        missing_axes_report.pop("axes")
+        missing_axes_error = baseline_tuning_provenance_error(
+            missing_axes_report,
+            mode="dense",
+            lr=1e-4,
+            steps=100,
+            data_sha256="deadbeef",
+            batch_size=8,
+            protocol=multi_protocol,
+        )
+        assert missing_axes_error is not None
+        assert "axes" in missing_axes_error
+
+        # 实际落盘的是紧凑来源记录（没有完整 axes）：缺失轴
+        # 必须通过 axis_winners 与 recommended_config 的差集
+        # 被发现，不能因为记录里没有 axes 就放行。
+        incomplete_record = baseline_tuning_provenance_record(
+            incomplete_report,
+            "incomplete_tuning.json",
+        )
+        assert incomplete_record["multi_axis"] is True
+        assert "dense_fnn_hidden" not in incomplete_record[
+            "axis_winners"
+        ]
         incomplete_adequacy_path = _write_analysis_run(
             "incomplete_axis_seed1",
             "dense",
@@ -36958,6 +37025,19 @@ def baseline_tuning_provenance_error(
         )
 
     winner = payload.get("winner") or {}
+
+    # 完整调参报告必须带 axes：紧凑来源记录（config.json 里的
+    # baseline_tuning）虽然也没有 axes，但它不是 --baseline-tuning-
+    # from 读取的报告。多轴报告缺 axes 时不能退回只看 winner.lr
+    # 的旧单轴逻辑，否则其余轴完全没有被核对。
+    if (
+        payload.get("multi_axis") is True
+        or payload.get("design") == "coordinate"
+    ) and "axes" not in payload:
+        return (
+            "调参报告声明为多轴设计但缺少 axes：无法逐轴核对"
+            "推荐配置是否真的复用于基线训练，不能只核对学习率"
+        )
 
     axis_error = _baseline_tuning_axis_error(payload)
     if axis_error is not None:
