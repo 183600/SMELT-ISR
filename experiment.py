@@ -14943,7 +14943,7 @@ _COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
 # 或 recall；这些指标同样会被 checkpoint 选择抬高。因此凡是
 # 周期验证实际计算的 val 指标，都生成一份共同步数派生指标。
 _COMMON_STEP_METRIC_SUFFIX = "_at_common_step"
-_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+_COMMON_STEP_CORE_BASE_METRICS: Tuple[str, ...] = (
     "val_loss",
     "val_ppl",
     "val_bits_per_byte",
@@ -14959,6 +14959,20 @@ _COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
     "val_precision_weighted",
     "val_recall_macro",
     "val_recall_weighted",
+)
+# 排序指标（PR-AUC / lift / ROC-AUC）默认只在 final/test 计算；
+# 显式选为选型指标或传 --periodic-auc 时，周期验证也会写出这些
+# 键。它们同样需要避开 checkpoint 选型偏差的共同步数口径——
+# 极度不平衡时项目建议以 PR-AUC 判定，若只有 final 版本，
+# 判定指标恰恰是最容易被选型抬高、又没有无偏复核的那个。
+_COMMON_STEP_OPTIONAL_BASE_METRICS: Tuple[str, ...] = (
+    "val_pr_auc_macro",
+    "val_pr_auc_macro_lift",
+    "val_roc_auc_macro",
+)
+_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+    _COMMON_STEP_CORE_BASE_METRICS
+    + _COMMON_STEP_OPTIONAL_BASE_METRICS
 )
 _COMMON_STEP_METRICS: Tuple[str, ...] = tuple(
     base + _COMMON_STEP_METRIC_SUFFIX
@@ -15316,8 +15330,11 @@ def annotate_common_step_metrics(
     - 命中共有评估步则精确取值，否则在相邻评估点间线性插值；
     - 覆盖周期验证实际计算的全部 val 指标：loss / ppl / bpb /
       token accuracy / micro、macro、weighted F1 / precision /
-      recall。AUC 与路由诊断只在最终评估计算，没有周期曲线，
-      不能伪造共同步数口径；
+      recall；若运行把 PR-AUC / lift / ROC-AUC 选为选型指标或
+      显式传了 ``--periodic-auc``，周期记录里也会有这些排序
+      指标，同样生成共同步数派生口径。没有任何运行写出某个
+      排序指标时跳过该项，不把「没算」写成「缺失」。
+      路由诊断只在最终评估计算，不能伪造共同步数口径；
     - 这是分析期派生指标，不用于训练期选型/早停；可直接作为
       ``--compare-metric`` 或预注册主指标。
 
@@ -15418,6 +15435,16 @@ def annotate_common_step_metrics(
                 })
                 continue
             curves[index] = points
+
+        # 排序指标是可选周期指标：本轮没有任何运行计算它们时
+        # 直接跳过，不生成空报告，也不把「没算」混进
+        # incomplete 告警。只要至少一个运行有记录，缺记录的
+        # 运行仍会进入 excluded_runs 并如实披露。
+        if (
+            base_metric in _COMMON_STEP_OPTIONAL_BASE_METRICS
+            and not curves
+        ):
+            continue
 
         metric_runs: List[Dict[str, object]] = []
         for index, points in curves.items():
@@ -16571,6 +16598,15 @@ _SELECTION_METRIC_KEYS = tuple(
         *_COMMON_STEP_METRICS,
     }
 )
+
+# 排序指标：周期验证默认不算；被选为选型指标或显式
+# --periodic-auc 时按与 final/test 相同的固定窗口与排序口径
+# 计算。集中定义避免三处字符串列表漂移。
+_AUC_METRIC_KEYS = frozenset({
+    "val_pr_auc_macro",
+    "val_pr_auc_macro_lift",
+    "val_roc_auc_macro",
+})
 
 # 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
 # 才计算的 AUC），但不含路由诊断与共同步数派生指标——调参
@@ -33829,6 +33865,160 @@ def run_self_test():
             "val_macro_f1_at_common_step",
             metric_common,
         )["applicable"]
+        # 没有周期排序指标时不能凭空生成 AUC 共同步数报告。
+        assert (
+            "val_pr_auc_macro_at_common_step"
+            not in metric_common["metric_reports"]
+        )
+
+    # 排序指标（PR-AUC / lift / ROC-AUC）同样需要共同步数无偏
+    # 口径：极度不平衡时项目建议以 PR-AUC 判定，若只有 final
+    # 版本，判定指标恰好是会被 checkpoint 选型抬高的那个。
+    for base in (
+        "val_pr_auc_macro",
+        "val_pr_auc_macro_lift",
+        "val_roc_auc_macro",
+    ):
+        derived = base + "_at_common_step"
+        assert derived in COMPARISON_METRIC_KEYS, derived
+        assert derived not in _SELECTION_METRIC_KEYS, derived
+        assert derived not in _NGRAM_TUNING_METRIC_KEYS, derived
+    assert (
+        _TRIVIAL_REFERENCE_FIELDS[
+            "val_pr_auc_macro_at_common_step"
+        ]
+        == "unigram_pr_auc_macro_chance"
+    )
+    assert (
+        _TRIVIAL_REFERENCE_FIELDS[
+            "val_pr_auc_macro_lift_at_common_step"
+        ]
+        == "unigram_pr_auc_macro_lift"
+    )
+    with tempfile.TemporaryDirectory() as auc_dir:
+        auc_paths = []
+        for name, curve in (
+            (
+                "short",
+                [
+                    (10, 0.30, 0.20, 0.60),
+                    (20, 0.40, 0.30, 0.70),
+                ],
+            ),
+            (
+                "long",
+                [
+                    (10, 0.25, 0.15, 0.55),
+                    (20, 0.35, 0.25, 0.65),
+                    (30, 0.45, 0.35, 0.75),
+                ],
+            ),
+        ):
+            run_dir = Path(auc_dir) / name
+            run_dir.mkdir()
+            with open(
+                run_dir / "config.json",
+                "w", encoding="utf-8",
+            ) as f:
+                json.dump(
+                    {
+                        "config": {"mode": "A"},
+                        "args": {"seed": 1},
+                    },
+                    f,
+                )
+            for step, pr_auc, lift, roc_auc in curve:
+                write_jsonl_record(
+                    run_dir / "metrics.jsonl",
+                    {
+                        "step": step,
+                        "val_loss": 1.0,
+                        "val_pr_auc_macro": pr_auc,
+                        "val_pr_auc_macro_lift": lift,
+                        "val_roc_auc_macro": roc_auc,
+                    },
+                )
+            write_jsonl_record(
+                run_dir / "metrics.jsonl",
+                {
+                    "step": "final",
+                    "val_loss": 0.5,
+                    "val_pr_auc_macro": 0.99,
+                    "val_pr_auc_macro_lift": 0.89,
+                    "val_roc_auc_macro": 0.99,
+                    "selected_model": "best_val",
+                    "selected_step": 20,
+                    "trained_steps": 20,
+                },
+            )
+            auc_paths.append(str(run_dir))
+
+        auc_rows = compare_runs(auc_paths)
+        auc_common = annotate_common_step_metrics(auc_rows)
+        auc_by_run = {
+            str(row["run"]): row for row in auc_rows
+        }
+        assert abs(
+            float(
+                auc_by_run["short"][
+                    "val_pr_auc_macro_at_common_step"
+                ]
+            )
+            - 0.40
+        ) < 1e-12
+        assert abs(
+            float(
+                auc_by_run["long"][
+                    "val_pr_auc_macro_at_common_step"
+                ]
+            )
+            - 0.35
+        ) < 1e-12
+        assert abs(
+            float(
+                auc_by_run["short"][
+                    "val_pr_auc_macro_lift_at_common_step"
+                ]
+            )
+            - 0.30
+        ) < 1e-12
+        assert abs(
+            float(
+                auc_by_run["long"][
+                    "val_roc_auc_macro_at_common_step"
+                ]
+            )
+            - 0.65
+        ) < 1e-12
+        # final 的 0.99 不能混入共同步数口径。
+        assert auc_by_run["short"][
+            "val_pr_auc_macro_at_common_step"
+        ] != auc_by_run["short"]["val_pr_auc_macro"]
+        pr_auc_bias = selection_bias_report(
+            auc_rows,
+            "val_pr_auc_macro",
+            auc_common,
+        )
+        assert pr_auc_bias["applicable"]
+        assert pr_auc_bias["unbiased_metric"] == (
+            "val_pr_auc_macro_at_common_step"
+        )
+        assert pr_auc_bias["unbiased_runs"] == 2
+        assert pr_auc_bias["advisory"]
+        lift_bias = selection_bias_report(
+            auc_rows,
+            "val_pr_auc_macro_lift",
+            auc_common,
+        )
+        assert lift_bias["unbiased_metric"] == (
+            "val_pr_auc_macro_lift_at_common_step"
+        )
+        assert "val_pr_auc_macro_at_common_step" in (
+            auc_common["metric_reports"]
+        )
+        assert "val_roc_auc_macro_at_common_step" in (
+            auc_common["metric_reports"]
+        )
 
     # ---- local_base 均衡强度折算 ----
     # 第二轮实际宽度 min(n_experts, k1*k2) 只用于计算量对齐；
@@ -43342,7 +43532,19 @@ def main():
             "周期验证中可计算时默认跟随主指标）：按宏观 F1 "
             "判定成败时若仍按 val_loss 选型，最终模型并不是"
             "按假设口径选出来的。可选范围限于周期验证实际"
-            "计算的指标（AUC 与路由诊断只在最终评估计算）"
+            "计算的指标（AUC 默认只在最终评估计算；选为"
+            "选型指标或加 --periodic-auc 后可在周期验证计算）"
+        ),
+    )
+    parser.add_argument(
+        "--periodic-auc",
+        action="store_true",
+        help=(
+            "在每个周期验证点计算与 final/test 同口径的 "
+            "PR-AUC / lift / ROC-AUC（额外前向开销）。用于"
+            "生成避开 checkpoint 选型偏差的 "
+            "<metric>_at_common_step 排序指标；AUC 已被选为"
+            "--selection-metric 时自动启用，无需重复传"
         ),
     )
     parser.add_argument(
@@ -46493,11 +46695,11 @@ def main():
                 # final/test 完全相同的排序口径计算；否则
                 # eval_metrics 缺键，checkpoint 永远不会被
                 # 选型更新，最终回退到最后一步参数。
-                compute_auc=args.selection_metric
-                in (
-                    "val_pr_auc_macro",
-                    "val_pr_auc_macro_lift",
-                    "val_roc_auc_macro",
+                # --periodic-auc 让不按 AUC 选型的运行也能
+                # 记录周期排序指标，供共同步数无偏复核。
+                compute_auc=(
+                    args.selection_metric in _AUC_METRIC_KEYS
+                    or bool(getattr(args, "periodic_auc", False))
                 ),
             )
             # 同一步已有 nan_diagnosis 时合并而不是覆盖。

@@ -488,9 +488,16 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   accuracy / micro、macro、weighted F1 / precision / recall）
   生成 `<metric>_at_common_step` 派生指标：在各运行最后一个
   周期验证步的最小值处精确取值或线性插值，不经过选型，可作为
-  `--compare-metric` 做聚合、显著性检验与因子效应。AUC 与路由
-  诊断只在最终评估计算，没有周期曲线，不伪造该口径；旧运行
-  缺周期指标时显式列入未覆盖而不是虚报。
+  `--compare-metric` 做聚合、显著性检验与因子效应。PR-AUC /
+  lift / ROC-AUC 默认只在最终评估计算；把它们选为
+  `--selection-metric` 或显式传 `--periodic-auc` 后，周期验证
+  也按相同固定窗口与排序口径记录，因而同样有
+  `<metric>_at_common_step` 无偏口径。极度不平衡时项目建议
+  以 PR-AUC 判定——若判定指标只有 final 版本，它恰好是最容易
+  被 checkpoint 选型抬高、却没有无偏复核的那个。没有任何运行
+  记录某个周期排序指标时跳过该项，不把「没算」写成「缺失」；
+  路由诊断只在最终评估计算，不伪造该口径；旧运行缺周期指标
+  时显式列入未覆盖而不是虚报。
   **确定性基线**：ngram 的计数与固定窗口评估不消耗随机性，
   换 seed 重跑只是同一估计的复制，不是独立重复。聚合层按
   `deterministic` 标记把同一单元的多个 seed 折叠为 1 个观测
