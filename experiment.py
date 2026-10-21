@@ -15549,9 +15549,11 @@ _COST_TIMING_FIELDS: Tuple[str, ...] = (
     "training_ms_per_step",
 )
 
-# 成本倍率的 95% 置信区间用 delta 方法近似（对数尺度），
+# 成本倍率的 95% 置信区间用 delta 方法近似（对数尺度）。
+# 两侧重复测量通常只有 3 个种子，正态 z=1.96 会系统性低估
+# 小样本不确定性；改用 Welch-Satterthwaite 自由度与 t 临界值。
 # 离散度超过该阈值时明确标注「计时噪声可能主导」。
-_COST_RATIO_CI_Z = 1.96
+_COST_RATIO_CI_ALPHA = 0.05
 _COST_NOISE_CV_LIMIT = 0.10
 
 # 需要运行结束测量的效率字段（参数量是结构属性，旧运行也
@@ -18649,18 +18651,41 @@ def _cost_comparison(
         ):
             # 对数尺度的 delta 方法：相对标准误由两侧的
             # 变异系数与独立观测数共同决定。
-            relative_variance = (
-                (std_a / cost_a) ** 2 / n_a
-                + (std_b / cost_b) ** 2 / n_b
-            )
+            term_a = (std_a / cost_a) ** 2 / n_a
+            term_b = (std_b / cost_b) ** 2 / n_b
+            relative_variance = term_a + term_b
             relative_se = math.sqrt(relative_variance)
-            low = ratio * math.exp(
-                -_COST_RATIO_CI_Z * relative_se
+
+            # Welch-Satterthwaite 自由度：两侧方差与样本量都
+            # 参与，避免把 n=3 的计时波动当成已知方差。
+            df = None
+            denominator = (
+                term_a ** 2 / (n_a - 1)
+                + term_b ** 2 / (n_b - 1)
             )
-            high = ratio * math.exp(
-                _COST_RATIO_CI_Z * relative_se
-            )
+            critical = None
+            if denominator > 0.0:
+                df = relative_variance ** 2 / denominator
+                critical = _t_critical(
+                    df,
+                    _COST_RATIO_CI_ALPHA,
+                )
+            if critical is None:
+                # 零方差时区间退化为点估计；理论上不应
+                # 走到这里，保留正态近似仅作数值兜底。
+                critical = 1.96
+                df = None
+                ci_method = "normal_fallback"
+            else:
+                ci_method = "welch_t"
+            low = ratio * math.exp(-critical * relative_se)
+            high = ratio * math.exp(critical * relative_se)
             detail["relative_se"] = round(relative_se, 6)
+            detail["ci_method"] = ci_method
+            detail["ci_df"] = (
+                round(df, 3) if df is not None else None
+            )
+            detail["ci_t_critical"] = round(critical, 6)
             detail["ratio_ci95"] = [
                 round(low, 6),
                 round(high, 6),
@@ -37582,6 +37607,13 @@ def run_self_test():
         "training_ms_per_step"
     ]
     assert noisy_detail["resolvable"] is True
+    assert noisy_detail["ci_method"] == "welch_t", noisy_detail
+    # 两组 n=3、等方差但均值不同时 Welch df≈3.87，t 临界值
+    # 应明显大于正态 1.96，否则小样本倍率区间被低估。
+    assert (
+        abs(noisy_detail["ci_df"] - 3.874) < 0.01
+    ), noisy_detail
+    assert noisy_detail["ci_t_critical"] > 2.8, noisy_detail
     low, high = noisy_detail["ratio_ci95"]
     assert low < 1.0 < high, noisy_detail
     assert (

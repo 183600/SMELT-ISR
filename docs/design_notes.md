@@ -336,7 +336,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   不可用时不给），报告用 `[efficiency-ci]` 行展示推理延迟与
   训练步耗时的区间：计时字段的区间宽度与均值同量级时，效率
   差异可能只是测量噪声（倍率本身的区间仍由 `ratio_ci95`
-  给出）；参数量/FLOPs 由结构决定（std=0），区间退化为点估计。
+  给出：对数尺度 delta 方法 + Welch-Satterthwaite 自由度与
+  t 临界值，`ci_method`/`ci_df`/`ci_t_critical` 一并落盘；两臂
+  各 3 个种子时 t 临界值约 2.8，而不是正态近似的 1.96）；
+  参数量/FLOPs 由结构决定（std=0），区间退化为点估计。
   计时字段若离散度过大或倍率区间跨 1，会被列为
   `timing_noise_fields`，不单独参与 `cost_verdict` 的材料成本
   判定（结构字段仍参与），避免单次计时把显著涨点误判成
