@@ -8106,34 +8106,50 @@ def _ngram_extended_metrics(
         predicted = probabilities.argmax(dim=1)
         correct = targets == predicted
 
-        if window_sink is not None:
-            window_sink.append({
-                "loss_sum": float(token_nll.sum()),
-                "tokens": int(targets.numel()),
-                "correct": int(correct.sum()),
-            })
+        # 逐窗口（batch 内每一行）统计，而不是把整个 batch
+        # 当成一个窗口：神经模型的 evaluate() 以单个固定评估
+        # 窗口为抽样单位，ngram 若按 batch 聚合，bootstrap 的
+        # 重采样单位与窗口数都会与神经运行不一致，逐窗口配对
+        # 比较也会因窗口数不同而直接失效。
+        seq_len = int(window.size(1)) - 1
+        row_losses = token_nll.view(int(window.size(0)), seq_len)
+        row_correct = correct.view(int(window.size(0)), seq_len)
+        row_targets = targets.view(int(window.size(0)), seq_len)
+        row_predicted = predicted.view(int(window.size(0)), seq_len)
 
-        if bootstrap_enabled:
-            window_loss_sums.append(float(token_nll.sum()))
-            window_tokens.append(float(targets.numel()))
-            window_true_positive.append(
-                torch.bincount(
-                    targets[correct],
-                    minlength=vocab_size,
+        for row in range(int(window.size(0))):
+            row_loss_sum = float(row_losses[row].sum())
+            row_target = row_targets[row]
+            row_pred = row_predicted[row]
+            row_hits = int(row_correct[row].sum())
+            if window_sink is not None:
+                window_sink.append({
+                    "loss_sum": row_loss_sum,
+                    "tokens": seq_len,
+                    "correct": row_hits,
+                })
+
+            if bootstrap_enabled:
+                window_loss_sums.append(row_loss_sum)
+                window_tokens.append(float(seq_len))
+                window_true_positive.append(
+                    torch.bincount(
+                        row_target[row_correct[row]],
+                        minlength=vocab_size,
+                    )
                 )
-            )
-            window_predicted.append(
-                torch.bincount(
-                    predicted,
-                    minlength=vocab_size,
+                window_predicted.append(
+                    torch.bincount(
+                        row_pred,
+                        minlength=vocab_size,
+                    )
                 )
-            )
-            window_support.append(
-                torch.bincount(
-                    targets,
-                    minlength=vocab_size,
+                window_support.append(
+                    torch.bincount(
+                        row_target,
+                        minlength=vocab_size,
+                    )
                 )
-            )
 
         confusion += torch.bincount(
             targets * vocab_size + predicted,
@@ -28170,6 +28186,36 @@ def run_self_test():
     )
     for key, value in ngram_boot.items():
         assert ngram_boot_repeat[key] == value
+
+    # 一个 batch 含多个窗口时，window_sink / bootstrap 的抽样
+    # 单位仍必须是单个固定评估窗口（与神经模型的 evaluate 同
+    # 口径），不能把整个 batch 聚合成一条记录：否则窗口数变少、
+    # bootstrap 区间口径不同，跨 family 的逐窗口配对也会因
+    # 窗口数不一致而失效。
+    ngram_batched_sink: List[Dict[str, float]] = []
+    ngram_batched = _ngram_extended_metrics(
+        cleaned_ngram,
+        [torch.cat(ngram_boot_windows[:2], dim=0)],
+        alpha=1.0,
+        order=2,
+        split="val",
+        include_auc=False,
+        bootstrap_replicates=64,
+        bootstrap_seed=2024,
+        window_sink=ngram_batched_sink,
+    )
+    assert len(ngram_batched_sink) == 2, ngram_batched_sink
+    assert int(ngram_batched["val_bootstrap_windows"]) == 2
+    batched_tokens = sum(
+        item["tokens"] for item in ngram_batched_sink
+    )
+    batched_loss = sum(
+        item["loss_sum"] for item in ngram_batched_sink
+    )
+    assert abs(
+        batched_loss / batched_tokens
+        - float(ngram_batched["val_loss"])
+    ) < 1e-12
 
     # n-gram 网格调参的选择诊断：并列 winner 与网格边界必须
     # 显式暴露，不能把 tie-break 或未覆盖区域说成唯一最优。
