@@ -22810,13 +22810,23 @@ def baseline_adequacy(
         report["ok"] = False
         return report
 
+    baseline_samples = _metric_samples(baseline_rows, metric)
+    collapsed_baseline_samples = _collapse_seed_samples(
+        baseline_samples
+    )
     baseline_values = [
-        float(row[metric])
-        for row in baseline_rows
-        if isinstance(row.get(metric), (int, float))
-        and not isinstance(row.get(metric), bool)
-        and math.isfinite(float(row[metric]))
+        float(sample["value"])
+        for sample in collapsed_baseline_samples
     ]
+    duplicate_baseline_seeds = sorted(
+        (
+            sample.get("seed")
+            for sample in collapsed_baseline_samples
+            if int(sample.get("n_runs", 1)) > 1
+        ),
+        key=_factor_sort_rank,
+    )
+    report["duplicate_baseline_seeds"] = duplicate_baseline_seeds
     baseline_mean = _mean(baseline_values)
     report["baseline_mean"] = baseline_mean
 
@@ -23766,7 +23776,7 @@ def baseline_adequacy(
         report["ok"] = False
     elif (
         reference_supported
-        and checked == len(baseline_values)
+        and checked == len(baseline_samples)
         and missing_reference == 0
     ):
         report["ok"] = True
