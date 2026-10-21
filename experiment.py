@@ -15233,6 +15233,7 @@ _REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
     "cudnn_version",
     "platform",
     "device_name",
+    "device_uuid",
     "deterministic_algorithms",
     "deterministic_algorithms_warn_only",
     "torch_num_threads",
@@ -15250,6 +15251,9 @@ _REPRODUCIBILITY_INFO_KEYS: Tuple[str, ...] = (
     "git_commit",
     "git_dirty",
     "git_diff_sha256",
+    "cwd",
+    "python_executable",
+    "cuda_visible_devices",
 )
 
 # 允许声明为实验因子（跨运行允许不同）的键：行级字段 +
@@ -25962,12 +25966,19 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             git_diff_sha256 = _sha256_text(diff)
 
     device_name = None
+    device_uuid = None
     cuda_capability = None
     cuda_total_memory_mb = None
     if device.type == "cuda" and torch.cuda.is_available():
         try:
             properties = torch.cuda.get_device_properties(device)
             device_name = torch.cuda.get_device_name(device)
+            # 物理 GPU UUID：仅记录 cuda:0 之类的逻辑编号无法区分
+            # CUDA_VISIBLE_DEVICES 重排后的实际硬件。旧版 torch
+            # 没有 uuid 属性时保持 None，不伪造设备身份。
+            properties_uuid = getattr(properties, "uuid", None)
+            if properties_uuid is not None:
+                device_uuid = str(properties_uuid)
             cuda_capability = (
                 f"{properties.major}.{properties.minor}"
             )
@@ -25983,6 +25994,10 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             datetime.timezone.utc
         ).isoformat(),
         "command": " ".join(sys.argv),
+        # 相对数据路径 / 相对 --out 只有结合工作目录才能还原；
+        # 脚本路径与解释器则用于区分同名入口与不同虚拟环境。
+        "cwd": os.getcwd(),
+        "python_executable": sys.executable,
         "hostname": platform.node(),
         "platform": platform.platform(),
         "python_version": platform.python_version(),
@@ -26004,6 +26019,11 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             else 0
         ),
         "device_name": device_name,
+        "device_index": device.index,
+        "device_uuid": device_uuid,
+        "cuda_visible_devices": os.environ.get(
+            "CUDA_VISIBLE_DEVICES"
+        ),
         "cuda_capability": cuda_capability,
         "cuda_total_memory_mb": cuda_total_memory_mb,
         "cpu_model": _cpu_model_name(),
@@ -26026,6 +26046,9 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "cublas_workspace_config": os.environ.get(
             "CUBLAS_WORKSPACE_CONFIG"
+        ),
+        "pytorch_cuda_alloc_conf": os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF"
         ),
         "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
         "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
@@ -30053,6 +30076,12 @@ def run_self_test():
     assert "allow_tf32_matmul" in metadata
     assert "allow_tf32_cudnn" in metadata
     assert "float32_matmul_precision" in metadata
+    assert metadata["cwd"] == os.getcwd()
+    assert metadata["python_executable"] == sys.executable
+    assert "cuda_visible_devices" in metadata
+    assert "pytorch_cuda_alloc_conf" in metadata
+    assert "device_uuid" in metadata
+    assert "device_index" in metadata
     assert metadata["cpu_model"]
     assert metadata["cpu_count"] is None or metadata["cpu_count"] > 0
     assert metadata["torch_num_threads"] == torch.get_num_threads()
