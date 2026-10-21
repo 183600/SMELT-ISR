@@ -16377,15 +16377,16 @@ def aggregate_runs(
 
         # 效率指标随精度指标一起聚合：评价改进必须同时给出
         # 涨点与效率指标，否则微小的涨点可能掩盖数量级的差异。
+        # 与精度指标同口径先按独立种子折叠：同一 seed 的复制运行
+        # （重复目录）给出的是同一个数，按运行计数会虚增 n、放大
+        # 自由度；复制运行的 std=0 还会让成本倍率的置信区间塌成
+        # 零宽度，把「只测过一次」伪装成可分辨的精确证据。
         for field in _COST_FIELDS:
+            samples = _collapse_seed_samples(
+                _metric_samples(group_rows, field)
+            )
             values = [
-                float(group_row[field])
-                for group_row in group_rows
-                if isinstance(
-                    group_row.get(field), (int, float)
-                )
-                and not isinstance(group_row.get(field), bool)
-                and math.isfinite(float(group_row[field]))
+                float(sample["value"]) for sample in samples
             ]
             field_mean = _mean(values)
             if field_mean is not None:
@@ -32808,6 +32809,26 @@ def run_self_test():
             float(latency_costs["ci95_low"])
             - float(latency_costs["ci95_high"])
         ) < 1e-12
+
+        # 伪重复的复制运行不能虚增成本观测数：同一 seed 的两个
+        # 目录给的是同一次结构/计时结果，按运行计数会得到 n=2、
+        # df=1 的零宽 CI，把「只测过一次」伪装成可分辨的证据。
+        dup_paths = [
+            _write_cost_run(
+                cost_dir, "dup_a", "local_base", 42, 3.00, 1e9
+            ),
+            _write_cost_run(
+                cost_dir, "dup_b", "local_base", 42, 3.00, 1e9
+            ),
+        ]
+        dup_cell = aggregate_runs(
+            compare_runs(dup_paths),
+            ["mode"],
+        )[0]
+        dup_costs = dup_cell["costs"]
+        assert dup_cell["duplicate_seeds"] == [42]
+        assert dup_costs["flops_per_forward"]["n"] == 1, dup_costs
+        assert "ci95" not in dup_costs["flops_per_forward"]
 
         # 计时 CI 必须真的出现在报告输出里，而不是只写进
         # JSON 报告（展示层漏了等于没有）。
