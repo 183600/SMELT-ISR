@@ -9306,9 +9306,7 @@ def analyze_training_curve(
         grad_spike_recent_max = max(
             grad_values[-recent_count:]
         )
-        grad_prior_median = prior_values[
-            len(prior_values) // 2
-        ]
+        grad_prior_median = _median(prior_values)
         if grad_prior_median > 0.0:
             grad_spike_ratio = (
                 grad_spike_recent_max / grad_prior_median
@@ -12972,7 +12970,7 @@ def diagnose_non_finite(
     ]
     if history_values:
         ordered = sorted(history_values)
-        median = ordered[len(ordered) // 2]
+        median = float(_median(ordered))
         gradient_trend = {
             "window": len(ordered),
             "recent_median": round(median, 6),
@@ -13309,7 +13307,7 @@ def measure_efficiency(
                 timings.append(time.perf_counter() - start)
 
         timings.sort()
-        latency_seconds = timings[len(timings) // 2]
+        latency_seconds = float(_percentile(timings, 0.5))
         inference_timing_summary = _timing_summary(timings)
 
         # 训练步计时（前向 + 反向，不含优化器更新）与推理
@@ -13350,9 +13348,9 @@ def measure_efficiency(
                 )
 
         training_timings.sort()
-        training_step_seconds = training_timings[
-            len(training_timings) // 2
-        ]
+        training_step_seconds = float(
+            _percentile(training_timings, 0.5)
+        )
         training_timing_summary = _timing_summary(
             training_timings
         )
@@ -29448,6 +29446,32 @@ def run_self_test():
         for warning in grad_spike_analysis["warnings"]
     )
 
+    # 近期窗口之外的历史梯度数为偶数时，此前中位数也必须
+    # 取中间两值平均（1..32 → 16.5），而不是上中位数 17。
+    even_prior_records = []
+    for grad_step in range(1, 41):
+        grad_record = {
+            "step": grad_step,
+            "train_loss": 5.0 - 0.02 * grad_step,
+            "grad_norm": (
+                float(grad_step)
+                if grad_step <= 32
+                else 1000.0
+            ),
+        }
+        if grad_step in (10, 20, 30, 40):
+            grad_record["val_loss"] = (
+                5.0 - 0.01 * grad_step
+            )
+        even_prior_records.append(grad_record)
+    even_prior_analysis = analyze_training_curve(
+        even_prior_records,
+        baseline_loss=baseline,
+    )
+    assert even_prior_analysis["prior_grad_norm_median"] == 16.5, (
+        even_prior_analysis["prior_grad_norm_median"]
+    )
+
     # 早期全部非有限、之后恢复且有验证点的运行：最后一个验证点
     # 之前没有任何有限训练损失（last_train_loss 为 None），但后续
     # 有限训练步使 recent_nonfinite 判定为 False、不判发散。打印
@@ -29742,6 +29766,29 @@ def run_self_test():
         "符合梯度爆炸" in finding
         for finding in trend_report["findings"]
     ), trend_report["findings"]
+
+    # 偶数个历史梯度取中间两值平均，不能只取上中位数。
+    even_trend_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        diag_result,
+        torch.tensor(float("nan")),
+        step=2,
+        lr=1e-3,
+        amp_dtype=None,
+        vocab_size=256,
+        recent_grad_norms=[
+            (1, 1.0),
+            (2, 2.0),
+            (3, 3.0),
+            (4, 3.0),
+        ],
+    )
+    assert even_trend_report["checks"]["gradient_trend"][
+        "recent_median"
+    ] == 2.5, even_trend_report["checks"]["gradient_trend"]
 
     nan_loss_result = dict(diag_result)
     nan_loss_result["loss"] = torch.tensor(float("nan"))
@@ -30128,6 +30175,29 @@ def run_self_test():
     ) == 3
     assert _percentile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.5
     assert _percentile([], 0.95) is None
+    assert _median([1.0, 2.0, 3.0, 4.0]) == 2.5
+
+    # 偶数次计时也必须用完整中位数：标量 latency 与分布摘要
+    # 的 median 不能一个取上中位数、一个取两值平均。
+    even_efficiency = measure_efficiency(
+        efficiency_model,
+        eval_dataset,
+        eval_device,
+        batch_size=2,
+        amp_dtype=None,
+        warmup=0,
+        iters=4,
+    )
+    for summary_key, scalar_key in (
+        ("latency_ms", "latency_ms_per_forward"),
+        ("training_ms", "training_ms_per_step"),
+    ):
+        summary = even_efficiency[summary_key]
+        assert summary["n"] == 4
+        assert abs(
+            float(summary["median"])
+            - float(even_efficiency[scalar_key])
+        ) < 1e-3, (summary, even_efficiency[scalar_key])
     assert (
         efficiency["flops_per_forward"] is None
         or int(efficiency["flops_per_forward"]) > 0
