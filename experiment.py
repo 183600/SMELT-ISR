@@ -6815,24 +6815,35 @@ def _bootstrap_eval_intervals(
     replicates: int,
     seed: int,
     ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
+    window_class_loss_sums: Optional[torch.Tensor] = None,
 ) -> Dict[str, object]:
     """
     对固定评估窗口做有放回 bootstrap，给出评估集层面的
-    95% 置信区间（loss / ppl / token accuracy / macro F1）。
+    95% 置信区间。
+
+    覆盖的指标：
+    - 似然口径：loss / ppl；以及传入逐窗口逐类损失时
+      的 macro NLL（与点估计同口径，对出现类等权）；
+    - 分类口径：token accuracy（micro）、macro / weighted
+      F1、macro / weighted precision / recall。
 
     口径说明：
     - 重采样单位是完整评估窗口，不是 token：同一窗口内的
       token 由同一段上下文产生，逐 token 重采样会把相关样本
       当成独立样本，低估评估不确定性；
-    - macro F1 的类别集合按每个重采样中实际出现的类确定
-      （support>0），与点估计「只对评估集中出现过的类平均」
-      完全同口径。若固定为全量类别集合、把重采样缺席的稀有
-      类按 F1=0 计入，区间会系统性偏低，甚至不覆盖点估计；
+    - macro / weighted F1、precision、recall 的类别集合按
+      每个重采样中实际出现的类确定（support>0），与点估计
+      「只对评估集中出现过的类平均 / 按 support 加权」完全
+      同口径。若固定为全量类别集合、把重采样缺席的稀有类按
+      F1=0 计入，区间会系统性偏低，甚至不覆盖点估计；
+    - macro NLL 同样只对本次重采样中出现过的类等权平均；
+      逐窗口逐类损失足够统计量由评估循环与混淆统计共用同一次
+      前向，不额外跑模型；
     - 重采样不进入训练、选型或超参数决策，只用于报告
       「测试集只评估一次」时点估计本身的抽样误差；
     - AR(1) 方差膨胀是一阶近似，膨胀后的区间会夹到指标的
       物理取值域（loss≥0、ppl≥1、比例类∈[0,1]）；
-    - 只覆盖混淆矩阵口径的指标；AUC 等排序指标未纳入。
+    - 只覆盖混淆矩阵/似然口径的指标；AUC 等排序指标未纳入。
 
     返回的键不带 split 前缀，由 ``evaluate`` 统一加前缀。
     """
@@ -6868,10 +6879,11 @@ def _bootstrap_eval_intervals(
     sampled_tp = true_positive[indices].sum(dim=1)
     sampled_predicted = predicted[indices].sum(dim=1)
     sampled_support = support[indices].sum(dim=1)
+    sampled_total_support = sampled_support.sum(dim=1)
 
     sampled_accuracy = (
         sampled_tp.sum(dim=1)
-        / sampled_support.sum(dim=1).clamp_min(1.0)
+        / sampled_total_support.clamp_min(1.0)
     )
 
     precision = sampled_tp / sampled_predicted.clamp_min(1.0)
@@ -6894,8 +6906,64 @@ def _bootstrap_eval_intervals(
         (f1 * sampled_present).sum(dim=1)
         / sampled_class_counts.clamp_min(1.0)
     )
-    if bool((sampled_class_counts == 0).any()):
-        sampled_macro_f1[sampled_class_counts == 0] = float("nan")
+    sampled_precision_macro = (
+        (precision * sampled_present).sum(dim=1)
+        / sampled_class_counts.clamp_min(1.0)
+    )
+    sampled_recall_macro = (
+        (recall * sampled_present).sum(dim=1)
+        / sampled_class_counts.clamp_min(1.0)
+    )
+    sampled_weighted_f1 = (
+        (f1 * sampled_support).sum(dim=1)
+        / sampled_total_support.clamp_min(1.0)
+    )
+    sampled_precision_weighted = (
+        (precision * sampled_support).sum(dim=1)
+        / sampled_total_support.clamp_min(1.0)
+    )
+    sampled_recall_weighted = (
+        (recall * sampled_support).sum(dim=1)
+        / sampled_total_support.clamp_min(1.0)
+    )
+    degenerate_macro = sampled_class_counts == 0
+    if bool(degenerate_macro.any()):
+        for values in (
+            sampled_macro_f1,
+            sampled_precision_macro,
+            sampled_recall_macro,
+        ):
+            values[degenerate_macro] = float("nan")
+
+    # 类平衡似然的逐窗口逐类损失和：按同一组窗口索引重采样，
+    # 再对本次重采样中出现过的类等权平均每类 NLL。
+    sampled_macro_nll: Optional[torch.Tensor] = None
+    if (
+        window_class_loss_sums is not None
+        and int(window_class_loss_sums.size(0)) == n_windows
+    ):
+        class_losses = window_class_loss_sums.to(torch.float64)
+        sampled_class_loss = torch.empty(
+            (int(replicates), int(class_losses.size(1))),
+            dtype=torch.float64,
+        )
+        # 分块累加，避免 replicates × windows × vocab 的
+        # 三维中间张量在较大评估集上占用过多内存。
+        chunk = 64
+        for begin in range(0, int(replicates), chunk):
+            stop = min(begin + chunk, int(replicates))
+            sampled_class_loss[begin:stop] = (
+                class_losses[indices[begin:stop]].sum(dim=1)
+            )
+        per_class_nll = (
+            sampled_class_loss
+            / sampled_support.clamp_min(1.0)
+        )
+        sampled_macro_nll = (
+            (per_class_nll * sampled_present).sum(dim=1)
+            / sampled_class_counts.clamp_min(1.0)
+        )
+        sampled_macro_nll[degenerate_macro] = float("nan")
 
     # 窗口间 lag-1 自相关：bootstrap 把窗口当 i.i.d. 抽样单位，
     # 但固定窗口沿评估序列排列，窗口指标常随数据顺序渐变（同一
@@ -6925,19 +6993,34 @@ def _bootstrap_eval_intervals(
     # 把区间推到指标不可能出现的范围（如负准确率、loss<0）。
     # 写出报告前夹回域内，避免读者把不可能的边界当成有效
     # 估计；夹取只放宽到域边界，不会把区间缩窄到点估计之外。
-    metric_bounds = {
+    metric_bounds: Dict[str, Tuple[Optional[float], Optional[float]]] = {
         "loss": (0.0, None),
         "ppl": (1.0, None),
+        "macro_nll": (0.0, None),
         "token_accuracy": (0.0, 1.0),
         "macro_f1": (0.0, 1.0),
+        "weighted_f1": (0.0, 1.0),
+        "precision_macro": (0.0, 1.0),
+        "precision_weighted": (0.0, 1.0),
+        "recall_macro": (0.0, 1.0),
+        "recall_weighted": (0.0, 1.0),
     }
 
-    for name, values in (
+    metric_series = [
         ("loss", sampled_loss),
         ("ppl", sampled_ppl),
         ("token_accuracy", sampled_accuracy),
         ("macro_f1", sampled_macro_f1),
-    ):
+        ("weighted_f1", sampled_weighted_f1),
+        ("precision_macro", sampled_precision_macro),
+        ("precision_weighted", sampled_precision_weighted),
+        ("recall_macro", sampled_recall_macro),
+        ("recall_weighted", sampled_recall_weighted),
+    ]
+    if sampled_macro_nll is not None:
+        metric_series.append(("macro_nll", sampled_macro_nll))
+
+    for name, values in metric_series:
         finite = values[torch.isfinite(values)]
         if finite.numel() == 0:
             continue
@@ -7253,11 +7336,14 @@ def evaluate(
       accuracy 的参考下界。
 
     ``bootstrap_replicates > 0`` 时额外对固定评估窗口做
-    有放回重采样，给出 loss / ppl / token accuracy / macro F1
+    有放回重采样，给出 loss / ppl / macro NLL / token accuracy /
+    macro 与 weighted F1 / macro 与 weighted precision / recall
     的 95% 置信区间（``{split}_*_ci95_low/high``）。测试集
     只解封一次，点估计本身无法区分「方法差异」与「评估窗口
     抽样噪声」；置信区间是评估集层面的不确定性，与跨随机
-    种子的训练方差互补，不参与训练或模型选择。
+    种子的训练方差互补，不参与训练或模型选择。假设以
+    macro F1 / 召回率等分类指标判定时，区间与点估计同口径，
+    不会只给 loss 不确定性而让分类结论裸奔。
 
     compute_auc=True 时（最终/测试评估）额外计算
     one-vs-rest 的 ``{split}_pr_auc_macro`` 与
@@ -7328,6 +7414,7 @@ def evaluate(
     window_true_positive: List[torch.Tensor] = []
     window_predicted: List[torch.Tensor] = []
     window_support: List[torch.Tensor] = []
+    window_class_loss_sums: List[torch.Tensor] = []
 
     # 类平衡似然（macro NLL）的逐类充分统计量：按目标类累计
     # 损失和与 token 数。它与频率加权的 total 累加共用同一次
@@ -7516,11 +7603,27 @@ def evaluate(
                                 minlength=vocab_size,
                             ).cpu()
                         )
-                        window_support.append(
-                            torch.bincount(
-                                target_row,
-                                minlength=vocab_size,
-                            ).cpu()
+                        row_support = torch.bincount(
+                            target_row,
+                            minlength=vocab_size,
+                        )
+                        window_support.append(row_support.cpu())
+                        # 逐类损失和：供 macro NLL 的窗口级
+                        # bootstrap 使用，与点估计共用同一批
+                        # token 损失，不额外跑前向。
+                        row_class_loss = torch.zeros(
+                            vocab_size,
+                            dtype=torch.float64,
+                            device=device,
+                        ).index_add_(
+                            0,
+                            target_row,
+                            token_losses.view(y.shape)[
+                                row
+                            ].to(torch.float64),
+                        )
+                        window_class_loss_sums.append(
+                            row_class_loss.cpu()
                         )
 
                 if compute_auc:
@@ -7654,6 +7757,9 @@ def evaluate(
                 batches,
                 batch_size,
                 dataset.seq_len,
+            ),
+            window_class_loss_sums=torch.stack(
+                window_class_loss_sums
             ),
         )
         for key, value in bootstrap_metrics.items():
@@ -8511,10 +8617,11 @@ def _ngram_extended_metrics(
     候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
 
     ``bootstrap_replicates > 1`` 时额外给出与神经模型同口径的
-    逐窗口 bootstrap 置信区间（loss / ppl / token accuracy /
-    macro F1）。统计基线是确定性的，换 seed 重复运行不是独立
-    重复；它的评估不确定性只能来自评估窗口抽样，因此这个区间
-    是 ngram 对照唯一的误差线来源。``window_sink`` 非 None 时
+    逐窗口 bootstrap 置信区间（loss / ppl / macro NLL /
+    token accuracy / macro 与 weighted F1 / macro 与 weighted
+    precision / recall）。统计基线是确定性的，换 seed 重复运行
+    不是独立重复；它的评估不确定性只能来自评估窗口抽样，因此
+    这个区间是 ngram 对照唯一的误差线来源。``window_sink`` 非 None 时
     逐窗口记录损失和、token 数与命中数，供跨运行逐窗口配对
     比较使用（固定评估窗口对所有运行相同）。
     """
@@ -8546,6 +8653,7 @@ def _ngram_extended_metrics(
     window_true_positive: List[torch.Tensor] = []
     window_predicted: List[torch.Tensor] = []
     window_support: List[torch.Tensor] = []
+    window_class_loss_sums: List[torch.Tensor] = []
 
     # 与神经模型评估同口径：按窗口总位置数分配收集缓冲
     # （不超过上限），逐窗口写入。不做 AUC 时不分配缓冲区。
@@ -8657,10 +8765,19 @@ def _ngram_extended_metrics(
                         minlength=vocab_size,
                     )
                 )
-                window_support.append(
-                    torch.bincount(
+                row_support = torch.bincount(
+                    row_target,
+                    minlength=vocab_size,
+                )
+                window_support.append(row_support)
+                window_class_loss_sums.append(
+                    torch.zeros(
+                        vocab_size,
+                        dtype=torch.float64,
+                    ).index_add_(
+                        0,
                         row_target,
-                        minlength=vocab_size,
+                        row_losses[row].to(torch.float64),
                     )
                 )
 
@@ -8786,6 +8903,9 @@ def _ngram_extended_metrics(
             torch.stack(window_support),
             int(bootstrap_replicates),
             seed_value,
+            window_class_loss_sums=torch.stack(
+                window_class_loss_sums
+            ),
         )
         for key, value in bootstrap_metrics.items():
             metrics[f"{split}_{key}"] = value
@@ -28947,6 +29067,25 @@ def run_self_test():
         <= float(boot_metrics_a["val_token_accuracy"])
         <= float(boot_metrics_a["val_token_accuracy_ci95_high"])
     )
+    # 不平衡场景允许以 macro / weighted F1、precision、recall
+    # 或 macro NLL 判定；这些点估计必须携带同口径的评估窗口
+    # 区间，不能只给 accuracy / macro F1 误差线。
+    for name in (
+        "macro_f1",
+        "weighted_f1",
+        "precision_macro",
+        "precision_weighted",
+        "recall_macro",
+        "recall_weighted",
+        "macro_nll",
+    ):
+        low = boot_metrics_a.get(f"val_{name}_ci95_low")
+        high = boot_metrics_a.get(f"val_{name}_ci95_high")
+        assert low is not None, name
+        assert high is not None, name
+        assert math.isfinite(float(low)), name
+        assert math.isfinite(float(high)), name
+        assert float(low) <= float(high), name
     # 窗口重叠比例必须随 bootstrap 一起落盘，且落在 [0, 1]；
     # 重叠窗口不是独立抽样单位，读者据此判断区间是否偏窄。
     assert boot_metrics_a["val_eval_windows"] >= 1

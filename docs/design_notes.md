@@ -179,8 +179,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `equivalence_seeds_to_achieve`。
 - `_bootstrap_eval_intervals`、`_percentile_interval`：对固定
   评估窗口做有放回重采样（默认 500 次，`--eval-bootstrap`，
-  0 关闭），给出 loss / ppl / token accuracy / macro F1 的
-  百分位 95% 置信区间；种子由数据指纹、split、窗口数与
+  0 关闭），给出 loss / ppl / macro NLL / token accuracy /
+  macro 与 weighted F1 / macro 与 weighted precision 与
+  recall 的百分位 95% 置信区间；假设以 F1 或召回率判定时，
+  区间与点估计同口径，而不是只给 loss/accuracy 误差线；
+  种子由数据指纹、split、窗口数与
   窗口长度派生，确定性可复现，且不扰动训练/数据 RNG。
   置信区间回答「换一批同分布评估窗口，点估计会漂多少」，
   与跨种子 t 检验（回答「换训练种子」）互补。退化重采样
@@ -435,8 +438,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   随报告落盘，避免低功效运行被当作正式结论。
   **评估窗口不确定性**：final val 与唯一一次 test 评估默认
   额外报告评估窗口 bootstrap 95% 置信区间（loss / ppl /
-  token accuracy / macro F1，`--eval-bootstrap` 控制重采样
-  次数，0 关闭）。它量化「换一批同分布评估窗口」的抽样
+  macro NLL / token accuracy / macro 与 weighted F1 /
+  macro 与 weighted precision 与 recall，`--eval-bootstrap`
+  控制重采样次数，0 关闭）。它量化「换一批同分布评估窗口」的抽样
   波动，与跨种子方差是两种不同的不确定性来源；窗口数为 1
   或指标退化时区间退化为点估计而不是虚构精度。窗口重叠比例
   （`*_eval_window_overlap_fraction`）已随指标落盘；窗口即便
@@ -743,8 +747,9 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 早停指标，默认 `val_loss`；预注册主指标可周期计算时自动
 跟随）、`--bad-cases`（默认 10，0 关闭）、
 `--eval-bootstrap N`（final/test 评估窗口 bootstrap 重采样
-次数，默认 500，0 关闭；输出 loss/ppl/token accuracy/
-macro F1 的 95% 置信区间）、
+次数，默认 500，0 关闭；输出 loss/ppl/macro NLL/
+token accuracy/macro 与 weighted F1、precision、recall
+的 95% 置信区间）、
 `--skip-efficiency`（跳过结束时的效率测量）、
 `--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
 变量检查、Mean ± Std、显著性检验与功效/等价性分析）、
