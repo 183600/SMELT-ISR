@@ -9423,6 +9423,13 @@ def _train_next_byte_evidence(
 
     train_end = dataset.split_bounds["train"][1]
     train_bytes = bytes(dataset._raw_buffer[:train_end])
+    # 被清洗的群组区间不参与窗口采样，其字节不构成训练监督：
+    # 与 train_excluded_spans 相交的命中必须跳过，否则清洗掉的
+    # 重复内容会冒充「训练里见过同一上下文」的核验证据（与
+    # effective_train_byte_counts / 数据审计同一口径）。
+    excluded_spans = _merge_byte_intervals(
+        dataset.train_excluded_spans
+    )
 
     for context in unique_contexts:
         counts: Dict[int, int] = {}
@@ -9434,6 +9441,14 @@ def _train_next_byte_evidence(
                 break
             next_position = position + len(context)
             if next_position < len(train_bytes):
+                # 命中区间为 [position, next_position]（上下文加
+                # 目标字节，闭区间），半开化后与排除区间求交。
+                if excluded_spans and any(
+                    low <= next_position and high > position
+                    for low, high in excluded_spans
+                ):
+                    start = position + 1
+                    continue
                 next_byte = train_bytes[next_position]
                 counts[next_byte] = (
                     counts.get(next_byte, 0) + 1
@@ -9513,15 +9528,19 @@ def _bad_case_report_from_buffers(
 
     # 训练集目标分布：评估 split 中稀少的目标若在训练中很常见，
     # 更可能是评估抽样波动/上下文特异，而不是标注错误。
+    # 与 unigram 基线同口径：被清洗群组不进入监督，也不进入该
+    # 分布（见 effective_train_byte_counts 的约定），否则
+    # train_rare 会把模型从未见过的字节当成「训练中常见」。
     train_target_counts: Optional[torch.Tensor] = None
     train_target_share: Optional[torch.Tensor] = None
     if dataset is not None:
-        train_tokens = int(dataset.train.numel())
+        train_tokens = int(dataset.effective_train_bytes)
         if train_tokens > 0:
-            train_target_counts = torch.bincount(
-                dataset.train.to(torch.int64),
-                minlength=vocab_size,
-            ).to(torch.float64)
+            train_target_counts = (
+                dataset.effective_train_byte_counts().to(
+                    torch.float64
+                )
+            )
             train_target_share = (
                 train_target_counts / float(train_tokens)
             )
@@ -19461,10 +19480,22 @@ def baseline_adequacy(
                     "排除「基线本身还有空间」的质疑"
                 )
             else:
+                if baseline_better_than_ngram is None:
+                    # None = 对比根本没做（ngram 缺失或口径不兼容
+                    # 已跳过），不能写成「没有它能战胜的 n-gram」
+                    # 这种已核实的否定结论；缺证据只能表述为缺证据。
+                    ngram_clause = (
+                        "且没有可用于核验的调优好的 n-gram 对照"
+                        "（n-gram 缺失或与当前口径不兼容，比较已跳过）"
+                    )
+                else:
+                    ngram_clause = (
+                        "对比集合里也没有它能战胜的调优好的 n-gram"
+                    )
                 message = (
                     f"所选基线 {baseline_mode} 没有任何调参证据"
                     "（config.json 无 baseline_tuning 记录，"
-                    "对比集合里也没有它能战胜的调优好的 n-gram）："
+                    f"{ngram_clause}）："
                     "没调过参的弱基线只能证明复杂模型比稻草人强，"
                     "不能证明方法收益。请先运行 "
                     "--suite-baseline-tuning 对基线做 val 调参，"
@@ -20978,6 +21009,10 @@ def balance_strength_report(
     """
     report: Dict[str, object] = {
         "applicable": False,
+        # 是否真的完成了强度比较：两个早退分支（可比运行不足、
+        # 施加均衡压力的有效臂不足）返回时 widths/strengths 根本
+        # 没算，打印端不能把这种情况报成「一致」。
+        "compared": False,
         "width_varied": False,
         "strength_varied": False,
         "confounded": False,
@@ -21035,6 +21070,9 @@ def balance_strength_report(
     ]
     width_span = max(widths) - min(widths)
     strength_span = max(strengths) - min(strengths)
+    # 到这里才真正做了跨臂比较：至少两个 coef>0 的臂参与了
+    # 极差计算，报告允许据此给出「一致/不一致」的结论。
+    report["compared"] = True
     strength_scale = max(
         1.0,
         max(abs(value) for value in strengths),
@@ -22565,9 +22603,13 @@ def print_comparison_analysis(
         and not coverage.get("partial")
         and len(coverage["present_cells"]) == len(expected_cells)
     )
-    compute_parity_ok = all(
-        entry.get("matched")
-        for entry in coverage.get("compute_parity", [])
+    parity_entries = coverage.get("compute_parity", [])
+    # 空列表 = 没有任何运行记录 FLOPs/参数量：all([]) 恒真，
+    # 若直接当「计算量对齐」，等于用缺证据冒充已核对（与
+    # annotate_factorial_confounds 的 unverified_controls 约定一致）。
+    compute_parity_checked = bool(parity_entries)
+    compute_parity_ok = compute_parity_checked and all(
+        entry.get("matched") for entry in parity_entries
     )
     width_parity_ok = not coverage.get("width_confounds")
     compute_aligned = metric == _COMPUTE_MATCHED_METRIC or (
@@ -22595,11 +22637,28 @@ def print_comparison_analysis(
         and not coverage["low_replicate_cells"]
         and not coverage.get("structural_confounds")
         and not compute_aligned
+        # 没有成本记录时既不能报「对齐」，也不能报「不匹配」：
+        # 两者都需要证据，这里只留未核对提示（见下）。
+        and (compute_parity_checked or not width_parity_ok)
     ):
         print(
             f"  [warn] {len(expected_cells) // 2}×2 组合齐全且"
             "种子数达标，但计算量/专家宽度不匹配：主效应须在"
             "等训练计算量指标上复核后才能归因"
+        )
+    elif (
+        full_factorial
+        and not coverage["missing_cells"]
+        and not coverage["low_replicate_cells"]
+        and not coverage.get("structural_confounds")
+        and metric != _COMPUTE_MATCHED_METRIC
+        and not compute_parity_checked
+    ):
+        print(
+            f"  [note] {len(expected_cells) // 2}×2 组合齐全且"
+            "种子数达标；但所有运行都缺 FLOPs/参数量记录，"
+            "计算量对齐无法核对，主效应须以等训练计算量指标"
+            "复核后才能归因"
         )
 
     print()
@@ -22609,6 +22668,17 @@ def print_comparison_analysis(
     )
     if not balance_scale["profiles"]:
         print("  无可用运行（缺 mode/k1/k2/top_k/balance_coef 记录）")
+    elif not balance_scale.get("compared"):
+        # 早退分支里 widths/strengths 没有计算，任何「一致」都是
+        # 无证据的结论；这里明确打印无法核对，而不是落到最后的 OK。
+        if len(balance_scale["profiles"]) < 2:
+            print("  [note] 可比较的运行不足 2 个，无法核对均衡强度")
+        else:
+            print(
+                "  [note] 施加均衡压力（balance_coef>0）的有效臂"
+                "不足 2 个（coef=0 对照臂不计入），无法核对"
+                "均衡强度"
+            )
     elif balance_scale["confounded"]:
         for advisory in balance_scale["advisories"]:
             print(f"  [warn] {advisory}")
@@ -37296,6 +37366,10 @@ def main():
             # 保留该步记录本身。
             record = {
                 "step": meta["step"],
+                # 与 step 同步落盘：等计算量对照读的是周期验证
+                # 记录（_val_curve_points），漏掉该键会让它永远
+                # 回退到 step，把 NaN 跳步也算进累计训练 FLOPs。
+                "optimizer_steps": meta.get("optimizer_steps"),
                 "train_loss": lm if math.isfinite(lm) else None,
                 "aux_loss": aux if math.isfinite(aux) else None,
                 "lr": meta["lr"],
