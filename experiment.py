@@ -9949,6 +9949,12 @@ _BAD_CASE_LABEL_CONTEXT = 8
 _BAD_CASE_LABEL_MIN_SUPPORT = 2
 _BAD_CASE_LABEL_TARGET_MAX_SHARE = 0.1
 
+# top-N 案例多样性：最差 token 可能集中在同一窗口的不同位置，
+# 此时它们不是 N 个独立证据。至少要有若干案例、且单一窗口
+# 占比达到阈值时才提示，避免短报告误报。
+_BAD_CASE_WINDOW_CONCENTRATION = 0.6
+_BAD_CASE_WINDOW_MIN_CASES = 3
+
 # 全量错误归因与 top-N 案例归因共用同一组类别（顺序即编码）。
 _BAD_CASE_CATEGORIES: Tuple[str, ...] = (
     "ambiguous",
@@ -10223,6 +10229,9 @@ def _empty_bad_case_report(
         "token_accuracy": None,
         "wrong_tokens": 0,
         "top_cases": [],
+        "top_cases_unique_windows": 0,
+        "top_cases_window_concentration": None,
+        "top_cases_concentration_warning": False,
         "top_confusions": [],
         "error_rate_by_target": [],
         "error_rate_by_position": [],
@@ -10526,6 +10535,7 @@ def _bad_case_report_from_buffers(
 
         top_cases.append({
             "rank": rank + 1,
+            "position": target_position,
             "target": target,
             "target_text": _render_byte(target),
             "predicted": predicted,
@@ -10578,6 +10588,32 @@ def _bad_case_report_from_buffers(
         category_counts[key] = (
             category_counts.get(key, 0) + 1
         )
+
+    # top-N 案例的来源窗口是否重复：同一窗口的多个位置都被
+    # 选中时，案例数会被高估为独立证据；保留重复计数并在
+    # 报告层提示，避免把「一个坏窗口」读成「N 种失败模式」。
+    window_counts: Dict[str, int] = {}
+    for case in top_cases:
+        window_key = str(case["window_text"])
+        window_counts[window_key] = (
+            window_counts.get(window_key, 0) + 1
+        )
+    for case in top_cases:
+        case["window_repeat_count"] = window_counts[
+            str(case["window_text"])
+        ]
+    top_cases_window_concentration = (
+        max(window_counts.values()) / len(top_cases)
+        if top_cases
+        else None
+    )
+    top_cases_concentration_warning = bool(
+        top_cases
+        and len(top_cases) >= _BAD_CASE_WINDOW_MIN_CASES
+        and top_cases_window_concentration is not None
+        and top_cases_window_concentration
+        >= _BAD_CASE_WINDOW_CONCENTRATION
+    )
 
     # 全量错误 token 的类别归因（不只是 top_n 个最差样本）：
     # 错误原因分布是提出新改进思路的最重要证据，必须按整个
@@ -10731,6 +10767,15 @@ def _bad_case_report_from_buffers(
         "token_accuracy": round(token_accuracy, 6),
         "wrong_tokens": wrong_tokens,
         "top_cases": top_cases,
+        "top_cases_unique_windows": len(window_counts),
+        "top_cases_window_concentration": (
+            round(top_cases_window_concentration, 6)
+            if top_cases_window_concentration is not None
+            else None
+        ),
+        "top_cases_concentration_warning": (
+            top_cases_concentration_warning
+        ),
         "top_confusions": top_confusions,
         "error_rate_by_target": error_rate_by_target,
         "error_rate_by_position": error_rate_by_position,
@@ -11308,6 +11353,15 @@ def print_bad_cases(report: Dict[str, object]) -> None:
             f"pred='{case['predicted_text']}' "
             f"category={case['category']} | "
             f"{case['context']}"
+        )
+
+    if report.get("top_cases_concentration_warning"):
+        print(
+            "[bad-case] top-N 案例集中在少数窗口："
+            f"唯一窗口 {report.get('top_cases_unique_windows')} 个，"
+            f"单一窗口最高占比 "
+            f"{float(report['top_cases_window_concentration']) * 100:.1f}%"
+            "；这些案例不是彼此独立的失败模式"
         )
 
     if report.get("top_confusions"):
@@ -29667,6 +29721,13 @@ def run_self_test():
     assert empty_bad_case["label_noise_verification"][
         "candidates"
     ] == 0
+    assert empty_bad_case["top_cases_unique_windows"] == 0
+    assert (
+        empty_bad_case["top_cases_window_concentration"] is None
+    )
+    assert not empty_bad_case[
+        "top_cases_concentration_warning"
+    ]
 
     assert bad_case_report["tokens_evaluated"] > 0
     assert bad_case_report["split"] == "val"
@@ -29682,6 +29743,20 @@ def run_self_test():
         assert case["category"] in valid_categories
         assert case["context"]
         assert 0.0 <= float(case["confidence"]) <= 1.0
+        assert 1 <= int(case["position"]) <= int(
+            eval_dataset.seq_len
+        )
+        assert int(case["window_repeat_count"]) >= 1
+    unique_windows = int(
+        bad_case_report["top_cases_unique_windows"]
+    )
+    assert 1 <= unique_windows <= len(
+        bad_case_report["top_cases"]
+    )
+    concentration = bad_case_report[
+        "top_cases_window_concentration"
+    ]
+    assert 0.0 < float(concentration) <= 1.0
 
     assert set(
         bad_case_report["category_counts"].keys()
@@ -29870,6 +29945,46 @@ def run_self_test():
     assert rare_bucket["wrong"] == 2, rare_bucket
     assert stratified_probe["error_frequency_basis"] == (
         "train_target_share"
+    )
+
+    # top-N 多样性：三个最差 token 若来自同一窗口，只能算一个
+    # 失败模式的重复观测，报告必须给出集中度而不是让读者把
+    # 案例数当成独立证据数。
+    shared_window = torch.arange(6, dtype=torch.uint8)
+    concentrated_probe = _bad_case_report_from_buffers(
+        torch.tensor([5.0, 4.0, 3.0]),
+        torch.tensor([0, 0, 0], dtype=torch.uint8),
+        torch.tensor([1, 1, 1], dtype=torch.int16),
+        torch.full((3,), 0.9),
+        torch.full((3,), 0.5),
+        3,
+        [
+            (5.0, 0, shared_window, 0, 0, 1, 0.9, 0.5),
+            (4.0, 1, shared_window, 1, 0, 1, 0.9, 0.5),
+            (3.0, 2, shared_window, 2, 0, 1, 0.9, 0.5),
+        ],
+        "val",
+        3,
+        16,
+        8,
+        256,
+        dataset=None,
+    )
+    assert concentrated_probe["top_cases_unique_windows"] == 1
+    assert (
+        concentrated_probe["top_cases_window_concentration"]
+        == 1.0
+    )
+    assert concentrated_probe[
+        "top_cases_concentration_warning"
+    ]
+    assert {
+        case["position"]
+        for case in concentrated_probe["top_cases"]
+    } == {1, 2, 3}
+    assert all(
+        case["window_repeat_count"] == 3
+        for case in concentrated_probe["top_cases"]
     )
 
     # 效率测量：参数量与模型一致，各测量值有效或明确不可用。
