@@ -37184,7 +37184,14 @@ def main():
         0,
         int(start_step) - int(nonfinite_events),
     )
-    consecutive_nonfinite = 0
+    # 连续非有限步数同样跨 resume 保留：该计数在检查点里随
+    # checkpoint_numerical_state 存档，且数值停止判据
+    # （consecutive_nonfinite >= 3）针对的是跨段累计的“连续”
+    # 失败次数；若在此清零，恢复前已连续失败 2 次的运行会
+    # 再获 3 次机会，数值停止守卫被静默削弱。
+    consecutive_nonfinite = _saved_counter(
+        "consecutive_nonfinite"
+    )
     numerical_stop = False
     numerical_polluted = False
     prior_numerical_stop = bool(
