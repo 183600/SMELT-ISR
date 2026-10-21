@@ -14537,7 +14537,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["numerical_stop"]
             or row["numerical_polluted"]
             or row["prior_numerical_stop"]
-            or row["curve_status"] == "diverged"
+            or row["curve_status"] in ("diverged", "diverging")
             or (
                 isinstance(nonfinite_events, int)
                 and not isinstance(nonfinite_events, bool)
@@ -21397,6 +21397,7 @@ def baseline_adequacy(
             "not_converged",
             "underfitting",
             "diverged",
+            "diverging",
         ):
             unconverged_baselines.append(
                 f"{row.get('run')}（curve_status={status}）"
@@ -32515,6 +32516,37 @@ def run_self_test():
             "数值失败运行不能充当消融" in message
             for message in failed_full_coverage["advisories"]
         )
+
+        # 有限但持续发散（diverging）同样不能当作有效运行：
+        # 它没有 NaN，却已失去稳定的训练轨迹。
+        finite_div_paths = full_paths[:-1] + [
+            _write_analysis_run(
+                "A_bal0_finite_diverging",
+                "A",
+                42,
+                3e-4,
+                100,
+                0.0,
+                2.00,
+                curve_status="diverging",
+            ),
+        ]
+        finite_div_coverage = ablation_coverage(
+            compare_runs(finite_div_paths),
+            factors,
+            ["A"],
+            allow_partial=True,
+        )
+        assert (
+            finite_div_coverage["n_failed_rows_excluded"] == 1
+        )
+        assert finite_div_coverage["failed_runs"] == [
+            "A_bal0_finite_diverging"
+        ]
+        assert any(
+            "A/b=off" in message
+            for message in finite_div_coverage["missing_cells"]
+        ), finite_div_coverage["missing_cells"]
         assert not any(
             "全因子组合齐全" in message
             for message in failed_full_coverage["advisories"]
@@ -35860,6 +35892,15 @@ def run_self_test():
             "nonfinite_events": 4,
             "numerical_status": "failed",
         },
+        {
+            "run": "finite-diverging",
+            "mode": "A",
+            "seed": 4,
+            "val_loss": 8.0,
+            "curve_status": "diverging",
+            "nonfinite_events": 0,
+            "numerical_status": "failed",
+        },
     ]
     numerical_aggregate = aggregate_runs(
         numerical_rows,
@@ -35871,10 +35912,14 @@ def run_self_test():
         numerical_aggregate["numerical_failures"][0]["run"]
         == "diverged"
     )
+    assert {
+        item["run"]
+        for item in numerical_aggregate["numerical_failures"]
+    } == {"diverged", "finite-diverging"}
     numerical_report = numerical_failure_report(
         numerical_rows
     )
-    assert numerical_report["excluded_run_count"] == 1
+    assert numerical_report["excluded_run_count"] == 2
     assert numerical_report["advisory"]
 
     # 单元均值的 95% CI 必须是 t 分布区间：宽度随 n 变小而
@@ -37211,6 +37256,7 @@ def analyze_baseline_tuning(
             "not_converged",
             "underfitting",
             "diverged",
+            "diverging",
         )
     ]
     report["winner_unconverged_runs"] = winner_unconverged_runs
@@ -37654,6 +37700,7 @@ def analyze_baseline_tuning_axes(
                     "not_converged",
                     "underfitting",
                     "diverged",
+                    "diverging",
                 )
             ]
             if winner_unconverged_runs:
