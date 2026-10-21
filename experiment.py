@@ -18010,11 +18010,18 @@ def _cost_verdict_from_ratios(
     cost_ratios: Dict[str, float],
     verdict: str,
     significant: bool,
+    noisy_timing_fields: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     """
     由效率倍率与显著性给出权衡判定，供对比创建时与多重比较
     校正后重算共用（校正可能把显著翻转为不显著，权衡结论
     必须同步降级为 ``gain_not_significant``）。
+
+    ``noisy_timing_fields`` 是计时离散度过大或倍率区间跨 1 的
+    字段：单次/少量运行的计时噪声可能伪造 10 倍成本，不能
+    用它单独把结论判成 ``gain_with_cost``。结构字段（参数量/
+    FLOPs/峰值占用）不受此豁免；若全部字段都被标为噪声，
+    退回使用全部倍率，避免因为缺证据而静默丢掉成本警告。
 
     ``cost_verdict``：
     - ``gain_with_cost``：指标显著改善，但效率倍率达到基线的
@@ -18028,7 +18035,16 @@ def _cost_verdict_from_ratios(
     if not cost_ratios or verdict == "missing_metric":
         return None
 
-    most_expensive = max(cost_ratios.values())
+    ignored = set(noisy_timing_fields or ())
+    considered = {
+        field: ratio
+        for field, ratio in cost_ratios.items()
+        if field not in ignored
+    }
+    if not considered:
+        considered = cost_ratios
+
+    most_expensive = max(considered.values())
     expensive = most_expensive >= _COST_RATIO_MATERIAL
     if verdict == "regression" and most_expensive > 1.0:
         return "dominated_regression"
@@ -18126,6 +18142,7 @@ def _cost_comparison(
         cost_ratios,
         verdict,
         significant,
+        noisy_timing_fields=timing_noise_fields,
     )
 
     # 记录哪些「效率字段」缺失：涨点/变差结论无法做精度与
@@ -18137,6 +18154,12 @@ def _cost_comparison(
             "ratios": cost_ratios,
             "uncertainty": cost_uncertainty,
             "timing_noise_fields": timing_noise_fields,
+            "material_cost_fields": [
+                field
+                for field, ratio in cost_ratios.items()
+                if field not in set(timing_noise_fields)
+                and ratio >= _COST_RATIO_MATERIAL
+            ],
             "unverifiable_timing_fields": (
                 unverifiable_timing_fields
             ),
@@ -18213,10 +18236,16 @@ def _apply_multiple_comparison_correction(
         cost = contrast.get("cost")
         if isinstance(cost, dict):
             ratios = cost.get("ratios")
+            noisy_timing = cost.get("timing_noise_fields")
             contrast["cost_verdict"] = _cost_verdict_from_ratios(
                 ratios if isinstance(ratios, dict) else {},
                 str(contrast.get("verdict")),
                 corrected,
+                noisy_timing_fields=(
+                    noisy_timing
+                    if isinstance(noisy_timing, list)
+                    else None
+                ),
             )
 
     # 符号翻转检验与 t 检验同属一个显著性家族：它只在配对
@@ -30890,6 +30919,34 @@ def run_self_test():
     assert _benjamini_hochberg([0.02]) == [0.02]
     assert _holm_bonferroni([None, 0.01]) == [None, 0.01]
     assert _benjamini_hochberg([None, 0.01]) == [None, 0.01]
+
+    # 效率权衡：单次计时可能伪造 10 倍成本；被标为计时噪声的
+    # 字段不能单独把显著涨点判成 gain_with_cost，但结构字段
+    # （参数/FLOPs）仍照常参与。若全部字段都不可信，则退回
+    # 全部倍率，不能静默丢掉成本警告。
+    assert _cost_verdict_from_ratios(
+        {
+            "n_params": 1.0,
+            "latency_ms_per_forward": 10.0,
+        },
+        "improvement",
+        True,
+    ) == "gain_with_cost"
+    assert _cost_verdict_from_ratios(
+        {
+            "n_params": 1.0,
+            "latency_ms_per_forward": 10.0,
+        },
+        "improvement",
+        True,
+        noisy_timing_fields=["latency_ms_per_forward"],
+    ) == "gain_balanced"
+    assert _cost_verdict_from_ratios(
+        {"latency_ms_per_forward": 10.0},
+        "improvement",
+        True,
+        noisy_timing_fields=["latency_ms_per_forward"],
+    ) == "gain_with_cost"
 
     # t 临界值应回归到 t 表：df=4 双侧 alpha=0.05 为
     # 2.776445，df=2 为 4.302653。
