@@ -25436,6 +25436,34 @@ _GRADIENT_FAILURE_HINTS = {
 }
 
 
+def _batch_sha256(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> str:
+    """
+    (x, y) 固定小批次的稳定指纹。
+
+    重复运行只比较损失无法区分「同一批次」与「碰巧得到相同
+    损失的不同批次」。把 dtype / 形状 / 原始字节一起哈希，可
+    在 sanity 报告中直接核对两次重复是否真的消费了同一份
+    数据；数据管线若暗中依赖未固定状态，指纹会先变化。
+    """
+    digest = hashlib.sha256()
+
+    for label, tensor in (("x", x), ("y", y)):
+        cpu = tensor.detach().to("cpu").contiguous()
+        digest.update(label.encode("ascii"))
+        digest.update(str(cpu.dtype).encode("ascii"))
+        digest.update(str(tuple(cpu.shape)).encode("ascii"))
+        raw = cpu.view(torch.uint8)
+        if np is not None:
+            digest.update(raw.numpy().tobytes())
+        else:
+            digest.update(bytes(raw.tolist()))
+
+    return digest.hexdigest()
+
+
 def run_sanity_overfit(
     cfg: Config,
     dataset: ByteDataset,
@@ -25509,6 +25537,11 @@ def run_sanity_overfit(
             batch_size,
             generator,
             device,
+        )
+        batch_sha256 = _batch_sha256(x, y)
+        print(
+            "[sanity] fixed batch sha256="
+            f"{batch_sha256[:12]}..."
         )
 
         # weight_decay=0、无 warmup、无梯度裁剪：全部正则化关闭。
@@ -25720,6 +25753,7 @@ def run_sanity_overfit(
             "n_params": n_params,
             "steps": steps,
             "batch_size": batch_size,
+            "batch_sha256": batch_sha256,
             "lr": lr,
             "seed": seed,
             "grad_checkpoint": grad_checkpoint,
@@ -25757,6 +25791,7 @@ def run_sanity_overfit(
 
 
 _SANITY_REPEAT_KEYS: Tuple[str, ...] = (
+    "batch_sha256",
     "initial_lm_loss",
     "final_lm_loss",
     "initial_total_loss",
@@ -29834,6 +29869,13 @@ def run_self_test():
         repeated_metrics["grad_probe"]["grad_norm"]
         == grad_probe["grad_norm"]
     )
+    assert (
+        repeated_metrics["batch_sha256"]
+        == sanity_metrics["batch_sha256"]
+    )
+    assert len(sanity_metrics["batch_sha256"]) == 64
+    assert _batch_sha256(x, y) == _batch_sha256(x.clone(), y.clone())
+    assert _batch_sha256(x, y) != _batch_sha256(y, x)
 
     # 重复运行报告必须能识别真正的一致/不一致，而不是恒真。
     same_repeat = sanity_repeat_report([
@@ -29860,6 +29902,17 @@ def run_self_test():
     assert loss_mismatch["repeat_value"] == (
         mismatched["final_lm_loss"]
     )
+    # 批次指纹变化必须被重复报告识别，不能只比较损失。
+    batch_mismatched = dict(repeated_metrics)
+    batch_mismatched["batch_sha256"] = "0" * 64
+    assert any(
+        item["key"] == "batch_sha256"
+        for item in sanity_repeat_report([
+            sanity_metrics,
+            batch_mismatched,
+        ])["mismatches"]
+    )
+
     # 只运行一次时没有复现性证据，必须是 None 而不是虚报 True。
     assert sanity_repeat_report([sanity_metrics])["identical"] is None
 
