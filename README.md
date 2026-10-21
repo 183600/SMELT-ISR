@@ -232,7 +232,7 @@ RQ3/RQ4 的路由诊断（第二轮 Jaccard / slot 复用 / 分支自复用、�
 - **结果分析（曲线 / NaN / 坏案例 / 效率）**：
   - **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐；验证损失尚未回升但泛化 gap 持续扩大时提前给出「过拟合前兆」警告（`gap_widening_warning`）与早停建议，不必等验证回升后才被动止损。
   - **NaN/Inf 系统排查**：按「数据 NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合精度溢出 → 梯度爆炸/学习率过大」路径收集证据；`nan_diagnosis` 记录失败步梯度范数与近期中位数的对比，区分梯度爆炸与前向/损失侧根因。
-  - **坏案例分析**：在与周期验证相同的固定窗口上、对**全部**评估 token 做流式统计（每 token 仅保留约 10 字节紧凑标量，不做随机下采样，token 准确率与 `evaluate` 同口径），top-N 最差样本用「每批 top-N + 跨批截断」精确维护并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；全量错误 token 的类别归因（`error_category_counts` / `error_category_shares`）不只统计 top-N，作为提出新改进思路的证据。
+  - **坏案例分析**：在与周期验证相同的固定窗口上、对**全部**评估 token 做流式统计（每 token 仅保留约 10 字节紧凑标量，不做随机下采样，token 准确率与 `evaluate` 同口径），top-N 最差样本用「每批 top-N + 跨批截断」精确维护并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；全量错误 token 的类别归因（`error_category_counts` / `error_category_shares`）不只统计 top-N，作为提出新改进思路的证据。标签噪声核验要求训练集同一上下文支持数 ≥2、目标占比 ≤10%，且主流后续字节占比 ≥50%——多数类优势不足只说明上下文歧义，不能当标注错误。`--compare` 会跨运行按错误 token 加权汇总错误类别，并列出在多个运行 top-10 混淆对中重复出现的稳定混淆对（报告会注明 top-10 的覆盖上限）。
   - **效率与精度权衡**：`--compare` 汇总每个实验单元的参数量、FLOPs、推理延迟、训练步耗时（前向+反向）与显存/内存，并在单因子对比里标注成本倍数；显著涨点但成本 ≥1.5×、或指标变差且更贵的对比会被显式标记（须评估性价比 / 严格劣于基线），避免「涨 0.5% 但计算 ×10」被当成有效改进。每个效率字段的均值都带 t 分布 95% 置信区间（`ci95_low/ci95_high`，n<2 不给），报告用 `[efficiency-ci]` 行展示推理延迟与训练步耗时的区间：区间宽度与均值同量级时，效率差异可能只是测量噪声。
 
 ### 多随机种子与消融套件示例

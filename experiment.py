@@ -11507,6 +11507,11 @@ _BAD_CASE_OVERCONFIDENT_THRESHOLD = 0.9
 _BAD_CASE_LABEL_CONTEXT = 8
 _BAD_CASE_LABEL_MIN_SUPPORT = 2
 _BAD_CASE_LABEL_TARGET_MAX_SHARE = 0.1
+# 「训练上下文的主流后续字节」必须有实质优势，否则同一上下文
+# 本来就多峰（如空格后的多个合法词首），把「非主流」当标注
+# 错误会把正常歧义样本误报为标签噪声。只有主流占比达到该
+# 阈值时，评估标签与之矛盾才算可核验的标注可疑。
+_BAD_CASE_LABEL_MAJORITY_MIN_SHARE = 0.5
 
 # top-N 案例多样性：最差 token 可能集中在同一窗口的不同位置，
 # 此时它们不是 N 个独立证据。至少要有若干案例、且单一窗口
@@ -11770,6 +11775,40 @@ def _train_next_byte_evidence(
     return evidence
 
 
+def _label_noise_context_verdict(
+    evidence: Optional[Dict[str, object]],
+    target: int,
+) -> Tuple[bool, Optional[float]]:
+    """
+    由训练上下文证据判断评估标签是否「可核验地可疑」。
+
+    返回 ``(verified, target_share)``。只要求「多数类不等于
+    目标」不够：多数类占比可能只有 11%，其余是大量合法分支，
+    这更像上下文歧义而不是标注错误。只有支持数足够、目标占比
+    低、且主流后续字节有实质优势时，才把它当作标注噪声证据。
+    """
+    if not isinstance(evidence, dict):
+        return False, None
+    support = int(evidence.get("support") or 0)
+    counts = evidence.get("counts")
+    if support <= 0 or not isinstance(counts, dict):
+        return False, None
+    target_share = float(counts.get(target, 0)) / support
+    majority_share = evidence.get("majority_share")
+    if majority_share is None:
+        return False, target_share
+    majority_byte = evidence.get("majority_byte")
+    verified = bool(
+        support >= _BAD_CASE_LABEL_MIN_SUPPORT
+        and target_share <= _BAD_CASE_LABEL_TARGET_MAX_SHARE
+        and float(majority_share)
+        >= _BAD_CASE_LABEL_MAJORITY_MIN_SHARE
+        and majority_byte is not None
+        and int(majority_byte) != int(target)
+    )
+    return verified, target_share
+
+
 def _empty_bad_case_report(
     split: str,
     note: str = "评估窗口为空，未生成坏案例。",
@@ -11816,6 +11855,9 @@ def _empty_bad_case_report(
             "min_train_support": _BAD_CASE_LABEL_MIN_SUPPORT,
             "max_target_share_in_context": (
                 _BAD_CASE_LABEL_TARGET_MAX_SHARE
+            ),
+            "min_majority_share_in_context": (
+                _BAD_CASE_LABEL_MAJORITY_MIN_SHARE
             ),
             "candidates": 0,
             "verified": 0,
@@ -12033,21 +12075,9 @@ def _bad_case_report_from_buffers(
             ].tolist()
         )
         evidence = context_evidence.get(context_key)
-        train_context_target_share: Optional[float] = None
-        label_noise_verified = False
-        if evidence is not None:
-            support = int(evidence["support"])
-            counts = evidence["counts"]
-            if support > 0 and isinstance(counts, dict):
-                train_context_target_share = (
-                    float(counts.get(target, 0)) / support
-                )
-                label_noise_verified = bool(
-                    support >= _BAD_CASE_LABEL_MIN_SUPPORT
-                    and train_context_target_share
-                    <= _BAD_CASE_LABEL_TARGET_MAX_SHARE
-                    and int(evidence["majority_byte"]) != target
-                )
+        label_noise_verified, train_context_target_share = (
+            _label_noise_context_verdict(evidence, target)
+        )
 
         train_rare = bool(
             train_target_share is None
@@ -12272,6 +12302,9 @@ def _bad_case_report_from_buffers(
         "max_target_share_in_context": (
             _BAD_CASE_LABEL_TARGET_MAX_SHARE
         ),
+        "min_majority_share_in_context": (
+            _BAD_CASE_LABEL_MAJORITY_MIN_SHARE
+        ),
         "candidates": len(top_cases),
         "verified": verified_label_noise,
         "unverified": len(top_cases)
@@ -12280,11 +12313,12 @@ def _bad_case_report_from_buffers(
             unverifiable_label_noise
         ),
         "note": (
-            "只有训练集中同一上下文有足够支持、且评估目标不是"
-            "主流后续字节时，top-N 案例才标记为 "
-            "label_noise_suspect；support=0 表示无法核验，"
-            "不能据此断定标注正确。全量错误归因只做训练/评估"
-            "目标稀有度交叉核对。"
+            "只有训练集中同一上下文有足够支持、评估目标占比低、"
+            "且主流后续字节有实质优势（≥50%）时，top-N 案例才"
+            "标记为 label_noise_suspect；多数类优势不足说明"
+            "上下文本身歧义。support=0 表示无法核验，不能据此"
+            "断定标注正确。全量错误归因只做训练/评估目标稀有度"
+            "交叉核对。"
         ),
     }
 
@@ -34006,6 +34040,33 @@ def run_self_test():
     assert label_noise_check["context_length"] == (
         _BAD_CASE_LABEL_CONTEXT
     )
+    assert label_noise_check[
+        "min_majority_share_in_context"
+    ] == _BAD_CASE_LABEL_MAJORITY_MIN_SHARE
+    # 多数类优势不足时不能判成标注错误：11% 的「多数类」只是
+    # 多峰上下文，不是可核验的标签矛盾。
+    ambiguous_evidence = {
+        "support": 20,
+        "majority_byte": 66,
+        "majority_share": 0.11,
+        "counts": {66: 2, 67: 2, 68: 2, 69: 2, 70: 2, 71: 2,
+                   72: 2, 73: 2, 74: 2, 65: 2},
+    }
+    ambiguous_verified, ambiguous_target_share = (
+        _label_noise_context_verdict(ambiguous_evidence, 65)
+    )
+    assert ambiguous_verified is False
+    assert abs(ambiguous_target_share - 0.1) < 1e-9
+    dominant_evidence = {
+        "support": 20,
+        "majority_byte": 66,
+        "majority_share": 0.8,
+        "counts": {66: 16, 65: 1, 67: 1, 68: 1, 69: 1},
+    }
+    dominant_verified, _ = _label_noise_context_verdict(
+        dominant_evidence, 65
+    )
+    assert dominant_verified is True
     for case in bad_case_report["top_cases"]:
         assert "label_noise_verified" in case
         assert "train_context_support" in case
