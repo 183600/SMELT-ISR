@@ -37315,8 +37315,13 @@ def main():
     )
     numerical_stop = False
     numerical_polluted = False
+    # 「曾数值停止」的历史必须跨多次 resume 保留：首次恢复后
+    # numerical_stop 已被重置为 False，而历史写在
+    # prior_numerical_stop 键里；只读 numerical_stop 会让第二次
+    # 起的续跑把这段历史洗掉，测试集解封门与跨运行对比随之失守。
     prior_numerical_stop = bool(
         saved_numerical_state.get("numerical_stop")
+        or saved_numerical_state.get("prior_numerical_stop")
     )
     if prior_numerical_stop:
         print(
