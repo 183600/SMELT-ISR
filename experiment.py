@@ -37425,6 +37425,32 @@ def run_self_test():
         assert tuning_plan[0]["lr"] == 1e-4
         assert tuning_plan[0]["seed"] == 42
 
+        assert baseline_tuning_axis_candidates_error(
+            "--baseline-tuning-dense-hiddens",
+            [128, 256],
+            True,
+        ) is None
+        assert baseline_tuning_axis_candidates_error(
+            "--baseline-tuning-dense-hiddens",
+            [0],
+            True,
+        ) is not None
+        assert baseline_tuning_axis_candidates_error(
+            "--baseline-tuning-weight-decays",
+            [0.0, 0.1],
+            False,
+        ) is None
+        assert baseline_tuning_axis_candidates_error(
+            "--baseline-tuning-weight-decays",
+            [-0.1],
+            False,
+        ) is not None
+        assert baseline_tuning_axis_candidates_error(
+            "--baseline-tuning-weight-decays",
+            [float("inf")],
+            False,
+        ) is not None
+
         # lr=1e-4 均值 4.0；lr=3e-4 均值同为 4.0（最低越好）但
         # 有种子波动：winner 取更保守的 1e-4，且提示无法区分。
         tuning_paths = []
@@ -39821,6 +39847,35 @@ def _execute_sweep_plan(
         run_paths.append(str(run_out))
 
     return run_paths
+
+
+def baseline_tuning_axis_candidates_error(
+    flag: str,
+    values: List[object],
+    integer: bool,
+) -> Optional[str]:
+    """
+    校验多轴调参候选的取值域：容量轴必须为正整数，正则轴
+    必须为有限非负数。返回错误消息或 None。
+    """
+    if integer:
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return f"{flag} 的每个候选必须是正整数"
+        return None
+    for value in values:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            return f"{flag} 的每个候选必须是有限非负数"
+    return None
 
 
 def resolve_baseline_tuning_metric(
@@ -42851,20 +42906,29 @@ def main():
     # 多轴（坐标式）调参的轴候选检查：每个轴至少两个不同取值
     # （单档不算调参），且格式化后不能重名（否则运行目录互相
     # 覆盖）。
-    for flag, values, formatter in (
+    for flag, values, formatter, integer in (
         (
             "--baseline-tuning-dense-hiddens",
             list(args.baseline_tuning_dense_hiddens),
             lambda value: f"h{value}",
+            True,
         ),
         (
             "--baseline-tuning-weight-decays",
             list(args.baseline_tuning_weight_decays),
             lambda value: f"wd{format(value, 'g')}",
+            False,
         ),
     ):
         if not values:
             continue
+        candidates_error = baseline_tuning_axis_candidates_error(
+            flag,
+            values,
+            integer,
+        )
+        if candidates_error is not None:
+            parser.error(candidates_error)
         if args.suite_baseline_tuning and len(set(values)) < 2:
             parser.error(
                 f"{flag} 至少需要两个不同的候选，"
