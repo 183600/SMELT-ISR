@@ -41697,6 +41697,21 @@ def main():
 
     # --compare 模式只读运行目录，不需要 --data / --out。
     if args.compare is not None:
+        # 路径写错时 compare_runs 仍会为不存在的目录生成整行 "-"
+        # 的幽灵运行，后续分析再对这些空运行报告「无对照/无基线」
+        # 并正常退出 0。对比对象本身不存在不是数据缺口，必须在
+        # 入口按参数错误拒绝（存在但缺 config/metrics 的旧运行
+        # 仍由 compare_runs 容忍并逐项标注缺失）。
+        invalid_compare_paths = [
+            path
+            for path in args.compare
+            if not Path(path).is_dir()
+        ]
+        if invalid_compare_paths:
+            parser.error(
+                "--compare 的运行目录不存在或不是目录: "
+                + ", ".join(invalid_compare_paths)
+            )
         compare_rows = compare_runs(args.compare)
         print_comparison(compare_rows)
         print_comparison_analysis(
