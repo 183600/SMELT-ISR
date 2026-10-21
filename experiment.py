@@ -14220,6 +14220,7 @@ def diagnose_non_finite(
     lr: float,
     amp_dtype: Optional[torch.dtype] = None,
     scaler: Optional[object] = None,
+    amp_scale_before_step: Optional[float] = None,
     vocab_size: int = 256,
     recent_grad_norms: Optional[List[Tuple[int, float]]] = None,
 ) -> Dict[str, object]:
@@ -14530,13 +14531,51 @@ def diagnose_non_finite(
 
     # ---- 5) 学习率、梯度缩放与梯度趋势 ----
     checks["lr"] = lr
+    amp_state: Dict[str, object] = {
+        "grad_scale_before_step": None,
+        "grad_scale_at_diagnosis": None,
+        "scale_reduced_on_failure": False,
+    }
     if scaler is not None:
         try:
-            checks["grad_scale"] = float(
-                scaler.get_scale()
-            )
+            scale_at_diagnosis = float(scaler.get_scale())
         except Exception:
-            checks["grad_scale"] = None
+            scale_at_diagnosis = None
+        checks["grad_scale"] = scale_at_diagnosis
+        amp_state["grad_scale_at_diagnosis"] = (
+            scale_at_diagnosis
+        )
+        if (
+            amp_scale_before_step is not None
+            and math.isfinite(float(amp_scale_before_step))
+            and float(amp_scale_before_step) > 0.0
+        ):
+            before = float(amp_scale_before_step)
+            amp_state["grad_scale_before_step"] = before
+            if scale_at_diagnosis is not None:
+                amp_state["scale_ratio_to_before"] = round(
+                    scale_at_diagnosis / before,
+                    6,
+                )
+                # GradScaler 在 unscale 时发现 inf/nan 梯度会
+                # 立即回退 scale（默认 ×0.5）；失败步出现回退
+                # 是混合精度反传溢出的直接证据，比让用户
+                # 「去查 AMP」更可行动。
+                reduced = (
+                    scale_at_diagnosis < before * 0.999
+                )
+                amp_state["scale_reduced_on_failure"] = reduced
+                if reduced:
+                    findings.append(
+                        "AMP GradScaler 在失败步把 grad scale "
+                        f"从 {before:.4g} 回退到 "
+                        f"{scale_at_diagnosis:.4g}："
+                        "反传梯度发生 fp16/bf16 溢出（inf/nan），"
+                        "这是混合精度数值问题的直接证据。"
+                        "优先检查 logits/损失量级、开启梯度裁剪、"
+                        "降低学习率，或改用 bf16/fp32 复现确认。"
+                    )
+    checks["amp"] = amp_state
 
     # 用失败步之前的有限梯度范数做对照：非有限通常是「梯度爆炸/
     # 学习率过大」的特征；梯度水平正常则更像前向/损失侧问题，
@@ -33964,6 +34003,39 @@ def run_self_test():
         for finding in forward_side_report["findings"]
     ), forward_side_report["findings"]
 
+    # AMP 证据：失败步 grad scale 回退必须直接指向混合精度
+    # 溢出，而不是只让用户泛泛地「查 AMP」。
+    class _ScaleProbe:
+        def __init__(self, scale: float):
+            self.scale = scale
+
+        def get_scale(self) -> float:
+            return self.scale
+
+    amp_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        diag_result,
+        torch.tensor(float("nan")),
+        step=4,
+        lr=1e-3,
+        amp_dtype=torch.float16,
+        scaler=_ScaleProbe(32768.0),
+        amp_scale_before_step=65536.0,
+        vocab_size=256,
+    )
+    amp_check = amp_report["checks"]["amp"]
+    assert amp_check["scale_reduced_on_failure"] is True
+    assert amp_check["grad_scale_before_step"] == 65536.0
+    assert amp_check["grad_scale_at_diagnosis"] == 32768.0
+    assert amp_check["scale_ratio_to_before"] == 0.5
+    assert any(
+        "GradScaler" in finding and "溢出" in finding
+        for finding in amp_report["findings"]
+    ), amp_report["findings"]
+
     # 坏案例分析：结构完整、类别合法，且只使用 val 固定窗口。
     bad_case_model = LanguageModel(
         Config(
@@ -48071,6 +48143,11 @@ def main():
         # 会跳过一批、采样轨迹与不中断训练不一致。
         checkpoint_gen_state = train_generator.get_state()
 
+        scaler_scale_before_step = (
+            float(scaler.get_scale())
+            if scaler is not None
+            else None
+        )
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -48132,6 +48209,9 @@ def main():
                     lr=current_lr,
                     amp_dtype=amp_dtype,
                     scaler=scaler,
+                    amp_scale_before_step=(
+                        scaler_scale_before_step
+                    ),
                     vocab_size=cfg.vocab_size,
                     recent_grad_norms=recent_grad_norms,
                 )
