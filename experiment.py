@@ -22470,8 +22470,11 @@ def hypothesis_alignment(
             "significant": bool(contrast.get("significant")),
             "p_value_holm": contrast.get("p_value_holm"),
             "expected_direction": None,
+            # 同一实验单元的种子可能分批启动；若各自声明的
+            # 最小效应不同，取最严格（最大）阈值，避免用某个
+            # 宽松声明把整个单元判成 supported。
             "min_effect": (
-                min(declared_min_effects)
+                max(declared_min_effects)
                 if declared_min_effects
                 else None
             ),
@@ -34838,6 +34841,51 @@ def run_self_test():
         assert mismatch_alignment["checks"][0]["status"] == (
             "direction_mismatch_not_significant"
         )
+        # 同一实验单元分批启动、各自声明不同最小效应时，单元
+        # 级判定必须采用最严格（最大）阈值，不能用宽松声明
+        # 把整体判成 supported。
+        strict_prereg_run = _write_analysis_run(
+            "prereg_strict_seed2",
+            "A",
+            6,
+            3e-4,
+            100,
+            0.01,
+            4.40,
+            hypothesis="延迟合并使验证损失至少下降 5%",
+            preregistration={
+                "primary_metric": "val_loss",
+                "direction": "decrease",
+                "min_effect": 0.05,
+            },
+        )
+        mixed_effect_rows = compare_runs(
+            [prereg_run, strict_prereg_run]
+        )
+        mixed_effect_aggregates = [
+            _synthetic_aggregate("smelt", ["smelt_seed1"], 4.5),
+            _synthetic_aggregate(
+                "A",
+                ["prereg_seed1", "prereg_strict_seed2"],
+                4.40,
+            ),
+        ]
+        mixed_effect_alignment = hypothesis_alignment(
+            mixed_effect_rows,
+            mixed_effect_aggregates,
+            [
+                _synthetic_contrast(
+                    "smelt", "A", 4.5, 4.365, True
+                )
+            ],
+            "val_loss",
+        )
+        assert mixed_effect_alignment["checks"][0][
+            "min_effect"
+        ] == 0.05
+        assert mixed_effect_alignment["checks"][0][
+            "status"
+        ] == "below_declared_min_effect"
         # 指标不一致的对比不参与核对（预注册针对的是主指标）。
         other_metric_alignment = hypothesis_alignment(
             prereg_rows,
