@@ -15810,6 +15810,70 @@ def numerical_failure_report(
     return report
 
 
+# 曲线诊断中可跨运行比较的数值字段（来自 metrics.jsonl 的
+# curve_analysis 记录）。status 之外还必须带出这些量：只看
+# 最终 val_loss 会把「训练更久/选型更晚」误当成方法更好，
+# 而回归幅度、泛化 gap 与最优点位置才能说明收益是否来自
+# 泛化改善还是过拟合前的短暂低点。
+_CURVE_ROW_FIELDS: Tuple[str, ...] = (
+    "best_val_step",
+    "best_val_loss",
+    "val_regression_from_best",
+    "generalization_gap_ratio_last",
+    "generalization_gap_trend",
+    "recent_train_drop",
+    "recent_val_drop",
+    "last_lr_over_peak",
+    "grad_norm_spike_ratio",
+    "gap_widening_warning",
+    "finite_diverging",
+    "n_eval_points",
+    "n_nonfinite_events",
+)
+
+
+def curve_diagnostics_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    汇总各运行的训练曲线数值诊断，供跨运行比较。
+
+    ``status`` 是离散结论，无法回答「过拟合多严重」「最优点
+    有多早」；这里保留每个运行的回归幅度、泛化 gap、近期
+    训练/验证变化与梯度尖峰倍率。只读取已落盘的
+    ``curve_analysis`` 记录，不重新训练、不改变任何选型。
+    """
+    runs = [
+        {
+            "run": str(row.get("run")),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "status": row.get("curve_status"),
+            **{
+                key: row.get(f"curve_{key}")
+                for key in _CURVE_ROW_FIELDS
+            },
+        }
+        for row in rows
+        if row.get("curve_available")
+    ]
+    overfit_runs = [
+        entry["run"]
+        for entry in runs
+        if entry.get("status") == "overfitting"
+    ]
+    return {
+        "runs": runs,
+        "n_runs_with_curve": len(runs),
+        "overfitting_runs": overfit_runs,
+        "note": (
+            "best@ 是验证损失最优点；regr 是最终相对最优的"
+            "回升幅度；gap 是最终 (val-train)/val。regr 大且"
+            "best@ 早说明过拟合严重，不能只看最终 val_loss。"
+        ),
+    }
+
+
 def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
     """
     汇总多个运行目录的 config 与最终指标。
@@ -16189,6 +16253,18 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if curve_record is not None
             else None
         )
+        # 曲线诊断数值：只看 status 只能知道「是否过拟合」，
+        # 看不到过拟合多严重、最优点多早、泛化 gap 多大。
+        # 这些字段直接来自 analyze_training_curve 的落盘结果，
+        # 让跨运行比较能对齐「同一训练曲线口径」而不只是最终
+        # 单点指标；旧记录缺字段时保持 None。
+        row["curve_available"] = curve_record is not None
+        for curve_key in _CURVE_ROW_FIELDS:
+            row[f"curve_{curve_key}"] = (
+                curve_record.get(curve_key)
+                if curve_record is not None
+                else None
+            )
 
         # 数值完整性：失败的运行不能进入均值与显著性检验。
         # 旧记录没有新字段时用曲线里的 nonfinite 事件与
@@ -27149,6 +27225,45 @@ def print_comparison_analysis(
         for advisory in factorial_compute_matched["advisories"]:
             print(f"  [warn] {advisory}")
 
+    curve_diagnostics = curve_diagnostics_report(rows)
+    if curve_diagnostics["runs"]:
+        print()
+        print(
+            "[curve] 跨运行训练曲线诊断（读取各运行 metrics.jsonl "
+            "的 curve_analysis；不是最终单点）"
+        )
+        curve_header = (
+            f"{'run':<20} {'status':<14} {'best@':>7} "
+            f"{'regr%':>7} {'gap%':>7} {'recentVal%':>10} "
+            f"{'gradSpike':>9} {'lr/peak':>8}"
+        )
+        print(curve_header)
+        print("-" * len(curve_header))
+
+        def _curve_value(value, spec=".2f"):
+            if value is None:
+                return "-"
+            return format(float(value) * 100.0, spec)
+
+        for entry in curve_diagnostics["runs"]:
+            print(
+                f"{entry['run'][:19]:<20} "
+                f"{str(entry.get('status'))[:13]:<14} "
+                f"{str(entry.get('best_val_step') or '-'):>7} "
+                f"{_curve_value(entry.get('val_regression_from_best')):>7} "
+                f"{_curve_value(entry.get('generalization_gap_ratio_last')):>7} "
+                f"{_curve_value(entry.get('recent_val_drop')):>10} "
+                f"{_curve_value(entry.get('grad_norm_spike_ratio')):>9} "
+                f"{_curve_value(entry.get('last_lr_over_peak')):>8}"
+            )
+        if curve_diagnostics["overfitting_runs"]:
+            print(
+                "  [warn] 以下运行判定为过拟合：最终 val 指标"
+                "不是其最优泛化点，比较时应同时看 best@/regr%："
+                + "; ".join(curve_diagnostics["overfitting_runs"])
+            )
+        print("  " + str(curve_diagnostics["note"]))
+
     # 报告里不重复落盘逐窗口原始记录（体量大，且已随各运行单独
     # 写入 eval_windows.json）：单元内只保留窗口数与协议指纹，
     # 窗口级结论已在各对比的 window_paired 里给出。
@@ -27201,6 +27316,7 @@ def print_comparison_analysis(
             factorial_compute_matched
         ),
         "missing_efficiency_cells": missing_efficiency_cells,
+        "curve_diagnostics": curve_diagnostics,
         "compute_matched": compute_matched,
         "common_step": common_step,
         "selection_bias": selection_bias,
@@ -32878,6 +32994,27 @@ def run_self_test():
         overfit_analysis
     )
     assert overfit_analysis["best_val_step"] == 30
+
+    # 跨运行曲线诊断必须带出数值而不只是 status；缺失曲线记录
+    # 的运行不能伪造成 0。
+    curve_probe = curve_diagnostics_report([
+        {
+            "run": "overfit_run",
+            "curve_available": True,
+            "curve_status": "overfitting",
+            "curve_best_val_step": 30,
+            "curve_val_regression_from_best": 0.05,
+            "curve_generalization_gap_ratio_last": 0.2,
+        },
+        {"run": "old_run", "curve_available": False},
+    ])
+    assert curve_probe["n_runs_with_curve"] == 1
+    assert curve_probe["overfitting_runs"] == ["overfit_run"]
+    assert curve_probe["runs"][0]["val_regression_from_best"] == 0.05
+    assert (
+        curve_probe["runs"][0]["generalization_gap_ratio_last"]
+        == 0.2
+    )
 
     underfit_analysis = analyze_training_curve(
         [
