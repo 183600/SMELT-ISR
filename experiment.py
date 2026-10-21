@@ -6637,7 +6637,9 @@ def macro_auc_metrics(
             ).sum(dim=1)
 
             # PR-AUC：降序排序下每个相异分数阈值组的
-            # 结束位置（1 基秩）与累计真正例数。
+            # 结束位置（1 基秩）与累计真正例数。并列分数必须
+            # 在整组结束时取累计命中数；若取组首会漏掉同组内
+            # 后续正例，PR-AUC 系统性偏低。
             labels_desc = sorted_labels.flip(1)
             hits = torch.cumsum(labels_desc, dim=1)
             scores_desc = sorted_scores.flip(1)
@@ -6645,7 +6647,7 @@ def macro_auc_metrics(
                 sorted_scores, dtype=torch.bool
             )
             boundary[:, :-1] = (
-                scores_desc[:, 1:] != scores_desc[:, :-1]
+                scores_desc[:, :-1] != scores_desc[:, 1:]
             )
             boundary_counts = boundary.sum(dim=1)
 
@@ -35014,6 +35016,22 @@ def run_self_test():
         assert hypothesis_metric_unverifiable(
             ["loss"], routing_available=False
         ) == []
+
+        # 并列分数必须在整组结束时累计命中，否则 PR-AUC 偏低。
+        tied_scores = torch.tensor([0.9, 0.8, 0.8])
+        tied_probs = torch.stack(
+            [1.0 - tied_scores, tied_scores],
+            dim=1,
+        )
+        tied_auc = macro_auc_metrics(
+            tied_probs,
+            torch.tensor([0, 1, 1]),
+            2,
+            min_support=1,
+        )
+        assert abs(
+            tied_auc["pr_auc_macro"] - 0.5
+        ) < 1e-12, tied_auc
 
         # ---- RQ3/RQ4 路由指标：跨种子聚合与显著性检验 ----
         routing_payload = {
