@@ -15567,9 +15567,13 @@ def _paired_sign_flip_test(
 # 才是在**同一批固定评估窗口**上比较。任何一项不同（例如换了
 # 数据、换了窗口数/批大小、换了 seq_len）都意味着窗口集合不是
 # 同一批，逐窗口配对没有意义，必须拒绝而不是硬算。
+# split_sha256 不能省：整体 data_sha256 相同只说明源文件相同，
+# val/test 划分比例、群组吸附或切分实现变化仍会改变 val 的
+# 实际字节段与固定窗口起点。
 _EVAL_WINDOW_FINGERPRINT_KEYS = (
     "split",
     "data_sha256",
+    "split_sha256",
     "seq_len",
     "batch_size",
     "batches",
@@ -30612,6 +30616,7 @@ def run_self_test():
             data_sha256: str,
             losses: List[float],
             hits: Optional[List[int]] = None,
+            split_sha256: Optional[str] = None,
         ) -> Dict[str, object]:
             window_tokens = 7
             windows = [
@@ -30627,6 +30632,7 @@ def run_self_test():
             return {
                 "split": "val",
                 "data_sha256": data_sha256,
+                "split_sha256": split_sha256,
                 "seq_len": 8,
                 "batch_size": 8,
                 "batches": 1,
@@ -30710,6 +30716,29 @@ def run_self_test():
         )
         assert window_mismatch["status"] == "protocol_mismatch"
         assert "data_sha256" in window_mismatch["mismatched_keys"]
+
+        # 同一源文件但 val/test 比例或群组吸附不同：整体数据指纹
+        # 相同、val 字节段不同，固定窗口起点也不同。必须按 val
+        # 内容指纹拒绝配对，不能把两个不同的窗口集合硬配对。
+        window_split_mismatch = paired_window_comparison(
+            _window_payload(
+                "deadbeef",
+                [4.0, 4.1],
+                split_sha256="val-a",
+            ),
+            _window_payload(
+                "deadbeef",
+                [3.0, 3.1],
+                split_sha256="val-b",
+            ),
+        )
+        assert (
+            window_split_mismatch["status"]
+            == "protocol_mismatch"
+        )
+        assert "split_sha256" in window_split_mismatch[
+            "mismatched_keys"
+        ]
 
         # 没有窗口记录时（旧运行）必须显式说明不可用，不能静默
         # 当成「没有差异」。
@@ -40676,6 +40705,10 @@ def main():
         eval_windows_payload: Dict[str, object] = {
             "split": "val",
             "data_sha256": dataset.data_sha256,
+            # 同源文件仍可能因 val/test 比例、群组吸附或切分实现
+            # 不同而得到不同的 val 字节段；逐窗口配对必须核对
+            # val 自身的内容指纹，而不只是整体文件指纹。
+            "split_sha256": dataset.split_sha256.get("val"),
             "seq_len": int(dataset.seq_len),
             "batch_size": int(args.batch_size),
             "batches": int(args.eval_batches),
