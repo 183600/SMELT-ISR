@@ -15025,6 +15025,7 @@ _LOWER_IS_BETTER_METRICS = {
             "val_loss",
             "val_ppl",
             "val_bits_per_byte",
+            "val_macro_nll",
         )
     ),
     # RQ3：第二轮选择与第一轮不同的专家（重合度越低越独立）；
@@ -27599,6 +27600,9 @@ def run_self_test():
     assert "val_macro_nll_at_common_step" in COMPARISON_METRIC_KEYS
     assert "val_macro_nll" in _SELECTION_METRIC_KEYS
     assert not metric_higher_is_better("val_macro_nll")
+    assert not metric_higher_is_better(
+        "val_macro_nll_at_common_step"
+    )
     assert (
         _TRIVIAL_REFERENCE_FIELDS["val_macro_nll"]
         == "unigram_macro_nll"
