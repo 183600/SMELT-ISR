@@ -18110,11 +18110,12 @@ def _cost_verdict_from_ratios(
     校正后重算共用（校正可能把显著翻转为不显著，权衡结论
     必须同步降级为 ``gain_not_significant``）。
 
-    ``noisy_timing_fields`` 是计时离散度过大或倍率区间跨 1 的
-    字段：单次/少量运行的计时噪声可能伪造 10 倍成本，不能
-    用它单独把结论判成 ``gain_with_cost``。结构字段（参数量/
-    FLOPs/峰值占用）不受此豁免；若全部字段都被标为噪声，
-    退回使用全部倍率，避免因为缺证据而静默丢掉成本警告。
+    ``noisy_timing_fields`` 是不可信的计时字段：离散度过大、
+    倍率区间跨 1，或缺少重复测量而无法估计不确定性。单次/
+    少量运行的计时噪声可能伪造 10 倍成本，不能单独把结论判成
+    ``gain_with_cost``。结构字段（参数量/FLOPs/峰值占用）不受
+    此豁免；若全部字段都被标为不可信，退回使用全部倍率，避免
+    因为缺证据而静默丢掉成本警告。
 
     ``cost_verdict``：
     - ``gain_with_cost``：指标显著改善，但效率倍率达到基线的
@@ -18231,11 +18232,18 @@ def _cost_comparison(
 
         cost_uncertainty[field] = detail
 
+    # 缺重复测量的计时字段同样是不可信成本证据：它没有可估计
+    # 的倍率区间，不能让单次测量单独把显著涨点判成
+    # gain_with_cost。判定时与噪声字段一并排除，但两者仍分开
+    # 落盘，展示层才能区分「统计上不可分辨」与「根本没重复测」。
+    low_confidence_timing_fields = (
+        timing_noise_fields + unverifiable_timing_fields
+    )
     cost_verdict = _cost_verdict_from_ratios(
         cost_ratios,
         verdict,
         significant,
-        noisy_timing_fields=timing_noise_fields,
+        noisy_timing_fields=low_confidence_timing_fields,
     )
 
     # 记录哪些「效率字段」缺失：涨点/变差结论无法做精度与
@@ -18250,7 +18258,7 @@ def _cost_comparison(
             "material_cost_fields": [
                 field
                 for field, ratio in cost_ratios.items()
-                if field not in set(timing_noise_fields)
+                if field not in set(low_confidence_timing_fields)
                 and ratio >= _COST_RATIO_MATERIAL
             ],
             "unverifiable_timing_fields": (
@@ -18329,14 +18337,21 @@ def _apply_multiple_comparison_correction(
         cost = contrast.get("cost")
         if isinstance(cost, dict):
             ratios = cost.get("ratios")
-            noisy_timing = cost.get("timing_noise_fields")
+            low_confidence_timing = []
+            for key in (
+                "timing_noise_fields",
+                "unverifiable_timing_fields",
+            ):
+                fields = cost.get(key)
+                if isinstance(fields, list):
+                    low_confidence_timing.extend(fields)
             contrast["cost_verdict"] = _cost_verdict_from_ratios(
                 ratios if isinstance(ratios, dict) else {},
                 str(contrast.get("verdict")),
                 corrected,
                 noisy_timing_fields=(
-                    noisy_timing
-                    if isinstance(noisy_timing, list)
+                    low_confidence_timing
+                    if low_confidence_timing
                     else None
                 ),
             )
@@ -36076,6 +36091,89 @@ def run_self_test():
         "val_loss",
     )
     assert "计时噪声" in noisy_text, noisy_text
+
+    # 单次计时（n=1）没有可估计的倍率区间：它同样不能单独
+    # 把显著涨点判成 gain_with_cost，但必须与「有重复测量但
+    # 噪声大」分开记录，便于展示层给出不同建议。
+    unverifiable_cell_a = {
+        "costs": {
+            "n_params": {"mean": 1e9, "std": 0.0, "n": 3},
+            "latency_ms_per_forward": {
+                "mean": 10.0,
+                "std": 0.0,
+                "n": 1,
+            },
+        },
+    }
+    unverifiable_cell_b = {
+        "costs": {
+            "n_params": {"mean": 1e9, "std": 0.0, "n": 3},
+            "latency_ms_per_forward": {
+                "mean": 100.0,
+                "std": 0.0,
+                "n": 1,
+            },
+        },
+    }
+    unverifiable_cost, unverifiable_verdict = _cost_comparison(
+        unverifiable_cell_a,
+        unverifiable_cell_b,
+        "improvement",
+        True,
+    )
+    assert unverifiable_verdict == "gain_balanced", (
+        unverifiable_cost
+    )
+    assert unverifiable_cost["unverifiable_timing_fields"] == [
+        "latency_ms_per_forward"
+    ]
+    assert unverifiable_cost["timing_noise_fields"] == []
+    assert (
+        "latency_ms_per_forward"
+        not in unverifiable_cost["material_cost_fields"]
+    )
+    # 多重比较校正后的重算也必须沿用同一套低可信字段，不能
+    # 把刚排除掉的单次计时又当成材料成本。
+    unverifiable_contrast = {
+        "p_value": 0.01,
+        "significant": True,
+        "verdict": "improvement",
+        "cost": unverifiable_cost,
+        "cost_verdict": "gain_balanced",
+    }
+    _apply_multiple_comparison_correction([unverifiable_contrast])
+    assert unverifiable_contrast["cost_verdict"] == "gain_balanced", (
+        unverifiable_contrast
+    )
+
+    # 若全部成本证据都只有单次计时，仍退回全部倍率给出成本
+    # 警告，不能因为「不可信」而静默丢掉权衡提示。
+    timing_only_cost, timing_only_verdict = _cost_comparison(
+        {
+            "costs": {
+                "latency_ms_per_forward": {
+                    "mean": 10.0,
+                    "std": 0.0,
+                    "n": 1,
+                },
+            },
+        },
+        {
+            "costs": {
+                "latency_ms_per_forward": {
+                    "mean": 100.0,
+                    "std": 0.0,
+                    "n": 1,
+                },
+            },
+        },
+        "improvement",
+        True,
+    )
+    assert timing_only_verdict == "gain_with_cost", (
+        timing_only_cost
+    )
+    assert timing_only_cost["material_cost_fields"] == []
 
     # 数值失败运行必须被排除出均值/检验，并单独列出。
     numerical_rows = [
