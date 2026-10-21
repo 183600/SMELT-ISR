@@ -15815,6 +15815,23 @@ def numerical_failure_report(
 # 最终 val_loss 会把「训练更久/选型更晚」误当成方法更好，
 # 而回归幅度、泛化 gap 与最优点位置才能说明收益是否来自
 # 泛化改善还是过拟合前的短暂低点。
+# 坏案例记录中可跨运行汇总的字段（metrics.jsonl 的
+# ``step="bad_cases", split="val"``）。错误类别按错误 token
+# 加权汇总，混淆对只覆盖各运行落盘的 top-10。
+_BAD_CASE_ROW_FIELDS: Tuple[str, ...] = (
+    "tokens_evaluated",
+    "wrong_tokens",
+    "token_accuracy",
+    "error_category_counts",
+    "error_category_shares",
+    "top_confusions",
+    "error_rate_by_position",
+    "error_rate_by_train_frequency",
+    "error_frequency_basis",
+    "calibration",
+    "label_noise_verification",
+)
+
 _CURVE_ROW_FIELDS: Tuple[str, ...] = (
     "best_val_step",
     "best_val_loss",
@@ -15870,6 +15887,218 @@ def curve_diagnostics_report(
             "best@ 是验证损失最优点；regr 是最终相对最优的"
             "回升幅度；gap 是最终 (val-train)/val。regr 大且"
             "best@ 早说明过拟合严重，不能只看最终 val_loss。"
+        ),
+    }
+
+
+def bad_case_comparison_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    跨运行汇总坏案例的错误模式。
+
+    单个运行的 top-N 案例可能只是偶然困难样本；真正值得据此
+    改模型的证据是「多个种子/模式重复出现」的错误类别与混淆
+    对。这里按错误 token 数加权汇总全量归因，并统计每个
+    混淆对出现在多少个运行里。
+
+    注意各运行只落盘 top-10 混淆对，合计计数是这些 top 对的
+    求和，不是全量混淆矩阵；报告必须保留该覆盖上限，避免把
+    「top 对里常见」误读成「全量里常见」。
+    """
+    available = [
+        row for row in rows if row.get("bad_case_available")
+    ]
+    if not available:
+        return {
+            "n_runs_with_bad_cases": 0,
+            "runs": [],
+            "note": "没有运行带坏案例记录。",
+        }
+
+    category_names = list(_BAD_CASE_CATEGORIES)
+    category_counts = {name: 0 for name in category_names}
+    category_share_by_run: Dict[str, List[float]] = {
+        name: [] for name in category_names
+    }
+    total_tokens = 0
+    total_wrong = 0
+    pair_totals: Dict[Tuple[int, int], int] = {}
+    pair_run_counts: Dict[Tuple[int, int], int] = {}
+    position_totals: Dict[str, List[int]] = {}
+    frequency_totals: Dict[str, List[int]] = {}
+    frequency_bases = set()
+    runs = []
+
+    for row in available:
+        tokens = int(row.get("bad_case_tokens_evaluated") or 0)
+        wrong = int(row.get("bad_case_wrong_tokens") or 0)
+        total_tokens += tokens
+        total_wrong += wrong
+        counts = _as_dict(
+            row.get("bad_case_error_category_counts")
+        )
+        shares = _as_dict(
+            row.get("bad_case_error_category_shares")
+        )
+        for name in category_names:
+            count = int(counts.get(name) or 0)
+            category_counts[name] += count
+            share = shares.get(name)
+            if (
+                isinstance(share, (int, float))
+                and not isinstance(share, bool)
+                and math.isfinite(float(share))
+            ):
+                category_share_by_run[name].append(
+                    float(share)
+                )
+
+        pairs = row.get("bad_case_top_confusions") or []
+        seen_pairs = set()
+        for pair in pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 3:
+                continue
+            target, predicted, count = pair[:3]
+            if not all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                for value in (target, predicted, count)
+            ):
+                continue
+            key = (int(target), int(predicted))
+            pair_totals[key] = pair_totals.get(key, 0) + int(count)
+            seen_pairs.add(key)
+        for key in seen_pairs:
+            pair_run_counts[key] = pair_run_counts.get(key, 0) + 1
+
+        for field, sink in (
+            ("bad_case_error_rate_by_position", position_totals),
+            (
+                "bad_case_error_rate_by_train_frequency",
+                frequency_totals,
+            ),
+        ):
+            for entry in row.get(field) or []:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if name is None:
+                    continue
+                bucket = sink.setdefault(str(name), [0, 0])
+                bucket[0] += int(entry.get("tokens") or 0)
+                bucket[1] += int(entry.get("wrong") or 0)
+        basis = row.get("bad_case_error_frequency_basis")
+        if basis is not None:
+            frequency_bases.add(str(basis))
+
+        runs.append({
+            "run": str(row.get("run")),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "tokens_evaluated": tokens,
+            "wrong_tokens": wrong,
+            "token_accuracy": row.get("bad_case_token_accuracy"),
+            "error_category_counts": {
+                name: int(counts.get(name) or 0)
+                for name in category_names
+            },
+            "error_category_shares": {
+                name: shares.get(name)
+                for name in category_names
+            },
+            "top_confusion": (
+                pairs[0] if pairs else None
+            ),
+        })
+
+    category_shares = {
+        name: (
+            round(count / total_wrong, 6)
+            if total_wrong > 0
+            else None
+        )
+        for name, count in category_counts.items()
+    }
+    n_runs = len(available)
+    min_pair_runs = (
+        1 if n_runs == 1 else max(2, (n_runs + 1) // 2)
+    )
+    persistent_pairs = [
+        {
+            "target": target,
+            "predicted": predicted,
+            # 同一运行只计一次，避免单个运行的重复计数
+            # 把它伪装成跨运行稳定模式。
+            "runs_present": pair_run_counts.get(
+                (target, predicted), 0
+            ),
+            "top_count_sum": count,
+        }
+        for (target, predicted), count in sorted(
+            pair_totals.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        if pair_run_counts.get((target, predicted), 0)
+        >= min_pair_runs
+    ][:10]
+
+    def _stratified_summary(
+        buckets: Dict[str, List[int]],
+    ) -> List[Dict[str, object]]:
+        rows_out = []
+        for name, (tokens, wrong) in buckets.items():
+            rows_out.append({
+                "name": name,
+                "tokens": tokens,
+                "wrong": wrong,
+                "error_rate": (
+                    round(wrong / tokens, 6)
+                    if tokens > 0
+                    else None
+                ),
+            })
+        return rows_out
+
+    category_share_ranges = {}
+    unstable_categories = []
+    if n_runs >= 2:
+        for name, values in category_share_by_run.items():
+            if len(values) < 2:
+                continue
+            spread = max(values) - min(values)
+            category_share_ranges[name] = round(spread, 6)
+            if spread >= 0.20:
+                unstable_categories.append(name)
+
+    return {
+        "n_runs_with_bad_cases": n_runs,
+        "runs": runs,
+        "tokens_evaluated": total_tokens,
+        "wrong_tokens": total_wrong,
+        "error_category_counts": category_counts,
+        "error_category_shares": category_shares,
+        "persistent_confusions": persistent_pairs,
+        "persistent_confusion_min_runs": min_pair_runs,
+        "error_rate_by_position": _stratified_summary(
+            position_totals
+        ),
+        "error_rate_by_train_frequency": (
+            _stratified_summary(frequency_totals)
+            if len(frequency_bases) <= 1
+            else []
+        ),
+        "category_share_ranges": category_share_ranges,
+        "unstable_categories": unstable_categories,
+        "coverage_note": (
+            "混淆对只来自各运行落盘的 top-10 对，"
+            "合计计数不是全量混淆矩阵；全量错误类别按错误"
+            " token 加权汇总。"
+        ),
+        "note": (
+            "跨运行重复出现的错误类别/混淆对才是稳定的改进"
+            "线索；类别占比跨运行极差 ≥20pp 时说明失败模式"
+            "主要由种子/运行差异驱动，不能当作单一方法缺陷。"
         ),
     }
 
@@ -16125,6 +16354,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         )
         final_record = None
         curve_record = None
+        bad_case_record = None
 
         for record in records:
             step = record.get("step")
@@ -16132,6 +16362,13 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
                 final_record = record
             elif step == "curve_analysis":
                 curve_record = record
+            elif (
+                step == "bad_cases"
+                and record.get("split") == "val"
+            ):
+                # 只取 val：test 坏案例同样受尘封协议保护，
+                # 不进入跨运行比较。
+                bad_case_record = record
 
         row["val_loss"] = (
             final_record.get("val_loss")
@@ -16263,6 +16500,16 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row[f"curve_{curve_key}"] = (
                 curve_record.get(curve_key)
                 if curve_record is not None
+                else None
+            )
+
+        # 坏案例记录（val）：供跨运行汇总稳定错误模式。旧运行
+        # 只有部分字段时保持 None，不伪造缺失的归因。
+        row["bad_case_available"] = bad_case_record is not None
+        for bad_key in _BAD_CASE_ROW_FIELDS:
+            row[f"bad_case_{bad_key}"] = (
+                bad_case_record.get(bad_key)
+                if bad_case_record is not None
                 else None
             )
 
@@ -27264,6 +27511,83 @@ def print_comparison_analysis(
             )
         print("  " + str(curve_diagnostics["note"]))
 
+    bad_case_comparison = bad_case_comparison_report(rows)
+    if bad_case_comparison["runs"]:
+        print()
+        print(
+            "[bad-case] 跨运行错误模式（val 固定窗口；"
+            "类别按全部错误 token 加权，不是只看 top-N）"
+        )
+        category_names = list(_BAD_CASE_CATEGORIES)
+        short_names = {
+            "ambiguous": "ambig",
+            "systematic_confusion": "sysConf",
+            "label_noise_suspect": "labelNoise",
+            "uncertain": "uncert",
+        }
+        bad_header = (
+            f"{'run':<20} {'acc':>7} {'wrong':>8} "
+            + " ".join(
+                f"{short_names.get(name, name[:9]):>10}"
+                for name in category_names
+            )
+        )
+        print(bad_header)
+        print("-" * len(bad_header))
+
+        def _bad_value(value, spec=".4f"):
+            if value is None:
+                return "-"
+            return format(float(value), spec)
+
+        for entry in bad_case_comparison["runs"]:
+            shares = entry["error_category_shares"]
+            print(
+                f"{entry['run'][:19]:<20} "
+                f"{_bad_value(entry.get('token_accuracy')):>7} "
+                f"{str(entry.get('wrong_tokens')):>8} "
+                + " ".join(
+                    f"{_bad_value(shares.get(name)):>10}"
+                    for name in category_names
+                )
+            )
+
+        persistent = bad_case_comparison["persistent_confusions"]
+        if persistent:
+            min_runs = bad_case_comparison[
+                "persistent_confusion_min_runs"
+            ]
+            pairs_text = " ".join(
+                f"'{_render_byte(pair['target'])}'→"
+                f"'{_render_byte(pair['predicted'])}'"
+                f"(runs={pair['runs_present']},"
+                f"topSum={pair['top_count_sum']})"
+                for pair in persistent[:8]
+            )
+            print(
+                f"  [bad-case] 稳定混淆对（至少 {min_runs} 个运行"
+                f"的 top-10 中出现）: {pairs_text}"
+            )
+        if bad_case_comparison["unstable_categories"]:
+            ranges = bad_case_comparison[
+                "category_share_ranges"
+            ]
+            print(
+                "  [bad-case] [warn] 错误类别占比跨运行极差 ≥20pp: "
+                + ", ".join(
+                    f"{name}="
+                    f"{float(ranges.get(name, 0.0)) * 100:.1f}pp"
+                    for name in bad_case_comparison[
+                        "unstable_categories"
+                    ]
+                )
+                + "；失败模式可能由种子/运行差异驱动"
+            )
+        print(
+            "  " + str(bad_case_comparison["coverage_note"])
+        )
+        print("  " + str(bad_case_comparison["note"]))
+
     # 报告里不重复落盘逐窗口原始记录（体量大，且已随各运行单独
     # 写入 eval_windows.json）：单元内只保留窗口数与协议指纹，
     # 窗口级结论已在各对比的 window_paired 里给出。
@@ -27317,6 +27641,7 @@ def print_comparison_analysis(
         ),
         "missing_efficiency_cells": missing_efficiency_cells,
         "curve_diagnostics": curve_diagnostics,
+        "bad_case_comparison": bad_case_comparison,
         "compute_matched": compute_matched,
         "common_step": common_step,
         "selection_bias": selection_bias,
@@ -33015,6 +33340,59 @@ def run_self_test():
         curve_probe["runs"][0]["generalization_gap_ratio_last"]
         == 0.2
     )
+
+    # 坏案例跨运行汇总：类别按错误 token 加权，混淆对必须
+    # 在多运行出现才列为稳定模式。
+    bad_probe = bad_case_comparison_report([
+        {
+            "run": "a",
+            "bad_case_available": True,
+            "bad_case_tokens_evaluated": 100,
+            "bad_case_wrong_tokens": 10,
+            "bad_case_token_accuracy": 0.9,
+            "bad_case_error_category_counts": {
+                "ambiguous": 4,
+                "systematic_confusion": 3,
+                "label_noise_suspect": 2,
+                "uncertain": 1,
+            },
+            "bad_case_error_category_shares": {
+                "ambiguous": 0.4,
+                "systematic_confusion": 0.3,
+                "label_noise_suspect": 0.2,
+                "uncertain": 0.1,
+            },
+            "bad_case_top_confusions": [[65, 66, 5], [67, 68, 2]],
+        },
+        {
+            "run": "b",
+            "bad_case_available": True,
+            "bad_case_tokens_evaluated": 200,
+            "bad_case_wrong_tokens": 20,
+            "bad_case_token_accuracy": 0.9,
+            "bad_case_error_category_counts": {
+                "ambiguous": 2,
+                "systematic_confusion": 8,
+                "label_noise_suspect": 5,
+                "uncertain": 5,
+            },
+            "bad_case_error_category_shares": {
+                "ambiguous": 0.1,
+                "systematic_confusion": 0.4,
+                "label_noise_suspect": 0.25,
+                "uncertain": 0.25,
+            },
+            "bad_case_top_confusions": [[65, 66, 7], [67, 68, 1]],
+        },
+    ])
+    assert bad_probe["n_runs_with_bad_cases"] == 2
+    assert bad_probe["wrong_tokens"] == 30
+    assert bad_probe["error_category_counts"]["ambiguous"] == 6
+    assert bad_probe["error_category_shares"]["ambiguous"] == 0.2
+    assert bad_probe["persistent_confusion_min_runs"] == 2
+    assert bad_probe["persistent_confusions"][0]["target"] == 65
+    assert bad_probe["persistent_confusions"][0]["runs_present"] == 2
+    assert bad_probe["unstable_categories"]
 
     underfit_analysis = analyze_training_curve(
         [
@@ -48247,6 +48625,29 @@ def main():
                     "top_confusions": bad_case_report[
                         "top_confusions"
                     ],
+                    # 分层错误率、校准与标签噪声核验同样进入
+                    # 跨运行汇总：只看 top-N 列表无法判断
+                    # 错误是集中在序列开头、稀有目标还是
+                    # 高置信度误判。
+                    "error_rate_by_position": bad_case_report[
+                        "error_rate_by_position"
+                    ],
+                    "error_rate_by_train_frequency": (
+                        bad_case_report[
+                            "error_rate_by_train_frequency"
+                        ]
+                    ),
+                    "error_frequency_basis": bad_case_report[
+                        "error_frequency_basis"
+                    ],
+                    "calibration": bad_case_report[
+                        "calibration"
+                    ],
+                    "label_noise_verification": (
+                        bad_case_report[
+                            "label_noise_verification"
+                        ]
+                    ),
                     "top_cases": bad_case_report["top_cases"],
                     "summary": bad_case_report["summary"],
                 }),
