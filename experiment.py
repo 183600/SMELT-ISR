@@ -8254,6 +8254,120 @@ def resolve_ngram_tuning_metric(
     return "val_loss", "default_loss"
 
 
+def _ngram_tuning_diagnostics(
+    best: Dict[str, object],
+    runner_up: Optional[Dict[str, object]],
+    tuning_metric: str,
+    alpha_grid: List[float],
+    max_order: int,
+    candidate_count: int,
+    valid_candidate_count: int,
+) -> Dict[str, object]:
+    """
+    汇总 n-gram (order, alpha) 网格调参的选择不确定性。
+
+    n-gram 的最终 val 指标是在同一批 val 窗口上从整个网格里
+    选出的 winner，和神经模型的 checkpoint 选型一样存在乐观
+    偏差；只看 winner 的分数无法判断它是否只是网格内的微小
+    噪声优势。这里报告：
+
+    - ``metric_gap`` / ``metric_gap_relative``：winner 与
+      runner-up 在调参指标上的差距；差距为 0 表示并列，当前
+      选择只是「更简单优先」的确定性 tie-break；
+    - ``boundary_hits``：winner 落在 alpha / order 网格边界时
+      提示网格可能没有覆盖更优区域；
+    - ``selection_bias_note``：val 网格调参后的同一 val 指标
+      带乐观偏差，test 全程尘封，评估不确定性应看窗口
+      bootstrap 而不是重复 seed。
+    """
+    best_value = best.get(tuning_metric)
+    best_value_float: Optional[float] = None
+    if (
+        isinstance(best_value, (int, float))
+        and not isinstance(best_value, bool)
+        and math.isfinite(float(best_value))
+    ):
+        best_value_float = float(best_value)
+
+    runner_value_float: Optional[float] = None
+    if runner_up is not None:
+        runner_value = runner_up.get(tuning_metric)
+        if (
+            isinstance(runner_value, (int, float))
+            and not isinstance(runner_value, bool)
+            and math.isfinite(float(runner_value))
+        ):
+            runner_value_float = float(runner_value)
+
+    gap: Optional[float] = None
+    gap_relative: Optional[float] = None
+    if (
+        best_value_float is not None
+        and runner_value_float is not None
+    ):
+        gap = abs(best_value_float - runner_value_float)
+        if abs(best_value_float) > 0.0:
+            gap_relative = gap / abs(best_value_float)
+
+    best_order = int(best["order"])
+    best_alpha = float(best["alpha"])
+    alpha_min = min(float(value) for value in alpha_grid)
+    alpha_max = max(float(value) for value in alpha_grid)
+    boundary_hits: List[str] = []
+    if best_order >= int(max_order):
+        boundary_hits.append("order=网格上界")
+    if best_alpha <= alpha_min:
+        boundary_hits.append("alpha=网格下界")
+    if best_alpha >= alpha_max:
+        boundary_hits.append("alpha=网格上界")
+
+    advisories: List[str] = []
+    if gap is not None:
+        tolerance = 1e-12 * max(1.0, abs(best_value_float or 0.0))
+        if gap <= tolerance and runner_up is not None:
+            advisories.append(
+                "winner 与 runner-up 在调参指标上并列：当前仅是"
+                "按「更小 order / 更小 alpha」的确定性 tie-break，"
+                "不能把选中配置的 val 指标当成唯一最优证据"
+            )
+    if boundary_hits:
+        advisories.append(
+            "winner 落在调参网格边界（"
+            + ", ".join(boundary_hits)
+            + "）：网格可能未覆盖更优区域，扩展候选后应重跑"
+        )
+
+    return {
+        "tuning_metric": tuning_metric,
+        "candidate_count": int(candidate_count),
+        "valid_candidate_count": int(valid_candidate_count),
+        "best": {
+            "order": best_order,
+            "alpha": best_alpha,
+            "value": best_value_float,
+        },
+        "runner_up": (
+            {
+                "order": int(runner_up["order"]),
+                "alpha": float(runner_up["alpha"]),
+                "value": runner_value_float,
+            }
+            if runner_up is not None
+            else None
+        ),
+        "metric_gap": gap,
+        "metric_gap_relative": gap_relative,
+        "boundary_hits": boundary_hits,
+        "selection_bias_note": (
+            "最终 val 指标是在同一批 val 窗口上从整个网格选出的 "
+            "winner，和 checkpoint 选型一样带乐观偏差；test 全程"
+            "尘封。评估不确定性应看 --eval-bootstrap 的窗口区间，"
+            "不能用重复 seed 冒充独立重复"
+        ),
+        "advisories": advisories,
+    }
+
+
 def run_statistical_baseline(
     args: argparse.Namespace,
     dataset: ByteDataset,
@@ -8505,10 +8619,28 @@ def run_statistical_baseline(
             "无法按当前指标选出 (order, alpha)；请检查指标"
             "是否适用于该评估集，或显式改用 val_loss"
         )
-    best = min(candidates, key=_candidate_rank)
+    ranked_candidates = sorted(
+        valid_candidates,
+        key=_candidate_rank,
+    )
+    best = ranked_candidates[0]
+    runner_up = (
+        ranked_candidates[1]
+        if len(ranked_candidates) > 1
+        else None
+    )
 
     best_order = int(best["order"])
     best_alpha = float(best["alpha"])
+    tuning_diagnostics = _ngram_tuning_diagnostics(
+        best,
+        runner_up,
+        tuning_metric,
+        alpha_grid,
+        args.ngram_max_order,
+        len(candidates),
+        len(valid_candidates),
+    )
 
     print(
         "[ngram] val 调优结果: order="
@@ -8517,6 +8649,16 @@ def run_statistical_baseline(
         f"{float(best[tuning_metric]):.4f}, "
         f"val_loss={best['val_loss']:.4f}"
     )
+    if tuning_diagnostics.get("metric_gap") is not None:
+        print(
+            "[ngram] winner 与 runner-up 的 "
+            f"{tuning_metric} 差距="
+            f"{float(tuning_diagnostics['metric_gap']):.6g}"
+        )
+    for advisory in tuning_diagnostics.get(
+        "advisories", []
+    ):
+        print(f"[ngram][warn] {advisory}")
 
     # ---- 用调优好的配置算同口径完整指标 ----
     # 统计基线是确定性的：评估不确定性只能来自评估窗口抽样，
@@ -8551,6 +8693,7 @@ def run_statistical_baseline(
         "ngram_max_order": args.ngram_max_order,
         "ngram_tuning_metric": tuning_metric,
         "ngram_tuning_metric_source": tuning_metric_source,
+        "ngram_tuning": tuning_diagnostics,
         **final_metrics,
     }
 
@@ -8746,6 +8889,7 @@ def run_statistical_baseline(
             "ngram_tuning_metric_source": (
                 tuning_metric_source
             ),
+            "ngram_tuning": tuning_diagnostics,
         },
         # 统计基线没有优化器与训练轮数；comparison_family 让
         # 受控变量检查只在神经网络运行之间进行。
@@ -13651,6 +13795,9 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["mode"] = run_config.get("mode")
             row["ngram_tuning_metric"] = run_config.get(
                 "ngram_tuning_metric"
+            )
+            row["ngram_tuning"] = run_config.get(
+                "ngram_tuning"
             )
             row["top_k"] = run_config.get("top_k")
             row["k1"] = run_config.get("k1")
@@ -20990,9 +21137,30 @@ def baseline_adequacy(
         report["advisories"].append(
             "n-gram 对照是确定性基线（换 seed 重跑结果相同）："
             "不能用多种子 Mean ± Std 估计其不确定性；如需"
-            "误差线，请对评估窗口做 bootstrap，或在不同的"
+            "误差线，请对评估窗口做 bootstrap（新版的 "
+            "--eval-bootstrap 已为 ngram 输出区间），或在不同的"
             "时间切分上重复评估"
         )
+        ngram_tuning_issues: List[str] = []
+        for row in ngram_rows:
+            tuning = row.get("ngram_tuning")
+            if not isinstance(tuning, dict):
+                continue
+            run_name = str(row.get("run"))
+            for advisory in tuning.get("advisories", []) or []:
+                ngram_tuning_issues.append(
+                    f"{run_name}（{advisory}）"
+                )
+        if ngram_tuning_issues:
+            report["ngram_tuning_diagnostics"] = (
+                ngram_tuning_issues
+            )
+            report["advisories"].append(
+                "n-gram 调参诊断发现选择不确定性："
+                + "; ".join(ngram_tuning_issues)
+                + "。winner 的 val 指标带网格选择偏差，"
+                "不能把微小领先当成基线已被充分调强"
+            )
     elif ngram_rows:
         ngram_independent_seeds = _independent_seed_count(
             len(ngram_rows),
@@ -27512,6 +27680,39 @@ def run_self_test():
     )
     for key, value in ngram_boot.items():
         assert ngram_boot_repeat[key] == value
+
+    # n-gram 网格调参的选择诊断：并列 winner 与网格边界必须
+    # 显式暴露，不能把 tie-break 或未覆盖区域说成唯一最优。
+    tie_best = {"order": 2, "alpha": 1.0, "val_loss": 2.5}
+    tie_runner = {"order": 1, "alpha": 0.25, "val_loss": 2.5}
+    tie_tuning = _ngram_tuning_diagnostics(
+        tie_best,
+        tie_runner,
+        "val_loss",
+        [0.25, 1.0],
+        3,
+        candidate_count=6,
+        valid_candidate_count=6,
+    )
+    assert tie_tuning["metric_gap"] == 0.0
+    assert any(
+        "并列" in advisory
+        for advisory in tie_tuning["advisories"]
+    )
+    boundary_best = {"order": 3, "alpha": 1.0, "val_loss": 2.0}
+    boundary_tuning = _ngram_tuning_diagnostics(
+        boundary_best,
+        None,
+        "val_loss",
+        [0.25, 1.0],
+        3,
+        candidate_count=6,
+        valid_candidate_count=6,
+    )
+    assert "order=网格上界" in boundary_tuning["boundary_hits"]
+    assert "alpha=网格上界" in boundary_tuning["boundary_hits"]
+    assert boundary_tuning["metric_gap"] is None
+    assert boundary_tuning["advisories"]
 
     dedup_reference = compute_reference_baselines(
         dedup_dataset,
