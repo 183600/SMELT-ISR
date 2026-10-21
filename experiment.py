@@ -9049,7 +9049,8 @@ def _ngram_extended_metrics(
     include_auc: bool = True,
     bootstrap_replicates: int = 0,
     bootstrap_seed: Optional[int] = None,
-    window_sink: Optional[List[Dict[str, float]]] = None,
+    window_sink: Optional[List[Dict[str, object]]] = None,
+    window_classification: bool = False,
 ) -> Dict[str, object]:
     """
     用调优好的 (order, alpha) 在固定窗口上计算与神经模型
@@ -9060,6 +9061,12 @@ def _ngram_extended_metrics(
     ``include_auc=False`` 时跳过 AUC（网格调参只需要
     accuracy/F1 等分类指标时不收集整张概率矩阵，显著降低
     候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
+
+    ``window_classification=True`` 时每个窗口记录额外附带
+    该窗口的 accuracy / micro、macro、weighted F1 与
+    precision / recall（与全局指标同一 ``confusion_matrix_metrics``
+    口径），供分类调参指标做逐窗口配对 one-SE 选择。默认
+    False，避免把逐窗口分类明细写进 eval_windows.json。
 
     ``bootstrap_replicates > 1`` 时额外给出与神经模型同口径的
     逐窗口 bootstrap 置信区间（loss / ppl / macro NLL /
@@ -9189,11 +9196,22 @@ def _ngram_extended_metrics(
             row_pred = row_predicted[row]
             row_hits = int(row_correct[row].sum())
             if window_sink is not None:
-                window_sink.append({
+                window_record: Dict[str, object] = {
                     "loss_sum": row_loss_sum,
                     "tokens": seq_len,
                     "correct": row_hits,
-                })
+                }
+                if window_classification:
+                    row_confusion = torch.bincount(
+                        row_target * vocab_size + row_pred,
+                        minlength=vocab_size ** 2,
+                    ).view(vocab_size, vocab_size)
+                    window_record["classification"] = (
+                        confusion_matrix_metrics(
+                            row_confusion.double()
+                        )
+                    )
+                window_sink.append(window_record)
 
             if bootstrap_enabled:
                 window_loss_sums.append(row_loss_sum)
@@ -9532,61 +9550,91 @@ def _ngram_window_tuning_value(
 def _select_ngram_candidate_one_se(
     point_best: Dict[str, object],
     candidates: List[Dict[str, object]],
-    window_losses: Dict[Tuple[int, float], List[float]],
+    window_values: Dict[Tuple[int, float], List[float]],
     tuning_metric: str,
 ) -> Optional[Dict[str, object]]:
     """
     对 n-gram 网格用逐窗口配对 one-SE 规则做最终选择。
 
-    点估计最优只说明「在这批 val 窗口上最小」，网格里相邻配置
-    的微小优势可能只是窗口抽样噪声。这里以点估计 winner 为
-    参照，对每个候选计算逐窗口配对差（候选 - 点估计 winner）
-    的均值与标准误；正自相关时按 AR(1) 有效窗口数放宽标准误。
-    均值差不超过一个标准误的候选视为统计上不可分辨，再按
-    「更小 order / 更小 alpha」选择更简单配置。
+    点估计最优只说明「在这批 val 窗口上最小/最大」，网格里
+    相邻配置的微小优势可能只是窗口抽样噪声。这里以点估计
+    winner 为参照，对每个候选计算逐窗口配对差（候选 - 点估计
+    winner）的均值与标准误；正自相关时按 AR(1) 有效窗口数
+    放宽标准误。均值差不超过一个标准误的候选视为统计上
+    不可分辨，再按「更小 order / 更小 alpha」选择更简单配置。
 
-    只对损失类指标启用；分类/AUC 指标需要完整 argmax 分布，
-    逐窗口配对 loss 不是同一口径，仍按点估计选择。
+    损失类指标用逐窗口 loss 变换到调参指标尺度；accuracy /
+    micro、macro、weighted F1 与 precision / recall 用
+    ``_ngram_extended_metrics`` 记录的逐窗口同口径分类指标，
+    并按同一规则配对（越高越好时方向取反）。AUC 需要整张
+    概率矩阵且逐窗口类支持稀疏，逐窗口估计与原口径不一致，
+    仍按点估计选择。
     """
-    if tuning_metric not in (
+    loss_like = tuning_metric in (
         "val_loss",
         "val_ppl",
         "val_bits_per_byte",
+    )
+    higher_is_better = metric_higher_is_better(tuning_metric)
+    if (
+        not loss_like
+        and tuning_metric[len("val_"):]
+        not in _NGRAM_PER_WINDOW_CLASSIFICATION_METRICS
     ):
         return None
 
     def _key(row: Dict[str, object]) -> Tuple[int, float]:
         return int(row["order"]), float(row["alpha"])
 
+    def _values(raw: List[float]) -> Optional[List[float]]:
+        values: List[float] = []
+        for value in raw:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(number):
+                return None
+            values.append(
+                _ngram_window_tuning_value(
+                    number, tuning_metric
+                )
+                if loss_like
+                else number
+            )
+        return values
+
     point_key = _key(point_best)
-    point_losses = window_losses.get(point_key)
-    if not point_losses or len(point_losses) < 3:
+    point_raw = window_values.get(point_key)
+    if not point_raw or len(point_raw) < 3:
         return {
             "rule": "paired_one_se",
             "available": False,
-            "reason": "insufficient_window_losses",
+            "reason": "insufficient_window_values",
+        }
+    point_values = _values(point_raw)
+    if point_values is None:
+        return {
+            "rule": "paired_one_se",
+            "available": False,
+            "reason": "nonfinite_window_values",
         }
 
-    n_windows = len(point_losses)
-    point_values = [
-        _ngram_window_tuning_value(loss, tuning_metric)
-        for loss in point_losses
-    ]
+    n_windows = len(point_values)
     point_mean = sum(point_values) / n_windows
     tolerance = 1e-12 * max(1.0, abs(point_mean))
 
     tied: List[Dict[str, object]] = []
     for candidate in candidates:
-        candidate_losses = window_losses.get(_key(candidate))
+        candidate_raw = window_values.get(_key(candidate))
         if (
-            candidate_losses is None
-            or len(candidate_losses) != n_windows
+            candidate_raw is None
+            or len(candidate_raw) != n_windows
         ):
             continue
-        candidate_values = [
-            _ngram_window_tuning_value(loss, tuning_metric)
-            for loss in candidate_losses
-        ]
+        candidate_values = _values(candidate_raw)
+        if candidate_values is None:
+            continue
         differences = [
             value - base
             for value, base in zip(
@@ -9603,7 +9651,12 @@ def _select_ngram_candidate_one_se(
             rho1,
         )
         threshold = se * inflation
-        if mean_diff <= threshold + tolerance:
+        within_one_se = (
+            mean_diff >= -(threshold + tolerance)
+            if higher_is_better
+            else mean_diff <= threshold + tolerance
+        )
+        if within_one_se:
             value = candidate.get(tuning_metric)
             tied.append({
                 "order": int(candidate["order"]),
@@ -9625,7 +9678,7 @@ def _select_ngram_candidate_one_se(
         return {
             "rule": "paired_one_se",
             "available": False,
-            "reason": "no_candidates_with_window_losses",
+            "reason": "no_candidates_with_window_values",
         }
 
     selected = min(
@@ -9786,10 +9839,24 @@ def run_statistical_baseline(
     candidate_window_losses: Dict[
         Tuple[int, float], List[float]
     ] = {}
+    # 分类调参指标（accuracy / F1 / precision / recall）的逐窗口
+    # 同口径取值：供 one-SE 选择按窗口配对，而不是只看聚合后
+    # 的微小差距。
+    candidate_window_classification: Dict[
+        Tuple[int, float], List[float]
+    ] = {}
     loss_like_metrics = (
         "val_loss",
         "val_ppl",
         "val_bits_per_byte",
+    )
+    classification_metric_key = tuning_metric[
+        len("val_"):
+    ]
+    classification_tunable = (
+        tuning_metric not in loss_like_metrics
+        and classification_metric_key
+        in _NGRAM_PER_WINDOW_CLASSIFICATION_METRICS
     )
     higher_is_better = metric_higher_is_better(
         tuning_metric
@@ -9874,6 +9941,9 @@ def run_statistical_baseline(
                 # 分类/AUC 指标必须看完整的 argmax/概率分布：
                 # 在 val_loss 上选出的 (order, alpha) 不能证明
                 # 它在 macro F1 / PR-AUC 上也最优。
+                class_window_records: List[
+                    Dict[str, object]
+                ] = []
                 candidate_metrics = _ngram_extended_metrics(
                     model,
                     val_windows,
@@ -9886,7 +9956,42 @@ def run_statistical_baseline(
                         "val_pr_auc_macro_lift",
                         "val_roc_auc_macro",
                     ),
+                    window_sink=(
+                        class_window_records
+                        if classification_tunable
+                        else None
+                    ),
+                    window_classification=(
+                        classification_tunable
+                    ),
                 )
+                if classification_tunable:
+                    values: List[float] = []
+                    usable = True
+                    for window_record in class_window_records:
+                        classification = window_record.get(
+                            "classification"
+                        )
+                        if not isinstance(
+                            classification, dict
+                        ):
+                            usable = False
+                            break
+                        value = classification.get(
+                            classification_metric_key
+                        )
+                        if not (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                        ):
+                            usable = False
+                            break
+                        values.append(float(value))
+                    if usable and len(values) >= 3:
+                        candidate_window_classification[
+                            (order, alpha)
+                        ] = values
                 for key in (
                     "val_loss",
                     "val_ppl",
@@ -9968,13 +10073,18 @@ def run_statistical_baseline(
         else None
     )
 
-    # 点估计最优可能只领先很小一截；对损失类指标用逐窗口
-    # 配对 one-SE 规则，把统计上不可分辨的候选按更简单优先
-    # 收敛，降低网格调参的 winner's curse。
+    # 点估计最优可能只领先很小一截；损失类与分类指标都用
+    # 逐窗口配对 one-SE 规则，把统计上不可分辨的候选按更简单
+    # 优先收敛，降低网格调参的 winner's curse（AUC 除外，逐
+    # 窗口类支持稀疏、与全局口径不一致）。
     selection = _select_ngram_candidate_one_se(
         point_best,
         valid_candidates,
-        candidate_window_losses,
+        (
+            candidate_window_classification
+            if classification_tunable
+            else candidate_window_losses
+        ),
         tuning_metric,
     )
     if (
@@ -16634,6 +16744,21 @@ _NGRAM_TUNING_METRIC_KEYS = tuple(
     for key in _BASELINE_TUNING_METRIC_KEYS
     if key != "val_loss_at_matched_flops"
 )
+
+# 有逐窗口同口径估计、可对 n-gram (order, alpha) 网格做
+# 逐窗口配对 one-SE 选择的分类指标（confusion_matrix_metrics
+# 的键，去掉 val_ 前缀）；AUC 不在此列，逐窗口类支持稀疏，
+# 逐窗口估计与全局口径不一致。
+_NGRAM_PER_WINDOW_CLASSIFICATION_METRICS = frozenset({
+    "token_accuracy",
+    "micro_f1",
+    "macro_f1",
+    "weighted_f1",
+    "precision_macro",
+    "precision_weighted",
+    "recall_macro",
+    "recall_weighted",
+})
 
 # 因子的自然排序（立即合并对照在前，延迟合并在后），
 # 用于让「基线→改进」的差值符号可解释。
@@ -31044,13 +31169,71 @@ def run_self_test():
         "one-SE" in advisory
         for advisory in one_se_diagnostics["advisories"]
     )
-    # 分类指标不走逐窗口 loss 配对，仍按点估计选择。
+    # 分类指标用逐窗口同口径分类指标配对（越高越好）：与点估计
+    # winner 相差 1 个标准误内的候选择更简单配置；差距明显的
+    # 候选取不应进入并列集合。
+    f1_base = [
+        0.80 + 0.01 * ((index % 3) - 1)
+        for index in range(one_se_n)
+    ]
+    f1_near = [
+        value - 0.001 + 0.02 * ((index % 2) - 0.5)
+        for index, value in enumerate(f1_base)
+    ]
+    f1_worse = [
+        value - 0.20 + 0.01 * ((index % 2) - 0.5)
+        for index, value in enumerate(f1_base)
+    ]
+    f1_windows = {
+        (3, 1.0): f1_base,
+        (1, 0.25): f1_near,
+        (2, 1.0): f1_worse,
+    }
+    f1_candidates = [
+        {
+            "order": 1,
+            "alpha": 0.25,
+            "val_macro_f1": sum(f1_near) / one_se_n,
+        },
+        {
+            "order": 2,
+            "alpha": 1.0,
+            "val_macro_f1": sum(f1_worse) / one_se_n,
+        },
+        {
+            "order": 3,
+            "alpha": 1.0,
+            "val_macro_f1": sum(f1_base) / one_se_n,
+        },
+    ]
+    f1_selection = _select_ngram_candidate_one_se(
+        f1_candidates[2],
+        f1_candidates,
+        f1_windows,
+        "val_macro_f1",
+    )
+    assert f1_selection is not None
+    assert f1_selection["available"] is True
+    assert f1_selection["selected_is_point_best"] is False
+    assert f1_selection["selected"] == {
+        "order": 1,
+        "alpha": 0.25,
+    }
+    f1_tied_keys = {
+        (row["order"], row["alpha"])
+        for row in f1_selection["tied"]
+    }
+    assert (1, 0.25) in f1_tied_keys
+    assert (3, 1.0) in f1_tied_keys
+    assert (2, 1.0) not in f1_tied_keys
+    # AUC 需要整张概率矩阵，逐窗口类支持稀疏：不做逐窗口
+    # one-SE，仍按点估计选择。
     assert (
         _select_ngram_candidate_one_se(
             point_best,
             one_se_candidates,
             one_se_windows,
-            "val_macro_f1",
+            "val_pr_auc_macro",
         )
         is None
     )
