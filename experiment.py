@@ -8561,9 +8561,17 @@ def _sparkline(values, width=48):
         return ""
 
     if len(values) > width:
-        stride = len(values) / width
+        # 采样必须覆盖两个端点：等距取整会让最后一个点落在
+        # int((width-1)*stride) < len-1 上被丢掉，走势条看不到
+        # 训练末段的收敛/发散，而末段恰恰是诊断最关心的部分。
+        last = len(values) - 1
         values = [
-            values[min(len(values) - 1, int(index * stride))]
+            values[
+                min(
+                    last,
+                    int(round(index * last / (width - 1))),
+                )
+            ]
             for index in range(width)
         ]
 
