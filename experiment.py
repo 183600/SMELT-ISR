@@ -22631,7 +22631,11 @@ def hypothesis_alignment(
         if declaration.get("primary_metric")
     }
     for declared_metric in sorted(declared_primary_metrics):
-        if declared_metric in frequency_weighted_metrics:
+        declared_base = (
+            _common_step_metric_base(declared_metric)
+            or declared_metric
+        )
+        if declared_base in frequency_weighted_metrics:
             advisories.append(
                 f"预注册主指标 {declared_metric} 按 token 频率加权："
                 "类别不平衡时它几乎只反映高频字节，稀有字节学没"
@@ -22640,7 +22644,7 @@ def hypothesis_alignment(
                 "大小），两者回答的问题不同，不能只报对自己有利"
                 "的一个"
             )
-        elif declared_metric in balanced_likelihood_metrics:
+        elif declared_base in balanced_likelihood_metrics:
             advisories.append(
                 f"预注册主指标 {declared_metric} 是类平衡似然："
                 "它回答「稀有字节学没学会」，与频率加权的 "
@@ -22786,8 +22790,9 @@ def imbalance_metric_advisory(
             "参考价值有限，应同时报告 macro F1"
         )
 
+    base_metric = _common_step_metric_base(metric) or metric
     if (
-        metric in ("val_token_accuracy", "val_micro_f1")
+        base_metric in ("val_token_accuracy", "val_micro_f1")
         and max_majority >= _IMBALANCE_WEAK_MAJORITY
     ):
         report["advisories"].append(
@@ -22806,7 +22811,7 @@ def imbalance_metric_advisory(
         "val_bits_per_byte",
     )
     if (
-        metric in frequency_weighted_metrics
+        base_metric in frequency_weighted_metrics
         and max_majority >= _IMBALANCE_WEAK_MAJORITY
     ):
         report["advisories"].append(
@@ -22817,7 +22822,7 @@ def imbalance_metric_advisory(
             "（--compare-metric val_macro_nll，随机水平 "
             "log 词表大小）"
         )
-    if metric == "val_macro_nll":
+    if base_metric == "val_macro_nll":
         report["advisories"].append(
             "当前主指标是类平衡似然（val_macro_nll，对评估集"
             "中出现的类等权）：它与频率加权的 val_loss 回答的"
@@ -34865,6 +34870,33 @@ def run_self_test():
             "预注册" in message
             for message in mismatch_registry["advisories"]
         )
+        # 预注册主指标本身是共同步数派生口径时，同样要提示
+        # 它是频率加权似然，不能因后缀而静默略过。
+        common_prereg_run = _write_analysis_run(
+            "prereg_common_seed1",
+            "A",
+            6,
+            3e-4,
+            100,
+            0.01,
+            4.10,
+            hypothesis="延迟合并使共同步数验证损失至少下降 2%",
+            preregistration={
+                "primary_metric": "val_loss_at_common_step",
+                "direction": "decrease",
+                "min_effect": 0.02,
+            },
+        )
+        common_alignment = hypothesis_alignment(
+            compare_runs([common_prereg_run]),
+            [],
+            [],
+            "val_loss_at_common_step",
+        )
+        assert any(
+            "频率加权" in message
+            for message in common_alignment["advisories"]
+        ), common_alignment
 
         # 方向/最小效应核对：supported / refuted /
         # below_declared_min_effect / direction_mismatch 各分支。
@@ -35042,6 +35074,24 @@ def run_self_test():
         assert any(
             "PR-AUC" in message
             for message in imb_report["advisories"]
+        )
+        # 共同步数派生指标与原始周期指标口径相同：不能因为
+        # 名字后缀就漏掉频率加权/多数类主导提示。
+        common_imb_report = imbalance_metric_advisory(
+            imb_rows,
+            "val_loss_at_common_step",
+        )
+        assert any(
+            "频率加权" in message
+            for message in common_imb_report["advisories"]
+        )
+        common_acc_report = imbalance_metric_advisory(
+            imb_rows,
+            "val_token_accuracy_at_common_step",
+        )
+        assert any(
+            "多数类主导" in message
+            for message in common_acc_report["advisories"]
         )
         roc_report = imbalance_metric_advisory(
             imb_rows,
