@@ -595,8 +595,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   - `--hypothesis-direction decrease|increase`：实验臂相对
     对照臂，主指标的**数值**预期下降/上升；
   - `--hypothesis-min-effect REL`：最小有意义相对效应
-    （相对对照均值，如 0.02 = 2%）。
-  三者写入 `config.json` 的 `hypothesis_preregistration`。
+    （相对对照均值，如 0.02 = 2%）；
+  - `--hypothesis-baseline MODE`：预注册对照基线（哪个臂是
+    比较对象）。没有它时事后可以换一个更容易战胜的臂当
+    基线，方向/最小效应/主指标都预注册也仍可被 baseline
+    shopping 操纵；可单独声明（它约束的是对比协议而非判定
+    统计量），只读对比与统计基线入口不接受。
+  这些字段写入 `config.json` 的 `hypothesis_preregistration`。
+  `--compare` 阶段核对分析基线与预注册基线：未显式传
+  `--compare-baseline` 时采用预注册值，指定了别的模式时提示
+  baseline shopping，预注册基线不在对比集合中时披露「无法
+  给出相对预注册基线的直接对比」，各运行预注册不一致时
+  点名冲突而不是自动裁决。
   `--compare` 阶段据此输出 `hypothesis_alignment`：
   观测方向与预注册显著相反 → `refuted`（假设被数据推翻，
   不能事后改写解释）；方向一致但幅度未达最小效应 →
@@ -619,10 +629,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   实际计算的任一对比指标（`val_macro_f1`、
   `val_recall_weighted`、`val_pr_auc_macro` /
   `val_pr_auc_macro_lift` / `val_roc_auc_macro` 等）。AUC
-  默认仍只在 final/test
-  计算；被显式指定为选型指标时，训练循环会在每个验证点
-  按与 final/test 相同的固定窗口和排序口径计算，避免
-  「以 PR-AUC 判定却按 val_loss 选模型」的口径脱节。
+  默认只在 final/test 计算；被显式指定为选型指标或传
+  `--periodic-auc` 时，训练循环会在每个验证点按与
+  final/test 相同的固定窗口和排序口径计算，避免
+  「以 PR-AUC 判定却按 val_loss 选模型」的口径脱节，
+  并让 PR-AUC 也有 `<metric>_at_common_step` 无偏口径。
   路由诊断与等计算量/共同步数派生指标仍不能用于选型。
   未显式指定时，若 `--primary-metric` 可在周期验证中
   计算则自动跟随，否则回退 `val_loss` 并警告口径不一致。
@@ -776,7 +787,8 @@ python experiment.py --data <语料文件> --out <输出目录> --mode <模式>
 （泄露级审计问题拒绝训练/拒绝解封测试集）；假设预注册：
 `--hypothesis`（必填）、`--rq`、`--primary-metric`、
 `--hypothesis-direction decrease|increase`、
-`--hypothesis-min-effect REL`（后三者配套使用）。
+`--hypothesis-min-effect REL`（后三者配套使用）、
+`--hypothesis-baseline MODE`（预注册对照基线，可单独使用）。
 
 结果分析相关参数：`--early-stop-patience`（默认 0，关闭早停）、
 `--early-stop-min-delta`、`--selection-metric`（验证集选型/

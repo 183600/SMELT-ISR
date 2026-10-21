@@ -15821,6 +15821,13 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["hypothesis_min_effect"] = preregistration.get(
             "min_effect"
         )
+        # 预注册的对照基线（--hypothesis-baseline）：主指标/
+        # 方向/最小效应都声明了，若对照臂可以事后挑，整个
+        # 检验仍然可以被 baseline shopping 操纵。旧运行没有
+        # 该字段时保持 None。
+        row["hypothesis_baseline"] = preregistration.get(
+            "baseline"
+        )
 
         # 参考基线（uniform / unigram 在 val 上的同口径指标）：
         # 对比分析用它核对「所声明的基线是否真的强于无上下文
@@ -23803,16 +23810,22 @@ def hypothesis_preregistration_error(
     direction = getattr(args, "hypothesis_direction", None)
     min_effect = getattr(args, "hypothesis_min_effect", None)
     primary_metric = getattr(args, "primary_metric", None)
+    baseline = getattr(args, "hypothesis_baseline", None)
 
-    if primary_metric is None and direction is None and min_effect is None:
+    if (
+        primary_metric is None
+        and direction is None
+        and min_effect is None
+        and baseline is None
+    ):
         return None
 
     if args.compare is not None or args.sanity_only:
         return (
             "--primary-metric / --hypothesis-direction / "
-            "--hypothesis-min-effect 只适用于训练入口："
-            "--compare 只读分析与 --sanity-only 结构自检"
-            "不训练神经模型"
+            "--hypothesis-min-effect / --hypothesis-baseline "
+            "只适用于训练入口：--compare 只读分析与 "
+            "--sanity-only 结构自检不训练神经模型"
         )
 
     if args.statistical_baseline:
@@ -23823,6 +23836,12 @@ def hypothesis_preregistration_error(
                 "训练臂，方向与最小效应无法由该入口验证；"
                 "可只用 --primary-metric 指定 n-gram 的 val "
                 "调参口径"
+            )
+        if baseline is not None:
+            return (
+                "--hypothesis-baseline 不适用于 "
+                "--statistical-baseline：统计基线本身就是被"
+                "比较的对象，没有可预注册的对照臂"
             )
         # 统计基线的调参口径必须落在 n-gram 真正会计算的
         # 指标集合内：路由诊断/等计算量 loss 只存在于神经
@@ -23838,6 +23857,10 @@ def hypothesis_preregistration_error(
         return None
 
     if primary_metric is None:
+        if direction is None and min_effect is None:
+            # 只预注册对照基线（未声明主指标）是合法的：
+            # 它约束的是对比协议而非判定统计量。
+            return None
         return (
             "--hypothesis-direction / --hypothesis-min-effect "
             "必须与 --primary-metric 一起使用：方向与最小效应"
@@ -25104,6 +25127,107 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     )
 
 
+def resolve_preregistered_baseline(
+    rows: List[Dict[str, object]],
+    baseline_mode: Optional[str],
+) -> Dict[str, object]:
+    """
+    核对「分析期选用的对照基线」与「训练前预注册的对照基线」。
+
+    预注册了主指标/方向/最小效应、却没有预注册对照臂时，事后
+    更换对照基线仍属于 baseline shopping：挑一个最容易战胜的
+    臂当基线，任何显著性/等价性结论都失去意义。规则：
+
+    - 各运行在 ``--hypothesis-baseline`` 里写入同一模式时，
+      该模式是唯一合法的分析基线；``--compare-baseline`` 未
+      显式指定或指定了别的模式都会在这里核对并提示；
+    - 不同运行预注册了不同基线时不一致，无法自动裁决，保持
+      调用方传入的基线并显式告警；
+    - 旧运行没有该字段时保持 ``ok=None``，不虚报通过。
+    """
+    preregistered: Dict[str, str] = {}
+    missing: List[str] = []
+    for row in rows:
+        run = str(row.get("run"))
+        declared = row.get("hypothesis_baseline")
+        if isinstance(declared, str) and declared:
+            preregistered[run] = declared
+        else:
+            missing.append(run)
+    declared_modes = sorted(set(preregistered.values()))
+    run_modes = {
+        str(row.get("mode"))
+        for row in rows
+        if row.get("mode") is not None
+    }
+    report: Dict[str, object] = {
+        "baseline_mode": baseline_mode,
+        "preregistered_runs": preregistered,
+        "declared_modes": declared_modes,
+        "runs_without_preregistration": missing,
+        "consistent": None,
+        "auto_selected": False,
+        "mismatch": False,
+        "baseline_in_runs": None,
+        "ok": None,
+        "advisories": [],
+    }
+
+    if not declared_modes:
+        return report
+
+    if len(declared_modes) > 1:
+        report["consistent"] = False
+        report["ok"] = False
+        report["advisories"].append(
+            "各运行预注册的对照基线不一致（"
+            + ", ".join(declared_modes)
+            + "）；无法自动裁决，分析继续使用 "
+            + (
+                f"--compare-baseline={baseline_mode}，"
+                if baseline_mode is not None
+                else "当前对比集合的分组，"
+            )
+            + "但请先统一训练前声明并重跑，避免事后挑基线"
+        )
+        return report
+
+    declared = declared_modes[0]
+    report["baseline_in_runs"] = (
+        declared in run_modes if run_modes else None
+    )
+    if baseline_mode is None:
+        report["baseline_mode"] = declared
+        report["auto_selected"] = True
+        report["consistent"] = True
+        report["ok"] = True
+        report["advisories"].append(
+            f"未显式传 --compare-baseline，采用训练前预注册的"
+            f"对照基线 {declared}（--hypothesis-baseline）"
+        )
+    elif baseline_mode == declared:
+        report["consistent"] = True
+        report["ok"] = True
+    else:
+        report["consistent"] = False
+        report["mismatch"] = True
+        report["ok"] = False
+        report["advisories"].append(
+            f"分析使用的对照基线 {baseline_mode} 与训练前预注册的"
+            f" {declared} 不一致；事后更换对照基线属于 baseline "
+            "shopping，显著性与等价性结论需在预注册基线上复核"
+        )
+    if report["baseline_in_runs"] is False:
+        report["advisories"].append(
+            f"预注册的对照基线 {declared} 不在本次对比集合中："
+            "本次分析无法给出相对预注册基线的直接对比，请把该"
+            "基线的运行一并加入 --compare"
+        )
+        if report["ok"] is True:
+            report["ok"] = None
+    return report
+
+
 def print_comparison_analysis(
     rows: List[Dict[str, object]],
     factors: Optional[List[str]] = None,
@@ -25142,6 +25266,22 @@ def print_comparison_analysis(
             + ", ".join(COMPARISON_METRIC_KEYS)
             + "）"
         )
+
+    # 对照基线预注册：--hypothesis-baseline 在训练前声明本轮
+    # 要与哪个臂比较；分析期改用别的臂（哪怕是同一集合里更弱
+    # 的那个）属于 baseline shopping。这里统一裁决实际使用的
+    # 基线，后续直接对比与稻草人守卫都用裁决结果。
+    baseline_preregistration = resolve_preregistered_baseline(
+        rows, baseline_mode
+    )
+    resolved_baseline = baseline_preregistration.get(
+        "baseline_mode"
+    )
+    baseline_mode = (
+        str(resolved_baseline)
+        if resolved_baseline is not None
+        else None
+    )
 
     # 等训练计算量的 loss：A/B 每步 FLOPs 高于 smelt，等步数
     # 对比会把机制收益和额外计算混在一起。该派生指标在本函数
@@ -26297,6 +26437,44 @@ def print_comparison_analysis(
                 "看到数据后再放宽等价界可以「制造」等价结论"
             )
 
+    # 对照基线预注册：训练前声明与哪个臂比较，分析期不得
+    # 换更弱的臂当基线（baseline shopping）。
+    print()
+    print(
+        "[baseline-preregistration] 对照基线预注册核对"
+        "（--hypothesis-baseline；事后更换对照基线属于 "
+        "baseline shopping）"
+    )
+    if not baseline_preregistration.get("declared_modes"):
+        print(
+            "  [note] 没有任何运行预注册对照基线"
+            "（--hypothesis-baseline）：无法排除事后挑选"
+            "更弱的臂作为基线，建议训练前声明"
+        )
+    else:
+        print(
+            "  预注册对照基线: "
+            + ", ".join(
+                str(mode)
+                for mode in baseline_preregistration[
+                    "declared_modes"
+                ]
+            )
+        )
+        if baseline_preregistration.get("ok") is True:
+            print(
+                "  OK：分析使用的对照基线 "
+                f"{baseline_preregistration.get('baseline_mode')} "
+                "与训练前预注册一致"
+            )
+    for message in baseline_preregistration.get(
+        "advisories", []
+    ):
+        level = "warn" if baseline_preregistration.get(
+            "ok"
+        ) is False else "note"
+        print(f"  [{level}] {message}")
+
     # 基线合理性：复杂模型必须战胜精心调优过的基线，
     # 战胜稻草人说明不了任何问题（详见 baseline_adequacy）。
     print()
@@ -26676,6 +26854,7 @@ def print_comparison_analysis(
         ),
         "contrasts": contrasts,
         "reference_contrasts": reference,
+        "baseline_preregistration": baseline_preregistration,
         "baseline_adequacy": adequacy,
         "selection_metric_mismatch": selection_metric_mismatch,
         "imbalance_advisory": imbalance,
@@ -27627,6 +27806,11 @@ def write_run_config(
             "min_effect": getattr(
                 args, "hypothesis_min_effect", None
             ),
+            # 预注册对照基线：训练前声明本轮与哪个臂比较，
+            # 避免分析期换一个更容易战胜的臂当基线。
+            "baseline": getattr(
+                args, "hypothesis_baseline", None
+            ),
         },
         "reference_baselines": reference_baselines,
         "baseline_tuning": baseline_tuning,
@@ -27785,6 +27969,7 @@ def write_run_config(
                     "primary_metric",
                     "direction",
                     "min_effect",
+                    "baseline",
                 ):
                     if (
                         current_prereg.get(key) is None
@@ -38143,6 +38328,7 @@ def run_self_test():
                 "primary_metric": None,
                 "hypothesis_direction": None,
                 "hypothesis_min_effect": None,
+                "hypothesis_baseline": None,
             }
             base.update(overrides)
             return argparse.Namespace(**base)
@@ -38236,6 +38422,30 @@ def run_self_test():
                 statistical_baseline=True,
                 primary_metric="val_loss",
                 hypothesis_direction="decrease",
+            )
+        ) is not None
+        # 对照基线预注册：可单独声明（约束的是对比协议而非
+        # 判定统计量），但只读对比与统计基线入口不接受。
+        assert hypothesis_preregistration_error(
+            _prereg_args(hypothesis_baseline="smelt")
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                primary_metric="val_loss",
+                hypothesis_direction="decrease",
+                hypothesis_baseline="local_base",
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                compare=["some_run"],
+                hypothesis_baseline="smelt",
+            )
+        ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                statistical_baseline=True,
+                hypothesis_baseline="smelt",
             )
         ) is not None
 
@@ -38936,6 +39146,13 @@ def run_self_test():
         )
         assert full_analysis["baseline_adequacy"]["ok"] is True
         assert full_analysis["hypothesis_registry"]["cells"]
+        # 未预注册对照基线时保持 None，不虚报通过。
+        assert (
+            full_analysis["baseline_preregistration"]["ok"] is None
+        )
+        assert full_analysis["baseline_preregistration"][
+            "declared_modes"
+        ] == []
         assert "imbalance_advisory" in full_analysis
         assert (
             full_analysis["equivalence_margin"]
@@ -38943,6 +39160,113 @@ def run_self_test():
         )
         assert full_analysis["target_power"] == _TARGET_POWER
         assert "power_equivalence" in full_analysis
+        # 对照基线预注册：训练前声明 smelt 为对照，分析期
+        # 未显式指定时自动采用；改用一个更容易战胜的臂必须
+        # 被点名为 baseline shopping；各运行预注册不一致时
+        # 不能自动裁决。
+        prereg_base_path = _write_analysis_run(
+            "prereg_baseline_seed1",
+            "A",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.40,
+            hypothesis="延迟合并使验证损失下降",
+            reference=good_reference,
+            preregistration={
+                "primary_metric": "val_loss",
+                "direction": "decrease",
+                "min_effect": None,
+                "baseline": "smelt",
+            },
+        )
+        prereg_rows = compare_runs(
+            [smelt_path, prereg_base_path]
+        )
+        auto_baseline = print_comparison_analysis(
+            prereg_rows,
+            factors=factors,
+            metric="val_loss",
+        )
+        prereg_report = auto_baseline["baseline_preregistration"]
+        assert prereg_report["auto_selected"] is True
+        assert prereg_report["baseline_mode"] == "smelt"
+        assert prereg_report["ok"] is True
+        assert prereg_report["advisories"]
+        assert (
+            auto_baseline["baseline_adequacy"]["baseline_mode"]
+            == "smelt"
+        )
+        mismatch_baseline = print_comparison_analysis(
+            prereg_rows,
+            factors=factors,
+            baseline_mode="A",
+            metric="val_loss",
+        )
+        mismatch_report = mismatch_baseline[
+            "baseline_preregistration"
+        ]
+        assert mismatch_report["mismatch"] is True
+        assert mismatch_report["ok"] is False
+        assert any(
+            "baseline shopping" in message
+            for message in mismatch_report["advisories"]
+        )
+        # 预注册的基线不在对比集合里：直接对比缺失必须披露，
+        # 且不能把「无法核对」当成通过。
+        only_variant = compare_runs([prereg_base_path])
+        absent_baseline = print_comparison_analysis(
+            only_variant,
+            factors=factors,
+            metric="val_loss",
+        )
+        absent_report = absent_baseline[
+            "baseline_preregistration"
+        ]
+        assert absent_report["baseline_in_runs"] is False
+        assert absent_report["ok"] is None
+        assert any(
+            "不在本次对比集合中" in message
+            for message in absent_report["advisories"]
+        )
+        # 不同运行预注册了不同基线：冲突必须点名。
+        conflicting_path = _write_analysis_run(
+            "prereg_conflict_seed1",
+            "A",
+            2,
+            3e-4,
+            100,
+            0.01,
+            4.45,
+            hypothesis="延迟合并使验证损失下降",
+            reference=good_reference,
+            preregistration={
+                "primary_metric": "val_loss",
+                "direction": "decrease",
+                "min_effect": None,
+                "baseline": "local_base",
+            },
+        )
+        conflict_rows = compare_runs(
+            [prereg_base_path, conflicting_path]
+        )
+        conflict_baseline = print_comparison_analysis(
+            conflict_rows,
+            factors=factors,
+            baseline_mode="smelt",
+            metric="val_loss",
+        )
+        conflict_report = conflict_baseline[
+            "baseline_preregistration"
+        ]
+        assert conflict_report["ok"] is False
+        assert conflict_report["consistent"] is False
+        assert any(
+            "不一致" in message
+            for message in conflict_report["advisories"]
+        )
+
         # 指定等价界后按声明口径记录（不是固定默认值）。
         custom_margin_analysis = print_comparison_analysis(
             hyp_rows,
@@ -43518,6 +43842,20 @@ def main():
             "必须与 --primary-metric 和 --hypothesis-direction "
             "一起使用。事先声明的最小效应可以区分「方向对但"
             "小到没有实际意义」与真正支持假设"
+        ),
+    )
+    parser.add_argument(
+        "--hypothesis-baseline",
+        type=str,
+        default=None,
+        choices=sorted(Config.ALL_MODES),
+        metavar="MODE",
+        help=(
+            "预注册的对照基线（训练前声明本轮与哪个臂比较）："
+            "对比阶段若 --compare-baseline 指定了别的模式会"
+            "提示 baseline shopping；未显式指定分析基线时"
+            "采用该预注册值。缺少它时事后换一个更弱的臂当"
+            "基线，任何显著性与等价性结论都可以被操纵"
         ),
     )
     parser.add_argument(
