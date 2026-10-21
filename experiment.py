@@ -15075,6 +15075,7 @@ _BASELINE_TUNING_METRIC_KEYS = tuple(
     for key in COMPARISON_METRIC_KEYS
     if key not in _ROUTING_ROW_FIELDS
     and key not in _COMMON_STEP_METRICS
+    and key != _COMPUTE_MATCHED_METRIC
 )
 
 # n-gram 基线没有训练曲线，无法定义「等训练计算量」或
@@ -30570,6 +30571,13 @@ def run_self_test():
     # 验证点累计 FLOPs 的较小值，昂贵臂在较早的计算量点被插值，
     # 而不是拿各自训练结束时的 loss 直接比较。
     assert "val_loss_at_matched_flops" in COMPARISON_METRIC_KEYS
+    # 等计算量指标只在分析期从验证曲线派生，训练时并不产生，
+    # 不能作为基线调参目标（否则网格候选没有该字段，调参
+    # 报告无法选出 winner）。
+    assert (
+        _COMPUTE_MATCHED_METRIC
+        not in _BASELINE_TUNING_METRIC_KEYS
+    )
     with tempfile.TemporaryDirectory() as matched_dir:
         specs = (
             ("cheap", 100.0, [(10, 5.0), (20, 4.0), (30, 3.0)]),
