@@ -88,6 +88,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `config.data.split_fractions` 记录清洗后的真实训练口径。训练期只用
   切分边界核对 test 占比（不读 test 内容）；解封前独立探针再核对
   test 固定窗口的输入/标签逐位对齐。
+- **连续字节流标签噪声清洗**：无群组分隔符时，
+  `--drop-train-corrupt-bytes` 只从 train 剔除非法 UTF-8 字节与
+  NUL 字节本身（不修补、不发明标签），val/test 字节与切分位置
+  不变；被剔除区间不进入训练窗口、unigram / n-gram 计数、内容
+  分块与分布审计，`data_audit.effective_bytes` 与
+  `config.data.train_cleaning` 记录清洗口径。有群组边界时应使用
+  `--drop-train-corrupt-groups` 以保持群组完整。
 - **严格审计**：`--strict-data-audit` 把泄露级问题（跨 split 重复
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
@@ -298,7 +305,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   优化器类受控变量检查；但数据与评估口径（`data_sha256`、
   `split_sha256`、`seq_len`、切分比例、`batch_size`、
   `eval_batches`、数据增强、
-  群组切分/去重设置）仍通过 `cross_family_protocol_check`
+  群组切分/去重/标签噪声清洗设置）仍通过
+  `cross_family_protocol_check`
   逐项核对，避免把不同数据/窗口上的 ngram 指标当作基线证据。
 - **统计可靠性**：`--seeds 42 43 44` 对同一命令行配置跑多个
   随机种子，输出写入 `<out>/seed<SEED>`，结束后自动给出每个

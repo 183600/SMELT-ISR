@@ -79,6 +79,14 @@ val/test 的字节与切分位置保持不变。被剔除内容不会进入神�
 切分比例与清洗统计。训练期审计只用切分边界核对 test 实际占比，不读取
 test 内容；解封前还会独立核对 test 固定窗口的输入/标签是否逐位对齐。
 
+**连续字节流的标签噪声清洗**：没有群组分隔符时，可用
+`--drop-train-corrupt-bytes` 只从 train 中剔除无法按 UTF-8 解码的
+字节与 NUL 字节本身（不做任何字节修补）；val/test 的字节与切分位置
+完全不变。被剔除字节不会进入训练窗口、unigram / n-gram 计数或分布
+审计，`data_audit.effective_bytes` 与 `config.data.train_cleaning`
+记录实际清洗口径。有 `--group-separator` 时请改用
+`--drop-train-corrupt-groups`，避免破坏群组完整性。
+
 **默认泄露硬门**：审计一旦发现跨 split 重复窗口或重复群组（泄露级
 问题），训练入口会直接拒绝启动；解封测试集时发现同类问题也会拒绝
 解封（不写入 `test` 记录）。只有显式传入 `--allow-data-leakage` 才会

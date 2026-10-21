@@ -2988,6 +2988,7 @@ class ByteDataset:
         group_separator: Optional[bytes] = None,
         deduplicate_train_groups: bool = False,
         drop_train_corrupt_groups: bool = False,
+        drop_train_corrupt_bytes: bool = False,
         drop_train_degenerate_groups: bool = False,
     ):
         data_path = Path(filename)
@@ -3061,6 +3062,19 @@ class ByteDataset:
         )
 
         if (
+            drop_train_corrupt_bytes
+            and group_separator is not None
+        ):
+            raise ValueError(
+                "drop_train_corrupt_bytes 仅用于无群组边界的"
+                "连续字节流；有 --group-separator 时请使用 "
+                "--drop-train-corrupt-groups 以保持群组完整"
+            )
+        self.drop_train_corrupt_bytes = bool(
+            drop_train_corrupt_bytes
+        )
+
+        if (
             drop_train_degenerate_groups
             and group_separator is None
         ):
@@ -3073,10 +3087,10 @@ class ByteDataset:
             drop_train_degenerate_groups
         )
 
-        # 训练集清洗（可选的群组级去重）：只剔除 train 中与
-        # val/test 或更早训练群组完全重复的群组。被剔除的字节
-        # 不会进入任何训练窗口；val/test 的字节与切分位置保持
-        # 完全不变。
+        # 训练集清洗（可选的群组级/字节级）：只剔除 train 中
+        # 与 val/test 或更早训练群组完全重复的群组、损坏字节或
+        # 退化群组。被剔除的字节不会进入任何训练窗口；val/test
+        # 的字节与切分位置保持完全不变。
         self.train_excluded_spans: List[Tuple[int, int]] = []
         self.train_cleaning: Optional[Dict[str, object]] = None
         self._train_start_intervals: Optional[
@@ -3186,6 +3200,18 @@ class ByteDataset:
                 )
             )
 
+        corrupt_byte_excluded: List[Tuple[int, int]] = []
+        corrupt_byte_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_corrupt_bytes:
+            (
+                corrupt_byte_excluded,
+                corrupt_byte_stats,
+            ) = _plan_train_corruption_cleaning_bytes(
+                self._raw_buffer,
+                n_train,
+            )
+
         degenerate_excluded: List[Tuple[int, int]] = []
         degenerate_stats: Optional[Dict[str, object]] = None
 
@@ -3202,6 +3228,7 @@ class ByteDataset:
         combined_excluded = sorted(
             dedup_excluded
             + corrupt_excluded
+            + corrupt_byte_excluded
             + degenerate_excluded
         )
         merged_excluded = _merge_byte_intervals(
@@ -3225,57 +3252,91 @@ class ByteDataset:
             dedup_stats is not None
             or corrupt_stats is not None
             or degenerate_stats is not None
+            or corrupt_byte_stats is not None
         ):
             dropped_bytes = sum(
                 end - start
                 for start, end in merged_excluded
             )
-            base_stats = (
-                dedup_stats
-                or corrupt_stats
-                or degenerate_stats
-                or {}
+            group_stats = [
+                stats
+                for stats in (
+                    dedup_stats,
+                    corrupt_stats,
+                    degenerate_stats,
+                )
+                if stats is not None
+            ]
+
+            # 群组级统计的基座沿用第一种清洗的明细（例如
+            # 去重的 dropped_duplicate_of、按原因拆分），
+            # 再追加本次组合后的总量与字节级清洗。
+            combined_stats: Dict[str, object] = (
+                dict(group_stats[0]) if group_stats else {}
             )
-            combined_stats = dict(base_stats)
-            total_groups = int(
-                combined_stats.get("groups_total", 0)
-            )
+            combined_stats.update({
+                "enabled": True,
+                "cleaning_kinds": [],
+                "dropped_bytes": dropped_bytes,
+                "post_clean_train_bytes": (
+                    n_train - dropped_bytes
+                ),
+            })
+
+            if group_stats:
+                total_groups = int(
+                    group_stats[0]["groups_total"]
+                )
+                groups_dropped = sum(
+                    int(stats["groups_dropped"])
+                    for stats in group_stats
+                )
+                combined_stats["groups_total"] = total_groups
+                combined_stats["groups_dropped"] = (
+                    groups_dropped
+                )
+                combined_stats["groups_kept"] = (
+                    total_groups - groups_dropped
+                )
 
             if corrupt_stats is not None:
                 combined_stats["corruption"] = corrupt_stats
+            if corrupt_byte_stats is not None:
+                combined_stats["corruption_bytes"] = (
+                    corrupt_byte_stats
+                )
             if degenerate_stats is not None:
                 combined_stats["degenerate"] = degenerate_stats
 
             cleaning_kinds: List[str] = []
-            groups_dropped = 0
             if dedup_stats is not None:
-                groups_dropped += int(
-                    dedup_stats["groups_dropped"]
-                )
                 cleaning_kinds.append("duplicate")
             if corrupt_stats is not None:
-                groups_dropped += int(
-                    corrupt_stats["groups_dropped"]
-                )
                 cleaning_kinds.append("corrupt")
             if degenerate_stats is not None:
-                groups_dropped += int(
-                    degenerate_stats["groups_dropped"]
-                )
                 cleaning_kinds.append("degenerate")
+            if corrupt_byte_stats is not None:
+                cleaning_kinds.append("corrupt_bytes")
+            combined_stats["cleaning_kinds"] = cleaning_kinds
 
-            combined_stats["groups_dropped"] = groups_dropped
-            combined_stats["groups_kept"] = (
-                total_groups - groups_dropped
-            )
+            policy_parts: List[str] = []
+            if group_stats:
+                policy_parts.append(
+                    "drop train groups by kind(s): "
+                    + ", ".join(
+                        kind
+                        for kind in cleaning_kinds
+                        if kind != "corrupt_bytes"
+                    )
+                )
+            if corrupt_byte_stats is not None:
+                policy_parts.append(
+                    "drop train bytes with invalid UTF-8 or NUL"
+                )
             combined_stats["policy"] = (
-                "drop train groups by kind(s): "
-                + ", ".join(cleaning_kinds)
-                + "; val/test untouched"
-            )
-            combined_stats["dropped_bytes"] = dropped_bytes
-            combined_stats["post_clean_train_bytes"] = (
-                n_train - dropped_bytes
+                "; ".join(policy_parts)
+                + ("; " if policy_parts else "")
+                + "val/test untouched"
             )
             self.train_excluded_spans = merged_excluded
             self.train_cleaning = combined_stats
@@ -3316,10 +3377,10 @@ class ByteDataset:
             )
             if not valid_intervals:
                 raise ValueError(
-                    "训练集群组清洗后没有剩余任何合法训练窗口："
-                    "清洗比例过高（几乎全部训练群组都与 val/test "
-                    "重复或互为重复），请检查语料/群组分隔符，"
-                    "而不是在去重后继续训练"
+                    "训练集清洗后没有剩余任何合法训练窗口："
+                    "清洗比例过高（几乎全部训练内容与 val/test "
+                    "重复、损坏或退化），请检查语料/清洗开关，"
+                    "而不是在清洗后继续训练"
                 )
 
             self._train_start_intervals = valid_intervals
@@ -3404,11 +3465,11 @@ class ByteDataset:
     @property
     def effective_train_bytes(self) -> int:
         """
-        实际参与训练统计的 train 字节数（扣除被清洗群组）。
+        实际参与训练统计的 train 字节数（扣除被清洗内容）。
 
         神经网络窗口采样已由 ``train_excluded_spans`` 屏蔽；任何
         在 train 上拟合统计量的基线也必须使用同一口径，否则
-        被清洗的重复群组仍会进入 unigram / n-gram 计数。
+        被清洗的重复群组/损坏字节仍会进入 unigram / n-gram 计数。
         """
         excluded = sum(
             end - start
@@ -3422,9 +3483,10 @@ class ByteDataset:
         """
         统计实际参与训练的 train 字节频次（256 个字节类）。
 
-        被 ``--deduplicate-train-groups`` 剔除的群组区间不计入；
-        返回 int64 张量，供 unigram 参考基线与数据审计的分布
-        偏移统计使用，保证它们与神经网络看到的训练数据一致。
+        被 ``--deduplicate-train-groups`` 或
+        ``--drop-train-corrupt-bytes`` 剔除的区间不计入；返回
+        int64 张量，供 unigram 参考基线与数据审计的分布偏移
+        统计使用，保证它们与神经网络看到的训练数据一致。
         """
         try:
             counts = torch.bincount(
@@ -4231,7 +4293,7 @@ def probe_data_pipeline(
                 for low, high in merged
             ):
                 failures.append(
-                    "训练批采样窗口触碰被清洗群组"
+                    "训练批采样窗口触碰被清洗内容"
                     "（清洗内容仍会进入训练）"
                 )
                 break
@@ -4941,6 +5003,67 @@ def _scan_text_integrity(
     }
 
 
+def _invalid_utf8_nul_spans(
+    raw: memoryview,
+    offset: int,
+    length: int,
+    final: bool,
+    chunk: int = 1 << 20,
+) -> List[Tuple[int, int, str]]:
+    """
+    返回 [offset, offset+length) 内非法 UTF-8 字节与 NUL 字节的
+    精确区间。
+
+    使用 ``errors="surrogateescape"`` 的增量解码器：每个非法
+    字节映射为一个 U+DC80..U+DCFF 代理码点，再把解码结果逐字符
+    重新编码回字节，就能把码点位置映射回原始字节偏移。多字节
+    合法字符跨分块时由解码器缓冲，偏移通过 ``pending_start``
+    续接；``final=False`` 时末尾不完整的多字节序列留给下一个
+    split，不会把合法字符的切分点误判为损坏。
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(
+        errors="surrogateescape"
+    )
+    spans: List[Tuple[int, int, str]] = []
+    position = offset
+    end = offset + length
+    pending_start = offset
+
+    while position < end:
+        stop = min(position + chunk, end)
+        block = bytes(raw[position:stop])
+        text = decoder.decode(
+            block,
+            final=final and stop >= end,
+        )
+        cursor = pending_start
+
+        for character in text:
+            encoded = character.encode(
+                "utf-8",
+                "surrogateescape",
+            )
+            size = len(encoded)
+            codepoint = ord(character)
+
+            if (
+                size == 1
+                and 0xDC80 <= codepoint <= 0xDCFF
+            ):
+                spans.append(
+                    (cursor, cursor + 1, "invalid_utf8")
+                )
+            elif character == "\x00":
+                spans.append((cursor, cursor + 1, "nul"))
+
+            cursor += size
+
+        pending_start = cursor
+        position = stop
+
+    return spans
+
+
 def _plan_train_corruption_cleaning(
     raw: bytearray,
     separator: bytes,
@@ -5025,6 +5148,64 @@ def _plan_train_corruption_cleaning(
                 integrity["nul_bytes"],
             ])
 
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
+
+
+def _plan_train_corruption_cleaning_bytes(
+    raw: bytearray,
+    train_end: int,
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划无群组连续字节流的训练集标签噪声清洗：只从 train 中
+    剔除非法 UTF-8 字节与 NUL 字节本身，绝不修补字节，也绝不
+    改动 val/test。
+
+    与群组级清洗不同，这里不需要用户提供分隔符：损坏字节的
+    位置由解码器直接定位。被剔除的字节不进入训练窗口、unigram/
+    n-gram 计数或分布审计；仍保留的合法字节继续参与训练。
+    """
+    tagged = _invalid_utf8_nul_spans(
+        memoryview(raw),
+        0,
+        train_end,
+        final=(train_end == len(raw)),
+    )
+
+    invalid_bytes = sum(
+        1
+        for _, _, kind in tagged
+        if kind == "invalid_utf8"
+    )
+    nul_bytes = sum(
+        1
+        for _, _, kind in tagged
+        if kind == "nul"
+    )
+    excluded = _merge_byte_intervals(
+        [(start, end) for start, end, _ in tagged]
+    )
+
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "scope": "bytes",
+        "policy": (
+            "drop train bytes that are invalid UTF-8 or NUL; "
+            "val/test untouched"
+        ),
+        "invalid_utf8_bytes": invalid_bytes,
+        "nul_bytes": nul_bytes,
+        "excluded_spans": len(excluded),
+        "dropped_bytes": sum(
+            end - start for start, end in excluded
+        ),
+        "examples": [
+            [start, end]
+            for start, end in excluded[:5]
+        ],
+    }
     stats["post_clean_train_bytes"] = (
         train_end - int(stats["dropped_bytes"])
     )
@@ -5439,12 +5620,42 @@ def audit_data_splits(
                 scan_cache[scan_key] = scan
         scans[split] = scan
         if dataset.group_separator is None:
-            integrity = _scan_text_integrity(
-                dataset._raw,
-                begin,
-                end - begin,
-                final=(end == dataset.num_bytes),
-            )
+            if split == "train" and dataset.train_excluded_spans:
+                # 无群组语料的字节级清洗：被剔除的损坏字节不
+                # 再计入审计统计，只扫描仍参与训练的连续片段。
+                integrity = {
+                    "utf8_replacements": 0,
+                    "nul_bytes": 0,
+                }
+                for span_start, span_end in (
+                    _subtract_byte_intervals(
+                        begin,
+                        end,
+                        dataset.train_excluded_spans,
+                    )
+                ):
+                    part = _scan_text_integrity(
+                        dataset._raw,
+                        span_start,
+                        span_end - span_start,
+                        final=(
+                            span_end == dataset.num_bytes
+                        ),
+                        warmup=False,
+                    )
+                    integrity["utf8_replacements"] += part[
+                        "utf8_replacements"
+                    ]
+                    integrity["nul_bytes"] += part[
+                        "nul_bytes"
+                    ]
+            else:
+                integrity = _scan_text_integrity(
+                    dataset._raw,
+                    begin,
+                    end - begin,
+                    final=(end == dataset.num_bytes),
+                )
         else:
             # 群组分隔符是用户显式声明的数据结构（可能含 NUL 或
             # 非 UTF-8 字节，如 --group-separator '\x00'），不能
@@ -5854,6 +6065,7 @@ def audit_data_splits(
     return {
         "max_windows": max_windows,
         "splits": splits_report,
+        "train_cleaning": dataset.train_cleaning,
         "split_fractions": {
             split: info["fraction"]
             for split, info in splits_report.items()
@@ -5984,19 +6196,36 @@ def print_data_audit(report: Dict[str, object]) -> None:
             )
         )
 
-    if isinstance(groups, dict):
-        cleaning = groups.get("train_cleaning")
-        if isinstance(cleaning, dict):
-            print(
-                "[data]   训练集群组去重: "
+    cleaning = report.get("train_cleaning")
+    if isinstance(cleaning, dict):
+        kinds = ", ".join(
+            str(kind)
+            for kind in (cleaning.get("cleaning_kinds") or [])
+        )
+        detail_parts: List[str] = []
+        if cleaning.get("groups_total") is not None:
+            detail_parts.append(
                 f"drop={cleaning.get('groups_dropped')}"
-                f"/{cleaning.get('groups_total')} 群组, "
-                f"{cleaning.get('dropped_bytes')}B, "
+                f"/{cleaning.get('groups_total')} 群组"
+            )
+        if cleaning.get("dropped_bytes") is not None:
+            detail_parts.append(
+                f"{cleaning.get('dropped_bytes')}B"
+            )
+        if cleaning.get("valid_window_starts") is not None:
+            detail_parts.append(
                 "valid_starts="
                 f"{cleaning.get('valid_window_starts')}"
                 f"/{cleaning.get('total_window_starts')}"
             )
+        print(
+            "[data]   训练集清洗"
+            + (f"（{kinds}）" if kinds else "")
+            + ": "
+            + ", ".join(detail_parts)
+        )
 
+    if isinstance(groups, dict):
         health = groups.get("content_health")
         if isinstance(health, dict):
             print(
@@ -7253,9 +7482,9 @@ def compute_reference_baselines(
     vocab_size = 256
 
     # unigram 统计量只在 train 上 fit，且与神经网络窗口采样
-    # 使用同一「有效训练字节」口径：被 --deduplicate-train-groups
-    # 清洗掉的重复群组不能进入基线计数，否则基线会通过重复
-    # 内容看到 val/test，比较不再公平。
+    # 使用同一「有效训练字节」口径：被群组去重或字节级标签噪声
+    # 清洗掉的内容不能进入基线计数，否则基线会通过重复/损坏
+    # 内容看到不同的训练分布，比较不再公平。
     train_counts = dataset.effective_train_byte_counts().double()
     train_total = float(train_counts.sum())
     raw_train_total = len(dataset.train)
@@ -14856,6 +15085,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_corrupt_groups",
+    "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
     # 源文件指纹相同不等于实际进入各 split 的字节段相同：
     # 群组吸附、清洗实现或切分代码变化都会改变 train/val/test
@@ -14895,6 +15125,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_corrupt_groups",
+    "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
     "allow_data_leakage",
     "batch_size",
@@ -15375,6 +15606,9 @@ def build_comparison_protocol(
         "drop_train_corrupt_groups": bool(
             getattr(args, "drop_train_corrupt_groups", False)
         ),
+        "drop_train_corrupt_bytes": bool(
+            getattr(args, "drop_train_corrupt_bytes", False)
+        ),
         "drop_train_degenerate_groups": bool(
             getattr(args, "drop_train_degenerate_groups", False)
         ),
@@ -15547,6 +15781,11 @@ def experiment_protocol_from_payload(
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
+            if has_training
+            else False
+        ),
+        "drop_train_corrupt_bytes": bool(
+            run_args.get("drop_train_corrupt_bytes", False)
             if has_training
             else False
         ),
@@ -28626,6 +28865,127 @@ def run_self_test():
     ]
     assert cleaned_corrupt_probe["train_cleaning_checked"]
 
+    # 无群组连续字节流的标签噪声清洗：损坏字节本身从 train
+    # 剔除，但绝不动 val/test；清洗后的窗口、统计基线与审计
+    # 必须使用同一有效训练口径。
+    byte_rng = random.Random(20241022)
+    byte_body = bytes(
+        byte_rng.randrange(32, 127) for _ in range(1200)
+    )
+    byte_payload = (
+        byte_body[:101]
+        + b"\xff"
+        + byte_body[102:200]
+        + b"\x00"
+        + byte_body[201:]
+    )
+    assert len(byte_payload) == 1200
+    with tempfile.NamedTemporaryFile() as byte_file:
+        byte_file.write(byte_payload)
+        byte_file.flush()
+
+        raw_byte_dataset = ByteDataset(
+            byte_file.name,
+            seq_len=8,
+            val_fraction=0.2,
+            test_fraction=0.2,
+        )
+        cleaned_byte_dataset = ByteDataset(
+            byte_file.name,
+            seq_len=8,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            drop_train_corrupt_bytes=True,
+        )
+
+        raw_byte_audit = audit_data_splits(
+            raw_byte_dataset,
+            include_test=True,
+        )
+        cleaned_byte_audit = audit_data_splits(
+            cleaned_byte_dataset,
+            include_test=True,
+        )
+
+    assert raw_byte_audit["splits"]["train"][
+        "utf8_replacements"
+    ] == 1
+    assert raw_byte_audit["splits"]["train"]["nul_bytes"] == 1
+    assert not enforce_strict_data_audit(raw_byte_audit)
+
+    assert cleaned_byte_dataset.split_bounds == (
+        raw_byte_dataset.split_bounds
+    )
+    assert cleaned_byte_dataset.split_sha256 == (
+        raw_byte_dataset.split_sha256
+    )
+    assert cleaned_byte_dataset.train_excluded_spans == [
+        (101, 102),
+        (200, 201),
+    ]
+    assert cleaned_byte_dataset.train_cleaning[
+        "cleaning_kinds"
+    ] == ["corrupt_bytes"]
+    assert cleaned_byte_dataset.train_cleaning[
+        "corruption_bytes"
+    ]["invalid_utf8_bytes"] == 1
+    assert cleaned_byte_dataset.train_cleaning[
+        "corruption_bytes"
+    ]["nul_bytes"] == 1
+    assert cleaned_byte_dataset.effective_train_bytes == 718
+    assert cleaned_byte_dataset.train_num_valid_starts == 694
+
+    cleaned_byte_audit_train = cleaned_byte_audit["splits"][
+        "train"
+    ]
+    assert cleaned_byte_audit_train["utf8_replacements"] == 0
+    assert cleaned_byte_audit_train["nul_bytes"] == 0
+    assert cleaned_byte_audit_train["effective_bytes"] == 718
+    assert cleaned_byte_audit["train_cleaning"][
+        "cleaning_kinds"
+    ] == ["corrupt_bytes"]
+    assert enforce_strict_data_audit(cleaned_byte_audit)
+    assert cleaned_byte_audit["leakage_violations"] == []
+
+    cleaned_byte_x, _ = cleaned_byte_dataset.batch(
+        "train",
+        64,
+        torch.Generator().manual_seed(12),
+        eval_device,
+    )
+    cleaned_byte_values = set(
+        cleaned_byte_x.flatten().tolist()
+    )
+    assert 255 not in cleaned_byte_values
+    assert 0 not in cleaned_byte_values
+
+    cleaned_byte_ngram = NgramBaseline(
+        cleaned_byte_dataset.train,
+        max_order=2,
+        exclude_spans=(
+            cleaned_byte_dataset.train_excluded_spans
+        ),
+    )
+    assert cleaned_byte_ngram.train_total == 718
+    cleaned_byte_reference = compute_reference_baselines(
+        cleaned_byte_dataset,
+        batch_size=2,
+        batches=1,
+        device=eval_device,
+    )
+    assert cleaned_byte_reference["unigram_train_bytes"] == 718
+
+    cleaned_byte_probe = probe_data_pipeline(
+        cleaned_byte_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert cleaned_byte_probe["ok"], cleaned_byte_probe[
+        "failures"
+    ]
+    assert cleaned_byte_probe["train_cleaning_checked"]
+
     # 训练集异常值：长且几乎单一字节的退化群组必须被审计发现；
     # 显式清洗时只整组剔除该 train 群组，val/test 不动。
     degenerate_groups = [
@@ -31578,6 +31938,13 @@ def run_self_test():
     assert equivalence_contrasts[0]["equivalent_raw"] is True
 
     # ---- 对比分析：受控变量 / 聚合 / 显著性 / 消融覆盖 ----
+    # 字节级标签噪声清洗改变实际训练样本集合，必须与群组清洗
+    # 一样进入受控变量与跨 family 数据口径核对。
+    assert "drop_train_corrupt_bytes" in COMPARISON_PROTOCOL_KEYS
+    assert (
+        "drop_train_corrupt_bytes"
+        in _CROSS_FAMILY_PROTOCOL_KEYS
+    )
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
             name: str,
@@ -40017,6 +40384,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-corrupt-bytes",
+        action="store_true",
+        help=(
+            "训练集标签噪声清洗（无 --group-separator 的连续"
+            "字节流）：只从 train 中剔除非法 UTF-8 与 NUL 字节"
+            "本身，被剔除的字节不进入训练窗口、n-gram/参考基线"
+            "或分布审计；val/test 的字节与切分位置完全不变。"
+            "有群组边界时请改用 --drop-train-corrupt-groups "
+            "以保持群组完整"
+        ),
+    )
+    parser.add_argument(
         "--drop-train-degenerate-groups",
         action="store_true",
         help=(
@@ -41297,6 +41676,23 @@ def main():
                     saved_corrupt_drop
                 )
 
+        if "drop_train_corrupt_bytes" in saved_args:
+            saved_corrupt_byte_drop = bool(
+                saved_args.get("drop_train_corrupt_bytes")
+            )
+            if saved_corrupt_byte_drop != bool(
+                args.drop_train_corrupt_bytes
+            ):
+                print(
+                    "resume restored drop_train_corrupt_bytes "
+                    f"{bool(args.drop_train_corrupt_bytes)} -> "
+                    f"{saved_corrupt_byte_drop} (训练集清洗是"
+                    "采样轨迹的一部分)"
+                )
+                args.drop_train_corrupt_bytes = (
+                    saved_corrupt_byte_drop
+                )
+
         if "drop_train_degenerate_groups" in saved_args:
             saved_degenerate_drop = bool(
                 saved_args.get("drop_train_degenerate_groups")
@@ -41504,6 +41900,16 @@ def main():
         )
 
     if (
+        args.drop_train_corrupt_bytes
+        and group_separator_bytes is not None
+    ):
+        parser.error(
+            "--drop-train-corrupt-bytes 仅用于无 "
+            "--group-separator 的连续字节流；有群组边界时请用 "
+            "--drop-train-corrupt-groups 以保持群组完整"
+        )
+
+    if (
         args.drop_train_degenerate_groups
         and group_separator_bytes is None
     ):
@@ -41529,6 +41935,9 @@ def main():
             ),
             drop_train_corrupt_groups=(
                 args.drop_train_corrupt_groups
+            ),
+            drop_train_corrupt_bytes=(
+                args.drop_train_corrupt_bytes
             ),
             drop_train_degenerate_groups=(
                 args.drop_train_degenerate_groups
