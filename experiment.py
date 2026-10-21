@@ -13085,6 +13085,7 @@ def selection_bias_report(
         "metric": metric,
         "applicable": metric in _SELECTION_BIASED_METRICS,
         "biased_runs": [],
+        "eligible_runs": 0,
         "last_step_runs": [],
         "unknown_selection_runs": [],
         "unbiased_metric": None,
@@ -13096,9 +13097,14 @@ def selection_bias_report(
     if not report["applicable"]:
         return report
 
+    # 分母只统计真正参与选型判定的非确定性运行：ngram 等确定性
+    # 基线不做 checkpoint 选型，把它们算进分母会稀释偏差比例，
+    # 让「多少运行的指标来自选型后的验证集」被低估。
+    eligible_runs = 0
     for row in rows:
         if _is_deterministic_run(row):
             continue
+        eligible_runs += 1
         name = str(row.get("run"))
         selected = row.get("selected_model")
         if selected == "best_val":
@@ -13112,6 +13118,8 @@ def selection_bias_report(
             report["last_step_runs"].append(name)
         else:
             report["unknown_selection_runs"].append(name)
+
+    report["eligible_runs"] = eligible_runs
 
     metric_reports = (
         _as_dict(common_step).get("metric_reports")
@@ -13137,7 +13145,7 @@ def selection_bias_report(
 
     if report["biased_runs"]:
         detail = (
-            f"{len(report['biased_runs'])}/{len(rows)} 个运行的"
+            f"{len(report['biased_runs'])}/{eligible_runs} 个运行的"
             f" {metric} 来自验证集选中的 checkpoint（best_val）"
         )
         if report["unbiased_metric"]:
@@ -28124,6 +28132,20 @@ def run_self_test():
     )
     assert bias_report["unbiased_runs"] == 2
     assert bias_report["advisory"]
+    assert bias_report["eligible_runs"] == 2
+    # 确定性基线不做 checkpoint 选型，不能进偏差比例的分母：
+    # 混入 ngram 运行后，比例分母仍必须是参与选型的运行数。
+    mixed_rows = list(common_rows) + [
+        dict(common_rows[0], run="ngram-baseline", mode="ngram")
+    ]
+    mixed_bias = selection_bias_report(
+        mixed_rows,
+        "val_loss",
+        common_report,
+    )
+    assert mixed_bias["eligible_runs"] == 2
+    assert len(mixed_bias["biased_runs"]) == 2
+    assert "/2 个运行" in str(mixed_bias["advisory"])
     assert not selection_bias_report(
         common_rows,
         "val_loss_at_common_step",
