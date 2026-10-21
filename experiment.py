@@ -15566,6 +15566,18 @@ def _cell_missing_measured_costs(
     ]
 
 
+def _missing_efficiency_cell_labels(
+    aggregates: List[Dict[str, object]],
+) -> List[str]:
+    """列出真正缺效率测量数据的实验单元（确定性基线除外）。"""
+    return [
+        str(aggregate["label"])
+        for aggregate in aggregates
+        if _cell_missing_measured_costs(aggregate)
+        and not aggregate.get("deterministic")
+    ]
+
+
 def _cell_cost_mean(
     cell: Dict[str, object],
     field: str,
@@ -24464,12 +24476,9 @@ def print_comparison_analysis(
     # --skip-efficiency 的运行没有效率字段，涉及这些
     # 单元的涨点结论无法做精度与效率的权衡（统计基线 ngram
     # 是查表模型、本来就无该口径，不计入）。
-    missing_efficiency_cells = [
-        aggregate["label"]
-        for aggregate in aggregates
-        if _cell_missing_measured_costs(aggregate)
-        and "mode=ngram" not in str(aggregate["label"])
-    ]
+    missing_efficiency_cells = _missing_efficiency_cell_labels(
+        aggregates
+    )
     if missing_efficiency_cells:
         print(
             "  [efficiency] 以下实验单元缺效率测量数据（旧运行或 "
@@ -38182,6 +38191,19 @@ def run_self_test():
     assert recorded_none["commits_differ"]
     assert recorded_none["hashseed_unset_runs"] == ["r1", "r2"]
     assert recorded_none["hashseed_unrecorded_runs"] == []
+
+    assert _missing_efficiency_cell_labels([
+        {
+            "label": "ngram",
+            "deterministic": True,
+            "costs": {},
+        },
+        {
+            "label": "neural",
+            "deterministic": False,
+            "costs": {},
+        },
+    ]) == ["neural"]
 
     explicit_none_key = check_run_provenance([
         {
