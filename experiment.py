@@ -4952,8 +4952,12 @@ def _scan_text_integrity(
     字节级语言模型的标签就是原始字节，损坏字节等价于标签
     噪声，必须在训练前可见：
 
-    - utf8_replacements：以 ``errors="replace"`` 增量解码时产生
-      的 U+FFFD 数量，即无法按 UTF-8 解码的字节序列数；
+    - utf8_replacements：无法按 UTF-8 解码的字节数。这里不用
+      ``errors="replace"`` 统计 U+FFFD，因为语料本身可能合法地
+      包含字面替换字符 U+FFFD；用 surrogateescape 把每个非法
+      字节映射为 U+DC80..U+DCFF 代理码点，既能与
+      ``_invalid_utf8_nul_spans`` 的清洗口径逐字节一致，也不会
+      把合法文本误判为标签噪声；
     - nul_bytes：NUL（0x00）字节数量，文本语料中出现即疑似
       二进制污染或文件拼接错误。
 
@@ -4969,7 +4973,7 @@ def _scan_text_integrity(
     解码，不从前一段（分隔符）借状态。
     """
     decoder = codecs.getincrementaldecoder("utf-8")(
-        errors="replace"
+        errors="surrogateescape"
     )
 
     # 预热：把解码器带到「从 offset 前几个字节开始」的状态。
@@ -4993,8 +4997,12 @@ def _scan_text_integrity(
             block,
             final=final and stop >= end,
         )
-        replacements += text.count("\ufffd")
-        nul_bytes += block.count(0)
+        for character in text:
+            codepoint = ord(character)
+            if 0xDC80 <= codepoint <= 0xDCFF:
+                replacements += 1
+            elif character == "\x00":
+                nul_bytes += 1
         position = stop
 
     return {
@@ -29642,6 +29650,58 @@ def run_self_test():
     )
     assert not enforce_strict_data_audit(low_noise_audit)
     assert low_noise_audit["leakage_violations"] == []
+
+    # 合法文本可能包含字面替换字符 U+FFFD：它编码为合法 UTF-8，
+    # 不能被完整性审计误判为标签噪声。审计与逐字节清洗必须
+    # 使用同一口径（surrogateescape），否则会出现「严格审计
+    # 拒绝、--drop-train-corrupt-bytes 却找不到可删字节」。
+    literal_replacement = "\ufffd".encode("utf-8")
+    literal_scan = _scan_text_integrity(
+        memoryview(bytearray(literal_replacement)),
+        0,
+        len(literal_replacement),
+        final=True,
+    )
+    assert literal_scan["utf8_replacements"] == 0
+    assert literal_scan["nul_bytes"] == 0
+    invalid_scan = _scan_text_integrity(
+        memoryview(bytearray(b"\xff")),
+        0,
+        1,
+        final=True,
+    )
+    assert invalid_scan["utf8_replacements"] == 1
+
+    literal_rng = random.Random(20241022)
+    literal_body = bytes(
+        literal_rng.choice(
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+        for _ in range(20000)
+    )
+    literal_body = (
+        literal_body[:10000]
+        + literal_replacement
+        + literal_body[10000:]
+    )
+    with tempfile.NamedTemporaryFile() as literal_file:
+        literal_file.write(literal_body)
+        literal_file.flush()
+
+        literal_dataset = ByteDataset(
+            literal_file.name,
+            seq_len=8,
+        )
+        literal_audit = audit_data_splits(
+            literal_dataset,
+            include_test=True,
+        )
+
+    assert (
+        literal_audit["splits"]["train"]["utf8_replacements"] == 0
+    )
+    assert literal_audit["violations"] == []
+    assert enforce_strict_data_audit(literal_audit)
 
     # 多字节 UTF-8 字符横跨 split 边界不能产生假阳性「标签
     # 噪声」：文件整体合法，切分只是诊断视角。字符「€」的
