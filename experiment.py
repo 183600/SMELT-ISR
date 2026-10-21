@@ -6217,6 +6217,54 @@ def confusion_matrix_metrics(
     }
 
 
+def class_balanced_loss_metrics(
+    class_loss_sums: torch.Tensor,
+    class_counts: torch.Tensor,
+    vocab_size: int,
+) -> Dict[str, float]:
+    """
+    类平衡（macro）似然口径：对评估集中出现的每个目标类等权
+    平均每类 NLL。
+
+    ``val_loss`` 是按 token 频率加权的平均：字节级语料里
+    少数高频字节（空格、换行、常见标点）占绝大多数 token，
+    稀有字节即使完全没学会，val_loss 也几乎不动——用频率
+    加权的似然判定「学会了上下文」会系统性偏乐观。macro NLL
+    先对每个类算它自己的平均 NLL，再对类等权平均，是似然
+    口径下与 macro F1 对应的类平衡指标（不平衡场景下与
+    macro F1 / PR-AUC 一起看才有意义）。
+
+    随机水平参照 ``macro_nll_chance`` = log(vocab_size)：
+    均匀预测器对每个类的 NLL 都恰为 log V，类平衡平均后不变，
+    因此它是任何模型必须显著低于的绝对下限。
+
+    ``macro_nll_min_support`` 披露被纳入的最小类 support：
+    只有 1~2 个样本的稀有类会让 macro NLL 的方差被放大，
+    解读时必须看到这一项（与 macro F1 同样的注意事项）。
+    """
+    counts = class_counts.to(torch.float64)
+    sums = class_loss_sums.to(torch.float64)
+    present = counts > 0.0
+
+    chance = math.log(float(vocab_size))
+
+    if not bool(present.any()):
+        return {
+            "macro_nll": float("nan"),
+            "macro_nll_classes": 0.0,
+            "macro_nll_chance": chance,
+            "macro_nll_min_support": 0.0,
+        }
+
+    per_class = sums[present] / counts[present]
+    return {
+        "macro_nll": float(per_class.mean()),
+        "macro_nll_classes": float(int(present.sum())),
+        "macro_nll_chance": chance,
+        "macro_nll_min_support": float(counts[present].min()),
+    }
+
+
 # 评估集不确定性：对固定评估窗口做有放回重采样。窗口是
 # 评估协议的最小独立单位（同一窗口内 token 高度相关），
 # 逐 token 重采样会低估不确定性。
@@ -6790,6 +6838,20 @@ def evaluate(
     window_predicted: List[torch.Tensor] = []
     window_support: List[torch.Tensor] = []
 
+    # 类平衡似然（macro NLL）的逐类充分统计量：按目标类累计
+    # 损失和与 token 数。它与频率加权的 total 累加共用同一次
+    # 前向的 logits，不额外跑模型。
+    class_loss_sums = torch.zeros(
+        vocab_size,
+        device=device,
+        dtype=torch.float64,
+    )
+    class_counts = torch.zeros(
+        vocab_size,
+        device=device,
+        dtype=torch.float64,
+    )
+
     # CUDA 路径在全部批次结束后统一同步；CPU 路径保持同步语义。
     auc_async = compute_auc and device.type == "cuda"
 
@@ -6866,18 +6928,40 @@ def evaluate(
                     vocab_size,
                 )
 
+                # 逐 token 损失：类平衡 NLL（macro_nll）与评估
+                # 窗口 bootstrap 的逐窗口统计量共用它，不额外跑
+                # 模型。logits 就是本批前向的输出，upcast 到
+                # fp32 与 loss 计算口径一致。
+                token_logits = raw_logits.reshape(
+                    -1,
+                    vocab_size,
+                ).float()
+                token_losses = F.cross_entropy(
+                    token_logits,
+                    flat_target,
+                    reduction="none",
+                )
+
+                # 类平衡似然的逐类充分统计量：按目标类累计
+                # 损失和与 token 数（fp64 累加，避免高频类的
+                # 求和误差污染每类 NLL）。
+                class_loss_sums.index_add_(
+                    0,
+                    flat_target,
+                    token_losses.to(torch.float64),
+                )
+                class_counts.index_add_(
+                    0,
+                    flat_target,
+                    torch.ones_like(
+                        token_losses,
+                        dtype=torch.float64,
+                    ),
+                )
+
                 if bootstrap_enabled:
                     # 逐窗口 loss 与混淆充分统计量：用与点估计
                     # 同一前向的 logits 计算，不额外跑模型。
-                    token_logits = raw_logits.reshape(
-                        -1,
-                        vocab_size,
-                    ).float()
-                    token_losses = F.cross_entropy(
-                        token_logits,
-                        flat_target,
-                        reduction="none",
-                    )
                     window_loss_sums.append(
                         token_losses.view(y.shape)
                         .sum(dim=1)
@@ -6991,6 +7075,18 @@ def evaluate(
     class_metrics = confusion_matrix_metrics(confusion.double())
 
     for key, value in class_metrics.items():
+        metrics[f"{split}_{key}"] = value
+
+    # 类平衡似然口径：与频率加权的 {split}_loss 同单位（自然
+    # 对数似然），但对评估集中出现的类等权，稀有字节不再被
+    # 高频字节淹没。类别不平衡场景下它才是「有没有真的学会
+    # 稀有字节」的似然口径。
+    balanced_metrics = class_balanced_loss_metrics(
+        class_loss_sums,
+        class_counts,
+        vocab_size,
+    )
+    for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
 
     if bootstrap_enabled and window_loss_sums:
@@ -7192,6 +7288,22 @@ def compute_reference_baselines(
         if bool(roc_eligible.any()):
             roc_auc_reference = 0.5
 
+    # 类平衡（macro）NLL 参考：与 evaluate() 的 val_macro_nll
+    # 同口径（对评估集中出现的类等权平均每类 NLL）。
+    # - uniform：每类 NLL 恒为 log 256，类平衡平均后不变；
+    # - unigram：预测器与上下文无关，每类 NLL 恒为 -log p(c)，
+    #   类平衡平均即出现类上的平均 -log p(c)。
+    # 这两个数是「类平衡似然」的稻草人下界：基线合理性检查在
+    # val_macro_nll 上用它核对基线是否真的强于无上下文预测器。
+    present_classes = eval_support > 0.0
+    uniform_macro_nll = float(-uniform_log_probs.mean())
+    if bool(present_classes.any()):
+        unigram_macro_nll = float(
+            (-unigram_log_probs[present_classes]).mean()
+        )
+    else:
+        unigram_macro_nll = None
+
     return {
         "split": split,
         "tokens_evaluated": evaluated_tokens,
@@ -7232,6 +7344,12 @@ def compute_reference_baselines(
         # 序数指标（AUC）的常数预测器参考（见上方注释）。
         "unigram_pr_auc_macro_chance": pr_auc_chance,
         "unigram_roc_auc_macro": roc_auc_reference,
+        # 类平衡似然参考（macro NLL）：与 val_macro_nll 同口径。
+        "uniform_macro_nll": uniform_macro_nll,
+        "unigram_macro_nll": unigram_macro_nll,
+        "macro_nll_classes_present": float(
+            int(present_classes.sum())
+        ),
     }
 
 
@@ -7836,6 +7954,18 @@ def _ngram_extended_metrics(
         dtype=torch.float64,
     )
 
+    # 类平衡（macro）NLL 的逐类充分统计量：与神经模型
+    # evaluate() 同口径，保证统计基线与神经模型可以直接在
+    # val_macro_nll 上对比（类平衡似然不能只给神经模型算）。
+    class_loss_sums = torch.zeros(
+        vocab_size,
+        dtype=torch.float64,
+    )
+    class_counts = torch.zeros(
+        vocab_size,
+        dtype=torch.float64,
+    )
+
     # 与神经模型评估同口径：按窗口总位置数分配收集缓冲
     # （不超过上限），逐窗口写入。不做 AUC 时不分配缓冲区。
     auc_capacity = 0
@@ -7878,10 +8008,24 @@ def _ngram_extended_metrics(
             targets,
         ]
 
-        total_nll += float(
-            -target_probs.clamp_min(1e-300).log().sum()
-        )
+        token_nll = -target_probs.clamp_min(1e-300).log()
+
+        total_nll += float(token_nll.sum())
         evaluated_tokens += targets.numel()
+
+        class_loss_sums.index_add_(
+            0,
+            targets,
+            token_nll.to(torch.float64),
+        )
+        class_counts.index_add_(
+            0,
+            targets,
+            torch.ones_like(
+                token_nll,
+                dtype=torch.float64,
+            ),
+        )
 
         predicted = probabilities.argmax(dim=1)
 
@@ -7918,6 +8062,15 @@ def _ngram_extended_metrics(
     class_metrics = confusion_matrix_metrics(confusion)
 
     for key, value in class_metrics.items():
+        metrics[f"{split}_{key}"] = value
+
+    # 类平衡似然（macro NLL）：与神经模型同口径。
+    balanced_metrics = class_balanced_loss_metrics(
+        class_loss_sums,
+        class_counts,
+        vocab_size,
+    )
+    for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
 
     if (
@@ -12548,6 +12701,10 @@ _COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
     "val_loss",
     "val_ppl",
     "val_bits_per_byte",
+    # 类平衡似然同样会被 checkpoint 选择抬高（选型指标若按
+    # 频率加权 loss，稀有字节的表现不影响选型结果），因此
+    # 也要有避开选型偏差的共同步数派生口径。
+    "val_macro_nll",
     "val_token_accuracy",
     "val_micro_f1",
     "val_macro_f1",
@@ -13483,6 +13640,23 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        # 类平衡似然（macro NLL）：频率加权的 val_loss 之外，
+        # 不平衡场景下必须有一份按类等权的似然口径。
+        row["val_macro_nll"] = (
+            final_record.get("val_macro_nll")
+            if final_record is not None
+            else None
+        )
+        row["val_macro_nll_chance"] = (
+            final_record.get("val_macro_nll_chance")
+            if final_record is not None
+            else None
+        )
+        row["val_macro_nll_classes"] = (
+            final_record.get("val_macro_nll_classes")
+            if final_record is not None
+            else None
+        )
         row["val_token_accuracy"] = (
             final_record.get("val_token_accuracy")
             if final_record is not None
@@ -13676,14 +13850,17 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
 
     只展示 val 口径指标（尘封协议：test 结果只随单个运行的
     metrics.jsonl 报告，绝不并排对比）；除 val loss 外同时
-    给出 token accuracy（micro 口径）与 macro F1：字节分布
-    高度不平衡时 accuracy 会被高频字节抬高，必须两类指标
-    一起看；完整口径（micro / macro / weighted、PR-AUC 等）
-    见各运行 metrics.jsonl。
+    给出类平衡似然（macroNLL，按出现类等权）、token accuracy
+    （micro 口径）与 macro F1：字节分布高度不平衡时 accuracy
+    会被高频字节抬高、频率加权的 loss 也几乎只反映高频字节，
+    必须类平衡口径与分类指标一起看；完整口径（micro / macro /
+    weighted、PR-AUC 等）见各运行 metrics.jsonl。
+
     """
     header = (
         f"{'run':<20} {'mode':<9} {'params':>9} "
-        f"{'val_loss':>9} {'val_bpb':>8} {'acc':>6} "
+        f"{'val_loss':>9} {'macroNLL':>9} {'val_bpb':>8} "
+        f"{'acc':>6} "
         f"{'macroF1':>8} "
         f"{'lat(ms)':>9} {'train(ms)':>10} {'GFLOPs':>8} "
         f"{'mem(MB)':>9} {'numerical':<10} {'curve':<18}"
@@ -13708,6 +13885,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             f"{str(row.get('mode'))[:8]:<9} "
             f"{str(row.get('n_params')):>9} "
             f"{_value(row.get('val_loss')):>9} "
+            f"{_value(row.get('val_macro_nll')):>9} "
             f"{_value(row.get('val_bits_per_byte'), '.4f'):>8} "
             f"{_value(row.get('val_token_accuracy'), '.4f'):>6} "
             f"{_value(row.get('val_macro_f1'), '.4f'):>8} "
@@ -13959,6 +14137,10 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     *_COMMON_STEP_METRICS,
     "val_ppl",
     "val_bits_per_byte",
+    # 类平衡似然：val_loss 按 token 频率加权，高频字节几乎
+    # 决定全部 loss；不平衡场景下必须同时看按类等权的
+    # macro NLL（随机水平 log 词表大小，见 val_macro_nll_chance）。
+    "val_macro_nll",
     "val_token_accuracy",
     "val_micro_f1",
     "val_macro_f1",
@@ -14002,6 +14184,8 @@ _LOWER_IS_BETTER_METRICS = {
     "val_loss_at_matched_flops",
     "val_ppl",
     "val_bits_per_byte",
+    # 类平衡似然：同样是 NLL，越低越好。
+    "val_macro_nll",
     *(
         base + _COMMON_STEP_METRIC_SUFFIX
         for base in (
@@ -19031,6 +19215,9 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_loss_at_common_step": "unigram_loss",
     "val_ppl": "unigram_loss",
     "val_bits_per_byte": "unigram_loss",
+    # 类平衡似然：稻草人参考是同口径的 unigram macro NLL
+    # （对出现类等权平均每类 -log p(c)）。
+    "val_macro_nll": "unigram_macro_nll",
     "val_token_accuracy": "unigram_token_accuracy",
     "val_micro_f1": "unigram_token_accuracy",
     "val_macro_f1": "unigram_macro_f1",
@@ -20061,6 +20248,12 @@ def baseline_adequacy(
 # （Jaccard/熵）同样算有效判定口径。
 _HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
     ("loss", r"loss|损失|nll|负对数似然"),
+    # 类平衡似然：假设点名它时，判定口径必须与频率加权的
+    # val_loss 区分开（不平衡场景下二者结论可能相反）。
+    (
+        "macro_nll",
+        r"macro[\s_-]?nll|class[\s_-]?balanced|类平衡|按类等权",
+    ),
     ("ppl", r"ppl|perplexity|困惑度"),
     ("bits_per_byte", r"bits[\s_-]?per[\s_-]?byte|bpb|每字节比特"),
     ("accuracy", r"accuracy|acc\b|准确率|正确率"),
@@ -20084,6 +20277,7 @@ _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
         "val_loss",
         "val_loss_at_matched_flops",
     ),
+    "macro_nll": ("val_macro_nll",),
     "ppl": ("val_ppl",),
     "bits_per_byte": ("val_bits_per_byte",),
     "accuracy": ("val_token_accuracy",),
@@ -20908,6 +21102,36 @@ def imbalance_metric_advisory(
         report["advisories"].append(
             f"当前主指标 {metric} 受多数类主导："
             "建议改用 macro F1 或 PR-AUC 作为判定口径"
+        )
+
+    # 似然口径同样是频率加权的：val_loss / val_ppl / bpb 按
+    # token 数加权，高频字节几乎决定全部数值，稀有字节即使
+    # 完全没学会也几乎不影响它。不平衡场景下判定必须同时看
+    # 类平衡口径 val_macro_nll（对出现类等权，随机水平
+    # log 词表大小）。
+    frequency_weighted_metrics = (
+        "val_loss",
+        "val_ppl",
+        "val_bits_per_byte",
+    )
+    if (
+        metric in frequency_weighted_metrics
+        and max_majority >= _IMBALANCE_WEAK_MAJORITY
+    ):
+        report["advisories"].append(
+            f"当前主指标 {metric} 按 token 频率加权："
+            f"最高频类占 {max_majority:.1%}，它几乎决定全部"
+            "似然值，稀有字节学没学会都看不出来；不平衡场景"
+            "请同时看类平衡口径 val_macro_nll"
+            "（--compare-metric val_macro_nll，随机水平 "
+            "log 词表大小）"
+        )
+    if metric == "val_macro_nll":
+        report["advisories"].append(
+            "当前主指标是类平衡似然（val_macro_nll，对评估集"
+            "中出现的类等权）：它与频率加权的 val_loss 回答的"
+            "问题不同（稀有字节 vs 整体似然），结论不一致时"
+            "必须同时报告两者，不要只挑对自己有利的一个"
         )
 
     # PR-AUC 自身必须相对随机水平解读：正类越稀疏，随机
@@ -25582,6 +25806,123 @@ def run_self_test():
     )
     assert "val_loss" in val_metrics
     assert "val_ppl" in val_metrics
+
+    # ---- 类平衡似然（macro NLL）----
+    # 频率加权的 val_loss 几乎只反映高频字节；类平衡口径按
+    # 评估集中出现的类等权，随机水平是 log 词表大小，纳入类数
+    # 与最小类 support 必须落盘（解读方差时要看）。
+    assert "val_macro_nll" in val_metrics
+    assert "val_macro_nll_chance" in val_metrics
+    assert "val_macro_nll_classes" in val_metrics
+    assert abs(
+        float(val_metrics["val_macro_nll_chance"])
+        - math.log(256.0)
+    ) < 1e-12
+    assert float(val_metrics["val_macro_nll"]) > 0.0
+    assert float(val_metrics["val_macro_nll_classes"]) >= 1.0
+    assert float(val_metrics["val_macro_nll_min_support"]) >= 1.0
+
+    # 两种似然口径必须来自同一组逐 token 损失：类内 NLL 的
+    # token 加权平均 == val_loss（否则 macro NLL 与 loss 不可
+    # 互相解释）。
+    manual_class_sums = torch.zeros(
+        256,
+        dtype=torch.float64,
+    )
+    manual_counts = torch.zeros(
+        256,
+        dtype=torch.float64,
+    )
+    with torch.no_grad():
+        for manual_batch_index in range(2):
+            manual_x, manual_y = eval_dataset.fixed_eval_batch(
+                "val",
+                manual_batch_index,
+                2,
+                1,
+                eval_device,
+            )
+            if manual_x.size(0) == 0:
+                break
+            manual_logits = eval_model(manual_x, manual_y)["logits"]
+            manual_target = manual_y.reshape(-1).to(torch.int64)
+            manual_losses = torch.nn.functional.cross_entropy(
+                manual_logits.reshape(-1, 256).float(),
+                manual_target,
+                reduction="none",
+            )
+            manual_class_sums.index_add_(
+                0,
+                manual_target,
+                manual_losses.to(torch.float64),
+            )
+            manual_counts.index_add_(
+                0,
+                manual_target,
+                torch.ones_like(
+                    manual_losses,
+                    dtype=torch.float64,
+                ),
+            )
+    manual_weighted = float(
+        manual_class_sums.sum() / manual_counts.sum()
+    )
+    assert abs(
+        manual_weighted - float(val_metrics["val_loss"])
+    ) < 1e-4 * max(1.0, abs(manual_weighted))
+    manual_balanced = class_balanced_loss_metrics(
+        manual_class_sums,
+        manual_counts,
+        256,
+    )
+    assert abs(
+        float(manual_balanced["macro_nll"])
+        - float(val_metrics["val_macro_nll"])
+    ) < 1e-4 * max(1.0, abs(manual_weighted))
+
+    # 合成例子：类 0 的 NLL=1、类 1 的 NLL=4 → 类平衡均值 2.5。
+    synthetic_balanced = class_balanced_loss_metrics(
+        torch.tensor([2.0, 4.0, 0.0]),
+        torch.tensor([2.0, 1.0, 0.0]),
+        256,
+    )
+    assert abs(
+        float(synthetic_balanced["macro_nll"]) - 2.5
+    ) < 1e-12
+    assert synthetic_balanced["macro_nll_classes"] == 2.0
+    assert synthetic_balanced["macro_nll_min_support"] == 1.0
+    assert abs(
+        float(synthetic_balanced["macro_nll_chance"])
+        - math.log(256.0)
+    ) < 1e-12
+    # 空评估集不虚报：返回 NaN 而不是编造一个精度。
+    empty_balanced = class_balanced_loss_metrics(
+        torch.zeros(256, dtype=torch.float64),
+        torch.zeros(256, dtype=torch.float64),
+        256,
+    )
+    assert math.isnan(float(empty_balanced["macro_nll"]))
+    assert empty_balanced["macro_nll_classes"] == 0.0
+
+    # 指标接线：类平衡似然可作对比指标、选型指标、共同步数
+    # 派生指标，且方向是越低越好；稻草人参考是同口径的
+    # unigram macro NLL。
+    assert "val_macro_nll" in COMPARISON_METRIC_KEYS
+    assert "val_macro_nll_at_common_step" in COMPARISON_METRIC_KEYS
+    assert "val_macro_nll" in _SELECTION_METRIC_KEYS
+    assert not metric_higher_is_better("val_macro_nll")
+    assert (
+        _TRIVIAL_REFERENCE_FIELDS["val_macro_nll"]
+        == "unigram_macro_nll"
+    )
+    assert (
+        _TRIVIAL_REFERENCE_FIELDS["val_macro_nll_at_common_step"]
+        == "unigram_macro_nll"
+    )
+    # 假设点名类平衡似然时必须可判定。
+    assert hypothesis_metric_unverifiable(
+        ["macro_nll"], None
+    ) == []
 
     # 评估窗口 bootstrap：字段齐全、可复现，且点估计落在
     # 置信区间内；bootstrap 不改变任何点估计指标。
@@ -36895,6 +37236,16 @@ def main():
         f"{reference_baselines['unigram_token_accuracy']:.4f}"
         "（类别不平衡下解读 accuracy 的参考下界）"
     )
+    unigram_macro_nll = reference_baselines.get("unigram_macro_nll")
+    if isinstance(unigram_macro_nll, (int, float)):
+        print(
+            "[reference] 类平衡似然参考：uniform macro_nll="
+            f"{reference_baselines['uniform_macro_nll']:.4f} "
+            "(= ln 256), unigram macro_nll="
+            f"{float(unigram_macro_nll):.4f}"
+            "（按出现类等权的 NLL；频率加权的 val_loss 几乎只"
+            "反映高频字节，稀有字节的表现看这一项）"
+        )
 
     if args.hypothesis.strip():
         print(
