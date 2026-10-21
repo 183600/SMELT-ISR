@@ -32924,6 +32924,220 @@ def run_self_test():
             for issue in clear_report["issues"]
         )
 
+        # ---- 多轴（坐标式）基线调参 ----
+        # 坐标式设计：每个候选相对基线只改一个轴，逐轴判定
+        # winner；推荐配置是各轴 winner 的组合，坐标式网格通常
+        # 没有直接评估过这个组合——报告必须如实标注。
+        multi_axes = [
+            {
+                "name": "lr",
+                "protocol_key": "lr",
+                "label": "学习率",
+                "values": [1e-4, 3e-4, 1e-3],
+                "base_value": 3e-4,
+            },
+            {
+                "name": "dense_fnn_hidden",
+                "protocol_key": "dense_fnn_hidden",
+                "label": "dense FFN 隐藏宽度",
+                "values": [128, 256, 512],
+                "base_value": 256,
+            },
+            {
+                "name": "weight_decay",
+                "protocol_key": "weight_decay",
+                "label": "权重衰减",
+                "values": [0.0, 0.1, 0.2],
+                "base_value": 0.1,
+            },
+        ]
+        multi_base = {
+            "lr": 3e-4,
+            "dense_fnn_hidden": 256,
+            "weight_decay": 0.1,
+        }
+
+        # 计划：每个候选相对基线只改一个轴；基线配置若已被某个
+        # 轴的候选覆盖就复用该运行，不重复训练。
+        multi_plan = build_baseline_tuning_plan(
+            seeds=[42],
+            mode="dense",
+            lrs=[1e-4, 3e-4],
+            balance_coef=0.0,
+            dense_hiddens=[128, 512],
+            weight_decays=[0.0, 0.2],
+            base_lr=3e-4,
+            base_dense_hidden=256,
+            base_weight_decay=0.1,
+        )
+        assert sorted(
+            str(item["label"]) for item in multi_plan
+        ) == sorted([
+            "h128_seed42",
+            "h512_seed42",
+            "lr0.0001_seed42",
+            "lr0.0003_seed42",
+            "wd0_seed42",
+            "wd0.2_seed42",
+        ])
+        for item in multi_plan:
+            changed = [
+                key
+                for key, value in multi_base.items()
+                if item.get(key) != value
+            ]
+            assert len(changed) <= 1, item
+
+        def _multi_run(
+            name: str,
+            lr: float,
+            hidden: int,
+            wd: float,
+            value: float,
+            seed: int,
+        ) -> str:
+            return _write_analysis_run(
+                name,
+                "dense",
+                seed,
+                lr,
+                100,
+                0.0,
+                value,
+                protocol_overrides={
+                    "dense_fnn_hidden": hidden,
+                    "weight_decay": wd,
+                },
+            )
+
+        multi_paths: List[str] = []
+        for seed in (42, 43, 44):
+            multi_paths.append(_multi_run(
+                f"multi_base_seed{seed}", 3e-4, 256, 0.1, 4.0, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_lr1e-4_seed{seed}", 1e-4, 256, 0.1, 3.9, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_lr1e-3_seed{seed}", 1e-3, 256, 0.1, 4.2, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_h128_seed{seed}", 3e-4, 128, 0.1, 4.3, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_h512_seed{seed}", 3e-4, 512, 0.1, 3.7, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_wd0_seed{seed}", 3e-4, 256, 0.0, 4.1, seed
+            ))
+            multi_paths.append(_multi_run(
+                f"multi_wd0.2_seed{seed}", 3e-4, 256, 0.2, 3.8, seed
+            ))
+
+        multi_report = analyze_baseline_tuning_axes(
+            compare_runs(multi_paths),
+            "val_loss",
+            "dense",
+            multi_axes,
+            [42, 43, 44],
+            multi_base,
+        )
+        assert multi_report["multi_axis"] is True
+        assert multi_report["design"] == "coordinate"
+        assert multi_report["axis_winners"] == {
+            "lr": 1e-4,
+            "dense_fnn_hidden": 512,
+            "weight_decay": 0.2,
+        }
+        assert multi_report["recommended_config"] == {
+            "lr": 1e-4,
+            "dense_fnn_hidden": 512,
+            "weight_decay": 0.2,
+        }
+        # 推荐组合在坐标式网格里没有被直接评估：必须如实标注，
+        # 不能把它当成「已验证的强基线」。
+        assert multi_report["recommended_config_evaluated"] is False
+        assert any(
+            "没有在本轮坐标式网格中被直接评估过" in issue
+            for issue in multi_report["issues"]
+        )
+        axis_by_name = {
+            str(axis_report["name"]): axis_report
+            for axis_report in multi_report["axes"]
+        }
+        # 逐轴分组：跨轴候选不得串进同一组。
+        for axis_name, expected_values in (
+            ("lr", [1e-4, 3e-4, 1e-3]),
+            ("dense_fnn_hidden", [128, 256, 512]),
+            ("weight_decay", [0.0, 0.1, 0.2]),
+        ):
+            axis_report = axis_by_name[axis_name]
+            assert sorted(
+                candidate["value"]
+                for candidate in axis_report["candidates"]
+            ) == expected_values
+            assert all(
+                candidate["n_runs"] == 3
+                for candidate in axis_report["candidates"]
+            )
+            assert axis_report["seed_alignment"]["aligned"] is True
+        assert axis_by_name["lr"]["winner"]["value"] == 1e-4
+        # 学习率轴的 winner 额外带 winner.lr：下游调参来源记录与
+        # 基线合理性检查按它核对。
+        assert axis_by_name["lr"]["winner"]["lr"] == 1e-4
+        assert multi_report["winner"]["lr"] == 1e-4
+        assert (
+            axis_by_name["dense_fnn_hidden"]["winner"]["value"] == 512
+        )
+        assert axis_by_name["weight_decay"]["winner"]["value"] == 0.2
+
+        # 调参来源：当前训练必须与推荐配置逐轴一致，否则拒绝
+        # 借用调参报告。
+        multi_protocol = dict(multi_report["training_config"])
+        multi_protocol["lr"] = 1e-4
+        multi_protocol["weight_decay"] = 0.2
+        multi_protocol["dense_fnn_hidden"] = 512
+        assert baseline_tuning_provenance_error(
+            multi_report,
+            mode="dense",
+            lr=1e-4,
+            steps=100,
+            data_sha256="deadbeef",
+            batch_size=8,
+            protocol=multi_protocol,
+        ) is None
+        assert baseline_tuning_provenance_error(
+            multi_report,
+            mode="dense",
+            lr=3e-4,
+            steps=100,
+            data_sha256="deadbeef",
+            batch_size=8,
+            protocol=multi_protocol,
+        ) is not None
+        mismatched_protocol = dict(multi_protocol)
+        mismatched_protocol["weight_decay"] = 0.1
+        assert baseline_tuning_provenance_error(
+            multi_report,
+            mode="dense",
+            lr=1e-4,
+            steps=100,
+            data_sha256="deadbeef",
+            batch_size=8,
+            protocol=mismatched_protocol,
+        ) is not None
+        multi_record = baseline_tuning_provenance_record(
+            multi_report,
+            "baseline_tuning.json",
+        )
+        assert multi_record["multi_axis"] is True
+        assert multi_record["recommended_config"] == {
+            "lr": 1e-4,
+            "dense_fnn_hidden": 512,
+            "weight_decay": 0.2,
+        }
+        assert multi_record["recommended_config_evaluated"] is False
+
         # 候选之间训练配置不一致：调参结论无效，必须报 issue
         # （否则「更优 lr」可能与「训练更久」混杂）。
         config_break_path = _write_analysis_run(
@@ -34066,6 +34280,8 @@ _SWEEP_MULTI_VALUE_FLAGS = (
     "--seeds",
     "--suite-modes",
     "--baseline-tuning-lrs",
+    "--baseline-tuning-dense-hiddens",
+    "--baseline-tuning-weight-decays",
     "--ablation-modes",
 )
 _SWEEP_BOOL_FLAGS = (
@@ -34220,13 +34436,29 @@ def build_baseline_tuning_plan(
     mode: str,
     lrs: List[float],
     balance_coef: float,
+    dense_hiddens: Optional[List[int]] = None,
+    weight_decays: Optional[List[float]] = None,
+    base_lr: Optional[float] = None,
+    base_dense_hidden: Optional[int] = None,
+    base_weight_decay: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """
-    基线调参网格的运行计划：学习率 × 随机种子。
+    基线调参网格的运行计划。
 
-    候选之间只允许学习率不同，其余（steps/batch/数据/模型结构）
-    全部继承同一条命令行，保证调参比较是在固定训练配置下做的
-    「超参数搜索」，而不是偷跑更多步。
+    单轴（默认）时是「学习率 × 随机种子」：候选之间只允许学习
+    率不同，其余（steps/batch/数据/模型结构）全部继承同一条命令
+    行，保证调参比较是在固定训练配置下做的「超参数搜索」，而不
+    是偷跑更多步。
+
+    传入 dense_hiddens / weight_decays 时启用**坐标式**（每候选
+    相对基线只改一个轴）多轴设计：每个轴的候选都相对同一条基
+    线配置只改该轴一个超参，其余轴固定在基线值。这样每个轴的
+    效应都能单独归因，不会与「顺手换了别的超参」混杂；多出来的
+    代价是运行数按轴相乘（坐标式设计本身就是这个代价）。
+
+    基线配置始终作为共同参照点：多轴设计若没有基线运行，就无法
+    回答「改这个轴到底有没有变好」——基线配置已由某个轴的候选覆
+    盖时复用该运行，不额外重复训练。
     """
     plan: List[Dict[str, object]] = []
     labels = [f"lr{format(lr, 'g')}" for lr in lrs]
@@ -34235,15 +34467,124 @@ def build_baseline_tuning_plan(
             "基线调参候选的学习率在运行目录名中格式化后重名，"
             "会互相覆盖输出目录；请使用差异更大的候选"
         )
-    for lr in lrs:
+    for name, values in (
+        ("h", dense_hiddens or []),
+        ("wd", weight_decays or []),
+    ):
+        formatted = [
+            f"{name}{format(value, 'g')}" for value in values
+        ]
+        if len(set(formatted)) != len(formatted):
+            raise ValueError(
+                f"基线调参候选的 {name} 在运行目录名中格式化后"
+                "重名，会互相覆盖输出目录；请使用差异更大的候选"
+            )
+
+    axis_specs: List[Dict[str, object]] = [
+        {
+            "name": "lr",
+            "protocol_key": "lr",
+            "label": "学习率",
+            "values": [float(lr) for lr in lrs],
+        },
+    ]
+    if dense_hiddens:
+        axis_specs.append({
+            "name": "dense_fnn_hidden",
+            "protocol_key": "dense_fnn_hidden",
+            "label": "dense FFN 隐藏宽度",
+            "values": [int(value) for value in dense_hiddens],
+        })
+    if weight_decays:
+        axis_specs.append({
+            "name": "weight_decay",
+            "protocol_key": "weight_decay",
+            "label": "权重衰减",
+            "values": [float(value) for value in weight_decays],
+        })
+
+    base_values: Dict[str, object] = {
+        "lr": None if base_lr is None else float(base_lr),
+        "dense_fnn_hidden": (
+            None
+            if base_dense_hidden is None
+            else int(base_dense_hidden)
+        ),
+        "weight_decay": (
+            None
+            if base_weight_decay is None
+            else float(base_weight_decay)
+        ),
+    }
+
+    def _signature(config: Dict[str, object]) -> Tuple[str, ...]:
+        return tuple(
+            f"{key}={_protocol_value_text(value)}"
+            for key, value in sorted(config.items())
+        )
+
+    def _label_for(axis: str, value: object, seed: int) -> str:
+        if axis == "base":
+            return f"base_seed{seed}"
+        if axis == "lr":
+            return f"lr{format(float(value), 'g')}_seed{seed}"
+        if axis == "dense_fnn_hidden":
+            return f"h{int(value)}_seed{seed}"
+        return f"wd{format(float(value), 'g')}_seed{seed}"
+
+    # 每个轴的候选条目（相对基线只改该轴）；同一配置只保留一条，
+    # 避免同一个运行被重复训练。
+    seen_signatures = set()
+    axis_entries: List[Dict[str, object]] = []
+    for spec in axis_specs:
+        axis = str(spec["name"])
+        for value in spec["values"]:
+            config = dict(base_values)
+            config[axis] = value
+            signature = _signature(config)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            axis_entries.append({
+                "axis": axis,
+                "value": value,
+                "config": config,
+            })
+
+    # 基线配置：多轴设计必须有共同参照点（基线运行即该参照）。
+    if base_lr is not None:
+        base_signature = _signature(base_values)
+        if base_signature not in seen_signatures:
+            axis_entries.append({
+                "axis": "base",
+                "value": None,
+                "config": dict(base_values),
+            })
+
+    for entry in axis_entries:
+        axis = str(entry["axis"])
+        value = entry["value"]
+        config = entry["config"]
         for seed in seeds:
-            plan.append({
-                "label": f"lr{format(lr, 'g')}_seed{seed}",
+            item: Dict[str, object] = {
+                "label": _label_for(axis, value, seed),
                 "mode": mode,
-                "lr": lr,
                 "balance_coef": balance_coef,
                 "seed": seed,
-            })
+                # 调参轴与取值随计划落盘：分析阶段按轴分组时，
+                # 不依赖运行目录名的解析。
+                "tuning_axis": axis,
+                "tuning_value": value,
+            }
+            if config.get("lr") is not None:
+                item["lr"] = config["lr"]
+            if config.get("dense_fnn_hidden") is not None:
+                item["dense_fnn_hidden"] = config[
+                    "dense_fnn_hidden"
+                ]
+            if config.get("weight_decay") is not None:
+                item["weight_decay"] = config["weight_decay"]
+            plan.append(item)
     return plan
 
 
@@ -34306,6 +34647,18 @@ def _execute_sweep_plan(
         if item.get("lr") is not None:
             # repr 保证浮点值往返逐位一致（如 1e-4）。
             command += ["--lr", repr(float(item["lr"]))]
+        # 多轴（坐标式）调参：容量与权重衰减轴的候选也逐条覆盖，
+        # 其余候选继承命令行里的基线值。
+        if item.get("dense_fnn_hidden") is not None:
+            command += [
+                "--dense-fnn-hidden",
+                str(int(item["dense_fnn_hidden"])),
+            ]
+        if item.get("weight_decay") is not None:
+            command += [
+                "--weight-decay",
+                repr(float(item["weight_decay"])),
+            ]
 
         print(
             f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
@@ -34801,6 +35154,667 @@ def analyze_baseline_tuning(
     return report
 
 
+def _axis_value_equal(left: object, right: object) -> bool:
+    """轴取值比较：浮点按相对误差比较，其余按等值比较。"""
+    if (
+        isinstance(left, (int, float))
+        and isinstance(right, (int, float))
+        and not isinstance(left, bool)
+        and not isinstance(right, bool)
+    ):
+        return math.isclose(
+            float(left),
+            float(right),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    return left == right
+
+
+def _axis_value_sort_key(value: object) -> Tuple[int, float, str]:
+    """轴取值的排序键：数值升序在前，其余按文本。"""
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    ):
+        return (0, float(value), "")
+    return (1, 0.0, str(value))
+
+
+def _axis_value_text(value: object) -> str:
+    """轴取值的可读文本（错误消息与表格用）。"""
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    ):
+        return format(float(value), "g")
+    return str(value)
+
+
+# 调参轴 → 命令行开关（推荐配置与错误消息用）。
+_BASELINE_TUNING_AXIS_CLI_FLAGS: Dict[str, str] = {
+    "lr": "--lr",
+    "dense_fnn_hidden": "--dense-fnn-hidden",
+    "weight_decay": "--weight-decay",
+}
+
+
+def _axis_cli_flag(axis_name: str) -> str:
+    return _BASELINE_TUNING_AXIS_CLI_FLAGS.get(
+        axis_name,
+        f"--{axis_name.replace('_', '-')}",
+    )
+
+
+def analyze_baseline_tuning_axes(
+    rows: List[Dict[str, object]],
+    metric: str,
+    mode: str,
+    axes: List[Dict[str, object]],
+    seeds: List[int],
+    base_config: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    坐标式（多轴）基线调参分析：逐轴判定 winner，并给出各轴
+    winner 组合出来的**推荐配置**。
+
+    为什么必须逐轴而不是直接比所有组合：坐标式设计里每个候选
+    相对基线只改一个轴，跨轴的候选之间容量/正则都不同，直接比较
+    会把「轴的效应」与「组合效应」混在一起。逐轴分析保证每个轴
+    的结论只归因于该轴。
+
+    推荐配置是各轴 winner 的组合，**本轮网格通常没有直接评估过
+    这个组合**（坐标式设计的固有性质）。报告必须如实标注这一点
+    （recommended_config_evaluated），并要求最终基线训练用该组合
+    再跑一遍作为确认——否则「调过参的基线」只是一个未经验证的
+    组合猜测。
+
+    其它检查与单轴调参一致：候选必须用同一组随机种子（否则均
+    值差混着种子难度差）、同一候选内不得有重复种子（伪重复）、
+    组内训练协议必须逐项一致（除该轴自身）、winner 未收敛时
+    提示限制基线的可能不是超参、winner/最优均值落在网格边界时
+    提示扩展候选。
+    """
+    higher_is_better = metric_higher_is_better(metric)
+
+    axis_reports: List[Dict[str, object]] = []
+    global_issues: List[str] = []
+
+    for axis in axes:
+        key = str(axis["protocol_key"])
+        label = str(axis.get("label", key))
+        base_value = axis.get("base_value")
+        candidate_values = list(axis.get("values", []))
+        axis_issues: List[str] = []
+
+        # 该轴的候选组：其它调参轴必须都停在基线值（坐标式设计
+        # 的定义——每个候选相对基线只改一个轴）。
+        group: List[Tuple[object, Dict[str, object]]] = []
+        for row in rows:
+            protocol = row.get("protocol")
+            if not isinstance(protocol, dict):
+                continue
+            if key not in protocol:
+                continue
+            others_at_base = True
+            for other in axes:
+                other_key = str(other["protocol_key"])
+                if other_key == key:
+                    continue
+                if not _axis_value_equal(
+                    protocol.get(other_key),
+                    other.get("base_value"),
+                ):
+                    others_at_base = False
+                    break
+            if not others_at_base:
+                continue
+            group.append((protocol.get(key), row))
+
+        # 观察到的取值：候选值 + 基线值（基线运行是共同参照点）。
+        observed_values: List[object] = []
+        for value in list(candidate_values) + [base_value]:
+            if value is None:
+                continue
+            if not any(
+                _axis_value_equal(value, other)
+                for other in observed_values
+            ):
+                observed_values.append(value)
+        observed_values.sort(key=_axis_value_sort_key)
+
+        candidates: List[Dict[str, object]] = []
+        candidate_seed_sets: Dict[str, List[int]] = {}
+        duplicate_seeds_by_value: Dict[str, List[int]] = {}
+        missing_seed_runs: List[str] = []
+
+        for value in observed_values:
+            value_rows = [
+                row
+                for observed, row in group
+                if _axis_value_equal(observed, value)
+            ]
+            metric_values = [
+                float(row[metric])
+                for row in value_rows
+                if isinstance(row.get(metric), (int, float))
+                and not isinstance(row.get(metric), bool)
+                and math.isfinite(float(row[metric]))
+            ]
+            seed_values: List[int] = []
+            for row in value_rows:
+                seed = row.get("seed")
+                if isinstance(seed, int) and not isinstance(seed, bool):
+                    seed_values.append(int(seed))
+                else:
+                    missing_seed_runs.append(str(row.get("run")))
+            unique_seeds = sorted(set(seed_values))
+            value_key = _axis_value_text(value)
+            candidate_seed_sets[value_key] = unique_seeds
+            duplicates = sorted({
+                seed
+                for seed in unique_seeds
+                if seed_values.count(seed) > 1
+            })
+            if duplicates:
+                duplicate_seeds_by_value[value_key] = duplicates
+            candidates.append({
+                "value": value,
+                "is_base": _axis_value_equal(value, base_value),
+                "n_runs": len(value_rows),
+                "n_metric_runs": len(metric_values),
+                "metric_mean": _mean(metric_values),
+                "metric_std": _sample_std(metric_values),
+                "runs": [str(row.get("run")) for row in value_rows],
+                "seeds": unique_seeds,
+            })
+            if len(metric_values) < len(value_rows):
+                axis_issues.append(
+                    f"{label}={value_key} 有 "
+                    f"{len(value_rows) - len(metric_values)} 个候选"
+                    f"运行缺少 {metric}，未计入均值"
+                )
+
+        # 种子对齐：各候选必须用同一组种子，否则均值差可能混着
+        # 种子难度差；同一候选内的重复种子是伪重复。
+        seed_alignment: Dict[str, object] = {
+            "candidate_seed_sets": candidate_seed_sets,
+            "common_seeds": [],
+            "aligned": None,
+            "duplicate_seeds": duplicate_seeds_by_value,
+            "missing_seed_runs": missing_seed_runs,
+        }
+        nonempty_sets = [
+            tuple(value_seeds)
+            for value_seeds in candidate_seed_sets.values()
+            if value_seeds
+        ]
+        if duplicate_seeds_by_value:
+            seed_alignment["aligned"] = False
+            axis_issues.append(
+                f"同一{label}候选内出现重复随机种子（伪重复）："
+                + "; ".join(
+                    f"{value_key} 种子 "
+                    + ", ".join(str(seed) for seed in value_seeds)
+                    for value_seeds, value_key in sorted(
+                        (
+                            (value_seeds, value_key)
+                            for value_key, value_seeds
+                            in duplicate_seeds_by_value.items()
+                        )
+                    )
+                )
+                + "。重复运行不是独立样本，会低估种子间方差，"
+                "winner 不能作为「调优过的基线」证据"
+            )
+        elif missing_seed_runs:
+            seed_alignment["aligned"] = None
+            axis_issues.append(
+                f"部分{label}调参运行缺少随机种子记录，无法核对"
+                "候选是否在同一组种子上评估：均值差可能混入种子"
+                "差异，不能作为「调优过的基线」证据"
+            )
+        elif len(set(nonempty_sets)) > 1 or len(
+            nonempty_sets
+        ) != len(observed_values):
+            seed_alignment["aligned"] = False
+            axis_issues.append(
+                f"各{label}候选使用的随机种子集合不一致："
+                + "; ".join(
+                    f"{value_key} 种子=["
+                    + ", ".join(str(seed) for seed in value_seeds)
+                    + "]"
+                    for value_key, value_seeds in sorted(
+                        candidate_seed_sets.items()
+                    )
+                )
+                + "。均值差可能是种子难度差异而不是该轴的差异，"
+                "winner 不能作为「调优过的基线」证据"
+            )
+        else:
+            seed_alignment["aligned"] = True
+            seed_alignment["common_seeds"] = (
+                list(nonempty_sets[0]) if nonempty_sets else []
+            )
+
+        # 组内训练协议一致性：除该轴自身外必须逐项相同，否则
+        # 「该轴更优」可能与「换了别的训练配置」混杂。
+        protocol_keys = [
+            protocol_key
+            for protocol_key in _BASELINE_TUNING_PROTOCOL_KEYS
+            if protocol_key != key
+        ]
+        protocol_values: Dict[str, set] = {
+            protocol_key: set() for protocol_key in protocol_keys
+        }
+        protocol_value_counts = {
+            protocol_key: 0 for protocol_key in protocol_keys
+        }
+        recorded_protocol = 0
+        for _, row in group:
+            protocol = row.get("protocol")
+            if not isinstance(protocol, dict):
+                continue
+            recorded_protocol += 1
+            for protocol_key in protocol_keys:
+                value = protocol.get(protocol_key)
+                if value is None:
+                    continue
+                protocol_value_counts[protocol_key] += 1
+                protocol_values[protocol_key].add(
+                    _protocol_value_text(value)
+                )
+        inconsistent_keys = [
+            protocol_key
+            for protocol_key, values in protocol_values.items()
+            if len(values) > 1
+        ]
+        if inconsistent_keys:
+            axis_issues.append(
+                f"该{label}候选之间的训练协议不一致（"
+                + ", ".join(inconsistent_keys)
+                + "）：调参结果与「训练得更久 / 换了优化协议或"
+                "数据划分」混杂，不可用于选择基线超参数"
+            )
+        partial_protocol_keys = []
+        axis_training_config: Dict[str, object] = {}
+        if recorded_protocol:
+            for protocol_key, values in protocol_values.items():
+                if (
+                    len(values) == 1
+                    and protocol_value_counts[protocol_key]
+                    == recorded_protocol
+                ):
+                    axis_training_config[protocol_key] = json.loads(
+                        next(iter(values))
+                    )
+                elif len(values) == 1:
+                    partial_protocol_keys.append(protocol_key)
+        if partial_protocol_keys:
+            axis_issues.append(
+                "部分候选运行缺少训练协议字段（"
+                + ", ".join(partial_protocol_keys)
+                + "）：无法确认所有候选使用同一训练协议，"
+                "winner 不能作为「调优过的基线」证据"
+            )
+
+        # winner 选择：均值最优；与最优均值的差距落在种子波动内
+        # 的候选视为无法区分，并列时优先取基线值（保守），否则取
+        # 数值更小的候选。
+        usable = [
+            candidate
+            for candidate in candidates
+            if candidate["metric_mean"] is not None
+            and int(candidate["n_runs"]) > 0
+        ]
+        winner: Optional[Dict[str, object]] = None
+        tied: List[Dict[str, object]] = []
+        best: Optional[Dict[str, object]] = None
+        winner_selection = "none"
+        if not usable:
+            axis_issues.append(
+                f"没有任何候选提供可用的 {metric}，无法选出"
+                f"{label}的 winner"
+            )
+        else:
+            def _mean_order(
+                candidate: Dict[str, object],
+            ) -> float:
+                mean = float(candidate["metric_mean"])
+                return -mean if higher_is_better else mean
+
+            best = min(usable, key=_mean_order)
+            best_mean = float(best["metric_mean"])
+            best_std = float(best["metric_std"] or 0.0)
+            for candidate in usable:
+                mean = float(candidate["metric_mean"])
+                gap = (
+                    best_mean - mean
+                    if higher_is_better
+                    else mean - best_mean
+                )
+                noise = max(
+                    best_std,
+                    float(candidate["metric_std"] or 0.0),
+                )
+                if gap <= 0.0 or (noise > 0.0 and gap < noise):
+                    tied.append(candidate)
+            winner = min(
+                tied,
+                key=lambda candidate: (
+                    0 if candidate["is_base"] else 1,
+                    _axis_value_sort_key(candidate["value"]),
+                ),
+            )
+            winner_selection = (
+                "conservative_tie_break" if len(tied) > 1 else "best_mean"
+            )
+            indistinguishable = [
+                candidate
+                for candidate in tied
+                if candidate is not winner
+            ]
+            if indistinguishable:
+                axis_issues.append(
+                    f"以下{label}候选与最优均值候选的差距小于种子"
+                    "波动（无法在统计上区分，已按 selection_rule "
+                    "从并列集合中取保守 winner）: "
+                    + ", ".join(
+                        _axis_value_text(candidate["value"])
+                        for candidate in indistinguishable
+                    )
+                )
+            elif len(tied) > 1:
+                axis_issues.append(
+                    f"存在与最优均值恰好并列的{label}候选，已按 "
+                    "selection_rule 取保守 winner"
+                )
+
+        # 收敛性：winner 仍在欠训/发散时，限制基线的可能不是该
+        # 轴的超参而是训练配置/数据/实现。
+        winner_unconverged_runs: List[str] = []
+        if winner is not None:
+            winner_unconverged_runs = [
+                str(row.get("run"))
+                for observed, row in group
+                if _axis_value_equal(observed, winner["value"])
+                and row.get("curve_status") in (
+                    "not_converged",
+                    "underfitting",
+                    "diverged",
+                )
+            ]
+            if winner_unconverged_runs:
+                axis_issues.append(
+                    f"winner {label}="
+                    f"{_axis_value_text(winner['value'])} 的部分候选"
+                    "运行没有训练到收敛/稳定（曲线诊断）: "
+                    + ", ".join(winner_unconverged_runs)
+                    + "。限制基线的可能不是该超参而是训练配置/"
+                    "数据/实现：请增加 --steps（或核查数据与实现）"
+                    "后重新调参，否则 winner 不能代表「调强过的基线」"
+                )
+
+        # 网格边界：winner 或最优均值候选落在候选边界时，最优
+        # 可能落在网格之外。
+        boundary_values = (
+            (observed_values[0], observed_values[-1])
+            if observed_values
+            else ()
+        )
+        winner_at_boundary = False
+        best_at_boundary = False
+        if boundary_values and winner is not None:
+            winner_at_boundary = any(
+                _axis_value_equal(winner["value"], edge)
+                for edge in boundary_values
+            )
+            best_at_boundary = any(
+                _axis_value_equal(best["value"], edge)
+                for edge in boundary_values
+            )
+            if (
+                winner_at_boundary or best_at_boundary
+            ) and len(observed_values) > 1:
+                reason = (
+                    f"winner {label}="
+                    f"{_axis_value_text(winner['value'])}"
+                    if winner_at_boundary
+                    else f"最优均值候选 {label}="
+                    f"{_axis_value_text(best['value'])}"
+                )
+                axis_issues.append(
+                    reason
+                    + " 位于候选网格边界（"
+                    + ", ".join(
+                        _axis_value_text(value)
+                        for value in observed_values
+                    )
+                    + "）：最优可能落在网格之外，当前「调过参的"
+                    "基线」仍可能被网格边界限制；建议扩展该轴的"
+                    "候选后重跑调参"
+                )
+
+        axis_reports.append({
+            "name": str(axis.get("name", key)),
+            "protocol_key": key,
+            "label": label,
+            "base_value": base_value,
+            "values": observed_values,
+            "candidates": candidates,
+            "winner": (
+                {
+                    "value": winner["value"],
+                    # 学习率轴额外给出 winner.lr：下游的调参来源
+                    # 记录与基线合理性检查按 winner.lr 核对。
+                    **(
+                        {"lr": winner["value"]}
+                        if key == "lr"
+                        else {}
+                    ),
+                    "metric": metric,
+                    "metric_mean": winner["metric_mean"],
+                    "metric_std": winner["metric_std"],
+                    "n_runs": winner["n_runs"],
+                    "runs": winner["runs"],
+                }
+                if winner is not None
+                else None
+            ),
+            "tied_values": [
+                candidate["value"] for candidate in tied
+            ],
+            "winner_selection": winner_selection,
+            "winner_at_boundary": winner_at_boundary,
+            "best_mean_at_boundary": best_at_boundary,
+            "winner_unconverged_runs": winner_unconverged_runs,
+            "seed_alignment": seed_alignment,
+            "training_config": axis_training_config,
+            "issues": axis_issues,
+        })
+
+    # 推荐配置：各轴 winner 的组合。
+    axis_winners: Dict[str, object] = {}
+    for axis_report in axis_reports:
+        winner = axis_report.get("winner")
+        if isinstance(winner, dict):
+            axis_winners[str(axis_report["name"])] = winner.get(
+                "value"
+            )
+        else:
+            axis_winners[str(axis_report["name"])] = axis_report.get(
+                "base_value"
+            )
+
+    recommended_config: Dict[str, object] = {}
+    for axis in axes:
+        name = str(axis.get("name", axis["protocol_key"]))
+        recommended_config[name] = axis_winners.get(
+            name,
+            axis.get("base_value"),
+        )
+
+    # 推荐组合是否在网格里被真正评估过：坐标式设计下通常没有。
+    recommended_evaluated = False
+    for row in rows:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            continue
+        matched = True
+        for axis in axes:
+            key = str(axis["protocol_key"])
+            name = str(axis.get("name", key))
+            if key not in protocol:
+                matched = False
+                break
+            if not _axis_value_equal(
+                protocol.get(key),
+                recommended_config.get(name),
+            ):
+                matched = False
+                break
+        if matched:
+            recommended_evaluated = True
+            break
+
+    issues: List[str] = list(global_issues)
+    for axis_report in axis_reports:
+        for issue in axis_report["issues"]:
+            issues.append(str(issue))
+
+    if not recommended_evaluated:
+        issues.append(
+            "各轴 winner 组合出的推荐配置（"
+            + ", ".join(
+                f"{name}={_axis_value_text(value)}"
+                for name, value in recommended_config.items()
+            )
+            + "）没有在本轮坐标式网格中被直接评估过（坐标式"
+            "设计每次只改一个轴）：它是各轴结论的组合猜测，"
+            "必须用该组合再训练一次基线来确认；未确认前不能"
+            "把它当作「已验证的强基线」"
+        )
+
+    # 训练配置（基线协议的公共部分）：调参轴自身的取值由推荐
+    # 配置单独记录。
+    lr_axis = next(
+        (
+            axis_report
+            for axis_report in axis_reports
+            if axis_report["protocol_key"] == "lr"
+        ),
+        None,
+    )
+
+    training_config: Dict[str, object] = {
+        key: None for key in _BASELINE_TUNING_PROTOCOL_KEYS
+    }
+    if isinstance(lr_axis, dict):
+        axis_config = lr_axis.get("training_config")
+        if isinstance(axis_config, dict):
+            training_config.update(axis_config)
+
+    report: Dict[str, object] = {
+        "comparison_family": "baseline_tuning",
+        "design": "coordinate",
+        "multi_axis": True,
+        "mode": mode,
+        "metric": metric,
+        "higher_is_better": higher_is_better,
+        "axes": axis_reports,
+        "axis_winners": axis_winners,
+        "base_config": dict(base_config),
+        "recommended_config": recommended_config,
+        "recommended_config_evaluated": recommended_evaluated,
+        "grid": [
+            float(value)
+            for value in (
+                lr_axis.get("values") if isinstance(lr_axis, dict) else []
+            )
+        ],
+        "seeds": [int(seed) for seed in seeds],
+        "n_candidates": sum(
+            len(axis_report["candidates"])
+            for axis_report in axis_reports
+        ),
+        "n_runs": len(rows),
+        "training_config": training_config,
+        "protocol_keys": list(_BASELINE_TUNING_PROTOCOL_KEYS),
+        "candidates": [
+            {
+                "axis": axis_report["name"],
+                **candidate,
+            }
+            for axis_report in axis_reports
+            for candidate in axis_report["candidates"]
+        ],
+        "winner": (
+            lr_axis.get("winner") if isinstance(lr_axis, dict) else None
+        ),
+        "winner_selection": (
+            lr_axis.get("winner_selection")
+            if isinstance(lr_axis, dict)
+            else "none"
+        ),
+        "tied_lrs": (
+            [
+                float(value)
+                for value in (lr_axis.get("tied_values") or [])
+            ]
+            if isinstance(lr_axis, dict)
+            else []
+        ),
+        "winner_at_grid_boundary": (
+            bool(lr_axis.get("winner_at_boundary"))
+            if isinstance(lr_axis, dict)
+            else False
+        ),
+        "best_mean_at_grid_boundary": (
+            bool(lr_axis.get("best_mean_at_boundary"))
+            if isinstance(lr_axis, dict)
+            else False
+        ),
+        "winner_unconverged_runs": (
+            list(lr_axis.get("winner_unconverged_runs") or [])
+            if isinstance(lr_axis, dict)
+            else []
+        ),
+        "seed_plan": {
+            "seeds": [int(seed) for seed in seeds],
+            "n_seeds": len(seeds),
+            "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
+            "underpowered_override": False,
+        },
+        "seed_alignment": (
+            lr_axis.get("seed_alignment")
+            if isinstance(lr_axis, dict)
+            else {}
+        ),
+        "selection_rule": (
+            "逐轴在 val 上先取指标均值最优的候选；与最优均值的"
+            "差距小于种子波动（两侧 std 的较大者）的候选视为并列"
+            "（无法在统计上区分），从并列集合中取基线值（没有则取"
+            "数值更小的候选）作为该轴 winner；各轴 winner 的组合"
+            "即推荐配置"
+        ),
+        "issues": issues,
+        "caveats": [
+            "调参只看 val：test 集全程尘封，不参与候选排序",
+            "坐标式设计：每个候选相对基线只改一个轴，其余轴固定"
+            "在基线值，因此各轴结论互不混杂；跨轴的候选之间容量/"
+            "正则都不同，不能直接横向比较",
+            "推荐配置是各轴 winner 的组合，坐标式网格通常没有直接"
+            "评估过它：必须用该组合再训练一次基线来确认",
+            "调参后应固定推荐配置训练最终基线，并用 "
+            "--baseline-tuning-from 记录来源；该来源会逐项核对"
+            "训练协议与各轴取值，协议不一致时拒绝；复杂模型必须"
+            "战胜这条调过参的基线才有意义",
+        ],
+    }
+
+    return report
+
+
 def print_baseline_tuning_report(
     report: Dict[str, object],
     out_root: Path,
@@ -34813,6 +35827,82 @@ def print_baseline_tuning_report(
         else "越低越好"
     )
     config = report.get("training_config") or {}
+
+    def _fmt(value) -> str:
+        if value is None:
+            return "-"
+        return f"{float(value):.6f}"
+
+    # 多轴（坐标式）调参：逐轴打印候选与 winner，再打印组合出的
+    # 推荐配置。
+    if report.get("multi_axis"):
+        print()
+        print(
+            "[baseline-tuning] 简单基线多轴坐标式调参（val，"
+            "test 集尘封不参与；每个候选相对基线只改一个轴）"
+        )
+        print(
+            f"  模式: {report['mode']}；指标: {metric}（{direction}"
+            + (
+                f"，来源={report['metric_source']}"
+                if report.get("metric_source")
+                else ""
+            )
+            + "）；"
+            f"训练配置: steps={config.get('total_steps')}, "
+            f"batch_size={config.get('batch_size')}"
+        )
+        for axis_report in report.get("axes", []):
+            label = axis_report.get("label", axis_report.get("name"))
+            print(f"  [{label}] 候选：")
+            print(
+                f"  {'value':>12} {'base':>6} {'n':>3} "
+                f"{'mean':>12} {'std':>12}"
+            )
+            for candidate in axis_report.get("candidates", []):
+                print(
+                    f"  {_axis_value_text(candidate['value']):>12} "
+                    f"{'是' if candidate.get('is_base') else '-':>6} "
+                    f"{int(candidate['n_runs']):>3} "
+                    f"{_fmt(candidate.get('metric_mean')):>12} "
+                    f"{_fmt(candidate.get('metric_std')):>12}"
+                )
+            axis_winner = axis_report.get("winner")
+            if isinstance(axis_winner, dict):
+                print(
+                    f"  [winner] {label}="
+                    f"{_axis_value_text(axis_winner['value'])}, "
+                    f"mean={_fmt(axis_winner.get('metric_mean'))} "
+                    f"(n={axis_winner.get('n_runs')}, "
+                    f"{metric}, {direction}；选择方式="
+                    f"{axis_report.get('winner_selection')})"
+                )
+        recommended = report.get("recommended_config") or {}
+        print(
+            "  [推荐配置] "
+            + ", ".join(
+                f"--{_axis_cli_flag(name)} "
+                f"{_axis_value_text(value)}"
+                for name, value in recommended.items()
+            )
+            + (
+                "（该组合已在本轮网格中直接评估）"
+                if report.get("recommended_config_evaluated")
+                else "（该组合未在本轮网格中直接评估：必须用它再"
+                "训练一次基线来确认）"
+            )
+        )
+        print(
+            "  下一步：用上面的推荐配置训练最终基线，并加 "
+            "--baseline-tuning-from "
+            f"{out_root / _BASELINE_TUNING_FILENAME} 记录调参来源；"
+            "复杂模型必须战胜这条调过参的基线"
+        )
+        for issue in report.get("issues", []):
+            print(f"  [warn] {issue}")
+        for caveat in report.get("caveats", []):
+            print(f"  [note] {caveat}")
+        return
 
     print()
     print(
@@ -34831,11 +35921,6 @@ def print_baseline_tuning_report(
         f"batch_size={config.get('batch_size')}"
     )
     print(f"  {'lr':>10} {'n':>3} {'mean':>12} {'std':>12}")
-
-    def _fmt(value) -> str:
-        if value is None:
-            return "-"
-        return f"{float(value):.6f}"
 
     for candidate in report.get("candidates", []):
         print(
@@ -34993,13 +36078,53 @@ def baseline_tuning_provenance_error(
         )
 
     winner = payload.get("winner") or {}
-    winner_lr = float(winner.get("lr"))
-    if not math.isclose(lr, winner_lr, rel_tol=1e-9, abs_tol=1e-12):
-        return (
-            f"当前 --lr={format(lr, 'g')} 与调参 winner "
-            f"lr={format(winner_lr, 'g')} 不一致：调参来源"
-            "必须真实复用于基线训练，不能借用调参报告"
-        )
+
+    # 调参轴与推荐取值：单轴报告（学习率）取 winner.lr；多轴
+    # （坐标式）报告逐轴取该轴 winner——推荐配置是各轴 winner
+    # 的组合，当前训练必须与它逐项一致。
+    tuned_values: Dict[str, object] = {}
+    axis_reports = payload.get("axes")
+    if isinstance(axis_reports, list):
+        for axis_report in axis_reports:
+            if not isinstance(axis_report, dict):
+                continue
+            key = str(axis_report.get("protocol_key", ""))
+            axis_winner = axis_report.get("winner")
+            if not key or not isinstance(axis_winner, dict):
+                continue
+            if "value" in axis_winner:
+                tuned_values[key] = axis_winner["value"]
+    if not tuned_values:
+        winner_lr = float(winner.get("lr"))
+        tuned_values = {"lr": winner_lr}
+
+    for key, expected in tuned_values.items():
+        if key == "lr":
+            current: object = lr
+        else:
+            current = (
+                protocol.get(key)
+                if isinstance(protocol, dict)
+                else None
+            )
+        if current is None or not _axis_value_equal(
+            current,
+            expected,
+        ):
+            flag = _axis_cli_flag(key)
+            if key == "lr":
+                return (
+                    f"当前 --lr={format(lr, 'g')} 与调参 winner "
+                    f"lr={format(float(expected), 'g')} 不一致："
+                    "调参来源必须真实复用于基线训练，不能借用"
+                    "调参报告"
+                )
+            return (
+                f"当前 {flag}={_axis_value_text(current)} 与调参"
+                f"报告该轴的 winner {_axis_value_text(expected)} "
+                f"不一致：{flag} 是调参轴，必须真实复用于基线"
+                "训练，不能借用调参报告"
+            )
 
     # 统计功效：调参 winner 是种子噪声的产物时，这条「调过参
     # 的基线」不可信。低功效调参（--allow-underpowered 或
@@ -35131,8 +36256,12 @@ def baseline_tuning_provenance_error(
     # 完整协议逐项核对：warmup / lr_schedule / weight_decay /
     # grad_clip / val/test_fraction / group_separator /
     # eval_batches / amp_dtype 等任何一项不同都说明「最终基线」
-    # 不是在调参时的受控条件下训练的。
+    # 不是在调参时的受控条件下训练的。调参轴自身的取值已在上
+    # 面按各轴 winner 核对过（推荐配置与当前训练必须一致），
+    # 不再与调参时的基线取值比较。
     for key in _BASELINE_TUNING_PROVENANCE_KEYS:
+        if key in tuned_values:
+            continue
         record_value = config.get(key)
         current_value = protocol.get(key)
         if _protocol_value_text(
@@ -35159,6 +36288,19 @@ def baseline_tuning_provenance_record(
     字段），供对比阶段的基线合理性检查核对。
     """
     winner = payload.get("winner") or {}
+    axis_reports = payload.get("axes")
+    axis_winners: Dict[str, object] = {}
+    if isinstance(axis_reports, list):
+        for axis_report in axis_reports:
+            if not isinstance(axis_report, dict):
+                continue
+            axis_winner = axis_report.get("winner")
+            if not isinstance(axis_winner, dict):
+                continue
+            axis_winners[str(axis_report.get("name"))] = (
+                axis_winner.get("value")
+            )
+    recommended = payload.get("recommended_config")
     return {
         "comparison_family": "baseline_tuning",
         "source": str(source),
@@ -35182,6 +36324,17 @@ def baseline_tuning_provenance_record(
         "best_mean_at_grid_boundary": payload.get(
             "best_mean_at_grid_boundary"
         ),
+        # 多轴（坐标式）调参：各轴 winner、组合出的推荐配置，
+        # 以及「该组合是否在网格里被直接评估过」必须落盘——
+        # 未评估过的组合只是各轴结论的拼接，读者据此判断
+        # 「调过参」这个说法的强度。
+        "design": payload.get("design", "single_axis"),
+        "multi_axis": bool(payload.get("multi_axis", False)),
+        "axis_winners": axis_winners,
+        "recommended_config": recommended,
+        "recommended_config_evaluated": payload.get(
+            "recommended_config_evaluated"
+        ),
     }
 
 
@@ -35194,13 +36347,55 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     metric, metric_source = resolve_baseline_tuning_metric(args)
     lrs = list(args.baseline_tuning_lrs)
     seeds = list(args.seeds)
+    dense_hiddens = list(
+        getattr(args, "baseline_tuning_dense_hiddens", None) or []
+    )
+    weight_decays = list(
+        getattr(args, "baseline_tuning_weight_decays", None) or []
+    )
+    mode = args.baseline_tuning_mode
+
+    # dense 的 FFN 宽度只对 dense 模式生效：非 dense 模式上传
+    # 容量轴会得到一串完全相同的运行，白烧算力。
+    if dense_hiddens and mode != "dense":
+        print(
+            "[suite-baseline-tuning] 提示：--baseline-tuning-"
+            "dense-hiddens 只对 dense 模式生效（当前 mode="
+            f"{mode}），该轴已跳过"
+        )
+        dense_hiddens = []
+
+    # 基线配置：坐标式设计里所有候选都相对它只改一个轴。
+    base_lr = float(args.lr)
+    base_weight_decay = float(args.weight_decay)
+    base_dense_hidden = (
+        int(args.dense_fnn_hidden)
+        if args.dense_fnn_hidden is not None
+        else (
+            int(args.top_k) * int(args.expert_hidden)
+            if dense_hiddens
+            else None
+        )
+    )
 
     base_argv = strip_sweep_args(sys.argv[1:])
+    multi_axis = bool(dense_hiddens or weight_decays)
     plan = build_baseline_tuning_plan(
         seeds=seeds,
-        mode=args.baseline_tuning_mode,
+        mode=mode,
         lrs=lrs,
         balance_coef=args.balance_coef,
+        dense_hiddens=dense_hiddens,
+        weight_decays=weight_decays,
+        # 单轴（旧）路径保持原样：只改学习率，其余训练配置全部
+        # 继承命令行；多轴路径才需要显式的基线配置坐标。
+        base_lr=base_lr if multi_axis else None,
+        base_dense_hidden=(
+            base_dense_hidden if multi_axis else None
+        ),
+        base_weight_decay=(
+            base_weight_decay if multi_axis else None
+        ),
     )
 
     out_root = Path(args.out)
@@ -35208,11 +36403,36 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
 
     print(
         "[suite-baseline-tuning] 基线调参：mode="
-        f"{args.baseline_tuning_mode}, 学习率候选="
+        f"{mode}, 学习率候选="
         + ", ".join(format(lr, "g") for lr in lrs)
+        + (
+            ", dense 宽度候选="
+            + ", ".join(str(value) for value in dense_hiddens)
+            if dense_hiddens
+            else ""
+        )
+        + (
+            ", 权重衰减候选="
+            + ", ".join(format(value, "g") for value in weight_decays)
+            if weight_decays
+            else ""
+        )
         + f", seeds={seeds}, 指标={metric}"
         f"（来源={metric_source}, val 选择，test 集不参与）"
     )
+    if multi_axis:
+        print(
+            "[suite-baseline-tuning] 坐标式多轴设计：每个候选"
+            "相对基线配置只改一个轴，其余轴固定在基线值"
+            f"（lr={format(base_lr, 'g')}, "
+            f"weight_decay={format(base_weight_decay, 'g')}"
+            + (
+                f", dense_fnn_hidden={base_dense_hidden}"
+                if base_dense_hidden is not None
+                else ""
+            )
+            + "）"
+        )
     if len(seeds) < _RECOMMENDED_SEEDS:
         print(
             "[suite-baseline-tuning] 提示：调参建议使用 "
@@ -35227,13 +36447,54 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     # 当前对比指标同口径。调参候选只有学习率不同、每步 FLOPs
     # 相同，等计算量点仍由验证曲线共同计算量决定。
     annotate_compute_matched_metrics(rows)
-    report = analyze_baseline_tuning(
-        rows,
-        metric,
-        args.baseline_tuning_mode,
-        lrs,
-        seeds,
-    )
+    if multi_axis:
+        axes = [
+            {
+                "name": "lr",
+                "protocol_key": "lr",
+                "label": "学习率",
+                "values": [float(lr) for lr in lrs],
+                "base_value": base_lr,
+            },
+        ]
+        if dense_hiddens:
+            axes.append({
+                "name": "dense_fnn_hidden",
+                "protocol_key": "dense_fnn_hidden",
+                "label": "dense FFN 隐藏宽度",
+                "values": [int(value) for value in dense_hiddens],
+                "base_value": base_dense_hidden,
+            })
+        if weight_decays:
+            axes.append({
+                "name": "weight_decay",
+                "protocol_key": "weight_decay",
+                "label": "权重衰减",
+                "values": [
+                    float(value) for value in weight_decays
+                ],
+                "base_value": base_weight_decay,
+            })
+        report = analyze_baseline_tuning_axes(
+            rows,
+            metric,
+            mode,
+            axes,
+            seeds,
+            {
+                "lr": base_lr,
+                "dense_fnn_hidden": base_dense_hidden,
+                "weight_decay": base_weight_decay,
+            },
+        )
+    else:
+        report = analyze_baseline_tuning(
+            rows,
+            metric,
+            mode,
+            lrs,
+            seeds,
+        )
     report["metric_source"] = metric_source
     report["seed_plan"] = {
         "seeds": [int(seed) for seed in seeds],
@@ -35258,6 +36519,19 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             "基线调参没有选出 winner（见报告 issues），"
             "不能产出「调过参的基线」；请检查失败原因后重跑"
         )
+
+    if report.get("multi_axis"):
+        missing_axes = [
+            str(axis_report.get("label", axis_report.get("name")))
+            for axis_report in report.get("axes", [])
+            if axis_report.get("winner") is None
+        ]
+        if missing_axes:
+            raise SystemExit(
+                "基线调参在以下轴上没有选出 winner："
+                + ", ".join(missing_axes)
+                + "（见报告 issues），不能产出「调过参的基线」"
+            )
 
 
 def run_experiment_sweep(args: argparse.Namespace) -> None:
@@ -35865,6 +37139,31 @@ def main():
         ),
     )
     parser.add_argument(
+        "--baseline-tuning-dense-hiddens",
+        nargs="+",
+        type=int,
+        default=[],
+        metavar="N",
+        help=(
+            "基线调参的容量轴候选（dense 模式的 FFN 隐藏宽度）："
+            "与学习率轴一起构成坐标式多轴调参——每个候选相对"
+            "基线配置只改一个轴，逐轴判定 winner。只对 dense "
+            "模式生效"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-tuning-weight-decays",
+        nargs="+",
+        type=float,
+        default=[],
+        metavar="WD",
+        help=(
+            "基线调参的正则轴候选（权重衰减）：与学习率/容量轴"
+            "一起构成坐标式多轴调参——每个候选相对基线配置只"
+            "改一个轴，逐轴判定 winner"
+        ),
+    )
+    parser.add_argument(
         "--baseline-tuning-metric",
         type=str,
         default=None,
@@ -36346,6 +37645,43 @@ def main():
             "--suite-baseline-tuning 至少需要两个不同的"
             "学习率候选（--baseline-tuning-lrs），"
             "单档网格不构成调参"
+        )
+    # 多轴（坐标式）调参的轴候选检查：每个轴至少两个不同取值
+    # （单档不算调参），且格式化后不能重名（否则运行目录互相
+    # 覆盖）。
+    for flag, values, formatter in (
+        (
+            "--baseline-tuning-dense-hiddens",
+            list(args.baseline_tuning_dense_hiddens),
+            lambda value: f"h{value}",
+        ),
+        (
+            "--baseline-tuning-weight-decays",
+            list(args.baseline_tuning_weight_decays),
+            lambda value: f"wd{format(value, 'g')}",
+        ),
+    ):
+        if not values:
+            continue
+        if args.suite_baseline_tuning and len(set(values)) < 2:
+            parser.error(
+                f"{flag} 至少需要两个不同的候选，"
+                "单档不算调参"
+            )
+        formatted = [formatter(value) for value in values]
+        if len(set(formatted)) != len(formatted):
+            parser.error(
+                f"{flag} 的候选在输出目录名中格式化后重名："
+                "请改用差异更大的候选，避免调参运行互相覆盖"
+            )
+    if (
+        args.baseline_tuning_dense_hiddens
+        and args.baseline_tuning_mode != "dense"
+    ):
+        parser.error(
+            "--baseline-tuning-dense-hiddens 只对 dense 基线"
+            "生效（--baseline-tuning-mode=dense）：容量轴在其它"
+            "模式下不改变模型，白烧算力"
         )
     if args.baseline_tuning_from is not None:
         if args.suite_baseline_tuning:
