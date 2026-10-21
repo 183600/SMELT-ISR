@@ -22749,6 +22749,7 @@ def baseline_adequacy(
         "ngram_missing": False,
         "ngram_protocol_compatible": None,
         "ngram_protocol_violations": [],
+        "ngram_comparison": None,
         "ngram_tuning_metric_mismatch": [],
         "tuning_parity": None,
         "ok": None,
@@ -23030,6 +23031,116 @@ def baseline_adequacy(
             if not ngram_metric_mismatches
             else "n-gram 统计基线"
         )
+        # 均值差必须连同基线自身的种子噪声一起解读：n-gram 是
+        # 确定性估计（无抽样方差），而基线均值来自 n 个种子；
+        # 单看均值会把种子波动当成「基线强于/弱于统计基线」的
+        # 结论。对差值做单样本 t 检验，并给出当前设计能检出的
+        # MDE 与所需种子数。
+        ngram_comparison: Dict[str, object] = {
+            "metric": metric,
+            "baseline_mode": baseline_mode,
+            "baseline_mean": baseline_mean,
+            "ngram_mean": float(ngram_mean),
+            # 原始差值（基线 - ngram）；方向好坏由
+            # baseline_better 与指标方向共同解释。
+            "delta": baseline_mean - float(ngram_mean),
+            "baseline_better": baseline_better,
+            "n_baseline_runs": len(baseline_rows),
+            "n_baseline_values": len(baseline_values),
+            "baseline_std": _sample_std(baseline_values),
+            "ngram_deterministic": True,
+            "test": None,
+            "p_value": None,
+            "se": None,
+            "df": None,
+            "significant": None,
+            "mde_80": None,
+            "mde_80_relative": None,
+            "seeds_to_detect": None,
+            "advisories": [],
+        }
+        differences = [
+            value - float(ngram_mean)
+            for value in baseline_values
+        ]
+        test = _paired_t_test(differences)
+        ngram_comparison["test"] = test.get("test")
+        for key in ("p_value", "se", "df"):
+            value = test.get(key)
+            if isinstance(value, (int, float)):
+                ngram_comparison[key] = float(value)
+        p_value = ngram_comparison["p_value"]
+        se = ngram_comparison["se"]
+        df = ngram_comparison["df"]
+        if isinstance(p_value, (int, float)):
+            ngram_comparison["significant"] = bool(
+                float(p_value) <= _SIGNIFICANCE_LEVEL
+            )
+        if (
+            isinstance(se, (int, float))
+            and isinstance(df, (int, float))
+            and float(se) > 0.0
+            and float(df) > 0.0
+        ):
+            mde = _minimum_detectable_effect(
+                float(se), float(df)
+            )
+            if mde is not None:
+                ngram_comparison["mde_80"] = mde
+                if abs(float(baseline_mean)) > 0.0:
+                    ngram_comparison["mde_80_relative"] = (
+                        mde / abs(float(baseline_mean))
+                    )
+        if abs(float(ngram_comparison["delta"])) > 0.0:
+            baseline_sd = ngram_comparison["baseline_std"]
+            if isinstance(baseline_sd, (int, float)):
+                seeds_needed = _seeds_to_detect(
+                    float(ngram_comparison["delta"]),
+                    float(baseline_sd),
+                )
+                if seeds_needed is not None:
+                    ngram_comparison["seeds_to_detect"] = (
+                        seeds_needed
+                    )
+        ngram_comparison_advice: List[str] = []
+        if len(baseline_values) < _MIN_SEEDS_FOR_STATS:
+            ngram_comparison_advice.append(
+                f"基线只有 {len(baseline_values)} 个可用种子"
+                f"（建议 ≥{_MIN_SEEDS_FOR_STATS}）：无法核对"
+                "与 n-gram 的差距是否超出基线自身的种子噪声"
+            )
+        elif ngram_comparison["significant"] is False:
+            mde = ngram_comparison["mde_80"]
+            seeds_needed = ngram_comparison["seeds_to_detect"]
+            detail = (
+                f"80% 功效 MDE={float(mde):.4f}"
+                if isinstance(mde, (int, float))
+                else "无法估计 MDE"
+            ) + (
+                f"，约需 {int(seeds_needed)} 个基线种子才能检出"
+                "该差距"
+                if isinstance(seeds_needed, int)
+                else ""
+            )
+            ngram_comparison_advice.append(
+                f"基线 {baseline_mode} 与 n-gram 的 {metric} "
+                f"差距在基线种子噪声内（p="
+                f"{float(ngram_comparison['p_value']):.3f}）："
+                f"{detail}；点估计方向不能当作已确认的结论"
+            )
+        elif ngram_comparison["significant"] is True:
+            ngram_comparison_advice.append(
+                f"基线与 n-gram 的 {metric} 差距超出基线种子"
+                f"噪声（p="
+                f"{float(ngram_comparison['p_value']):.3f}）："
+                "该比较在统计上可分辨（n-gram 为确定性估计，"
+                "其无抽样方差）"
+            )
+        ngram_comparison["advisories"] = (
+            ngram_comparison_advice
+        )
+        report["ngram_comparison"] = ngram_comparison
+        report["advisories"].extend(ngram_comparison_advice)
         if baseline_better:
             report["advisories"].append(
                 f"基线 {baseline_mode}（{baseline_mean:.4f}）"
@@ -38415,6 +38526,93 @@ def run_self_test():
         assert not any(
             "多种子重跑 n-gram" in message
             for message in single_ngram_adequacy["advisories"]
+        )
+        single_comparison = single_ngram_adequacy[
+            "ngram_comparison"
+        ]
+        assert single_comparison is not None
+        assert single_comparison["n_baseline_values"] == 1
+        assert any(
+            "种子噪声" in message
+            for message in single_comparison["advisories"]
+        )
+
+        # 基线 vs n-gram 的均值差必须带基线种子噪声：差距显著
+        # 超出噪声时记录可分辨；落在噪声内时明确「点估计方向
+        # 不能当作已确认结论」，并给出 MDE 与所需种子数。
+        clear_seed2 = _write_analysis_run(
+            "clear_seed2",
+            "smelt",
+            2,
+            3e-4,
+            100,
+            0.01,
+            4.52,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+        )
+        clear_seed3 = _write_analysis_run(
+            "clear_seed3",
+            "smelt",
+            3,
+            3e-4,
+            100,
+            0.01,
+            4.51,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+        )
+        clear_adequacy = baseline_adequacy(
+            compare_runs(
+                [smelt_path, clear_seed2, clear_seed3, ngram_path]
+            ),
+            "smelt",
+            "val_loss",
+        )
+        clear_comparison = clear_adequacy["ngram_comparison"]
+        assert clear_comparison["n_baseline_values"] == 3
+        assert clear_comparison["significant"] is True
+        assert clear_comparison["seeds_to_detect"] is not None
+        assert any(
+            "统计上可分辨" in message
+            for message in clear_comparison["advisories"]
+        )
+        noisy_seed2 = _write_analysis_run(
+            "noisy_seed2",
+            "smelt",
+            2,
+            3e-4,
+            100,
+            0.01,
+            4.80,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+        )
+        noisy_seed3 = _write_analysis_run(
+            "noisy_seed3",
+            "smelt",
+            3,
+            3e-4,
+            100,
+            0.01,
+            4.65,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+        )
+        noisy_adequacy = baseline_adequacy(
+            compare_runs(
+                [smelt_path, noisy_seed2, noisy_seed3, ngram_path]
+            ),
+            "smelt",
+            "val_loss",
+        )
+        noisy_comparison = noisy_adequacy["ngram_comparison"]
+        assert noisy_comparison["significant"] is False
+        assert noisy_comparison["mde_80"] is not None
+        assert noisy_comparison["seeds_to_detect"] is not None
+        assert any(
+            "噪声内" in message
+            for message in noisy_comparison["advisories"]
         )
 
         # 假设登记：有假设的运行按模式汇总，无假设的运行被点名；
