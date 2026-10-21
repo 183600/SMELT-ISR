@@ -6156,6 +6156,93 @@ def enforce_strict_data_audit(
     return False
 
 
+def distribution_shift_violations(
+    report: Dict[str, object],
+    max_byte_js: Optional[float] = None,
+    max_bigram_js: Optional[float] = None,
+    max_conditional_js: Optional[float] = None,
+) -> List[str]:
+    """
+    按显式阈值检查数据审计中的分布偏移指标。
+
+    JS 距离越大表示两个 split 的分布差异越大；阈值只在该
+    flag 被显式设置时生效，默认仍保留「警告但继续」的诊断
+    模式。返回逐对 split 的超阈值说明。
+    """
+    checks = (
+        ("distribution_shift", "字节分布 JS", max_byte_js),
+        (
+            "distribution_shift_bigram",
+            "字节二元组分布 JS",
+            max_bigram_js,
+        ),
+        (
+            "distribution_shift_conditional",
+            "条件标签分布 JS",
+            max_conditional_js,
+        ),
+    )
+    violations: List[str] = []
+
+    for field, label, limit in checks:
+        if limit is None:
+            continue
+        values = report.get(field) or {}
+        if not isinstance(values, dict):
+            continue
+        for pair, value in values.items():
+            if not isinstance(value, (int, float)):
+                continue
+            distance = float(value)
+            if not math.isfinite(distance):
+                continue
+            if distance > float(limit):
+                violations.append(
+                    f"{pair}: {label} = {distance:.4f} "
+                    f"> 阈值 {float(limit):.4f}"
+                )
+
+    return violations
+
+
+def enforce_distribution_shift_gate(
+    report: Dict[str, object],
+    max_byte_js: Optional[float] = None,
+    max_bigram_js: Optional[float] = None,
+    max_conditional_js: Optional[float] = None,
+    context: str = "",
+) -> bool:
+    """
+    分布偏移硬门：显式设置阈值后，超阈值的 train/val（以及
+    解封时的 test）偏移会拒绝继续，而不是只打印警告。
+
+    分布偏移本身不等于数据泄露：它说明训练与评估数据来自
+    不同分布，指标可能包含外推。拒绝继续是为了迫使先检查
+    切分/时间顺序或调整评估口径，避免把外推误差当成方法
+    收益。未设置任何阈值时返回 True。
+    """
+    violations = distribution_shift_violations(
+        report,
+        max_byte_js=max_byte_js,
+        max_bigram_js=max_bigram_js,
+        max_conditional_js=max_conditional_js,
+    )
+    if not violations:
+        return True
+
+    where = f"（{context}）" if context else ""
+    print(f"[data] 分布偏移检查未通过{where}：")
+    for violation in violations:
+        print(f"[data]   偏移: {violation}")
+    print(
+        "[data] 默认拒绝在分布偏移超阈值的数据上继续；"
+        "请检查切分/时间顺序与评估口径，或显式放宽/去掉 "
+        "--max-byte-shift / --max-bigram-shift / "
+        "--max-conditional-shift。"
+    )
+    return False
+
+
 def print_data_audit(report: Dict[str, object]) -> None:
     """打印数据审计摘要与全部警告。"""
     splits = report.get("splits", {})
@@ -28004,6 +28091,38 @@ def run_self_test():
     )
     assert clean_audit["leakage_violations"] == []
     assert enforce_data_leakage_gate(clean_audit)
+    # 分布偏移硬门：未设阈值时只警告；显式阈值后按各口径
+    # 逐对 split 检查，超限即拒绝继续，非有限值不参与。
+    shift_report = {
+        "distribution_shift": {"train_val": 0.12},
+        "distribution_shift_bigram": {"train_val": 0.03},
+        "distribution_shift_conditional": {
+            "train_val": 0.20,
+            "val_test": float("nan"),
+        },
+    }
+    assert distribution_shift_violations(shift_report) == []
+    byte_shift = distribution_shift_violations(
+        shift_report,
+        max_byte_js=0.10,
+    )
+    assert len(byte_shift) == 1
+    assert "train_val" in byte_shift[0]
+    assert distribution_shift_violations(
+        shift_report,
+        max_bigram_js=0.04,
+        max_conditional_js=0.21,
+    ) == []
+    assert enforce_distribution_shift_gate(
+        shift_report,
+        max_byte_js=0.12,
+        max_bigram_js=0.03,
+        max_conditional_js=0.20,
+    )
+    assert not enforce_distribution_shift_gate(
+        shift_report,
+        max_byte_js=0.11,
+    )
     assert all(
         info["shared_chunks"] == 0
         for info in clean_audit["content_chunks"][
@@ -40417,6 +40536,21 @@ def main():
             "（跨 split 重复内容已由默认泄露门拦截）"
         ),
     )
+    for shift_flag, shift_label in (
+        ("--max-byte-shift", "单字节分布 JS"),
+        ("--max-bigram-shift", "字节二元组分布 JS"),
+        ("--max-conditional-shift", "条件标签分布 JS"),
+    ):
+        parser.add_argument(
+            shift_flag,
+            type=float,
+            default=None,
+            metavar="JS",
+            help=(
+                f"分布偏移硬门（0~1）：{shift_label} 超过该值时"
+                "拒绝开始训练/拒绝解封测试集；不设置时只警告"
+            ),
+        )
     parser.add_argument(
         "--allow-data-leakage",
         action="store_true",
@@ -41882,6 +42016,25 @@ def main():
                 f"--group-separator 无效: {error}"
             )
 
+    for shift_flag, shift_value in (
+        ("--max-byte-shift", args.max_byte_shift),
+        ("--max-bigram-shift", args.max_bigram_shift),
+        (
+            "--max-conditional-shift",
+            args.max_conditional_shift,
+        ),
+    ):
+        if shift_value is None:
+            continue
+        if (
+            not math.isfinite(shift_value)
+            or shift_value < 0.0
+            or shift_value > 1.0
+        ):
+            parser.error(
+                f"{shift_flag} 必须是 [0, 1] 内的有限数"
+            )
+
     if args.deduplicate_train_groups and group_separator_bytes is None:
         parser.error(
             "--deduplicate-train-groups 需要 --group-separator："
@@ -42114,6 +42267,27 @@ def main():
             "严格数据审计未通过：请先清洗数据"
             "（去重、修编码、修正群组划分），或去掉 "
             "--strict-data-audit 仅保留警告。"
+        )
+
+    # 分布偏移硬门：阈值显式给出时，train/val 的字节、
+    # 二元组或条件标签分布偏移超限会拒绝训练。默认不设阈值，
+    # 保留审计警告供诊断。
+    data_audit["distribution_shift_gate"] = {
+        "max_byte_js": args.max_byte_shift,
+        "max_bigram_js": args.max_bigram_shift,
+        "max_conditional_js": args.max_conditional_shift,
+    }
+    if not enforce_distribution_shift_gate(
+        data_audit,
+        max_byte_js=args.max_byte_shift,
+        max_bigram_js=args.max_bigram_shift,
+        max_conditional_js=args.max_conditional_shift,
+        context="train/val",
+    ):
+        raise SystemExit(
+            "分布偏移检查未通过：请先检查切分/时间顺序与评估"
+            "口径，或显式放宽/去掉 --max-byte-shift / "
+            "--max-bigram-shift / --max-conditional-shift。"
         )
 
     # 统计基线入口：计数、调优、评估、写盘后直接结束，
@@ -43916,12 +44090,31 @@ def main():
                     "test",
                 )
             )
-            if leakage_blocked or strict_blocked:
+            test_audit["distribution_shift_gate"] = {
+                "max_byte_js": args.max_byte_shift,
+                "max_bigram_js": args.max_bigram_shift,
+                "max_conditional_js": (
+                    args.max_conditional_shift
+                ),
+            }
+            shift_blocked = (
+                not enforce_distribution_shift_gate(
+                    test_audit,
+                    max_byte_js=args.max_byte_shift,
+                    max_bigram_js=args.max_bigram_shift,
+                    max_conditional_js=(
+                        args.max_conditional_shift
+                    ),
+                    context="test",
+                )
+            )
+            if leakage_blocked or strict_blocked or shift_blocked:
                 # 在已泄露/损坏的测试集上报告指标毫无意义，还会
                 # 留下唯一的 test 记录；直接拒绝解封。
                 print(
                     "[test] 数据审计在测试集上发现泄露/"
-                    "损坏问题：为避免在污染数据上产出最终结论，"
+                    "损坏或分布偏移问题：为避免在污染数据上"
+                    "产出最终结论，"
                     "本次拒绝解封测试集（不写入 test 记录，"
                     "名额未消耗）。请先清洗数据后重跑。"
                 )

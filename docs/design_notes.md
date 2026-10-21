@@ -95,6 +95,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   分块与分布审计，`data_audit.effective_bytes` 与
   `config.data.train_cleaning` 记录清洗口径。有群组边界时应使用
   `--drop-train-corrupt-groups` 以保持群组完整。
+- **分布偏移硬门**：`--max-byte-shift` / `--max-bigram-shift` /
+  `--max-conditional-shift` 可把字节、二元组、条件标签 JS 距离
+  变成显式阈值；train/val（解封时含 test）任一对 split 超限即
+  拒绝训练/拒绝解封。默认不设阈值，只保留警告，避免把正常
+  的时序分布变化直接当成错误。
 - **严格审计**：`--strict-data-audit` 把泄露级问题（跨 split 重复
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
