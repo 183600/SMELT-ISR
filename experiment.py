@@ -37871,6 +37871,42 @@ def run_self_test():
         )
         assert axis_by_name["weight_decay"]["winner"]["value"] == 0.2
 
+        collision_axes = [{
+            "name": "weight_decay",
+            "protocol_key": "weight_decay",
+            "label": "权重衰减",
+            "values": [0.1, 0.2],
+            "base_value": 0.1000001,
+        }]
+        collision_rows: List[Dict[str, object]] = []
+        for seed in (42, 43, 44):
+            for value, metric_value in (
+                (0.1000001, 4.0),
+                (0.1, 3.9),
+                (0.2, 3.8),
+            ):
+                collision_rows.append({
+                    "run": f"collision_wd{value}_seed{seed}",
+                    "seed": seed,
+                    "val_loss": metric_value,
+                    "protocol": {"weight_decay": value},
+                })
+        collision_report = analyze_baseline_tuning_axes(
+            collision_rows,
+            "val_loss",
+            "dense",
+            collision_axes,
+            [42, 43, 44],
+            {"weight_decay": 0.1000001},
+        )
+        collision_alignment = collision_report["axes"][0][
+            "seed_alignment"
+        ]
+        assert collision_alignment["aligned"] is True, (
+            collision_alignment
+        )
+        assert len(collision_alignment["candidate_seed_sets"]) == 3
+
         # 调参来源：当前训练必须与推荐配置逐轴一致，否则拒绝
         # 借用调参报告。
         multi_protocol = dict(multi_report["training_config"])
@@ -40299,11 +40335,12 @@ def _axis_value_sort_key(value: object) -> Tuple[int, float, str]:
 
 def _axis_value_text(value: object) -> str:
     """轴取值的可读文本（错误消息与表格用）。"""
-    if (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-    ):
-        return format(float(value), "g")
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
     return str(value)
 
 
