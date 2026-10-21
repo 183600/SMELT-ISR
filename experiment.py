@@ -19506,8 +19506,12 @@ def factor_contrasts(
             differing = [
                 name
                 for name in group_keys
-                if cell_a["keys"].get(name)
-                != cell_b["keys"].get(name)
+                if _stable_factor_key(
+                    cell_a["keys"].get(name)
+                )
+                != _stable_factor_key(
+                    cell_b["keys"].get(name)
+                )
             ]
 
             if not differing:
@@ -34182,6 +34186,36 @@ def run_self_test():
             "重复随机种子"
             in _contrast_display(duplicate_contrast, "val_loss")
         )
+
+        # 聚合分桶使用 _stable_factor_key（bool 与数值不相等），
+        # 单因子对比的 differing 也必须用同一口径；否则 True 与
+        # 1 会被当成同一取值，两个实际分开的单元静默跳过检验。
+        canonical_factor_rows = [
+            {
+                "run": "flag_true",
+                "flag": True,
+                "seed": 1,
+                "val_loss": 2.0,
+            },
+            {
+                "run": "flag_one",
+                "flag": 1,
+                "seed": 1,
+                "val_loss": 1.0,
+            },
+        ]
+        canonical_factor_contrasts = factor_contrasts(
+            aggregate_runs(
+                canonical_factor_rows,
+                ["flag"],
+            ),
+            ["flag"],
+            "val_loss",
+        )
+        assert len(canonical_factor_contrasts) == 1
+        assert canonical_factor_contrasts[0][
+            "differing_factors"
+        ] == ["flag"]
 
         # 覆盖检查的展示层（print_comparison_analysis）也必须
         # 把伪重复单元列进结构化结果，不能只在检验内部悄悄处理。
