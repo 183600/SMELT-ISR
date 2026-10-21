@@ -15243,6 +15243,8 @@ _REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
     "cublas_workspace_config",
     "allow_tf32_matmul",
     "allow_tf32_cudnn",
+    "allow_fp16_reduced_precision_reduction",
+    "allow_bf16_reduced_precision_reduction",
 )
 
 # 信息性字段：允许不同，只提示（同一脚本指纹下的 git commit
@@ -26081,6 +26083,18 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
             if hasattr(torch, "get_float32_matmul_precision")
             else None
         ),
+        # fp16/bf16 的归约精度开关同样改变 GPU 数值结果；
+        # 默认值随 torch 版本变化，记录实际生效值供跨运行核对。
+        "allow_fp16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul,
+            "allow_fp16_reduced_precision_reduction",
+            None,
+        ),
+        "allow_bf16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul,
+            "allow_bf16_reduced_precision_reduction",
+            None,
+        ),
         # CPU 并行归约顺序可能随线程数变化；即使未显式固定，
         # 也要记录当时实际生效的线程环境，供复现/对比追溯。
         "torch_num_threads": torch.get_num_threads(),
@@ -30142,6 +30156,8 @@ def run_self_test():
     assert "allow_tf32_matmul" in metadata
     assert "allow_tf32_cudnn" in metadata
     assert "float32_matmul_precision" in metadata
+    assert "allow_fp16_reduced_precision_reduction" in metadata
+    assert "allow_bf16_reduced_precision_reduction" in metadata
     assert metadata["cwd"] == os.getcwd()
     assert metadata["python_executable"] == sys.executable
     assert "cuda_visible_devices" in metadata
