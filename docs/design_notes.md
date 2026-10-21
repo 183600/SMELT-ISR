@@ -183,7 +183,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   百分位 95% 置信区间；种子由数据指纹、split、窗口数与
   窗口长度派生，确定性可复现，且不扰动训练/数据 RNG。
   置信区间回答「换一批同分布评估窗口，点估计会漂多少」，
-  与跨种子 t 检验（回答「换训练种子」）互补。同时记录
+  与跨种子 t 检验（回答「换训练种子」）互补。退化重采样
+  （例如 macro F1 抽到的窗口没有任何 support）会产生 NaN；
+  区间只用有限重采样估计，并记录 `<metric>_bootstrap_degenerate`
+  次数，避免整个分位区间被 NaN 污染。同时记录
   `eval_windows` 与 `eval_window_overlap_fraction`：窗口重叠
   时 bootstrap 的重采样单位并不独立，区间会偏窄，读者不能
   把重叠窗口的区间当作独立样本精度。窗口不重叠时也检测

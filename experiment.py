@@ -6911,9 +6911,16 @@ def _bootstrap_eval_intervals(
         ("token_accuracy", sampled_accuracy),
         ("macro_f1", sampled_macro_f1),
     ):
-        if not bool(torch.isfinite(values).any()):
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
             continue
-        low, high = _percentile_interval(values, ci_level)
+        # 退化重采样（如 macro F1 抽到的窗口没有任何 support）
+        # 会产生 NaN；直接对含 NaN 的张量取分位数会让整个区间
+        # 变成 NaN。只用有限重采样估计区间，并显式记录退化数。
+        degenerate = int(values.numel() - finite.numel())
+        if degenerate > 0:
+            result[f"{name}_bootstrap_degenerate"] = degenerate
+        low, high = _percentile_interval(finite, ci_level)
         if inflation > 1.0:
             midpoint = (low + high) / 2.0
             half_width = (high - low) / 2.0 * inflation
@@ -32591,6 +32598,36 @@ def run_self_test():
     )
     assert abs(float(perfect_boot["macro_f1_ci95_low"]) - 1.0) < 1e-12
     assert abs(float(perfect_boot["macro_f1_ci95_high"]) - 1.0) < 1e-12
+
+    # 退化重采样（抽到的窗口没有任何 support）会让 macro F1
+    # 变成 NaN；区间必须只基于有限重采样计算，不能整体变成
+    # NaN，同时要显式记录退化次数。
+    degenerate_support = perfect_support.clone()
+    degenerate_support[:5] = 0
+    degenerate_boot = _bootstrap_eval_intervals(
+        loss_totals,
+        token_totals,
+        perfect_tp,
+        perfect_predicted,
+        degenerate_support,
+        replicates=300,
+        seed=17,
+    )
+    assert "macro_f1_ci95_low" in degenerate_boot
+    assert math.isfinite(
+        float(degenerate_boot["macro_f1_ci95_low"])
+    )
+    assert math.isfinite(
+        float(degenerate_boot["macro_f1_ci95_high"])
+    )
+    assert (
+        int(degenerate_boot["macro_f1_bootstrap_degenerate"])
+        > 0
+    )
+    assert (
+        int(degenerate_boot["macro_f1_bootstrap_degenerate"])
+        <= 300
+    )
 
     # ---- 评估窗口自相关：bootstrap 区间按 AR(1) 放宽 ----
     # 沿序列单调上升的窗口 loss 是强正自相关（ρ̂1 高），
