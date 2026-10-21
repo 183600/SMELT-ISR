@@ -16553,6 +16553,7 @@ def paired_window_comparison(
     loss_differences: List[float] = []
     accuracy_differences: List[float] = []
     invalid_loss_windows: List[int] = []
+    invalid_accuracy_windows: List[int] = []
     for index, (window_a, window_b) in enumerate(
         zip(windows_a, windows_b)
     ):
@@ -16570,6 +16571,8 @@ def paired_window_comparison(
         accuracy_b = _window_accuracy(window_b)
         if accuracy_a is not None and accuracy_b is not None:
             accuracy_differences.append(accuracy_b - accuracy_a)
+        else:
+            invalid_accuracy_windows.append(index)
 
     if invalid_loss_windows:
         return {
@@ -16617,9 +16620,29 @@ def paired_window_comparison(
         "overlap_fraction": payload_a.get("overlap_fraction"),
         "bootstrap_ci95": bootstrap,
     }
-    if accuracy_differences:
+    if invalid_accuracy_windows:
+        # 准确率只是附加口径：损失窗口完整时仍可比较损失，
+        # 但不能把「剩余窗口」的准确率均值伪装成全部窗口的
+        # 配对结果。与损失侧一样拒绝选择性缩小样本，并显式
+        # 记录哪些窗口无法配对。
+        result["accuracy_status"] = "missing_windows"
+        result["invalid_accuracy_window_indices"] = (
+            invalid_accuracy_windows
+        )
+        result["accuracy_unavailable_reason"] = (
+            "窗口记录缺少有效准确率（窗口下标："
+            + ", ".join(
+                str(index) for index in invalid_accuracy_windows
+            )
+            + "）：不能只对剩余窗口计算准确率配对"
+        )
+    elif accuracy_differences:
         accuracy_mean = (
             sum(accuracy_differences) / len(accuracy_differences)
+        )
+        result["accuracy_status"] = "ok"
+        result["n_accuracy_windows"] = len(
+            accuracy_differences
         )
         result["mean_accuracy_diff"] = accuracy_mean
         result["fraction_variant_more_accurate"] = (
@@ -32144,6 +32167,8 @@ def run_self_test():
         window_per_seed = window_paired["per_seed"][0]
         assert window_per_seed["status"] == "ok"
         assert window_per_seed["n_windows"] == 4
+        assert window_per_seed["accuracy_status"] == "ok"
+        assert window_per_seed["n_accuracy_windows"] == 4
         assert window_per_seed["fraction_variant_better"] == (
             1.0 if expected_window_diff < 0.0 else 0.0
         )
@@ -32200,6 +32225,30 @@ def run_self_test():
             1,
         ]
         assert "不能只对剩余窗口" in invalid_window_result["reason"]
+
+        # 准确率窗口缺失同样不能静默缩小配对样本：损失完整时
+        # 仍报告损失对比，但准确率必须标为不可用并列出下标。
+        invalid_accuracy_b = _window_payload(
+            "deadbeef", [3.0, 3.1, 3.2]
+        )
+        invalid_accuracy_b["windows"][2].pop("correct")
+        invalid_accuracy_result = paired_window_comparison(
+            _window_payload("deadbeef", [4.0, 4.1, 4.2]),
+            invalid_accuracy_b,
+        )
+        assert invalid_accuracy_result["status"] == "ok"
+        assert invalid_accuracy_result["n_windows"] == 3
+        assert (
+            invalid_accuracy_result["accuracy_status"]
+            == "missing_windows"
+        )
+        assert invalid_accuracy_result[
+            "invalid_accuracy_window_indices"
+        ] == [2]
+        assert "mean_accuracy_diff" not in invalid_accuracy_result
+        assert "不能只对剩余窗口" in invalid_accuracy_result[
+            "accuracy_unavailable_reason"
+        ]
 
         # 没有窗口记录时（旧运行）必须显式说明不可用，不能静默
         # 当成「没有差异」。
