@@ -21,7 +21,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -9816,6 +9816,70 @@ _BAD_CASE_CATEGORIES: Tuple[str, ...] = (
     "uncertain",
 )
 
+# 逐 token 错误率的上下文位置分层：自回归模型在序列开头的
+# 有效上下文最短，错误率若显著高于后段，改进方向应是位置/
+# 前缀建模而不是继续堆参数。区间为 [lower, upper)。
+_BAD_CASE_POSITION_BUCKETS: Tuple[
+    Tuple[str, int, Optional[int]], ...
+] = (
+    ("position_0", 0, 1),
+    ("position_1_3", 1, 4),
+    ("position_4_7", 4, 8),
+    ("position_8_15", 8, 16),
+    ("position_16_31", 16, 32),
+    ("position_32_plus", 32, None),
+)
+
+# 按目标字节在训练集中的频率分层：稀有目标的错误占比高，
+# 说明问题在数据不平衡/覆盖不足；高频目标错误率高则更像
+# 模型盲区。区间为 [lower, upper)，share 是训练集中该字节
+# 的 token 占比。
+_BAD_CASE_FREQUENCY_BUCKETS: Tuple[
+    Tuple[str, float, Optional[float]], ...
+] = (
+    ("train_share_lt_0.1pct", 0.0, 0.001),
+    ("train_share_0.1pct_to_1pct", 0.001, 0.01),
+    ("train_share_1pct_to_5pct", 0.01, 0.05),
+    ("train_share_ge_5pct", 0.05, None),
+)
+
+
+def _stratified_error_rows(
+    values: torch.Tensor,
+    wrong_mask: torch.Tensor,
+    buckets: Sequence[Tuple[str, object, Optional[object]]],
+    total_wrong: int,
+) -> List[Dict[str, object]]:
+    """
+    按一维分组变量统计 token 数、错误数与错误率。
+
+    ``values`` 与 ``wrong_mask`` 逐 token 对齐；只返回实际出现
+    过的分组（空分组不写入报告），避免短序列下大量零计数桶
+    淹没信息。``share_of_errors`` 是该组错误占全部错误的比例，
+    用于回答「错误主要集中在哪一类 token」。
+    """
+    rows: List[Dict[str, object]] = []
+    for name, lower, upper in buckets:
+        mask = values >= lower
+        if upper is not None:
+            mask = mask & (values < upper)
+        tokens = int(mask.sum().item())
+        if tokens <= 0:
+            continue
+        wrong = int((mask & wrong_mask).sum().item())
+        rows.append({
+            "name": name,
+            "tokens": tokens,
+            "wrong": wrong,
+            "error_rate": round(wrong / tokens, 6),
+            "share_of_errors": (
+                round(wrong / total_wrong, 6)
+                if total_wrong > 0
+                else None
+            ),
+        })
+    return rows
+
 
 def _render_byte(value: int) -> str:
     """把单个字节渲染为可打印文本（不可打印字节用 \\xNN）。"""
@@ -10020,6 +10084,9 @@ def _empty_bad_case_report(
         "top_cases": [],
         "top_confusions": [],
         "error_rate_by_target": [],
+        "error_rate_by_position": [],
+        "error_rate_by_train_frequency": [],
+        "error_frequency_basis": None,
         "category_counts": {},
         "error_category_counts": {
             name: 0 for name in _BAD_CASE_CATEGORIES
@@ -10107,6 +10174,37 @@ def _bad_case_report_from_buffers(
             train_target_share = (
                 train_target_counts / float(train_tokens)
             )
+
+    # 错误归因的两个关键分层：位置与目标频率。它们把
+    # 「模型错在哪些 token」从个例提升为可行动的分布结论：
+    # 开头位置错误率高指向前缀/位置建模，稀有目标错误占比高
+    # 指向数据覆盖或重采样，高频目标错误率高才更像模型盲区。
+    total_wrong = int(wrong_mask.sum().item())
+    error_rate_by_position: List[Dict[str, object]] = []
+    if dataset is not None and int(dataset.seq_len) > 1:
+        positions = (
+            torch.arange(num_tokens)
+            % int(dataset.seq_len)
+        )
+        error_rate_by_position = _stratified_error_rows(
+            positions,
+            wrong_mask,
+            _BAD_CASE_POSITION_BUCKETS,
+            total_wrong,
+        )
+
+    if train_target_share is not None:
+        frequency_values = train_target_share[target_all]
+        frequency_basis = "train_target_share"
+    else:
+        frequency_values = target_share[target_all]
+        frequency_basis = "eval_target_share"
+    error_rate_by_frequency = _stratified_error_rows(
+        frequency_values,
+        wrong_mask,
+        _BAD_CASE_FREQUENCY_BUCKETS,
+        total_wrong,
+    )
 
     # 标签噪声核验：只对 top-N 候选做训练集上下文查找，避免为
     # 全量错误 token 建索引；这些候选正是报告里被人工复核的
@@ -10494,6 +10592,11 @@ def _bad_case_report_from_buffers(
         "top_cases": top_cases,
         "top_confusions": top_confusions,
         "error_rate_by_target": error_rate_by_target,
+        "error_rate_by_position": error_rate_by_position,
+        "error_rate_by_train_frequency": (
+            error_rate_by_frequency
+        ),
+        "error_frequency_basis": frequency_basis,
         "category_counts": category_counts,
         "error_category_counts": error_category_counts,
         "error_category_shares": error_category_shares,
@@ -11075,6 +11178,36 @@ def print_bad_cases(report: Dict[str, object]) -> None:
             ][:5]
         )
         print(f"[bad-case] 高频混淆对: {pairs}")
+
+    def _stratified_text(rows) -> str:
+        return " ".join(
+            f"{row['name']}="
+            f"{float(row['error_rate']) * 100:.1f}%"
+            f"({row['wrong']}/{row['tokens']})"
+            for row in rows
+        )
+
+    position_rows = report.get("error_rate_by_position")
+    if position_rows:
+        print(
+            "[bad-case] 按序列位置错误率: "
+            + _stratified_text(position_rows)
+        )
+
+    frequency_rows = report.get(
+        "error_rate_by_train_frequency"
+    )
+    if frequency_rows:
+        basis = report.get("error_frequency_basis")
+        basis_text = (
+            "训练集目标占比"
+            if basis == "train_target_share"
+            else "评估集目标占比"
+        )
+        print(
+            f"[bad-case] 按目标频率错误率（{basis_text}）: "
+            + _stratified_text(frequency_rows)
+        )
 
     if report.get("category_counts"):
         print(
@@ -29290,6 +29423,95 @@ def run_self_test():
     )
     # 错误率分母必须与 evaluate 评估的 token 数一致（全量）。
     assert bad_case_report["tokens_evaluated"] >= 1
+
+    # 位置/频率分层必须覆盖全部评估 token，错误计数与总错误
+    # 一致；这是把坏案例从个例变成「改进方向」的聚合证据。
+    position_rows = bad_case_report[
+        "error_rate_by_position"
+    ]
+    frequency_rows = bad_case_report[
+        "error_rate_by_train_frequency"
+    ]
+    if position_rows:
+        assert sum(
+            int(row["tokens"]) for row in position_rows
+        ) == int(bad_case_report["tokens_evaluated"])
+        assert sum(
+            int(row["wrong"]) for row in position_rows
+        ) == int(bad_case_report["wrong_tokens"])
+        for row in position_rows:
+            assert 0.0 <= float(row["error_rate"]) <= 1.0
+    if frequency_rows:
+        assert sum(
+            int(row["tokens"]) for row in frequency_rows
+        ) == int(bad_case_report["tokens_evaluated"])
+        assert sum(
+            int(row["wrong"]) for row in frequency_rows
+        ) == int(bad_case_report["wrong_tokens"])
+        assert bad_case_report["error_frequency_basis"] in (
+            "train_target_share",
+            "eval_target_share",
+        )
+
+    # 分层公式定向测试：固定 8 个 token、seq_len=4，错误只落在
+    # position 1 与 3，两个错误目标都在训练集中占 0.1%。位置桶
+    # 必须给出 6 个 token / 2 个错误，频率桶必须把目标 1 归入
+    # [0.1%, 1%) 区间。
+    class _FakeBadCaseDataset:
+        seq_len = 4
+        effective_train_bytes = 1000
+
+        @staticmethod
+        def effective_train_byte_counts() -> torch.Tensor:
+            counts = torch.zeros(256, dtype=torch.int64)
+            counts[0] = 999
+            counts[1] = 1
+            return counts
+
+    stratified_probe = _bad_case_report_from_buffers(
+        torch.zeros(8),
+        torch.tensor(
+            [0, 0, 1, 1, 0, 1, 0, 1],
+            dtype=torch.uint8,
+        ),
+        torch.tensor(
+            [0, 0, 1, 0, 0, 0, 0, 1],
+            dtype=torch.int16,
+        ),
+        torch.full((8,), 0.9),
+        torch.zeros(8),
+        8,
+        [],
+        "val",
+        0,
+        16,
+        8,
+        256,
+        dataset=_FakeBadCaseDataset(),
+    )
+    assert stratified_probe["wrong_tokens"] == 2
+    position_bucket = next(
+        row
+        for row in stratified_probe["error_rate_by_position"]
+        if row["name"] == "position_1_3"
+    )
+    assert position_bucket["tokens"] == 6, position_bucket
+    assert position_bucket["wrong"] == 2, position_bucket
+    assert abs(
+        float(position_bucket["error_rate"]) - 2.0 / 6.0
+    ) < 1e-6, position_bucket
+    rare_bucket = next(
+        row
+        for row in stratified_probe[
+            "error_rate_by_train_frequency"
+        ]
+        if row["name"] == "train_share_0.1pct_to_1pct"
+    )
+    assert rare_bucket["tokens"] == 4, rare_bucket
+    assert rare_bucket["wrong"] == 2, rare_bucket
+    assert stratified_probe["error_frequency_basis"] == (
+        "train_target_share"
+    )
 
     # 效率测量：参数量与模型一致，各测量值有效或明确不可用。
     efficiency_model = LanguageModel(
