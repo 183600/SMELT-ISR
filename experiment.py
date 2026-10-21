@@ -14999,7 +14999,15 @@ def measure_efficiency(
             else None
         ),
         "inference_peak_memory_mb": inference_peak_mb,
+        # 该值只覆盖前向+反向的合成训练步，不含优化器状态
+        # （AdamW 一阶/二阶矩）与参数更新；真实训练循环的峰值
+        # 另由 actual_training_peak_memory_mb 记录，跨运行
+        # 对比优先使用后者。
         "training_peak_memory_mb": training_peak_mb,
+        "training_peak_memory_note": (
+            "前向+反向合成步峰值；不含优化器状态/更新，"
+            "真实训练峰值见 actual_training_peak_memory_mb"
+        ),
         "process_peak_rss_mb": _process_peak_rss_mb(),
         "batch_size": int(batch_size),
         "seq_len": int(x.size(1)),
@@ -15061,8 +15069,10 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
         "[efficiency] "
         f"inference_peak="
         f"{_format(efficiency.get('inference_peak_memory_mb'), 'MB')} | "
-        f"training_peak="
+        f"fwd_bwd_peak="
         f"{_format(efficiency.get('training_peak_memory_mb'), 'MB')} | "
+        f"actual_train_peak="
+        f"{_format(efficiency.get('actual_training_peak_memory_mb'), 'MB')} | "
         f"process_peak_rss="
         f"{_format(efficiency.get('process_peak_rss_mb'), 'MB')}"
     )
@@ -16376,11 +16386,24 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["flops_per_forward"] = efficiency.get(
             "flops_per_forward"
         )
+        row["training_peak_memory_mb"] = efficiency.get(
+            "training_peak_memory_mb"
+        )
+        row["actual_training_peak_memory_mb"] = (
+            efficiency.get("actual_training_peak_memory_mb")
+        )
+        # 优先用真实训练循环峰值（含优化器状态）；旧运行没有
+        # 该字段时才退回合成前向+反向峰值，最后才用进程 RSS。
         row["peak_memory_mb"] = (
-            efficiency.get("training_peak_memory_mb")
-            if efficiency.get("training_peak_memory_mb")
+            row["actual_training_peak_memory_mb"]
+            if row["actual_training_peak_memory_mb"]
             is not None
-            else efficiency.get("process_peak_rss_mb")
+            else (
+                efficiency.get("training_peak_memory_mb")
+                if efficiency.get("training_peak_memory_mb")
+                is not None
+                else efficiency.get("process_peak_rss_mb")
+            )
         )
 
         records = read_metrics_records(
@@ -34302,6 +34325,9 @@ def run_self_test():
     # 训练步计时（前向+反向）必须为正。
     assert efficiency["training_ms_per_step"] is not None
     assert float(efficiency["training_ms_per_step"]) > 0.0
+    assert "不含优化器状态" in efficiency[
+        "training_peak_memory_note"
+    ]
 
     # 效率测量必须给出分布与尾部，而不是只有一个中位数；
     # p95/p99 不得低于中位数，样本数必须与 iters 一致。
@@ -41471,6 +41497,26 @@ def run_self_test():
         base_costs = by_cost_label["mode=local_base"]["costs"]
         assert base_costs["flops_per_forward"]["mean"] == 1e9
 
+        # 真实训练峰值（含优化器状态）必须优先于合成前向+反向
+        # 峰值进入跨运行成本口径。
+        peak_config_path = (
+            Path(cost_paths[0]) / "config.json"
+        )
+        peak_config = json.loads(
+            peak_config_path.read_text(encoding="utf-8")
+        )
+        peak_config["efficiency"][
+            "actual_training_peak_memory_mb"
+        ] = 777.0
+        peak_config_path.write_text(
+            json.dumps(peak_config), encoding="utf-8"
+        )
+        peak_row = compare_runs([cost_paths[0]])[0]
+        assert peak_row["peak_memory_mb"] == 777.0
+        assert (
+            peak_row["training_peak_memory_mb"] == 100.0
+        )
+
         cost_contrasts = factor_contrasts(
             cost_aggregates,
             ["mode"],
@@ -47821,6 +47867,37 @@ def main():
     nan_diagnosis: Optional[Dict[str, object]] = None
     nan_record_pending = False
 
+    # 真实训练循环的显存峰值：measure_efficiency 的
+    # training_peak_memory_mb 只跑前向+反向，不含 AdamW 的
+    # 优化器状态与参数更新，会系统性低估真实训练占用。
+    # resume 时从检查点继承此前峰值，取本段与历史的最大值，
+    # 避免续跑把原运行的峰值洗掉。
+    prior_training_peak_mb: Optional[float] = None
+    saved_peak = saved_numerical_state.get(
+        "training_peak_memory_mb"
+    )
+    if (
+        isinstance(saved_peak, (int, float))
+        and not isinstance(saved_peak, bool)
+        and math.isfinite(float(saved_peak))
+        and float(saved_peak) >= 0.0
+    ):
+        prior_training_peak_mb = float(saved_peak)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    def _current_training_peak_mb() -> Optional[float]:
+        peaks = []
+        if prior_training_peak_mb is not None:
+            peaks.append(prior_training_peak_mb)
+        if device.type == "cuda":
+            peaks.append(
+                torch.cuda.max_memory_allocated(device) / 1e6
+            )
+        if not peaks:
+            return None
+        return round(max(peaks), 3)
+
     def checkpoint_numerical_state() -> Dict[str, object]:
         """当前数值状态随检查点存档，供 resume 与审计读取。"""
         return {
@@ -47832,6 +47909,9 @@ def main():
             "numerical_polluted": bool(numerical_polluted),
             "prior_numerical_stop": bool(prior_numerical_stop),
             "nan_diagnosis": nan_diagnosis,
+            "training_peak_memory_mb": (
+                _current_training_peak_mb()
+            ),
         }
 
     # metrics_file 在整个训练期间持续打开。
@@ -48308,6 +48388,11 @@ def main():
     # 先把暂存的逐步记录落盘，保持文件内 step 顺序。
     flush_records()
 
+    # 训练循环结束时的真实显存峰值（含优化器状态/更新）。
+    # 必须在最终评估与 test 解封之前读取，避免把评估期分配
+    # 混进训练成本。
+    actual_training_peak_mb = _current_training_peak_mb()
+
     # 结尾存档的 step 取优化器真实前进到的步数：正常结束时等于
     # args.steps，早停时等于提前结束的步数；循环未执行时
     # （start_step >= args.steps）取 start_step。
@@ -48729,6 +48814,14 @@ def main():
             args.batch_size,
             amp_dtype=amp_dtype,
         )
+        if actual_training_peak_mb is not None:
+            efficiency["actual_training_peak_memory_mb"] = (
+                actual_training_peak_mb
+            )
+            efficiency["actual_training_peak_note"] = (
+                "训练循环真实峰值（含优化器状态与参数更新；"
+                "resume 时取历史与本段的最大值）"
+            )
         update_run_config(out_dir, "efficiency", efficiency)
         metrics_file.write(
             json.dumps(
