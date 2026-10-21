@@ -17634,9 +17634,14 @@ def paired_window_comparison(
 
 def _cell_window_payloads_by_seed(
     cell: Dict[str, object],
-) -> Dict[int, Dict[str, object]]:
-    """实验单元内「种子 → 逐窗口评估记录」的映射。"""
+) -> Tuple[Dict[int, Dict[str, object]], List[int]]:
+    """
+    实验单元内「种子 → 逐窗口评估记录」的映射，以及该单元内
+    出现多次的随机种子。重复种子不能静默只取第一份运行时
+    记录做窗口配对。
+    """
     by_seed: Dict[int, Dict[str, object]] = {}
+    duplicate_seeds: set = set()
     for entry in cell.get("window_payloads", []) or []:
         if not isinstance(entry, dict):
             continue
@@ -17646,8 +17651,12 @@ def _cell_window_payloads_by_seed(
             continue
         if not isinstance(payload, dict):
             continue
-        by_seed.setdefault(int(seed), payload)
-    return by_seed
+        value = int(seed)
+        if value in by_seed:
+            duplicate_seeds.add(value)
+        else:
+            by_seed[value] = payload
+    return by_seed, sorted(duplicate_seeds)
 
 
 def _cell_window_paired_analysis(
@@ -17661,8 +17670,16 @@ def _cell_window_paired_analysis(
     可以按窗口配对；跨 seed 汇总时给出每个 seed 的窗口级差异与
     方向一致性，避免把不同 seed 的窗口混成一个假的大样本。
     """
-    payloads_a = _cell_window_payloads_by_seed(cell_a)
-    payloads_b = _cell_window_payloads_by_seed(cell_b)
+    payloads_a, duplicate_a = _cell_window_payloads_by_seed(
+        cell_a
+    )
+    payloads_b, duplicate_b = _cell_window_payloads_by_seed(
+        cell_b
+    )
+    duplicate_seeds = sorted(set(duplicate_a) | set(duplicate_b))
+    for seed in duplicate_seeds:
+        payloads_a.pop(seed, None)
+        payloads_b.pop(seed, None)
     common_seeds = sorted(set(payloads_a) & set(payloads_b))
 
     if not payloads_a and not payloads_b:
@@ -17671,7 +17688,15 @@ def _cell_window_paired_analysis(
             "reason": (
                 "没有逐窗口评估记录（运行由旧版本产生或未落盘）："
                 "无法给出窗口级配对证据"
+                if not duplicate_seeds
+                else "实验单元内存在重复随机种子（"
+                + ", ".join(
+                    str(seed) for seed in duplicate_seeds
+                )
+                + "），剔除后没有可唯一确定运行归属的逐窗口记录："
+                "无法给出窗口级配对证据"
             ),
+            "duplicate_seeds_excluded": duplicate_seeds,
         }
     if not common_seeds:
         return {
@@ -17679,7 +17704,17 @@ def _cell_window_paired_analysis(
             "reason": (
                 "两个实验单元没有共同的随机种子：无法按 seed 配对"
                 "逐窗口记录"
+                + (
+                    "（重复随机种子 "
+                    + ", ".join(
+                        str(seed) for seed in duplicate_seeds
+                    )
+                    + " 已剔除）"
+                    if duplicate_seeds
+                    else ""
+                )
             ),
+            "duplicate_seeds_excluded": duplicate_seeds,
         }
 
     per_seed: List[Dict[str, object]] = []
@@ -17705,6 +17740,7 @@ def _cell_window_paired_analysis(
                 )
             ),
             "per_seed": per_seed,
+            "duplicate_seeds_excluded": duplicate_seeds,
         }
 
     mean_diffs = [
@@ -17726,6 +17762,13 @@ def _cell_window_paired_analysis(
             "单位，窗口级原始 p 值偏小；已另给 AR(1) 有效窗口"
             "校正 p 值，训练随机性仍由种子级检验覆盖"
         )
+    if duplicate_seeds:
+        notes.append(
+            "同一实验单元内出现重复随机种子（"
+            + ", ".join(str(seed) for seed in duplicate_seeds)
+            + "）：这些种子的运行归属不唯一，已从窗口级配对中"
+            "剔除；种子级检验同样禁用配对"
+        )
     notes.append(
         "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
     )
@@ -17745,6 +17788,7 @@ def _cell_window_paired_analysis(
         "direction_consistent": bool(
             favoring == 0 or against == 0
         ),
+        "duplicate_seeds_excluded": duplicate_seeds,
         "notes": notes,
     }
 
@@ -34252,6 +34296,81 @@ def run_self_test():
         assert "[window]" in _format_window_paired(
             window_contrasts[0]
         )
+
+        duplicate_window_cell_a = {
+            "window_payloads": [
+                {
+                    "seed": 42,
+                    "run": "dup_a42_first",
+                    "payload": _window_payload(
+                        "deadbeef", [4.0, 4.1, 4.2, 3.9]
+                    ),
+                },
+                {
+                    "seed": 42,
+                    "run": "dup_a42_second",
+                    "payload": _window_payload(
+                        "deadbeef", [9.0, 9.0, 9.0, 9.0]
+                    ),
+                },
+                {
+                    "seed": 43,
+                    "run": "dup_a43",
+                    "payload": _window_payload(
+                        "deadbeef", [4.2, 4.3, 4.4, 4.1]
+                    ),
+                },
+            ],
+        }
+        duplicate_window_cell_b = {
+            "window_payloads": [
+                {
+                    "seed": 42,
+                    "run": "dup_b42_first",
+                    "payload": _window_payload(
+                        "deadbeef", [3.5, 3.6, 3.7, 3.4]
+                    ),
+                },
+                {
+                    "seed": 42,
+                    "run": "dup_b42_second",
+                    "payload": _window_payload(
+                        "deadbeef", [0.5, 0.5, 0.5, 0.5]
+                    ),
+                },
+                {
+                    "seed": 43,
+                    "run": "dup_b43",
+                    "payload": _window_payload(
+                        "deadbeef", [3.7, 3.8, 3.9, 3.6]
+                    ),
+                },
+            ],
+        }
+        duplicate_window = _cell_window_paired_analysis(
+            duplicate_window_cell_a,
+            duplicate_window_cell_b,
+        )
+        assert duplicate_window["available"] is True
+        assert duplicate_window["duplicate_seeds_excluded"] == [42]
+        assert [
+            entry["seed"]
+            for entry in duplicate_window["per_seed"]
+        ] == [43]
+        only_duplicate_window = _cell_window_paired_analysis(
+            {
+                "window_payloads": (
+                    duplicate_window_cell_a["window_payloads"][:2]
+                ),
+            },
+            {
+                "window_payloads": (
+                    duplicate_window_cell_b["window_payloads"][:2]
+                ),
+            },
+        )
+        assert only_duplicate_window["available"] is False
+        assert "重复随机种子" in only_duplicate_window["reason"]
 
         # 逐窗口差值沿评估序列强正自相关时，普通配对 t 检验
         # 会把 40 个窗口当 40 个独立样本（p 极小）；AR(1)
