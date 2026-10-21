@@ -12662,6 +12662,69 @@ def diagnose_non_finite(
                 logits.detach().abs().max()
             )
 
+    # 用同一份 logits 在 fp32 下重算逐 token LM 损失：这是
+    # 区分「前向 logits 已坏」与「损失侧 log(0)/除零/低精度
+    # 归约」的直接证据，也能量化目标概率下溢为 0 的 token 数。
+    recomputed_loss: Dict[str, object] = {
+        "available": False,
+        "lm_loss": None,
+        "finite": None,
+        "nonfinite_tokens": None,
+        "log_zero_probability_tokens": None,
+        "target_range_ok": None,
+    }
+    if (
+        logits is not None
+        and torch.is_tensor(logits)
+        and y is not None
+        and torch.is_tensor(y)
+        and logits.size(-1) > 0
+    ):
+        try:
+            flat_logits = logits.detach().reshape(
+                -1, int(logits.size(-1))
+            ).float()
+            flat_targets = y.reshape(-1).to(torch.int64)
+            if flat_logits.size(0) == flat_targets.numel():
+                target_range_ok = bool(
+                    (
+                        (flat_targets >= 0)
+                        & (flat_targets < logits.size(-1))
+                    ).all()
+                )
+                recomputed_loss["available"] = True
+                recomputed_loss["target_range_ok"] = (
+                    target_range_ok
+                )
+                if target_range_ok:
+                    with torch.no_grad():
+                        token_losses = F.cross_entropy(
+                            flat_logits,
+                            flat_targets,
+                            reduction="none",
+                        )
+                    finite_tokens = torch.isfinite(
+                        token_losses
+                    )
+                    recomputed_loss["finite"] = bool(
+                        finite_tokens.all()
+                    )
+                    recomputed_loss["nonfinite_tokens"] = int(
+                        (~finite_tokens).sum().item()
+                    )
+                    recomputed_loss["log_zero_probability_tokens"] = int(
+                        torch.isinf(token_losses).sum().item()
+                    )
+                    finite_values = token_losses[
+                        finite_tokens
+                    ]
+                    if finite_values.numel() > 0:
+                        recomputed_loss["lm_loss"] = float(
+                            finite_values.mean().item()
+                        )
+        except Exception as exc:
+            recomputed_loss["error"] = str(exc)[:200]
+
     overflow_limit = None
     if amp_dtype == torch.float16:
         overflow_limit = 65504.0
@@ -12682,12 +12745,45 @@ def diagnose_non_finite(
             str(amp_dtype) if amp_dtype is not None else None
         ),
         "low_precision_overflow_limit": overflow_limit,
+        "recompute_loss_fp32": recomputed_loss,
     }
 
     if _finite(logits) is False:
         findings.append(
             "logits 已含 NaN/Inf：优先怀疑低精度 matmul/softmax "
             "溢出或模型内部数值爆炸"
+        )
+    if recomputed_loss["available"]:
+        if recomputed_loss["target_range_ok"] is False:
+            findings.append(
+                "目标 token 越界：损失侧 gather/cross_entropy 会"
+                "产生非有限值或未定义行为，先修复数据/标签对齐"
+            )
+        elif (
+            recomputed_loss["finite"] is False
+            and _finite(logits) is True
+        ):
+            findings.append(
+                "logits 有限，但用同一 logits 在 fp32 重算仍有 "
+                f"{recomputed_loss['nonfinite_tokens']} 个 token "
+                "损失非有限：优先查目标概率下溢为 0（log(0)）"
+                "与低精度 logits 的动态范围，而不是梯度侧"
+            )
+        if (
+            recomputed_loss["log_zero_probability_tokens"]
+            or 0
+        ) > 0:
+            findings.append(
+                "重算发现 "
+                f"{recomputed_loss['log_zero_probability_tokens']}"
+                " 个 token 的目标概率为 0（对数发散）：这是"
+                "log(0)/softmax 下溢的直接证据"
+            )
+    if _finite(aux_loss) is False:
+        findings.append(
+            "辅助负载均衡损失非有限：检查路由计数归一化的"
+            "除零（空 token/batch）、softmax 溢出与 "
+            "balance_coef 数值范围"
         )
     if (
         logits_absmax is not None
@@ -29422,6 +29518,37 @@ def run_self_test():
         ]
         >= 1
     )
+    # 前向证据必须包含「用同一 logits 在 fp32 重算损失」的
+    # 结果，否则无法区分前向已坏与损失侧 log(0)/低精度归约。
+    recompute_check = diag_report["checks"]["forward"][
+        "recompute_loss_fp32"
+    ]
+    assert recompute_check["available"] is True
+    assert recompute_check["target_range_ok"] is True
+    assert recompute_check["finite"] is True
+    assert recompute_check["log_zero_probability_tokens"] == 0
+    assert recompute_check["lm_loss"] is not None
+
+    # 辅助损失非有限时必须显式指向路由归一化/除零，而不是
+    # 把所有 NaN 都归到梯度爆炸。
+    aux_nan_result = dict(diag_result)
+    aux_nan_result["aux_loss"] = torch.tensor(float("nan"))
+    aux_nan_report = diagnose_non_finite(
+        diag_model,
+        diag_optimizer,
+        x,
+        y,
+        aux_nan_result,
+        torch.tensor(float("nan")),
+        step=1,
+        lr=1e-3,
+        amp_dtype=None,
+        vocab_size=256,
+    )
+    assert any(
+        "辅助负载均衡损失" in finding
+        for finding in aux_nan_report["findings"]
+    ), aux_nan_report["findings"]
 
     # 梯度趋势证据：失败步梯度范数非有限、而此前均有有限梯度
     # 时，必须给出「梯度爆炸/学习率过大」的排查指引；失败步
