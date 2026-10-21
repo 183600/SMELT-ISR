@@ -25513,8 +25513,10 @@ def run_sanity_overfit(
 
         report_every = max(1, steps // 5)
 
-        initial_loss: Optional[float] = None
-        final_loss = float("nan")
+        initial_total_loss: Optional[float] = None
+        initial_lm_loss: Optional[float] = None
+        final_total_loss = float("nan")
+        final_lm_loss = float("nan")
         final_acc = float("nan")
         grad_probe: Optional[Dict[str, object]] = None
 
@@ -25527,13 +25529,20 @@ def run_sanity_overfit(
                 optimizer.zero_grad(set_to_none=True)
 
                 result = model(x, y)
-                loss = result["lm_loss"]
+                # 与全量训练使用同一条损失聚合路径。sanity_cfg
+                # 已把正则系数设为 0，数值上 total_loss 就是 lm_loss，
+                # 但代码路径仍会执行 lm + coef*aux 的求和；若 aux
+                # 侧出现 NaN/Inf 或聚合实现错误，全量训练会坏而
+                # 只看 lm_loss 的检查会漏掉。
+                loss = result["loss"]
+                lm_loss = result["lm_loss"]
 
                 # 在任何优化器更新之前记录初始损失：它是「模型
                 # 是否真的在学习」的参照。恒定/错误的损失实现
                 # 无法靠绝对阈值区分，必须看到相对下降。
                 if step == 1:
-                    initial_loss = float(loss.detach())
+                    initial_total_loss = float(loss.detach())
+                    initial_lm_loss = float(lm_loss.detach())
 
                 # 损失必须连在计算图上；否则 backward 必然失败
                 # 或训练空转，直接停下。
@@ -25595,7 +25604,8 @@ def run_sanity_overfit(
                     or step % report_every == 0
                     or step == steps
                 ):
-                    final_loss = float(loss.detach())
+                    final_total_loss = float(loss.detach())
+                    final_lm_loss = float(lm_loss.detach())
                     final_acc = float(
                         (
                             result["logits"].argmax(dim=-1) == y
@@ -25604,7 +25614,8 @@ def run_sanity_overfit(
 
                     print(
                         f"[sanity] step {step}/{steps} "
-                        f"lm_loss={final_loss:.4f} "
+                        f"total_loss={final_total_loss:.4f} "
+                        f"lm_loss={final_lm_loss:.4f} "
                         f"token_acc={final_acc:.4f}"
                     )
 
@@ -25628,14 +25639,14 @@ def run_sanity_overfit(
         # 不能排除「损失实现错误导致恒定小值」这类假通过。
         loss_reduction: Optional[float] = None
         if (
-            initial_loss is not None
-            and math.isfinite(initial_loss)
-            and initial_loss > 0.0
-            and math.isfinite(final_loss)
+            initial_total_loss is not None
+            and math.isfinite(initial_total_loss)
+            and initial_total_loss > 0.0
+            and math.isfinite(final_total_loss)
         ):
             loss_reduction = (
-                initial_loss - final_loss
-            ) / initial_loss
+                initial_total_loss - final_total_loss
+            ) / initial_total_loss
 
         learned = bool(
             loss_reduction is not None
@@ -25643,13 +25654,13 @@ def run_sanity_overfit(
         )
 
         metric_ok = (
-            final_loss <= loss_threshold
+            final_total_loss <= loss_threshold
             or final_acc >= acc_threshold
         )
 
         passed = metric_ok and learned
 
-        if initial_loss is not None:
+        if initial_total_loss is not None:
             reduction_text = (
                 f"{loss_reduction:.1%}"
                 if loss_reduction is not None
@@ -25657,8 +25668,10 @@ def run_sanity_overfit(
             )
             print(
                 "[sanity] 学习证据: "
-                f"initial_lm_loss={initial_loss:.4f}, "
-                f"final_lm_loss={final_loss:.4f}, "
+                f"initial_total_loss={initial_total_loss:.4f}, "
+                f"final_total_loss={final_total_loss:.4f}, "
+                f"initial_lm_loss={initial_lm_loss:.4f}, "
+                f"final_lm_loss={final_lm_loss:.4f}, "
                 f"relative_reduction={reduction_text}, "
                 f"required>={min_relative_improvement:.1%}"
             )
@@ -25695,8 +25708,15 @@ def run_sanity_overfit(
             "amp_dtype": (
                 str(amp_dtype) if amp_dtype is not None else None
             ),
-            "initial_lm_loss": initial_loss,
-            "final_lm_loss": final_loss,
+            # lm_loss 仅用于报告；passed/loss_reduction/阈值都基于
+            # 与全量训练相同的 total_loss 聚合路径。
+            "loss_source": (
+                "result['loss'] with balance_coef=0"
+            ),
+            "initial_lm_loss": initial_lm_loss,
+            "final_lm_loss": final_lm_loss,
+            "initial_total_loss": initial_total_loss,
+            "final_total_loss": final_total_loss,
             "final_token_accuracy": final_acc,
             "loss_reduction": loss_reduction,
             "min_relative_improvement": min_relative_improvement,
@@ -25720,8 +25740,11 @@ def run_sanity_overfit(
 _SANITY_REPEAT_KEYS: Tuple[str, ...] = (
     "initial_lm_loss",
     "final_lm_loss",
+    "initial_total_loss",
+    "final_total_loss",
     "final_token_accuracy",
     "loss_reduction",
+    "loss_source",
     "learned",
     "gradient_flow_ok",
 )
@@ -29893,6 +29916,39 @@ def run_self_test():
     assert not failed_metrics["passed"]
     assert failed_metrics["learned"] is False
     assert failed_metrics["grad_checkpoint"] is False
+
+    # sanity check 必须走全量训练的 total_loss 聚合路径：把
+    # result["loss"] 人为污染成 NaN 后，即使 lm_loss 仍有限，
+    # 检查也必须失败，而不是只盯着 lm_loss 假通过。
+    original_forward = LanguageModel.forward
+
+    def poisoned_forward(self, inputs, targets=None):
+        output = original_forward(self, inputs, targets)
+        if targets is not None:
+            output["loss"] = output["loss"] * float("nan")
+        return output
+
+    LanguageModel.forward = poisoned_forward
+    try:
+        poisoned_metrics = run_sanity_overfit(
+            sanity_cfg,
+            eval_dataset,
+            eval_device,
+            amp_dtype=None,
+            batch_size=2,
+            steps=1,
+            lr=1e-9,
+            loss_threshold=0.0,
+            acc_threshold=1.0,
+            seed=321,
+        )
+    finally:
+        LanguageModel.forward = original_forward
+
+    assert not poisoned_metrics["passed"]
+    assert math.isnan(poisoned_metrics["final_total_loss"])
+    assert math.isfinite(poisoned_metrics["final_lm_loss"])
+    assert poisoned_metrics["loss_source"].startswith("result['loss']")
 
     # 运行元数据必须包含代码版本与随机种子相关的追踪字段。
     metadata = collect_run_metadata(torch.device("cpu"))
@@ -42513,6 +42569,8 @@ def main():
         if sanity_result["passed"]:
             print(
                 "[sanity] PASSED: "
+                f"final total_loss="
+                f"{sanity_result['final_total_loss']:.4f}, "
                 f"final lm_loss="
                 f"{sanity_result['final_lm_loss']:.4f}, "
                 f"token_acc="
@@ -42521,10 +42579,10 @@ def main():
         elif reproducibility["identical"] is not False:
             print(
                 "[sanity] FAILED: 模型未能在小批量上过拟合 "
-                f"(initial lm_loss="
-                f"{sanity_result['initial_lm_loss']}, "
-                f"final lm_loss="
-                f"{sanity_result['final_lm_loss']:.4f}, "
+                f"(initial total_loss="
+                f"{sanity_result['initial_total_loss']}, "
+                f"final total_loss="
+                f"{sanity_result['final_total_loss']:.4f}, "
                 f"token_acc="
                 f"{sanity_result['final_token_accuracy']:.4f}, "
                 f"relative_reduction="
