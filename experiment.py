@@ -6737,6 +6737,7 @@ def evaluate(
     routing_probe: Optional["RoutingProbe"] = None,
     bad_case_collector: Optional["_BadCaseCollector"] = None,
     bootstrap_replicates: int = 0,
+    window_sink: Optional[List[Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -6786,6 +6787,12 @@ def evaluate(
     诊断的采样前向（探针在评估期间挂载、退出时卸载）：
     调用方在返回后用同一探针 build_report()；诊断只在
     val 上使用。
+
+    window_sink 非 None 时，逐窗口记录（损失和、目标 token
+    数、命中数）并追加到该列表：固定评估窗口在所有运行之间
+    逐位相同，因此两个运行可以按窗口配对比较——这给出
+    「在这批固定评估窗口上」的配对证据，与种子级检验
+    （训练随机性）互补。
     """
     was_training = model.training
     model.eval()
@@ -6958,6 +6965,27 @@ def evaluate(
                         dtype=torch.float64,
                     ),
                 )
+
+                if window_sink is not None:
+                    # 逐窗口统计：与整批口径同一份 logits 与
+                    # 预测结果（不额外跑模型），供跨运行按窗口
+                    # 配对比较使用。
+                    window_losses = token_losses.view(
+                        y.shape
+                    ).sum(dim=1)
+                    window_correct = (
+                        predicted.to(torch.int64)
+                        == flat_target.view(y.shape)
+                    ).sum(dim=1)
+                    loss_list = window_losses.detach().tolist()
+                    correct_list = window_correct.detach().tolist()
+                    window_token_count = int(y.size(1))
+                    for row_index in range(y.size(0)):
+                        window_sink.append({
+                            "loss_sum": float(loss_list[row_index]),
+                            "tokens": window_token_count,
+                            "correct": int(correct_list[row_index]),
+                        })
 
                 if bootstrap_enabled:
                     # 逐窗口 loss 与混淆充分统计量：用与点估计
@@ -13429,6 +13457,23 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             except (OSError, json.JSONDecodeError):
                 config_payload = {}
 
+        # 逐窗口评估记录（eval_windows.json）：固定评估窗口在所有
+        # 运行之间逐位相同，跨运行比较可以按窗口配对，给出
+        # 「在这批固定评估窗口上」的配对证据。缺失（旧运行）时
+        # 保持 None，窗口级分析整体跳过而不是静默当成没有差异。
+        windows_path = run_dir / "eval_windows.json"
+        if windows_path.exists():
+            try:
+                with open(
+                    windows_path,
+                    encoding="utf-8",
+                ) as f:
+                    loaded_windows = json.load(f)
+                if isinstance(loaded_windows, dict):
+                    row["eval_windows"] = loaded_windows
+            except (OSError, json.JSONDecodeError):
+                row["eval_windows"] = None
+
         # 确定性标记：ngram 统计基线换 seed 不会产生新的独立
         # 重复；聚合与检验必须据此折叠，而不是把复制运行当
         # 独立种子。
@@ -15226,6 +15271,17 @@ def _mean(values: List[float]) -> Optional[float]:
     return sum(values) / len(values)
 
 
+def _median(values: List[float]) -> Optional[float]:
+    """中位数（偶数个观测取中间两者的平均）。"""
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
 def _sample_std(values: List[float]) -> Optional[float]:
     """
     样本标准差（ddof=1）；少于 2 个观测时返回 None。
@@ -15500,6 +15556,351 @@ def _paired_sign_flip_test(
             and min_attainable_p <= _SIGNIFICANCE_LEVEL
         ),
         "effect": mean,
+    }
+
+
+# ============================================================
+# 逐窗口配对比较（固定评估窗口）
+# ============================================================
+
+# 逐窗口比较的评估协议指纹：这些字段必须逐项相同，两个运行
+# 才是在**同一批固定评估窗口**上比较。任何一项不同（例如换了
+# 数据、换了窗口数/批大小、换了 seq_len）都意味着窗口集合不是
+# 同一批，逐窗口配对没有意义，必须拒绝而不是硬算。
+_EVAL_WINDOW_FINGERPRINT_KEYS = (
+    "split",
+    "data_sha256",
+    "seq_len",
+    "batch_size",
+    "batches",
+)
+
+_EVAL_WINDOW_BOOTSTRAP_REPLICATES = 2000
+
+
+def _eval_window_fingerprint(
+    payload: Dict[str, object],
+) -> Tuple[object, ...]:
+    return tuple(
+        (
+            key,
+            json.dumps(payload.get(key), sort_keys=True),
+        )
+        for key in _EVAL_WINDOW_FINGERPRINT_KEYS
+    )
+
+
+def _window_per_token_loss(
+    window: Dict[str, object],
+) -> Optional[float]:
+    tokens = window.get("tokens")
+    loss_sum = window.get("loss_sum")
+    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool):
+        return None
+    if not isinstance(loss_sum, (int, float)) or isinstance(
+        loss_sum, bool
+    ):
+        return None
+    if float(tokens) <= 0.0:
+        return None
+    return float(loss_sum) / float(tokens)
+
+
+def _window_accuracy(
+    window: Dict[str, object],
+) -> Optional[float]:
+    tokens = window.get("tokens")
+    correct = window.get("correct")
+    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool):
+        return None
+    if not isinstance(correct, (int, float)) or isinstance(
+        correct, bool
+    ):
+        return None
+    if float(tokens) <= 0.0:
+        return None
+    return float(correct) / float(tokens)
+
+
+def _paired_window_bootstrap_ci(
+    differences: List[float],
+    seed: int,
+) -> Dict[str, object]:
+    """
+    配对差值均值的百分位 bootstrap 区间（固定种子，可复现）。
+
+    窗口级区间的独立性假设比种子级更弱（窗口可能重叠），
+    因此该区间只描述「在这批固定评估窗口上」的差异，不解释为
+    对「换一批评估窗口」的泛化区间。
+    """
+    n = len(differences)
+    if n < 2:
+        return {"available": False, "reason": "insufficient_windows"}
+    generator = torch.Generator().manual_seed(int(seed))
+    values = torch.tensor(differences, dtype=torch.float64)
+    indices = torch.randint(
+        low=0,
+        high=n,
+        size=(_EVAL_WINDOW_BOOTSTRAP_REPLICATES, n),
+        generator=generator,
+    )
+    means = values[indices].mean(dim=1)
+    low = float(torch.quantile(means, 0.025).item())
+    high = float(torch.quantile(means, 0.975).item())
+    return {
+        "available": True,
+        "low": low,
+        "high": high,
+        "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+        "method": "percentile_bootstrap",
+    }
+
+
+def paired_window_comparison(
+    payload_a: Dict[str, object],
+    payload_b: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    两个运行在同一批固定评估窗口上的配对比较。
+
+    固定评估窗口在所有运行之间逐位相同（见
+    ``ByteDataset.fixed_eval_batch``），因此两个运行可以按窗口
+    配对：差值 = b 的逐窗口指标 - a 的逐窗口指标。这给出
+    「在这批固定评估窗口上」的一致性证据，与种子级检验（训练
+    随机性）互补但**不独立**：两者来自同一批运行，不能当成两次
+    独立验证。
+
+    口径与解释边界：
+    - 评估协议指纹（数据指纹/split/窗口数/批大小/seq_len）不
+      一致时直接拒绝：窗口集合不同，配对没有意义；
+    - 窗口级 p 值与区间只覆盖「评估集抽样」这一层不确定性，
+      重叠窗口不是独立抽样单位，区间会偏窄（overlap_fraction
+      一并给出）；训练随机性仍由种子级检验负责；
+    - 差异方向按「b 相对 a」给出：loss 类指标越低越好，
+      accuracy 类指标越高越好。
+    """
+    fingerprint_a = _eval_window_fingerprint(payload_a)
+    fingerprint_b = _eval_window_fingerprint(payload_b)
+    if fingerprint_a != fingerprint_b:
+        mismatched = [
+            key
+            for (key, value_a), (_, value_b)
+            in zip(fingerprint_a, fingerprint_b)
+            if value_a != value_b
+        ]
+        return {
+            "status": "protocol_mismatch",
+            "mismatched_keys": mismatched,
+            "reason": (
+                "两个运行的评估协议指纹不同（"
+                + ", ".join(mismatched)
+                + "）：不是同一批固定评估窗口，逐窗口配对无效"
+            ),
+        }
+
+    windows_a = payload_a.get("windows")
+    windows_b = payload_b.get("windows")
+    if not isinstance(windows_a, list) or not isinstance(
+        windows_b, list
+    ):
+        return {
+            "status": "missing_windows",
+            "reason": "评估窗口记录缺失，无法逐窗口配对",
+        }
+    if len(windows_a) != len(windows_b):
+        return {
+            "status": "window_count_mismatch",
+            "n_windows_a": len(windows_a),
+            "n_windows_b": len(windows_b),
+            "reason": (
+                "两个运行的窗口数不同：不是同一批窗口，逐窗口"
+                "配对无效"
+            ),
+        }
+    if not windows_a:
+        return {
+            "status": "missing_windows",
+            "reason": "评估窗口记录为空，无法逐窗口配对",
+        }
+
+    loss_differences: List[float] = []
+    accuracy_differences: List[float] = []
+    for window_a, window_b in zip(windows_a, windows_b):
+        loss_a = _window_per_token_loss(window_a)
+        loss_b = _window_per_token_loss(window_b)
+        if loss_a is not None and loss_b is not None:
+            loss_differences.append(loss_b - loss_a)
+        accuracy_a = _window_accuracy(window_a)
+        accuracy_b = _window_accuracy(window_b)
+        if accuracy_a is not None and accuracy_b is not None:
+            accuracy_differences.append(accuracy_b - accuracy_a)
+
+    if not loss_differences:
+        return {
+            "status": "missing_windows",
+            "reason": "窗口记录缺少损失/命中信息，无法逐窗口配对",
+        }
+
+    n_windows = len(loss_differences)
+    mean_diff = sum(loss_differences) / n_windows
+    better_fraction = (
+        sum(1 for value in loss_differences if value < 0.0)
+        / n_windows
+    )
+    tie_fraction = (
+        sum(1 for value in loss_differences if value == 0.0)
+        / n_windows
+    )
+    bootstrap = _paired_window_bootstrap_ci(
+        loss_differences,
+        _randomization_seed(loss_differences),
+    )
+    test = _paired_t_test(loss_differences)
+    randomization = _paired_sign_flip_test(loss_differences)
+
+    result: Dict[str, object] = {
+        "status": "ok",
+        "n_windows": n_windows,
+        "mean_loss_diff": mean_diff,
+        "median_loss_diff": _median(loss_differences),
+        "fraction_variant_better": better_fraction,
+        "fraction_tied": tie_fraction,
+        "window_p_value": test.get("p_value"),
+        "window_test": test.get("test"),
+        "window_randomization_p_value": randomization.get(
+            "p_value"
+        ),
+        "overlap_fraction": payload_a.get("overlap_fraction"),
+        "bootstrap_ci95": bootstrap,
+    }
+    if accuracy_differences:
+        accuracy_mean = (
+            sum(accuracy_differences) / len(accuracy_differences)
+        )
+        result["mean_accuracy_diff"] = accuracy_mean
+        result["fraction_variant_more_accurate"] = (
+            sum(
+                1
+                for value in accuracy_differences
+                if value > 0.0
+            ) / len(accuracy_differences)
+        )
+    return result
+
+
+def _cell_window_payloads_by_seed(
+    cell: Dict[str, object],
+) -> Dict[int, Dict[str, object]]:
+    """实验单元内「种子 → 逐窗口评估记录」的映射。"""
+    by_seed: Dict[int, Dict[str, object]] = {}
+    for entry in cell.get("window_payloads", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        seed = entry.get("seed")
+        payload = entry.get("payload")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        by_seed.setdefault(int(seed), payload)
+    return by_seed
+
+
+def _cell_window_paired_analysis(
+    cell_a: Dict[str, object],
+    cell_b: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    两个实验单元之间的逐窗口配对分析（按 seed 配对运行）。
+
+    固定评估窗口对所有运行相同，因此同一 seed 的两个运行天然
+    可以按窗口配对；跨 seed 汇总时给出每个 seed 的窗口级差异与
+    方向一致性，避免把不同 seed 的窗口混成一个假的大样本。
+    """
+    payloads_a = _cell_window_payloads_by_seed(cell_a)
+    payloads_b = _cell_window_payloads_by_seed(cell_b)
+    common_seeds = sorted(set(payloads_a) & set(payloads_b))
+
+    if not payloads_a and not payloads_b:
+        return {
+            "available": False,
+            "reason": (
+                "没有逐窗口评估记录（运行由旧版本产生或未落盘）："
+                "无法给出窗口级配对证据"
+            ),
+        }
+    if not common_seeds:
+        return {
+            "available": False,
+            "reason": (
+                "两个实验单元没有共同的随机种子：无法按 seed 配对"
+                "逐窗口记录"
+            ),
+        }
+
+    per_seed: List[Dict[str, object]] = []
+    for seed in common_seeds:
+        comparison = paired_window_comparison(
+            payloads_a[seed], payloads_b[seed]
+        )
+        per_seed.append({"seed": seed, **comparison})
+
+    usable = [
+        entry
+        for entry in per_seed
+        if entry.get("status") == "ok"
+    ]
+    if not usable:
+        return {
+            "available": False,
+            "reason": (
+                "逐窗口比较没有可用结果："
+                + "; ".join(
+                    str(entry.get("reason", entry.get("status")))
+                    for entry in per_seed
+                )
+            ),
+            "per_seed": per_seed,
+        }
+
+    mean_diffs = [
+        float(entry["mean_loss_diff"]) for entry in usable
+    ]
+    overall_mean = sum(mean_diffs) / len(mean_diffs)
+    favoring = sum(1 for value in mean_diffs if value < 0.0)
+    against = sum(1 for value in mean_diffs if value > 0.0)
+    overlap_fractions = [
+        entry.get("overlap_fraction")
+        for entry in usable
+        if isinstance(entry.get("overlap_fraction"), (int, float))
+    ]
+    notes: List[str] = []
+    if overlap_fractions:
+        notes.append(
+            "评估窗口可能重叠（overlap_fraction="
+            f"{max(overlap_fractions):.3f}）：窗口不是独立抽样"
+            "单位，窗口级区间偏窄，训练随机性仍由种子级检验覆盖"
+        )
+    notes.append(
+        "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
+    )
+    return {
+        "available": True,
+        "n_seeds": len(usable),
+        "seeds": [int(entry["seed"]) for entry in usable],
+        "per_seed": per_seed,
+        "mean_loss_diff": overall_mean,
+        "mean_loss_diff_spread": (
+            max(mean_diffs) - min(mean_diffs)
+            if len(mean_diffs) > 1
+            else 0.0
+        ),
+        "n_seeds_favoring_variant": favoring,
+        "n_seeds_favoring_baseline": against,
+        "direction_consistent": bool(
+            favoring == 0 or against == 0
+        ),
+        "notes": notes,
     }
 
 
@@ -16560,6 +16961,17 @@ def aggregate_runs(
             ),
             "samples": {},
             "costs": {},
+            # 逐窗口评估记录（固定评估窗口在所有运行之间相同），
+            # 供跨单元的窗口级配对比较使用。
+            "window_payloads": [
+                {
+                    "seed": row.get("seed"),
+                    "run": str(row.get("run")),
+                    "payload": row.get("eval_windows"),
+                }
+                for row in group_rows
+                if isinstance(row.get("eval_windows"), dict)
+            ],
             "numerical_failures": [
                 {
                     "run": str(row.get("run")),
@@ -17193,6 +17605,15 @@ def factor_contrasts(
 
             test = _contrast_test(samples_a, samples_b)
 
+            # 逐窗口配对证据：固定评估窗口对所有运行相同，两个
+            # 单元可以按 seed 配对运行、按窗口配对指标。它与种子
+            # 级检验互补（评估集层面 vs 训练随机性），但来自同一
+            # 批运行，不能当成两次独立验证。
+            window_paired = _cell_window_paired_analysis(
+                cell_a,
+                cell_b,
+            )
+
             # Hedges g：Cohen's d（噪声比）的小样本无偏近似。
             # n=3 时 d 高估约 13%（配对口径约 43%），报告同时
             # 给 g 才不会把小种子数的效应量当成真实效应大小。
@@ -17318,6 +17739,7 @@ def factor_contrasts(
                 "verdict": verdict,
                 "cost": cost,
                 "cost_verdict": cost_verdict,
+                "window_paired": window_paired,
             })
             contrast.update(_contrast_interval(test))
             _attach_power_equivalence(
@@ -18075,6 +18497,51 @@ def _format_seed_count(value: float) -> str:
     return f"{value:.1f}"
 
 
+def _format_window_paired(
+    contrast: Dict[str, object],
+) -> str:
+    """
+    逐窗口配对证据的一行展示：固定评估窗口上的逐窗口配对差异
+    与方向一致性。没有窗口记录时返回空串（不展示，而不是显示
+    「无差异」）。
+    """
+    window_paired = contrast.get("window_paired")
+    if not isinstance(window_paired, dict):
+        return ""
+    if not window_paired.get("available"):
+        return ""
+    mean_diff = window_paired.get("mean_loss_diff")
+    if not isinstance(mean_diff, (int, float)):
+        return ""
+    favoring = int(window_paired.get("n_seeds_favoring_variant", 0))
+    against = int(window_paired.get("n_seeds_favoring_baseline", 0))
+    n_seeds = int(window_paired.get("n_seeds", 0))
+    parts = [
+        f"[window] 固定评估窗口逐窗口配对: Δloss={float(mean_diff):+.4f}"
+        f"（{favoring}/{n_seeds} 个种子方向偏向变体，"
+        f"{against}/{n_seeds} 偏向基线）"
+    ]
+    per_seed = window_paired.get("per_seed")
+    if isinstance(per_seed, list):
+        p_values = [
+            entry.get("window_p_value")
+            for entry in per_seed
+            if isinstance(entry, dict)
+            and isinstance(entry.get("window_p_value"), (int, float))
+        ]
+        if p_values:
+            parts.append(
+                "逐种子窗口级 p: "
+                + ", ".join(
+                    f"{float(value):.3g}" for value in p_values
+                )
+            )
+    notes = window_paired.get("notes")
+    if isinstance(notes, list) and notes:
+        parts.append("（" + "；".join(str(note) for note in notes) + "）")
+    return "  ".join(parts)
+
+
 def _contrast_display(
     contrast: Dict[str, object],
     metric: str,
@@ -18611,6 +19078,12 @@ def compare_cells_to_baseline(
             "verdict": verdict,
             "cost": cost,
             "cost_verdict": cost_verdict,
+            # 逐窗口配对证据：固定评估窗口对所有运行相同，基线
+            # 与变体可以按 seed 配对运行、按窗口配对指标。
+            "window_paired": _cell_window_paired_analysis(
+                reference,
+                aggregate,
+            ),
         }
         entry.update(_contrast_interval(result))
         _attach_power_equivalence(
@@ -20972,6 +21445,55 @@ def hypothesis_alignment(
             "的最小效应正是用来区分「显著」与「有意义」）："
             + "; ".join(below_min_effect)
         )
+
+    # 预注册主指标的口径族：频率加权的似然（val_loss / val_ppl /
+    # bpb）与类平衡似然（val_macro_nll）回答的不是同一个问题
+    # （整体似然 vs 稀有字节）。不平衡场景下只用其中一个判定，
+    # 结论会片面：声明与判定口径不一致时必须点名。
+    frequency_weighted_metrics = {
+        "val_loss",
+        "val_ppl",
+        "val_bits_per_byte",
+    }
+    balanced_likelihood_metrics = {"val_macro_nll"}
+    declared_primary_metrics = {
+        str(declaration.get("primary_metric"))
+        for declaration in declarations.values()
+        if declaration.get("primary_metric")
+    }
+    for declared_metric in sorted(declared_primary_metrics):
+        if declared_metric in frequency_weighted_metrics:
+            advisories.append(
+                f"预注册主指标 {declared_metric} 按 token 频率加权："
+                "类别不平衡时它几乎只反映高频字节，稀有字节学没"
+                "学会都看不出来；建议同时预注册并报告类平衡口径 "
+                "val_macro_nll（对出现类等权，随机水平 log 词表"
+                "大小），两者回答的问题不同，不能只报对自己有利"
+                "的一个"
+            )
+        elif declared_metric in balanced_likelihood_metrics:
+            advisories.append(
+                f"预注册主指标 {declared_metric} 是类平衡似然："
+                "它回答「稀有字节学没学会」，与频率加权的 "
+                "val_loss 回答的问题不同；结论必须同时报告两者，"
+                "不能只报对自己有利的一个"
+            )
+    mismatched_declared = sorted(
+        declared_metric
+        for declared_metric in declared_primary_metrics
+        if declared_metric != metric
+    )
+    if mismatched_declared and declarations:
+        advisories.append(
+            "预注册主指标（"
+            + ", ".join(mismatched_declared)
+            + "）与当前判定指标（"
+            + str(metric)
+            + "）不一致：该假设无法被当前对比核对，"
+            "两个口径的结论可能方向相反；要么用预注册指标判定"
+            "（--compare-metric），要么按新口径重新预注册，"
+            "不能事后换口径"
+        )
     if not checks:
         advisories.append(
             "没有可核对的预注册对比：运行未声明 "
@@ -22505,6 +23027,9 @@ def print_comparison_analysis(
             print(
                 "  " + _contrast_display(contrast, metric)
             )
+            window_line = _format_window_paired(contrast)
+            if window_line:
+                print(window_line)
 
         # 效率权衡汇总：显著涨点伴随数量级效率差异、或指标
         # 变差且效率更低时，这些对比必须单独点名，不能只凭
@@ -22567,6 +23092,9 @@ def print_comparison_analysis(
             print(
                 "    " + _contrast_display(contrast, metric)
             )
+            window_line = _format_window_paired(contrast)
+            if window_line:
+                print("    " + window_line.strip())
 
     print(
         "  注：同一检验家族内已做多重比较校正——显著性判定以 "
@@ -23117,6 +23645,32 @@ def print_comparison_analysis(
             print("  无可用效应（等计算量指标缺少数值或共同种子）")
         for advisory in factorial_compute_matched["advisories"]:
             print(f"  [warn] {advisory}")
+
+    # 报告里不重复落盘逐窗口原始记录（体量大，且已随各运行单独
+    # 写入 eval_windows.json）：单元内只保留窗口数与协议指纹，
+    # 窗口级结论已在各对比的 window_paired 里给出。
+    for aggregate in aggregates:
+        payloads = aggregate.pop("window_payloads", None)
+        if not payloads:
+            continue
+        aggregate["eval_window_runs"] = [
+            {
+                "seed": entry.get("seed"),
+                "run": entry.get("run"),
+                "n_windows": (
+                    entry.get("payload", {}).get("n_windows")
+                    if isinstance(entry.get("payload"), dict)
+                    else None
+                ),
+                "split": (
+                    entry.get("payload", {}).get("split")
+                    if isinstance(entry.get("payload"), dict)
+                    else None
+                ),
+            }
+            for entry in payloads
+            if isinstance(entry, dict)
+        ]
 
     return {
         "factors": factors,
@@ -29288,6 +29842,7 @@ def run_self_test():
             n_params: Optional[int] = None,
             flops: Optional[int] = None,
             ngram_tuning_metric: Optional[str] = None,
+            eval_windows: Optional[Dict[str, object]] = None,
         ) -> str:
             run_dir = Path(analysis_dir) / name
             run_dir.mkdir()
@@ -29404,6 +29959,13 @@ def run_self_test():
                 run_dir / "metrics.jsonl",
                 final_record,
             )
+            if eval_windows is not None:
+                with open(
+                    run_dir / "eval_windows.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(eval_windows, f, ensure_ascii=False)
             return str(run_dir)
 
         run_paths = [
@@ -30042,6 +30604,154 @@ def run_self_test():
             and cell["duplicate_seeds"] == [42]
             for cell in duplicate_analysis["duplicate_seed_cells"]
         ), duplicate_analysis["duplicate_seed_cells"]
+
+        # ---- 逐窗口配对比较（固定评估窗口） ----
+        # 固定评估窗口在所有运行之间逐位相同：两个运行可以按
+        # 窗口配对，给出「在这批固定窗口上」的配对证据。
+        def _window_payload(
+            data_sha256: str,
+            losses: List[float],
+            hits: Optional[List[int]] = None,
+        ) -> Dict[str, object]:
+            window_tokens = 7
+            windows = [
+                {
+                    "loss_sum": float(loss) * window_tokens,
+                    "tokens": window_tokens,
+                    "correct": int(
+                        hits[index] if hits is not None else 0
+                    ),
+                }
+                for index, loss in enumerate(losses)
+            ]
+            return {
+                "split": "val",
+                "data_sha256": data_sha256,
+                "seq_len": 8,
+                "batch_size": 8,
+                "batches": 1,
+                "n_windows": len(windows),
+                "overlap_fraction": 0.0,
+                "windows": windows,
+            }
+
+        window_dense_path = _write_analysis_run(
+            "window_dense_seed42",
+            "dense",
+            42,
+            3e-4,
+            100,
+            0.0,
+            4.0,
+            eval_windows=_window_payload(
+                "deadbeef", [4.0, 4.1, 4.2, 3.9]
+            ),
+        )
+        window_a_path = _write_analysis_run(
+            "window_A_seed42",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.0,
+            3.5,
+            eval_windows=_window_payload(
+                "deadbeef", [3.5, 3.6, 3.7, 3.4]
+            ),
+        )
+        window_rows = compare_runs(
+            [window_dense_path, window_a_path]
+        )
+        assert window_rows[0]["eval_windows"]["n_windows"] == 4
+        window_contrasts = factor_contrasts(
+            aggregate_runs(window_rows, ["mode"]),
+            ["mode"],
+            "val_loss",
+        )
+        assert len(window_contrasts) == 1
+        window_paired = window_contrasts[0]["window_paired"]
+        assert window_paired["available"] is True
+        assert window_paired["n_seeds"] == 1
+        # 逐窗口差值方向与单元排序一致：变体是排序靠后的那个
+        # 模式，逐窗口配对差值 = 变体 - 对照。
+        dense_losses = [4.0, 4.1, 4.2, 3.9]
+        variant_losses = [3.5, 3.6, 3.7, 3.4]
+        if str(window_contrasts[0]["variant"]) == "mode=dense":
+            expected_window_diff = (
+                sum(dense_losses) - sum(variant_losses)
+            ) / len(dense_losses)
+        else:
+            expected_window_diff = (
+                sum(variant_losses) - sum(dense_losses)
+            ) / len(dense_losses)
+        assert abs(
+            float(window_paired["mean_loss_diff"])
+            - expected_window_diff
+        ) < 1e-12
+        assert window_paired["direction_consistent"] is True
+        assert window_paired["n_seeds_favoring_variant"] == (
+            1 if expected_window_diff < 0.0 else 0
+        )
+        window_per_seed = window_paired["per_seed"][0]
+        assert window_per_seed["status"] == "ok"
+        assert window_per_seed["n_windows"] == 4
+        assert window_per_seed["fraction_variant_better"] == (
+            1.0 if expected_window_diff < 0.0 else 0.0
+        )
+        assert "[window]" in _format_window_paired(
+            window_contrasts[0]
+        )
+
+        # 评估协议指纹不同（换了数据）时必须拒绝逐窗口配对：
+        # 不是同一批窗口，配对没有意义。
+        window_mismatch = paired_window_comparison(
+            _window_payload("deadbeef", [4.0, 4.1]),
+            _window_payload("other", [3.0, 3.1]),
+        )
+        assert window_mismatch["status"] == "protocol_mismatch"
+        assert "data_sha256" in window_mismatch["mismatched_keys"]
+
+        # 没有窗口记录时（旧运行）必须显式说明不可用，不能静默
+        # 当成「没有差异」。
+        no_window_dense_path = _write_analysis_run(
+            "windowless_dense_seed42",
+            "dense",
+            42,
+            3e-4,
+            100,
+            0.0,
+            4.0,
+        )
+        no_window_a_path = _write_analysis_run(
+            "windowless_A_seed42",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.0,
+            3.5,
+        )
+        no_window_rows = compare_runs(
+            [no_window_dense_path, no_window_a_path]
+        )
+        assert "eval_windows" not in no_window_rows[0]
+        no_window_contrasts = factor_contrasts(
+            aggregate_runs(no_window_rows, ["mode"]),
+            ["mode"],
+            "val_loss",
+        )
+        assert len(no_window_contrasts) == 1
+        assert (
+            no_window_contrasts[0]["window_paired"]["available"]
+            is False
+        )
+        assert (
+            "逐窗口评估记录"
+            in no_window_contrasts[0]["window_paired"]["reason"]
+        )
+        assert _format_window_paired(
+            no_window_contrasts[0]
+        ) == ""
 
         # 确定性基线：ngram 的计数与固定窗口评估不依赖 seed。
         # 三个「不同种子」的运行是同一估计的三份复制，不能
@@ -39932,6 +40642,10 @@ def main():
             device=device,
         )
 
+    # 逐窗口评估记录：固定评估窗口在所有运行之间逐位相同，
+    # 落盘后两个运行可以按窗口配对比较（同一批窗口上的配对证
+    # 据，与种子级检验互补）。只落盘 val：test 保持尘封。
+    val_window_records: List[Dict[str, float]] = []
     final_metrics = evaluate(
         model,
         dataset,
@@ -39945,7 +40659,40 @@ def main():
         bootstrap_replicates=getattr(
             args, "eval_bootstrap", 0
         ),
+        window_sink=val_window_records,
     )
+
+    if val_window_records:
+        # 窗口可能重叠：重叠窗口不是独立抽样单位，窗口级
+        # 区间会偏窄。重叠比例随窗口数据一起落盘。
+        overlap_fraction: Optional[float] = None
+        starts = dataset._fixed_starts.get("val", {}).get("starts")
+        if starts is not None and len(starts) > 1:
+            gaps = starts[1:] - starts[:-1]
+            overlap_count = int(
+                (gaps < dataset.seq_len).sum().item()
+            )
+            overlap_fraction = overlap_count / (len(starts) - 1)
+        eval_windows_payload: Dict[str, object] = {
+            "split": "val",
+            "data_sha256": dataset.data_sha256,
+            "seq_len": int(dataset.seq_len),
+            "batch_size": int(args.batch_size),
+            "batches": int(args.eval_batches),
+            "n_windows": len(val_window_records),
+            "overlap_fraction": overlap_fraction,
+            "windows": val_window_records,
+        }
+        with open(
+            out_dir / "eval_windows.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                _json_safe(eval_windows_payload),
+                f,
+                ensure_ascii=False,
+            )
 
     # 最优验证损失仍按历史口径单独汇总（选型指标可能是
     # macro F1 等分类指标，两者不应混为一谈）。
