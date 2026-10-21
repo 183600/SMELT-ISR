@@ -19359,6 +19359,13 @@ def factorial_effects(
                 )
                 + "）：复制运行已折叠为一个观测，不能算独立重复"
             )
+        if not effect.get("complete_seed_records", True):
+            report["advisories"].append(
+                f"{effect['design']} 的 {effect['description']}"
+                "所在单元存在未记录随机种子的运行：配对检验"
+                "只覆盖有种子且共同的子集，效应不能外推到该"
+                "单元的全部运行"
+            )
 
     if report["incomplete_designs"]:
         report["advisories"].append(
@@ -23196,6 +23203,10 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append("计算量未对齐")
     if effect.get("duplicate_seeds"):
         qualifiers.append("存在重复随机种子（已折叠）")
+    if not effect.get("complete_seed_records", True):
+        qualifiers.append(
+            "存在未记录种子的运行（配对仅覆盖有种子子集）"
+        )
     tost_holm = effect.get("tost_p_value_holm")
     if tost_holm is not None:
         margin_abs = effect.get("equivalence_margin_abs")
@@ -33158,6 +33169,76 @@ def run_self_test():
         json.dumps(
             _json_safe(factorial),
             ensure_ascii=False,
+        )
+
+        # 单元里混入未记录种子的运行：配对检验仍可覆盖有种子
+        # 的共同子集，但必须显式提示结论不能外推到全部运行；
+        # 不能只留下 complete_seed_records=False 就静默配对。
+        def _incomplete_cell(
+            mode_name: str,
+            balance: float,
+            samples: List[Tuple[object, float]],
+        ) -> Dict[str, object]:
+            values = [value for _, value in samples]
+            return {
+                "label": f"incomplete_{mode_name}_{balance}",
+                "keys": {
+                    "mode": mode_name,
+                    "balance_coef": balance,
+                },
+                "n_runs": len(samples),
+                "samples": {
+                    "val_loss": [
+                        {
+                            "seed": seed,
+                            "run": f"incomplete_{mode_name}_{balance}",
+                            "value": value,
+                        }
+                        for seed, value in samples
+                    ],
+                },
+                "val_loss_mean": sum(values) / len(values),
+            }
+
+        incomplete_factorial = factorial_effects(
+            [
+                _incomplete_cell(
+                    "local_base",
+                    0.0,
+                    [(1, 3.00), (2, 3.02), (3, 2.98), (None, 3.00)],
+                ),
+                _incomplete_cell(
+                    "A",
+                    0.0,
+                    [(1, 2.90), (2, 2.92), (3, 2.88)],
+                ),
+                _incomplete_cell(
+                    "local_base",
+                    0.01,
+                    [(1, 2.95), (2, 2.97), (3, 2.93)],
+                ),
+                _incomplete_cell(
+                    "A",
+                    0.01,
+                    [(1, 2.85), (2, 2.87), (3, 2.83)],
+                ),
+            ],
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        incomplete_delayed = [
+            effect
+            for effect in incomplete_factorial["effects"]
+            if effect["effect_name"] == "delayed_merge_main"
+        ][0]
+        assert incomplete_delayed["n_pairs"] == 3
+        assert not incomplete_delayed["complete_seed_records"]
+        assert any(
+            "未记录随机种子" in message
+            for message in incomplete_factorial["advisories"]
+        )
+        assert "未记录种子的运行" in _format_factorial_effect(
+            incomplete_delayed
         )
 
         # 有交互分支：B 的均衡损失收益（-0.30）明显大于
