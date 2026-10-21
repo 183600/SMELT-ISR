@@ -25535,6 +25535,13 @@ def run_sanity_overfit(
         )
 
         # 固定一个小批次：整个检查期间重复使用同一批数据。
+        # 采样必须只消费显式 generator：若数据管线暗中使用
+        # torch 全局 RNG，任何在前面的全局随机消耗（模型初始
+        # 化、其他模块）都会改变数据轨迹，同种子结果在真实
+        # 训练中就不再稳定。这里在采样前后核对全局 torch RNG
+        # 状态未被触碰（DataLoader worker 场景对应 worker 端
+        # 的 generator 隔离）。
+        global_rng_before_batch = torch.get_rng_state()
         generator = torch.Generator().manual_seed(seed)
         x, y = dataset.batch(
             "train",
@@ -25542,11 +25549,21 @@ def run_sanity_overfit(
             generator,
             device,
         )
+        data_sampling_uses_explicit_generator = torch.equal(
+            torch.get_rng_state(),
+            global_rng_before_batch,
+        )
         batch_sha256 = _batch_sha256(x, y)
         print(
             "[sanity] fixed batch sha256="
             f"{batch_sha256[:12]}..."
         )
+        if not data_sampling_uses_explicit_generator:
+            print(
+                "[sanity] [warn] 训练批采样消耗了 torch 全局 "
+                "RNG：同一批数据会随全局随机消耗顺序漂移，"
+                "请让数据管线只使用传入的 torch.Generator"
+            )
 
         # weight_decay=0、无 warmup、无梯度裁剪：全部正则化关闭。
         optimizer = torch.optim.AdamW(
@@ -25716,6 +25733,9 @@ def run_sanity_overfit(
 
         passed = metric_ok and learned
 
+        if not data_sampling_uses_explicit_generator:
+            passed = False
+
         if initial_total_loss is not None:
             reduction_text = (
                 f"{loss_reduction:.1%}"
@@ -25758,6 +25778,9 @@ def run_sanity_overfit(
             "steps": steps,
             "batch_size": batch_size,
             "batch_sha256": batch_sha256,
+            "data_sampling_uses_explicit_generator": (
+                data_sampling_uses_explicit_generator
+            ),
             "lr": lr,
             "seed": seed,
             "grad_checkpoint": grad_checkpoint,
@@ -25796,6 +25819,7 @@ def run_sanity_overfit(
 
 _SANITY_REPEAT_KEYS: Tuple[str, ...] = (
     "batch_sha256",
+    "data_sampling_uses_explicit_generator",
     "initial_lm_loss",
     "final_lm_loss",
     "initial_total_loss",
@@ -29842,6 +29866,10 @@ def run_self_test():
     assert sanity_metrics["passed"], sanity_metrics
     assert sanity_metrics["grad_checkpoint"] is True
     assert "amp_dtype" in sanity_metrics
+    assert (
+        sanity_metrics["data_sampling_uses_explicit_generator"]
+        is True
+    ), sanity_metrics
     assert sanity_metrics["learned"] is True, sanity_metrics
     assert (
         sanity_metrics["loss_reduction"]
@@ -30065,6 +30093,44 @@ def run_self_test():
     assert math.isnan(poisoned_metrics["final_total_loss"])
     assert math.isfinite(poisoned_metrics["final_lm_loss"])
     assert poisoned_metrics["loss_source"].startswith("result['loss']")
+
+    # 数据采样若暗中使用 torch 全局 RNG，必须被判为不可复现：
+    # 构造一个在 batch() 里消耗全局 RNG 的桩数据集，确认检查
+    # 不是恒真。
+    class _GlobalRngDependentDataset:
+        def batch(self, split, batch_size, generator, device):
+            torch.rand(1)
+            inputs = torch.zeros(
+                (batch_size, 4),
+                dtype=torch.int32,
+                device=device,
+            )
+            targets = torch.zeros(
+                (batch_size, 4),
+                dtype=torch.uint8,
+                device=device,
+            )
+            return inputs, targets
+
+    rng_dependent_metrics = run_sanity_overfit(
+        sanity_cfg,
+        _GlobalRngDependentDataset(),
+        eval_device,
+        amp_dtype=None,
+        batch_size=2,
+        steps=1,
+        lr=1e-9,
+        loss_threshold=0.0,
+        acc_threshold=1.0,
+        seed=321,
+    )
+    assert not rng_dependent_metrics["passed"]
+    assert (
+        rng_dependent_metrics[
+            "data_sampling_uses_explicit_generator"
+        ]
+        is False
+    ), rng_dependent_metrics
 
     # 运行元数据必须包含代码版本与随机种子相关的追踪字段。
     metadata = collect_run_metadata(torch.device("cpu"))
