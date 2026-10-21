@@ -19791,6 +19791,40 @@ def _baseline_tuning_seed_count(
     return None
 
 
+def _baseline_tuning_axis_error(
+    record: Dict[str, object],
+) -> Optional[str]:
+    """
+    核对坐标式多轴调参报告是否覆盖了每个声明的轴。
+
+    某个轴没有有效 winner 时，推荐配置只会回退到该轴的基线值：
+    报告仍可能因为学习率轴有 winner 而被读回，但缺失轴并没有
+    被调过参。调用方不能把这种不完整报告当成「基线已充分调参」
+    的证据。单轴旧报告没有 axes 字段，返回 None 保持兼容。
+    """
+    axis_reports = record.get("axes")
+    if not isinstance(axis_reports, list) or not axis_reports:
+        return None
+    for axis_report in axis_reports:
+        if not isinstance(axis_report, dict):
+            return "调参报告的轴记录格式非法：无法核对每个轴是否都有 winner"
+        key = axis_report.get("protocol_key")
+        if not isinstance(key, str) or not key:
+            return "调参报告存在缺少 protocol_key 的轴记录：无法核对调参轴"
+        axis_winner = axis_report.get("winner")
+        if (
+            not isinstance(axis_winner, dict)
+            or axis_winner.get("value") is None
+        ):
+            label = str(axis_report.get("label", key))
+            return (
+                f"调参报告的轴 {label}（{key}）没有有效 winner："
+                "该轴没有可用的候选结果，推荐配置只是回退到"
+                "基线值，不能作为该轴已调参的证据"
+            )
+    return None
+
+
 def baseline_adequacy(
     rows: List[Dict[str, object]],
     baseline_mode: Optional[str],
@@ -20157,6 +20191,14 @@ def baseline_adequacy(
             if not isinstance(record, dict):
                 continue
             run_name = str(row.get("run"))
+            axis_error = _baseline_tuning_axis_error(record)
+            if axis_error is not None:
+                report["advisories"].append(
+                    f"基线 {run_name} 的调参来源不完整："
+                    + axis_error
+                    + "；不把该记录作为基线已调参的证据"
+                )
+                continue
             winner_lr = record.get("winner_lr")
             if winner_lr is None:
                 winner = record.get("winner")
@@ -20328,6 +20370,8 @@ def baseline_adequacy(
             record = row.get("baseline_tuning")
             if not isinstance(record, dict):
                 continue
+            if _baseline_tuning_axis_error(record) is not None:
+                continue
             winner_lr = record.get("winner_lr")
             if winner_lr is None:
                 winner = record.get("winner")
@@ -20414,6 +20458,8 @@ def baseline_adequacy(
                     )
                     own_tuning = bool(
                         record_mode == row_mode
+                        and _baseline_tuning_axis_error(record)
+                        is None
                         and isinstance(seed_plan, dict)
                         and record_seeds is not None
                         and record_seeds >= _MIN_SEEDS_FOR_STATS
@@ -33877,6 +33923,54 @@ def run_self_test():
         }
         assert multi_record["recommended_config_evaluated"] is False
 
+        # 某个轴没有 winner 的坐标式报告不能作为来源：推荐配置
+        # 在该轴只是回退到基线值，实际没有调过该轴。
+        incomplete_report = dict(multi_report)
+        incomplete_axes = [
+            dict(axis_report)
+            for axis_report in multi_report["axes"]
+        ]
+        for axis_report in incomplete_axes:
+            if axis_report.get("protocol_key") == "dense_fnn_hidden":
+                axis_report["winner"] = None
+        incomplete_report["axes"] = incomplete_axes
+        incomplete_error = baseline_tuning_provenance_error(
+            incomplete_report,
+            mode="dense",
+            lr=1e-4,
+            steps=100,
+            data_sha256="deadbeef",
+            batch_size=8,
+            protocol=multi_protocol,
+        )
+        assert incomplete_error is not None
+        assert "dense_fnn_hidden" in incomplete_error
+        assert "没有有效 winner" in incomplete_error
+
+        incomplete_record = dict(multi_record)
+        incomplete_record["axes"] = incomplete_axes
+        incomplete_adequacy_path = _write_analysis_run(
+            "incomplete_axis_seed1",
+            "dense",
+            1,
+            1e-4,
+            100,
+            0.01,
+            4.0,
+            reference=good_reference,
+            baseline_tuning=incomplete_record,
+        )
+        incomplete_adequacy = baseline_adequacy(
+            compare_runs([incomplete_adequacy_path]),
+            "dense",
+            "val_loss",
+        )
+        assert incomplete_adequacy["tuned"] is False
+        assert any(
+            "调参来源不完整" in message
+            for message in incomplete_adequacy["advisories"]
+        )
+
         # 候选之间训练配置不一致：调参结论无效，必须报 issue
         # （否则「更优 lr」可能与「训练更久」混杂）。
         config_break_path = _write_analysis_run(
@@ -36817,6 +36911,14 @@ def baseline_tuning_provenance_error(
         )
 
     winner = payload.get("winner") or {}
+
+    axis_error = _baseline_tuning_axis_error(payload)
+    if axis_error is not None:
+        return (
+            axis_error
+            + "。不完整的坐标式调参报告不能作为基线来源；"
+            "请补齐所有轴的候选后重新调参"
+        )
 
     # 调参轴与推荐取值：单轴报告（学习率）取 winner.lr；多轴
     # （坐标式）报告逐轴取该轴 winner——推荐配置是各轴 winner
