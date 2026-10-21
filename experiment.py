@@ -7961,6 +7961,9 @@ def _ngram_extended_metrics(
     order: int,
     split: str,
     include_auc: bool = True,
+    bootstrap_replicates: int = 0,
+    bootstrap_seed: Optional[int] = None,
+    window_sink: Optional[List[Dict[str, float]]] = None,
 ) -> Dict[str, object]:
     """
     用调优好的 (order, alpha) 在固定窗口上计算与神经模型
@@ -7971,6 +7974,14 @@ def _ngram_extended_metrics(
     ``include_auc=False`` 时跳过 AUC（网格调参只需要
     accuracy/F1 等分类指标时不收集整张概率矩阵，显著降低
     候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
+
+    ``bootstrap_replicates > 1`` 时额外给出与神经模型同口径的
+    逐窗口 bootstrap 置信区间（loss / ppl / token accuracy /
+    macro F1）。统计基线是确定性的，换 seed 重复运行不是独立
+    重复；它的评估不确定性只能来自评估窗口抽样，因此这个区间
+    是 ngram 对照唯一的误差线来源。``window_sink`` 非 None 时
+    逐窗口记录损失和、token 数与命中数，供跨运行逐窗口配对
+    比较使用（固定评估窗口对所有运行相同）。
     """
     vocab_size = model.vocab_size
 
@@ -7993,6 +8004,13 @@ def _ngram_extended_metrics(
         vocab_size,
         dtype=torch.float64,
     )
+
+    bootstrap_enabled = int(bootstrap_replicates) > 1
+    window_loss_sums: List[float] = []
+    window_tokens: List[float] = []
+    window_true_positive: List[torch.Tensor] = []
+    window_predicted: List[torch.Tensor] = []
+    window_support: List[torch.Tensor] = []
 
     # 与神经模型评估同口径：按窗口总位置数分配收集缓冲
     # （不超过上限），逐窗口写入。不做 AUC 时不分配缓冲区。
@@ -8056,6 +8074,36 @@ def _ngram_extended_metrics(
         )
 
         predicted = probabilities.argmax(dim=1)
+        correct = targets == predicted
+
+        if window_sink is not None:
+            window_sink.append({
+                "loss_sum": float(token_nll.sum()),
+                "tokens": int(targets.numel()),
+                "correct": int(correct.sum()),
+            })
+
+        if bootstrap_enabled:
+            window_loss_sums.append(float(token_nll.sum()))
+            window_tokens.append(float(targets.numel()))
+            window_true_positive.append(
+                torch.bincount(
+                    targets[correct],
+                    minlength=vocab_size,
+                )
+            )
+            window_predicted.append(
+                torch.bincount(
+                    predicted,
+                    minlength=vocab_size,
+                )
+            )
+            window_support.append(
+                torch.bincount(
+                    targets,
+                    minlength=vocab_size,
+                )
+            )
 
         confusion += torch.bincount(
             targets * vocab_size + predicted,
@@ -8113,6 +8161,34 @@ def _ngram_extended_metrics(
             vocab_size,
         )
         for key, value in auc_metrics.items():
+            metrics[f"{split}_{key}"] = value
+
+    if bootstrap_enabled and window_loss_sums:
+        if bootstrap_seed is not None:
+            seed_value = int(bootstrap_seed)
+        else:
+            # 调用方未给种子时由窗口内容派生：同一批固定窗口
+            # 在重复评估中得到同一区间，不受全局 RNG 影响。
+            material = b"|".join(
+                window.numpy().tobytes() for window in windows
+            )
+            seed_value = int.from_bytes(
+                hashlib.blake2b(
+                    material,
+                    digest_size=8,
+                ).digest(),
+                "big",
+            )
+        bootstrap_metrics = _bootstrap_eval_intervals(
+            torch.tensor(window_loss_sums, dtype=torch.float64),
+            torch.tensor(window_tokens, dtype=torch.float64),
+            torch.stack(window_true_positive),
+            torch.stack(window_predicted),
+            torch.stack(window_support),
+            int(bootstrap_replicates),
+            seed_value,
+        )
+        for key, value in bootstrap_metrics.items():
             metrics[f"{split}_{key}"] = value
 
     return metrics
@@ -8413,12 +8489,28 @@ def run_statistical_baseline(
     )
 
     # ---- 用调优好的配置算同口径完整指标 ----
+    # 统计基线是确定性的：评估不确定性只能来自评估窗口抽样，
+    # 因此与神经模型同口径给出逐窗口 bootstrap 区间，并落盘
+    # 逐窗口记录供跨运行配对比较。
+    bootstrap_replicates = int(
+        getattr(args, "eval_bootstrap", 0)
+    )
+    val_window_records: List[Dict[str, float]] = []
     final_metrics = _ngram_extended_metrics(
         model,
         val_windows,
         best_alpha,
         best_order,
         split="val",
+        bootstrap_replicates=bootstrap_replicates,
+        bootstrap_seed=_eval_bootstrap_seed(
+            dataset.data_sha256,
+            "val",
+            args.eval_batches,
+            args.batch_size,
+            dataset.seq_len,
+        ),
+        window_sink=val_window_records,
     )
 
     final_record = {
@@ -8439,6 +8531,41 @@ def run_statistical_baseline(
             ensure_ascii=False,
         )
     )
+
+    if val_window_records:
+        overlap_fraction: Optional[float] = None
+        starts = dataset._fixed_starts.get(
+            "val", {}
+        ).get("starts")
+        if starts is not None and len(starts) > 1:
+            gaps = starts[1:] - starts[:-1]
+            overlap_count = int(
+                (gaps < dataset.seq_len).sum().item()
+            )
+            overlap_fraction = overlap_count / (
+                len(starts) - 1
+            )
+        eval_windows_payload: Dict[str, object] = {
+            "split": "val",
+            "data_sha256": dataset.data_sha256,
+            "split_sha256": dataset.split_sha256.get("val"),
+            "seq_len": int(dataset.seq_len),
+            "batch_size": int(args.batch_size),
+            "batches": int(args.eval_batches),
+            "n_windows": len(val_window_records),
+            "overlap_fraction": overlap_fraction,
+            "windows": val_window_records,
+        }
+        with open(
+            out_dir / "eval_windows.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                _json_safe(eval_windows_payload),
+                f,
+                ensure_ascii=False,
+            )
 
     # ---- 一次性 test 评估（沿用训练运行同一封存协议）----
     # 注意：本入口每次运行都会新建输出目录语义（metrics.jsonl
@@ -8542,6 +8669,14 @@ def run_statistical_baseline(
                 best_alpha,
                 best_order,
                 split="test",
+                bootstrap_replicates=bootstrap_replicates,
+                bootstrap_seed=_eval_bootstrap_seed(
+                    dataset.data_sha256,
+                    "test",
+                    args.eval_batches,
+                    args.batch_size,
+                    dataset.seq_len,
+                ),
             )
 
             _write({
@@ -27258,6 +27393,72 @@ def run_self_test():
     )
     assert raw_ngram.train_total == 48
     assert cleaned_ngram.train_total == 28
+
+    # 统计基线的评估误差线：与神经模型同口径的逐窗口 bootstrap
+    # 与逐窗口记录（供配对比较）。ngram 是确定性的，换 seed
+    # 不是独立重复，窗口抽样是它唯一可报告的评估不确定性。
+    ngram_boot_windows = [
+        torch.tensor(
+            [[65, 66, 65, 66, 65, 66, 65, 66, 65 + row % 2]],
+            dtype=torch.uint8,
+        )
+        for row in range(8)
+    ]
+    ngram_window_sink: List[Dict[str, float]] = []
+    ngram_boot = _ngram_extended_metrics(
+        cleaned_ngram,
+        ngram_boot_windows,
+        alpha=1.0,
+        order=2,
+        split="val",
+        include_auc=False,
+        bootstrap_replicates=128,
+        bootstrap_seed=2024,
+        window_sink=ngram_window_sink,
+    )
+    assert len(ngram_window_sink) == len(ngram_boot_windows)
+    assert int(ngram_boot["val_bootstrap_windows"]) == len(
+        ngram_boot_windows
+    )
+    assert int(ngram_boot["val_bootstrap_replicates"]) == 128
+    assert (
+        float(ngram_boot["val_loss_ci95_low"])
+        <= float(ngram_boot["val_loss"])
+        <= float(ngram_boot["val_loss_ci95_high"])
+    )
+    assert (
+        float(ngram_boot["val_macro_f1_ci95_low"])
+        <= float(ngram_boot["val_macro_f1_ci95_high"])
+    )
+    sink_tokens = sum(
+        item["tokens"] for item in ngram_window_sink
+    )
+    sink_loss = sum(
+        item["loss_sum"] for item in ngram_window_sink
+    )
+    sink_correct = sum(
+        item["correct"] for item in ngram_window_sink
+    )
+    assert abs(
+        sink_loss / sink_tokens - float(ngram_boot["val_loss"])
+    ) < 1e-12
+    assert abs(
+        sink_correct / sink_tokens
+        - float(ngram_boot["val_token_accuracy"])
+    ) < 1e-12
+    # 同一批窗口、同一 seed 得到逐位相同的区间，不扰动全局 RNG。
+    ngram_boot_repeat = _ngram_extended_metrics(
+        cleaned_ngram,
+        ngram_boot_windows,
+        alpha=1.0,
+        order=2,
+        split="val",
+        include_auc=False,
+        bootstrap_replicates=128,
+        bootstrap_seed=2024,
+    )
+    for key, value in ngram_boot.items():
+        assert ngram_boot_repeat[key] == value
 
     dedup_reference = compute_reference_baselines(
         dedup_dataset,
