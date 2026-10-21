@@ -8554,26 +8554,32 @@ def _sparkline(values, width=48):
     """
     把一列数值渲染成等宽 Unicode 走势条，便于在终端快速扫
     训练曲线走势；数值越小时块越低（损失越小越靠下）。
+
+    width<=0 返回空串；width=1 时只保留最后一个点（最近一次
+    观测），避免降采样的端点插值除以 width-1。
     """
     values = [float(value) for value in values]
 
-    if not values:
+    if not values or width <= 0:
         return ""
 
     if len(values) > width:
-        # 采样必须覆盖两个端点：等距取整会让最后一个点落在
-        # int((width-1)*stride) < len-1 上被丢掉，走势条看不到
-        # 训练末段的收敛/发散，而末段恰恰是诊断最关心的部分。
-        last = len(values) - 1
-        values = [
-            values[
-                min(
-                    last,
-                    int(round(index * last / (width - 1))),
-                )
+        if width == 1:
+            values = [values[-1]]
+        else:
+            # 采样必须覆盖两个端点：等距取整会让最后一个点落在
+            # int((width-1)*stride) < len-1 上被丢掉，走势条看不到
+            # 训练末段的收敛/发散，而末段恰恰是诊断最关心的部分。
+            last = len(values) - 1
+            values = [
+                values[
+                    min(
+                        last,
+                        int(round(index * last / (width - 1))),
+                    )
+                ]
+                for index in range(width)
             ]
-            for index in range(width)
-        ]
 
     low = min(values)
     high = max(values)
@@ -27111,6 +27117,16 @@ def run_self_test():
         )
         safe_records = read_metrics_records(safe_path)
     assert safe_records[0]["train_loss"] is None
+
+    # 走势条：空输入/非正宽度不报错；宽度 1 不因降采样
+    # 除以 width-1 崩溃；正常降采样同时覆盖首尾点。
+    assert _sparkline([], 48) == ""
+    assert _sparkline([1.0, 2.0, 3.0], 0) == ""
+    assert len(_sparkline([1.0, 2.0, 3.0], 1)) == 1
+    spark = _sparkline(list(range(100)), 48)
+    assert len(spark) == 48
+    assert spark[0] == _SPARK_BLOCKS[0]
+    assert spark[-1] == _SPARK_BLOCKS[-1]
 
     # 曲线诊断必须区分过拟合 / 欠拟合 / 未收敛 / 发散 / 健康。
     baseline = math.log(256.0)
