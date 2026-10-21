@@ -42807,20 +42807,44 @@ def main():
                 f"{sanity_result['final_token_accuracy']:.4f}"
             )
         elif reproducibility["identical"] is not False:
-            print(
-                "[sanity] FAILED: 模型未能在小批量上过拟合 "
-                f"(initial total_loss="
-                f"{sanity_result['initial_total_loss']}, "
-                f"final total_loss="
-                f"{sanity_result['final_total_loss']:.4f}, "
-                f"token_acc="
-                f"{sanity_result['final_token_accuracy']:.4f}, "
-                f"relative_reduction="
-                f"{sanity_result['loss_reduction']})。"
-                "这通常意味着梯度没有反向传播、损失计算错误、"
-                "优化器或学习率配置有严重问题；请先排查再开始"
-                "全量训练。确需跳过可用 --skip-sanity-check。"
-            )
+            if not sanity_result.get(
+                "data_sampling_uses_explicit_generator",
+                True,
+            ):
+                print(
+                    "[sanity] FAILED: 数据采样消耗了 torch 全局 "
+                    "RNG（未完全使用传入的 torch.Generator）。"
+                    "同一份数据会随模型初始化等其他全局随机"
+                    "消耗的顺序漂移，同种子难以稳定复现；请先"
+                    "修正数据管线的随机源再开始全量训练。"
+                )
+            elif not sanity_result.get(
+                "gradient_flow_ok",
+                True,
+            ):
+                print(
+                    "[sanity] FAILED: 梯度检查未通过"
+                    "（缺失/全零/非有限梯度或损失未连入"
+                    "计算图），具体失败项见上方 [sanity] "
+                    "梯度检查与排查建议；请先修复反向传播"
+                    "路径再开始全量训练。"
+                )
+            else:
+                print(
+                    "[sanity] FAILED: 模型未能在小批量上过拟合 "
+                    f"(initial total_loss="
+                    f"{sanity_result['initial_total_loss']}, "
+                    f"final total_loss="
+                    f"{sanity_result['final_total_loss']:.4f}, "
+                    f"token_acc="
+                    f"{sanity_result['final_token_accuracy']:.4f}, "
+                    f"relative_reduction="
+                    f"{sanity_result['loss_reduction']})。"
+                    "这通常意味着梯度没有反向传播、损失计算"
+                    "错误、优化器或学习率配置有严重问题；请先"
+                    "排查再开始全量训练。确需跳过可用 "
+                    "--skip-sanity-check。"
+                )
 
     if args.sanity_only or (
         sanity_result is not None
