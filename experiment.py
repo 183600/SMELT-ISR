@@ -6324,7 +6324,6 @@ def _bootstrap_eval_intervals(
     window_true_positive: torch.Tensor,
     window_predicted: torch.Tensor,
     window_support: torch.Tensor,
-    present_classes: torch.Tensor,
     replicates: int,
     seed: int,
     ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
@@ -6337,9 +6336,10 @@ def _bootstrap_eval_intervals(
     - 重采样单位是完整评估窗口，不是 token：同一窗口内的
       token 由同一段上下文产生，逐 token 重采样会把相关样本
       当成独立样本，低估评估不确定性；
-    - macro F1 的类别集合固定为全量评估中 support>0 的类，
-      重采样缺少某个稀有类时不改变指标定义，避免置信区间
-      与点估计口径不一致；
+    - macro F1 的类别集合按每个重采样中实际出现的类确定
+      （support>0），与点估计「只对评估集中出现过的类平均」
+      完全同口径。若固定为全量类别集合、把重采样缺席的稀有
+      类按 F1=0 计入，区间会系统性偏低，甚至不覆盖点估计；
     - 重采样不进入训练、选型或超参数决策，只用于报告
       「测试集只评估一次」时点估计本身的抽样误差；
     - 只覆盖混淆矩阵口径的指标；AUC 等排序指标未纳入。
@@ -6395,15 +6395,17 @@ def _bootstrap_eval_intervals(
         * recall[nonzero]
         / denominator[nonzero]
     )
-    mask = present_classes.to(torch.bool)
-    if bool(mask.any()):
-        sampled_macro_f1 = f1[:, mask].mean(dim=1)
-    else:
-        sampled_macro_f1 = torch.full(
-            (int(replicates),),
-            float("nan"),
-            dtype=torch.float64,
-        )
+    # 每个重采样都有自己的类别集合：只对本次抽样中 support>0
+    # 的类求平均。固定全量类别集合会把「本次抽样恰好没有该
+    # 稀有类」当成 F1=0，使 bootstrap 分布整体下移。
+    sampled_present = sampled_support > 0.0
+    sampled_class_counts = sampled_present.sum(dim=1)
+    sampled_macro_f1 = (
+        (f1 * sampled_present).sum(dim=1)
+        / sampled_class_counts.clamp_min(1.0)
+    )
+    if bool((sampled_class_counts == 0).any()):
+        sampled_macro_f1[sampled_class_counts == 0] = float("nan")
 
     # 窗口间 lag-1 自相关：bootstrap 把窗口当 i.i.d. 抽样单位，
     # 但固定窗口沿评估序列排列，窗口指标常随数据顺序渐变（同一
@@ -6468,7 +6470,7 @@ def _bootstrap_eval_intervals(
         ("token_accuracy", sampled_accuracy),
         ("macro_f1", sampled_macro_f1),
     ):
-        if name == "macro_f1" and not bool(mask.any()):
+        if not bool(torch.isfinite(values).any()):
             continue
         low, high = _percentile_interval(values, ci_level)
         if inflation > 1.0:
@@ -7118,14 +7120,12 @@ def evaluate(
         metrics[f"{split}_{key}"] = value
 
     if bootstrap_enabled and window_loss_sums:
-        present_classes = confusion.sum(dim=1) > 0
         bootstrap_metrics = _bootstrap_eval_intervals(
             torch.cat(window_loss_sums),
             torch.cat(window_tokens),
             torch.stack(window_true_positive),
             torch.stack(window_predicted),
             torch.stack(window_support),
-            present_classes.cpu(),
             int(bootstrap_replicates),
             _eval_bootstrap_seed(
                 dataset.data_sha256,
@@ -29601,14 +29601,12 @@ def run_self_test():
         predicted_per_window[row, (row + 1) % 4] = 2
         support_per_window[row, (row + 1) % 4] = 2
         support_per_window[row, (row + 2) % 4] = 2
-    present = torch.ones(4, dtype=torch.bool)
     boot_a = _bootstrap_eval_intervals(
         loss_totals,
         token_totals,
         tp_per_window,
         predicted_per_window,
         support_per_window,
-        present,
         replicates=300,
         seed=12345,
     )
@@ -29618,7 +29616,6 @@ def run_self_test():
         tp_per_window,
         predicted_per_window,
         support_per_window,
-        present,
         replicates=300,
         seed=12345,
     )
@@ -29648,7 +29645,6 @@ def run_self_test():
         tp_per_window,
         predicted_per_window,
         support_per_window,
-        present,
         replicates=200,
         seed=7,
     )
@@ -29665,6 +29661,33 @@ def run_self_test():
         float(constant_boot["window_effective_windows"])
         == float(windows)
     )
+
+    # macro F1 的 bootstrap 类别集合必须随重采样变化：某稀有类
+    # 只出现在一个窗口时，重采样常常完全抽不到它。若仍按全量
+    # 类别集合把缺席类记成 F1=0，全部预测正确也会得到 0.75；
+    # 按「本次重采样中出现的类」平均则恒为 1，与点估计同口径。
+    perfect_tp = torch.zeros((windows, 4), dtype=torch.int64)
+    perfect_predicted = torch.zeros_like(perfect_tp)
+    perfect_support = torch.zeros_like(perfect_tp)
+    for row in range(windows):
+        for class_id in (0, 1, 2):
+            perfect_tp[row, class_id] = 3
+            perfect_predicted[row, class_id] = 3
+            perfect_support[row, class_id] = 3
+    perfect_tp[windows - 1, 3] = 1
+    perfect_predicted[windows - 1, 3] = 1
+    perfect_support[windows - 1, 3] = 1
+    perfect_boot = _bootstrap_eval_intervals(
+        loss_totals,
+        token_totals,
+        perfect_tp,
+        perfect_predicted,
+        perfect_support,
+        replicates=300,
+        seed=13,
+    )
+    assert abs(float(perfect_boot["macro_f1_ci95_low"]) - 1.0) < 1e-12
+    assert abs(float(perfect_boot["macro_f1_ci95_high"]) - 1.0) < 1e-12
 
     # ---- 评估窗口自相关：bootstrap 区间按 AR(1) 放宽 ----
     # 沿序列单调上升的窗口 loss 是强正自相关（ρ̂1 高），
@@ -29694,7 +29717,6 @@ def run_self_test():
         trend_tp,
         trend_pred,
         trend_sup,
-        present,
         replicates=200,
         seed=11,
     )
@@ -29721,7 +29743,6 @@ def run_self_test():
         trend_tp,
         trend_pred,
         trend_sup,
-        present,
         replicates=200,
         seed=11,
     )
@@ -29747,7 +29768,6 @@ def run_self_test():
         trend_tp,
         trend_pred,
         trend_sup,
-        present,
         replicates=200,
         seed=11,
     )
