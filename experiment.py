@@ -21803,6 +21803,19 @@ _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+
+def _hypothesis_supported_metrics(name: str) -> Tuple[str, ...]:
+    """词表名字对应的可判定指标，含共同步数派生口径。"""
+    expanded: List[str] = []
+    for metric in _HYPOTHESIS_METRIC_SUPPORT.get(name, ()):
+        if metric not in expanded:
+            expanded.append(metric)
+        common_step = _common_step_metric_name(metric)
+        if common_step is not None and common_step not in expanded:
+            expanded.append(common_step)
+    return tuple(expanded)
+
+
 # 路由诊断类判定指标依赖 routing_analysis：dense 基线、
 # --skip-routing-analysis 或旧运行没有该记录时，假设无法被
 # 当前运行的数据判定。
@@ -21914,7 +21927,7 @@ def hypothesis_metric_unverifiable(
     for name in mentions:
         supported = [
             metric
-            for metric in _HYPOTHESIS_METRIC_SUPPORT.get(name, ())
+            for metric in _hypothesis_supported_metrics(name)
             if metric in COMPARISON_METRIC_KEYS
         ]
         if not supported:
@@ -22052,7 +22065,7 @@ def hypothesis_preregistration_error(
     hypothesis_text = args.hypothesis or ""
     mentions = hypothesis_metric_mentions(hypothesis_text)
     aligned = any(
-        primary_metric in _HYPOTHESIS_METRIC_SUPPORT.get(name, ())
+        primary_metric in _hypothesis_supported_metrics(name)
         for name in mentions
     )
     if not aligned:
@@ -34630,10 +34643,24 @@ def run_self_test():
         assert hypothesis_preregistration_error(
             _prereg_args(
                 hypothesis="延迟合并使 macro F1 提升",
+                primary_metric="val_macro_f1_at_common_step",
+                hypothesis_direction="increase",
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                hypothesis="延迟合并使 macro F1 提升",
                 primary_metric="val_weighted_f1",
                 hypothesis_direction="increase",
             )
         ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                primary_metric="val_loss_at_common_step",
+                hypothesis_direction="decrease",
+                hypothesis_min_effect=0.02,
+            )
+        ) is None
         assert hypothesis_preregistration_error(
             _prereg_args(
                 primary_metric="val_loss",
