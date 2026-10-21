@@ -9037,6 +9037,19 @@ _CURVE_GAP_WIDENING = 0.05
 # （默认调度为 cosine 退火到峰值的 10%，留少量余量）。
 _CURVE_LR_ANNEALED_FRACTION = 0.15
 
+# 最近一次验证间隔内训练与验证损失同时相对上升达到该比例
+# 时，判定为有限发散/训练不稳定（不是过拟合：过拟合要求训练
+# 损失仍在下降）。这类曲线继续训练通常只会更糟，应优先降低
+# 学习率、收紧梯度裁剪并从稳定检查点恢复。
+_CURVE_DIVERGENCE_RISE = 0.10
+
+# 梯度范数尖峰预警：近期窗口最大值达到此前中位数的该倍数时，
+# 即使损失尚未变成 NaN，也提示梯度爆炸/学习率过大的前兆。
+_CURVE_GRAD_SPIKE_RATIO = 5.0
+_CURVE_GRAD_SPIKE_MIN_HISTORY = 20
+_CURVE_GRAD_SPIKE_RECENT_FRACTION = 0.2
+_CURVE_GRAD_SPIKE_MIN_RECENT = 5
+
 _SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 
 
@@ -9115,16 +9128,26 @@ def analyze_training_curve(
       收敛平台，报告会结合记录中的 lr 曲线区分两种情形）；
     - ``not_converged``：最近一次间隔内训练与验证损失仍同步
       明显下降，说明训练步数/学习率还没到平台；
+    - ``diverging``：最近一次间隔内训练与验证损失同时明显
+      上升（有限发散/训练不稳定），需要降低学习率、收紧
+      梯度裁剪并从稳定检查点恢复；
     - ``diverged``：最近一步损失非有限（NaN/Inf）；
     - ``healthy``：验证仍在改善（或训练验证同步缓降）且
       验证未回升；
     - ``insufficient_data``：验证点不足以做结论。
 
+    除状态外还检查「尚未 NaN 的前兆」：近期梯度范数达到此前
+    中位数的 ``_CURVE_GRAD_SPIKE_RATIO`` 倍时置
+    ``grad_norm_spike_warning``，即使曲线仍被判为 healthy/
+    plateau 也会在 warnings 中提示排查梯度爆炸/学习率过大。
+
     返回的诊断会追加为 ``{"step": "curve_analysis", ...}``
     记录，并打印对应建议（过拟合→正则化/增大数据/早停，
-    欠拟合/双平台→查学习率、优化器与数据管道）。
+    欠拟合/双平台→查学习率、优化器与数据管道，有限发散→
+    降学习率/收紧裁剪/从稳定检查点恢复）。
     """
     train_points: List[Tuple[int, float]] = []
+    grad_points: List[Tuple[int, float]] = []
     nonfinite_steps: List[int] = []
     eval_points: List[Dict[str, object]] = []
     pending: List[float] = []
@@ -9165,6 +9188,13 @@ def analyze_training_curve(
                 train_loss = float(train_loss)
                 train_points.append((step, train_loss))
                 pending.append(train_loss)
+
+            # 有限梯度范数序列：用于在损失尚未变成 NaN 时发现
+            # 梯度尖峰（爆炸/学习率过大的前兆）。
+            if "grad_norm" in record and not grad_nonfinite:
+                grad_points.append(
+                    (step, float(grad_norm))
+                )
 
             # 学习率曲线（每步记录）：用于区分「双平台」是调度
             # 末期的正常收敛，还是高学习率下的训练停滞。
@@ -9239,10 +9269,59 @@ def analyze_training_curve(
 
     warnings: List[str] = []
 
+    # 梯度尖峰：与「此前中位数」比较而不是与绝对阈值比较，
+    # 不同模型/模式的正常梯度量级差异很大。只把近期窗口纳入
+    # 判断，早期 warmup 的高梯度不应让最终报告永久报警。
+    grad_spike = False
+    grad_spike_ratio: Optional[float] = None
+    grad_spike_recent_max: Optional[float] = None
+    grad_prior_median: Optional[float] = None
+    if len(grad_points) >= _CURVE_GRAD_SPIKE_MIN_HISTORY:
+        grad_values = [value for _, value in grad_points]
+        recent_count = max(
+            _CURVE_GRAD_SPIKE_MIN_RECENT,
+            int(
+                len(grad_values)
+                * _CURVE_GRAD_SPIKE_RECENT_FRACTION
+            ),
+        )
+        recent_count = min(recent_count, len(grad_values) - 1)
+        prior_values = sorted(grad_values[:-recent_count])
+        grad_spike_recent_max = max(
+            grad_values[-recent_count:]
+        )
+        grad_prior_median = prior_values[
+            len(prior_values) // 2
+        ]
+        if grad_prior_median > 0.0:
+            grad_spike_ratio = (
+                grad_spike_recent_max / grad_prior_median
+            )
+            grad_spike = (
+                grad_spike_ratio
+                >= _CURVE_GRAD_SPIKE_RATIO
+            )
+
     analysis: Dict[str, object] = {
         "n_train_steps": len(train_points),
         "n_eval_points": len(finite_evals),
         "n_nonfinite_events": len(nonfinite_steps),
+        "recent_grad_norm_max": (
+            round(grad_spike_recent_max, 6)
+            if grad_spike_recent_max is not None
+            else None
+        ),
+        "prior_grad_norm_median": (
+            round(grad_prior_median, 6)
+            if grad_prior_median is not None
+            else None
+        ),
+        "grad_norm_spike_ratio": (
+            round(grad_spike_ratio, 6)
+            if grad_spike_ratio is not None
+            else None
+        ),
+        "grad_norm_spike_warning": bool(grad_spike),
         "nonfinite_steps": nonfinite_steps[-10:],
         "peak_lr": peak_lr,
         "last_lr": last_lr,
@@ -9270,11 +9349,24 @@ def analyze_training_curve(
             "diagnose_non_finite 输出的 nan_diagnosis 记录）。"
         )
 
+    if grad_spike:
+        warnings.append(
+            "近期梯度范数最大值 "
+            f"{grad_spike_recent_max:.4g} 是此前中位数 "
+            f"{grad_prior_median:.4g} 的 "
+            f"{grad_spike_ratio:.1f} 倍：即使损失尚未变成 "
+            "NaN，也可能是梯度爆炸/学习率过大的前兆。"
+            "建议降低学习率、收紧 --grad-clip，并检查是否"
+            "已出现参数/优化器状态污染。"
+        )
+
     # 警告签名用布尔类别而不是完整文本：文本包含计数/百分比，
     # 每次验证都会变化，在线监控会退化成每点重复打印。
     analysis["warning_flags"] = {
         "nonfinite": bool(nonfinite_steps),
         "gap_widening": False,
+        "diverging": False,
+        "grad_spike": bool(grad_spike),
     }
 
     if (recent_nonfinite or last_eval_nonfinite) and (
@@ -9343,6 +9435,27 @@ def analyze_training_curve(
     recent_val_drop = _relative_drop(
         last["val_loss"],
         previous["val_loss"],
+    )
+    recent_train_rise = (
+        None
+        if recent_train_drop is None
+        else -recent_train_drop
+    )
+    recent_val_rise = (
+        None
+        if recent_val_drop is None
+        else -recent_val_drop
+    )
+
+    # 有限发散：最近一个验证间隔内训练与验证损失同时明显
+    # 上升。它不是过拟合（过拟合要求训练损失仍在下降），也不是
+    # 普通平台；继续训练通常只会更糟，必须先处理数值/优化
+    # 稳定性。
+    finite_diverging = (
+        recent_train_drop is not None
+        and recent_val_drop is not None
+        and recent_train_drop <= -_CURVE_DIVERGENCE_RISE
+        and recent_val_drop <= -_CURVE_DIVERGENCE_RISE
     )
 
     # 泛化 gap：最终训练损失比验证损失低出的相对比例。记忆化
@@ -9434,6 +9547,20 @@ def analyze_training_curve(
     analysis["warning_flags"]["gap_widening"] = bool(
         gap_widening
     )
+    analysis["recent_train_rise"] = (
+        None
+        if recent_train_rise is None
+        else round(recent_train_rise, 6)
+    )
+    analysis["recent_val_rise"] = (
+        None
+        if recent_val_rise is None
+        else round(recent_val_rise, 6)
+    )
+    analysis["finite_diverging"] = bool(finite_diverging)
+    analysis["warning_flags"]["diverging"] = bool(
+        finite_diverging
+    )
     if gap_widening:
         warnings.append(
             "泛化 gap 相对首个验证点扩大 "
@@ -9443,7 +9570,21 @@ def analyze_training_curve(
             "训练损失继续下降但验证收益停滞，是过拟合前兆。"
         )
 
-    if (
+    if finite_diverging:
+        analysis["status"] = "diverging"
+        analysis["divergence_signal"] = "both_losses_rising"
+        analysis["recommendation"] = (
+            "最近一次验证间隔内训练损失上升 "
+            f"{recent_train_rise * 100:.1f}%、验证损失上升 "
+            f"{recent_val_rise * 100:.1f}%：这不是过拟合"
+            "（过拟合时训练损失仍在下降），而是训练不稳定/"
+            "有限发散的信号。继续训练通常只会更糟。建议："
+            "降低学习率、收紧 --grad-clip、检查最近的梯度"
+            "范数尖峰与数据批次，并从发散前的最优检查点恢复；"
+            "若发生在 warmup 阶段，先确认 warmup 步数与峰值"
+            "学习率是否匹配。"
+        )
+    elif (
         best_index <= len(finite_evals) - 2
         and regression >= _CURVE_OVERFIT_REGRESSION
         and (train_still_down or train_below_val)
@@ -28984,6 +29125,65 @@ def run_self_test():
     )
     assert diverged_analysis["n_nonfinite_events"] == 2
 
+    # 有限发散：训练与验证损失同时明显上升时不能判成平台
+    # （旧实现会落到 plateau），必须给出降低学习率/收紧裁剪的
+    # 不稳定建议。
+    finite_diverging_analysis = analyze_training_curve(
+        [
+            {"step": 10, "train_loss": 5.0, "val_loss": 5.1},
+            {"step": 20, "train_loss": 4.8, "val_loss": 4.9},
+            {"step": 30, "train_loss": 3.9, "val_loss": 4.0},
+            {"step": 40, "train_loss": 4.3, "val_loss": 4.5},
+        ],
+        baseline_loss=baseline,
+    )
+    assert finite_diverging_analysis["status"] == "diverging", (
+        finite_diverging_analysis
+    )
+    assert finite_diverging_analysis["finite_diverging"] is True
+    assert finite_diverging_analysis["warning_flags"][
+        "diverging"
+    ] is True
+    assert "学习率" in str(
+        finite_diverging_analysis["recommendation"]
+    )
+    assert "grad-clip" in str(
+        finite_diverging_analysis["recommendation"]
+    )
+
+    # 梯度尖峰：损失仍然有限、曲线看起来正常时，近期梯度
+    # 范数达到此前中位数的 5 倍以上必须提前报警，而不是等到
+    # 出现 NaN 才排查。
+    grad_spike_records = []
+    for grad_step in range(1, 41):
+        grad_record = {
+            "step": grad_step,
+            "train_loss": 5.0 - 0.02 * grad_step,
+            "grad_norm": 10.0 if grad_step >= 33 else 1.0,
+        }
+        if grad_step in (10, 20, 30, 40):
+            grad_record["val_loss"] = (
+                5.0 - 0.01 * grad_step
+            )
+        grad_spike_records.append(grad_record)
+    grad_spike_analysis = analyze_training_curve(
+        grad_spike_records,
+        baseline_loss=baseline,
+    )
+    assert grad_spike_analysis[
+        "grad_norm_spike_warning"
+    ] is True, grad_spike_analysis
+    assert grad_spike_analysis["warning_flags"][
+        "grad_spike"
+    ] is True
+    assert grad_spike_analysis["grad_norm_spike_ratio"] >= (
+        _CURVE_GRAD_SPIKE_RATIO
+    )
+    assert any(
+        "梯度" in warning
+        for warning in grad_spike_analysis["warnings"]
+    )
+
     # 早期全部非有限、之后恢复且有验证点的运行：最后一个验证点
     # 之前没有任何有限训练损失（last_train_loss 为 None），但后续
     # 有限训练步使 recent_nonfinite 判定为 False、不判发散。打印
@@ -29072,6 +29272,8 @@ def run_self_test():
     assert gap_initial["warning_flags"] == {
         "nonfinite": False,
         "gap_widening": False,
+        "diverging": False,
+        "grad_spike": False,
     }, gap_initial
 
     gap_warning, gap_warning_status = monitor_training_curve(
