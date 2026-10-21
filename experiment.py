@@ -25301,7 +25301,10 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
       会让训练空转）；
     - 全部梯度必须有限（NaN/Inf 会静默污染所有参数）；
     - 非专家参数不允许缺失梯度（detach、意外 no_grad、分支
-      写死等造成的计算图断链）。
+      写死等造成的计算图断链）；
+    - 非专家参数也不允许整个张量的梯度恒为零：缺失梯度会被
+      单独拦截，但「分支执行了却乘了 0 / 被条件性地短路」只会
+      表现为全零梯度，单看全局梯度范数仍可能被其他参数掩盖。
 
     专家参数允许因本批次未路由到而缺失或为零梯度。调用方需在
     反向之后、优化器 step 之前调用（AMP 下先手动
@@ -25317,6 +25320,7 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
         "n_nonfinite_grad": 0,
         "missing_non_expert_params": [],
         "nonfinite_params": [],
+        "zero_non_expert_params": [],
         "grad_norm": None,
         "failures": [],
     }
@@ -25327,11 +25331,14 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
     nonfinite: List[str] = probe[
         "nonfinite_params"
     ]  # type: ignore[assignment]
+    zero_non_expert: List[str] = probe[
+        "zero_non_expert_params"
+    ]  # type: ignore[assignment]
 
     total_sq = 0.0
 
     # 逐参数的有限性判定与平方和打包后再一次性取回。
-    pending: List[Tuple[str, torch.Tensor]] = []
+    pending: List[Tuple[str, bool, torch.Tensor]] = []
 
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -25351,9 +25358,11 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
         probe["n_with_grad"] = int(probe["n_with_grad"]) + 1
 
         # 有限性掩码与平方和打包成 [finite, squared] 的对，
-        # 与逐参数处理的分支顺序保持一致。
+        # 与逐参数处理的分支顺序保持一致。第三项记录是否为
+        # 专家参数，供后续区分「合法未路由」与「断链零梯度」。
         pending.append((
             name,
+            id(parameter) in expert_ids,
             torch.stack([
                 torch.isfinite(grad).all().to(torch.float64),
                 grad.detach().double().pow(2).sum(),
@@ -25362,12 +25371,12 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
 
     if pending:
         values = torch.stack(
-            [packed for _, packed in pending]
+            [packed for _, _, packed in pending]
         ).tolist()
     else:
         values = []
 
-    for (name, _), packed in zip(pending, values):
+    for (name, is_expert, _), packed in zip(pending, values):
         finite_value = packed[0]
         squared = packed[1]
 
@@ -25382,6 +25391,8 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
 
         if squared == 0.0:
             probe["n_zero_grad"] = int(probe["n_zero_grad"]) + 1
+            if not is_expert:
+                zero_non_expert.append(name)
 
     probe["grad_norm"] = math.sqrt(total_sq)
 
@@ -25393,6 +25404,8 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
         failures.append("no_nonzero_gradient")
     if missing_non_expert:
         failures.append("missing_non_expert_gradients")
+    if zero_non_expert:
+        failures.append("zero_non_expert_gradients")
 
     return probe
 
@@ -25414,6 +25427,11 @@ _GRADIENT_FAILURE_HINTS = {
     "missing_non_expert_gradients": (
         "非专家参数缺失梯度：计算图在这些模块处断链"
         "（detach / no_grad / 条件分支未执行）"
+    ),
+    "zero_non_expert_gradients": (
+        "非专家参数整个张量的梯度恒为零：该模块虽然执行了，"
+        "但输出被乘 0、被条件分支短路或未参与损失；请检查"
+        "gate/掩码/分支合并处是否把有效路径清零"
     ),
 }
 
@@ -25560,6 +25578,7 @@ def run_sanity_overfit(
                         "n_nonfinite_grad": None,
                         "missing_non_expert_params": [],
                         "nonfinite_params": [],
+                        "zero_non_expert_params": [],
                         "grad_norm": None,
                         "failures": ["loss_not_connected"],
                     }
@@ -29875,6 +29894,27 @@ def run_self_test():
     assert broken_name in broken_probe[
         "missing_non_expert_params"
     ]
+
+    # 整个非专家张量的梯度被清零（不是缺失）时也必须报错：
+    # 只看全局梯度范数会被其他参数掩盖，断链分支因此漏检。
+    zero_name = None
+    for name, parameter in probe_model.named_parameters():
+        if (
+            id(parameter) not in expert_ids
+            and parameter.grad is not None
+            and bool(parameter.grad.abs().sum() > 0)
+        ):
+            parameter.grad = torch.zeros_like(parameter.grad)
+            zero_name = name
+            break
+    assert zero_name is not None
+
+    zero_probe = _probe_gradient_flow(probe_model)
+    assert (
+        "zero_non_expert_gradients"
+        in zero_probe["failures"]
+    ), zero_probe
+    assert zero_name in zero_probe["zero_non_expert_params"]
 
     # NumPy 全局随机状态必须可存档并逐位恢复；存档载荷只含
     # 基本类型，能在 weights_only=True 的 torch.load 下读取。
