@@ -14747,15 +14747,17 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         metadata = config_payload.get("run_metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+        provenance_keys = (
+            *_REPRODUCIBILITY_HARD_KEYS,
+            *_REPRODUCIBILITY_INFO_KEYS,
+            "pythonhashseed_at_start",
+        )
         row["provenance"] = {
             key: metadata.get(key)
-            for key in (
-                *_REPRODUCIBILITY_HARD_KEYS,
-                *_REPRODUCIBILITY_INFO_KEYS,
-            )
+            for key in provenance_keys
         }
-        row["provenance"]["pythonhashseed_at_start"] = (
-            metadata.get("pythonhashseed_at_start")
+        row["provenance_recorded_keys"] = sorted(
+            key for key in provenance_keys if key in metadata
         )
 
         row["n_params"] = config_payload.get("n_params")
@@ -16338,38 +16340,44 @@ def check_run_provenance(
     dirty 状态单独作为信息项：同一脚本指纹下的 commit 差异
     可能只是文档/CI 改动，不直接判违规。
     """
-    values_by_key: Dict[str, List[Tuple[str, object]]] = {
-        key: []
-        for key in (
-            *_REPRODUCIBILITY_HARD_KEYS,
-            *_REPRODUCIBILITY_INFO_KEYS,
-            "pythonhashseed_at_start",
-        )
-    }
-
+    provenance_values: List[
+        Tuple[str, Dict[str, object], set]
+    ] = []
     for row in rows:
         provenance = row.get("provenance")
         if not isinstance(provenance, dict):
             provenance = {}
-        name = str(row.get("run"))
-        for key in values_by_key:
-            values_by_key[key].append(
-                (name, provenance.get(key))
-            )
+        recorded = row.get("provenance_recorded_keys")
+        if isinstance(recorded, (list, tuple, set, frozenset)):
+            recorded_keys = {
+                str(key) for key in recorded if isinstance(key, str)
+            }
+        else:
+            recorded_keys = set(provenance)
+        provenance_values.append(
+            (str(row.get("run")), provenance, recorded_keys)
+        )
 
     checked: List[str] = []
     unchecked: List[str] = []
     mismatches: List[Dict[str, object]] = []
 
     for key in _REPRODUCIBILITY_HARD_KEYS:
-        values = values_by_key[key]
+        values = [
+            (
+                name,
+                provenance.get(key),
+                key in recorded_keys,
+            )
+            for name, provenance, recorded_keys in provenance_values
+        ]
         present = [
             (name, value)
-            for name, value in values
-            if value is not None
+            for name, value, recorded in values
+            if recorded
         ]
         missing_runs = [
-            name for name, value in values if value is None
+            name for name, _, recorded in values if not recorded
         ]
 
         if not present:
@@ -16388,28 +16396,66 @@ def check_run_provenance(
             mismatches.append({
                 "key": key,
                 "values": {
-                    name: value for name, value in values
+                    name: value
+                    for name, value, _ in values
                 },
                 "missing_runs": missing_runs,
             })
 
-    hashseed_values = values_by_key["pythonhashseed_at_start"]
+    hashseed_values = [
+        (
+            name,
+            provenance.get("pythonhashseed_at_start"),
+            "pythonhashseed_at_start" in recorded_keys,
+        )
+        for name, provenance, recorded_keys in provenance_values
+    ]
     hashseed_unset_runs = [
         name
-        for name, value in hashseed_values
-        if value is None
+        for name, value, recorded in hashseed_values
+        if recorded and value is None
+    ]
+    hashseed_unrecorded_runs = [
+        name for name, _, recorded in hashseed_values if not recorded
     ]
 
+    git_commit_values = [
+        (
+            name,
+            provenance.get("git_commit"),
+            "git_commit" in recorded_keys,
+        )
+        for name, provenance, recorded_keys in provenance_values
+    ]
     git_commits = {
         repr(_stable_factor_key(value))
-        for _, value in values_by_key["git_commit"]
-        if value is not None
+        for _, value, recorded in git_commit_values
+        if recorded and value is not None
     }
+    git_commit_missing_runs = [
+        name
+        for name, value, recorded in git_commit_values
+        if not recorded or value is None
+    ]
+
+    script_hash_values = [
+        (
+            name,
+            provenance.get("script_sha256"),
+            "script_sha256" in recorded_keys,
+        )
+        for name, provenance, recorded_keys in provenance_values
+    ]
     script_hashes = {
         repr(_stable_factor_key(value))
-        for _, value in values_by_key["script_sha256"]
-        if value is not None
+        for _, value, recorded in script_hash_values
+        if recorded and value is not None
     }
+    script_hash_missing_runs = [
+        name
+        for name, value, recorded in script_hash_values
+        if not recorded or value is None
+    ]
 
     return {
         "keys": list(_REPRODUCIBILITY_HARD_KEYS),
@@ -16417,8 +16463,12 @@ def check_run_provenance(
         "unchecked_keys": unchecked,
         "mismatches": mismatches,
         "hashseed_unset_runs": hashseed_unset_runs,
+        "hashseed_unrecorded_runs": hashseed_unrecorded_runs,
         "commits_differ": (
-            len(git_commits) > 1 and len(script_hashes) <= 1
+            len(git_commits) > 1
+            and not git_commit_missing_runs
+            and len(script_hashes) == 1
+            and not script_hash_missing_runs
         ),
         "ok": not mismatches,
     }
@@ -23983,6 +24033,13 @@ def print_comparison_analysis(
             "（set_seed 的 setdefault 无法追溯地固定当前解释器；"
             "严格逐位复现请在命令行显式设置）: "
             + ", ".join(provenance["hashseed_unset_runs"])
+        )
+    if provenance["hashseed_unrecorded_runs"]:
+        print(
+            "  [warn] 以下运行未记录启动时 PYTHONHASHSEED 状态，"
+            "无法核对是否固定（旧版本运行需在命令行显式设置后"
+            "重跑）: "
+            + ", ".join(provenance["hashseed_unrecorded_runs"])
         )
     if provenance["commits_differ"]:
         print(
@@ -38086,6 +38143,78 @@ def run_self_test():
     ])
     assert same_provenance["ok"], same_provenance["mismatches"]
     assert "script_sha256" in same_provenance["checked_keys"]
+
+    legacy_provenance = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {"git_commit": "c1"},
+        },
+        {
+            "run": "r2",
+            "provenance": {"git_commit": "c2"},
+        },
+    ])
+    assert not legacy_provenance["commits_differ"]
+    assert legacy_provenance["hashseed_unset_runs"] == []
+    assert legacy_provenance["hashseed_unrecorded_runs"] == [
+        "r1",
+        "r2",
+    ]
+
+    recorded_none = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "git_commit": "c1",
+                "pythonhashseed_at_start": None,
+            },
+        },
+        {
+            "run": "r2",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "git_commit": "c2",
+                "pythonhashseed_at_start": None,
+            },
+        },
+    ])
+    assert recorded_none["commits_differ"]
+    assert recorded_none["hashseed_unset_runs"] == ["r1", "r2"]
+    assert recorded_none["hashseed_unrecorded_runs"] == []
+
+    explicit_none_key = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "cuda_version": None,
+            },
+        },
+        {
+            "run": "r2",
+            "provenance": {
+                "script_sha256": "a" * 64,
+                "cuda_version": None,
+            },
+        },
+    ])
+    assert "cuda_version" in explicit_none_key["checked_keys"]
+    assert "cuda_version" not in explicit_none_key["unchecked_keys"]
+
+    unrecorded_sha = check_run_provenance([
+        {
+            "run": "r1",
+            "provenance": {"git_commit": "c1"},
+            "provenance_recorded_keys": ["git_commit"],
+        },
+        {
+            "run": "r2",
+            "provenance": {"git_commit": "c2"},
+            "provenance_recorded_keys": ["git_commit"],
+        },
+    ])
+    assert not unrecorded_sha["commits_differ"]
 
     # --require-pythonhashseed：启动前未设置时给出明确错误；
     # 已设置（当前解释器）或未要求时不报错。
