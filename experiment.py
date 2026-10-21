@@ -8696,6 +8696,7 @@ def _ngram_tuning_diagnostics(
     max_order: int,
     candidate_count: int,
     valid_candidate_count: int,
+    selection: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """
     汇总 n-gram (order, alpha) 网格调参的选择不确定性。
@@ -8712,7 +8713,10 @@ def _ngram_tuning_diagnostics(
       提示网格可能没有覆盖更优区域；
     - ``selection_bias_note``：val 网格调参后的同一 val 指标
       带乐观偏差，test 全程尘封，评估不确定性应看窗口
-      bootstrap 而不是重复 seed。
+      bootstrap 而不是重复 seed；
+    - ``selection``：可选的 one-SE 选择记录；给出点估计最优、
+      最终选择、并列候选与配对标准误，避免把微小噪声优势
+      当成唯一最优。
     """
     best_value = best.get(tuning_metric)
     best_value_float: Optional[float] = None
@@ -8770,6 +8774,16 @@ def _ngram_tuning_diagnostics(
             + ", ".join(boundary_hits)
             + "）：网格可能未覆盖更优区域，扩展候选后应重跑"
         )
+    if selection and not selection.get(
+        "selected_is_point_best", True
+    ):
+        advisories.append(
+            "one-SE 规则未选择点估计最优配置："
+            "与点估计 winner 的逐窗口配对差在 1 个标准误内，"
+            "按更简单优先选择 order="
+            f"{best_order}/alpha={best_alpha:g}，"
+            "避免把网格内微小噪声优势当成稳定收益"
+        )
 
     return {
         "tuning_metric": tuning_metric,
@@ -8798,7 +8812,165 @@ def _ngram_tuning_diagnostics(
             "尘封。评估不确定性应看 --eval-bootstrap 的窗口区间，"
             "不能用重复 seed 冒充独立重复"
         ),
+        "selection": selection,
         "advisories": advisories,
+    }
+
+
+def _ngram_window_tuning_value(
+    loss: float,
+    tuning_metric: str,
+) -> float:
+    """把逐窗口 loss 变换到调参指标尺度（仅损失类指标）。"""
+    if tuning_metric == "val_ppl":
+        return math.exp(min(loss, 80.0))
+    if tuning_metric == "val_bits_per_byte":
+        return loss / math.log(2.0)
+    return loss
+
+
+def _select_ngram_candidate_one_se(
+    point_best: Dict[str, object],
+    candidates: List[Dict[str, object]],
+    window_losses: Dict[Tuple[int, float], List[float]],
+    tuning_metric: str,
+) -> Optional[Dict[str, object]]:
+    """
+    对 n-gram 网格用逐窗口配对 one-SE 规则做最终选择。
+
+    点估计最优只说明「在这批 val 窗口上最小」，网格里相邻配置
+    的微小优势可能只是窗口抽样噪声。这里以点估计 winner 为
+    参照，对每个候选计算逐窗口配对差（候选 - 点估计 winner）
+    的均值与标准误；正自相关时按 AR(1) 有效窗口数放宽标准误。
+    均值差不超过一个标准误的候选视为统计上不可分辨，再按
+    「更小 order / 更小 alpha」选择更简单配置。
+
+    只对损失类指标启用；分类/AUC 指标需要完整 argmax 分布，
+    逐窗口配对 loss 不是同一口径，仍按点估计选择。
+    """
+    if tuning_metric not in (
+        "val_loss",
+        "val_ppl",
+        "val_bits_per_byte",
+    ):
+        return None
+
+    def _key(row: Dict[str, object]) -> Tuple[int, float]:
+        return int(row["order"]), float(row["alpha"])
+
+    point_key = _key(point_best)
+    point_losses = window_losses.get(point_key)
+    if not point_losses or len(point_losses) < 3:
+        return {
+            "rule": "paired_one_se",
+            "available": False,
+            "reason": "insufficient_window_losses",
+        }
+
+    n_windows = len(point_losses)
+    point_values = [
+        _ngram_window_tuning_value(loss, tuning_metric)
+        for loss in point_losses
+    ]
+    point_mean = sum(point_values) / n_windows
+    tolerance = 1e-12 * max(1.0, abs(point_mean))
+
+    tied: List[Dict[str, object]] = []
+    for candidate in candidates:
+        candidate_losses = window_losses.get(_key(candidate))
+        if (
+            candidate_losses is None
+            or len(candidate_losses) != n_windows
+        ):
+            continue
+        candidate_values = [
+            _ngram_window_tuning_value(loss, tuning_metric)
+            for loss in candidate_losses
+        ]
+        differences = [
+            value - base
+            for value, base in zip(
+                candidate_values, point_values
+            )
+        ]
+        mean_diff = sum(differences) / n_windows
+        se = _sample_std(differences) / math.sqrt(n_windows)
+        rho1 = _lag1_autocorrelation(
+            torch.tensor(differences, dtype=torch.float64)
+        )
+        _effective, inflation = _ar1_effective_windows(
+            n_windows,
+            rho1,
+        )
+        threshold = se * inflation
+        if mean_diff <= threshold + tolerance:
+            value = candidate.get(tuning_metric)
+            tied.append({
+                "order": int(candidate["order"]),
+                "alpha": float(candidate["alpha"]),
+                "value": (
+                    float(value)
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    else None
+                ),
+                "paired_mean_diff": mean_diff,
+                "paired_se": se,
+                "ar1_inflation": inflation,
+                "threshold": threshold,
+            })
+
+    if not tied:
+        return {
+            "rule": "paired_one_se",
+            "available": False,
+            "reason": "no_candidates_with_window_losses",
+        }
+
+    selected = min(
+        tied,
+        key=lambda row: (row["order"], row["alpha"]),
+    )
+    selected_row = next(
+        (
+            candidate
+            for candidate in candidates
+            if _key(candidate)
+            == (selected["order"], selected["alpha"])
+        ),
+        point_best,
+    )
+    selected_is_point_best = (
+        _key(selected_row) == point_key
+    )
+    point_value = point_best.get(tuning_metric)
+    return {
+        "rule": "paired_one_se",
+        "available": True,
+        "n_windows": n_windows,
+        "point_best": {
+            "order": point_key[0],
+            "alpha": point_key[1],
+            "value": (
+                float(point_value)
+                if isinstance(point_value, (int, float))
+                and not isinstance(point_value, bool)
+                and math.isfinite(float(point_value))
+                else None
+            ),
+        },
+        "selected": {
+            "order": int(selected_row["order"]),
+            "alpha": float(selected_row["alpha"]),
+        },
+        "selected_is_point_best": selected_is_point_best,
+        "tied": tied,
+        "note": (
+            "候选与点估计 winner 的逐窗口配对差不超过一个"
+            "标准误时按更简单优先选择；正自相关按 AR(1) "
+            "有效窗口数放宽标准误"
+        ),
     }
 
 
@@ -8911,6 +9083,9 @@ def run_statistical_baseline(
     ]
 
     candidates: List[Dict[str, object]] = []
+    candidate_window_losses: Dict[
+        Tuple[int, float], List[float]
+    ] = {}
     loss_like_metrics = (
         "val_loss",
         "val_ppl",
@@ -8952,6 +9127,30 @@ def run_statistical_baseline(
             )
             totals += -log_probs.sum(dim=1)
             tokens += log_probs.size(1)
+            if tuning_metric in loss_like_metrics:
+                # 逐窗口损失用于 one-SE 选择：同一批窗口上
+                # 候选与点估计 winner 可以按窗口配对，避免
+                # 用聚合后的小差距把噪声当成稳定收益。
+                seq_len = int(window.size(1)) - 1
+                window_means = (
+                    (-log_probs)
+                    .reshape(
+                        model.max_order,
+                        int(window.size(0)),
+                        seq_len,
+                    )
+                    .sum(dim=2)
+                    / float(seq_len)
+                )
+                for order in range(
+                    1, model.max_order + 1
+                ):
+                    candidate_window_losses.setdefault(
+                        (order, alpha),
+                        [],
+                    ).extend(
+                        window_means[order - 1].tolist()
+                    )
 
         for order in range(1, model.max_order + 1):
             val_loss = float(
@@ -9057,12 +9256,45 @@ def run_statistical_baseline(
         valid_candidates,
         key=_candidate_rank,
     )
-    best = ranked_candidates[0]
+    point_best = ranked_candidates[0]
+    best = point_best
     runner_up = (
         ranked_candidates[1]
         if len(ranked_candidates) > 1
         else None
     )
+
+    # 点估计最优可能只领先很小一截；对损失类指标用逐窗口
+    # 配对 one-SE 规则，把统计上不可分辨的候选按更简单优先
+    # 收敛，降低网格调参的 winner's curse。
+    selection = _select_ngram_candidate_one_se(
+        point_best,
+        valid_candidates,
+        candidate_window_losses,
+        tuning_metric,
+    )
+    if (
+        selection is not None
+        and selection.get("available")
+        and not selection.get("selected_is_point_best")
+    ):
+        selected_order = int(selection["selected"]["order"])
+        selected_alpha = float(selection["selected"]["alpha"])
+        selected_candidate = next(
+            (
+                candidate
+                for candidate in valid_candidates
+                if int(candidate["order"]) == selected_order
+                and abs(
+                    float(candidate["alpha"]) - selected_alpha
+                )
+                <= 1e-15
+            ),
+            None,
+        )
+        if selected_candidate is not None:
+            best = selected_candidate
+            runner_up = point_best
 
     best_order = int(best["order"])
     best_alpha = float(best["alpha"])
@@ -9074,7 +9306,35 @@ def run_statistical_baseline(
         args.ngram_max_order,
         len(candidates),
         len(valid_candidates),
+        selection=selection,
     )
+
+    if (
+        selection is not None
+        and selection.get("available")
+        and not selection.get("selected_is_point_best")
+    ):
+        selected_detail = next(
+            (
+                detail
+                for detail in selection.get("tied", [])
+                if int(detail["order"]) == best_order
+                and abs(
+                    float(detail["alpha"]) - best_alpha
+                )
+                <= 1e-15
+            ),
+            None,
+        )
+        if isinstance(selected_detail, dict):
+            print(
+                "[ngram] one-SE 选择更简单配置: "
+                f"order={best_order}, alpha={best_alpha:g}；"
+                "相对点估计最优的逐窗口配对差="
+                f"{float(selected_detail['paired_mean_diff']):.6g}"
+                "（阈值="
+                f"{float(selected_detail['threshold']):.6g}）"
+            )
 
     print(
         "[ngram] val 调优结果: order="
@@ -29203,6 +29463,92 @@ def run_self_test():
     assert "alpha=网格上界" in boundary_tuning["boundary_hits"]
     assert boundary_tuning["metric_gap"] is None
     assert boundary_tuning["advisories"]
+
+    # n-gram one-SE 选择：点估计最优只领先一个标准误以内的
+    # 更简单配置应被选中；明显更差的配置不能靠简单优先混入。
+    one_se_n = 60
+    one_se_base = [
+        2.0 + 0.001 * ((index * 7) % 13)
+        for index in range(one_se_n)
+    ]
+    one_se_near = [
+        value + 1e-4 + 1e-3 * ((index % 3) - 1)
+        for index, value in enumerate(one_se_base)
+    ]
+    one_se_worse = [
+        value + 0.01 + 1e-5 * ((index % 2) - 0.5)
+        for index, value in enumerate(one_se_base)
+    ]
+    one_se_windows = {
+        (3, 1.0): one_se_base,
+        (1, 0.25): one_se_near,
+        (2, 1.0): one_se_worse,
+    }
+    one_se_candidates = [
+        {
+            "order": 1,
+            "alpha": 0.25,
+            "val_loss": sum(one_se_near) / one_se_n,
+        },
+        {
+            "order": 2,
+            "alpha": 1.0,
+            "val_loss": sum(one_se_worse) / one_se_n,
+        },
+        {
+            "order": 3,
+            "alpha": 1.0,
+            "val_loss": sum(one_se_base) / one_se_n,
+        },
+    ]
+    point_best = one_se_candidates[2]
+    one_se_selection = _select_ngram_candidate_one_se(
+        point_best,
+        one_se_candidates,
+        one_se_windows,
+        "val_loss",
+    )
+    assert one_se_selection is not None
+    assert one_se_selection["available"] is True
+    assert (
+        one_se_selection["selected_is_point_best"] is False
+    )
+    assert one_se_selection["selected"] == {
+        "order": 1,
+        "alpha": 0.25,
+    }
+    tied_keys = {
+        (row["order"], row["alpha"])
+        for row in one_se_selection["tied"]
+    }
+    assert (1, 0.25) in tied_keys
+    assert (3, 1.0) in tied_keys
+    assert (2, 1.0) not in tied_keys
+    one_se_diagnostics = _ngram_tuning_diagnostics(
+        one_se_candidates[0],
+        point_best,
+        "val_loss",
+        [0.25, 1.0],
+        3,
+        candidate_count=3,
+        valid_candidate_count=3,
+        selection=one_se_selection,
+    )
+    assert one_se_diagnostics["selection"] == one_se_selection
+    assert any(
+        "one-SE" in advisory
+        for advisory in one_se_diagnostics["advisories"]
+    )
+    # 分类指标不走逐窗口 loss 配对，仍按点估计选择。
+    assert (
+        _select_ngram_candidate_one_se(
+            point_best,
+            one_se_candidates,
+            one_se_windows,
+            "val_macro_f1",
+        )
+        is None
+    )
 
     dedup_reference = compute_reference_baselines(
         dedup_dataset,

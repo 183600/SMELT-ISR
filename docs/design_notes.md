@@ -490,6 +490,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   评估窗口 bootstrap。ngram 与神经运行的数据指纹、切分
   比例、评估窗口集合或数据增强不一致时，「基线强于 ngram」
   的判断被跳过并显式列出 `cross_family` 违规项。
+  ngram 自身的 (order, alpha) 网格调参也会在 val 上产生
+  winner's curse：点估计最优若只领先微小一截，可能只是窗口
+  抽样噪声。对 loss / ppl / bpb，候选与点估计 winner 做逐窗口
+  配对差，正自相关时按 AR(1) 有效窗口数放宽标准误；配对均值
+  差不超过一个标准误的候选按「更小 order / 更小 alpha」收敛
+  （`ngram_tuning.selection`，记录点估计最优、最终选择、并列
+  集合与阈值）。分类/AUC 指标没有同口径逐窗口 loss，仍按点
+  估计选择并显式标注。
   **调参对称性**：基线做了学习率网格、挑战臂却使用默认
   lr 且没有独立调参来源时，报告单独提示：
   落败不能排除调参不足，胜出只是保守下界。
