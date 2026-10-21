@@ -13100,6 +13100,7 @@ def selection_bias_report(
         "applicable": metric in _SELECTION_BIASED_METRICS,
         "biased_runs": [],
         "eligible_runs": 0,
+        "failed_runs_excluded": [],
         "last_step_runs": [],
         "unknown_selection_runs": [],
         "unbiased_metric": None,
@@ -13111,12 +13112,19 @@ def selection_bias_report(
     if not report["applicable"]:
         return report
 
-    # 分母只统计真正参与选型判定的非确定性运行：ngram 等确定性
-    # 基线不做 checkpoint 选型，把它们算进分母会稀释偏差比例，
-    # 让「多少运行的指标来自选型后的验证集」被低估。
+    # 分母只统计真正参与选型判定的非确定性、非数值失败运行：
+    # ngram 等确定性基线不做 checkpoint 选型；数值失败运行的
+    # final 指标可能来自 fallback checkpoint，已被排除出聚合与
+    # 检验。把两者算进分母都会稀释偏差比例，让「多少运行的
+    # 指标来自选型后的验证集」被低估。
     eligible_runs = 0
     for row in rows:
         if _is_deterministic_run(row):
+            continue
+        if row.get("numerical_status") == "failed":
+            report["failed_runs_excluded"].append(
+                str(row.get("run"))
+            )
             continue
         eligible_runs += 1
         name = str(row.get("run"))
@@ -28276,6 +28284,25 @@ def run_self_test():
     assert mixed_bias["eligible_runs"] == 2
     assert len(mixed_bias["biased_runs"]) == 2
     assert "/2 个运行" in str(mixed_bias["advisory"])
+    # 数值失败运行的 final 指标不参与聚合/检验，也不能进入
+    # 选型偏差比例的分母，否则分母会被故障运行稀释。
+    failed_bias_rows = list(common_rows) + [
+        dict(
+            common_rows[0],
+            run="failed-baseline",
+            numerical_status="failed",
+        )
+    ]
+    failed_bias = selection_bias_report(
+        failed_bias_rows,
+        "val_loss",
+        common_report,
+    )
+    assert failed_bias["eligible_runs"] == 2
+    assert len(failed_bias["biased_runs"]) == 2
+    assert failed_bias["failed_runs_excluded"] == [
+        "failed-baseline"
+    ]
     assert not selection_bias_report(
         common_rows,
         "val_loss_at_common_step",
