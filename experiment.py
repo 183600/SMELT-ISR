@@ -35467,6 +35467,20 @@ def run_self_test():
             )
         )
         assert fallback_metric == ("val_loss", "compare_metric")
+        # --compare-metric 本身也可能是分析期派生指标：此时
+        # 不能再把它当成调参目标，必须回退到训练时真实产生的
+        # val_loss，否则网格候选都没有该字段。
+        invalid_fallback_metric = resolve_baseline_tuning_metric(
+            argparse.Namespace(
+                baseline_tuning_metric=None,
+                primary_metric="routing_jaccard_branch",
+                compare_metric="val_loss_at_matched_flops",
+            )
+        )
+        assert invalid_fallback_metric == (
+            "val_loss",
+            "fallback_loss",
+        )
 
         # 各候选的随机种子集合不一致：均值差可能是种子难度
         # 差异，报告必须显式标记为不可作为调参证据。
@@ -37592,7 +37606,7 @@ def resolve_baseline_tuning_metric(
     并打印原因而不是静默换指标。
 
     返回 ``(metric, source)``，source 为 ``explicit`` /
-    ``primary_metric`` / ``compare_metric``。
+    ``primary_metric`` / ``compare_metric`` / ``fallback_loss``。
     """
     explicit = getattr(args, "baseline_tuning_metric", None)
     if explicit is not None:
@@ -37609,7 +37623,17 @@ def resolve_baseline_tuning_metric(
             f"--compare-metric={args.compare_metric}"
         )
 
-    return str(args.compare_metric), "compare_metric"
+    compare_metric = str(args.compare_metric)
+    if compare_metric not in _BASELINE_TUNING_METRIC_KEYS:
+        print(
+            "[baseline-tuning] 对比指标 "
+            f"{compare_metric} 不是训练时产生的指标"
+            "（等计算量 loss 只在分析期从验证曲线派生，"
+            "路由诊断需要 MoE 记录），回退到 val_loss"
+        )
+        return "val_loss", "fallback_loss"
+
+    return compare_metric, "compare_metric"
 
 
 def analyze_baseline_tuning(
