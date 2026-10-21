@@ -14566,6 +14566,19 @@ def annotate_compute_matched_metrics(
         row.pop("matched_compute_target_flops", None)
         row.pop("matched_compute_ratio", None)
 
+        # 数值失败运行已被聚合与检验排除，不能让它的（通常更
+        # 早结束的）曲线决定共同计算量：否则所有正常运行都会
+        # 被截断到故障运行的训练长度，结论不再代表完整对比。
+        if row.get("numerical_status") == "failed":
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "数值失败运行已从聚合与检验排除，"
+                    "不参与共同计算量"
+                ),
+            })
+            continue
+
         flops = _finite_float(row.get("flops_per_forward"))
         if flops is None or flops <= 0.0:
             report["excluded_runs"].append({
@@ -14726,8 +14739,20 @@ def annotate_common_step_metrics(
         row.pop("common_step_target_step", None)
         row.pop("common_step_ratio", None)
 
+    failed_excluded: List[Dict[str, object]] = []
     loss_curves: Dict[int, List[Tuple[float, float]]] = {}
     for index, row in enumerate(rows):
+        # 与 aggregate_runs 一致：数值失败运行不参与对比，不能
+        # 用它的短曲线把共同步数拉到故障停止的位置。
+        if row.get("numerical_status") == "failed":
+            failed_excluded.append({
+                "run": row.get("run"),
+                "reason": (
+                    "数值失败运行已从聚合与检验排除，"
+                    "不参与共同步数"
+                ),
+            })
+            continue
         points = _val_step_curve_points(
             Path(str(row.get("path")))
         )
@@ -14767,6 +14792,8 @@ def annotate_common_step_metrics(
         curves: Dict[int, List[Tuple[float, float]]] = {}
         metric_excluded: List[Dict[str, object]] = []
         for index, row in enumerate(rows):
+            if row.get("numerical_status") == "failed":
+                continue
             if base_metric == "val_loss":
                 points = loss_curves.get(index)
             else:
@@ -14829,6 +14856,11 @@ def annotate_common_step_metrics(
             report["excluded_runs"] = metric_excluded
 
     report["metric_reports"] = metric_reports
+    # val_loss 的 metric_excluded 会覆盖同名字段；显式并回数值
+    # 失败运行，保证「为何未参与」在报告里始终可见。
+    report["excluded_runs"] = (
+        failed_excluded + list(report["excluded_runs"])
+    )
     report["ok"] = bool(report["runs"])
 
     if report["runs"]:
@@ -32268,6 +32300,40 @@ def run_self_test():
             )
             matched_paths.append(str(run_dir))
 
+        # 数值失败运行只有更短的曲线：它已被排除出聚合，也不能
+        # 把共同计算量拉到自己的故障停止点。
+        failed_dir = Path(matched_dir) / "failed_early"
+        failed_dir.mkdir()
+        with open(
+            failed_dir / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "config": {"mode": "failed_early"},
+                    "efficiency": {"flops_per_forward": 100.0},
+                },
+                f,
+            )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": 5, "val_loss": 9.0},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": 10, "val_loss": 8.0},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": "curve_analysis", "status": "diverged"},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": "final", "val_loss": 8.0},
+        )
+        matched_paths.append(str(failed_dir))
+
         matched_rows = compare_runs(matched_paths)
         matched_report = annotate_compute_matched_metrics(
             matched_rows
@@ -32302,6 +32368,11 @@ def run_self_test():
         item["interpolation"] == "linear_between_evals"
         for item in matched_report["runs"]
     )
+    assert "val_loss_at_matched_flops" not in by_run["failed_early"]
+    assert "failed_early" in {
+        str(item["run"])
+        for item in matched_report["excluded_runs"]
+    }
 
     # 非有限步跳过 optimizer.step：等计算量必须按有效更新数
     # 累计，而不是按训练 step 虚增计算量。
@@ -32385,6 +32456,46 @@ def run_self_test():
             )
             common_paths.append(str(run_dir))
 
+        # 数值失败运行同样不能决定共同步数；否则正常对比会被
+        # 截断到故障停止前的早期评估点。
+        failed_dir = Path(common_dir) / "failed_early"
+        failed_dir.mkdir()
+        with open(
+            failed_dir / "config.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "config": {"mode": "A"},
+                    "args": {"seed": 2},
+                },
+                f,
+            )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": 5, "val_loss": 9.0},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": 10, "val_loss": 8.0},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {"step": "curve_analysis", "status": "diverged"},
+        )
+        write_jsonl_record(
+            failed_dir / "metrics.jsonl",
+            {
+                "step": "final",
+                "val_loss": 8.0,
+                "selected_model": "best_val",
+                "selected_step": 10,
+                "trained_steps": 10,
+            },
+        )
+        common_paths.append(str(failed_dir))
+
         common_rows = compare_runs(common_paths)
         common_report = annotate_common_step_metrics(
             common_rows
@@ -32407,6 +32518,11 @@ def run_self_test():
         float(by_run["long"]["val_loss_at_common_step"])
         - 4.2
     ) < 1e-9
+    assert "val_loss_at_common_step" not in by_run["failed_early"]
+    assert "failed_early" in {
+        str(item["run"])
+        for item in common_report["excluded_runs"]
+    }
     assert by_run["short"][
         "val_loss_at_common_step"
     ] != by_run["short"]["val_loss"]
@@ -32446,7 +32562,11 @@ def run_self_test():
     assert "/2 个运行" in str(mixed_bias["advisory"])
     # 数值失败运行的 final 指标不参与聚合/检验，也不能进入
     # 选型偏差比例的分母，否则分母会被故障运行稀释。
-    failed_bias_rows = list(common_rows) + [
+    failed_bias_rows = [
+        row
+        for row in common_rows
+        if row.get("numerical_status") != "failed"
+    ] + [
         dict(
             common_rows[0],
             run="failed-baseline",
