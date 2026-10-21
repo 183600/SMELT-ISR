@@ -18233,38 +18233,61 @@ def compare_cells_to_baseline(
 ) -> List[Dict[str, object]]:
     """
     指定基线模式（--compare-baseline），把每个实验单元与
-    基线单元直接对比。基线模式有多个单元（如 balance_coef
-    不同）时选运行数最多的一个。直接对比构成自己的检验
-    家族，同样做多重比较校正并附效应量 95% CI，以及
-    80% 功效 MDE 与 TOST 等价性口径（``equivalence_margin``
-    给定时）。
+    基线单元直接对比。基线模式在不同上下文（除 mode 外的
+    分组因子，如 balance_coef/top_k）有多个单元时，每个
+    上下文内分别选运行数最多的一个，且只比较同一上下文的
+    单元——否则 mode 因子会与上下文因子混杂。直接对比构成
+    自己的检验家族，同样做多重比较校正并附效应量 95% CI，
+    以及 80% 功效 MDE 与 TOST 等价性口径
+    （``equivalence_margin`` 给定时）。
     """
     if not baseline_mode:
         return []
 
-    matching = [
-        aggregate
-        for aggregate in aggregates
-        if str(aggregate["keys"].get("mode")) == baseline_mode
-    ]
-    if not matching:
-        return []
+    context_keys: List[str] = []
+    for aggregate in aggregates:
+        keys = aggregate.get("keys") or {}
+        if not isinstance(keys, dict):
+            continue
+        for key in keys:
+            if key != "mode" and key not in context_keys:
+                context_keys.append(key)
 
-    reference = max(
-        matching,
-        key=lambda aggregate: (
+    def _cell_context(
+        aggregate: Dict[str, object],
+    ) -> Tuple[object, ...]:
+        keys = aggregate.get("keys") or {}
+        return tuple(
+            _stable_factor_key(keys.get(key))
+            for key in context_keys
+        )
+
+    references: Dict[Tuple[object, ...], Dict[str, object]] = {}
+    for aggregate in aggregates:
+        if str(aggregate["keys"].get("mode")) != baseline_mode:
+            continue
+        context = _cell_context(aggregate)
+        current = references.get(context)
+        candidate_rank = (
             # 参考单元按独立种子数选，伪重复不能靠复制目录
             # 把自己「选」成基线；确定性基线（ngram）的多个
             # seed 只是复制同一估计，按 1 个观测计。
             int(aggregate.get("effective_seed_count", 0)),
             int(aggregate.get("n_runs", 0)),
-        ),
-    )
+        )
+        if current is None or candidate_rank > (
+            int(current.get("effective_seed_count", 0)),
+            int(current.get("n_runs", 0)),
+        ):
+            references[context] = aggregate
+    if not references:
+        return []
 
     contrasts: List[Dict[str, object]] = []
 
     for aggregate in aggregates:
-        if aggregate is reference:
+        reference = references.get(_cell_context(aggregate))
+        if reference is None or aggregate is reference:
             continue
         # 同一基线模式的其他单元（如不同的 balance_coef /
         # top_k）与参考单元的差异不是 mode 因子对比：把它们
@@ -33003,6 +33026,80 @@ def run_self_test():
     ci_single = aggregate_runs(ci_rows[:1], ["mode"])[0]
     assert ci_single["ci95"]["val_loss"] is None
     assert "val_loss_ci95_low" not in ci_single
+
+    # --compare-baseline 必须在相同上下文内比较：基线模式在
+    # balance_coef=0/0.01 各有一个单元时，0.01 的变体只能对
+    # 0.01 的基线；没有同上下文基线的单元应跳过，不能串到
+    # 运行数更多的其他上下文基线。
+    context_rows = []
+    for balance, smelt_values, a_values in (
+        (0.0, [3.0, 3.2, 3.4], [2.8, 2.9, 3.0]),
+        (0.01, [4.0, 4.2, 4.4], [4.5, 4.6, 4.7]),
+    ):
+        for seed, (smelt_value, a_value) in enumerate(
+            zip(smelt_values, a_values),
+            start=1,
+        ):
+            context_rows.append(
+                {
+                    "run": f"smelt_bal{balance}_seed{seed}",
+                    "mode": "smelt",
+                    "balance_coef": balance,
+                    "seed": seed,
+                    "val_loss": smelt_value,
+                }
+            )
+            context_rows.append(
+                {
+                    "run": f"A_bal{balance}_seed{seed}",
+                    "mode": "A",
+                    "balance_coef": balance,
+                    "seed": seed,
+                    "val_loss": a_value,
+                }
+            )
+    context_rows.append(
+        {
+            "run": "A_bal0.02_seed1",
+            "mode": "A",
+            "balance_coef": 0.02,
+            "seed": 1,
+            "val_loss": 1.0,
+        }
+    )
+    context_aggregates = aggregate_runs(
+        context_rows,
+        ["mode", "balance_coef"],
+    )
+    context_contrasts = compare_cells_to_baseline(
+        context_aggregates,
+        "smelt",
+        "val_loss",
+    )
+    aggregate_by_label = {
+        aggregate["label"]: aggregate
+        for aggregate in context_aggregates
+    }
+    assert len(context_contrasts) == 2, context_contrasts
+    for context_contrast in context_contrasts:
+        baseline_cell = aggregate_by_label[
+            context_contrast["baseline"]
+        ]
+        variant_cell = aggregate_by_label[
+            context_contrast["variant"]
+        ]
+        assert (
+            baseline_cell["keys"]["balance_coef"]
+            == variant_cell["keys"]["balance_coef"]
+        ), context_contrast
+        expected_delta = (
+            -0.3
+            if baseline_cell["keys"]["balance_coef"] == 0.0
+            else 0.4
+        )
+        assert (
+            abs(context_contrast["delta"] - expected_delta) < 1e-12
+        ), context_contrast
 
     with tempfile.TemporaryDirectory() as numerical_dir:
         failed_run = Path(numerical_dir) / "failed_run"
