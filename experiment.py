@@ -24228,8 +24228,14 @@ def hypothesis_alignment(
       不可判定（不能静默算作达到最小效应）；
     - ``supported``：方向一致、达到最小效应（若有声明）且
       校正后显著；
+    - ``inconclusive_underpowered``：方向一致、达到最小效应
+      但不显著，且当前设计（se/df 与家族校正后的 alpha）对
+      预注册最小效应的功效低于目标（80%）：不显著是样本量
+      不足的预期结果，不能解读为「无效应」，也不能解读为
+      「等价」；
     - ``not_significant``／``no_effect_observed``：方向一致
-      但不显著（或差值为 0），证据不足；
+      但不显著（或差值为 0），且功效足够或无法评估，证据
+      不足；
     - ``conflicting_preregistration``：同一实验单元的运行给出
       了互相矛盾的方向，核对无法进行。
     """
@@ -24256,6 +24262,7 @@ def hypothesis_alignment(
     supported: List[str] = []
     below_min_effect: List[str] = []
     min_effect_undefined: List[str] = []
+    inconclusive_underpowered: List[str] = []
 
     for contrast in contrasts:
         if contrast.get("confounded") or contrast.get(
@@ -24378,6 +24385,62 @@ def hypothesis_alignment(
             status = "supported"
         else:
             status = "not_significant"
+            # 功效核对：主指标预注册了最小效应时，「不显著」
+            # 只有在设计对最小效应有足够功效时才有信息量。
+            # 用家族校正后的 alpha（判定口径与 significant
+            # 一致）在预注册最小效应处计算功效；se/df 不可用
+            # 时退回同口径 MDE 与阈值比较。功效不足则判为
+            # inconclusive_underpowered，而不是 not_significant。
+            if (
+                threshold_abs is not None
+                and threshold_abs > 0.0
+            ):
+                power_known = False
+                se = contrast.get("se")
+                df = contrast.get("df")
+                alpha_family = contrast.get(
+                    "alpha_bonferroni"
+                )
+                if not isinstance(alpha_family, (int, float)):
+                    alpha_family = _SIGNIFICANCE_LEVEL
+                if (
+                    isinstance(se, (int, float))
+                    and not isinstance(se, bool)
+                    and isinstance(df, (int, float))
+                    and not isinstance(df, bool)
+                ):
+                    power = _t_power(
+                        threshold_abs,
+                        float(se),
+                        float(df),
+                        alpha=float(alpha_family),
+                    )
+                    if power is not None:
+                        power_known = True
+                        entry["power_at_min_effect"] = power
+                        entry["power_at_min_effect_alpha"] = (
+                            float(alpha_family)
+                        )
+                        if power < _TARGET_POWER:
+                            status = (
+                                "inconclusive_underpowered"
+                            )
+                if not power_known:
+                    mde = contrast.get("mde_80_bonferroni")
+                    if not isinstance(mde, (int, float)):
+                        mde = contrast.get("mde_80")
+                    if (
+                        isinstance(mde, (int, float))
+                        and not isinstance(mde, bool)
+                        and math.isfinite(float(mde))
+                    ):
+                        entry["mde_80_vs_min_effect"] = float(
+                            mde
+                        )
+                        if float(mde) > threshold_abs:
+                            status = (
+                                "inconclusive_underpowered"
+                            )
         entry["status"] = status
         checks.append(entry)
 
@@ -24421,6 +24484,22 @@ def hypothesis_alignment(
                 f"{baseline_text} 为零/近零或缺失，相对阈值"
                 "无法定义）"
             )
+        elif status == "inconclusive_underpowered":
+            power = entry.get("power_at_min_effect")
+            if isinstance(power, (int, float)):
+                power_text = f"，对最小效应功效≈{float(power):.2f}"
+            else:
+                mde = entry.get("mde_80_vs_min_effect")
+                power_text = (
+                    f"，家族校正 MDE≈{float(mde):.4f} "
+                    f"> 最小效应阈值 {threshold_abs:.4f}"
+                    if isinstance(mde, (int, float))
+                    else ""
+                )
+            inconclusive_underpowered.append(
+                f"{label}（Δ={delta:+.4f}，方向一致但不显著"
+                f"{power_text}（目标 {_TARGET_POWER:.2f}））"
+            )
 
     if refuted:
         advisories.append(
@@ -24442,6 +24521,14 @@ def hypothesis_alignment(
             "或缺失：比例阈值没有可解释的尺度，既不能判为达到"
             "最小效应，也不能判为不显著，结论应为不可判定："
             + "; ".join(min_effect_undefined)
+        )
+    if inconclusive_underpowered:
+        advisories.append(
+            "以下对比方向一致但不显著，且当前设计对预注册"
+            "最小效应的功效不足：不显著是样本量不足的预期"
+            "结果，不能解读为「无效应」，也不能解读为「等价」；"
+            "需要增加随机种子或降低种子间方差才能判定："
+            + "; ".join(inconclusive_underpowered)
         )
 
     # 预注册主指标的口径族：频率加权的似然（val_loss / val_ppl /
@@ -24518,6 +24605,9 @@ def hypothesis_alignment(
         "supported": supported,
         "below_min_effect": below_min_effect,
         "min_effect_undefined": min_effect_undefined,
+        "inconclusive_underpowered": (
+            inconclusive_underpowered
+        ),
         "advisories": advisories,
     }
 
@@ -38646,6 +38736,65 @@ def run_self_test():
         assert mismatch_alignment["checks"][0]["status"] == (
             "direction_mismatch_not_significant"
         )
+        # 方向一致但不显著：若当前设计对预注册最小效应的功效
+        # 不足，「不显著」只是样本量不足的预期结果，不能当作
+        # 普通的不显著结论。
+        underpowered_contrast = _synthetic_contrast(
+            "smelt", "A", 4.5, 4.4, False
+        )
+        underpowered_contrast.update({"se": 0.25, "df": 3.0})
+        underpowered_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [underpowered_contrast],
+            "val_loss",
+        )
+        underpowered_check = underpowered_alignment["checks"][0]
+        assert underpowered_check["status"] == (
+            "inconclusive_underpowered"
+        ), underpowered_alignment
+        assert (
+            float(underpowered_check["power_at_min_effect"])
+            < _TARGET_POWER
+        )
+        assert underpowered_alignment[
+            "inconclusive_underpowered"
+        ]
+        assert any(
+            "功效不足" in message
+            for message in underpowered_alignment["advisories"]
+        )
+        # 功效足够时维持 not_significant 语义。
+        powered_contrast = _synthetic_contrast(
+            "smelt", "A", 4.5, 4.4, False
+        )
+        powered_contrast.update({"se": 0.005, "df": 100.0})
+        powered_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [powered_contrast],
+            "val_loss",
+        )
+        assert powered_alignment["checks"][0]["status"] == (
+            "not_significant"
+        ), powered_alignment
+        # se/df 不可用时退回家族校正 MDE 与最小效应阈值比较。
+        mde_contrast = _synthetic_contrast(
+            "smelt", "A", 4.5, 4.4, False
+        )
+        mde_contrast["mde_80_bonferroni"] = 0.5
+        mde_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [mde_contrast],
+            "val_loss",
+        )
+        assert mde_alignment["checks"][0]["status"] == (
+            "inconclusive_underpowered"
+        ), mde_alignment
+        assert mde_alignment["checks"][0][
+            "mde_80_vs_min_effect"
+        ] == 0.5
         # 同一实验单元分批启动、各自声明不同最小效应时，单元
         # 级判定必须采用最严格（最大）阈值，不能用宽松声明
         # 把整体判成 supported。

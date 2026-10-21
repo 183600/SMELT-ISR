@@ -614,8 +614,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   声明了相对最小效应但对照均值为零/近零或缺失 →
   `min_effect_undefined`（比例阈值没有可解释的尺度，结论
   不可判定，不能静默算作达到最小效应）；方向一致且达到
-  最小效应、Holm 校正后显著 → `supported`；其余为
-  `not_significant` / `direction_mismatch_not_significant`。
+  最小效应、Holm 校正后显著 → `supported`；方向一致、达到
+  最小效应但不显著，且按家族校正后的 alpha 计算、对预注册
+  最小效应的功效低于 80% → `inconclusive_underpowered`
+  （不显著是样本量不足的预期结果，不能读成「无效应」或
+  「等价」，se/df 不可用时退回 `mde_80_bonferroni` 与最小
+  效应阈值比较）；其余为 `not_significant` /
+  `direction_mismatch_not_significant`。
   分析指标与运行预注册主指标不一致时单独提示
   `[metric-shopping]`（事后换指标），旧运行没有预注册记录时
   只提示「无法排除指标选择偏差」。
