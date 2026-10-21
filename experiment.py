@@ -2987,6 +2987,7 @@ class ByteDataset:
         device: Optional[torch.device] = None,
         group_separator: Optional[bytes] = None,
         deduplicate_train_groups: bool = False,
+        drop_train_shared_chunks: bool = False,
         drop_train_corrupt_groups: bool = False,
         drop_train_corrupt_bytes: bool = False,
         drop_train_degenerate_groups: bool = False,
@@ -3050,6 +3051,16 @@ class ByteDataset:
                 "没有显式的群组边界就无法在不改动 val/test 的"
                 "前提下做内容级去重"
             )
+
+        if drop_train_shared_chunks and group_separator is None:
+            raise ValueError(
+                "drop_train_shared_chunks 需要 group_separator："
+                "没有显式的群组边界就无法整组剔除与 val/test "
+                "共享内容的训练样本，也无法保证 val/test 不变"
+            )
+        self.drop_train_shared_chunks = bool(
+            drop_train_shared_chunks
+        )
 
         if drop_train_corrupt_groups and group_separator is None:
             raise ValueError(
@@ -3187,6 +3198,32 @@ class ByteDataset:
                 )
             )
 
+        shared_chunk_excluded: List[Tuple[int, int]] = []
+        shared_chunk_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_shared_chunks:
+            shared_min_chunk = max(
+                _AUDIT_CHUNK_MIN_BYTES,
+                seq_len + 1,
+            )
+            shared_chunk_excluded, shared_chunk_stats = (
+                _plan_train_shared_chunk_cleaning(
+                    self._raw_buffer,
+                    group_separator,
+                    n_train,
+                    {
+                        "val": (n_train, n_val_end),
+                        "test": (n_val_end, len(tokens)),
+                    },
+                    shared_min_chunk,
+                    max(
+                        _AUDIT_CHUNK_MAX_BYTES,
+                        shared_min_chunk * 4,
+                    ),
+                    dedup_excluded,
+                )
+            )
+
         corrupt_excluded: List[Tuple[int, int]] = []
         corrupt_stats: Optional[Dict[str, object]] = None
 
@@ -3196,7 +3233,7 @@ class ByteDataset:
                     self._raw_buffer,
                     group_separator,
                     n_train,
-                    dedup_excluded,
+                    dedup_excluded + shared_chunk_excluded,
                 )
             )
 
@@ -3221,12 +3258,17 @@ class ByteDataset:
                     self._raw_buffer,
                     group_separator,
                     n_train,
-                    dedup_excluded + corrupt_excluded,
+                    (
+                        dedup_excluded
+                        + shared_chunk_excluded
+                        + corrupt_excluded
+                    ),
                 )
             )
 
         combined_excluded = sorted(
             dedup_excluded
+            + shared_chunk_excluded
             + corrupt_excluded
             + corrupt_byte_excluded
             + degenerate_excluded
@@ -3250,6 +3292,7 @@ class ByteDataset:
 
         if (
             dedup_stats is not None
+            or shared_chunk_stats is not None
             or corrupt_stats is not None
             or degenerate_stats is not None
             or corrupt_byte_stats is not None
@@ -3262,6 +3305,7 @@ class ByteDataset:
                 stats
                 for stats in (
                     dedup_stats,
+                    shared_chunk_stats,
                     corrupt_stats,
                     degenerate_stats,
                 )
@@ -3299,6 +3343,10 @@ class ByteDataset:
                     total_groups - groups_dropped
                 )
 
+            if shared_chunk_stats is not None:
+                combined_stats["shared_chunks"] = (
+                    shared_chunk_stats
+                )
             if corrupt_stats is not None:
                 combined_stats["corruption"] = corrupt_stats
             if corrupt_byte_stats is not None:
@@ -3311,6 +3359,8 @@ class ByteDataset:
             cleaning_kinds: List[str] = []
             if dedup_stats is not None:
                 cleaning_kinds.append("duplicate")
+            if shared_chunk_stats is not None:
+                cleaning_kinds.append("shared_chunks")
             if corrupt_stats is not None:
                 cleaning_kinds.append("corrupt")
             if degenerate_stats is not None:
@@ -5316,6 +5366,110 @@ def _plan_train_degenerate_cleaning(
                 span_end,
                 top_byte,
                 round(top_share, 6),
+            ])
+
+    stats["post_clean_train_bytes"] = (
+        train_end - int(stats["dropped_bytes"])
+    )
+    return excluded, stats
+
+
+def _plan_train_shared_chunk_cleaning(
+    raw: bytearray,
+    separator: bytes,
+    train_end: int,
+    eval_ranges: Dict[str, Tuple[int, int]],
+    min_chunk: int,
+    max_chunk: int,
+    already_excluded: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    规划训练集群组级「跨 split 近似重复」清洗：只从 train 中
+    整组剔除包含与 val/test 共享的内容定义块的群组，绝不改动
+    val/test。
+
+    精确群组指纹只能抓内容完全相同的文档；同一段文字被包在
+    更长的训练群组里（或整体错位复制）时指纹不同，但共享块
+    仍会把评估内容泄露给训练。这里用与
+    ``_content_chunk_duplicate_audit`` 完全相同的分块口径：
+    只要训练群组内出现一个与 val/test 群组相同、长度至少为
+    一个完整窗口的连续块，就整组剔除。整组剔除而不是删单个
+    块，避免在连续字节流中制造新的跨群组邻接标签。
+    """
+    eval_chunks: set = set()
+    eval_groups = 0
+
+    for begin, end in eval_ranges.values():
+        if end <= begin:
+            continue
+        for span_start, span_end in _iter_group_spans(
+            raw,
+            separator,
+            begin,
+            end,
+        ):
+            scan = _content_defined_chunk_scan(
+                memoryview(raw),
+                [(span_start, span_end)],
+                min_chunk,
+                max_chunk,
+            )
+            eval_chunks.update(scan["chunks"].keys())
+            eval_groups += 1
+
+    excluded_set = set(already_excluded)
+    excluded: List[Tuple[int, int]] = []
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "policy": (
+            "drop train groups sharing content-defined chunks "
+            "with val/test; val/test untouched"
+        ),
+        "min_chunk_bytes": min_chunk,
+        "max_chunk_bytes": max_chunk,
+        "eval_groups": eval_groups,
+        "eval_chunks": len(eval_chunks),
+        "groups_total": 0,
+        "groups_scanned": 0,
+        "groups_already_excluded": 0,
+        "groups_dropped": 0,
+        "dropped_bytes": 0,
+        "shared_chunks": 0,
+        "examples": [],
+    }
+
+    for span_start, span_end in _iter_group_spans(
+        raw,
+        separator,
+        0,
+        train_end,
+    ):
+        stats["groups_total"] += 1
+
+        if (span_start, span_end) in excluded_set:
+            stats["groups_already_excluded"] += 1
+            continue
+
+        stats["groups_scanned"] += 1
+        scan = _content_defined_chunk_scan(
+            memoryview(raw),
+            [(span_start, span_end)],
+            min_chunk,
+            max_chunk,
+        )
+        common = scan["chunks"].keys() & eval_chunks
+        if not common:
+            continue
+
+        stats["groups_dropped"] += 1
+        stats["dropped_bytes"] += span_end - span_start
+        stats["shared_chunks"] += len(common)
+        excluded.append((span_start, span_end))
+        if len(stats["examples"]) < 5:
+            stats["examples"].append([
+                span_start,
+                span_end,
+                len(common),
             ])
 
     stats["post_clean_train_bytes"] = (
@@ -9892,6 +10046,13 @@ def run_statistical_baseline(
                 getattr(
                     args,
                     "deduplicate_train_groups",
+                    False,
+                )
+            ),
+            "drop_train_shared_chunks": bool(
+                getattr(
+                    args,
+                    "drop_train_shared_chunks",
                     False,
                 )
             ),
@@ -15874,6 +16035,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    "drop_train_shared_chunks",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
@@ -15914,6 +16076,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "test_fraction",
     "group_separator",
     "deduplicate_train_groups",
+    "drop_train_shared_chunks",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
@@ -16426,6 +16589,9 @@ def build_comparison_protocol(
         "deduplicate_train_groups": bool(
             getattr(args, "deduplicate_train_groups", False)
         ),
+        "drop_train_shared_chunks": bool(
+            getattr(args, "drop_train_shared_chunks", False)
+        ),
         "drop_train_corrupt_groups": bool(
             getattr(args, "drop_train_corrupt_groups", False)
         ),
@@ -16604,6 +16770,9 @@ def experiment_protocol_from_payload(
         # 口径。
         "deduplicate_train_groups": bool(
             run_args.get("deduplicate_train_groups", False)
+        ),
+        "drop_train_shared_chunks": bool(
+            run_args.get("drop_train_shared_chunks", False)
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
@@ -27138,6 +27307,13 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_shared_chunks": bool(
+                getattr(
+                    args,
+                    "drop_train_shared_chunks",
+                    False,
+                )
+            ),
             "drop_train_corrupt_groups": bool(
                 getattr(
                     args,
@@ -30252,6 +30428,107 @@ def run_self_test():
     assert dedup_probe["ok"], dedup_probe["failures"]
     assert dedup_probe["train_cleaning_checked"]
     assert dedup_probe["group_boundaries_checked"]
+
+    # 跨 split 近似重复清洗：精确群组指纹抓不到「训练群组里
+    # 嵌入了 val 片段」的泄露；内容定义分块必须检出并整组剔除
+    # 该训练群组，val/test 字节完全不变。这里第 2 个训练群组
+    # 在中间嵌入一段与 val 群组开头相同的 512B 内容。
+    shared_rng = random.Random(20241023)
+    shared_alphabet = (
+        b"abcdefghijklmnopqrstuvwxyz"
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+
+    def _shared_random(length: int) -> bytes:
+        return bytes(
+            shared_rng.choice(shared_alphabet)
+            for _ in range(length)
+        )
+
+    shared_fragment = _shared_random(512)
+    shared_groups = [
+        _shared_random(1024),
+        (
+            _shared_random(256)
+            + shared_fragment
+            + _shared_random(256)
+        ),
+        _shared_random(1024),
+        _shared_random(1024),
+        shared_fragment + _shared_random(512),
+        _shared_random(1024),
+    ]
+    shared_payload = (
+        separator.join(shared_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as shared_file:
+        shared_file.write(shared_payload)
+        shared_file.flush()
+
+        raw_shared_dataset = ByteDataset(
+            shared_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+        )
+        cleaned_shared_dataset = ByteDataset(
+            shared_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+            drop_train_shared_chunks=True,
+        )
+
+        raw_shared_audit = audit_data_splits(
+            raw_shared_dataset,
+            include_test=True,
+        )
+        cleaned_shared_audit = audit_data_splits(
+            cleaned_shared_dataset,
+            include_test=True,
+        )
+
+    assert (
+        raw_shared_audit["content_chunks"]["cross_split"][
+            "train_val"
+        ]["shared_chunks"]
+        > 0
+    )
+    assert raw_shared_audit["leakage_violations"]
+    assert not enforce_data_leakage_gate(raw_shared_audit)
+    # 只剔除含共享块的那一个训练群组；val/test 的切分与内容
+    # 指纹必须逐位不变。
+    assert cleaned_shared_dataset.train_excluded_spans == [
+        (1026, 2050)
+    ]
+    assert cleaned_shared_dataset.train_cleaning[
+        "cleaning_kinds"
+    ] == ["shared_chunks"]
+    assert cleaned_shared_dataset.train_cleaning[
+        "shared_chunks"
+    ]["groups_dropped"] == 1
+    for split_name in ("val", "test"):
+        assert (
+            cleaned_shared_dataset.split_sha256[split_name]
+            == raw_shared_dataset.split_sha256[split_name]
+        )
+    assert (
+        cleaned_shared_audit["content_chunks"]["cross_split"][
+            "train_val"
+        ]["shared_chunks"]
+        == 0
+    )
+    assert cleaned_shared_audit["leakage_violations"] == []
+    assert enforce_data_leakage_gate(cleaned_shared_audit)
+    shared_probe = probe_data_pipeline(
+        cleaned_shared_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert shared_probe["ok"], shared_probe["failures"]
 
     # 训练集标签噪声清洗：只整组剔除 train 中含非法 UTF-8/NUL
     # 的群组，val/test 的字节与切分位置完全不变；清洗后的窗口
@@ -42645,6 +42922,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-shared-chunks",
+        action="store_true",
+        help=(
+            "训练集跨 split 近似重复清洗（需要 "
+            "--group-separator）：用内容定义分块找出与 "
+            "val/test 共享至少一个完整窗口长度连续块的训练"
+            "群组，并整组剔除；精确群组去重抓不到的「长群组"
+            "里嵌入评估片段/错位复制」泄露也会被清除。"
+            "val/test 的字节与切分位置完全不变"
+        ),
+    )
+    parser.add_argument(
         "--drop-train-corrupt-groups",
         action="store_true",
         help=(
@@ -43968,6 +44257,26 @@ def main():
                 )
                 args.deduplicate_train_groups = saved_dedup
 
+        # 跨 split 近似重复清洗同样改变实际参与训练的样本集合，
+        # 是采样轨迹的一部分；按存档恢复，避免续跑悄悄把
+        # val/test 共享内容重新带回训练。
+        if "drop_train_shared_chunks" in saved_args:
+            saved_shared_drop = bool(
+                saved_args.get("drop_train_shared_chunks")
+            )
+            if saved_shared_drop != bool(
+                args.drop_train_shared_chunks
+            ):
+                print(
+                    "resume restored drop_train_shared_chunks "
+                    f"{bool(args.drop_train_shared_chunks)} -> "
+                    f"{saved_shared_drop} (训练集清洗是采样轨迹"
+                    "的一部分)"
+                )
+                args.drop_train_shared_chunks = (
+                    saved_shared_drop
+                )
+
         # 标签噪声清洗同样改变实际参与训练的样本集合，是采样
         # 轨迹的一部分；按存档恢复，避免续跑悄悄换回含损坏标签
         # 的另一套训练数据。
@@ -44220,6 +44529,13 @@ def main():
             "val/test"
         )
 
+    if args.drop_train_shared_chunks and group_separator_bytes is None:
+        parser.error(
+            "--drop-train-shared-chunks 需要 --group-separator："
+            "没有显式群组边界时无法整组清洗跨 split 共享"
+            "内容而不改动 val/test"
+        )
+
     if (
         args.drop_train_corrupt_groups
         and group_separator_bytes is None
@@ -44263,6 +44579,9 @@ def main():
             group_separator=group_separator_bytes,
             deduplicate_train_groups=(
                 args.deduplicate_train_groups
+            ),
+            drop_train_shared_chunks=(
+                args.drop_train_shared_chunks
             ),
             drop_train_corrupt_groups=(
                 args.drop_train_corrupt_groups
