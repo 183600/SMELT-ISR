@@ -9808,6 +9808,14 @@ _BAD_CASE_LABEL_CONTEXT = 8
 _BAD_CASE_LABEL_MIN_SUPPORT = 2
 _BAD_CASE_LABEL_TARGET_MAX_SHARE = 0.1
 
+# 全量错误归因与 top-N 案例归因共用同一组类别（顺序即编码）。
+_BAD_CASE_CATEGORIES: Tuple[str, ...] = (
+    "ambiguous",
+    "systematic_confusion",
+    "label_noise_suspect",
+    "uncertain",
+)
+
 
 def _render_byte(value: int) -> str:
     """把单个字节渲染为可打印文本（不可打印字节用 \\xNN）。"""
@@ -9990,6 +9998,57 @@ def _train_next_byte_evidence(
         }
 
     return evidence
+
+
+def _empty_bad_case_report(
+    split: str,
+    note: str = "评估窗口为空，未生成坏案例。",
+) -> Dict[str, object]:
+    """
+    空评估集的坏案例报告骨架。
+
+    即使没有可评估 token，报告也必须保留与正常路径相同的
+    键集合：调用方会无条件读取 wrong_tokens / 类别计数等
+    字段，缺键会让「评估集为空」从可解释的空结果变成
+    KeyError 崩溃。
+    """
+    return {
+        "split": split,
+        "tokens_evaluated": 0,
+        "token_accuracy": None,
+        "wrong_tokens": 0,
+        "top_cases": [],
+        "top_confusions": [],
+        "error_rate_by_target": [],
+        "category_counts": {},
+        "error_category_counts": {
+            name: 0 for name in _BAD_CASE_CATEGORIES
+        },
+        "error_category_shares": {
+            name: None for name in _BAD_CASE_CATEGORIES
+        },
+        "calibration": {
+            "ece": None,
+            "mean_confidence": None,
+            "accuracy": None,
+            "overconfidence": None,
+            "bins": [],
+            "note": "没有可校准的 token。",
+        },
+        "label_noise_verification": {
+            "context_length": _BAD_CASE_LABEL_CONTEXT,
+            "min_train_support": _BAD_CASE_LABEL_MIN_SUPPORT,
+            "max_target_share_in_context": (
+                _BAD_CASE_LABEL_TARGET_MAX_SHARE
+            ),
+            "candidates": 0,
+            "verified": 0,
+            "unverified": 0,
+            "unverifiable_no_train_context": 0,
+            "note": note,
+        },
+        "summary": note,
+    }
 
 
 def _bad_case_report_from_buffers(
@@ -10326,12 +10385,7 @@ def _bad_case_report_from_buffers(
     )
     wrong_category_code = wrong_category_code[wrong_mask]
 
-    category_names = (
-        "ambiguous",
-        "systematic_confusion",
-        "label_noise_suspect",
-        "uncertain",
-    )
+    category_names = _BAD_CASE_CATEGORIES
     wrong_tokens = int(wrong_mask.sum())
     error_category_counts = {
         name: int((wrong_category_code == code).sum())
@@ -10692,16 +10746,7 @@ class _BadCaseCollector:
         self._materialize_candidates()
 
         if self.written == 0:
-            return {
-                "split": self.split,
-                "tokens_evaluated": 0,
-                "token_accuracy": None,
-                "top_cases": [],
-                "top_confusions": [],
-                "error_rate_by_target": [],
-                "category_counts": {},
-                "summary": "评估窗口为空，未生成坏案例。",
-            }
+            return _empty_bad_case_report(self.split)
 
         return _bad_case_report_from_buffers(
             self.loss_buffer,
@@ -10979,16 +11024,7 @@ def analyze_bad_cases(
             torch.cuda.synchronize(device)
 
         if written == 0:
-            return {
-                "split": split,
-                "tokens_evaluated": 0,
-                "token_accuracy": None,
-                "top_cases": [],
-                "top_confusions": [],
-                "error_rate_by_target": [],
-                "category_counts": {},
-                "summary": "评估窗口为空，未生成坏案例。",
-            }
+            return _empty_bad_case_report(split)
 
         return _bad_case_report_from_buffers(
             loss_buffer,
@@ -29120,12 +29156,25 @@ def run_self_test():
         top_n=3,
     )
 
-    valid_categories = {
-        "ambiguous",
-        "systematic_confusion",
-        "label_noise_suspect",
-        "uncertain",
-    }
+    valid_categories = set(_BAD_CASE_CATEGORIES)
+
+    # 空评估集的报告必须与正常路径同构：调用方会无条件读取
+    # wrong_tokens / 类别计数，缺键会从「没有错误可分析」变成
+    # KeyError。
+    empty_bad_case = _empty_bad_case_report("val")
+    assert empty_bad_case["tokens_evaluated"] == 0
+    assert empty_bad_case["wrong_tokens"] == 0
+    assert empty_bad_case["top_cases"] == []
+    assert set(empty_bad_case["error_category_counts"]) == (
+        valid_categories
+    )
+    assert set(empty_bad_case["error_category_shares"]) == (
+        valid_categories
+    )
+    assert empty_bad_case["calibration"]["ece"] is None
+    assert empty_bad_case["label_noise_verification"][
+        "candidates"
+    ] == 0
 
     assert bad_case_report["tokens_evaluated"] > 0
     assert bad_case_report["split"] == "val"
