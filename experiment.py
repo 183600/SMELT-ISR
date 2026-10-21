@@ -16123,6 +16123,13 @@ _RECOMMENDED_SEEDS = 3
 _TARGET_POWER = 0.80
 _DEFAULT_EQUIVALENCE_MARGIN = 0.01
 
+# 预注册最小效应按对照均值的比例解释。对照均值恰为零（或
+# 小到低于该绝对下限）时，比例阈值退化为 0 或远低于数值
+# 分辨率，任何非零差值都会被误判成「达到最小效应」。这类
+# 相对阈值没有可解释的尺度，必须报告为不可判定，而不是
+# 静默判成 supported。
+_HYPOTHESIS_MIN_EFFECT_ABS_FLOOR = 1.0e-12
+
 # 非中心 t 功效的数值积分设置：对 u = sqrt(V)（V ~ chi2_df）
 # 做复合 Simpson 积分。u 的密度以 sqrt(df-1) 为众数、宽度
 # 约 1/√2，右尾为 exp(-u^2/2)：积分上限取众数 + _T_POWER_TAIL
@@ -23616,6 +23623,9 @@ def hypothesis_alignment(
       显著，结论只能是「不确定」（样本不足）；
     - ``below_declared_min_effect``：方向一致但幅度小于预注册
       的最小有意义效应，不能主张支持假设（哪怕统计显著）；
+    - ``min_effect_undefined``：声明了相对最小效应，但对照
+      均值为零/近零或缺失，比例阈值没有可解释的尺度，结果
+      不可判定（不能静默算作达到最小效应）；
     - ``supported``：方向一致、达到最小效应（若有声明）且
       校正后显著；
     - ``not_significant``／``no_effect_observed``：方向一致
@@ -23645,6 +23655,7 @@ def hypothesis_alignment(
     refuted: List[str] = []
     supported: List[str] = []
     below_min_effect: List[str] = []
+    min_effect_undefined: List[str] = []
 
     for contrast in contrasts:
         if contrast.get("confounded") or contrast.get(
@@ -23721,17 +23732,27 @@ def hypothesis_alignment(
         direction = next(iter(directions))
         entry["expected_direction"] = direction
         delta = float(contrast["delta"])
-        expected_sign = -1.0 if direction == "decrease" else 1.0
         baseline_mean = contrast.get("mean_baseline")
         min_effect = entry["min_effect"]
         threshold_abs = None
+        threshold_defined = False
         if (
             isinstance(min_effect, float)
+            and math.isfinite(min_effect)
             and isinstance(baseline_mean, (int, float))
             and not isinstance(baseline_mean, bool)
         ):
-            threshold_abs = min_effect * abs(float(baseline_mean))
+            baseline_abs = abs(float(baseline_mean))
+            if math.isfinite(baseline_abs):
+                candidate = min_effect * baseline_abs
+                if (
+                    math.isfinite(candidate)
+                    and candidate > _HYPOTHESIS_MIN_EFFECT_ABS_FLOOR
+                ):
+                    threshold_abs = candidate
+                    threshold_defined = True
         entry["min_effect_abs"] = threshold_abs
+        entry["baseline_mean"] = baseline_mean
 
         conflict = direction == "decrease" and delta > 0.0 or (
             direction == "increase" and delta < 0.0
@@ -23744,6 +23765,10 @@ def hypothesis_alignment(
                 if entry["significant"]
                 else "direction_mismatch_not_significant"
             )
+        elif isinstance(min_effect, float) and not threshold_defined:
+            # 有最小效应声明却没有可解释的对照尺度：既不能判
+            # supported，也不能把「无法核对」伪装成不显著。
+            status = "min_effect_undefined"
         elif (
             threshold_abs is not None
             and abs(delta) < threshold_abs
@@ -23783,6 +23808,19 @@ def hypothesis_alignment(
                 f"{min_effect:.2%}×对照均值="
                 f"{threshold_abs:.4f}）"
             )
+        elif status == "min_effect_undefined":
+            baseline_text = (
+                f"{float(baseline_mean):.6g}"
+                if isinstance(baseline_mean, (int, float))
+                and not isinstance(baseline_mean, bool)
+                else "缺失"
+            )
+            min_effect_undefined.append(
+                f"{label}（Δ={delta:+.4f}，预注册最小效应 "
+                f"{min_effect:.2%}×对照均值，但对照均值="
+                f"{baseline_text} 为零/近零或缺失，相对阈值"
+                "无法定义）"
+            )
 
     if refuted:
         advisories.append(
@@ -23797,6 +23835,13 @@ def hypothesis_alignment(
             "效应：即使统计显著也不能主张支持假设（事先声明"
             "的最小效应正是用来区分「显著」与「有意义」）："
             + "; ".join(below_min_effect)
+        )
+    if min_effect_undefined:
+        advisories.append(
+            "以下对比声明了相对最小效应，但对照均值为零/近零"
+            "或缺失：比例阈值没有可解释的尺度，既不能判为达到"
+            "最小效应，也不能判为不显著，结论应为不可判定："
+            + "; ".join(min_effect_undefined)
         )
 
     # 预注册主指标的口径族：频率加权的似然（val_loss / val_ppl /
@@ -23872,6 +23917,7 @@ def hypothesis_alignment(
         "refuted": refuted,
         "supported": supported,
         "below_min_effect": below_min_effect,
+        "min_effect_undefined": min_effect_undefined,
         "advisories": advisories,
     }
 
@@ -37208,6 +37254,44 @@ def run_self_test():
         assert below_alignment["checks"][0]["status"] == (
             "below_declared_min_effect"
         )
+        # 对照均值为零/近零时，相对最小效应阈值退化为 0 或
+        # 低于数值分辨率：必须判为不可判定，不能因 delta 非零
+        # 就静默算作达到最小效应。
+        for undefined_baseline in (0.0, 1e-15):
+            undefined_alignment = hypothesis_alignment(
+                prereg_rows,
+                alignment_aggregates,
+                [
+                    _synthetic_contrast(
+                        "smelt",
+                        "A",
+                        undefined_baseline,
+                        -0.5,
+                        True,
+                    )
+                ],
+                "val_loss",
+            )
+            undefined_check = undefined_alignment["checks"][0]
+            assert undefined_check["status"] == (
+                "min_effect_undefined"
+            ), undefined_alignment
+            assert undefined_check["min_effect_abs"] is None
+            assert undefined_alignment["min_effect_undefined"]
+        # 对照均值缺失时同样没有可解释的相对尺度。
+        missing_baseline_contrast = _synthetic_contrast(
+            "smelt", "A", 4.5, 4.4, True
+        )
+        missing_baseline_contrast.pop("mean_baseline")
+        missing_baseline_alignment = hypothesis_alignment(
+            prereg_rows,
+            alignment_aggregates,
+            [missing_baseline_contrast],
+            "val_loss",
+        )
+        assert missing_baseline_alignment["checks"][0][
+            "status"
+        ] == "min_effect_undefined"
         refuted_alignment = hypothesis_alignment(
             prereg_rows,
             alignment_aggregates,
