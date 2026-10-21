@@ -30121,6 +30121,32 @@ def run_self_test():
         safe_records = read_metrics_records(safe_path)
     assert safe_records[0]["train_loss"] is None
 
+    # update_run_config 必须合并单个键而不是覆盖整份运行卡片：
+    # 训练结束后的 final / curve_analysis 与训练前写出的配置
+    # 要能同时保留。
+    with tempfile.TemporaryDirectory() as cfg_dir:
+        cfg_path = Path(cfg_dir) / "config.json"
+        cfg_path.write_text(
+            json.dumps({"config": {"mode": "B"}}),
+            encoding="utf-8",
+        )
+        update_run_config(
+            Path(cfg_dir),
+            "final",
+            {"step": "final", "val_loss": 1.25},
+        )
+        update_run_config(
+            Path(cfg_dir),
+            "curve_analysis",
+            {"status": "healthy"},
+        )
+        merged = json.loads(
+            cfg_path.read_text(encoding="utf-8")
+        )
+    assert merged["config"]["mode"] == "B"
+    assert merged["final"]["val_loss"] == 1.25
+    assert merged["curve_analysis"]["status"] == "healthy"
+
     # 走势条：空输入/非正宽度不报错；宽度 1 不因降采样
     # 除以 width-1 崩溃；正常降采样同时覆盖首尾点。
     assert _sparkline([], 48) == ""
@@ -44010,6 +44036,11 @@ def main():
         )
     )
 
+    # 最终结果同时并入 config.json：config.json 是运行卡片，
+    # 单独归档（不读 metrics.jsonl）时也能看到最终验证指标、
+    # 选型步与训练量，而不是只有训练前的配置。
+    update_run_config(out_dir, "final", final_record)
+
     # 选型协议写入 config.json：最终模型由验证集选定（best_val）
     # 或回退到最后一步（last），以及是否用于测试集评估。
     update_run_config(
@@ -44063,6 +44094,17 @@ def main():
     )
     metrics_file.flush()
     print_curve_analysis(curve_analysis)
+
+    # 曲线诊断同样并入 config.json，运行卡片自带最终状态
+    # （healthy / overfitting / diverged 等）。
+    update_run_config(
+        out_dir,
+        "curve_analysis",
+        {
+            "reference_baseline_loss": curve_baseline_loss,
+            **curve_analysis,
+        },
+    )
 
     # --------------------------------------------------------
     # 结果分析 2：坏案例分析（验证集，测试集保持尘封）。
