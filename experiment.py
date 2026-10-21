@@ -6318,6 +6318,69 @@ def _percentile_interval(
     return float(quantiles[0]), float(quantiles[1])
 
 
+def _lag1_autocorrelation(
+    values: torch.Tensor,
+) -> Optional[float]:
+    """
+    序列的 lag-1 自相关 ρ̂1；样本不足或方差为 0 时返回 None。
+
+    bootstrap 把窗口当 i.i.d. 抽样单位，但固定窗口沿评估序列
+    排列，窗口指标常随数据顺序渐变（同一类块、主题相邻等）。
+    正自相关会让区间偏窄；报告 ρ̂1 与 AR(1) 有效窗口数
+    n·(1-ρ)/(1+ρ) 用于方差膨胀。ρ̂1 只依赖顺序与数值，与
+    bootstrap 随机数无关。
+    """
+    numeric = values.to(torch.float64).reshape(-1)
+    n = int(numeric.numel())
+    if n < 4 or not bool(torch.isfinite(numeric).all()):
+        return None
+    head = numeric[:-1]
+    tail = numeric[1:]
+    head = head - head.mean()
+    tail = tail - tail.mean()
+    denominator = torch.sqrt(
+        (head * head).sum() * (tail * tail).sum()
+    )
+    if float(denominator) <= 0.0:
+        return None
+    raw_rho = float((head * tail).sum() / denominator)
+    return max(-1.0, min(1.0, raw_rho))
+
+
+def _ar1_effective_windows(
+    n_windows: int,
+    rho1: Optional[float],
+) -> Tuple[float, float]:
+    """
+    由 ρ̂1 给出 AR(1) 有效窗口数与区间方差膨胀因子。
+
+    负相关不用于缩窄区间（只放宽不收窄）：ρ→-1 时
+    n·(1-ρ)/(1+ρ) 发散甚至除零（完全交替序列 ρ̂1 恰为 -1），
+    此时直接取 n。ρ̂1 达到 _EVAL_WINDOW_AUTOCORRELATION 才
+    启用膨胀，低于阈值时样本 ρ̂ 的噪声与调整量同量级。
+    """
+    if rho1 is None:
+        return float(n_windows), 1.0
+    if rho1 <= 0.0:
+        effective = float(n_windows)
+    elif rho1 >= 0.999:
+        effective = 1.0
+    else:
+        effective = max(
+            1.0,
+            min(
+                float(n_windows),
+                float(n_windows)
+                * (1.0 - rho1)
+                / (1.0 + rho1),
+            ),
+        )
+    inflation = 1.0
+    if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
+        inflation = math.sqrt(float(n_windows) / effective)
+    return effective, inflation
+
+
 def _bootstrap_eval_intervals(
     window_loss_sums: torch.Tensor,
     window_tokens: torch.Tensor,
@@ -6409,51 +6472,18 @@ def _bootstrap_eval_intervals(
 
     # 窗口间 lag-1 自相关：bootstrap 把窗口当 i.i.d. 抽样单位，
     # 但固定窗口沿评估序列排列，窗口指标常随数据顺序渐变（同一
-    # 类块、主题相邻等），正自相关会让区间偏窄。报告 ρ̂1 与
-    # AR(1) 有效窗口数 n·(1-ρ)/(1+ρ)；ρ̂1 达到阈值时按方差
-    # 膨胀因子 √(n/n_eff) 放宽全部区间（以区间中点为中心等比
-    # 放大，一阶近似；只放宽不收窄，负相关不用于缩窄区间）。
+    # 类块、主题相邻等），正自相关会让区间偏窄。ρ̂1 达到阈值时
+    # 按方差膨胀因子 √(n/n_eff) 放宽全部区间（以区间中点为中心
+    # 等比放大，一阶近似；只放宽不收窄，负相关不用于缩窄）。
     per_window_loss = (
         window_loss_sums.to(torch.float64)
         / window_tokens.to(torch.float64).clamp_min(1.0)
     )
-    rho1: Optional[float] = None
-    if n_windows >= 4:
-        head = per_window_loss[:-1]
-        tail = per_window_loss[1:]
-        head = head - head.mean()
-        tail = tail - tail.mean()
-        denominator = torch.sqrt(
-            (head * head).sum() * (tail * tail).sum()
-        )
-        if float(denominator) > 0.0:
-            raw_rho = float((head * tail).sum() / denominator)
-            rho1 = max(-1.0, min(1.0, raw_rho))
-
-    effective_windows = float(n_windows)
-    inflation = 1.0
-    if rho1 is not None:
-        if rho1 <= 0.0:
-            # 负相关按文档只用于「不缩窄」：AR(1) 公式
-            # n·(1-ρ)/(1+ρ) 在 ρ→-1 时发散甚至除零（完全交替
-            # 的窗口序列 ρ̂1 恰为 -1.0），此时直接取 n。
-            effective_windows = float(n_windows)
-        elif rho1 >= 0.999:
-            effective_windows = 1.0
-        else:
-            effective_windows = max(
-                1.0,
-                min(
-                    float(n_windows),
-                    float(n_windows)
-                    * (1.0 - rho1)
-                    / (1.0 + rho1),
-                ),
-            )
-        if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
-            inflation = math.sqrt(
-                float(n_windows) / effective_windows
-            )
+    rho1 = _lag1_autocorrelation(per_window_loss)
+    effective_windows, inflation = _ar1_effective_windows(
+        n_windows,
+        rho1,
+    )
 
     result: Dict[str, object] = {
         "bootstrap_replicates": int(replicates),
@@ -15783,6 +15813,12 @@ def _paired_window_bootstrap_ci(
     窗口级区间的独立性假设比种子级更弱（窗口可能重叠），
     因此该区间只描述「在这批固定评估窗口上」的差异，不解释为
     对「换一批评估窗口」的泛化区间。
+
+    与评估级 bootstrap 同一口径：逐窗口差值沿评估序列可能正
+    自相关（同类块/主题相邻），普通 percentile bootstrap 把
+    窗口当 i.i.d. 会让区间偏窄。ρ̂1 达到阈值时按 AR(1) 有效
+    窗口数做方差膨胀（只放宽不收窄），并把 ρ̂1、有效窗口数与
+    膨胀因子随区间一起报告。
     """
     n = len(differences)
     if n < 2:
@@ -15798,12 +15834,29 @@ def _paired_window_bootstrap_ci(
     means = values[indices].mean(dim=1)
     low = float(torch.quantile(means, 0.025).item())
     high = float(torch.quantile(means, 0.975).item())
+    rho1 = _lag1_autocorrelation(values)
+    effective_windows, inflation = _ar1_effective_windows(
+        n,
+        rho1,
+    )
+    if inflation > 1.0:
+        midpoint = (low + high) / 2.0
+        half_width = (high - low) / 2.0 * inflation
+        low = midpoint - half_width
+        high = midpoint + half_width
     return {
         "available": True,
         "low": low,
         "high": high,
         "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
-        "method": "percentile_bootstrap",
+        "method": (
+            "percentile_bootstrap_ar1_adjusted"
+            if inflation > 1.0
+            else "percentile_bootstrap"
+        ),
+        "lag1_autocorrelation": rho1,
+        "effective_windows": effective_windows,
+        "ci_inflation": inflation,
     }
 
 
@@ -29979,6 +30032,39 @@ def run_self_test():
     assert (
         float(alternating_boot["window_effective_windows"])
         == float(alternating_totals.numel())
+    )
+
+    # 逐窗口配对差值的 bootstrap 与评估级同口径：正自相关时按
+    # AR(1) 放宽区间，负相关/零相关不缩窄。固定种子保证可复现。
+    paired_trend = [0.1 * index for index in range(8)]
+    paired_trend_boot = _paired_window_bootstrap_ci(
+        paired_trend,
+        seed=99,
+    )
+    assert paired_trend_boot["available"] is True
+    assert (
+        float(paired_trend_boot["lag1_autocorrelation"])
+        >= _EVAL_WINDOW_AUTOCORRELATION
+    )
+    assert float(paired_trend_boot["ci_inflation"]) > 1.0
+    assert (
+        float(paired_trend_boot["effective_windows"]) < 8.0
+    )
+    paired_shuffled = [0.1, 0.8, 0.2, 0.7, 0.3, 0.6, 0.4, 0.5]
+    paired_shuffled_boot = _paired_window_bootstrap_ci(
+        paired_shuffled,
+        seed=99,
+    )
+    assert float(paired_shuffled_boot["ci_inflation"]) == 1.0
+    assert (
+        float(paired_trend_boot["high"])
+        - float(paired_trend_boot["low"])
+        > float(paired_shuffled_boot["high"])
+        - float(paired_shuffled_boot["low"])
+    )
+    assert (
+        _paired_window_bootstrap_ci(paired_trend, seed=99)
+        == paired_trend_boot
     )
 
     # ---- 对比分析：多重比较校正与置信区间 ----
