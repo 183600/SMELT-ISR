@@ -6697,6 +6697,88 @@ def _ar1_effective_windows(
     return effective, inflation
 
 
+def _ar1_adjusted_mean_test(
+    values: List[float],
+) -> Dict[str, object]:
+    """
+    对逐窗口配对差值的均值做 AR(1) 有效窗口数校正检验。
+
+    普通配对 t 检验把沿评估序列排列的窗口当独立样本；固定
+    窗口可能重叠或同属相邻主题块，正自相关会让标准误偏小。
+    这里用 ρ̂1 推导有效窗口数 n_eff = n(1-ρ)/(1+ρ)，把标准误
+    放大 sqrt(n/n_eff)，自由度取 n_eff-1。只放宽不收窄；ρ̂1
+    低于阈值时不调整。n_eff<3 时不给 p 值（有效证据不足），
+    避免用 1 个有效窗口伪造显著性。
+    """
+    values = [float(value) for value in values]
+    n = len(values)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {
+            "applied": False,
+            "lag1_autocorrelation": None,
+            "effective_windows": float(n),
+            "ci_inflation": 1.0,
+            "p_value": None,
+            "df": None,
+            "note": "insufficient_windows",
+        }
+    if any(not math.isfinite(value) for value in values):
+        return {
+            "applied": False,
+            "lag1_autocorrelation": None,
+            "effective_windows": float(n),
+            "ci_inflation": 1.0,
+            "p_value": None,
+            "df": None,
+            "note": "non_finite_values",
+        }
+
+    tensor = torch.tensor(values, dtype=torch.float64)
+    rho1 = _lag1_autocorrelation(tensor)
+    effective, inflation = _ar1_effective_windows(n, rho1)
+    result: Dict[str, object] = {
+        "applied": inflation > 1.0,
+        "lag1_autocorrelation": rho1,
+        "effective_windows": effective,
+        "ci_inflation": inflation,
+        "p_value": None,
+        "df": None,
+        "note": None,
+    }
+    if inflation <= 1.0:
+        result["note"] = "autocorrelation_below_threshold"
+        return result
+
+    mean = sum(values) / n
+    std = _sample_std(values)
+    se = std / math.sqrt(n) * inflation
+    if se == 0.0:
+        if mean == 0.0:
+            result["p_value"] = 1.0
+            result["df"] = None
+            result["note"] = "zero_variance"
+        else:
+            result["p_value"] = 0.0
+            result["df"] = None
+            result["note"] = "noise_free_separation"
+        return result
+
+    if effective < _MIN_SEEDS_FOR_STATS:
+        result["note"] = "effective_windows_below_three"
+        return result
+
+    df = effective - 1.0
+    t_value = mean / se
+    result["t"] = t_value
+    result["se"] = se
+    result["df"] = df
+    result["p_value"] = _two_sided_t_p_value(
+        abs(t_value),
+        df,
+    )
+    return result
+
+
 def _bootstrap_eval_intervals(
     window_loss_sums: torch.Tensor,
     window_tokens: torch.Tensor,
@@ -16956,7 +17038,9 @@ def paired_window_comparison(
       一致时直接拒绝：窗口集合不同，配对没有意义；
     - 窗口级 p 值与区间只覆盖「评估集抽样」这一层不确定性，
       重叠窗口不是独立抽样单位，区间会偏窄（overlap_fraction
-      一并给出）；训练随机性仍由种子级检验负责；
+      一并给出）；正自相关时另给 AR(1) 有效窗口数校正后的
+      p 值（`window_p_value_ar1`），原始 p 值保留作对照；
+      训练随机性仍由种子级检验负责；
     - 差异方向按「b 相对 a」给出：loss 类指标越低越好，
       accuracy 类指标越高越好。
     """
@@ -17058,6 +17142,7 @@ def paired_window_comparison(
     )
     test = _paired_t_test(loss_differences)
     randomization = _paired_sign_flip_test(loss_differences)
+    ar1_test = _ar1_adjusted_mean_test(loss_differences)
 
     result: Dict[str, object] = {
         "status": "ok",
@@ -17071,6 +17156,17 @@ def paired_window_comparison(
         "window_randomization_p_value": randomization.get(
             "p_value"
         ),
+        "window_lag1_autocorrelation": ar1_test.get(
+            "lag1_autocorrelation"
+        ),
+        "window_effective_windows": ar1_test.get(
+            "effective_windows"
+        ),
+        "window_ar1_adjustment_applied": ar1_test.get("applied"),
+        "window_ci_inflation_ar1": ar1_test.get("ci_inflation"),
+        "window_p_value_ar1": ar1_test.get("p_value"),
+        "window_df_ar1": ar1_test.get("df"),
+        "window_ar1_note": ar1_test.get("note"),
         "overlap_fraction": payload_a.get("overlap_fraction"),
         "bootstrap_ci95": bootstrap,
     }
@@ -17200,7 +17296,8 @@ def _cell_window_paired_analysis(
         notes.append(
             "评估窗口可能重叠（overlap_fraction="
             f"{max(overlap_fractions):.3f}）：窗口不是独立抽样"
-            "单位，窗口级区间偏窄，训练随机性仍由种子级检验覆盖"
+            "单位，窗口级原始 p 值偏小；已另给 AR(1) 有效窗口"
+            "校正 p 值，训练随机性仍由种子级检验覆盖"
         )
     notes.append(
         "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
@@ -19926,10 +20023,25 @@ def _format_window_paired(
         ]
         if p_values:
             parts.append(
-                "逐种子窗口级 p: "
+                "逐种子窗口级原始 p: "
                 + ", ".join(
                     f"{float(value):.3g}" for value in p_values
                 )
+            )
+        ar1_p_values = []
+        for entry in per_seed:
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("window_ar1_adjustment_applied"):
+                continue
+            value = entry.get("window_p_value_ar1")
+            if isinstance(value, (int, float)):
+                ar1_p_values.append(f"{float(value):.3g}")
+            else:
+                ar1_p_values.append("有效窗口不足")
+        if ar1_p_values:
+            parts.append(
+                "AR(1) 校正 p: " + ", ".join(ar1_p_values)
             )
     notes = window_paired.get("notes")
     if isinstance(notes, list) and notes:
@@ -33392,6 +33504,70 @@ def run_self_test():
         )
         assert "[window]" in _format_window_paired(
             window_contrasts[0]
+        )
+
+        # 逐窗口差值沿评估序列强正自相关时，普通配对 t 检验
+        # 会把 40 个窗口当 40 个独立样本（p 极小）；AR(1)
+        # 有效窗口数校正后只剩约 1 个有效窗口，必须拒绝给出
+        # 显著性，而不是继续报原始 p 值。
+        window_trend_diffs = [
+            0.02
+            + 0.01 * index
+            + (0.0004 if index % 2 else -0.0004)
+            for index in range(40)
+        ]
+        raw_trend_test = _paired_t_test(window_trend_diffs)
+        ar1_trend_test = _ar1_adjusted_mean_test(
+            window_trend_diffs
+        )
+        assert raw_trend_test["p_value"] < 1e-6
+        assert ar1_trend_test["applied"] is True
+        assert (
+            ar1_trend_test["lag1_autocorrelation"] > 0.3
+        )
+        assert ar1_trend_test["effective_windows"] < 3.0
+        assert ar1_trend_test["p_value"] is None
+        assert (
+            ar1_trend_test["note"]
+            == "effective_windows_below_three"
+        )
+        trend_base_losses = [
+            4.0 + 0.005 * index for index in range(40)
+        ]
+        trend_variant_losses = [
+            loss + diff
+            for loss, diff in zip(
+                trend_base_losses, window_trend_diffs
+            )
+        ]
+        trend_pair = paired_window_comparison(
+            _window_payload("deadbeef", trend_base_losses),
+            _window_payload("deadbeef", trend_variant_losses),
+        )
+        assert trend_pair["status"] == "ok"
+        assert (
+            trend_pair["window_ar1_adjustment_applied"]
+            is True
+        )
+        assert trend_pair["window_p_value"] < 1e-6
+        assert trend_pair["window_p_value_ar1"] is None
+        assert (
+            "AR(1) 校正 p" in _format_window_paired(
+                {
+                    "window_paired": {
+                        "available": True,
+                        "mean_loss_diff": float(
+                            trend_pair["mean_loss_diff"]
+                        ),
+                        "n_seeds": 1,
+                        "n_seeds_favoring_variant": 0,
+                        "n_seeds_favoring_baseline": 1,
+                        "per_seed": [
+                            {"seed": 42, **trend_pair}
+                        ],
+                    }
+                }
+            )
         )
 
         # 评估协议指纹不同（换了数据）时必须拒绝逐窗口配对：

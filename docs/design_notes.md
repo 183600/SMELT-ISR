@@ -447,6 +447,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   等比放宽全部四个区间（`window_ci_inflation`；只放宽不收窄，
   负相关不用于把区间做窄），展示层对受影响的 split 发
   `[warn]`，避免放宽后的区间仍被当成窗口独立前提下的宽度。
+  逐窗口配对比较的 p 值同样不能把重叠/正自相关窗口当独立
+  样本：除原始 `window_p_value` 外，另给 AR(1) 有效窗口数
+  校正的 `window_p_value_ar1`（标准误乘 √(n/n_eff)，自由度
+  n_eff−1，只放宽不收窄）；n_eff<3 时不给校正 p 值并标记
+  `effective_windows_below_three`，而不是继续报原始显著性。
   **选型偏差的无偏口径**：final 的 val 指标来自验证集选中的
   checkpoint，同一批数据既选型又判定会产生 winner's curse。
   `--compare` 对所有周期验证实际计算的指标（loss / ppl / bpb /
