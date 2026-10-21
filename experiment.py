@@ -21819,6 +21819,64 @@ _HYPOTHESIS_AVERAGING_QUALIFIER = re.compile(
     re.IGNORECASE,
 )
 
+# 预注册主指标若已经带平均口径（如 val_macro_f1），假设文本
+# 写明的口径必须与之兼容：只写「F1」算未注明（由
+# hypothesis_ambiguous_averaging_metrics 单独点名），写
+# 「macro F1」却预注册 weighted F1 则是明确的口径冲突。
+_HYPOTHESIS_AVERAGING_METRIC_QUALIFIERS = {
+    "val_micro_f1": "micro",
+    "val_macro_f1": "macro",
+    "val_weighted_f1": "weighted",
+    "val_precision_macro": "macro",
+    "val_precision_weighted": "weighted",
+    "val_recall_macro": "macro",
+    "val_recall_weighted": "weighted",
+}
+_HYPOTHESIS_AVERAGING_QUALIFIER_PATTERNS = (
+    ("macro", re.compile(r"macro|宏(?:平均|均值)?", re.IGNORECASE)),
+    ("micro", re.compile(r"micro|微(?:平均|均值)?", re.IGNORECASE)),
+    ("weighted", re.compile(r"weighted|加权", re.IGNORECASE)),
+)
+
+
+def hypothesis_metric_averaging_qualifier(
+    metric: str,
+) -> Optional[str]:
+    """返回指标名自带的平均口径（macro/micro/weighted）。"""
+    base = _common_step_metric_base(metric) or metric
+    return _HYPOTHESIS_AVERAGING_METRIC_QUALIFIERS.get(base)
+
+
+def hypothesis_averaging_qualifier_mismatch(
+    primary_metric: str,
+    text: str,
+) -> Optional[str]:
+    """
+    检查假设文本写明的平均口径是否与预注册主指标冲突。
+
+    只处理「文本明确写了口径」的情况：没写任何口径时不在这里
+    报错（另行提示口径歧义），避免把「F1 提升」误判成冲突。
+    文本同时写了多个口径时，只要包含预注册指标的口径就算兼容
+    （例如同时讨论 macro F1 与 weighted recall）。
+    """
+    expected = hypothesis_metric_averaging_qualifier(
+        primary_metric
+    )
+    if expected is None:
+        return None
+    found = [
+        name
+        for name, pattern in _HYPOTHESIS_AVERAGING_QUALIFIER_PATTERNS
+        if pattern.search(text)
+    ]
+    if not found or expected in found:
+        return None
+    return (
+        f"预注册主指标 {primary_metric} 的平均口径是 "
+        f"{expected}，但假设文本写的是 {', '.join(found)}："
+        "假设与判定口径必须一致"
+    )
+
 
 def hypothesis_metric_mentions(text: str) -> List[str]:
     """
@@ -22006,6 +22064,13 @@ def hypothesis_preregistration_error(
             "无法对齐"
         )
 
+    averaging_mismatch = hypothesis_averaging_qualifier_mismatch(
+        primary_metric,
+        hypothesis_text,
+    )
+    if averaging_mismatch is not None:
+        return averaging_mismatch
+
     return None
 
 
@@ -22027,7 +22092,8 @@ def hypothesis_registry(
     写明了但当前评估管线不可判定的指标（如路由类指标而运行
     没有 routing_analysis 记录）同样单独点名，避免假性对齐。
     F1 / precision / recall 未注明 macro/micro/weighted 时
-    同样点名（三种平均口径可能给出不同结论）。
+    同样点名（三种平均口径可能给出不同结论）；假设写明的
+    口径与预注册主指标冲突时也单独点名。
 
     ``metric`` 为当前对比使用的判定指标（--compare-metric）：
     运行预注册了 ``--primary-metric`` 但与当前指标不一致时，
@@ -22044,6 +22110,8 @@ def hypothesis_registry(
     unverifiable_details: List[str] = []
     ambiguous_averaging_runs: List[str] = []
     ambiguous_averaging_details: List[str] = []
+    averaging_mismatch_runs: List[str] = []
+    averaging_mismatch_details: List[str] = []
     preregistered_runs: List[str] = []
     preregistration_missing_runs: List[str] = []
     metric_mismatch_runs: List[str] = []
@@ -22061,6 +22129,7 @@ def hypothesis_registry(
                 "hypotheses_without_metric_runs": [],
                 "hypotheses_with_unverifiable_metric_runs": [],
                 "hypotheses_with_ambiguous_averaging_runs": [],
+                "hypotheses_with_averaging_mismatch_runs": [],
                 "preregistered_primary_metrics": [],
                 "preregistration_missing_runs": [],
                 "metric_mismatch_runs": [],
@@ -22132,6 +22201,20 @@ def hypothesis_registry(
                     metric_mismatch_details.append(
                         f"{run_name}（预注册 {preregistered}，"
                         f"当前判定 {metric}）"
+                    )
+                averaging_mismatch = (
+                    hypothesis_averaging_qualifier_mismatch(
+                        preregistered,
+                        hypothesis_text,
+                    )
+                )
+                if averaging_mismatch is not None:
+                    entry[
+                        "hypotheses_with_averaging_mismatch_runs"
+                    ].append(run_name)
+                    averaging_mismatch_runs.append(run_name)
+                    averaging_mismatch_details.append(
+                        f"{run_name}（{averaging_mismatch}）"
                     )
             elif mode != "ngram":
                 entry["preregistration_missing_runs"].append(
@@ -22216,6 +22299,15 @@ def hypothesis_registry(
             + "。请在假设里写明判定口径，并与 --primary-metric "
             "/ --compare-metric 保持一致"
         )
+    if averaging_mismatch_runs:
+        advisories.append(
+            "以下运行的假设写明的平均口径与预注册主指标不一致"
+            "（同一个实验在不同平均口径下可能一个显著、另一个"
+            "不显著，假设与判定口径必须一致）："
+            + "; ".join(averaging_mismatch_details)
+            + "。请把假设改为与 --primary-metric 相同的口径，"
+            "或改用假设所写口径的指标"
+        )
     if metric_mismatch_runs:
         advisories.append(
             f"以下运行预注册的主指标与当前判定指标 {metric} "
@@ -22252,6 +22344,12 @@ def hypothesis_registry(
         ),
         "ambiguous_averaging_details": (
             ambiguous_averaging_details
+        ),
+        "hypotheses_with_averaging_mismatch_runs": (
+            averaging_mismatch_runs
+        ),
+        "averaging_mismatch_details": (
+            averaging_mismatch_details
         ),
         "preregistered_runs": preregistered_runs,
         "preregistration_missing_runs": (
@@ -34403,6 +34501,69 @@ def run_self_test():
         assert hypothesis_ambiguous_averaging_metrics(
             "precision 与 recall 都提升"
         ) == ["precision", "recall"]
+
+        # 假设写明的平均口径必须与预注册主指标兼容：只写「F1」
+        # 留给歧义检查；写「macro F1」却预注册 weighted F1 则是
+        # 明确冲突（共同步数派生指标按基础指标判断）。
+        assert hypothesis_metric_averaging_qualifier(
+            "val_macro_f1"
+        ) == "macro"
+        assert hypothesis_metric_averaging_qualifier(
+            "val_macro_f1_at_common_step"
+        ) == "macro"
+        assert hypothesis_metric_averaging_qualifier(
+            "val_loss"
+        ) is None
+        assert hypothesis_averaging_qualifier_mismatch(
+            "val_macro_f1",
+            "macro F1 提升",
+        ) is None
+        assert hypothesis_averaging_qualifier_mismatch(
+            "val_macro_f1",
+            "F1 提升",
+        ) is None
+        assert hypothesis_averaging_qualifier_mismatch(
+            "val_weighted_f1",
+            "macro F1 提升",
+        ) is not None
+        assert hypothesis_averaging_qualifier_mismatch(
+            "val_micro_f1",
+            "macro F1 与加权召回率都提升",
+        ) is not None
+        assert hypothesis_averaging_qualifier_mismatch(
+            "val_weighted_f1",
+            "macro F1 与加权召回率都提升",
+        ) is None
+
+        mismatched_averaging_path = _write_analysis_run(
+            "averaging_mismatch_seed1",
+            "A",
+            4,
+            3e-4,
+            100,
+            0.01,
+            4.30,
+            hypothesis="延迟合并使 macro F1 提升",
+            preregistration={
+                "primary_metric": "val_weighted_f1",
+                "direction": "increase",
+                "min_effect": None,
+            },
+        )
+        mismatched_averaging_registry = hypothesis_registry(
+            compare_runs([mismatched_averaging_path]),
+            "val_weighted_f1",
+        )
+        assert mismatched_averaging_registry[
+            "hypotheses_with_averaging_mismatch_runs"
+        ] == ["averaging_mismatch_seed1"]
+        assert any(
+            "平均口径" in message
+            for message in mismatched_averaging_registry[
+                "advisories"
+            ]
+        )
+
         ambiguous_path = _write_analysis_run(
             "ambiguous_seed1",
             "A",
@@ -34456,6 +34617,20 @@ def run_self_test():
         assert hypothesis_preregistration_error(
             _prereg_args(
                 primary_metric="val_macro_f1",
+                hypothesis_direction="increase",
+            )
+        ) is not None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                hypothesis="延迟合并使 macro F1 提升",
+                primary_metric="val_macro_f1",
+                hypothesis_direction="increase",
+            )
+        ) is None
+        assert hypothesis_preregistration_error(
+            _prereg_args(
+                hypothesis="延迟合并使 macro F1 提升",
+                primary_metric="val_weighted_f1",
                 hypothesis_direction="increase",
             )
         ) is not None
