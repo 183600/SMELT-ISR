@@ -489,7 +489,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   主指标上必须真的优于无上下文 unigram 参考（各运行
   `config.json` 的 `reference_baselines`；PR-AUC / ROC-AUC
   同样有常数预测器参考——纳入类平均 prevalence 与 0.5，
-  切换对比指标后守卫不会静默失效），不能劣于对比集合
+  PR-AUC lift 的参考恒为 0，切换对比指标后守卫不会静默
+  失效），不能劣于对比集合
   里调优好的 n-gram 统计基线，种子数应 ≥3，且必须带有调参
   证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线
   自身在 val 上做过 阶数 × 平滑系数 网格调优，视为已调参）；
@@ -556,7 +557,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   极度不平衡单独分级——随机 PR-AUC 只有平均 prevalence
   （≈0.001，评估时记录为 `val_pr_auc_macro_chance`），排序
   判定必须报告 PR-AUC 高出该水平的 lift，而不能把 PR-AUC
-  绝对值当准确率读。四项检查的结构化结果
+  绝对值当准确率读。lift 以 `val_pr_auc_macro_lift` 作为
+  一等的对比/选型/预注册指标落盘（随机水平恒为 0），避免
+  跨数据集直接比较随 prevalence 缩放的 PR-AUC 绝对值。
+  四项检查的结构化结果
   （`hypothesis_registry`、`baseline_adequacy`、
   `imbalance_advisory`）随 `comparison_analysis.json` 落盘。
 - **假设预注册（方向 / 最小效应 / 主指标）**：可检验的假设
@@ -591,7 +595,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `--selection-metric` 可把验证集选型/早停改为周期验证
   实际计算的任一对比指标（`val_macro_f1`、
   `val_recall_weighted`、`val_pr_auc_macro` /
-  `val_roc_auc_macro` 等）。AUC 默认仍只在 final/test
+  `val_pr_auc_macro_lift` / `val_roc_auc_macro` 等）。AUC
+  默认仍只在 final/test
   计算；被显式指定为选型指标时，训练循环会在每个验证点
   按与 final/test 相同的固定窗口和排序口径计算，避免
   「以 PR-AUC 判定却按 val_loss 选模型」的口径脱节。

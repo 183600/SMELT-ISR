@@ -7066,10 +7066,13 @@ def macro_auc_metrics(
     分数增长缓慢，容易给出过于乐观的结论。
 
     同时返回 ``pr_auc_macro_chance``：macro PR-AUC 的随机
-    水平（各纳入类 prevalence 的均值）。PR-AUC 本身随正类
-    比例缩放，脱离该水平看绝对值没有意义；1:1000 级别的
-    不平衡下随机 PR-AUC 只有约 0.001，而随机 ROC-AUC 仍
-    是 0.5，两者的「及格线」完全不同。
+    水平（各纳入类 prevalence 的均值），以及
+    ``pr_auc_macro_lift`` = ``pr_auc_macro - chance``。PR-AUC
+    本身随正类比例缩放，脱离该水平看绝对值没有意义；
+    1:1000 级别的不平衡下随机 PR-AUC 只有约 0.001，而随机
+    ROC-AUC 仍是 0.5，两者的「及格线」完全不同。lift 的
+    随机水平恒为 0，是不随 prevalence 缩放的一等指标，
+    可直接用于预注册、跨运行对比与稻草人核对。
 
     每个类独立做 one-vs-rest：ROC-AUC 为并列分数取平均
     秩的 Mann-Whitney 统计量；PR-AUC 按相异分数阈值分步
@@ -7259,15 +7262,27 @@ def macro_auc_metrics(
                         )
                     )
 
+    pr_auc_macro = (
+        sum(pr_aucs) / len(pr_aucs)
+        if pr_aucs
+        else None
+    )
+    pr_auc_macro_chance = (
+        pr_prevalence_sum / len(pr_aucs)
+        if pr_aucs
+        else None
+    )
     return {
-        "pr_auc_macro": (
-            sum(pr_aucs) / len(pr_aucs)
-            if pr_aucs
-            else None
-        ),
-        "pr_auc_macro_chance": (
-            pr_prevalence_sum / len(pr_aucs)
-            if pr_aucs
+        "pr_auc_macro": pr_auc_macro,
+        "pr_auc_macro_chance": pr_auc_macro_chance,
+        # 相对随机水平的 lift 才是不随 prevalence 缩放的一等
+        # 指标：PR-AUC 绝对值在 1:1000 不平衡下从 0.001 起步，
+        # 跨数据集/不同类别构成不能直接比较；lift 的随机水平
+        # 恒为 0，可直接预注册、对比与做稻草人核对。
+        "pr_auc_macro_lift": (
+            pr_auc_macro - pr_auc_macro_chance
+            if pr_auc_macro is not None
+            and pr_auc_macro_chance is not None
             else None
         ),
         "roc_auc_macro": (
@@ -7813,6 +7828,7 @@ def evaluate(
             # 静默缺键。
             metrics[f"{split}_pr_auc_macro"] = None
             metrics[f"{split}_pr_auc_macro_chance"] = None
+            metrics[f"{split}_pr_auc_macro_lift"] = None
             metrics[f"{split}_roc_auc_macro"] = None
             metrics[f"{split}_auc_n_classes"] = 0
             metrics[f"{split}_pr_auc_n_classes"] = 0
@@ -8012,6 +8028,9 @@ def compute_reference_baselines(
         ],
         # 序数指标（AUC）的常数预测器参考（见上方注释）。
         "unigram_pr_auc_macro_chance": pr_auc_chance,
+        # 常数预测器的 PR-AUC lift = prevalence - prevalence = 0；
+        # 显式落盘，基线守卫在 lift 口径上有同源参考。
+        "unigram_pr_auc_macro_lift": 0.0,
         "unigram_roc_auc_macro": roc_auc_reference,
         # 类平衡似然参考（macro NLL）：与 val_macro_nll 同口径。
         "uniform_macro_nll": uniform_macro_nll,
@@ -9436,7 +9455,11 @@ def run_statistical_baseline(
                     order,
                     split="val",
                     include_auc=tuning_metric
-                    in ("val_pr_auc_macro", "val_roc_auc_macro"),
+                    in (
+                        "val_pr_auc_macro",
+                        "val_pr_auc_macro_lift",
+                        "val_roc_auc_macro",
+                    ),
                 )
                 for key in (
                     "val_loss",
@@ -15527,6 +15550,14 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             if final_record is not None
             else None
         )
+        # PR-AUC lift = 绝对值 - 随机水平，是跨 prevalence
+        # 可直接比较的一等口径；旧运行没有该字段时保持 None，
+        # 不根据 chance 静默重算（最终指标可能来自旧评估）。
+        row["val_pr_auc_macro_lift"] = (
+            final_record.get("val_pr_auc_macro_lift")
+            if final_record is not None
+            else None
+        )
         row["val_roc_auc_macro"] = (
             final_record.get("val_roc_auc_macro")
             if final_record is not None
@@ -15980,6 +16011,10 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_recall_macro",
     "val_recall_weighted",
     "val_pr_auc_macro",
+    # PR-AUC 相对随机水平（平均 prevalence）的 lift。绝对值随
+    # prevalence 缩放，跨数据集不可比；lift 随机水平恒为 0，
+    # 可直接作为主指标/预注册口径/基线核对口径。
+    "val_pr_auc_macro_lift",
     "val_roc_auc_macro",
 )
 
@@ -21842,6 +21877,10 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     # 切到 PR-AUC 对比时，基线合理性检查会静默降级为
     # 「无法核对」。旧运行缺这些参考字段时按缺记录处理。
     "val_pr_auc_macro": "unigram_pr_auc_macro_chance",
+    # lift 的随机水平恒为 0（常数预测器的 AP = prevalence），
+    # 与具体运行/评估集无关；仍登记参考口径，基线守卫才不会
+    # 在切到 lift 主指标时静默降级为「无法核对」。
+    "val_pr_auc_macro_lift": "unigram_pr_auc_macro_lift",
     "val_roc_auc_macro": "unigram_roc_auc_macro",
 }
 
@@ -21886,6 +21925,14 @@ def _trivial_reference_value(
     if field is None:
         return None
 
+    base_metric = (
+        _common_step_metric_base(metric) or metric
+    )
+    if base_metric == "val_pr_auc_macro_lift":
+        # PR-AUC lift 的随机水平定义为 0；旧运行参考记录里
+        # 没有该字段也应能完成稻草人核对。
+        return 0.0
+
     value = reference.get(field)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
@@ -21896,9 +21943,6 @@ def _trivial_reference_value(
 
     # unigram_loss 换算到其他口径时与 evaluate / 曲线诊断一致；
     # 共同步数派生指标沿用其原始指标的换算口径。
-    base_metric = (
-        _common_step_metric_base(metric) or metric
-    )
     if base_metric == "val_ppl":
         return math.exp(min(value, 80.0))
     if base_metric == "val_bits_per_byte":
@@ -22977,6 +23021,12 @@ _HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
     ("bits_per_byte", r"bits[\s_-]?per[\s_-]?byte|bpb|每字节比特"),
     ("accuracy", r"accuracy|acc\b|准确率|正确率"),
     ("f1", r"f1|f-?score|f分数"),
+    (
+        "pr_auc_lift",
+        r"pr[\s_-]?auc.{0,16}(?:lift|随机)"
+        r"|average[\s_-]?precision.{0,16}lift"
+        r"|lift.{0,8}(?:over|above).{0,8}chance|高出随机",
+    ),
     ("pr_auc", r"pr[\s_-]?auc|average[\s_-]?precision|平?均精度|精确率-召回率"),
     ("roc_auc", r"roc[\s_-]?auc|auroc"),
     ("precision", r"precision|精确率|查准率"),
@@ -23005,6 +23055,7 @@ _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
         "val_macro_f1",
         "val_weighted_f1",
     ),
+    "pr_auc_lift": ("val_pr_auc_macro_lift",),
     "pr_auc": ("val_pr_auc_macro",),
     "roc_auc": ("val_roc_auc_macro",),
     "precision": (
@@ -29066,9 +29117,43 @@ def run_self_test():
     # 模型仍按 loss 选出，判定与选型口径脱节。AUC 显式成为
     # 选型指标时，周期验证必须能计算同口径指标。
     assert "val_pr_auc_macro" in _SELECTION_METRIC_KEYS
+    assert "val_pr_auc_macro_lift" in _SELECTION_METRIC_KEYS
     assert "val_roc_auc_macro" in _SELECTION_METRIC_KEYS
     assert metric_higher_is_better("val_pr_auc_macro")
+    assert metric_higher_is_better("val_pr_auc_macro_lift")
     assert metric_higher_is_better("val_roc_auc_macro")
+    # lift 是 PR-AUC 与随机水平之差，随机水平恒为 0；它必须
+    # 随评估结果落盘，且能作为独立的对比/预注册口径。
+    assert "val_pr_auc_macro_lift" in COMPARISON_METRIC_KEYS
+    lift_probe = macro_auc_metrics(
+        torch.tensor(
+            [
+                [0.9, 0.1],
+                [0.8, 0.2],
+                [0.7, 0.3],
+                [0.2, 0.8],
+                [0.3, 0.7],
+                [0.1, 0.9],
+            ]
+        ),
+        torch.tensor([0, 0, 0, 1, 1, 1]),
+        2,
+        min_support=1,
+    )
+    assert abs(
+        float(lift_probe["pr_auc_macro_lift"])
+        - (
+            float(lift_probe["pr_auc_macro"])
+            - float(lift_probe["pr_auc_macro_chance"])
+        )
+    ) < 1e-12
+    assert (
+        _TRIVIAL_REFERENCE_FIELDS["val_pr_auc_macro_lift"]
+        == "unigram_pr_auc_macro_lift"
+    )
+    assert hypothesis_metric_unverifiable(
+        ["pr_auc_lift"], None
+    ) == []
     assert not metric_higher_is_better("val_macro_nll")
     assert not metric_higher_is_better(
         "val_macro_nll_at_common_step"
@@ -33742,6 +33827,10 @@ def run_self_test():
                 ] = pr_auc_chance
             if pr_auc is not None:
                 final_record["val_pr_auc_macro"] = pr_auc
+            if pr_auc is not None and pr_auc_chance is not None:
+                final_record["val_pr_auc_macro_lift"] = (
+                    pr_auc - pr_auc_chance
+                )
             if precision_recall:
                 final_record.update(precision_recall)
             write_jsonl_record(
@@ -36913,6 +37002,17 @@ def run_self_test():
         assert "pr_auc" in hypothesis_metric_mentions(
             "PR-AUC 上升"
         )
+        # lift 是独立口径：点名 PR-AUC lift / 高出随机水平时
+        # 必须映射到 val_pr_auc_macro_lift，而不能只登记绝对值。
+        assert "pr_auc_lift" in hypothesis_metric_mentions(
+            "PR-AUC lift 提升"
+        )
+        assert "pr_auc_lift" in hypothesis_metric_mentions(
+            "PR-AUC 高出随机水平"
+        )
+        assert "pr_auc_lift" not in hypothesis_metric_mentions(
+            "PR-AUC 提升"
+        )
         assert hypothesis_metric_mentions("效果更好") == []
 
         # 多分类平均口径歧义：F1 / precision / recall 必须注明
@@ -37768,6 +37868,44 @@ def run_self_test():
             fallback_pr_adequacy["checks"][0][
                 "trivial_reference_source"
             ]
+        )
+
+        # lift 口径的随机水平恒为 0：基线 lift 必须为正，且
+        # 旧运行即使没有 unigram lift 字段也能用 0 参考核对。
+        lift_tuning = dict(good_tuning)
+        lift_tuning["metric"] = "val_pr_auc_macro_lift"
+        lift_baseline_path = _write_analysis_run(
+            "lift_smelt_seed1",
+            "smelt",
+            1,
+            3e-4,
+            100,
+            0.01,
+            4.50,
+            reference=auc_reference,
+            baseline_tuning=lift_tuning,
+            pr_auc=0.02,
+            pr_auc_chance=0.001,
+        )
+        lift_adequacy = baseline_adequacy(
+            compare_runs([lift_baseline_path]),
+            "smelt",
+            "val_pr_auc_macro_lift",
+        )
+        assert lift_adequacy["ok"] is True, lift_adequacy
+        assert (
+            lift_adequacy["checks"][0]["trivial_reference"]
+            == 0.0
+        )
+        weak_lift_adequacy = baseline_adequacy(
+            compare_runs([weak_pr_path]),
+            "smelt",
+            "val_pr_auc_macro_lift",
+        )
+        assert weak_lift_adequacy["ok"] is False
+        assert any(
+            "unigram" in message
+            for message in weak_lift_adequacy["straw_man"]
         )
 
         # print_comparison_analysis 必须携带三个新检查的结构化
@@ -45437,7 +45575,11 @@ def main():
                 # eval_metrics 缺键，checkpoint 永远不会被
                 # 选型更新，最终回退到最后一步参数。
                 compute_auc=args.selection_metric
-                in ("val_pr_auc_macro", "val_roc_auc_macro"),
+                in (
+                    "val_pr_auc_macro",
+                    "val_pr_auc_macro_lift",
+                    "val_roc_auc_macro",
+                ),
             )
             # 同一步已有 nan_diagnosis 时合并而不是覆盖。
             pending_records[-1].setdefault(
