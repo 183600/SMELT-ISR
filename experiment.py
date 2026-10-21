@@ -14857,6 +14857,12 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "deduplicate_train_groups",
     "drop_train_corrupt_groups",
     "drop_train_degenerate_groups",
+    # 源文件指纹相同不等于实际进入各 split 的字节段相同：
+    # 群组吸附、清洗实现或切分代码变化都会改变 train/val/test
+    # 的内容。逐 split 指纹把「同一文件 + 同一比例」背后的
+    # 实际划分也纳入受控变量，避免两次运行在不同验证/测试
+    # 数据上比较却显示协议一致。
+    "split_sha256",
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
@@ -14880,6 +14886,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
 # 方法差异。
 _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "data_sha256",
+    # 神经运行与 ngram 必须看到同一组 train/val/test 字节段；
+    # 只比整体文件指纹无法发现群组吸附/清洗实现差异。
+    "split_sha256",
     "seq_len",
     "val_fraction",
     "test_fraction",
@@ -15375,6 +15384,12 @@ def build_comparison_protocol(
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
+        # 逐 split 内容指纹：同源文件但不同群组吸附/清洗/切分
+        # 结果的运行不能算同一数据协议。
+        "split_sha256": (
+            dict(getattr(args, "data_split_sha256", {}) or {})
+            or None
+        ),
         # 选型协议：final/test 都在验证集选中的模型上评估
         # （best.pt 不可用时回退到最后一步并明确提示）。
         "model_selection": "best_val_with_last_fallback",
@@ -15548,6 +15563,10 @@ def experiment_protocol_from_payload(
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
         "data_sha256": data.get("sha256"),
+        # 逐 split 指纹：新运行写在 data.split_sha256；旧运行
+        # 没有该字段时保持 None，由检查器列为「未核对」而不是
+        # 默认为一致。
+        "split_sha256": data.get("split_sha256"),
         # 旧运行没有选型记录，其 final/test 一律基于最后一步
         # 参数；显式回退为 "last_step"，与新版选型协议混用时
         # 会被受控变量检查标记出来。
@@ -32820,6 +32839,34 @@ def run_self_test():
             for violation in steps_controlled["violations"]
         )
 
+        # 同一源文件、同一 val/test 比例，但群组吸附/清洗实现
+        # 改变后实际 split 字节段不同：逐 split 指纹必须进入
+        # 受控变量检查，否则比较的是不同验证/测试数据。
+        split_path = _write_analysis_run(
+            "A_seed48_badsplit",
+            "A",
+            48,
+            3e-4,
+            100,
+            0.01,
+            2.55,
+            protocol_overrides={
+                "split_sha256": {
+                    "train": "train-a",
+                    "val": "val-a",
+                    "test": "test-a",
+                }
+            },
+        )
+        split_controlled = check_controlled_variables(
+            compare_runs(run_paths + [split_path]),
+            factors,
+        )
+        assert any(
+            violation["key"] == "split_sha256"
+            for violation in split_controlled["violations"]
+        ), split_controlled["violations"]
+
         # k1/k2 是最容易悄悄改变结果的结构设置：把 --compare-factors
         # 收窄到 mode,seed 后，k1 不同必须被受控变量检查抓住，
         # 不能因为「默认因子里有 k1」就永远不核对。
@@ -32858,6 +32905,11 @@ def run_self_test():
             "protocol": {
                 "comparison_family": "neural",
                 "data_sha256": "abc",
+                "split_sha256": {
+                    "train": "t",
+                    "val": "v",
+                    "test": "x",
+                },
                 "seq_len": 64,
                 "val_fraction": 0.1,
                 "test_fraction": 0.1,
@@ -32871,6 +32923,11 @@ def run_self_test():
             "protocol": {
                 "comparison_family": "statistical",
                 "data_sha256": "abc",
+                "split_sha256": {
+                    "train": "t",
+                    "val": "v",
+                    "test": "x",
+                },
                 "seq_len": 64,
                 "val_fraction": 0.1,
                 "test_fraction": 0.1,
@@ -32885,6 +32942,7 @@ def run_self_test():
         )
         assert cross_ok["ok"], cross_ok
         assert "data_sha256" in cross_ok["checked_keys"]
+        assert "split_sha256" in cross_ok["checked_keys"]
         mismatched_ngram = json.loads(
             json.dumps(ngram_cross)
         )
@@ -32897,6 +32955,21 @@ def run_self_test():
         assert any(
             violation["key"] == "data_sha256"
             for violation in cross_bad["violations"]
+        )
+        split_mismatch_ngram = json.loads(
+            json.dumps(ngram_cross)
+        )
+        split_mismatch_ngram["protocol"]["split_sha256"][
+            "val"
+        ] = "v-other"
+        cross_split_bad = cross_family_protocol_check(
+            [neural_cross, split_mismatch_ngram],
+            [],
+        )
+        assert not cross_split_bad["ok"]
+        assert any(
+            violation["key"] == "split_sha256"
+            for violation in cross_split_bad["violations"]
         )
 
         # 消融覆盖：只跑了 balance=0.01 的开启臂，缺 2×2 的

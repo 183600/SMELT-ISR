@@ -71,7 +71,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   群组分隔符与存档不一致会明确提示。文本完整性扫描在 split 边界
   处先做解码器状态预热，多字节 UTF-8 字符横跨切分点不会被误报为
   标签噪声；`final` 只在文件真正末尾置 True，截断字符才会报
-  U+FFFD。
+  U+FFFD。每个 split 的内容指纹写入 `data.split_sha256`，并作为
+  受控变量核对：源文件相同但切分/群组吸附/清洗实现不同，仍会被
+  识别为不同数据协议。
 - **群组数据**：传入 `--group-separator` 时，语料按分隔符切成
   「群组」（同一文档/用户/物体产生的内容），train/val/test 的切分
   位置吸附到群组边界：任何群组整体落在同一个 split，两侧之间零
@@ -264,7 +266,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 
 - **受控变量协议**：每次训练把优化器（AdamW 及 betas/eps）、
   学习率与调度、warmup、训练步数、weight decay、梯度裁剪、
-  batch size、数据增强（当前为无增强，显式记录）、数据指纹、
+  batch size、数据增强（当前为无增强，显式记录）、整体数据指纹
+  `data_sha256` 与逐 split 内容指纹 `split_sha256`、
   模型结构（含分支几何 `k1/k2`、路由宽度 `top_k`、均衡损失
   系数 `balance_coef`、`dense_fnn_hidden`、`residual_scale`）、
   评估协议与选型口径（`model_selection` 与 `selection_metric`：
@@ -293,7 +296,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   直接报错，不会静默关闭检查。统计基线（ngram）没有优化器与
   训练轮数，单独记为 `comparison_family=statistical`，不参与
   优化器类受控变量检查；但数据与评估口径（`data_sha256`、
-  `seq_len`、切分比例、`batch_size`、`eval_batches`、数据增强、
+  `split_sha256`、`seq_len`、切分比例、`batch_size`、
+  `eval_batches`、数据增强、
   群组切分/去重设置）仍通过 `cross_family_protocol_check`
   逐项核对，避免把不同数据/窗口上的 ngram 指标当作基线证据。
 - **统计可靠性**：`--seeds 42 43 44` 对同一命令行配置跑多个
