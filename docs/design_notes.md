@@ -455,6 +455,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   校正的 `window_p_value_ar1`（标准误乘 √(n/n_eff)，自由度
   n_eff−1，只放宽不收窄）；n_eff<3 时不给校正 p 值并标记
   `effective_windows_below_three`，而不是继续报原始显著性。
+  **AUC 覆盖率**：AUC 需要保留逐 token 概率，默认最多
+  100,000 个评估位置（`_AUC_MAX_TOKENS`）。超过上限时不再
+  截取评估序列前缀（会让后段窗口系统性缺席），而是在全局
+  评估位置上等距抽样；`*_auc_tokens_available`、
+  `*_auc_coverage_fraction` 与 `*_auc_sampling`
+  （`full`/`uniform_stride`）随指标落盘，读者能直接判断
+  AUC 覆盖了多大比例的评估位置。
   **选型偏差的无偏口径**：final 的 val 指标来自验证集选中的
   checkpoint，同一批数据既选型又判定会产生 winner's curse。
   `--compare` 对所有周期验证实际计算的指标（loss / ppl / bpb /

@@ -6435,8 +6435,9 @@ def print_data_audit(report: Dict[str, object]) -> None:
 # macro AUC 只纳入 support 达到该阈值的字节类。
 _AUC_MIN_SUPPORT = 20
 
-# AUC 计算最多保留的评估位置数，超出时按窗口顺序截断并在
-# 结果中注明。
+# AUC 计算最多保留的评估位置数。超出时不再截取评估序列
+# 前缀（会让后段窗口系统性缺席），而是在全局评估位置上等距
+# 抽样，并记录覆盖率与抽样方式。
 _AUC_MAX_TOKENS = 100_000
 
 # AUC 收集每次处理的最大行数；分块 softmax 与整批结果逐位一致。
@@ -6444,6 +6445,32 @@ _AUC_SOFTMAX_CHUNK_ROWS = 8192
 
 # AUC 分块排序的块大小上限（纳入类数 × 评估位置数）。
 _AUC_SORT_CHUNK_ELEMENTS = 1_600_000
+
+
+def _auc_uniform_sample_positions(
+    total_positions: int,
+    capacity: int,
+) -> Optional[torch.Tensor]:
+    """
+    在全部评估位置上等距抽取 capacity 个位置。
+
+    ``total_positions <= capacity`` 时返回 None（无需抽样，直接
+    全量收集）。否则用全局位置步长 floor(i·N/K) 抽样，保证前后
+    段窗口都有代表，而不是只保留序列前缀。
+    """
+    if capacity <= 0 or total_positions <= capacity:
+        return None
+    if capacity == 1:
+        return torch.tensor(
+            [total_positions // 2],
+            dtype=torch.int64,
+        )
+    step = float(total_positions - 1) / float(capacity - 1)
+    positions = torch.round(
+        torch.arange(capacity, dtype=torch.float64) * step
+    ).to(torch.int64)
+    positions.clamp_(0, total_positions - 1)
+    return torch.unique(positions)
 
 
 def confusion_matrix_metrics(
@@ -7319,13 +7346,22 @@ def evaluate(
     # CUDA 路径在全部批次结束后统一同步；CPU 路径保持同步语义。
     auc_async = compute_auc and device.type == "cuda"
 
+    auc_total_positions = 0
+    auc_sample_positions: Optional[torch.Tensor] = None
     if compute_auc:
         _, eval_data = dataset._eval_windows(split)
         num_starts = len(eval_data) - dataset.seq_len
+        auc_total_positions = (
+            min(batches * batch_size, num_starts)
+            * dataset.seq_len
+        )
         auc_capacity = min(
             _AUC_MAX_TOKENS,
-            min(batches * batch_size, num_starts)
-            * dataset.seq_len,
+            auc_total_positions,
+        )
+        auc_sample_positions = _auc_uniform_sample_positions(
+            auc_total_positions,
+            auc_capacity,
         )
         auc_probs = torch.empty(
             auc_capacity,
@@ -7338,6 +7374,7 @@ def evaluate(
             dtype=torch.int64,
             pin_memory=auc_async,
         )
+        auc_processed_positions = 0
 
     try:
         with torch.autocast(
@@ -7486,24 +7523,48 @@ def evaluate(
                             ).cpu()
                         )
 
-                if compute_auc and (
-                    auc_tokens < _AUC_MAX_TOKENS
-                ):
-                    # 最后一批可能超出封顶：按剩余上限截断，
-                    # 保证收集的 token 数严格不超过上限。
-                    # 先按行截断再转 fp32 求 softmax：逐行结果
-                    # 与整批 softmax 后截断逐位一致。
-                    remaining = (
-                        _AUC_MAX_TOKENS - auc_tokens
-                    )
+                if compute_auc:
                     flat_logits = raw_logits.reshape(
                         -1,
                         vocab_size,
                     )
-                    num_new = min(
-                        remaining,
-                        flat_logits.size(0),
-                    )
+                    if auc_sample_positions is None:
+                        selected_logits = flat_logits
+                        selected_targets = flat_target
+                    else:
+                        # 只对全局等距抽中的位置做 softmax：
+                        # 两侧都按同一全局位置切分，避免把
+                        # 后段评估窗口系统性排除。
+                        start_position = (
+                            auc_processed_positions
+                        )
+                        end_position = (
+                            start_position
+                            + flat_logits.size(0)
+                        )
+                        lower = int(
+                            torch.searchsorted(
+                                auc_sample_positions,
+                                start_position,
+                            )
+                        )
+                        upper = int(
+                            torch.searchsorted(
+                                auc_sample_positions,
+                                end_position,
+                            )
+                        )
+                        local_positions = (
+                            auc_sample_positions[lower:upper]
+                            - start_position
+                        ).to(flat_logits.device)
+                        selected_logits = flat_logits[
+                            local_positions
+                        ]
+                        selected_targets = flat_target[
+                            local_positions
+                        ]
+                    num_new = int(selected_logits.size(0))
                     # 按行分块：逐行 softmax 与整批等价。
                     for start in range(
                         0,
@@ -7515,7 +7576,9 @@ def evaluate(
                             num_new,
                         )
                         probs = F.softmax(
-                            flat_logits[start:stop].float(),
+                            selected_logits[
+                                start:stop
+                            ].float(),
                             dim=-1,
                         )
                         # 拷入 CPU 收集缓冲，循环结束统一同步。
@@ -7529,10 +7592,13 @@ def evaluate(
                     auc_targets[
                         auc_tokens:auc_tokens + num_new
                     ].copy_(
-                        flat_target[:num_new],
+                        selected_targets,
                         non_blocking=auc_async,
                     )
                     auc_tokens += num_new
+                    auc_processed_positions += int(
+                        flat_logits.size(0)
+                    )
 
                 # cross_entropy 返回批均值，乘回目标 token 数。
                 # add_(alpha=) 完成「乘 token 数 + 累加」。
@@ -7613,6 +7679,20 @@ def evaluate(
         # 读取 CPU 收集缓冲前统一等待。
         if auc_async and auc_tokens > 0:
             torch.cuda.synchronize(device)
+
+        metrics[f"{split}_auc_tokens_available"] = (
+            auc_total_positions
+        )
+        metrics[f"{split}_auc_coverage_fraction"] = (
+            auc_tokens / auc_total_positions
+            if auc_total_positions > 0
+            else 0.0
+        )
+        metrics[f"{split}_auc_sampling"] = (
+            "uniform_stride"
+            if auc_sample_positions is not None
+            else "full"
+        )
 
         if auc_tokens > 0:
             auc_metrics = macro_auc_metrics(
@@ -8473,14 +8553,22 @@ def _ngram_extended_metrics(
     auc_probs = None
     auc_targets = None
     auc_tokens = 0
+    auc_total_positions = 0
+    auc_sample_positions: Optional[torch.Tensor] = None
+    auc_processed_positions = 0
     if include_auc:
+        auc_total_positions = sum(
+            int(window.size(0))
+            * (int(window.size(1)) - 1)
+            for window in windows
+        )
         auc_capacity = min(
             _AUC_MAX_TOKENS,
-            sum(
-                int(window.size(0))
-                * (int(window.size(1)) - 1)
-                for window in windows
-            ),
+            auc_total_positions,
+        )
+        auc_sample_positions = _auc_uniform_sample_positions(
+            auc_total_positions,
+            auc_capacity,
         )
         auc_probs = torch.empty(
             auc_capacity,
@@ -8584,19 +8672,44 @@ def _ngram_extended_metrics(
         if (
             auc_probs is not None
             and auc_targets is not None
-            and auc_tokens < _AUC_MAX_TOKENS
         ):
-            # 最后一个窗口可能超出封顶：按剩余上限截断，
-            # 保证收集的 token 数严格不超过上限。
-            remaining = _AUC_MAX_TOKENS - auc_tokens
-            num_new = min(targets.numel(), remaining)
+            if auc_sample_positions is None:
+                selected_probabilities = probabilities
+                selected_targets = targets
+            else:
+                start_position = auc_processed_positions
+                end_position = (
+                    start_position + targets.numel()
+                )
+                lower = int(
+                    torch.searchsorted(
+                        auc_sample_positions,
+                        start_position,
+                    )
+                )
+                upper = int(
+                    torch.searchsorted(
+                        auc_sample_positions,
+                        end_position,
+                    )
+                )
+                local_positions = (
+                    auc_sample_positions[lower:upper]
+                    - start_position
+                )
+                selected_probabilities = probabilities[
+                    local_positions
+                ]
+                selected_targets = targets[local_positions]
+            num_new = int(selected_targets.numel())
             auc_probs[
                 auc_tokens:auc_tokens + num_new
-            ].copy_(probabilities[:num_new])
+            ].copy_(selected_probabilities)
             auc_targets[
                 auc_tokens:auc_tokens + num_new
-            ].copy_(targets[:num_new])
+            ].copy_(selected_targets)
             auc_tokens += num_new
+            auc_processed_positions += int(targets.numel())
 
     loss = total_nll / evaluated_tokens
 
@@ -8619,6 +8732,21 @@ def _ngram_extended_metrics(
     )
     for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
+
+    if include_auc:
+        metrics[f"{split}_auc_tokens_available"] = (
+            auc_total_positions
+        )
+        metrics[f"{split}_auc_coverage_fraction"] = (
+            auc_tokens / auc_total_positions
+            if auc_total_positions > 0
+            else 0.0
+        )
+        metrics[f"{split}_auc_sampling"] = (
+            "uniform_stride"
+            if auc_sample_positions is not None
+            else "full"
+        )
 
     if (
         include_auc
@@ -28529,6 +28657,60 @@ def run_self_test():
     assert "val_loss" in val_metrics
     assert "val_ppl" in val_metrics
 
+    # AUC 收集路径与覆盖率元数据：未超上限时全量评估，
+    # coverage=1，避免旧实现只报 token 数却看不出覆盖范围。
+    auc_metrics = evaluate(
+        eval_model,
+        eval_dataset,
+        2,
+        1,
+        eval_device,
+        compute_auc=True,
+    )
+    assert int(auc_metrics["val_auc_tokens_evaluated"]) > 0
+    assert (
+        int(auc_metrics["val_auc_tokens_available"])
+        == int(auc_metrics["val_auc_tokens_evaluated"])
+    )
+    assert (
+        float(auc_metrics["val_auc_coverage_fraction"]) == 1.0
+    )
+    assert auc_metrics["val_auc_sampling"] == "full"
+
+    # 人为把上限压到 16，验证超限走全局等距抽样而不是前缀
+    # 截断：抽样数等于上限、覆盖率小于 1，且前后窗口都有机会
+    # 被选中（最小/最大抽样位置应接近全局两端）。
+    auc_cap_before = globals()["_AUC_MAX_TOKENS"]
+    globals()["_AUC_MAX_TOKENS"] = 8
+    try:
+        capped_auc_metrics = evaluate(
+            eval_model,
+            eval_dataset,
+            2,
+            1,
+            eval_device,
+            compute_auc=True,
+        )
+    finally:
+        globals()["_AUC_MAX_TOKENS"] = auc_cap_before
+    assert (
+        capped_auc_metrics["val_auc_sampling"]
+        == "uniform_stride"
+    )
+    assert int(
+        capped_auc_metrics["val_auc_tokens_evaluated"]
+    ) == 8
+    assert int(
+        capped_auc_metrics["val_auc_tokens_available"]
+    ) > 8
+    assert (
+        0.0
+        < float(
+            capped_auc_metrics["val_auc_coverage_fraction"]
+        )
+        < 1.0
+    )
+
     # ---- 类平衡似然（macro NLL）----
     # 频率加权的 val_loss 几乎只反映高频字节；类平衡口径按
     # 评估集中出现的类等权，随机水平是 log 词表大小，纳入类数
@@ -29407,6 +29589,68 @@ def run_self_test():
     )
     for key, value in ngram_boot.items():
         assert ngram_boot_repeat[key] == value
+
+    # ngram 的 AUC 收集也必须记录可用位置与覆盖率；未超上限
+    # 时全量评估，coverage=1，而不是只写一个 token 数。
+    ngram_auc = _ngram_extended_metrics(
+        cleaned_ngram,
+        ngram_boot_windows,
+        alpha=1.0,
+        order=2,
+        split="val",
+        include_auc=True,
+        bootstrap_replicates=0,
+    )
+    ngram_auc_available = sum(
+        int(window.size(0)) * (int(window.size(1)) - 1)
+        for window in ngram_boot_windows
+    )
+    assert (
+        int(ngram_auc["val_auc_tokens_available"])
+        == ngram_auc_available
+    )
+    assert (
+        int(ngram_auc["val_auc_tokens_evaluated"])
+        == ngram_auc_available
+    )
+    assert (
+        float(ngram_auc["val_auc_coverage_fraction"]) == 1.0
+    )
+    assert ngram_auc["val_auc_sampling"] == "full"
+
+    ngram_auc_cap_before = globals()["_AUC_MAX_TOKENS"]
+    globals()["_AUC_MAX_TOKENS"] = 8
+    try:
+        ngram_capped_auc = _ngram_extended_metrics(
+            cleaned_ngram,
+            ngram_boot_windows,
+            alpha=1.0,
+            order=2,
+            split="val",
+            include_auc=True,
+            bootstrap_replicates=0,
+        )
+    finally:
+        globals()["_AUC_MAX_TOKENS"] = ngram_auc_cap_before
+    assert (
+        ngram_capped_auc["val_auc_sampling"]
+        == "uniform_stride"
+    )
+    assert (
+        int(ngram_capped_auc["val_auc_tokens_evaluated"])
+        == 8
+    )
+    assert (
+        int(ngram_capped_auc["val_auc_tokens_available"])
+        > 8
+    )
+    assert (
+        0.0
+        < float(
+            ngram_capped_auc["val_auc_coverage_fraction"]
+        )
+        < 1.0
+    )
 
     # 一个 batch 含多个窗口时，window_sink / bootstrap 的抽样
     # 单位仍必须是单个固定评估窗口（与神经模型的 evaluate 同
@@ -36761,6 +37005,30 @@ def run_self_test():
         assert hypothesis_metric_unverifiable(
             ["loss"], routing_available=False
         ) == []
+
+        # AUC 超上限时必须全局等距抽样，不能只取序列前缀：
+        # 首尾位置都要有代表，且抽样数严格等于上限。
+        sampled_auc_positions = _auc_uniform_sample_positions(
+            1000,
+            100,
+        )
+        assert sampled_auc_positions is not None
+        assert sampled_auc_positions.numel() == 100
+        assert int(sampled_auc_positions[0]) == 0
+        assert int(sampled_auc_positions[-1]) == 999
+        assert bool(
+            torch.all(
+                sampled_auc_positions[1:]
+                > sampled_auc_positions[:-1]
+            )
+        )
+        assert _auc_uniform_sample_positions(1000, 1000) is None
+        assert _auc_uniform_sample_positions(1000, 2000) is None
+        single_auc_position = _auc_uniform_sample_positions(
+            1000, 1
+        )
+        assert single_auc_position is not None
+        assert int(single_auc_position[0]) == 500
 
         # 并列分数必须在整组结束时累计命中，否则 PR-AUC 偏低。
         tied_scores = torch.tensor([0.9, 0.8, 0.8])
