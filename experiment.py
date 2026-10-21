@@ -19781,6 +19781,32 @@ def _contrast_display(
                 )
                 + "；建议多种子/多次测量后再下效率结论）"
             )
+        # 只缺一侧的某个效率字段时，该字段不会进入 ratios；
+        # 若只看「是否还有任一倍率」就会漏报这一项不可比，
+        # 让残缺的效率证据静默通过。这里按基线/对照分别列出。
+        missing_measured = []
+        for side_key, side_label in (
+            ("baseline_missing_measured_fields", "基线"),
+            ("variant_missing_measured_fields", "对照"),
+        ):
+            fields = cost.get(side_key)
+            if not isinstance(fields, list) or not fields:
+                continue
+            missing_measured.append(
+                f"{side_label}缺 "
+                + "、".join(
+                    _COST_FIELD_LABELS.get(
+                        str(field), str(field)
+                    )
+                    for field in fields
+                )
+            )
+        if missing_measured:
+            caveat += (
+                "（效率字段不可比："
+                + "；".join(missing_measured)
+                + "，对应倍率未参与精度/效率权衡）"
+            )
 
     # 涨点/变差但缺效率数据（没有可比倍率）：只报指标差值
     # 等于回避精度与效率的权衡，必须点出权衡缺失，而不是让
@@ -36536,6 +36562,69 @@ def run_self_test():
         "val_loss",
     )
     assert "计时噪声" in noisy_text, noisy_text
+
+    # 只缺一侧的某个效率字段时，仍可能有其他倍率；展示层
+    # 必须点名缺失字段不可比，不能因为 ratios 非空就静默略过。
+    partial_cell_a = {
+        "costs": {
+            "flops_per_forward": {
+                "mean": 1e9,
+                "std": 0.0,
+                "n": 3,
+            },
+            "peak_memory_mb": {
+                "mean": 100.0,
+                "std": 0.0,
+                "n": 3,
+            },
+        },
+    }
+    partial_cell_b = {
+        "costs": {
+            "flops_per_forward": {
+                "mean": 1.1e9,
+                "std": 0.0,
+                "n": 3,
+            },
+            "peak_memory_mb": {
+                "mean": 100.0,
+                "std": 0.0,
+                "n": 3,
+            },
+            "latency_ms_per_forward": {
+                "mean": 100.0,
+                "std": 1.0,
+                "n": 3,
+            },
+        },
+    }
+    partial_cost, partial_verdict = _cost_comparison(
+        partial_cell_a,
+        partial_cell_b,
+        "improvement",
+        True,
+    )
+    assert partial_verdict == "gain_balanced", partial_cost
+    assert partial_cost["baseline_missing_measured_fields"] == [
+        "latency_ms_per_forward"
+    ]
+    partial_text = _contrast_display(
+        {
+            "factor": "mode",
+            "baseline": "a",
+            "variant": "b",
+            "metric": "val_loss",
+            "samples_a": [{"seed": 1, "value": 3.0}],
+            "samples_b": [{"seed": 1, "value": 2.8}],
+            "delta": -0.2,
+            "verdict": "改善",
+            "cost": partial_cost,
+            "cost_verdict": "gain_balanced",
+        },
+        "val_loss",
+    )
+    assert "效率字段不可比" in partial_text, partial_text
+    assert "基线缺 推理计时" in partial_text, partial_text
 
     # 单次计时（n=1）没有可估计的倍率区间：它同样不能单独
     # 把显著涨点判成 gain_with_cost，但必须与「有重复测量但
