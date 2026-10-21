@@ -6318,6 +6318,71 @@ def enforce_strict_data_audit(
     return False
 
 
+def test_label_integrity_violations(
+    report: Dict[str, object],
+) -> List[str]:
+    """
+    返回测试集标签完整性问题的明细（越界 token、非法 UTF-8、
+    NUL）。只看 ``splits["test"]``，train/val 的同类问题仍由
+    ``--strict-data-audit`` 控制。
+
+    测试集是最终结论的唯一证据，不能像训练集那样在事后清洗
+    （清洗 test 会改变被评估的分布，也等于用测试数据做决策）。
+    因此在解封前默认拒绝带标签噪声的测试集，而不是在损坏的
+    标签上报告一个看似精确的最终指标。
+    """
+    test_info = (report.get("splits") or {}).get("test")
+    if not isinstance(test_info, dict):
+        return []
+
+    violations: List[str] = []
+    invalid = int(test_info.get("invalid_tokens", 0) or 0)
+    if invalid > 0:
+        violations.append(
+            f"test: {invalid} 个越界 token（标签超出词表）"
+        )
+    replacements = int(
+        test_info.get("utf8_replacements", 0) or 0
+    )
+    if replacements > 0:
+        violations.append(
+            f"test: {replacements} 个无法按 UTF-8 解码的"
+            "字节（标签噪声）"
+        )
+    nul_bytes = int(test_info.get("nul_bytes", 0) or 0)
+    if nul_bytes > 0:
+        violations.append(
+            f"test: {nul_bytes} 个 NUL 字节（二进制/填充污染）"
+        )
+    return violations
+
+
+def enforce_test_label_integrity(
+    report: Dict[str, object],
+    context: str = "test",
+) -> bool:
+    """
+    测试集标签完整性硬门：测试集永远不参与清洗，因此带标签
+    噪声的测试集不能给出可信的最终指标。默认拒绝解封；只有
+    显式 ``--allow-corrupt-test-labels`` 才放行，且豁免会写入
+    运行记录。
+    """
+    violations = test_label_integrity_violations(report)
+    if not violations:
+        return True
+
+    where = f"（{context}）" if context else ""
+    print(f"[test] 测试集标签完整性检查未通过{where}：")
+    for violation in violations:
+        print(f"[test]   标签噪声: {violation}")
+    print(
+        "[test] 测试集不参与清洗，带标签噪声的最终指标不可信；"
+        "默认拒绝解封。若这些字节确实是目标分布的一部分，"
+        "可显式传 --allow-corrupt-test-labels（会被记录）。"
+    )
+    return False
+
+
 def distribution_shift_violations(
     report: Dict[str, object],
     max_byte_js: Optional[float] = None,
@@ -9913,13 +9978,34 @@ def run_statistical_baseline(
                 "test",
             )
         )
-        if leakage_blocked or strict_blocked:
-            # 统计基线同样不能在泄露/损坏的测试集上报告指标；
-            # 不写 test 记录，名额未消耗。
+        label_integrity_blocked = (
+            not args.allow_corrupt_test_labels
+            and not enforce_test_label_integrity(
+                test_audit,
+                "test",
+            )
+        )
+        shift_blocked = (
+            not enforce_distribution_shift_gate(
+                test_audit,
+                max_byte_js=args.max_byte_shift,
+                max_bigram_js=args.max_bigram_shift,
+                max_conditional_js=args.max_conditional_shift,
+                context="test",
+            )
+        )
+        if (
+            leakage_blocked
+            or strict_blocked
+            or shift_blocked
+            or label_integrity_blocked
+        ):
+            # 统计基线同样不能在泄露/损坏/分布偏移的测试集上
+            # 报告指标；不写 test 记录，名额未消耗。
             print(
-                "[test] 数据审计在测试集上发现泄露/损坏"
-                "问题：拒绝解封测试集（不写入 test 记录）。"
-                "请先清洗数据后重跑。"
+                "[test] 数据审计在测试集上发现泄露/损坏/"
+                "标签噪声或分布偏移问题：拒绝解封测试集"
+                "（不写入 test 记录）。请先清洗数据后重跑。"
             )
             test_windows = None
         else:
@@ -29452,6 +29538,31 @@ def run_self_test():
     )
     assert clean_audit["leakage_violations"] == []
     assert enforce_data_leakage_gate(clean_audit)
+    # 测试集标签完整性：test 不参与清洗，默认拒绝带标签噪声
+    # 的测试集；train/val 的同类问题仍由严格审计控制。
+    assert test_label_integrity_violations({
+        "splits": {"test": {"invalid_tokens": 0}}
+    }) == []
+    assert enforce_test_label_integrity({
+        "splits": {"test": {"invalid_tokens": 0}}
+    })
+    assert test_label_integrity_violations({
+        "splits": {
+            "train": {"utf8_replacements": 3},
+            "test": {
+                "invalid_tokens": 1,
+                "utf8_replacements": 2,
+                "nul_bytes": 4,
+            },
+        }
+    }) == [
+        "test: 1 个越界 token（标签超出词表）",
+        "test: 2 个无法按 UTF-8 解码的字节（标签噪声）",
+        "test: 4 个 NUL 字节（二进制/填充污染）",
+    ]
+    assert not enforce_test_label_integrity({
+        "splits": {"test": {"utf8_replacements": 1}}
+    })
     # 分布偏移硬门：未设阈值时只警告；显式阈值后按各口径
     # 逐对 split 检查，超限即拒绝继续，非有限值不参与。
     shift_report = {
@@ -43005,6 +43116,16 @@ def main():
             "泄露时使用；豁免会记录进 config.json"
         ),
     )
+    parser.add_argument(
+        "--allow-corrupt-test-labels",
+        action="store_true",
+        help=(
+            "显式允许在含非法 UTF-8/NUL/越界 token 的测试集上"
+            "解封评估：测试集不参与清洗，默认拒绝在这种标签"
+            "噪声上产出最终结论；仅当这些字节确实是目标分布"
+            "的一部分时使用，豁免会记录进 config.json"
+        ),
+    )
 
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=128)
@@ -46639,6 +46760,13 @@ def main():
                     "test",
                 )
             )
+            label_integrity_blocked = (
+                not args.allow_corrupt_test_labels
+                and not enforce_test_label_integrity(
+                    test_audit,
+                    "test",
+                )
+            )
             test_audit["distribution_shift_gate"] = {
                 "max_byte_js": args.max_byte_shift,
                 "max_bigram_js": args.max_bigram_shift,
@@ -46657,7 +46785,12 @@ def main():
                     context="test",
                 )
             )
-            if leakage_blocked or strict_blocked or shift_blocked:
+            if (
+                leakage_blocked
+                or strict_blocked
+                or shift_blocked
+                or label_integrity_blocked
+            ):
                 # 在已泄露/损坏的测试集上报告指标毫无意义，还会
                 # 留下唯一的 test 记录；直接拒绝解封。
                 print(
