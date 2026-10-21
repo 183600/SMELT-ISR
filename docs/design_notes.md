@@ -587,10 +587,15 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   分类指标，按 loss 选出的模型并不是按假设口径选出的。
   `--selection-metric` 可把验证集选型/早停改为周期验证
   实际计算的任一对比指标（`val_macro_f1`、
-  `val_recall_weighted` 等；AUC 与路由诊断只在最终评估
-  计算，不能用于选型）。未显式指定时，若
-  `--primary-metric` 可在周期验证中计算则自动跟随，
-  否则回退 `val_loss` 并警告口径不一致。指标方向由
+  `val_recall_weighted`、`val_pr_auc_macro` /
+  `val_roc_auc_macro` 等）。AUC 默认仍只在 final/test
+  计算；被显式指定为选型指标时，训练循环会在每个验证点
+  按与 final/test 相同的固定窗口和排序口径计算，避免
+  「以 PR-AUC 判定却按 val_loss 选模型」的口径脱节。
+  路由诊断与等计算量/共同步数派生指标仍不能用于选型。
+  未显式指定时，若 `--primary-metric` 可在周期验证中
+  计算则自动跟随，否则回退 `val_loss` 并警告口径不一致。
+  指标方向由
   `metric_higher_is_better` 决定（loss/ppl 越低越好，
   其余越高越好）；选型指标、最优值、选中步与选中点的
   val_loss 一并写入 `best.pt`、`metrics.jsonl` 的 final
@@ -599,9 +604,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   运行不能混在一起比较）。`--compare` 再次核对运行记录的
   `selection_metric` 与当前 `--compare-metric`：当前指标本身
   可用于选型却不一致时，`selection_metric_mismatch` 明确警告
-  「最终模型不是按假设的判定口径选出的」；等计算量 loss、
-  AUC 等只能离线计算的指标不触发该警告。恢复训练时选型
-  指标按检查点恢复，避免中途换指标重新解释历史评估点。
+  「最终模型不是按假设的判定口径选出的」；等计算量 loss
+  等只能离线派生的指标不触发该警告。恢复训练时选型指标按
+  检查点恢复，避免中途换指标重新解释历史评估点。
 - **基线欠训与容量混淆守卫**：`baseline_adequacy` 除核对
   「基线强于 unigram 参考」「基线有调参来源」「不劣于调优好的
   n-gram」「种子数」之外，还检查：

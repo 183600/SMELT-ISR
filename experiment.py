@@ -16047,17 +16047,19 @@ _SELECTION_BIASED_METRICS = frozenset(
 )
 
 # 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
-# 依据：AUC 只在最终/测试评估时计算，路由诊断要等训练结束后的
-# 一次专门前向，等计算量 / 共同步数指标更是 --compare 阶段才
-# 从曲线派生，训练过程中拿不到，不能用于选型。
+# 依据。AUC 默认只在最终/测试评估时计算；但当它被显式指定为
+# 选型指标时，训练循环会在每个验证点计算同口径的 PR-AUC /
+# ROC-AUC（见训练入口的 compute_auc 开关），因此可以作为选型
+# 依据——极度不平衡场景推荐以 PR-AUC 判定，选型口径必须能跟着
+# 判定口径走，而不是固定按 val_loss 选模型。路由诊断要等训练
+# 结束后的一次专门前向，等计算量 / 共同步数指标更是 --compare
+# 阶段才从曲线派生，训练过程中拿不到，仍不能用于选型。
 _SELECTION_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
     if key not in _ROUTING_ROW_FIELDS
     and key
     not in {
-        "val_pr_auc_macro",
-        "val_roc_auc_macro",
         "val_loss_at_matched_flops",
         *_COMMON_STEP_METRICS,
     }
@@ -29014,6 +29016,13 @@ def run_self_test():
     assert "val_macro_nll" in COMPARISON_METRIC_KEYS
     assert "val_macro_nll_at_common_step" in COMPARISON_METRIC_KEYS
     assert "val_macro_nll" in _SELECTION_METRIC_KEYS
+    # 极度不平衡时应以 PR-AUC 判定；若它不能用于选型，最终
+    # 模型仍按 loss 选出，判定与选型口径脱节。AUC 显式成为
+    # 选型指标时，周期验证必须能计算同口径指标。
+    assert "val_pr_auc_macro" in _SELECTION_METRIC_KEYS
+    assert "val_roc_auc_macro" in _SELECTION_METRIC_KEYS
+    assert metric_higher_is_better("val_pr_auc_macro")
+    assert metric_higher_is_better("val_roc_auc_macro")
     assert not metric_higher_is_better("val_macro_nll")
     assert not metric_higher_is_better(
         "val_macro_nll_at_common_step"
@@ -45339,6 +45348,12 @@ def main():
                 args.eval_batches,
                 device,
                 amp_dtype=amp_dtype,
+                # 选型指标是 AUC 时，每个验证点都要用与
+                # final/test 完全相同的排序口径计算；否则
+                # eval_metrics 缺键，checkpoint 永远不会被
+                # 选型更新，最终回退到最后一步参数。
+                compute_auc=args.selection_metric
+                in ("val_pr_auc_macro", "val_roc_auc_macro"),
             )
             # 同一步已有 nan_diagnosis 时合并而不是覆盖。
             pending_records[-1].setdefault(
