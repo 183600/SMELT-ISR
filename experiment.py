@@ -16327,13 +16327,22 @@ def _paired_sign_flip_test(
         p_value = (count + 1) / (replicates + 1)
         method = "monte_carlo"
 
-    # 精确枚举的最小可达双侧 p 值：两个极端符号组合（全正/
+    # 最小可达双侧 p 值：精确枚举时两个极端符号组合（全正/
     # 全负）对应 |mean| 最大，n 很小时 2/2^n 可能本身就大于
     # 0.05，此时设计在数学上不可能得到显著结果，必须提示，
-    # 不能把「不显著」解读为「无效应」。
-    min_attainable_p = (
-        2.0 / permutations if permutations > 0 else None
-    )
+    # 不能把「不显著」解读为「无效应」。Monte Carlo 分支采用
+    # (count+1)/(R+1)，count 可以为 0（极端组合未必被抽中），
+    # 因此最小可达值是 1/(R+1)，不是精确分支的 2/R。
+    if method == "exact":
+        min_attainable_p = (
+            2.0 / permutations if permutations > 0 else None
+        )
+    else:
+        min_attainable_p = (
+            1.0 / (permutations + 1)
+            if permutations > 0
+            else None
+        )
 
     return {
         "test": "paired_sign_flip",
@@ -31042,6 +31051,15 @@ def run_self_test():
         == float(sign_flip_mc_b["p_value"])
     )
     assert 0.0 < float(sign_flip_mc_a["p_value"]) < 1.0
+    # MC 的 (count+1)/(R+1) 在 count=0 时可达 1/(R+1)；
+    # 不能沿用精确枚举的 2/R。
+    assert abs(
+        float(sign_flip_mc_a["min_attainable_p"])
+        - 1.0
+        / (
+            _RANDOMIZATION_MONTE_CARLO_REPLICATES + 1
+        )
+    ) < 1e-15
 
     # leave-one-out 稳健性：差值同号时去掉任一种子方向不变；
     # 一个极端离群种子会让去它之后的效应翻转，必须被识别。
