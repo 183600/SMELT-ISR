@@ -19123,6 +19123,7 @@ def baseline_adequacy(
         "baseline_mode": baseline_mode,
         "metric": metric,
         "n_baseline_runs": 0,
+        "n_baseline_runs_failed": 0,
         "baseline_mean": None,
         "checks": [],
         "straw_man": [],
@@ -19150,21 +19151,52 @@ def baseline_adequacy(
         )
         return report
 
-    baseline_rows = [
+    matching_baseline_rows = [
         row
         for row in rows
         if str(row.get("mode")) == baseline_mode
     ]
+    failed_baseline_rows = [
+        row
+        for row in matching_baseline_rows
+        if row.get("numerical_status") == "failed"
+    ]
+    baseline_rows = [
+        row
+        for row in matching_baseline_rows
+        if row.get("numerical_status") != "failed"
+    ]
+    report["n_baseline_runs"] = len(baseline_rows)
+    report["n_baseline_runs_failed"] = len(failed_baseline_rows)
+
+    if failed_baseline_rows:
+        # 数值失败/发散运行的最终指标可能来自 fallback checkpoint，
+        # 不能拿来证明基线「强于稻草人」或「值得战胜」：把它们排除
+        # 出本检查，与 aggregate_runs 的均值/检验口径保持一致。
+        report["advisories"].append(
+            f"{len(failed_baseline_rows)} 个 mode={baseline_mode} "
+            "的基线运行存在 NaN/Inf、数值停止或发散，"
+            "已从基线合理性核对中排除（"
+            + ", ".join(
+                str(row.get("run"))
+                for row in failed_baseline_rows
+            )
+            + "）：数值失败运行的 fallback 指标不能证明基线合理"
+        )
 
     if not baseline_rows:
-        report["straw_man"].append(
-            f"未找到 mode={baseline_mode} 的基线运行，"
-            "无法核对基线合理性"
-        )
+        if failed_baseline_rows:
+            report["straw_man"].append(
+                f"mode={baseline_mode} 的基线运行全部数值失败/"
+                "发散：没有可用的基线结果，无法核对基线合理性"
+            )
+        else:
+            report["straw_man"].append(
+                f"未找到 mode={baseline_mode} 的基线运行，"
+                "无法核对基线合理性"
+            )
         report["ok"] = False
         return report
-
-    report["n_baseline_runs"] = len(baseline_rows)
 
     baseline_values = [
         float(row[metric])
@@ -19269,14 +19301,35 @@ def baseline_adequacy(
     # 与 ngram_rows 是同一批运行，差值恒为 0，会凭空给出
     # 「基线不劣于 ngram」的稻草人判定；统计基线自身在 val 上
     # 做过网格调参，按第 3 步的豁免口径处理。
-    ngram_rows = [
+    matching_ngram_rows = [
         row
         for row in rows
         if str(row.get("mode")) == "ngram"
+    ]
+    failed_ngram_rows = [
+        row
+        for row in matching_ngram_rows
+        if row.get("numerical_status") == "failed"
+    ]
+    ngram_rows = [
+        row
+        for row in matching_ngram_rows
+        if row.get("numerical_status") != "failed"
         and isinstance(row.get(metric), (int, float))
         and not isinstance(row.get(metric), bool)
         and math.isfinite(float(row[metric]))
     ]
+    if failed_ngram_rows and baseline_mode != "ngram":
+        report["advisories"].append(
+            f"{len(failed_ngram_rows)} 个 ngram 统计基线运行"
+            "存在数值失败/发散，已从「基线不劣于 n-gram」的"
+            "对照中排除（"
+            + ", ".join(
+                str(row.get("run"))
+                for row in failed_ngram_rows
+            )
+            + "）"
+        )
 
     def _ngram_tuning_metric_of(
         row: Dict[str, object],
@@ -30924,6 +30977,73 @@ def run_self_test():
         assert any(
             "n-gram" in message
             for message in ngram_adequacy["straw_man"]
+        )
+
+        # 数值失败/发散运行不能作为基线合理性证据：其 fallback
+        # 指标即便很「好」也必须排除，且不能在只剩失败运行时
+        # 给出可用均值。
+        failed_smelt_path = _write_analysis_run(
+            "failed_smelt_seed2",
+            "smelt",
+            2,
+            3e-4,
+            100,
+            0.01,
+            1.00,
+            reference=good_reference,
+            baseline_tuning=good_tuning,
+            curve_status="diverged",
+        )
+        mixed_failed_adequacy = baseline_adequacy(
+            compare_runs([smelt_path, failed_smelt_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert mixed_failed_adequacy["n_baseline_runs"] == 1
+        assert (
+            mixed_failed_adequacy["n_baseline_runs_failed"]
+            == 1
+        )
+        assert mixed_failed_adequacy["baseline_mean"] == 4.50
+        assert any(
+            "数值失败" in message
+            for message in mixed_failed_adequacy["advisories"]
+        )
+        all_failed_adequacy = baseline_adequacy(
+            compare_runs([failed_smelt_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert all_failed_adequacy["ok"] is False
+        assert all_failed_adequacy["n_baseline_runs"] == 0
+        assert all_failed_adequacy["baseline_mean"] is None
+        assert any(
+            "全部数值失败" in message
+            for message in all_failed_adequacy["straw_man"]
+        )
+
+        # ngram 对照同样不能拿失败运行的指标参与「基线不劣于
+        # n-gram」判断。
+        failed_ngram_path = _write_analysis_run(
+            "failed_ngram",
+            "ngram",
+            0,
+            3e-4,
+            100,
+            0.01,
+            3.00,
+            curve_status="diverged",
+            ngram_tuning_metric="val_loss",
+        )
+        failed_ngram_adequacy = baseline_adequacy(
+            compare_runs([smelt_path, failed_ngram_path]),
+            "smelt",
+            "val_loss",
+        )
+        assert failed_ngram_adequacy["ngram_missing"] is True
+        assert any(
+            "数值失败" in message
+            for message in failed_ngram_adequacy["advisories"]
         )
 
         # 基线没有任何调参证据，且对比集合里也没有它能战胜的
