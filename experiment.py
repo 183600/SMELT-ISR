@@ -18525,7 +18525,36 @@ def ablation_coverage(
         "compute_parity": [],
         "advisories": [],
         "n_rows": len(rows),
+        "n_failed_rows_excluded": 0,
+        "failed_runs": [],
     }
+
+    failed_rows = [
+        row
+        for row in rows
+        if row.get("numerical_status") == "failed"
+    ]
+    if failed_rows:
+        # 数值失败/发散运行不能作为「该消融单元格已覆盖」或
+        # 「已有 N 个配对种子」的证据：fallback 指标与中断的
+        # 训练轨迹都不代表该配置可用。排除后若单元格变空，
+        # 会自然进入 missing_cells，而不是虚报组合齐全。
+        report["n_failed_rows_excluded"] = len(failed_rows)
+        report["failed_runs"] = [
+            str(row.get("run")) for row in failed_rows
+        ]
+        rows = [
+            row
+            for row in rows
+            if row.get("numerical_status") != "failed"
+        ]
+        report["n_rows"] = len(rows)
+        report["advisories"].append(
+            f"{len(failed_rows)} 个运行存在 NaN/Inf、数值停止"
+            "或发散，已从消融覆盖与配对种子核对中排除（"
+            + ", ".join(report["failed_runs"])
+            + "）：数值失败运行不能充当消融单元格覆盖证据"
+        )
 
     if not report["applicable"]:
         report["advisories"].append(
@@ -30045,6 +30074,44 @@ def run_self_test():
         assert any(
             "只有 1 个种子" in message
             for message in full_coverage["low_replicate_cells"]
+        )
+
+        # 数值失败的运行不能充当消融覆盖：把 A/b=off 的唯一
+        # 运行标记为发散后，该组合必须重新变为缺失，而不是
+        # 仍被算作已覆盖。
+        failed_full_paths = full_paths[:-1] + [
+            _write_analysis_run(
+                "A_bal0_failed",
+                "A",
+                42,
+                3e-4,
+                100,
+                0.0,
+                2.00,
+                curve_status="diverged",
+            ),
+        ]
+        failed_full_coverage = ablation_coverage(
+            compare_runs(failed_full_paths),
+            factors,
+            ["A"],
+            allow_partial=True,
+        )
+        assert failed_full_coverage["n_failed_rows_excluded"] == 1
+        assert failed_full_coverage["failed_runs"] == [
+            "A_bal0_failed"
+        ]
+        assert any(
+            "A/b=off" in message
+            for message in failed_full_coverage["missing_cells"]
+        ), failed_full_coverage["missing_cells"]
+        assert any(
+            "数值失败运行不能充当消融" in message
+            for message in failed_full_coverage["advisories"]
+        )
+        assert not any(
+            "全因子组合齐全" in message
+            for message in failed_full_coverage["advisories"]
         )
 
         # 组合齐全但结构设置不一致（某个消融单元格用了 k1=4）：
