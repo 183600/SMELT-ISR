@@ -10372,6 +10372,9 @@ def run_statistical_baseline(
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
             ),
+            "allow_corrupt_test_labels": bool(
+                getattr(args, "allow_corrupt_test_labels", False)
+            ),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
             "data_sha256": dataset.data_sha256,
@@ -16341,6 +16344,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
+    # 标签噪声豁免会改变 test 是否被封条拒绝；两个运行最终
+    # 指标的可信资格不同，同样不能算同一评估口径。
+    "allow_corrupt_test_labels",
     "eval_interval",
     "eval_batches",
     "data_sha256",
@@ -16375,6 +16381,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "drop_train_degenerate_groups",
     "drop_train_degenerate_runs",
     "allow_data_leakage",
+    "allow_corrupt_test_labels",
     "batch_size",
     "eval_batches",
     "data_augmentation",
@@ -16901,6 +16908,9 @@ def build_comparison_protocol(
         "allow_data_leakage": bool(
             getattr(args, "allow_data_leakage", False)
         ),
+        "allow_corrupt_test_labels": bool(
+            getattr(args, "allow_corrupt_test_labels", False)
+        ),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
@@ -17085,6 +17095,9 @@ def experiment_protocol_from_payload(
         ),
         "allow_data_leakage": bool(
             run_args.get("allow_data_leakage", False)
+        ),
+        "allow_corrupt_test_labels": bool(
+            run_args.get("allow_corrupt_test_labels", False)
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
@@ -27638,6 +27651,9 @@ def write_run_config(
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
             ),
+            "allow_corrupt_test_labels": bool(
+                getattr(args, "allow_corrupt_test_labels", False)
+            ),
         },
         "data_audit": data_audit,
         "data_protocol_check": data_protocol_check,
@@ -34459,6 +34475,11 @@ def run_self_test():
         "drop_train_corrupt_bytes"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    assert "allow_corrupt_test_labels" in COMPARISON_PROTOCOL_KEYS
+    assert (
+        "allow_corrupt_test_labels"
+        in _CROSS_FAMILY_PROTOCOL_KEYS
+    )
     # 旧 ngram 运行的 comparison_protocol 缺少清洗/泄露键时，
     # 必须从 args 回填它实际使用的数据口径；不能因为统计基线
     # 没有优化器就把这些键一律当成 False，否则会伪造「与神经
@@ -34472,6 +34493,7 @@ def run_self_test():
             "drop_train_corrupt_bytes": True,
             "drop_train_degenerate_groups": True,
             "allow_data_leakage": True,
+            "allow_corrupt_test_labels": True,
         },
         "data": {
             "sha256": "deadbeef",
@@ -34492,6 +34514,7 @@ def run_self_test():
         "drop_train_corrupt_bytes",
         "drop_train_degenerate_groups",
         "allow_data_leakage",
+        "allow_corrupt_test_labels",
     ):
         assert legacy_statistical_protocol[key] is True, key
     with tempfile.TemporaryDirectory() as analysis_dir:
