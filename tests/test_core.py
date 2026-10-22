@@ -4766,6 +4766,55 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
 
+    def test_contrasts_tolerate_out_of_range_means_and_counts(self):
+        huge = 10**400
+
+        def cell(mode, mean, std=1.0):
+            return {
+                "label": mode,
+                "keys": {"mode": mode},
+                "samples": {"val_loss": []},
+                "val_loss_mean": mean,
+                "val_loss_std": std,
+                "n_runs": 3,
+                "effective_seed_count": 3,
+                "costs": {},
+            }
+
+        contrasts = experiment.factor_contrasts(
+            [cell("A", 1.0), cell("B", huge)],
+            ["mode"],
+            "val_loss",
+        )
+        self.assertEqual(len(contrasts), 1)
+        self.assertIsNone(contrasts[0]["delta"])
+        # 巨大 std 同样不能直接平方；无效值按缺失处理。
+        contrasts = experiment.factor_contrasts(
+            [cell("A", 1.0, huge), cell("B", 2.0, huge)],
+            ["mode"],
+            "val_loss",
+        )
+        self.assertIsNone(contrasts[0]["delta_over_noise"])
+        # 损坏的运行数不能阻止对比生成或被当成负数。
+        broken_a = dict(cell("A", 1.0), n_runs=[])
+        broken_b = dict(cell("B", 2.0), n_runs={})
+        contrasts = experiment.factor_contrasts(
+            [broken_a, broken_b], ["mode"], "val_loss"
+        )
+        self.assertEqual(
+            contrasts[0]["n_expected_baseline"], 0
+        )
+        baseline = experiment.compare_cells_to_baseline(
+            [
+                dict(cell("A", 1.0), effective_seed_count=[]),
+                cell("B", 2.0),
+            ],
+            "A",
+            "val_loss",
+        )
+        self.assertEqual(len(baseline), 1)
+        self.assertEqual(baseline[0]["delta"], 1.0)
+
     def test_factor_keys_preserve_large_integer_precision(self):
         left = 2 ** 53
         right = left + 1

@@ -19105,6 +19105,13 @@ def _finite_float(value: object) -> Optional[float]:
     return numeric
 
 
+def _nonnegative_int(value: object) -> int:
+    """非负整数计数；bool/损坏值按 0 处理，供旧报告兼容。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, int(value))
+
+
 def _as_dict(value: object) -> Dict[str, object]:
     """dict 原样返回；其余值（旧/损坏 config 字段）当空 dict。"""
     return value if isinstance(value, dict) else {}
@@ -27164,24 +27171,42 @@ def factor_contrasts(
             if rank_a > rank_b:
                 cell_a, cell_b = cell_b, cell_a
 
-            samples_a = cell_a["samples"].get(metric, [])
-            samples_b = cell_b["samples"].get(metric, [])
-            mean_a = cell_a.get(f"{metric}_mean")
-            mean_b = cell_b.get(f"{metric}_mean")
-            std_a = cell_a.get(f"{metric}_std")
-            std_b = cell_b.get(f"{metric}_std")
+            samples_a = _as_dict(
+                cell_a.get("samples")
+            ).get(metric, [])
+            samples_b = _as_dict(
+                cell_b.get("samples")
+            ).get(metric, [])
+            if not isinstance(samples_a, list):
+                samples_a = []
+            if not isinstance(samples_b, list):
+                samples_b = []
+            mean_a = _finite_float(
+                cell_a.get(f"{metric}_mean")
+            )
+            mean_b = _finite_float(
+                cell_b.get(f"{metric}_mean")
+            )
+            std_a = _finite_float(
+                cell_a.get(f"{metric}_std")
+            )
+            std_b = _finite_float(
+                cell_b.get(f"{metric}_std")
+            )
 
             delta = (
-                float(mean_b) - float(mean_a)
+                mean_b - mean_a
                 if mean_a is not None and mean_b is not None
                 else None
             )
 
             pooled_std = None
             if std_a is not None and std_b is not None:
-                pooled_std = math.sqrt(
-                    (float(std_a) ** 2 + float(std_b) ** 2) / 2.0
-                )
+                pooled_squared = (
+                    std_a * std_a + std_b * std_b
+                ) / 2.0
+                if math.isfinite(pooled_squared):
+                    pooled_std = math.sqrt(pooled_squared)
 
             noise_ratio = None
             if delta is not None and pooled_std:
@@ -27223,8 +27248,12 @@ def factor_contrasts(
                 cell_a.get("deterministic")
                 or cell_b.get("deterministic")
             )
-            expected_a = int(cell_a.get("n_runs", 0) or 0)
-            expected_b = int(cell_b.get("n_runs", 0) or 0)
+            expected_a = _nonnegative_int(
+                cell_a.get("n_runs")
+            )
+            expected_b = _nonnegative_int(
+                cell_b.get("n_runs")
+            )
             missing_a = (
                 0
                 if deterministic_cell
@@ -27252,9 +27281,10 @@ def factor_contrasts(
             # 效率与精度的权衡：给出变体相对基线的效率倍率，并
             # 把「统计显著但效率更低」「变差且效率更低」单独
             # 标记，避免只报涨点而不报效率变化。
+            test_p_value = _finite_float(test.get("p_value"))
             significant = (
-                test.get("p_value") is not None
-                and float(test["p_value"]) <= _SIGNIFICANCE_LEVEL
+                test_p_value is not None
+                and test_p_value <= _SIGNIFICANCE_LEVEL
             )
             cost, cost_verdict = _cost_comparison(
                 cell_a,
@@ -29671,12 +29701,16 @@ def compare_cells_to_baseline(
             # 参考单元按独立种子数选，伪重复不能靠复制目录
             # 把自己「选」成基线；确定性基线（ngram）的多个
             # seed 只是复制同一估计，按 1 个观测计。
-            int(aggregate.get("effective_seed_count", 0)),
-            int(aggregate.get("n_runs", 0)),
+            _nonnegative_int(
+                aggregate.get("effective_seed_count")
+            ),
+            _nonnegative_int(aggregate.get("n_runs")),
         )
         if current is None or candidate_rank > (
-            int(current.get("effective_seed_count", 0)),
-            int(current.get("n_runs", 0)),
+            _nonnegative_int(
+                current.get("effective_seed_count")
+            ),
+            _nonnegative_int(current.get("n_runs")),
         ):
             references[context] = aggregate
     if not references:
@@ -29698,21 +29732,36 @@ def compare_cells_to_baseline(
             == str(reference["keys"].get("mode"))
         ):
             continue
+        samples_reference = _as_dict(
+            reference.get("samples")
+        ).get(metric, [])
+        samples_variant = _as_dict(
+            aggregate.get("samples")
+        ).get(metric, [])
+        if not isinstance(samples_reference, list):
+            samples_reference = []
+        if not isinstance(samples_variant, list):
+            samples_variant = []
         result = _contrast_test(
-            reference["samples"].get(metric, []),
-            aggregate["samples"].get(metric, []),
+            samples_reference,
+            samples_variant,
         )
-        mean_reference = reference.get(f"{metric}_mean")
-        mean_variant = aggregate.get(f"{metric}_mean")
+        mean_reference = _finite_float(
+            reference.get(f"{metric}_mean")
+        )
+        mean_variant = _finite_float(
+            aggregate.get(f"{metric}_mean")
+        )
         delta = (
-            float(mean_variant) - float(mean_reference)
+            mean_variant - mean_reference
             if mean_reference is not None
             and mean_variant is not None
             else None
         )
+        p_value = _finite_float(result.get("p_value"))
         significant = (
-            result.get("p_value") is not None
-            and float(result["p_value"]) <= _SIGNIFICANCE_LEVEL
+            p_value is not None
+            and p_value <= _SIGNIFICANCE_LEVEL
         )
         if delta is None:
             verdict = "missing_metric"
@@ -29735,16 +29784,20 @@ def compare_cells_to_baseline(
         # 噪声比与 Hedges g：与单因子对比同口径（|Δ|/合并
         # 标准差 + 小样本偏倚校正），--compare-baseline 的直接
         # 对比同样要能读出「效应相对种子噪声有多大」。
-        std_reference = reference.get(f"{metric}_std")
-        std_current = aggregate.get(f"{metric}_std")
+        std_reference = _finite_float(
+            reference.get(f"{metric}_std")
+        )
+        std_current = _finite_float(
+            aggregate.get(f"{metric}_std")
+        )
         pooled_std = None
-        if isinstance(std_reference, (int, float)) and isinstance(
-            std_current, (int, float)
-        ):
-            pooled_std = math.sqrt(
-                (float(std_reference) ** 2 + float(std_current) ** 2)
-                / 2.0
-            )
+        if std_reference is not None and std_current is not None:
+            pooled_squared = (
+                std_reference * std_reference
+                + std_current * std_current
+            ) / 2.0
+            if math.isfinite(pooled_squared):
+                pooled_std = math.sqrt(pooled_squared)
         noise_ratio = (
             abs(delta) / pooled_std
             if delta is not None and pooled_std
