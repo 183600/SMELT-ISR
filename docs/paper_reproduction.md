@@ -146,11 +146,14 @@ python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95_b20k \
   1/r、GQA、4096 上下文、推导几何与预设一致；
 - `protocol_faithful`：3.1 节协议（WSD、batch 256、稳定期/分支步数、
   文档级 mask、六个分支点）齐备；
-- `is_full_reproduction` = 两者同时成立；
+- `is_full_reproduction` = 两者同时成立（recipe 复现）；
+- `numerical_reproduction` = `is_full_reproduction` 且 `budget_audit`
+  的 FLOPs/参数/KV/S 全部落在论文容差内（数值复现）；
 - `budget_audit` 独立报告预算偏差。**公开实现不能保证与论文逐位相同的
   参数化**：FLOPs 依赖论文未公开的平均文档长度与专家中间维，本仓库按
   4096 上下文与总参数目标推导。预算偏差存在时，结论应写成
-  「recipe 复现 + 预算偏差 X%」，不能写成「数值复现」。
+  「recipe 复现 + 预算偏差 X%」，不能写成「数值复现」；此时
+  `is_full_reproduction=true` 而 `numerical_reproduction=false`。
 
 ## 5. 仍未覆盖的部分
 

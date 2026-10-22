@@ -329,7 +329,9 @@ python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
   10B-token cosine decay 续跑。
 - `paper_fidelity` 分成两层：`architecture_faithful`（附录 A 的结构 +
   top-8/GQA/4096/1-r/循环位置）与 `protocol_faithful`（3.1 节协议），
-  两者都通过才是 `is_full_reproduction=true`。`budget_audit` 单独报告
+  两者都通过才是 `is_full_reproduction=true`（recipe 复现）；
+  只有预算也落在论文容差内才是 `numerical_reproduction=true`。
+  `budget_audit` 单独报告
   FLOPs / 总参数 / KV cache / S 的实测值与论文目标的偏差——附录 A 的
   参数化来自未公开 family，公开实现不能保证逐位数值相同，存在预算
   偏差时不能声称数值复现，只能声称 recipe 复现。

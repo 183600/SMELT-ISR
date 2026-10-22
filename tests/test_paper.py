@@ -223,6 +223,20 @@ class PaperFidelityTests(unittest.TestCase):
             self.assertEqual(
                 report["cell"]["scale"], "100M"
             )
+            # recipe 复现与数值复现分开：base 格的预算
+            # （总参数/active/S）落在容差内，smelt 格的
+            # FLOPs 比例与 S 仍有偏差，不能声称数值复现。
+            if arch == "base":
+                self.assertTrue(
+                    report["numerical_reproduction"],
+                    report["budget_audit"][
+                        "within_paper_tolerance"
+                    ],
+                )
+            else:
+                self.assertFalse(
+                    report["numerical_reproduction"]
+                )
 
     def test_prototype_config_is_not_full_reproduction(self):
         cfg = experiment.Config(

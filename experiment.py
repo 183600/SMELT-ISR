@@ -1297,14 +1297,32 @@ def paper_fidelity_report(
     ]
 
     budget_audit: Optional[Dict[str, object]] = None
+    budget_all_within: Optional[bool] = None
     if cell is not None and arch is not None:
         budget_audit = _paper_budget_audit(cfg, cell)
+        budget_all_within = bool(
+            budget_audit["all_within_tolerance"]
+        )
+    # 「recipe 复现」与「数值复现」分开：recipe 指附录 A 的结构
+    # 与 3.1 节协议；数值复现还要求 FLOPs/参数/KV/S 都落在论文
+    # 容差内，而附录 A 的参数化来自未公开 family，公开实现通常
+    # 达不到。两个字段都不允许靠措辞合并。
+    numerical_reproduction = bool(
+        is_full_reproduction and budget_all_within
+    )
 
-    if is_full_reproduction:
+    if numerical_reproduction:
         interpretation = (
-            "配置与训练协议均对齐论文披露口径；未被论文披露的"
-            "超参与数据不在复现范围内，预算偏差见 budget_audit，"
-            "数值结果不能声称与论文逐位一致"
+            "recipe（架构+协议）与论文附录 A 的预算容差均对齐；"
+            "未被论文披露的超参与语料仍不等价于原实现，结论"
+            "应写成复现而非逐位相同"
+        )
+    elif is_full_reproduction:
+        interpretation = (
+            "recipe（附录 A 结构 + 3.1 节协议）复现完成；"
+            "budget_audit 仍有偏差，numerical_reproduction=false，"
+            "不能声称数值复现（偏差来源与推导规则见 "
+            "docs/paper_reproduction.md）"
         )
     elif architecture_faithful and protocol is None:
         interpretation = (
@@ -1346,6 +1364,7 @@ def paper_fidelity_report(
         "architecture_faithful": bool(architecture_faithful),
         "protocol_faithful": protocol_faithful,
         "is_full_reproduction": is_full_reproduction,
+        "numerical_reproduction": numerical_reproduction,
         "budget_audit": budget_audit,
         "undisclosed": list(PAPER_UNDISCLOSED),
         "protocol": dict(PAPER_PROTOCOL),
