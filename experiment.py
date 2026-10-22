@@ -31197,8 +31197,11 @@ def compare_cells_to_baseline(
             "variant_value": aggregate["keys"].get("mode"),
             "mean_baseline": mean_reference,
             "mean_variant": mean_variant,
-            "std_baseline": reference.get(f"{metric}_std"),
-            "std_variant": aggregate.get(f"{metric}_std"),
+            # 与 factor_contrasts 同口径：std 先转成有限数值，
+            # 损坏/超范围记录按缺失处理，不能把 inf 或字符串
+            # 原样写进对比报告（还会破坏 JSON 落盘）。
+            "std_baseline": std_reference,
+            "std_variant": std_current,
             "delta": delta,
             "paired_differences": result.get(
                 "paired_differences"
@@ -31241,15 +31244,14 @@ def compare_cells_to_baseline(
                 "leave_one_out_sign_stable"
             ),
             "n_pairs": result.get("n_pairs", 0),
+            # samples 已在上面按 _as_dict/list 校验并取出；
+            # 不能再直接对 aggregate["samples"] 调 .get，否则
+            # 手工编辑/旧版本的损坏记录会让整份对比崩掉。
             "n_baseline": len(
-                _collapse_seed_samples(
-                    reference["samples"].get(metric, [])
-                )
+                _collapse_seed_samples(samples_reference)
             ),
             "n_variant": len(
-                _collapse_seed_samples(
-                    aggregate["samples"].get(metric, [])
-                )
+                _collapse_seed_samples(samples_variant)
             ),
             "duplicate_seeds": bool(
                 result.get("duplicate_seeds")

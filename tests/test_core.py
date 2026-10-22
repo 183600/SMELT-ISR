@@ -6518,6 +6518,41 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertNotIn("ci_family_adjusted_high", item)
         json.dumps(item, allow_nan=False)
 
+    def test_compare_cells_filters_bad_std_and_samples(self):
+        cells = [
+            {
+                "label": "A",
+                "keys": {"mode": "A"},
+                "samples": {"val_loss": []},
+                "val_loss_mean": 1.0,
+                "val_loss_std": 1.0e308,
+                "n_runs": 1,
+                "effective_seed_count": 1,
+                "costs": {},
+            },
+            {
+                "label": "B",
+                "keys": {"mode": "B"},
+                # 损坏记录：samples 不是 dict，std 不是有限值。
+                "samples": [],
+                "val_loss_mean": 2.0,
+                "val_loss_std": float("inf"),
+                "n_runs": 1,
+                "effective_seed_count": 1,
+                "costs": {},
+            },
+        ]
+        contrasts = experiment.compare_cells_to_baseline(
+            cells, "A", "val_loss"
+        )
+        self.assertEqual(len(contrasts), 1)
+        contrast = contrasts[0]
+        self.assertEqual(contrast["std_baseline"], 1.0e308)
+        self.assertIsNone(contrast["std_variant"])
+        self.assertEqual(contrast["n_baseline"], 0)
+        self.assertEqual(contrast["n_variant"], 0)
+        json.dumps(contrast, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
