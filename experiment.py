@@ -36959,6 +36959,7 @@ def _iter_manifest_entries(
     depth: int = 0,
     *,
     with_digest: bool = True,
+    _budget: Optional[List[int]] = None,
 ) -> List[Dict[str, object]]:
     """
     按路径排序遍历 root 下的文件与符号链接。
@@ -36966,6 +36967,9 @@ def _iter_manifest_entries(
     ``with_digest=False`` 只收集路径与类型，不读取文件内容：
     校验时的「清单外新增文件」扫描不需要把已校验过的大检查点
     再哈希一遍。
+
+    ``_budget`` 是跨递归共享的条目计数，保证上限约束的是整个
+    目录树而不只是单个子目录。
     """
     if depth > _ARTIFACT_MANIFEST_MAX_DEPTH:
         raise ValueError(
@@ -36974,6 +36978,18 @@ def _iter_manifest_entries(
             "请确认 --write-manifest 指向的是运行目录而不是"
             "整个文件系统"
         )
+
+    if _budget is None:
+        _budget = [0]
+
+    def consume() -> None:
+        _budget[0] += 1
+        if _budget[0] > _ARTIFACT_MANIFEST_MAX_ENTRIES:
+            raise ValueError(
+                "运行目录文件数超过清单上限 "
+                f"{_ARTIFACT_MANIFEST_MAX_ENTRIES}："
+                "请缩小 --write-manifest 的范围"
+            )
 
     directory = current if current is not None else root
     with os.scandir(directory) as iterator:
@@ -36986,13 +37002,8 @@ def _iter_manifest_entries(
         # 清单自身不进入清单：否则写入后哈希立刻失效。
         if current is None and child.name == _ARTIFACT_MANIFEST_NAME:
             continue
-        if len(entries) > _ARTIFACT_MANIFEST_MAX_ENTRIES:
-            raise ValueError(
-                "运行目录文件数超过清单上限 "
-                f"{_ARTIFACT_MANIFEST_MAX_ENTRIES}："
-                "请缩小 --write-manifest 的范围"
-            )
         if child.is_symlink():
+            consume()
             entries.append(_manifest_file_entry(
                 child_path, relative
             ))
@@ -37002,8 +37013,10 @@ def _iter_manifest_entries(
                 child_path,
                 depth + 1,
                 with_digest=with_digest,
+                _budget=_budget,
             ))
         elif child.is_file(follow_symlinks=False):
+            consume()
             if with_digest:
                 entries.append(_manifest_file_entry(
                     child_path, relative
@@ -37016,6 +37029,7 @@ def _iter_manifest_entries(
         else:
             # FIFO/套接字/设备文件不能按内容归档，只登记类型，
             # 让校验能发现它们被替换成普通文件。
+            consume()
             entries.append({
                 "path": relative,
                 "type": "other",

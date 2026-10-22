@@ -2253,6 +2253,20 @@ class ArtifactManifestTests(unittest.TestCase):
                 {item["reason"] for item in report["mismatched"]},
             )
 
+    def test_manifest_entry_limit_counts_across_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            # _make_run 本身有 3 个文件（config、metrics、logs/）。
+            # 上限按整棵目录树计数，不能被每个子目录各自重置。
+            previous = experiment._ARTIFACT_MANIFEST_MAX_ENTRIES
+            experiment._ARTIFACT_MANIFEST_MAX_ENTRIES = 2
+            try:
+                with self.assertRaises(ValueError) as raised:
+                    experiment.build_artifact_manifest(root)
+            finally:
+                experiment._ARTIFACT_MANIFEST_MAX_ENTRIES = previous
+            self.assertIn("上限", str(raised.exception))
+
     def test_manifest_mode_rejects_conflicting_entries(self):
         both = experiment.manifest_mode_error(
             argparse.Namespace(
