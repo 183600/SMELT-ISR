@@ -4953,6 +4953,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             components["between_seed_sd"], 0.0
         )
         self.assertIsNotNone(components["std_error_of_mean"])
+        # 截断前的原始方差分量可为负，缩放实现不能把它丢掉。
+        components = experiment._window_variance_components(
+            {1: [0.0, 10.0], 2: [5.0, 5.0]}
+        )
+        raw = components[
+            "variance_components_single_observation"
+        ]
+        self.assertLess(raw["raw_seed"], 0.0)
+        self.assertTrue(raw["truncated_at_zero"])
 
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [

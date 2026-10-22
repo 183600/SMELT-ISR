@@ -24069,9 +24069,19 @@ def _window_variance_components(
         mean_seed_var_norm + mean_error_var_norm
     )
 
-    def _rescale_square(value: float) -> Optional[float]:
-        """把归一化方差还原到原始尺度；溢出时返回 None。"""
-        if not math.isfinite(value) or value < 0.0:
+    def _rescale_square(
+        value: float,
+        *,
+        signed: bool = False,
+    ) -> Optional[float]:
+        """把归一化方差还原到原始尺度；溢出时返回 None。
+
+        ``signed=True`` 保留可正可负的原始方差分量（截断前），
+        用于诊断「随机效应方差被截断到 0」。
+        """
+        if not math.isfinite(value):
+            return None
+        if value < 0.0 and not signed:
             return None
         result = (value * scale) * scale
         return result if math.isfinite(result) else None
@@ -24087,8 +24097,12 @@ def _window_variance_components(
     seed_var = _rescale_square(seed_var_norm)
     window_var = _rescale_square(window_var_norm)
     error_var = _rescale_square(error_var_norm)
-    raw_seed_var = _rescale_square(raw_seed_var_norm)
-    raw_window_var = _rescale_square(raw_window_var_norm)
+    raw_seed_var = _rescale_square(
+        raw_seed_var_norm, signed=True
+    )
+    raw_window_var = _rescale_square(
+        raw_window_var_norm, signed=True
+    )
     mean_seed_var = _rescale_square(mean_seed_var_norm)
     mean_window_var = _rescale_square(mean_window_var_norm)
     mean_error_var = _rescale_square(mean_error_var_norm)
