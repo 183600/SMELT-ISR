@@ -37216,16 +37216,22 @@ def verify_artifact_manifest(
         seen.add(relative)
 
         target = root / relative
-        # 防御符号链接目录穿越：解析后必须仍位于 root 内。
+        entry_type = item.get("type", "file")
+        # 防御目录穿越：条目所在目录解析后必须仍位于 root 内。
+        # 对符号链接条目只能检查其父目录，不能再解析链接自身：
+        # 清单明确记录符号链接目标而不跟随（见
+        # _manifest_file_entry），合法的归档链接可以指向运行
+        # 目录之外；跟随解析会把这种合法清单误报为逃逸。
+        check_path = (
+            target.parent if entry_type == "symlink" else target
+        )
         try:
-            target.resolve(strict=False).relative_to(
+            check_path.resolve(strict=False).relative_to(
                 root_resolved
             )
         except (OSError, ValueError):
             fail(relative, "escapes_root")
             continue
-
-        entry_type = item.get("type", "file")
         try:
             exists = target.exists()
             is_symlink = target.is_symlink()

@@ -2117,6 +2117,51 @@ class ArtifactManifestTests(unittest.TestCase):
                 {item["reason"] for item in report["mismatched"]},
             )
 
+    def test_manifest_external_symlink_is_allowed_but_contained_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            outside = Path(tmp) / "outside.txt"
+            outside.write_text("external artifact")
+
+            # 清单记录链接目标而不是跟随链接：运行目录之外的
+            # 合法归档链接必须能通过校验，否则 writer 写出的
+            # 清单无法验证自己的输出。
+            external_link = root / "external.txt"
+            try:
+                external_link.symlink_to(outside)
+            except (OSError, NotImplementedError):
+                self.skipTest("当前平台不支持符号链接")
+            experiment.write_artifact_manifest(root)
+            self.assertTrue(
+                experiment.verify_artifact_manifest(root)["ok"]
+            )
+
+            # 逃逸检查仍然生效：通过目录链接把清单路径引到
+            # 运行目录之外必须拒绝，即使条目的父目录字符串
+            # 看起来在 root 下。
+            escape_dir = root / "escape"
+            try:
+                escape_dir.symlink_to(Path(tmp), target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("当前平台不支持目录符号链接")
+            manifest_path = root / "artifact_manifest.json"
+            payload = json.loads(manifest_path.read_text())
+            payload["files"].append({
+                "path": "escape/outside.txt",
+                "type": "file",
+                "bytes": outside.stat().st_size,
+                "sha256": experiment._sha256_file(outside),
+            })
+            manifest_path.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            report = experiment.verify_artifact_manifest(root)
+            self.assertFalse(report["ok"])
+            self.assertIn(
+                "escapes_root",
+                {item["reason"] for item in report["mismatched"]},
+            )
+
     def test_manifest_mode_rejects_conflicting_entries(self):
         both = experiment.manifest_mode_error(
             argparse.Namespace(
