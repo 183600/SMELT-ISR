@@ -23080,6 +23080,17 @@ def ablation_component_verdicts(
         ]
         primary_summary = _component_evidence_summary(primary)
         simple_summary = _component_evidence_summary(simple)
+        interaction = [
+            effect
+            for effect in effects
+            if effect.get("delayed_mode") == mode
+            and effect.get("effect_name") == "interaction"
+        ]
+        interaction_significant = any(
+            effect.get("claim") == "interaction_detected"
+            and effect.get("significant")
+            for effect in interaction
+        )
         status = str(primary_summary["status"])
         reasons = [str(primary_summary.get("reason"))]
         if status == "supported":
@@ -23094,6 +23105,16 @@ def ablation_component_verdicts(
                 reasons.append(
                     "主效应支持，但简单效应受混杂/未核对控制项"
                     "阻塞"
+                )
+            elif (
+                interaction_significant
+                and simple_summary["status"] != "supported"
+            ):
+                status = "partial"
+                reasons.append(
+                    "交互显著且简单效应未全部支持：主效应可能"
+                    "只由其中一个均衡开关水平驱动，不能宣称"
+                    "组件在所有设置下有用"
                 )
         elif (
             status in {"missing", "insufficient_data", "inconclusive"}
@@ -23130,6 +23151,12 @@ def ablation_component_verdicts(
     balance_simple_summary = _component_evidence_summary(
         balance_simple
     )
+    balance_interaction_significant = any(
+        effect.get("effect_name") == "interaction"
+        and effect.get("claim") == "interaction_detected"
+        and effect.get("significant")
+        for effect in effects
+    )
     balance_status = str(balance_primary["status"])
     balance_reasons = [str(balance_primary["reason"])]
     if balance_status == "supported":
@@ -23144,6 +23171,16 @@ def ablation_component_verdicts(
             balance_reasons.append(
                 "均衡损失主效应支持，但简单效应受混杂/未核对"
                 "控制项阻塞"
+            )
+        elif (
+            balance_interaction_significant
+            and balance_simple_summary["status"] != "supported"
+        ):
+            balance_status = "partial"
+            balance_reasons.append(
+                "交互显著且简单效应未全部支持：主效应可能"
+                "只由其中一个设置驱动，不能宣称均衡损失"
+                "在所有设置下有用"
             )
     elif (
         balance_status
@@ -42141,6 +42178,37 @@ def run_self_test():
             component_verdicts["statuses"]["balance_loss"]
             == "supported"
         )
+        interaction_partial_factorial = json.loads(
+            json.dumps(
+                _json_safe(factorial),
+                ensure_ascii=False,
+            )
+        )
+        for effect in interaction_partial_factorial["effects"]:
+            if effect["effect_name"] == "interaction":
+                effect["claim"] = "interaction_detected"
+                effect["significant"] = True
+            elif (
+                effect["effect_name"]
+                == "delayed_merge_at_balance_on"
+            ):
+                effect["claim"] = "not_significant"
+                effect["significant"] = False
+        interaction_partial_verdicts = (
+            ablation_component_verdicts(
+                interaction_partial_factorial,
+                component_coverage,
+            )
+        )
+        assert (
+            interaction_partial_verdicts["statuses"][
+                "delayed_merge_A"
+            ]
+            == "partial"
+        ), interaction_partial_verdicts["components"][0]
+        assert not interaction_partial_verdicts[
+            "all_components_supported"
+        ]
         # 统计上全部支持还不够：当前分析指标若与训练前预注册
         # 的主指标不一致，等于在多个指标里事后挑一个支持结论
         # 的，必须阻塞「各自有用」的联合判定。
