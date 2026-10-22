@@ -13747,6 +13747,9 @@ def run_statistical_baseline(
 
     # ---- config.json：与训练运行相同结构，可直接 --compare ----
     payload = {
+        # 与 write_run_config 使用同一配置 schema；统计基线也是
+        # 独立实验单元，归档工具不应遇到两种结构。
+        "config_schema": _ENVIRONMENT_CONFIG_SCHEMA,
         # 计数与固定窗口评估都不消耗随机性：显式标记，供
         # --compare 折叠多个 seed 的复制运行（不能当独立重复）。
         "deterministic": True,
@@ -13944,17 +13947,9 @@ def run_statistical_baseline(
         )
     )
 
-    with open(
-        out_dir / "config.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            _json_safe(payload),
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    # 与训练入口一样原子写 config.json：计数/评估结束后写盘失败
+    # 不能留下半截 JSON，否则跟踪信息与归档清单都会失效。
+    _atomic_write_json(out_dir / "config.json", payload)
 
 
 # ============================================================
