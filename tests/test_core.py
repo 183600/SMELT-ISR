@@ -4766,6 +4766,29 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
 
+    def test_design_power_fallback_does_not_keep_stale_adequacy(self):
+        # 旧/手工 power 记录缺重算字段时，不能沿用按更小家族
+        # 算出的 adequate=True 放行新增的交互对比。
+        power = {
+            "expected_seed_sd_relative": 0.01,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 3,
+            "planned_seeds": 7,
+            "adequate": True,
+        }
+        adjusted = experiment._design_power_for_family(
+            power,
+            6,
+            ["pairwise", "main", "interaction", "simple"],
+        )
+        self.assertIsNone(adjusted["adequate"])
+        self.assertFalse(adjusted["adequacy_recomputed"])
+        design = {"power": adjusted}
+        self.assertIsNotNone(
+            experiment.design_power_gate_error(design)
+        )
+
     def test_plan_treatment_keys_may_be_non_strings(self):
         # 手工/旧计划可能用非字符串键；不能因 str(key) 后查不到
         # 值就把不同处理单元静默合并。

@@ -57793,10 +57793,14 @@ def _design_power_for_family(
             effective_family,
             contrast_types=effective_contrasts,
         )
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
         # 手工构造/旧版记录可能没有重算所需的原始字段；
-        # 至少保留调整后的家族规模与对比类型，不能退回低估的
-        # 声明值。
+        # 至少保留调整后的家族规模与对比类型。但原有
+        # ``adequate=True`` 是按更小的家族/更弱的对比算出来的，
+        # 不能继续沿用，否则新增的交互对比会绕过启动门。
+        adjusted["adequate"] = None
+        adjusted["adequacy_recomputed"] = False
+        adjusted["adequacy_recompute_error"] = str(error)
         return adjusted
     recomputed["declared_planned_comparisons"] = declared
     recomputed["declared_planned_contrasts"] = declared_contrasts
