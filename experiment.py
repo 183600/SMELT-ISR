@@ -22411,8 +22411,16 @@ def _factor_sort_rank(value):
         return (3, 0.0, "")
     if isinstance(value, bool):
         return (2, float(value), "")
-    if isinstance(value, (int, float)):
-        return (0, float(value), "")
+    if isinstance(value, int):
+        try:
+            return (0, float(value), "")
+        except OverflowError:
+            # 与 _stable_factor_key 同一口径：JSON 可含任意大整
+            # 数。返回整数本身（而不是 inf）既避免溢出，也保留
+            # 不同大整数之间的可比较顺序。
+            return (0, value, "")
+    if isinstance(value, float):
+        return (0, value, "")
     if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
         return (1, float(_FACTOR_VALUE_ORDER[value]), value)
     if isinstance(value, str):
@@ -22838,17 +22846,35 @@ def check_run_provenance(
     }
 
 
+def _finite_values(values: List[float]) -> Optional[List[float]]:
+    """把数值列表统一转成有限 float；任一值不可用则返回 None。
+
+    报告/分析函数会读取手工修复或旧版本写下的 JSON，其中可能
+    含超过 float 范围的整数。集中在这里转换，避免 ``sum`` 的
+    真除法或 ``float()`` 在单个坏值上让整份报告崩溃。
+    """
+    numeric: List[float] = []
+    for value in values:
+        number = _finite_float(value)
+        if number is None:
+            return None
+        numeric.append(number)
+    return numeric
+
+
 def _mean(values: List[float]) -> Optional[float]:
-    if not values:
+    numeric = _finite_values(values)
+    if not numeric:
         return None
-    return sum(values) / len(values)
+    return sum(numeric) / len(numeric)
 
 
 def _median(values: List[float]) -> Optional[float]:
     """中位数（偶数个观测取中间两者的平均）。"""
-    if not values:
+    numeric = _finite_values(values)
+    if not numeric:
         return None
-    ordered = sorted(float(value) for value in values)
+    ordered = sorted(numeric)
     middle = len(ordered) // 2
     if len(ordered) % 2 == 1:
         return ordered[middle]
@@ -22859,13 +22885,14 @@ def _sample_std(values: List[float]) -> Optional[float]:
     """
     样本标准差（ddof=1）；少于 2 个观测时返回 None。
     """
-    if len(values) < 2:
+    numeric = _finite_values(values)
+    if numeric is None or len(numeric) < 2:
         return None
-    mean = sum(values) / len(values)
+    mean = sum(numeric) / len(numeric)
     variance = sum(
-        (value - mean) ** 2 for value in values
-    ) / (len(values) - 1)
-    return math.sqrt(variance)
+        (value - mean) ** 2 for value in numeric
+    ) / (len(numeric) - 1)
+    return math.sqrt(max(0.0, variance))
 
 
 def _betacf(a: float, b: float, x: float) -> float:
@@ -23190,44 +23217,28 @@ def _eval_window_fingerprint(
 def _window_per_token_loss(
     window: Dict[str, object],
 ) -> Optional[float]:
-    tokens = window.get("tokens")
-    loss_sum = window.get("loss_sum")
-    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool):
+    if not isinstance(window, dict):
         return None
-    if not isinstance(loss_sum, (int, float)) or isinstance(
-        loss_sum, bool
-    ):
+    tokens = _finite_float(window.get("tokens"))
+    loss_sum = _finite_float(window.get("loss_sum"))
+    if tokens is None or loss_sum is None or tokens <= 0.0:
         return None
-    if not math.isfinite(float(tokens)):
-        return None
-    if not math.isfinite(float(loss_sum)):
-        return None
-    if float(tokens) <= 0.0:
-        return None
-    value = float(loss_sum) / float(tokens)
+    value = loss_sum / tokens
     return value if math.isfinite(value) else None
 
 
 def _window_accuracy(
     window: Dict[str, object],
 ) -> Optional[float]:
-    tokens = window.get("tokens")
-    correct = window.get("correct")
-    if not isinstance(tokens, (int, float)) or isinstance(tokens, bool):
+    if not isinstance(window, dict):
         return None
-    if not isinstance(correct, (int, float)) or isinstance(
-        correct, bool
-    ):
+    tokens = _finite_float(window.get("tokens"))
+    correct = _finite_float(window.get("correct"))
+    if tokens is None or correct is None or tokens <= 0.0:
         return None
-    if not math.isfinite(float(tokens)):
+    if correct < 0.0 or correct > tokens:
         return None
-    if not math.isfinite(float(correct)):
-        return None
-    if float(tokens) <= 0.0:
-        return None
-    if float(correct) < 0.0 or float(correct) > float(tokens):
-        return None
-    value = float(correct) / float(tokens)
+    value = correct / tokens
     return value if math.isfinite(value) else None
 
 
@@ -23513,26 +23524,23 @@ def _cell_window_payloads_by_seed(
 def _clean_window_differences(
     per_seed_differences: Dict[int, List[float]],
 ) -> Dict[int, List[float]]:
-    """过滤非有限窗口差值；保留可排序的整数种子键。"""
+    """过滤非有限窗口差值；只保留精确整数种子键。"""
     cleaned: Dict[int, List[float]] = {}
-    for seed in sorted(per_seed_differences):
-        values = per_seed_differences.get(seed)
+    for seed, values in per_seed_differences.items():
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            continue
         if not isinstance(values, list):
             continue
-        numeric = [
-            float(value)
-            for value in values
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-        ]
-        if len(numeric) != len(values):
-            continue
-        if not numeric or any(
-            not math.isfinite(value) for value in numeric
-        ):
+        numeric = _finite_values(values)
+        if numeric is None or not numeric:
             continue
         cleaned[int(seed)] = numeric
-    return cleaned
+    # 先清理键再排序：损坏 JSON 可能混入字符串/None 等不可比较
+    # 的键，直接 sorted() 会在报告阶段抛 TypeError。
+    return {
+        seed: cleaned[seed]
+        for seed in sorted(cleaned)
+    }
 
 
 def _hierarchical_window_bootstrap_ci(
@@ -25592,16 +25600,12 @@ def _metric_samples(
     """
     samples: List[Dict[str, object]] = []
     for row in group_rows:
-        value = row.get(metric)
-        if (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(float(value))
-        ):
+        value = _finite_float(row.get(metric))
+        if value is not None:
             samples.append({
                 "seed": row.get("seed"),
                 "run": row.get("run"),
-                "value": float(value),
+                "value": value,
             })
     return samples
 
@@ -25623,7 +25627,13 @@ def _collapse_seed_samples(
     unseeded: List[Dict[str, object]] = []
 
     for sample in samples:
+        if not isinstance(sample, dict):
+            continue
         seed = sample.get("seed")
+        # 非有限/超大整数值无法参与均值与方差；提前跳过而不是让
+        # 单个损坏样本在 float() 处炸掉整份聚合报告。
+        if _finite_float(sample.get("value")) is None:
+            continue
         if seed is None:
             unseeded.append(sample)
             continue
@@ -25636,22 +25646,22 @@ def _collapse_seed_samples(
     collapsed: List[Dict[str, object]] = []
     for key in order:
         group = grouped[key]
+        values = [
+            float(_finite_float(sample.get("value")))
+            for sample in group
+        ]
         collapsed.append({
             "seed": group[0].get("seed"),
             "run": ", ".join(
                 str(sample.get("run")) for sample in group
             ),
-            "value": _mean(
-                [float(sample["value"]) for sample in group]
-            ),
+            "value": _mean(values),
             "n_runs": len(group),
             # 同一 seed 的复制运行若给出不同值，说明它们并非
             # 逐位相同的确定性复制；均值折叠可以避免虚增 n，
             # 但必须把这份差异显式记录，不能悄悄抹平。
             "within_seed_sd": (
-                _sample_std(
-                    [float(sample["value"]) for sample in group]
-                )
+                _sample_std(values)
                 if len(group) > 1
                 else None
             ),
@@ -26928,10 +26938,11 @@ def _cell_seed_values(
         if seed is None:
             complete = False
             continue
-        mapping[_stable_factor_key(seed)] = (
-            seed,
-            float(sample["value"]),
-        )
+        value = _finite_float(sample.get("value"))
+        if value is None:
+            complete = False
+            continue
+        mapping[_stable_factor_key(seed)] = (seed, value)
     return mapping, complete, duplicate_seeds
 
 
@@ -57457,12 +57468,8 @@ def baseline_tuning_axis_candidates_error(
             return f"{flag} 的每个候选必须是正整数"
         return None
     for value in values:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) < 0.0
-        ):
+        numeric = _finite_float(value)
+        if numeric is None or numeric < 0.0:
             return f"{flag} 的每个候选必须是有限非负数"
     return None
 
@@ -57669,12 +57676,7 @@ def analyze_baseline_tuning(
         protocol = row.get("protocol")
         if not isinstance(protocol, dict):
             return None
-        value = protocol.get("lr")
-        if isinstance(value, (int, float)) and not isinstance(
-            value, bool
-        ):
-            return float(value)
-        return None
+        return _finite_float(protocol.get("lr"))
 
     candidates: List[Dict[str, object]] = []
     seed_alignment = report["seed_alignment"]
@@ -57692,15 +57694,18 @@ def analyze_baseline_tuning(
 
     for lr in lrs:
         lr_rows = [
-            row for row in rows if _row_lr(row) == float(lr)
+            row for row in rows if _row_lr(row) == _finite_float(lr)
         ]
-        values = [
-            float(row[metric])
-            for row in lr_rows
-            if isinstance(row.get(metric), (int, float))
-            and not isinstance(row.get(metric), bool)
-            and math.isfinite(float(row[metric]))
-        ]
+        values: List[float] = []
+        seed_metric: Dict[int, float] = {}
+        for row in lr_rows:
+            value = _finite_float(row.get(metric))
+            if value is None:
+                continue
+            values.append(value)
+            seed = row.get("seed")
+            if isinstance(seed, int) and not isinstance(seed, bool):
+                seed_metric[int(seed)] = value
         mean = _mean(values)
 
         seed_values: List[int] = []
@@ -57732,15 +57737,7 @@ def analyze_baseline_tuning(
             "seeds": unique_seeds,
             # 按种子对齐的指标值：调参并列判定必须利用配对
             # 差值（std 不是均值差的标准误，且忽略配对）。
-            "seed_metric": {
-                int(row["seed"]): float(row[metric])
-                for row in lr_rows
-                if isinstance(row.get("seed"), int)
-                and not isinstance(row.get("seed"), bool)
-                and isinstance(row.get(metric), (int, float))
-                and not isinstance(row.get(metric), bool)
-                and math.isfinite(float(row[metric]))
-            },
+            "seed_metric": seed_metric,
         }
         if len(values) < len(lr_rows):
             report["issues"].append(
@@ -58024,28 +58021,31 @@ def analyze_baseline_tuning(
 
 def _axis_value_equal(left: object, right: object) -> bool:
     """轴取值比较：浮点按相对误差比较，其余按等值比较。"""
-    if (
-        isinstance(left, (int, float))
-        and isinstance(right, (int, float))
-        and not isinstance(left, bool)
-        and not isinstance(right, bool)
-    ):
+    left_number = _finite_float(left)
+    right_number = _finite_float(right)
+    if left_number is not None and right_number is not None:
         return math.isclose(
-            float(left),
-            float(right),
+            left_number,
+            right_number,
             rel_tol=1e-9,
             abs_tol=1e-12,
         )
+    # 超出 float 范围的整数仍可精确相等比较；不能因为无法转成
+    # float 就把两个完全相同的合法 JSON 大整数判成不一致。
     return left == right
 
 
-def _axis_value_sort_key(value: object) -> Tuple[int, float, str]:
+def _axis_value_sort_key(value: object) -> Tuple[int, object, str]:
     """轴取值的排序键：数值升序在前，其余按文本。"""
-    if (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-    ):
-        return (0, float(value), "")
+    if isinstance(value, bool):
+        return (1, 0.0, str(value))
+    if isinstance(value, int):
+        # 整数保留原值：与 float 可直接比较，且不会在超大整数
+        # 上溢出；同一轴内混合 int/float 时仍按数值大小排序。
+        return (0, value, "")
+    number = _finite_float(value)
+    if number is not None:
+        return (0, number, "")
     return (1, 0.0, str(value))
 
 
@@ -58164,11 +58164,10 @@ def analyze_baseline_tuning_axes(
                 if _axis_value_equal(observed, value)
             ]
             metric_values = [
-                float(row[metric])
+                number
                 for row in value_rows
-                if isinstance(row.get(metric), (int, float))
-                and not isinstance(row.get(metric), bool)
-                and math.isfinite(float(row[metric]))
+                for number in [_finite_float(row.get(metric))]
+                if number is not None
             ]
             seed_values: List[int] = []
             for row in value_rows:
@@ -58895,28 +58894,21 @@ def load_baseline_tuning(path: Path) -> Dict[str, object]:
         raise ValueError(f"{path} 缺少 metric 字段")
     winner = payload.get("winner")
     winner_lr = (
-        winner.get("lr") if isinstance(winner, dict) else None
+        _finite_float(winner.get("lr"))
+        if isinstance(winner, dict)
+        else None
     )
-    if (
-        isinstance(winner_lr, bool)
-        or not isinstance(winner_lr, (int, float))
-        or not math.isfinite(float(winner_lr))
-        or float(winner_lr) <= 0.0
-    ):
+    if winner_lr is None or winner_lr <= 0.0:
         raise ValueError(
             f"{path} 没有有效 winner（winner.lr 必须是有限"
             "正数）；调参失败的报告不能作为基线来源"
         )
     winner_metric = (
-        winner.get("metric_mean")
+        _finite_float(winner.get("metric_mean"))
         if isinstance(winner, dict)
         else None
     )
-    if (
-        isinstance(winner_metric, bool)
-        or not isinstance(winner_metric, (int, float))
-        or not math.isfinite(float(winner_metric))
-    ):
+    if winner_metric is None:
         raise ValueError(
             f"{path} 的 winner 没有可用指标均值（必须是"
             "有限数值），不能作为基线来源"

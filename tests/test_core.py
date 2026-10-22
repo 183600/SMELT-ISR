@@ -4046,6 +4046,93 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 experiment.load_baseline_tuning(path)
 
+    def test_baseline_tuning_rejects_out_of_float_range_lr(self):
+        base = {
+            "comparison_family": "baseline_tuning",
+            "mode": "dense",
+            "metric": "val_loss",
+            # JSON 允许任意大整数；float(10**400) 会溢出。
+            "winner": {"lr": 10**400, "metric_mean": 1.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning.json"
+            path.write_text(json.dumps(base), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                experiment.load_baseline_tuning(path)
+            base["winner"] = {
+                "lr": 1e-3,
+                "metric_mean": 10**400,
+            }
+            path.write_text(
+                json.dumps(base), encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                experiment.load_baseline_tuning(path)
+
+    def test_analysis_helpers_tolerate_out_of_float_range_numbers(self):
+        huge = 10**400
+        self.assertEqual(
+            experiment._metric_samples(
+                [{"seed": 1, "run": "r", "val_loss": huge}],
+                "val_loss",
+            ),
+            [],
+        )
+        self.assertEqual(
+            experiment._collapse_seed_samples(
+                [{"seed": 1, "run": "r", "value": huge}]
+            ),
+            [],
+        )
+        mapping, _complete, duplicates = (
+            experiment._cell_seed_values(
+                {
+                    "samples": {
+                        "val_loss": [
+                            {"seed": 1, "value": huge}
+                        ]
+                    }
+                },
+                "val_loss",
+            )
+        )
+        self.assertEqual(mapping, {})
+        self.assertEqual(duplicates, [])
+        self.assertIsNone(experiment._mean([huge]))
+        self.assertIsNone(experiment._median([huge, 1.0]))
+        self.assertIsNone(
+            experiment._sample_std([huge, 1.0, 2.0])
+        )
+        self.assertIsNone(
+            experiment._window_per_token_loss({
+                "tokens": huge,
+                "loss_sum": 1.0,
+            })
+        )
+        self.assertIsNone(
+            experiment._window_accuracy({
+                "tokens": huge,
+                "correct": 1.0,
+            })
+        )
+        self.assertEqual(
+            experiment._clean_window_differences({
+                1: [huge, 1.0],
+                "bad-key": [1.0],
+            }),
+            {},
+        )
+        # 排序/比较不能因为无法转成 float 而崩溃；相同大整数
+        # 仍必须判为相等。
+        experiment._factor_sort_rank(huge)
+        self.assertTrue(
+            experiment._axis_value_equal(huge, huge)
+        )
+        self.assertFalse(
+            experiment._axis_value_equal(huge, huge + 1)
+        )
+        experiment._axis_value_sort_key(huge)
+
     def test_paper_protocol_keeps_undisclosed_warmup_defaults(self):
         previous = sys.argv
         sys.argv = ["experiment.py", "--paper-protocol"]
