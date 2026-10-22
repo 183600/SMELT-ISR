@@ -2766,6 +2766,30 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(len(summary["entries"]), 1)
 
+    def test_fragility_summary_accepts_factorial_effect_labels(self):
+        effect = {
+            "design": "A vs local_base",
+            "effect_name": "merge_main",
+            "significant": True,
+            "fragility": {
+                "available": True,
+                "verdict": "stable",
+                "n": 5,
+                "n_positive": 5,
+                "n_negative": 0,
+                "alpha": 0.05,
+            },
+        }
+        summary = experiment._fragility_summary([effect])
+        self.assertEqual(len(summary["entries"]), 1)
+        self.assertEqual(
+            summary["entries"][0]["baseline"],
+            "A vs local_base",
+        )
+        self.assertEqual(
+            summary["entries"][0]["variant"], "merge_main"
+        )
+
     def test_fragility_does_not_claim_nonsignificant_holm_result(self):
         first = {
             "baseline": "b",

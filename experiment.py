@@ -23944,26 +23944,38 @@ def _fragility_summary(
             continue
         if not fragility.get("available"):
             continue
+        # 单因子/直接对比用 baseline→variant；全因子消融的
+        # 主效应/交互没有这两个字段，用 design + effect_name
+        # 作为可读身份，不能把它们汇总成 None→None。
+        baseline = contrast.get("baseline")
+        variant = contrast.get("variant")
+        factor = contrast.get("factor")
+        design = contrast.get("design")
+        effect_name = contrast.get("effect_name")
+        if baseline is None and variant is None:
+            baseline = design or effect_name
+            variant = effect_name or baseline
+        if factor is None:
+            factor = effect_name or "effect"
         # 同一个对比可能同时出现在单因子对比与
         # --compare-baseline 直接对比里（方向也可能相反，
         # 例如 local_base→A 与 A→local_base）；脆弱性结论
         # 相同，不能因此重复计数或重复打印。按无序的对比
         # 双方 + 因子去重。
         key = (
-            tuple(sorted((
-                str(contrast.get("baseline")),
-                str(contrast.get("variant")),
-            ))),
-            str(contrast.get("factor")),
+            tuple(sorted((str(baseline), str(variant)))),
+            str(factor),
         )
         if key in seen:
             continue
         seen.add(key)
         entries.append({
             "family": label,
-            "baseline": contrast.get("baseline"),
-            "variant": contrast.get("variant"),
-            "factor": contrast.get("factor"),
+            "baseline": baseline,
+            "variant": variant,
+            "factor": factor,
+            "design": design,
+            "effect_name": effect_name,
             "verdict": fragility.get("verdict"),
             "significant": bool(contrast.get("significant")),
             "fragility_index": fragility.get(
@@ -34754,8 +34766,20 @@ def print_comparison_analysis(
     )
 
     higher_is_better = metric_higher_is_better(metric)
+    # 顶层汇总必须覆盖全因子消融的主效应/交互：它们已经各自
+    # 附带 fragility，遗漏会让报告顶层只看到两两对比，而把
+    # 消融中由少数种子驱动的显著效应藏起来。
+    factorial_fragility: List[Dict[str, object]] = []
+    if isinstance(factorial, dict):
+        effects = factorial.get("effects")
+        if isinstance(effects, list):
+            factorial_fragility = [
+                effect
+                for effect in effects
+                if isinstance(effect, dict)
+            ]
     fragility_summary = _fragility_summary(
-        list(contrasts) + list(reference),
+        list(contrasts) + list(reference) + factorial_fragility,
         label="combined",
     )
 
