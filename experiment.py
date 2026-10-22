@@ -2199,6 +2199,22 @@ class _BlockCheckpoint(torch.autograd.Function):
         return (None,) + arg_grads
 
 
+def _tensor_content_sha256(tensor: torch.Tensor) -> str:
+    """张量内容的稳定 sha256（先转 CPU fp32 连续布局）。"""
+    array = (
+        tensor.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .contiguous()
+    )
+    try:
+        payload = array.numpy().tobytes()
+    except (TypeError, RuntimeError):
+        payload = bytes(
+            array.reshape(-1).view(torch.uint8).tolist()
+        )
+    return hashlib.sha256(payload).hexdigest()
+
+
 class LanguageModel(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -2269,6 +2285,11 @@ class LanguageModel(nn.Module):
         else:
             self.apply(self._init_weights)
 
+        # 初始化指纹在训练前计算，用于同种子跨结构核对：
+        # shared 覆盖所有模式共有的参数，moe/ffn 分别记录
+        # 两条结构分支独有的参数。指纹不进入 state_dict。
+        self.init_fingerprints = self._initialization_fingerprints()
+
     @staticmethod
     def _init_weights(module: nn.Module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -2326,6 +2347,40 @@ class LanguageModel(nn.Module):
                         dtype=weight.dtype,
                     )
                 )
+
+    def _initialization_fingerprints(self) -> Dict[str, object]:
+        """按参数类别计算训练前初始权重的 sha256。"""
+        buckets: Dict[str, List[Tuple[str, str]]] = {
+            "shared": [],
+            "moe": [],
+            "ffn": [],
+        }
+        for name, parameter in self.named_parameters():
+            if ".moe." in name:
+                bucket = "moe"
+            elif ".ffn." in name:
+                bucket = "ffn"
+            else:
+                bucket = "shared"
+            buckets[bucket].append(
+                (name, _tensor_content_sha256(parameter))
+            )
+
+        fingerprints: Dict[str, object] = {
+            "scheme": self.cfg.init_scheme,
+        }
+        for bucket, entries in buckets.items():
+            digest = hashlib.sha256()
+            for name, content_digest in sorted(entries):
+                digest.update(name.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(content_digest.encode("ascii"))
+                digest.update(b"\n")
+            fingerprints[f"{bucket}_sha256"] = (
+                digest.hexdigest() if entries else None
+            )
+            fingerprints[f"{bucket}_tensors"] = len(entries)
+        return fingerprints
 
     def _call(self, fn, *args):
         """
@@ -16836,6 +16891,22 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             config_payload
         )
 
+        # 训练前初始化指纹与首批训练数据指纹：同种子下
+        # 若两者不一致，结构/指标差异就不能全部归因于
+        # 声明因子。旧运行没有这些记录时保持 None。
+        initialization = config_payload.get("initialization")
+        row["init_fingerprints"] = (
+            initialization
+            if isinstance(initialization, dict)
+            else None
+        )
+        training_trace = config_payload.get("training_trace")
+        row["training_trace"] = (
+            training_trace
+            if isinstance(training_trace, dict)
+            else None
+        )
+
         # 可复现性来源：代码指纹与数值环境（来自各运行
         # config.json 的 run_metadata）。跨代码版本或跨
         # Python/torch/CUDA/设备比较时，方法差异无法与实现/
@@ -26230,6 +26301,162 @@ def imbalance_metric_advisory(
     return report
 
 
+def same_seed_randomness_check(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    同种子跨运行核对初始化与首批训练数据是否逐位一致。
+
+    统计比较假设：同一种子下，除声明因子外其余随机性来源
+    相同。若共享初始化、结构分支初始化或首批训练数据指纹
+    不一致，则同种子配对不再成立，显著差异不能归因到声明
+    因子。旧运行缺指纹时只报告「无法核对」，不伪造一致。
+    """
+    groups: Dict[int, List[Dict[str, object]]] = {}
+    for row in rows:
+        if row.get("deterministic"):
+            continue
+        mode = str(row.get("mode") or "")
+        if mode == "ngram":
+            continue
+        seed = row.get("seed")
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+        ):
+            continue
+        groups.setdefault(seed, []).append(row)
+
+    category_fields = (
+        ("shared", "共享参数"),
+        ("moe", "MoE 独有参数"),
+        ("ffn", "稠密 FFN 独有参数"),
+    )
+    confounds: List[Dict[str, object]] = []
+    unverified: List[str] = []
+    seed_groups: List[Dict[str, object]] = []
+    checked_groups = 0
+
+    for seed in sorted(groups):
+        entries = groups[seed]
+        if len(entries) < 2:
+            continue
+        checked_groups += 1
+        group_confounds: List[Dict[str, object]] = []
+        group_unverified: List[str] = []
+
+        initializations = []
+        for row in entries:
+            init = row.get("init_fingerprints")
+            if isinstance(init, dict):
+                initializations.append((row, init))
+        if len(initializations) < 2:
+            group_unverified.append(
+                "种子 " + str(seed) + " 的运行缺少初始化指纹"
+            )
+        else:
+            schemes = sorted({
+                str(init.get("scheme"))
+                for _, init in initializations
+                if init.get("scheme") is not None
+            })
+            if len(schemes) > 1:
+                group_confounds.append({
+                    "type": "initialization_scheme",
+                    "seed": seed,
+                    "values": {
+                        str(row.get("run")): str(
+                            init.get("scheme")
+                        )
+                        for row, init in initializations
+                    },
+                    "modes": sorted({
+                        str(row.get("mode"))
+                        for row, _ in initializations
+                    }),
+                })
+            for category, label in category_fields:
+                key = f"{category}_sha256"
+                recorded = [
+                    (
+                        str(row.get("run")),
+                        str(row.get("mode")),
+                        str(init.get(key)),
+                    )
+                    for row, init in initializations
+                    if init.get(key) is not None
+                ]
+                if len(recorded) < 2:
+                    continue
+                distinct = {digest for _, _, digest in recorded}
+                if len(distinct) <= 1:
+                    continue
+                group_confounds.append({
+                    "type": "initialization",
+                    "category": category,
+                    "label": label,
+                    "seed": seed,
+                    "values": {
+                        run: digest
+                        for run, _, digest in recorded
+                    },
+                    "modes": sorted({
+                        mode for _, mode, _ in recorded
+                    }),
+                })
+
+        traces = []
+        for row in entries:
+            trace = row.get("training_trace")
+            if isinstance(trace, dict) and trace.get(
+                "sha256"
+            ) is not None:
+                traces.append((row, trace))
+        if len(traces) < 2:
+            group_unverified.append(
+                "种子 " + str(seed) + " 的运行缺少首批训练数据指纹"
+            )
+        else:
+            distinct = {
+                str(trace.get("sha256"))
+                for _, trace in traces
+            }
+            if len(distinct) > 1:
+                group_confounds.append({
+                    "type": "training_batch",
+                    "seed": seed,
+                    "values": {
+                        str(row.get("run")): str(
+                            trace.get("sha256")
+                        )
+                        for row, trace in traces
+                    },
+                    "modes": sorted({
+                        str(row.get("mode"))
+                        for row, _ in traces
+                    }),
+                })
+
+        confounds.extend(group_confounds)
+        unverified.extend(group_unverified)
+        seed_groups.append({
+            "seed": seed,
+            "runs": [
+                str(row.get("run")) for row in entries
+            ],
+            "confounds": len(group_confounds),
+            "unverified": group_unverified,
+        })
+
+    return {
+        "ok": not confounds,
+        "groups_checked": checked_groups,
+        "seed_groups": seed_groups,
+        "confounds": confounds,
+        "unverified": unverified,
+    }
+
+
 def annotate_factorial_confounds(
     factorial: Dict[str, object],
     controlled: Dict[str, object],
@@ -26295,6 +26522,35 @@ def annotate_factorial_confounds(
         factorial.setdefault("advisories", []).append(
             "消融单元之间存在结构设置混杂：主效应/交互不能"
             "归因到待验证设计"
+        )
+
+    randomness_confounds = coverage.get(
+        "randomness_confounds"
+    ) or []
+    if randomness_confounds:
+        affected_modes = set()
+        for confound in randomness_confounds:
+            affected_modes.update(
+                str(mode)
+                for mode in (confound.get("modes") or [])
+            )
+        for effect in factorial.get("effects", []):
+            involved = {
+                "local_base",
+                str(effect.get("delayed_mode")),
+            }
+            if not involved & affected_modes:
+                continue
+            effect["randomness_confounded"] = True
+            if effect.get("claim") in positive_claims | {
+                "unverified_controls",
+                "confounded",
+                "compute_confounded",
+            }:
+                effect["claim"] = "randomness_confounded"
+        factorial.setdefault("advisories", []).append(
+            "同种子运行的初始化或首批训练数据不同：同种子配对"
+            "假设不成立，主效应/交互不能归因到声明因子"
         )
 
     compute_confounds = {
@@ -26584,6 +26840,10 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append("消融结构设置混杂")
     if effect.get("compute_confounded"):
         qualifiers.append("计算量未对齐")
+    if effect.get("randomness_confounded"):
+        qualifiers.append(
+            "同种子初始化/训练数据不一致"
+        )
     if effect.get("duplicate_seeds"):
         qualifiers.append("存在重复随机种子（已折叠）")
     if not effect.get("complete_seed_records", True):
@@ -26619,6 +26879,9 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
             ),
             "compute_confounded": (
                 "显著但计算量不匹配，需等计算量复核"
+            ),
+            "randomness_confounded": (
+                "显著但同种子随机性未对齐，不能归因"
             ),
         }.get(str(effect.get("claim")), "显著")
     else:
@@ -27016,6 +27279,13 @@ def print_comparison_analysis(
         allow_partial=allow_partial_ablation,
     )
     balance_scale = balance_strength_report(rows)
+    randomness = same_seed_randomness_check(rows)
+    coverage["randomness_confounds"] = randomness[
+        "confounds"
+    ]
+    coverage["randomness_unverified"] = randomness[
+        "unverified"
+    ]
     factorial = factorial_effects(
         aggregates,
         group_keys,
@@ -28379,8 +28649,51 @@ def print_comparison_analysis(
             print(f"  [warn] {message}")
     for advisory in coverage["advisories"]:
         print(f"  [note] {advisory}")
+    print()
+    print(
+        "[randomness] 同种子随机性核对"
+        "（初始化指纹 / 首批训练数据指纹）"
+    )
+    if randomness["groups_checked"] == 0:
+        print(
+            "  [note] 没有同种子的非确定性运行可核对"
+            "（至少需要同一 seed 的 2 次运行）"
+        )
+    elif randomness["confounds"]:
+        for confound in randomness["confounds"]:
+            if confound["type"] == "training_batch":
+                detail = "首批训练数据顺序不同"
+            elif confound["type"] == "initialization_scheme":
+                detail = "初始化方案不同"
+            else:
+                detail = (
+                    str(confound.get("label")) + "初始化不同"
+                )
+            values = ", ".join(
+                f"{run}={_format_factor_value(value)}"
+                for run, value in confound[
+                    "values"
+                ].items()
+            )
+            print(
+                "  [confounded] 种子 "
+                f"{confound['seed']}：{detail}"
+                f"（{', '.join(confound['modes'])}）"
+            )
+            print(f"    指纹: {values[:240]}")
+        print(
+            "  同种子配对假设不成立：以上差异不是声明因子的"
+            "效应，相关主效应/交互不能归因"
+        )
+    else:
+        print(
+            f"  OK：{randomness['groups_checked']} 个种子分组"
+            "的初始化与首批训练数据指纹一致"
+        )
+    for message in randomness["unverified"]:
+        print(f"  [warn] {message}：无法确认同种子随机性对齐")
+
     # 「全因子齐全」只在两个轴都进入对比因子、且已覆盖格子数
-    # 等于预期全因子格数时才成立：只跑 balance_coef 一个轴
     # （或只跑部分组合）时不能打印全因子 OK，否则会把
     # 「局部覆盖」冒充成「各创新点各自有用」的证据。
     full_factorial = (
@@ -28407,6 +28720,7 @@ def print_comparison_analysis(
         and not coverage["missing_cells"]
         and not coverage["low_replicate_cells"]
         and not coverage.get("structural_confounds")
+        and not randomness["confounds"]
         and compute_aligned
     ):
         aligned_text = (
@@ -28417,6 +28731,15 @@ def print_comparison_analysis(
         print(
             f"  OK：{len(expected_cells) // 2}×2 全因子组合齐全"
             f"、种子数达标且{aligned_text}"
+        )
+    elif (
+        full_factorial
+        and randomness["confounds"]
+    ):
+        print(
+            f"  [warn] {len(expected_cells) // 2}×2 组合齐全，"
+            "但同种子初始化/训练数据指纹不一致："
+            "主效应不能按同种子配对归因"
         )
     elif (
         full_factorial
@@ -29608,6 +29931,42 @@ def _json_safe(value):
     return value
 
 
+def training_batch_fingerprint(
+    dataset: ByteDataset,
+    seed: int,
+    batch_size: int,
+    batches: int = 2,
+) -> Dict[str, object]:
+    """
+    用独立 CPU 随机流复现训练批采样，记录前若干批的内容指纹。
+
+    该指纹只读数据、不改变训练 RNG；同种子运行若协议完全
+    一致，指纹必须逐位相同，否则说明数据顺序/批次组成已经
+    成为未声明变量。
+    """
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    digest = hashlib.sha256()
+    completed = 0
+    for batch_index in range(batches):
+        inputs, targets = dataset.batch(
+            "train",
+            batch_size,
+            generator,
+            torch.device("cpu"),
+        )
+        digest.update(f"batch={batch_index}".encode("ascii"))
+        digest.update(_tensor_content_sha256(inputs).encode("ascii"))
+        digest.update(_tensor_content_sha256(targets).encode("ascii"))
+        completed += 1
+    return {
+        "seed": int(seed),
+        "batch_size": int(batch_size),
+        "batches": completed,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def write_run_config(
     out_dir: Path,
     cfg: Config,
@@ -29620,6 +29979,7 @@ def write_run_config(
     baseline_tuning: Optional[Dict[str, object]] = None,
     data_protocol_check: Optional[Dict[str, object]] = None,
     dataset: Optional[ByteDataset] = None,
+    init_fingerprints: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     写出 config.json：结构配置、完整超参数、参数量、数据指纹、
@@ -29635,6 +29995,16 @@ def write_run_config(
         # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
         "comparison_protocol": build_comparison_protocol(cfg, args),
         "n_params": n_params,
+        "initialization": init_fingerprints,
+        "training_trace": (
+            training_batch_fingerprint(
+                dataset,
+                int(args.seed),
+                int(args.batch_size),
+            )
+            if dataset is not None
+            else None
+        ),
         "hypothesis": args.hypothesis,
         "research_question": args.rq,
         # 假设里提到的判定指标（规范化名字）：单次运行的假设
@@ -30704,6 +31074,14 @@ def run_self_test():
             named_moe_state[key],
             named_dense_state[key],
         ), f"name_hash 初始化在共享参数 {key} 上未对齐"
+    assert (
+        named_moe.init_fingerprints["shared_sha256"]
+        == named_dense.init_fingerprints["shared_sha256"]
+    )
+    assert (
+        named_moe.init_fingerprints["moe_sha256"]
+        != named_dense.init_fingerprints["moe_sha256"]
+    )
 
     set_seed(123)
     ordered_moe = LanguageModel(
@@ -30735,6 +31113,117 @@ def run_self_test():
         "module_order 下 MoE 与 dense 的共享层初始化应当不同"
         "（自测用于证明该历史方案确实存在初始化混杂）"
     )
+    assert (
+        ordered_moe.init_fingerprints["shared_sha256"]
+        != ordered_dense.init_fingerprints["shared_sha256"]
+    )
+
+    # 同种子随机性核对：初始化或训练数据指纹不一致时必须
+    # 判为混杂；跨种子差异不能被误报成同种子混杂；旧运行
+    # 缺指纹时只能报告无法核对。
+    _trace = {
+        "seed": 123,
+        "batch_size": 2,
+        "batches": 2,
+        "sha256": "batch-a",
+    }
+    _rows_ok = [
+        {
+            "run": "r1",
+            "mode": "A",
+            "seed": 123,
+            "init_fingerprints": dict(
+                named_moe.init_fingerprints
+            ),
+            "training_trace": dict(_trace),
+        },
+        {
+            "run": "r2",
+            "mode": "B",
+            "seed": 123,
+            "init_fingerprints": dict(
+                named_moe.init_fingerprints
+            ),
+            "training_trace": dict(_trace),
+        },
+    ]
+    _randomness_ok = same_seed_randomness_check(_rows_ok)
+    assert _randomness_ok["ok"], _randomness_ok
+    assert _randomness_ok["groups_checked"] == 1
+
+    _rows_batch = [dict(row) for row in _rows_ok]
+    _rows_batch[1] = dict(_rows_batch[1])
+    _rows_batch[1]["training_trace"] = {
+        **_trace,
+        "sha256": "batch-b",
+    }
+    _batch_confound = same_seed_randomness_check(_rows_batch)
+    assert not _batch_confound["ok"]
+    assert any(
+        item["type"] == "training_batch"
+        for item in _batch_confound["confounds"]
+    )
+
+    _rows_other_seed = [dict(row) for row in _rows_batch]
+    _rows_other_seed[1] = dict(_rows_other_seed[1])
+    _rows_other_seed[1]["seed"] = 124
+    _seed_split = same_seed_randomness_check(
+        _rows_other_seed
+    )
+    assert _seed_split["ok"], _seed_split
+
+    _rows_unverified = [
+        {
+            "run": "old-a",
+            "mode": "A",
+            "seed": 7,
+            "init_fingerprints": None,
+            "training_trace": None,
+        },
+        {
+            "run": "old-b",
+            "mode": "B",
+            "seed": 7,
+            "init_fingerprints": None,
+            "training_trace": None,
+        },
+    ]
+    _randomness_unverified = same_seed_randomness_check(
+        _rows_unverified
+    )
+    assert _randomness_unverified["ok"]
+    assert _randomness_unverified["unverified"]
+
+    # 首批训练数据指纹：同种子必须逐位一致，换种子应改变。
+    class _BatchProbe:
+        @staticmethod
+        def batch(split, batch_size, generator, device):
+            inputs = torch.randint(
+                0,
+                256,
+                (batch_size, 4),
+                generator=generator,
+            )
+            targets = torch.randint(
+                0,
+                256,
+                (batch_size, 4),
+                generator=generator,
+            )
+            return inputs, targets
+
+    _trace_a = training_batch_fingerprint(
+        _BatchProbe(), 5, 2
+    )
+    _trace_b = training_batch_fingerprint(
+        _BatchProbe(), 5, 2
+    )
+    _trace_c = training_batch_fingerprint(
+        _BatchProbe(), 6, 2
+    )
+    assert _trace_a["sha256"] == _trace_b["sha256"]
+    assert _trace_a["sha256"] != _trace_c["sha256"]
+    assert _trace_a["batches"] == 2
 
     # dense 基线：无 MoE、无循环——每个 Block 的 attention
     # 与 FFN 恰好各执行一次；smelt 的中间区域则执行两轮。
@@ -39928,6 +40417,49 @@ def run_self_test():
             == "supports_component"
         )
 
+        # 同种子初始化/训练数据不一致时，涉及该种子的方案
+        # 效应必须降级，不能继续声称组件有效。
+        randomness_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                },
+                {
+                    "delayed_mode": "B",
+                    "claim": "supports_component",
+                },
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            randomness_factorial,
+            {"ok": True},
+            {
+                "structural_confounds": [],
+                "compute_parity": [],
+                "randomness_confounds": [
+                    {
+                        "type": "training_batch",
+                        "seed": 7,
+                        "modes": ["A"],
+                    }
+                ],
+            },
+        )
+        assert (
+            randomness_factorial["effects"][0]["claim"]
+            == "randomness_confounded"
+        )
+        assert (
+            randomness_factorial["effects"][1]["claim"]
+            == "supports_component"
+        )
+        assert any(
+            "同种子" in message
+            for message in randomness_factorial["advisories"]
+        )
+
         # 「所有运行都没记录」不等于「这些控制项一致」。显著
         # 效应必须降级为 unverified_controls，且只影响正结论，
         # 不能把原本不显著的效应当成新发现。
@@ -49086,6 +49618,7 @@ def main():
             baseline_tuning=baseline_tuning_record,
             data_protocol_check=data_protocol_check,
             dataset=dataset,
+            init_fingerprints=None,
         )
         if args.resume is None:
             # 全新运行：参考基线记录是 metrics.jsonl 的首行；
@@ -49509,6 +50042,9 @@ def main():
         baseline_tuning=baseline_tuning_record,
         data_protocol_check=data_protocol_check,
         dataset=dataset,
+        init_fingerprints=getattr(
+            model, "init_fingerprints", None
+        ),
     )
 
     metrics_path = out_dir / "metrics.jsonl"
