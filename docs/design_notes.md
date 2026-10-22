@@ -846,6 +846,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `script_sha256`（实验脚本自身的 SHA-256，单文件代码库下即完整
   实验代码的指纹，不依赖 git，覆盖压缩包运行与脏工作区两种
   commit 无法定位代码的场景）。
+- 归档完整性不依赖人工 `sha256sum`：`--write-manifest RUN_DIR`
+  在目录内原子写入 `artifact_manifest.json`，逐文件记录相对
+  路径、大小、SHA-256 与符号链接目标，并附生成时的
+  `script_sha256`、git 状态、Python/torch/NumPy 版本；从
+  `config.json` 摘出 study_id、数据/切分指纹、预注册文件指纹与
+  `comparison_protocol_sha256`。`--verify-manifest RUN_DIR`
+  重新哈希并报告缺失、大小/内容不符、类型或链接目标变化；
+  清单外新增文件默认列为 `untracked`，`--verify-manifest-strict`
+  下判失败。校验拒绝绝对路径、`..` 与符号链接穿越；清单不含
+  自身，避免哈希自指；生成与校验都会报告清单自身的 SHA-256，
+  供外部归档记录锚定。清单是快照，续跑或补测后必须重新生成。
 
 ## 训练入口
 
@@ -880,7 +891,10 @@ token accuracy/macro 与 weighted F1、precision、recall
 `--compare-factors`、`--compare-baseline MODE`、`--compare-metric`、
 `--equivalence-margin REL`（TOST 等价界，相对基线均值，默认
 0.01 = 1%；报告以此区分「无实质差异」与「未发现显著差异」，
-并给出 80% 功效 MDE 与所需种子数）。
+并给出 80% 功效 MDE 与所需种子数）、
+`--write-manifest RUN_DIR` / `--verify-manifest RUN_DIR`
+（归档清单生成与逐项哈希复核；可加
+`--verify-manifest-strict` 把清单外新增文件也判为失败）。
 
 多种子 / 消融套件：`--seeds SEED [SEED ...]`、
 `--suite-modes MODE [MODE ...]`（配合 `--seeds` 做控变量的

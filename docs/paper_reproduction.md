@@ -170,15 +170,20 @@ python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95_b20k \
 
 ## 6. 基线冻结
 
-本次提交同时创建了 `.github/EXPERIMENT_FREEZE` 并把仓库变量
-`EXPERIMENT_FREEZE` 设为 `true`（两者任一都触发工作流的冻结开关）：
+冻结由仓库变量 `EXPERIMENT_FREEZE=true` 或
+`.github/EXPERIMENT_FREEZE` / 根目录 `EXPERIMENT_FREEZE` 文件触发
+（两者任一即可）：
 
 - `Continuous Loop` 只保留排队、清理与归档步骤，不再运行 opencode
   agent，因此不会再自动修改结构参数或提交实验结果；
-- 需要恢复自动循环时，删除 `.github/EXPERIMENT_FREEZE` 并把仓库变量
-  `EXPERIMENT_FREEZE` 设为 `false`（或删除变量）；
-- 恢复前应先确认 `paper_fidelity` 审计仍覆盖新增改动，否则基线会再次
-  漂移出论文口径。
+- 进入冻结时应记录 `git rev-parse HEAD`、`sha256sum experiment.py`
+  与 `git status --porcelain`（必须为空），并把冻结提交写入预注册
+  的 `frozen_commit`；
+- 解除冻结需删除上述文件并把仓库变量设为 `false`（或删除变量）；
+- 恢复自动循环前应先确认 `paper_fidelity` 审计仍覆盖新增改动，
+  否则基线会再次漂移出论文口径。
 
-冻结不是「锁死」：手工提交与运行始终可用，冻结只停用无人值守的
-自动改写。
+当前仓库内没有 `.github/EXPERIMENT_FREEZE`：论文复现的冻结已在
+提交 `918efd4` 解除；仓库变量的当前值需在 GitHub 仓库设置中核对，
+不能只看仓库文件。冻结不是「锁死」：手工提交与运行始终可用，
+冻结只停用无人值守的自动改写。

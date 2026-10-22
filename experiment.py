@@ -20,7 +20,7 @@ import tempfile
 import time
 import weakref
 from dataclasses import asdict, dataclass, fields, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -36850,6 +36850,557 @@ def _json_safe(value):
     return value
 
 
+# ============================================================
+# Artifact manifest / archive verification
+# ============================================================
+
+# 归档清单：把「运行目录里到底有哪些产物、各自是什么内容」
+# 变成可机读、可复核的记录。docs/experiment_protocol.md 要求
+# 归档时给出 SHA-256，但此前只能靠人工 sha256sum，容易漏文件、
+# 也无法区分「清单外的文件」与「清单内被改动」。该清单由
+# --write-manifest 生成，--verify-manifest 逐项复核。
+_ARTIFACT_MANIFEST_NAME = "artifact_manifest.json"
+_ARTIFACT_MANIFEST_SCHEMA = "smelt-isr/artifact-manifest/v1"
+# 防御性上限：清单不应无界膨胀（误把 / 或 home 目录当运行目录
+# 传入时尽早失败，而不是递归整块磁盘）。
+_ARTIFACT_MANIFEST_MAX_ENTRIES = 200_000
+_ARTIFACT_MANIFEST_MAX_DEPTH = 64
+
+
+def _sha256_file(path: Path) -> str:
+    """流式计算文件 SHA-256，避免把大检查点整块读入内存。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(
+            lambda: handle.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_relative_path(value: object) -> Optional[str]:
+    """
+    校验并规范化清单内的相对路径。
+
+    只接受规范化的 POSIX 相对路径：拒绝绝对路径、``..``、
+    空组件、反斜杠（同一字符串在不同平台可能指向不同文件）
+    与非规范写法（``a//b``、``a/./b``）。这些限制保证清单
+    不能把校验引到运行目录之外。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if "\x00" in value or "\\" in value:
+        return None
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        return None
+    if not path.parts:
+        return None
+    if any(part in ("", ".", "..") for part in path.parts):
+        return None
+    normalized = path.as_posix()
+    if normalized != value:
+        return None
+    return normalized
+
+
+def _manifest_file_entry(path: Path, relative: str) -> Dict[str, object]:
+    """
+    生成单个目录项的清单记录。
+
+    符号链接只记录链接目标，不跟随链接哈希目标文件：跟随
+    会让清单依赖运行目录之外的内容，也可能形成链接环。
+    """
+    if path.is_symlink():
+        return {
+            "path": relative,
+            "type": "symlink",
+            "target": os.readlink(path),
+        }
+    stat = path.stat()
+    return {
+        "path": relative,
+        "type": "file",
+        "bytes": int(stat.st_size),
+        "sha256": _sha256_file(path),
+    }
+
+
+def _iter_manifest_entries(
+    root: Path,
+    current: Optional[Path] = None,
+    depth: int = 0,
+    *,
+    with_digest: bool = True,
+) -> List[Dict[str, object]]:
+    """
+    按路径排序遍历 root 下的文件与符号链接。
+
+    ``with_digest=False`` 只收集路径与类型，不读取文件内容：
+    校验时的「清单外新增文件」扫描不需要把已校验过的大检查点
+    再哈希一遍。
+    """
+    if depth > _ARTIFACT_MANIFEST_MAX_DEPTH:
+        raise ValueError(
+            "运行目录层级过深（超过 "
+            f"{_ARTIFACT_MANIFEST_MAX_DEPTH} 层）："
+            "请确认 --write-manifest 指向的是运行目录而不是"
+            "整个文件系统"
+        )
+
+    directory = current if current is not None else root
+    with os.scandir(directory) as iterator:
+        children = sorted(iterator, key=lambda item: item.name)
+
+    entries: List[Dict[str, object]] = []
+    for child in children:
+        child_path = Path(child.path)
+        relative = child_path.relative_to(root).as_posix()
+        # 清单自身不进入清单：否则写入后哈希立刻失效。
+        if current is None and child.name == _ARTIFACT_MANIFEST_NAME:
+            continue
+        if len(entries) > _ARTIFACT_MANIFEST_MAX_ENTRIES:
+            raise ValueError(
+                "运行目录文件数超过清单上限 "
+                f"{_ARTIFACT_MANIFEST_MAX_ENTRIES}："
+                "请缩小 --write-manifest 的范围"
+            )
+        if child.is_symlink():
+            entries.append(_manifest_file_entry(
+                child_path, relative
+            ))
+        elif child.is_dir(follow_symlinks=False):
+            entries.extend(_iter_manifest_entries(
+                root,
+                child_path,
+                depth + 1,
+                with_digest=with_digest,
+            ))
+        elif child.is_file(follow_symlinks=False):
+            if with_digest:
+                entries.append(_manifest_file_entry(
+                    child_path, relative
+                ))
+            else:
+                entries.append({
+                    "path": relative,
+                    "type": "file",
+                })
+        else:
+            # FIFO/套接字/设备文件不能按内容归档，只登记类型，
+            # 让校验能发现它们被替换成普通文件。
+            entries.append({
+                "path": relative,
+                "type": "other",
+            })
+    return entries
+
+
+def _manifest_run_summary(
+    root: Path,
+) -> Optional[Dict[str, object]]:
+    """
+    从 config.json 提取归档时最常用的身份字段。
+
+    这里只做摘要，真正的一致性由 config.json 自身的 SHA-256
+    保证；摘要缺失（目录里没有 config.json）不拒绝生成清单，
+    因为该命令也可用于归档不含训练配置的分析/图表目录。
+    """
+    config_path = root / "config.json"
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+
+    metadata = config.get("run_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    data = config.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    preregistration = config.get("preregistration")
+    if not isinstance(preregistration, dict):
+        preregistration = {}
+
+    return {
+        "study_id": preregistration.get("study_id"),
+        "hypothesis": config.get("hypothesis"),
+        "research_question": config.get("research_question"),
+        "run_started_utc": metadata.get("timestamp_utc"),
+        "script_sha256": metadata.get("script_sha256"),
+        "git_commit": metadata.get("git_commit"),
+        "git_dirty": metadata.get("git_dirty"),
+        "data_sha256": data.get("sha256"),
+        "data_split_sha256": data.get("split_sha256"),
+        "comparison_protocol_sha256": config.get(
+            "comparison_protocol_sha256"
+        ),
+        "preregistration_file_sha256": preregistration.get(
+            "file_sha256"
+        ),
+        "preregistration_frozen_commit": preregistration.get(
+            "frozen_commit"
+        ),
+    }
+
+
+def _manifest_current_provenance() -> Dict[str, object]:
+    """记录生成清单时的代码与解释器版本，供事后核对。"""
+    status = _git_output("status", "--porcelain")
+    return {
+        "script_sha256": _script_sha256(),
+        "git_commit": _git_output("rev-parse", "HEAD"),
+        "git_dirty": (
+            bool(status) if status is not None else None
+        ),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "numpy_version": (
+            getattr(np, "__version__", None)
+            if np is not None
+            else None
+        ),
+        "platform": platform.platform(),
+        "cwd": os.getcwd(),
+        "command": " ".join(sys.argv),
+    }
+
+
+def build_artifact_manifest(root: Path) -> Dict[str, object]:
+    """构造运行目录的内容清单（不写盘）。"""
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError(f"运行目录不存在或不是目录: {root}")
+    files = _iter_manifest_entries(root)
+    return {
+        "schema": _ARTIFACT_MANIFEST_SCHEMA,
+        "generated_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        # 只记录目录名而不是绝对路径：归档解压到别处后清单
+        # 仍然可用，也不会泄露生成机器的目录结构。
+        "root_name": root.name or str(root),
+        "provenance": _manifest_current_provenance(),
+        "run": _manifest_run_summary(root),
+        "files": files,
+    }
+
+
+def write_artifact_manifest(root: Path) -> Path:
+    """
+    在运行目录写入 ``artifact_manifest.json``（原子写入）。
+
+    清单只描述写入时刻的目录状态；训练/评估仍在追加
+    metrics.jsonl 或更新检查点时必须等所有进程结束后重新
+    生成，不能把旧清单当作最终归档凭证。
+    """
+    root = Path(root)
+    payload = build_artifact_manifest(root)
+    path = root / _ARTIFACT_MANIFEST_NAME
+
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(root),
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+        raise
+    return path
+
+
+def verify_artifact_manifest(
+    root: Path,
+    *,
+    strict: bool = False,
+) -> Dict[str, object]:
+    """
+    逐项复核 ``artifact_manifest.json``。
+
+    返回结构化报告而不是只打印：``ok`` 表示完整性通过；
+    ``strict=True`` 时清单外的新增文件也算失败（归档必须与
+    清单逐字一致）。代码/环境与当前进程是否一致单独作为
+    信息字段，不参与完整性判定：在另一台机器上校验归档时
+    环境不同是预期情况，但完整性仍应通过。
+    """
+    root = Path(root)
+    path = root / _ARTIFACT_MANIFEST_NAME
+    result: Dict[str, object] = {
+        "manifest": str(path),
+        "manifest_sha256": None,
+        "schema": None,
+        "strict": bool(strict),
+        "checked": 0,
+        "missing": [],
+        "mismatched": [],
+        "untracked": [],
+        "errors": [],
+        "integrity_ok": False,
+        "code_matches_current": None,
+        "environment_matches_current": None,
+        "ok": False,
+    }
+
+    try:
+        manifest_bytes = path.read_bytes()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        result["errors"].append(f"无法读取清单: {error}")
+        return result
+    result["manifest_sha256"] = hashlib.sha256(
+        manifest_bytes
+    ).hexdigest()
+
+    if not isinstance(payload, dict):
+        result["errors"].append("清单顶层必须是 JSON 对象")
+        return result
+
+    schema = payload.get("schema")
+    result["schema"] = schema
+    if schema != _ARTIFACT_MANIFEST_SCHEMA:
+        result["errors"].append(
+            "清单 schema 不匹配："
+            f"{schema!r}（预期 {_ARTIFACT_MANIFEST_SCHEMA}）"
+        )
+
+    files = payload.get("files")
+    if not isinstance(files, list):
+        result["errors"].append("清单缺少 files 数组")
+        return result
+    if len(files) > _ARTIFACT_MANIFEST_MAX_ENTRIES:
+        result["errors"].append(
+            "清单条目数超过上限 "
+            f"{_ARTIFACT_MANIFEST_MAX_ENTRIES}"
+        )
+        return result
+
+    root_resolved = root.resolve()
+    seen = set()
+    missing: List[str] = []
+    mismatched: List[Dict[str, object]] = []
+
+    def fail(relative, reason, **extra):
+        entry = {"path": relative, "reason": reason}
+        entry.update(extra)
+        mismatched.append(entry)
+
+    for item in files:
+        if not isinstance(item, dict):
+            fail("<invalid>", "entry_not_object")
+            continue
+        relative = _manifest_relative_path(item.get("path"))
+        if relative is None:
+            fail(str(item.get("path")), "unsafe_path")
+            continue
+        if relative in seen:
+            fail(relative, "duplicate_path")
+            continue
+        seen.add(relative)
+
+        target = root / relative
+        # 防御符号链接目录穿越：解析后必须仍位于 root 内。
+        try:
+            target.resolve(strict=False).relative_to(
+                root_resolved
+            )
+        except (OSError, ValueError):
+            fail(relative, "escapes_root")
+            continue
+
+        entry_type = item.get("type", "file")
+        try:
+            exists = target.exists()
+            is_symlink = target.is_symlink()
+        except OSError as error:
+            fail(relative, "stat_error", error=str(error))
+            continue
+        if not exists and not is_symlink:
+            missing.append(relative)
+            continue
+
+        if entry_type == "symlink":
+            if not target.is_symlink():
+                fail(relative, "expected_symlink")
+            elif os.readlink(target) != item.get("target"):
+                fail(
+                    relative,
+                    "symlink_target",
+                    expected=item.get("target"),
+                    actual=os.readlink(target),
+                )
+        elif entry_type == "file":
+            if target.is_symlink() or not target.is_file():
+                fail(relative, "expected_regular_file")
+                continue
+            try:
+                actual_size = target.stat().st_size
+            except OSError as error:
+                fail(relative, "stat_error", error=str(error))
+                continue
+            if actual_size != item.get("bytes"):
+                fail(
+                    relative,
+                    "size",
+                    expected=item.get("bytes"),
+                    actual=int(actual_size),
+                )
+                continue
+            try:
+                actual_sha256 = _sha256_file(target)
+            except OSError as error:
+                fail(relative, "read_error", error=str(error))
+                continue
+            if actual_sha256 != item.get("sha256"):
+                fail(
+                    relative,
+                    "sha256",
+                    expected=item.get("sha256"),
+                    actual=actual_sha256,
+                )
+        elif entry_type == "other":
+            if (
+                target.is_file()
+                or target.is_dir()
+                or target.is_symlink()
+            ):
+                fail(relative, "expected_special_file")
+        else:
+            fail(relative, "unknown_type", value=entry_type)
+
+    try:
+        actual_entries = _iter_manifest_entries(
+            root,
+            with_digest=False,
+        )
+    except (OSError, ValueError) as error:
+        result["errors"].append(
+            f"无法遍历运行目录: {error}"
+        )
+        actual_entries = []
+    actual_paths = {
+        str(entry.get("path"))
+        for entry in actual_entries
+        if isinstance(entry.get("path"), str)
+    }
+    untracked = sorted(actual_paths - seen)
+
+    provenance = payload.get("provenance")
+    if isinstance(provenance, dict):
+        result["code_matches_current"] = (
+            provenance.get("script_sha256")
+            == _script_sha256()
+        )
+        current_environment = {
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "numpy_version": (
+                getattr(np, "__version__", None)
+                if np is not None
+                else None
+            ),
+            "platform": platform.platform(),
+        }
+        result["environment_matches_current"] = {
+            key: provenance.get(key) == value
+            for key, value in current_environment.items()
+        }
+
+    result["checked"] = len(seen)
+    result["missing"] = missing
+    result["mismatched"] = mismatched
+    result["untracked"] = untracked
+    result["integrity_ok"] = not (
+        result["errors"] or missing or mismatched
+    )
+    result["ok"] = bool(result["integrity_ok"]) and not (
+        strict and untracked
+    )
+    return result
+
+
+def manifest_mode_error(args) -> Optional[str]:
+    """
+    校验 --write-manifest / --verify-manifest 的互斥与搭配。
+
+    清单模式是只读的归档工具，不需要 --data/--out/种子，也不能
+    与训练、预注册或对比入口混用：混用时用户很容易以为「生成了
+    清单」而实际又启动了一次训练，或反过来把训练参数静默忽略。
+    """
+    write_mode = getattr(args, "write_manifest", None)
+    verify_mode = getattr(args, "verify_manifest", None)
+    if write_mode is not None and verify_mode is not None:
+        return (
+            "--write-manifest 与 --verify-manifest 不能同时使用："
+            "先写清单，再单独调用校验"
+        )
+    if write_mode is None and verify_mode is None:
+        if getattr(args, "verify_manifest_strict", False):
+            return (
+                "--verify-manifest-strict 必须与 "
+                "--verify-manifest 一起使用"
+            )
+        return None
+
+    conflicts = [
+        flag
+        for flag, active in (
+            ("--compare", getattr(args, "compare", None) is not None),
+            (
+                "--final-test-comparison",
+                getattr(args, "final_test_comparison", None)
+                is not None,
+            ),
+            ("--sanity-only", bool(getattr(args, "sanity_only", False))),
+            (
+                "--statistical-baseline",
+                bool(getattr(args, "statistical_baseline", False)),
+            ),
+            (
+                "--suite-baseline-tuning",
+                bool(getattr(args, "suite_baseline_tuning", False)),
+            ),
+            (
+                "--preregistration",
+                getattr(args, "preregistration", None) is not None,
+            ),
+            ("--data", getattr(args, "data", None) is not None),
+            ("--out", getattr(args, "out", None) is not None),
+            ("--seeds", getattr(args, "seeds", None) is not None),
+            ("--resume", getattr(args, "resume", None) is not None),
+            (
+                "--evaluate-test",
+                bool(getattr(args, "evaluate_test", False)),
+            ),
+        )
+        if active
+    ]
+    if conflicts:
+        return (
+            "清单模式（--write-manifest/--verify-manifest）是"
+            "只读归档工具，不能与以下训练/分析参数同时使用: "
+            + ", ".join(conflicts)
+        )
+    return None
+
+
 def training_batch_fingerprint(
     dataset: ByteDataset,
     seed: int,
@@ -56484,6 +57035,39 @@ def main():
         ),
     )
     parser.add_argument(
+        "--write-manifest",
+        type=str,
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "不训练：为运行/归档目录生成 "
+            "artifact_manifest.json（逐文件 SHA-256、大小、"
+            "符号链接目标，外加生成时的代码与解释器版本）。"
+            "必须在所有训练/评估进程结束后执行，清单才代表"
+            "最终归档内容；--verify-manifest 可逐项复核"
+        ),
+    )
+    parser.add_argument(
+        "--verify-manifest",
+        type=str,
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "不训练：复核目录内的 artifact_manifest.json，"
+            "报告缺失、大小/SHA-256 不符、类型变化与清单外"
+            "新增文件；完整性失败时以非零状态码退出"
+        ),
+    )
+    parser.add_argument(
+        "--verify-manifest-strict",
+        action="store_true",
+        help=(
+            "与 --verify-manifest 配合：清单之外的任何新增"
+            "文件也算失败（严格归档逐字一致）；默认只报告"
+            "untracked，不把后续追加的日志误判为损坏"
+        ),
+    )
+    parser.add_argument(
         "--compare-factors",
         type=str,
         default=",".join(DEFAULT_COMPARISON_FACTORS),
@@ -56832,6 +57416,41 @@ def main():
     # `--allow-eval-content-for-cleaning` 会产生相同的实际数据
     # 口径，却在 config/预注册核对里显示成不同协议。
     _normalize_clean_against_test(args)
+
+    # 归档清单模式同样是只读入口：必须在论文预设、预注册与
+    # 数据加载之前分流，避免 --write-manifest 被当成一次训练。
+    manifest_error = manifest_mode_error(args)
+    if manifest_error is not None:
+        parser.error(manifest_error)
+    if args.write_manifest is not None:
+        try:
+            manifest_path = write_artifact_manifest(
+                Path(args.write_manifest)
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--write-manifest 失败: {error}")
+        print(
+            f"[manifest] 已写入 {manifest_path}"
+            f"（sha256={_sha256_file(manifest_path)}）；"
+            "请把这个清单指纹记入外部归档记录，"
+            "并确认所有训练/评估进程已结束"
+        )
+        return
+    if args.verify_manifest is not None:
+        report = verify_artifact_manifest(
+            Path(args.verify_manifest),
+            strict=bool(args.verify_manifest_strict),
+        )
+        print(
+            json.dumps(
+                _json_safe(report),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if not report["ok"]:
+            raise SystemExit(1)
+        return
 
     # 论文复现预设必须在其它校验与 Config 构造之前落地：
     # --paper-cell 决定模型结构，--paper-protocol 决定训练协议

@@ -212,5 +212,25 @@ python experiment.py --data corpus.txt --out runs/confirm \
 - 预注册文件、最终报告、分析脚本、依赖版本与环境信息；
 - 测试集访问账本与归档校验和（SHA-256）。
 
+所有训练/评估进程结束后，为每个最终运行目录生成可机读清单：
+
+```bash
+python experiment.py --write-manifest runs/final/A
+python experiment.py --verify-manifest runs/final/A --verify-manifest-strict
+```
+
+`artifact_manifest.json` 逐文件记录相对路径、字节数、SHA-256
+与符号链接目标，并从 `config.json` 摘出 `script_sha256`、
+`git_commit`、数据/切分指纹、预注册文件指纹与
+`comparison_protocol_sha256`。校验器拒绝绝对路径、`..` 与
+非规范相对路径；默认把清单外新增文件列为 `untracked`（可能
+是后续日志），`--verify-manifest-strict` 下才算失败。清单是
+写入时刻的快照：`--resume`、补跑 `--evaluate-test` 或追加
+分析报告后必须重新生成；上传/解压到归档目的地后再校验一次，
+才能证明传输过程没有改动内容。`--write-manifest` 会打印清单
+自身的 SHA-256，`--verify-manifest` 也会在报告中返回
+`manifest_sha256`；把该指纹记入外部归档记录/DOI 元数据，
+才能把「清单未被替换」也纳入审计链。
+
 仓库内只保留代码与文档；结果放外部归档，避免仓库体积与
 「清理脚本删除审计记录」的冲突。
