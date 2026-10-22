@@ -4305,6 +4305,26 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             aggregate["duplicate_seeds"], [1, "1"]
         )
 
+    def test_contrast_test_tolerates_unhashable_seed_records(self):
+        samples_a = [
+            {"seed": [1], "value": 1.0},
+            {"seed": [2], "value": 1.1},
+            {"seed": [3], "value": 0.9},
+        ]
+        samples_b = [
+            {"seed": [1], "value": 1.2},
+            {"seed": [2], "value": 1.3},
+            {"seed": [3], "value": 1.1},
+        ]
+        result = experiment._contrast_test(
+            samples_a, samples_b
+        )
+        self.assertEqual(result["test"], "paired_t")
+        self.assertEqual(result["n_pairs"], 3)
+        self.assertEqual(
+            result["paired_seeds"], [[1], [2], [3]]
+        )
+
     def test_time_order_manifest_accepts_all_digit_plain_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "times.txt"

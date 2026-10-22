@@ -26114,13 +26114,15 @@ def _contrast_test(
     直接退回 Welch 并保留每个复制运行作为样本才是错误做法：
     伪重复的运行不是独立重复，换检验不会恢复独立性。
     """
+    # 用稳定键而不是原始值做集合/字典键：损坏但合法的旧 config
+    # 可能把 seed 写成 list/dict，直接 set() 会抛 unhashable。
     seeds_a = [
-        sample["seed"]
+        _stable_factor_key(sample["seed"])
         for sample in samples_a
         if sample["seed"] is not None
     ]
     seeds_b = [
-        sample["seed"]
+        _stable_factor_key(sample["seed"])
         for sample in samples_b
         if sample["seed"] is not None
     ]
@@ -26152,17 +26154,31 @@ def _contrast_test(
     }
 
     by_seed_a = {
-        sample["seed"]: float(sample["value"])
+        _stable_factor_key(sample["seed"]): (
+            sample["seed"],
+            float(sample["value"]),
+        )
         for sample in samples_a
         if sample["seed"] is not None
     }
     by_seed_b = {
-        sample["seed"]: float(sample["value"])
+        _stable_factor_key(sample["seed"]): (
+            sample["seed"],
+            float(sample["value"]),
+        )
         for sample in samples_b
         if sample["seed"] is not None
     }
 
-    common_seeds = sorted(set(by_seed_a) & set(by_seed_b))
+    common_keys = sorted(
+        set(by_seed_a) & set(by_seed_b),
+        key=lambda key: _factor_sort_rank(
+            by_seed_a[key][0]
+        ),
+    )
+    common_seeds = [
+        by_seed_a[key][0] for key in common_keys
+    ]
 
     # 配对要求两侧样本**全部**带种子且种子集合相同：只比较
     # 「有种子的样本」会让无种子样本被静默排除出检验，却仍计入
@@ -26178,8 +26194,8 @@ def _contrast_test(
 
     if paired:
         differences = [
-            by_seed_b[seed] - by_seed_a[seed]
-            for seed in common_seeds
+            by_seed_b[key][1] - by_seed_a[key][1]
+            for key in common_keys
         ]
         result = _paired_t_test(differences)
         result["n_pairs"] = len(common_seeds)
@@ -26249,8 +26265,8 @@ def _contrast_test(
     # 共同种子配对。
     if len(common_seeds) >= _MIN_SEEDS_FOR_STATS:
         differences = [
-            by_seed_b[seed] - by_seed_a[seed]
-            for seed in common_seeds
+            by_seed_b[key][1] - by_seed_a[key][1]
+            for key in common_keys
         ]
         paired_result = _paired_t_test(differences)
         paired_result["n_pairs"] = len(common_seeds)
