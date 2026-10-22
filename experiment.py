@@ -60684,6 +60684,7 @@ def main():
         )
         and len(args.seeds) < _MIN_SEEDS_FOR_STATS
         and not args.allow_underpowered
+        and not getattr(args, "plan_design", False)
     ):
         parser.error(
             "关键套件（--suite-modes / --suite-ablation / "
