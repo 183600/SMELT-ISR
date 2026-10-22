@@ -26468,6 +26468,8 @@ def resolve_preregistered_baseline(
     preregistered: Dict[str, str] = {}
     missing: List[str] = []
     for row in rows:
+        if _is_deterministic_run(row):
+            continue
         run = str(row.get("run"))
         declared = row.get("hypothesis_baseline")
         if isinstance(declared, str) and declared:
@@ -26542,6 +26544,15 @@ def resolve_preregistered_baseline(
             f"预注册的对照基线 {declared} 不在本次对比集合中："
             "本次分析无法给出相对预注册基线的直接对比，请把该"
             "基线的运行一并加入 --compare"
+        )
+        if report["ok"] is True:
+            report["ok"] = None
+    if missing:
+        report["advisories"].append(
+            "以下运行没有预注册对照基线（旧版运行）: "
+            + ", ".join(missing)
+            + "：无法核对这些运行是否与其余运行声明了同一"
+            "分析基线"
         )
         if report["ok"] is True:
             report["ok"] = None
@@ -37325,6 +37336,28 @@ def run_self_test():
         )
         assert margin_inconsistent["ok"] is False
 
+        baseline_partial = resolve_preregistered_baseline(
+            [
+                {
+                    "run": "A_seed1",
+                    "mode": "A",
+                    "hypothesis_baseline": "smelt",
+                },
+                {"run": "old_run", "mode": "smelt"},
+            ],
+            None,
+        )
+        assert baseline_partial["baseline_mode"] == "smelt"
+        assert baseline_partial["auto_selected"] is True
+        assert baseline_partial["runs_without_preregistration"] == [
+            "old_run"
+        ]
+        assert baseline_partial["ok"] is None
+        assert any(
+            "无法核对这些运行" in advisory
+            for advisory in baseline_partial["advisories"]
+        )
+
         # 所需种子数是「sd 点估计」的插件估计：必须登记口径，
         # 并给出 sd 的相对标准误 1/√(2(n-1))（n=3 时约 50%），
         # 否则规划值会被当成精确值。
@@ -41392,7 +41425,10 @@ def run_self_test():
         prereg_report = auto_baseline["baseline_preregistration"]
         assert prereg_report["auto_selected"] is True
         assert prereg_report["baseline_mode"] == "smelt"
-        assert prereg_report["ok"] is True
+        assert prereg_report["ok"] is None
+        assert prereg_report["runs_without_preregistration"] == [
+            "smelt_seed1"
+        ]
         assert prereg_report["advisories"]
         assert (
             auto_baseline["baseline_adequacy"]["baseline_mode"]
