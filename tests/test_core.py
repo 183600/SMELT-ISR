@@ -1843,6 +1843,7 @@ class PreregistrationTests(unittest.TestCase):
         payload = self._payload()
         payload["data"]["cleaning"] = {
             "allow_eval_content_for_cleaning": True,
+            "deduplicate_train_groups": True,
         }
         args = self._args(
             split_policy="contiguous",
@@ -1859,6 +1860,7 @@ class PreregistrationTests(unittest.TestCase):
 
         payload["data"]["cleaning"] = {
             "clean_train_against_test": True,
+            "deduplicate_train_groups": True,
         }
         args = self._args(
             split_policy="contiguous",
@@ -1870,6 +1872,54 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIsNone(
             experiment.preregistration_data_error(
                 args, payload, self._dataset()
+            )
+        )
+
+    def test_data_rejects_cleaning_not_declared_in_preregistration(self):
+        # 未声明 cleaning 等于声明全部关闭；否则看到验证结果后
+        # 临时启用清洗就能改变训练样本集合而绕过预注册核对。
+        payload = self._payload()
+        args = self._args(
+            split_policy="contiguous",
+            group_separator="\n\n",
+            deduplicate_train_groups=True,
+        )
+        error = experiment.preregistration_data_error(
+            args, payload, self._dataset()
+        )
+        self.assertIn("data.cleaning", error)
+
+        # 只声明一个关闭开关也不能让未声明的清洗项静默通过。
+        payload["data"]["cleaning"] = {
+            "deduplicate_train_groups": False,
+        }
+        args = self._args(
+            split_policy="contiguous",
+            group_separator="\n\n",
+            deduplicate_train_groups=False,
+            drop_train_shared_chunks=True,
+        )
+        error = experiment.preregistration_data_error(
+            args, payload, self._dataset()
+        )
+        self.assertIn("drop_train_shared_chunks", error)
+
+        # 全部关闭时，省略 cleaning 的旧预注册文件仍可核对通过。
+        args = self._args(
+            split_policy="contiguous",
+            group_separator="\n\n",
+            deduplicate_train_groups=False,
+            drop_train_shared_chunks=False,
+            clean_train_against_test=False,
+            allow_eval_content_for_cleaning=False,
+            drop_train_corrupt_groups=False,
+            drop_train_corrupt_bytes=False,
+            drop_train_degenerate_groups=False,
+            drop_train_degenerate_runs=False,
+        )
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, self._payload(), self._dataset()
             )
         )
 

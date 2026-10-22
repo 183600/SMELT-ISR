@@ -31299,43 +31299,53 @@ def preregistration_data_error(
             )
 
     cleaning = data.get("cleaning")
-    if isinstance(cleaning, dict):
-        # 两个同义开关按「任一为真即读取 test」归一化核对：
-        # 用户用哪个别名不应改变协议是否一致。
-        declared_alias_values = {
-            bool(cleaning[key])
-            for key in _CLEAN_AGAINST_TEST_ALIASES
-            if key in cleaning
-        }
-        if len(declared_alias_values) > 1:
+    if cleaning is not None and not isinstance(cleaning, dict):
+        return "data.cleaning 必须是对象"
+    # 未声明的清洗开关按默认 False 解释，而不是「不核对」：
+    # 只声明一个 false 开关、却启用其它清洗项，会改变实际参与
+    # 训练/去重的字节范围；预注册文件不能在看到结果后通过
+    # 漏写字段绕过核对。
+    declared_cleaning = (
+        cleaning if isinstance(cleaning, dict) else {}
+    )
+    declared_alias_values = {
+        bool(declared_cleaning[key])
+        for key in _CLEAN_AGAINST_TEST_ALIASES
+        if key in declared_cleaning
+    }
+    if len(declared_alias_values) > 1:
+        return (
+            "预注册 data.cleaning 的两个同义开关取值相反："
+            "clean_train_against_test 与 "
+            "allow_eval_content_for_cleaning"
+        )
+    declared_effective = (
+        next(iter(declared_alias_values))
+        if declared_alias_values
+        else False
+    )
+    actual_effective = _clean_against_test_effective(args)
+    if actual_effective != declared_effective:
+        return (
+            "预注册 data.cleaning."
+            "clean_train_against_test/"
+            "allow_eval_content_for_cleaning="
+            f"{declared_effective} 与当前 {actual_effective} "
+            "不一致：清洗开关会改变实际参与训练/去重的"
+            "数据，不能在看到结果后再改"
+        )
+    for key in _PREREGISTRATION_CLEANING_KEYS:
+        if key in _CLEAN_AGAINST_TEST_ALIASES:
+            continue
+        expected = bool(declared_cleaning.get(key, False))
+        actual = bool(getattr(args, key, False))
+        if actual != expected:
             return (
-                "预注册 data.cleaning 的两个同义开关取值相反："
-                "clean_train_against_test 与 "
-                "allow_eval_content_for_cleaning"
+                f"预注册 data.cleaning.{key}={expected} "
+                f"与当前 {actual} 不一致：清洗开关会改变"
+                "实际参与训练/去重的数据，不能在看到结果后"
+                "再改；未声明的清洗开关按 false 处理"
             )
-        if declared_alias_values:
-            declared_effective = next(iter(declared_alias_values))
-            actual_effective = _clean_against_test_effective(args)
-            if actual_effective != declared_effective:
-                return (
-                    "预注册 data.cleaning."
-                    "clean_train_against_test/"
-                    "allow_eval_content_for_cleaning="
-                    f"{declared_effective} 与当前 {actual_effective} "
-                    "不一致：清洗开关会改变实际参与训练/去重的"
-                    "数据，不能在看到结果后再改"
-                )
-        for key, expected in cleaning.items():
-            if key in _CLEAN_AGAINST_TEST_ALIASES:
-                continue
-            actual = bool(getattr(args, key, False))
-            if actual != bool(expected):
-                return (
-                    f"预注册 data.cleaning.{key}={bool(expected)} "
-                    f"与当前 {actual} 不一致：清洗开关会改变"
-                    "实际参与训练/去重的数据，不能在看到结果后"
-                    "再改"
-                )
 
     for key, attr in (
         ("entity_manifest_sha256", "entity_manifest"),
