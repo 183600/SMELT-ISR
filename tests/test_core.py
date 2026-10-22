@@ -3726,6 +3726,11 @@ class ArtifactManifestTests(unittest.TestCase):
             "a\\b",
             "./a",
             "a/",
+            # Windows 的盘符/UNC 前缀在 POSIX 下不是绝对路径，
+            # 但换到 Windows 后会把 root / path 解析到目录外。
+            "C:/outside",
+            "c:outside",
+            "//server/share",
         ):
             self.assertIsNone(
                 experiment._manifest_relative_path(value),

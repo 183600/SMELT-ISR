@@ -39236,6 +39236,16 @@ def _manifest_relative_path(value: object) -> Optional[str]:
         return None
     if "\x00" in value or "\\" in value:
         return None
+    # Windows 盘符/UNC 前缀在 POSIX 的 PurePosixPath 下不是
+    # 绝对路径，但换到 Windows 上 root / "C:/x" 会直接丢弃
+    # root，把校验引到运行目录之外。清单是跨平台归档格式，
+    # 必须在解析阶段就拒绝这类前缀。
+    if value.startswith("//") or (
+        len(value) >= 2
+        and value[1] == ":"
+        and value[0].isalpha()
+    ):
+        return None
     path = PurePosixPath(value)
     if path.is_absolute():
         return None
