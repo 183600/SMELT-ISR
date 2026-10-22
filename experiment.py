@@ -23070,6 +23070,11 @@ def _mean(values: List[float]) -> Optional[float]:
     numeric = _finite_values(values)
     if not numeric:
         return None
+    # 正常量级走原公式，保持历史结果的逐位一致性；只有直接
+    # 求和溢出/非有限时才退回缩放计算。
+    direct = sum(numeric) / len(numeric)
+    if math.isfinite(direct):
+        return direct
     scale = max(abs(value) for value in numeric)
     if scale == 0.0:
         return 0.0
@@ -23087,7 +23092,10 @@ def _median(values: List[float]) -> Optional[float]:
     middle = len(ordered) // 2
     if len(ordered) % 2 == 1:
         return ordered[middle]
-    # 先各自折半再相加：两个 1e308 直接相加会溢出成 inf。
+    direct = (ordered[middle - 1] + ordered[middle]) / 2.0
+    if math.isfinite(direct):
+        return direct
+    # 两个同号 1e308 直接相加会溢出：各自折半后再相加。
     return ordered[middle - 1] / 2.0 + ordered[middle] / 2.0
 
 
@@ -23096,13 +23104,24 @@ def _sample_std(values: List[float]) -> Optional[float]:
     样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时
     返回 None。
 
-    先把数据按最大绝对值缩放再算方差，避免合法的大浮点数在
-    ``(value - mean) ** 2`` 处抛 OverflowError。正常量级的输入
-    与直接公式结果一致。
+    正常量级先用原公式（保持历史结果一致）；平方溢出时再按
+    最大绝对值缩放计算，避免 ``(value - mean) ** 2`` 抛
+    OverflowError。
     """
     numeric = _finite_values(values)
     if numeric is None or len(numeric) < 2:
         return None
+    try:
+        mean = sum(numeric) / len(numeric)
+        variance = sum(
+            (value - mean) ** 2 for value in numeric
+        ) / (len(numeric) - 1)
+        direct = math.sqrt(max(0.0, variance))
+    except OverflowError:
+        direct = None
+    if direct is not None and math.isfinite(direct):
+        return direct
+
     scale = max(abs(value) for value in numeric)
     if scale == 0.0:
         return 0.0
@@ -23321,12 +23340,14 @@ def _paired_sign_flip_test(
     if values is None:
         return {"test": "invalid_values"}
 
-    # 符号翻转统计量对公共尺度不变：先把差值缩放到 [-1, 1]，
+    # 符号翻转统计量对公共尺度不变：大数值时先缩放到 [-1, 1]，
     # 避免合法的大浮点数在求和/平方时溢出成 inf 或抛
-    # OverflowError。随机化种子仍用原始值，保证结果可复现。
+    # OverflowError。正常量级保持原值，避免改变历史 p 值的最低位
+    # 舍入。随机化种子仍用原始值，保证结果可复现。
     raw_values = values
-    scale = max(abs(value) for value in values)
-    if scale > 0.0:
+    max_abs = max(abs(value) for value in values)
+    scale = max_abs if max_abs > 1.0e150 else 1.0
+    if scale != 1.0:
         values = [value / scale for value in values]
     mean_scaled = sum(values) / n
     mean = mean_scaled * scale
@@ -23987,9 +24008,12 @@ def _window_variance_components(
     # ``** 2`` 抛 OverflowError）。方差占比与自由度对公共尺度
     # 不变；绝对分量在最后再按 scale² 还原，超出 float 范围时
     # 明确返回 None。
-    scale = max(
+    max_abs = max(
         abs(value) for row in matrix for value in row
     )
+    # 正常量级不缩放（scale=1.0），保持历史方差分量的逐位一致；
+    # 只有平方可能溢出的超大输入才归一化。
+    scale = max_abs if max_abs > 1.0e150 else 1.0
     if scale == 0.0:
         scaled_matrix = [
             [0.0 for _ in row] for row in matrix
@@ -25000,20 +25024,40 @@ def _welch_t_test(
             "se": 0.0,
         }
 
-    # Welch-Satterthwaite 自由度用相对方差计算：直接对
-    # (var/n)**2 求值在方差接近 float 上限时会溢出，而公共
-    # 缩放因子在分子分母中会抵消。
-    scale = max(term_a, term_b)
-    scaled_a = term_a / scale
-    scaled_b = term_b / scale
-    denominator = (
-        scaled_a * scaled_a / (n_a - 1)
-        + scaled_b * scaled_b / (n_b - 1)
-    )
-    if denominator <= 0.0 or not math.isfinite(denominator):
-        return {"test": "invalid_values"}
+    # Welch-Satterthwaite 自由度：正常量级沿用历史公式，保持
+    # 逐位一致；只有 (var/n)**2 可能溢出时才改用相对方差计算，
+    # 公共缩放因子在分子分母中会抵消。
+    df = None
+    try:
+        old_denominator = (
+            term_a * term_a / (n_a - 1)
+            + term_b * term_b / (n_b - 1)
+        )
+        if (
+            old_denominator > 0.0
+            and math.isfinite(old_denominator)
+        ):
+            candidate = (
+                se_squared * se_squared / old_denominator
+            )
+            if math.isfinite(candidate):
+                df = candidate
+    except OverflowError:
+        df = None
+    if df is None:
+        scale = max(term_a, term_b)
+        if scale <= 0.0:
+            return {"test": "invalid_values"}
+        scaled_a = term_a / scale
+        scaled_b = term_b / scale
+        denominator = (
+            scaled_a * scaled_a / (n_a - 1)
+            + scaled_b * scaled_b / (n_b - 1)
+        )
+        if denominator <= 0.0 or not math.isfinite(denominator):
+            return {"test": "invalid_values"}
+        df = (scaled_a + scaled_b) ** 2 / denominator
     t = delta / math.sqrt(se_squared)
-    df = (scaled_a + scaled_b) ** 2 / denominator
     return {
         "test": "welch_t",
         "t": t,
