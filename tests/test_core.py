@@ -6614,6 +6614,17 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(contrast["verdict"], "missing_metric")
         json.dumps(contrast, allow_nan=False)
 
+    def test_window_payload_scalar_is_not_iterated(self):
+        # 损坏的旧聚合记录可能把 window_payloads 写成标量；
+        # 逐窗口分析必须按「无逐窗口记录」处理，而不是抛
+        # TypeError 中断整份对比报告。
+        result = experiment._cell_window_paired_analysis(
+            {"window_payloads": 1.0e150},
+            {"window_payloads": []},
+        )
+        self.assertFalse(result["available"])
+        json.dumps(result, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],

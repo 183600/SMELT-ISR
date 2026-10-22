@@ -24262,7 +24262,13 @@ def _cell_window_payloads_by_seed(
     """
     by_seed: Dict[int, Dict[str, object]] = {}
     duplicate_seeds: set = set()
-    for entry in cell.get("window_payloads", []) or []:
+    # window_payloads 可能来自旧版本或手工编辑的聚合记录：只有
+    # list 才是逐窗口条目集合；标量/字典不能直接迭代，否则在
+    # 对比阶段抛 TypeError，整份报告无法生成。
+    raw_payloads = cell.get("window_payloads")
+    if not isinstance(raw_payloads, list):
+        raw_payloads = []
+    for entry in raw_payloads:
         if not isinstance(entry, dict):
             continue
         seed = entry.get("seed")
@@ -24815,6 +24821,10 @@ def _cell_window_paired_analysis(
     可以按窗口配对；跨 seed 汇总时给出每个 seed 的窗口级差异与
     方向一致性，避免把不同 seed 的窗口混成一个假的大样本。
     """
+    if not isinstance(cell_a, dict):
+        cell_a = {}
+    if not isinstance(cell_b, dict):
+        cell_b = {}
     payloads_a, duplicate_a = _cell_window_payloads_by_seed(
         cell_a
     )
