@@ -62,7 +62,7 @@ SMELT（middle 50% 循环两次，`--paper-arch smelt`）：
 
 ## 3. 运行方式
 
-### 3.1 稳定期运行（262 个网格单元任选其一）
+### 3.1 稳定期运行（32 个网格单元任选其一）
 
 ```bash
 python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \

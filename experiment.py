@@ -1413,6 +1413,14 @@ def apply_paper_cli(args, parser=None) -> None:
             fail(
                 "--paper-cell 只支持 base / smelt 两种论文架构"
             )
+        if (
+            args.mode == "B"
+            and _argv_has_flag("--mode")
+        ):
+            fail(
+                "--paper-cell 与显式 --mode B（延迟合并）冲突；"
+                "论文网格只有 base / smelt"
+            )
         try:
             preset = paper_preset(scale, sparsity, arch)
         except ValueError as error:
