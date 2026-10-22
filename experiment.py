@@ -371,8 +371,17 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
         # A / local_base / local_base_k2：Attention 由所有分支
         # 共享（每层一次），MoE 两阶段。
         attention_executions = layers
-        moe_passes = layers + middle
-        router_calls = moe_passes
+        if mode == "A":
+            # A 的第二轮在 k1 个分支上各自路由，因此每个中间
+            # Block 的 Router/MoE 执行 1 + k1 次（local_base*
+            # 第二轮已合并为单分支，仍是 2 次）。
+            moe_passes = (
+                pre + post + middle * (1 + k1)
+            )
+            router_calls = moe_passes
+        else:
+            moe_passes = layers + middle
+            router_calls = moe_passes
         if mode == "A":
             expert_assignments = (
                 top_k * (pre + post) + middle * (k1 + k1 * k2)
@@ -471,6 +480,9 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
                 "smelt": "pre + 2*middle + post",
                 "A": "n_layers (Attention 跨分支共享)",
                 "B": (
+                    "pre + [1 + (middle-1)*k1 + middle*k1] + post"
+                ),
+                "B_early": (
                     "pre + [1 + (middle-1)*k1 + middle*k1] + post"
                 ),
                 "base": "n_layers",
@@ -3736,16 +3748,19 @@ class TransformerBlock(nn.Module):
         # expert_outputs:
         # [batch, time, k1, dim]
         #
-        # 每个分支保留完整残差：x + scale * (gate * expert)。
-        # gate 不能省：top_k=1 时它是选中专家的完整 softmax
-        # 概率（Switch 风格），省掉会让分支残差与已合并路径
-        # 不一致；top_k>1 时 gate 是 top-k 归一化权重。
-        gated_experts = expert_outputs * gates.to(
-            expert_outputs.dtype
-        ).unsqueeze(-1)
+        # 每个分支保留完整残差：x + scale * expert。
+        # gate 只在这里为 k1==1 预乘：单分支最终收缩是恒等，
+        # 不预乘会丢掉 Switch 风格的门控概率。k1>1 时最终
+        # 跨分支收缩已经按同一组 gate 加权，这里再乘会让第一
+        # 轮专家贡献变成 p_i²·expert（门控被应用两次）。
+        branch_experts = expert_outputs
+        if int(k1) == 1:
+            branch_experts = expert_outputs * gates.to(
+                expert_outputs.dtype
+            ).unsqueeze(-1)
         branches = torch.add(
             x.unsqueeze(1),
-            gated_experts.permute(0, 2, 1, 3),
+            branch_experts.permute(0, 2, 1, 3),
             alpha=scale,
         )
 
@@ -3812,11 +3827,14 @@ class TransformerBlock(nn.Module):
             k1,
         )
 
-        # 未合并分支的专家输出必须先乘第一轮门控（top_k=1
-        # 时是选中概率，不是 1），再加完整残差。
-        expert_outputs = expert_outputs * gates.to(
-            expert_outputs.dtype
-        ).unsqueeze(-1)
+        # k1==1 时最终收缩是恒等，必须在这里乘第一轮门控
+        # （top_k=1 时是选中概率，不是 1）；k1>1 时最终收缩
+        # 会按同一组 gate 加权，预乘会让第一轮专家贡献变成
+        # p_i²·expert（门控被应用两次）。
+        if int(k1) == 1:
+            expert_outputs = expert_outputs * gates.to(
+                expert_outputs.dtype
+            ).unsqueeze(-1)
 
         # 残差并入 expert_outputs：dtype 一致时原地完成
         # x + scale * (gate*expert)；dtype 不匹配时用
@@ -4368,10 +4386,11 @@ class LanguageModel(nn.Module):
         branch_attn_bias: Optional[SegmentAttentionMask] = None
         if segment_ids is not None:
             attn_bias = SegmentAttentionMask(segment_ids)
-            if (
-                cfg.mode in ("B", "B_early")
-                and int(cfg.k1) > 1
-            ):
+            if cfg.mode in ("B", "B_early"):
+                # k1==1 时分支仍会把 branch 维并入 batch 维执行
+                # 后续中间 Block；掩码必须同样按 k1 复制，否则
+                # 除第一个中间 Block 外的所有 Block 都会退化为
+                # 跨文档的普通因果注意力。
                 branch_attn_bias = SegmentAttentionMask(
                     segment_ids.repeat_interleave(
                         int(cfg.k1), 0
@@ -5218,7 +5237,14 @@ def audit_entity_manifest(
         raise ValueError(
             "实体清单必须是非空 JSON 数组（按群组序号给 entity_id）"
         )
-    spans = list(_iter_group_spans(buf, group_separator, 0))
+    spans = list(
+        _iter_group_spans(
+            buf,
+            group_separator,
+            0,
+            len(buf),
+        )
+    )
     if len(values) != len(spans):
         raise ValueError(
             "实体清单条目数（"
@@ -5528,8 +5554,11 @@ class ByteDataset:
         # 训练样本集合就会依赖 test，「只解封一次」的协议被绕过；
         # 默认只对照 val 与更早的 train，旧行为必须显式开启并被
         # 记录。未启用任何对照 eval split 的清洗时该开关无效果。
+        # include_test_in_cleaning 与 clean_train_against_test 是
+        # 同义入口；两者任一为真都必须同时驱动清洗范围、校验
+        # 与披露，不能只改 eval_content_access 造成假披露。
         self.clean_train_against_test = bool(
-            clean_train_against_test
+            include_test_in_cleaning
         )
         if self.clean_train_against_test and not (
             deduplicate_train_groups
@@ -7726,12 +7755,18 @@ def _scan_text_integrity(
 
     # 预热：把解码器带到「从 offset 前几个字节开始」的状态。
     # 预热输出（可能包含边界前的字符或无效序列）全部丢弃，
-    # 不计入任何统计。
+    # 不计入任何统计；但解码器可能缓冲着 offset 之前未完成的
+    # 多字节序列。若后续字节把它判为非法，surrogateescape 会
+    # 在第一个当前块里吐出属于 offset 之前的代理码点。必须跳过
+    # 这些前缀代理码点，否则上一段末尾的坏字节会被记到本段
+    #（测试集标签完整性门会因此拒绝一个字节干净的 test）。
+    pre_offset_pending = 0
     if warmup and offset > 0:
         decoder.decode(
             bytes(raw[max(0, offset - 3):offset]),
             final=False,
         )
+        pre_offset_pending = len(decoder.getstate()[0])
 
     replacements = 0
     nul_bytes = 0
@@ -7748,9 +7783,18 @@ def _scan_text_integrity(
         for character in text:
             codepoint = ord(character)
             if 0xDC80 <= codepoint <= 0xDCFF:
+                # 前 pre_offset_pending 个代理码点对应 offset
+                # 之前的未完成序列，不属于本段。一旦出现普通
+                # 字符，说明之前的缓冲已被完整解码，后续代理
+                # 码点都属于本段。
+                if pre_offset_pending > 0:
+                    pre_offset_pending -= 1
+                    continue
                 replacements += 1
-            elif character == "\x00":
-                nul_bytes += 1
+            else:
+                pre_offset_pending = 0
+                if character == "\x00":
+                    nul_bytes += 1
         position = stop
 
     return {
@@ -7923,12 +7967,20 @@ def _plan_train_corruption_cleaning_bytes(
     位置由解码器直接定位。被剔除的字节不进入训练窗口、unigram/
     n-gram 计数或分布审计；仍保留的合法字节继续参与训练。
     """
-    tagged = _invalid_utf8_nul_spans(
-        memoryview(raw),
-        0,
-        train_end,
-        final=(train_end == len(raw)),
-    )
+    # 按整个文件解码，再把落在 train 内的坏字节归入清洗。只
+    # 扫描到 train_end 且 final=False 会漏掉「train 末尾的非法
+    # lead byte」：它需要后继 val/test 字节才能判定是否非法。
+    # 全局扫描还能保留跨 split 的合法多字节字符，不会误删。
+    tagged = [
+        (start, end, kind)
+        for start, end, kind in _invalid_utf8_nul_spans(
+            memoryview(raw),
+            0,
+            len(raw),
+            final=True,
+        )
+        if start < train_end
+    ]
 
     invalid_bytes = sum(
         1
@@ -8530,6 +8582,23 @@ def audit_data_splits(
     leakage_violations: List[str] = []
     evaluation_violations: List[str] = []
 
+    # 无群组语料：一次性按整个文件解码，得到每个非法/NUL 字节
+    # 的绝对位置，再按 split 归属计数。逐 split 预热解码会把
+    # 上一段末尾的未完成序列记到下一段（例如 val 末尾的坏字节
+    # 让字节干净的 test 被标签完整性门拒绝）；全局定位既保留
+    # 跨 split 合法多字节字符，又能把坏字节归到真正包含它的段。
+    # 群组模式仍逐群组扫描，以排除用户声明的分隔符字节。
+    global_integrity_spans: Optional[
+        List[Tuple[int, int, str]]
+    ] = None
+    if dataset.group_separator is None:
+        global_integrity_spans = _invalid_utf8_nul_spans(
+            dataset._raw,
+            0,
+            dataset.num_bytes,
+            final=True,
+        )
+
     for split in split_names:
         tokens = getattr(dataset, split)
 
@@ -8617,42 +8686,42 @@ def audit_data_splits(
                 scan_cache[scan_key] = scan
         scans[split] = scan
         if dataset.group_separator is None:
-            if split == "train" and dataset.train_excluded_spans:
-                # 无群组语料的字节级清洗：被剔除的损坏字节不
-                # 再计入审计统计，只扫描仍参与训练的连续片段。
-                integrity = {
-                    "utf8_replacements": 0,
-                    "nul_bytes": 0,
-                }
-                for span_start, span_end in (
-                    _subtract_byte_intervals(
-                        begin,
-                        end,
-                        dataset.train_excluded_spans,
-                    )
+            # 用全局字节位置归属到 split；train 的清洗区间不再
+            # 计入（模型不会看到这些字节），val/test 不做清洗。
+            integrity = {
+                "utf8_replacements": 0,
+                "nul_bytes": 0,
+            }
+            excluded = _merge_byte_intervals(
+                dataset.train_excluded_spans
+                if split == "train"
+                else []
+            )
+            excluded_index = 0
+            for span_start, _span_end, kind in (
+                global_integrity_spans or []
+            ):
+                if span_start < begin:
+                    continue
+                if span_start >= end:
+                    break
+                while (
+                    excluded_index < len(excluded)
+                    and excluded[excluded_index][1]
+                    <= span_start
                 ):
-                    part = _scan_text_integrity(
-                        dataset._raw,
-                        span_start,
-                        span_end - span_start,
-                        final=(
-                            span_end == dataset.num_bytes
-                        ),
-                        warmup=False,
-                    )
-                    integrity["utf8_replacements"] += part[
-                        "utf8_replacements"
-                    ]
-                    integrity["nul_bytes"] += part[
-                        "nul_bytes"
-                    ]
-            else:
-                integrity = _scan_text_integrity(
-                    dataset._raw,
-                    begin,
-                    end - begin,
-                    final=(end == dataset.num_bytes),
-                )
+                    excluded_index += 1
+                if (
+                    excluded_index < len(excluded)
+                    and excluded[excluded_index][0]
+                    <= span_start
+                    < excluded[excluded_index][1]
+                ):
+                    continue
+                if kind == "invalid_utf8":
+                    integrity["utf8_replacements"] += 1
+                elif kind == "nul":
+                    integrity["nul_bytes"] += 1
         else:
             # 群组分隔符是用户显式声明的数据结构（可能含 NUL 或
             # 非 UTF-8 字节，如 --group-separator '\x00'），不能

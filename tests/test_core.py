@@ -142,6 +142,57 @@ class CoreModelTests(unittest.TestCase):
             1 * (32 // 4),
         )
 
+    def test_delayed_merge_gate_is_applied_once(self):
+        # A 的第一轮分支若先乘 gate，最终跨分支收缩又乘同一组
+        # gate，会让专家贡献变成 p_i²·expert。这里用桩替换 MoE，
+        # 只保留门控/合并路径：正确结果应为 x + Σ p_i·expert_i。
+        cfg = _tiny_config(mode="A", k1=2, k2=2)
+        block = experiment.TransformerBlock(cfg)
+        block.attention_step = (
+            lambda x, scale=None, attn_mask=None: x
+        )
+        block.norm_moe = torch.nn.Identity()
+
+        def unmerged(x, top_k):
+            if x.dim() == 3:
+                experts = torch.tensor(
+                    [[[[2.0, 0.0], [0.0, 4.0]]]]
+                )
+                gates = torch.tensor([[[0.75, 0.25]]])
+                return (
+                    experts,
+                    gates,
+                    None,
+                    torch.zeros(()),
+                )
+            experts = torch.zeros(
+                *x.shape[:-1], 2, x.size(-1)
+            )
+            gates = torch.full((*x.shape[:-1], 2), 0.5)
+            return experts, gates, None, torch.zeros(())
+
+        def merge(
+            expert_outputs,
+            top_weights,
+            out_shape,
+            residual=None,
+            residual_scale=1.0,
+        ):
+            return residual
+
+        block.moe.unmerged = unmerged
+        block.moe.merge = merge
+        output, _, _ = block.local_two_stage(
+            torch.zeros(1, 1, 2),
+            2,
+            2,
+            delayed=True,
+        )
+        torch.testing.assert_close(
+            output[0, 0],
+            torch.tensor([1.5, 1.0]),
+        )
+
     def test_loop_residual_scaling(self):
         cfg = _tiny_config(residual_scaling="paper")
         self.assertAlmostEqual(
@@ -163,6 +214,27 @@ class CostModelTests(unittest.TestCase):
         # pre+post = 2 -> 2*2 + 2*(2 + 4) = 16
         self.assertEqual(
             profile["expert_assignments_per_token"], 16
+        )
+
+    def test_a_counts_routers_on_each_branch(self):
+        # middle=2, pre=post=1, k1=2：A 的第二轮在 k1 个分支上
+        # 各自路由，所以每个中间 Block 有 1+k1=3 次 Router/MoE
+        # 执行，总计 1+1+2*3=8，而不是 layers+middle=6。
+        profile = experiment.mode_cost_profile(
+            _tiny_config(mode="A")
+        )
+        self.assertEqual(
+            profile["router_calls_per_token"], 8
+        )
+        self.assertEqual(
+            profile["moe_passes_per_token"], 8
+        )
+        early = experiment.mode_cost_profile(
+            _tiny_config(mode="B_early")
+        )
+        self.assertEqual(
+            early["analytic_formula"]["attention_executions"],
+            "pre + [1 + (middle-1)*k1 + middle*k1] + post",
         )
 
     def test_b_counts_first_round_branch_routing(self):
@@ -666,6 +738,114 @@ class ProcessTests(unittest.TestCase):
                 ledger, key, Path(tmp) / "a"
             )
             self.assertFalse(check_same["repeat_access"])
+
+    def test_entity_manifest_audit_runs_with_group_separator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "entities.json"
+            path.write_text(
+                json.dumps(["doc0", "doc0", "doc1"]),
+                encoding="utf-8",
+            )
+            report = experiment.audit_entity_manifest(
+                b"a\nb\nc\n",
+                b"\n",
+                {
+                    "train": (0, 2),
+                    "val": (2, 8),
+                    "test": (8, 10),
+                },
+                str(path),
+            )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["groups"], 3)
+        self.assertEqual(report["entities"], 2)
+        self.assertEqual(report["cross_split_entities"], 1)
+        self.assertIn("doc0", dict(report["examples"]))
+
+    def test_text_integrity_attributes_boundary_byte_to_owning_split(self):
+        # val 末尾的非法 lead byte 不能因为跨 split 预热而被记到
+        # 字节干净的 test 上，否则测试集标签完整性门会误拒。
+        data = b"A" * 70 + b"B" * 19 + b"\xe2" + b"C" * 10
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corpus.bin"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.2,
+                test_fraction=0.1,
+            )
+            report = experiment.audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+        splits = report["splits"]
+        self.assertEqual(splits["train"]["utf8_replacements"], 0)
+        self.assertEqual(splits["val"]["utf8_replacements"], 1)
+        self.assertEqual(splits["test"]["utf8_replacements"], 0)
+        self.assertEqual(
+            experiment.test_label_integrity_violations(report),
+            [],
+        )
+
+    def test_drop_corrupt_bytes_catches_trailing_lead_byte(self):
+        # train 末尾的非法 lead byte 需要后继字节才能判定，
+        # 但清洗范围仍必须把它删掉，不能留给训练窗口。
+        data = b"A" * 69 + b"\xe2" + b"B" * 20 + b"C" * 10
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corpus.bin"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.2,
+                test_fraction=0.1,
+                drop_train_corrupt_bytes=True,
+            )
+            report = experiment.audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+        self.assertIn((69, 70), dataset.train_excluded_spans)
+        self.assertEqual(
+            report["splits"]["train"]["utf8_replacements"], 0
+        )
+        self.assertEqual(
+            report["splits"]["val"]["utf8_replacements"], 0
+        )
+
+    def test_include_test_in_cleaning_alias_is_effective(self):
+        groups = [
+            b"DUPAAAAA" if index == 0 else
+            f"train{index:02d}".encode().ljust(8, b"X")
+            for index in range(12)
+        ]
+        groups += [
+            f"val{index:03d}".encode().ljust(8, b"V")
+            for index in range(4)
+        ]
+        groups.append(b"DUPAAAAA")
+        data = b"\n".join(groups) + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "groups.txt"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=3,
+                val_fraction=0.3,
+                test_fraction=0.2,
+                group_separator=b"\n",
+                deduplicate_train_groups=True,
+                include_test_in_cleaning=True,
+            )
+        self.assertTrue(dataset.clean_train_against_test)
+        self.assertTrue(
+            dataset.train_cleaning["test_used_for_cleaning"]
+        )
+        self.assertTrue(
+            dataset.eval_content_access["test_content_used"]
+        )
+        self.assertGreater(len(dataset.train_excluded_spans), 0)
 
     def test_time_order_manifest_accepts_plain_text(self):
         with tempfile.TemporaryDirectory() as tmp:

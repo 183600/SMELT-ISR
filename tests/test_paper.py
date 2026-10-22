@@ -684,6 +684,53 @@ class DocumentMaskTests(unittest.TestCase):
             0.0,
         )
 
+    def test_branch_modes_keep_mask_with_single_branch(self):
+        # B/B_early 即使 k1==1 也会把分支维并入 batch 执行后续
+        # 中间 Block；掩码必须按 k1 复制，否则第二个文档会通过
+        # 普通因果注意力看到第一个文档。
+        for mode in ("B", "B_early"):
+            cfg = experiment.Config(
+                seq_len=8,
+                d_model=16,
+                n_heads=2,
+                n_kv_heads=1,
+                n_layers=4,
+                n_experts=2,
+                expert_hidden=8,
+                top_k=1,
+                k1=1,
+                k2=1,
+                mode=mode,
+                document_masks=True,
+                document_separator=[self.SEP],
+            )
+            torch.manual_seed(0)
+            model = experiment.LanguageModel(cfg).eval()
+            x = torch.tensor(
+                [[1, 2, 3, self.SEP, 5, 6, 7, 8]]
+            )
+            perturbed = x.clone()
+            perturbed[0, :3] = torch.tensor([20, 21, 22])
+            with torch.no_grad():
+                before = model(x)["logits"]
+                after = model(perturbed)["logits"]
+            # 文档 2（位置 4..7）不能受文档 1 扰动影响。
+            self.assertLess(
+                float(
+                    (before - after)[0, 4:].abs().max()
+                ),
+                1e-6,
+                mode,
+            )
+            # 文档 1 自身确实受影响，证明扰动不是无效的。
+            self.assertGreater(
+                float(
+                    (before - after)[0, :3].abs().max()
+                ),
+                0.0,
+                mode,
+            )
+
     def test_mask_requires_applicable_batch_shape(self):
         # 5 个 token、batch 2 的掩码可以物化；超限时显式报错
         # 由 DENSE_LIMIT_BYTES 控制（这里只验证上限常量存在）。
