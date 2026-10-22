@@ -279,6 +279,46 @@ def resume_effective_train_change_error(
     )
 
 
+def resume_split_isolation_change_error(
+    saved_isolation: Optional[object],
+    current_isolation: Optional[object],
+) -> Optional[str]:
+    """
+    检查续跑检查点的时序隔离记录是否一致。
+
+    split 内容指纹相同仍可能掩盖边界顺序/绝对位置变化（例如
+    重复内容使不同边界产生相同片段）；把边界、顺序与重叠
+    记录一起核对，避免续跑接到另一套时间切分上。旧检查点
+    没有该字段时返回 None，由调用方给出兼容提示。
+    """
+    if not isinstance(saved_isolation, dict) or not isinstance(
+        current_isolation, dict
+    ):
+        return None
+
+    saved_key = json.dumps(
+        saved_isolation,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    current_key = json.dumps(
+        current_isolation,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    if saved_key == current_key:
+        return None
+
+    return (
+        "resume 时序隔离记录已变化：train/val/test 的顺序、"
+        "绝对边界或重叠检查与检查点不一致。检查点对应另一套"
+        "时间切分，续跑会把两套划分混成一条轨迹。请换用全新"
+        "的 --out 目录与检查点从头训练。"
+    )
+
+
 def resume_amp_change_error(
     saved_args: object,
     current_amp_dtype: Optional[object],
@@ -3180,6 +3220,61 @@ def _snap_group_split(
     return best
 
 
+def _split_isolation_record(
+    split_bounds: Dict[str, Tuple[int, int]],
+    total_bytes: int,
+) -> Dict[str, object]:
+    """
+    生成可复现的时序隔离记录：三段的绝对字节边界、顺序、
+    是否首尾相接且覆盖全文、任意两段的重叠字节数。
+
+    只记录边界与结构，不读取或改变数据；写入 config 的
+    data.split_isolation 并作为受控变量核对。这样即使源文件
+    sha256 相同，切分顺序/群组吸附/边界实现变化也能被对比
+    与 resume 发现。
+    """
+    order = ("train", "val", "test")
+    bounds = {
+        split: [
+            int(split_bounds[split][0]),
+            int(split_bounds[split][1]),
+        ]
+        for split in order
+    }
+    contiguous = bounds["train"][0] == 0
+    for left, right in zip(order, order[1:]):
+        if bounds[left][1] != bounds[right][0]:
+            contiguous = False
+    covers_all = (
+        contiguous
+        and bounds["test"][1] == int(total_bytes)
+        and all(
+            start <= end
+            for start, end in bounds.values()
+        )
+    )
+    if bounds:
+        covered = sum(
+            end - start for start, end in bounds.values()
+        )
+        span = (
+            max(end for _, end in bounds.values())
+            - min(start for start, _ in bounds.values())
+        )
+        overlap_bytes = max(0, covered - span)
+    else:
+        overlap_bytes = 0
+
+    return {
+        "split_order": list(order),
+        "bounds": bounds,
+        "contiguous": contiguous,
+        "covers_all_bytes": covers_all,
+        "overlap_bytes": overlap_bytes,
+        "policy": "chronological_contiguous_no_shuffle",
+    }
+
+
 # 固定评估批设备侧结果的总字节上限。
 _EVAL_BATCH_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
@@ -3434,6 +3529,19 @@ class ByteDataset:
             "val": (n_train, n_val_end),
             "test": (n_val_end, len(tokens)),
         }
+        self.split_isolation = _split_isolation_record(
+            self.split_bounds,
+            len(tokens),
+        )
+        if (
+            not self.split_isolation["contiguous"]
+            or not self.split_isolation["covers_all_bytes"]
+            or int(self.split_isolation["overlap_bytes"]) != 0
+        ):
+            raise AssertionError(
+                "split 时序隔离检查失败：train/val/test 必须"
+                "按时间顺序首尾相接、覆盖全部字节且互不重叠"
+            )
 
         # 逐 split 内容指纹：整体数据 sha256 相同时，群组吸附/
         # 清洗/切分实现变化仍可能改变各段实际字节范围。把每段
@@ -6956,6 +7064,10 @@ def audit_data_splits(
         "content_chunks": content_chunks,
         "degenerate_runs": degenerate_runs,
         "val_label_noise": val_label_noise,
+        "split_isolation": _split_isolation_record(
+            dataset.split_bounds,
+            dataset.num_bytes,
+        ),
         "groups": groups_report,
         "warnings": warnings,
         "violations": violations,
@@ -7263,6 +7375,26 @@ def print_data_audit(report: Dict[str, object]) -> None:
         for name, info in splits.items()
     ]
     print("[data] 数据审计: " + ", ".join(parts))
+
+    isolation = report.get("split_isolation")
+    if isinstance(isolation, dict):
+        print(
+            "[data]   时序隔离: "
+            + " < ".join(isolation.get("split_order") or [])
+            + "，bounds="
+            + ", ".join(
+                f"{name}={bounds[0]}..{bounds[1]}"
+                for name, bounds in (
+                    isolation.get("bounds") or {}
+                ).items()
+            )
+            + (
+                "，连续且无重叠"
+                if isolation.get("contiguous")
+                and int(isolation.get("overlap_bytes", 0)) == 0
+                else "，边界异常"
+            )
+        )
 
     fractions = report.get("dataset_split_fractions") or {}
     if fractions:
@@ -11096,6 +11228,9 @@ def run_statistical_baseline(
             "effective_train_sha256": (
                 dataset.effective_train_sha256
             ),
+            "split_isolation": dict(
+                dataset.split_isolation
+            ),
         },
         "args": {
             key: value
@@ -11120,6 +11255,7 @@ def run_statistical_baseline(
                 split: list(bounds)
                 for split, bounds in dataset.split_bounds.items()
             },
+            "split_isolation": dict(dataset.split_isolation),
             "split_fractions": dataset.split_fractions,
             "split_sha256": dict(dataset.split_sha256),
             "effective_train_bytes": (
@@ -17621,6 +17757,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 清洗后的有效训练集指纹：同一 split/开关下清洗实现变化
     # 会改变实际参与训练的字节，必须能被跨运行核对。
     "effective_train_sha256",
+    # 时序隔离记录：绝对边界与顺序让「按时间先后切分、无重叠」
+    # 可以从 config 独立复核，而不是只靠比例与内容指纹推断。
+    "split_isolation",
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
@@ -17662,6 +17801,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 两者还必须看到同一套清洗后的有效训练字节；否则 ngram
     # 计数与神经窗口覆盖的训练分布不同，基线比较失效。
     "effective_train_sha256",
+    "split_isolation",
     "seq_len",
     "val_fraction",
     "test_fraction",
@@ -18290,6 +18430,13 @@ def build_comparison_protocol(
             "data_effective_train_sha256",
             None,
         ),
+        # 时序隔离记录：边界、顺序与重叠检查一起进入受控
+        # 协议，防止「同一文件 + 同一比例」掩盖切分顺序变化。
+        "split_isolation": getattr(
+            args,
+            "data_split_isolation",
+            None,
+        ),
         # 选型协议：final/test 都在验证集选中的模型上评估
         # （best.pt 不可用时回退到最后一步并明确提示）。
         "model_selection": "best_val_with_last_fallback",
@@ -18521,6 +18668,12 @@ def experiment_protocol_from_payload(
         "effective_train_sha256": _pick(
             data.get("effective_train_sha256"),
             run_args.get("data_effective_train_sha256"),
+        ),
+        # 时序隔离记录：旧运行没有时保持 None，由检查器标记为
+        # 未核对；新运行也可从 data.split_isolation 回填。
+        "split_isolation": _pick(
+            data.get("split_isolation"),
+            run_args.get("data_split_isolation"),
         ),
         # 旧运行没有选型记录，其 final/test 一律基于最后一步
         # 参数；显式回退为 "last_step"，与新版选型协议混用时
@@ -31401,6 +31554,9 @@ def write_run_config(
             split: list(bounds)
             for split, bounds in dataset.split_bounds.items()
         }
+        payload["data"]["split_isolation"] = dict(
+            dataset.split_isolation
+        )
         payload["data"]["split_fractions"] = (
             dataset.split_fractions
         )
@@ -34609,6 +34765,39 @@ def run_self_test():
             [],
         )
     )
+    # 时序隔离记录：边界顺序、连续覆盖与零重叠必须可从
+    # dataset/config 独立复核；重叠的边界必须被识别。
+    isolation = dedup_dataset.split_isolation
+    assert isolation["split_order"] == ["train", "val", "test"]
+    assert isolation["bounds"]["train"] == [0, 48]
+    assert isolation["contiguous"] is True
+    assert isolation["covers_all_bytes"] is True
+    assert isolation["overlap_bytes"] == 0
+    assert (
+        isolation["policy"]
+        == "chronological_contiguous_no_shuffle"
+    )
+    overlapping_isolation = _split_isolation_record(
+        {
+            "train": (0, 30),
+            "val": (20, 50),
+            "test": (50, 60),
+        },
+        60,
+    )
+    assert overlapping_isolation["contiguous"] is False
+    assert overlapping_isolation["overlap_bytes"] == 10
+    assert (
+        _split_isolation_record(
+            {
+                "train": (0, 30),
+                "val": (30, 50),
+                "test": (50, 60),
+            },
+            61,
+        )["covers_all_bytes"]
+        is False
+    )
     dedup_counts = dedup_dataset.effective_train_byte_counts()
     assert int(dedup_counts.sum()) == 28
     # B 群组在 train 中的唯一一次出现与 val 重复，已被清洗；
@@ -36076,6 +36265,45 @@ def run_self_test():
     assert effective_change_error is not None
     assert "abc" in effective_change_error
     assert "def" in effective_change_error
+
+    isolation_a = _split_isolation_record(
+        {
+            "train": (0, 30),
+            "val": (30, 50),
+            "test": (50, 60),
+        },
+        60,
+    )
+    isolation_b = _split_isolation_record(
+        {
+            "train": (0, 28),
+            "val": (28, 50),
+            "test": (50, 60),
+        },
+        60,
+    )
+    assert (
+        resume_split_isolation_change_error(
+            None,
+            isolation_a,
+        )
+        is None
+    )
+    assert (
+        resume_split_isolation_change_error(
+            isolation_a,
+            isolation_a,
+        )
+        is None
+    )
+    isolation_change_error = (
+        resume_split_isolation_change_error(
+            isolation_a,
+            isolation_b,
+        )
+    )
+    assert isolation_change_error is not None
+    assert "时序隔离" in isolation_change_error
 
     assert resume_amp_change_error({}, "torch.bfloat16") is None
     assert (
@@ -39254,6 +39482,10 @@ def run_self_test():
         "effective_train_sha256"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    # 时序隔离记录（顺序 + 绝对边界 + 零重叠）也必须作为
+    # 受控数据口径核对。
+    assert "split_isolation" in COMPARISON_PROTOCOL_KEYS
+    assert "split_isolation" in _CROSS_FAMILY_PROTOCOL_KEYS
     # 评估集重复豁免同样改变评估样本资格，必须进入协议核对，
     # 否则一个跑过 --allow-eval-duplicates、一个没跑，会被误判
     # 为同一评估口径。
@@ -39317,6 +39549,9 @@ def run_self_test():
     assert (
         legacy_statistical_protocol["effective_train_sha256"]
         is None
+    )
+    assert (
+        legacy_statistical_protocol["split_isolation"] is None
     )
     # 旧版去重默认读取 test：缺键时按历史行为回填 True，
     # 不能假装它和新版默认的 val-only 清洗一致。
@@ -50377,6 +50612,9 @@ def main():
         saved_data_effective_train_sha256 = saved_args.get(
             "data_effective_train_sha256"
         )
+        saved_data_split_isolation = saved_args.get(
+            "data_split_isolation"
+        )
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
         known_config_fields = {
@@ -50999,6 +51237,9 @@ def main():
     args.data_effective_train_sha256 = (
         dataset.effective_train_sha256
     )
+    args.data_split_isolation = dict(
+        dataset.split_isolation
+    )
 
     data_change_error = resume_data_change_error(
         saved_data_sha256,
@@ -51037,6 +51278,23 @@ def main():
             "resume checkpoint predates the effective train "
             "fingerprint; 仅凭 split 指纹与清洗开关无法确认"
             "清洗剔除区间未变"
+        )
+
+    isolation_change_error = (
+        resume_split_isolation_change_error(
+            saved_data_split_isolation,
+            dataset.split_isolation,
+        )
+    )
+    if isolation_change_error is not None:
+        parser.error(isolation_change_error)
+    elif saved_data_sha256 is not None and (
+        saved_data_split_isolation is None
+    ):
+        print(
+            "resume checkpoint predates the temporal split "
+            "isolation record; 仅凭 split 内容指纹无法确认"
+            "边界顺序与绝对位置未变"
         )
 
     if saved_data_sha256 is not None and (
