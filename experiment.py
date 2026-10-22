@@ -31172,15 +31172,34 @@ def same_seed_randomness_check(
         group_unverified: List[str] = []
 
         initializations = []
+        missing_init_runs = []
         for row in entries:
             init = row.get("init_fingerprints")
             if isinstance(init, dict):
                 initializations.append((row, init))
+            else:
+                missing_init_runs.append(str(row.get("run")))
         if len(initializations) < 2:
             group_unverified.append(
                 "种子 " + str(seed) + " 的运行缺少初始化指纹"
+                + (
+                    "（"
+                    + ", ".join(missing_init_runs)
+                    + "）"
+                    if missing_init_runs
+                    else ""
+                )
             )
         else:
+            if missing_init_runs:
+                # 同一个种子组里只要有一半有指纹还不足以支撑
+                # 「同起点」：缺少指纹的运行无法核对，必须显式
+                # 列为未验证，不能因为其余运行一致就静默放过。
+                group_unverified.append(
+                    "种子 " + str(seed) + " 的以下运行缺少"
+                    "初始化指纹，无法核对: "
+                    + ", ".join(missing_init_runs)
+                )
             schemes = sorted({
                 str(init.get("scheme"))
                 for _, init in initializations
@@ -31232,17 +31251,33 @@ def same_seed_randomness_check(
                 })
 
         traces = []
+        missing_trace_runs = []
         for row in entries:
             trace = row.get("training_trace")
             if isinstance(trace, dict) and trace.get(
                 "sha256"
             ) is not None:
                 traces.append((row, trace))
+            else:
+                missing_trace_runs.append(str(row.get("run")))
         if len(traces) < 2:
             group_unverified.append(
                 "种子 " + str(seed) + " 的运行缺少首批训练数据指纹"
+                + (
+                    "（"
+                    + ", ".join(missing_trace_runs)
+                    + "）"
+                    if missing_trace_runs
+                    else ""
+                )
             )
         else:
+            if missing_trace_runs:
+                group_unverified.append(
+                    "种子 " + str(seed) + " 的以下运行缺少"
+                    "首批训练数据指纹，无法核对: "
+                    + ", ".join(missing_trace_runs)
+                )
             distinct = {
                 str(trace.get("sha256"))
                 for _, trace in traces

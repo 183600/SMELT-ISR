@@ -921,6 +921,57 @@ class ProcessTests(unittest.TestCase):
         )
         self.assertEqual(metrics["val_bootstrap_block_size"], 3)
 
+    def test_same_seed_reports_partially_missing_fingerprints(self):
+        init = {
+            "scheme": "name_hash",
+            "shared_sha256": "shared",
+            "moe_sha256": "moe",
+        }
+        trace = {"sha256": "batch"}
+        rows = [
+            {
+                "run": "new-a",
+                "mode": "A",
+                "seed": 42,
+                "init_fingerprints": dict(init),
+                "training_trace": dict(trace),
+            },
+            {
+                "run": "new-b",
+                "mode": "B",
+                "seed": 42,
+                "init_fingerprints": dict(init),
+                "training_trace": dict(trace),
+            },
+            {
+                # 旧运行没有指纹：其余两条运行一致并不能证明
+                # 这一条也与它们同起点。
+                "run": "old",
+                "mode": "A",
+                "seed": 42,
+                "init_fingerprints": None,
+                "training_trace": None,
+            },
+        ]
+        report = experiment.same_seed_randomness_check(rows)
+        self.assertTrue(report["ok"])
+        self.assertTrue(
+            any("old" in message for message in report["unverified"]),
+            report["unverified"],
+        )
+        self.assertTrue(
+            any(
+                "初始化指纹" in message
+                for message in report["unverified"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "首批训练数据指纹" in message
+                for message in report["unverified"]
+            )
+        )
+
     def test_cross_family_explicit_null_is_compared(self):
         recorded = ["group_separator"]
         rows = [
