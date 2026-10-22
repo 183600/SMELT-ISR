@@ -16699,19 +16699,78 @@ def numerical_failure_report(
         for row in rows
         if row.get("numerical_status") == "unknown"
     ]
+    mode_counts: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        mode = str(row.get("mode"))
+        entry = mode_counts.setdefault(mode, {
+            "mode": mode,
+            "attempted_runs": 0,
+            "failed_runs": 0,
+            "failed_run_names": [],
+        })
+        entry["attempted_runs"] = (
+            int(entry["attempted_runs"]) + 1
+        )
+        if row.get("numerical_status") == "failed":
+            entry["failed_runs"] = (
+                int(entry["failed_runs"]) + 1
+            )
+            entry["failed_run_names"].append(
+                str(row.get("run"))
+            )
+    by_mode: List[Dict[str, object]] = []
+    for mode in sorted(mode_counts):
+        entry = mode_counts[mode]
+        attempted = int(entry["attempted_runs"])
+        entry["failure_rate"] = (
+            float(entry["failed_runs"]) / float(attempted)
+            if attempted > 0
+            else None
+        )
+        by_mode.append(entry)
+    failure_rates = {
+        float(entry["failure_rate"])
+        for entry in by_mode
+        if entry.get("failure_rate") is not None
+    }
+    imbalanced = (
+        any(rate > 0.0 for rate in failure_rates)
+        and len(failure_rates) > 1
+    )
+
     report: Dict[str, object] = {
         "failed": failed,
         "excluded_run_count": len(failed),
         "unknown": unknown,
+        "by_mode": by_mode,
+        "mode_failure_rates_imbalanced": imbalanced,
         "advisory": None,
     }
     if failed:
-        report["advisory"] = (
+        message = (
             f"{len(failed)} 个运行存在 NaN/Inf、数值停止、污染"
             "检查点续跑或 diverged 曲线：已从聚合与显著性检验中"
-            "排除（不是方法效果）；请修复数值问题或从干净检查点"
-            "重跑后再比较"
+            "排除；请修复数值问题或从干净检查点重跑后再比较"
         )
+        if imbalanced:
+            message += (
+                "。各 mode 的失败率不同（"
+                + "; ".join(
+                    f"{entry['mode']}={entry['failed_runs']}/"
+                    f"{entry['attempted_runs']}"
+                    for entry in by_mode
+                )
+                + "）：剔除失败运行后比较的是幸存者，"
+                "失败率本身可能是方法稳定性差异，不能把幸存"
+                "运行的优势归因到方法"
+            )
+        else:
+            message += (
+                "。注意：失败运行不是方法效果，但若某臂的失败"
+                "率更高，仍属于方法稳定性差异，不能只看幸存"
+                "运行的均值"
+            )
+        report["advisory"] = message
     return report
 
 
@@ -22837,6 +22896,7 @@ _COMPONENT_BLOCKING_CLAIMS = frozenset({
     "confounded",
     "compute_confounded",
     "randomness_confounded",
+    "attrition_confounded",
     "unverified_controls",
 })
 
@@ -23110,6 +23170,7 @@ def ablation_component_verdicts(
     for key, label in (
         ("structural_confounds", "结构设置混杂"),
         ("width_confounds", "专家宽度/计算量混杂"),
+        ("attrition_confounds", "数值失败/脱落不平衡"),
         ("randomness_confounds", "同种子随机性混杂"),
         ("randomness_unverified", "同种子随机性未核对"),
     ):
@@ -24316,11 +24377,44 @@ def ablation_coverage(
         "width_confounds": [],
         "seed_alignment": [],
         "compute_parity": [],
+        "numerical_attrition": [],
+        "attrition_confounds": [],
         "advisories": [],
         "n_rows": len(rows),
         "n_failed_rows_excluded": 0,
         "failed_runs": [],
     }
+
+    # 数值失败/发散的运行会在下面被排除；必须先按消融单元
+    # 记录「计划内尝试过多少运行、失败多少」，否则只看幸存
+    # 运行会把「某臂更容易崩溃」伪装成该臂均值更好（attrition
+    # bias）。这里用排除前的 rows 计数，不能等过滤后再补。
+    ablation_related = {"local_base", *_DELAYED_MERGE_MODES}
+    attempted_cells: Dict[tuple, int] = {}
+    failed_cells: Dict[tuple, int] = {}
+    failed_runs_by_cell: Dict[tuple, List[str]] = {}
+    for row in rows:
+        mode = str(_row_factor_value(row, "mode"))
+        if mode not in ablation_related:
+            continue
+        balance = _row_factor_value(row, "balance_coef")
+        if (
+            not isinstance(balance, (int, float))
+            or isinstance(balance, bool)
+            or not math.isfinite(float(balance))
+        ):
+            continue
+        cell_key = (mode, "off" if float(balance) == 0.0 else "on")
+        attempted_cells[cell_key] = (
+            attempted_cells.get(cell_key, 0) + 1
+        )
+        if row.get("numerical_status") == "failed":
+            failed_cells[cell_key] = (
+                failed_cells.get(cell_key, 0) + 1
+            )
+            failed_runs_by_cell.setdefault(cell_key, []).append(
+                str(row.get("run"))
+            )
 
     failed_rows = [
         row
@@ -24366,8 +24460,6 @@ def ablation_coverage(
     unknown_balance = False
     missing_structural_units: set = set()
     missing_structural_keys: set = set()
-
-    ablation_related = {"local_base", *_DELAYED_MERGE_MODES}
 
     for row in rows:
         mode = str(_row_factor_value(row, "mode"))
@@ -24722,6 +24814,73 @@ def ablation_coverage(
         for level in ("off", "on")
     ]
     report["expected_cells"] = expected_cells
+
+    # 每个消融单元的计划内失败率：过滤后的均值/配对检验只覆盖
+    # 幸存运行。若某格失败更多，该格的均值条件在「没有崩掉」
+    # 上，组件效应会混入幸存者偏差；失败率只在单元间不平衡时
+    # 阻塞归因，完全平衡的失败仍单独披露。
+    expected_pairs = [
+        (mode, level)
+        for mode in ("local_base", *expected_delayed)
+        for level in ("off", "on")
+    ]
+    attrition_entries: List[Dict[str, object]] = []
+    for mode, level in expected_pairs:
+        cell_key = (mode, level)
+        attempted = attempted_cells.get(cell_key, 0)
+        if attempted <= 0:
+            continue
+        failed = failed_cells.get(cell_key, 0)
+        attrition_entries.append({
+            "cell": f"{mode}/b={level}",
+            "mode": mode,
+            "level": level,
+            "attempted_runs": attempted,
+            "failed_runs": failed,
+            "usable_runs": merge_pair_cells.get(cell_key, 0),
+            "failure_rate": float(failed) / float(attempted),
+            "failed_run_names": list(
+                failed_runs_by_cell.get(cell_key, [])
+            ),
+        })
+    report["numerical_attrition"] = attrition_entries
+    failure_rates = {
+        str(entry["cell"]): float(entry["failure_rate"])
+        for entry in attrition_entries
+    }
+    if any(rate > 0.0 for rate in failure_rates.values()):
+        unbalanced = len(set(failure_rates.values())) > 1
+        details = "; ".join(
+            f"{entry['cell']}={entry['failed_runs']}/"
+            f"{entry['attempted_runs']}"
+            for entry in attrition_entries
+        )
+        if unbalanced:
+            affected_modes = sorted({
+                str(entry["mode"])
+                for entry in attrition_entries
+                if float(entry["failure_rate"]) > 0.0
+            })
+            report["attrition_confounds"].append({
+                "failure_rates": failure_rates,
+                "affected_modes": affected_modes,
+                "details": details,
+            })
+            report["advisories"].append(
+                "数值失败/发散的运行在消融单元间不平衡（"
+                + details
+                + "）：被剔除的失败运行不是方法效果，但失败率"
+                "本身可能是方法稳定性差异。仅比较幸存运行会把"
+                "「某臂更容易崩」误读成该臂更好，主效应/交互"
+                "不能归因到组件"
+            )
+        else:
+            report["advisories"].append(
+                "数值失败/发散运行在各消融单元间数量相同（"
+                + details
+                + "）：失败率已平衡，但单元均值仍只覆盖幸存"
+                "运行；结论应同时报告失败率，不能只看均值"
+            )
 
     # 全因子共享种子：每个方案的 2×2 内部对齐还不够，A、B 与
     # local_base 之间也必须使用同一组种子。否则 A 的组件效应与
@@ -27788,6 +27947,35 @@ def annotate_factorial_confounds(
             "归因到待验证设计"
         )
 
+    attrition_confounds = coverage.get(
+        "attrition_confounds"
+    ) or []
+    if attrition_confounds:
+        affected_modes = set()
+        for confound in attrition_confounds:
+            affected_modes.update(
+                str(mode)
+                for mode in (confound.get("affected_modes") or [])
+            )
+        for effect in factorial.get("effects", []):
+            involved = {
+                "local_base",
+                str(effect.get("delayed_mode")),
+            }
+            if not involved & affected_modes:
+                continue
+            effect["attrition_confounded"] = True
+            if effect.get("claim") in positive_claims | {
+                "unverified_controls",
+                "confounded",
+                "compute_confounded",
+            }:
+                effect["claim"] = "attrition_confounded"
+        factorial.setdefault("advisories", []).append(
+            "数值失败在消融单元间不平衡：幸存运行的条件均值"
+            "不能直接归因到组件，须同时报告失败率或重跑"
+        )
+
     randomness_confounds = coverage.get(
         "randomness_confounds"
     ) or []
@@ -28170,6 +28358,10 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
             ),
             "randomness_confounded": (
                 "显著但同种子随机性未对齐，不能归因"
+            ),
+            "attrition_confounded": (
+                "显著但数值失败率在单元间不平衡（幸存者偏差），"
+                "不能归因"
             ),
         }.get(str(effect.get("claim")), "显著")
     else:
@@ -28847,6 +29039,15 @@ def print_comparison_analysis(
                 f" stop={item['numerical_stop']}"
                 f" polluted={item['numerical_polluted']}"
                 f" prior_stop={item['prior_numerical_stop']}"
+            )
+        if numerical_failures.get("by_mode"):
+            print(
+                "  各 mode 失败率: "
+                + "; ".join(
+                    f"{entry['mode']}={entry['failed_runs']}/"
+                    f"{entry['attempted_runs']}"
+                    for entry in numerical_failures["by_mode"]
+                )
             )
         print("  [warn] " + str(numerical_failures["advisory"]))
     elif numerical_failures["unknown"]:
@@ -29924,6 +30125,27 @@ def print_comparison_analysis(
         print(f"  已覆盖组合: {present}")
     for message in coverage.get("structural_confounds", []):
         print(f"  [confounded] {message}")
+    for entry in coverage.get("numerical_attrition", []):
+        if int(entry.get("failed_runs", 0) or 0) <= 0:
+            continue
+        print(
+            "  [attrition] "
+            f"{entry['cell']}：失败 {entry['failed_runs']}/"
+            f"{entry['attempted_runs']}（可用 "
+            f"{entry['usable_runs']}）"
+            + (
+                "，失败运行: "
+                + ", ".join(entry.get("failed_run_names") or [])
+                if entry.get("failed_run_names")
+                else ""
+            )
+        )
+    for confound in coverage.get("attrition_confounds", []):
+        print(
+            "  [confounded] 数值失败/脱落不平衡: "
+            + str(confound.get("details"))
+            + "；幸存运行的均值不能归因到组件"
+        )
     for entry in coverage.get("seed_alignment", []):
         seeds_text = ", ".join(
             str(seed) for seed in entry["common_seeds"]
@@ -41392,6 +41614,29 @@ def run_self_test():
             "数值失败运行不能充当消融" in message
             for message in failed_full_coverage["advisories"]
         )
+        # 失败运行被剔除还不够：若失败集中在某一格，幸存运行
+        # 的均值会带上幸存者偏差，必须作为 attrition 混杂阻塞
+        # 组件归因，而不是只给全局警告。
+        assert failed_full_coverage["attrition_confounds"], (
+            failed_full_coverage["numerical_attrition"]
+        )
+        assert any(
+            "不平衡" in message
+            for message in failed_full_coverage["advisories"]
+        )
+        failure_effect = {
+            "delayed_mode": "A",
+            "effect_name": "delayed_merge_main",
+            "claim": "supports_component",
+        }
+        annotate_factorial_confounds(
+            {"effects": [failure_effect]},
+            {"ok": True, "unchecked_keys": []},
+            failed_full_coverage,
+        )
+        assert failure_effect["claim"] == "attrition_confounded", (
+            failure_effect
+        )
 
         # 有限但持续发散（diverging）同样不能当作有效运行：
         # 它没有 NaN，却已失去稳定的训练轨迹。
@@ -46116,6 +46361,28 @@ def run_self_test():
     )
     assert numerical_report["excluded_run_count"] == 2
     assert numerical_report["advisory"]
+    assert numerical_report["by_mode"][0]["mode"] == "A"
+    assert (
+        numerical_report["by_mode"][0]["failed_runs"] == 2
+    )
+    assert not numerical_report[
+        "mode_failure_rates_imbalanced"
+    ]
+    imbalanced_report = numerical_failure_report(
+        numerical_rows
+        + [
+            {
+                "run": f"B_ok{seed}",
+                "mode": "B",
+                "seed": seed,
+                "val_loss": 2.0,
+                "numerical_status": "ok",
+            }
+            for seed in (1, 2, 3)
+        ]
+    )
+    assert imbalanced_report["mode_failure_rates_imbalanced"]
+    assert "失败率不同" in str(imbalanced_report["advisory"])
 
     # 单元均值的 95% CI 必须是 t 分布区间：宽度随 n 变小而
     # 变宽；n<2 时不给区间，避免把点估计伪装成零宽度估计。
