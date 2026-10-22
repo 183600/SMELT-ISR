@@ -3000,6 +3000,23 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertIn("primary_metric", error)
 
+    def test_apply_numeric_conflict_keeps_large_integer_precision(self):
+        payload = self._payload()
+        payload["common_step"] = 2 ** 53
+        payload["steps"] = 2 ** 53 + 2
+        args = self._args(
+            common_step=2 ** 53 + 1,
+            steps=2 ** 53 + 2,
+        )
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("common_step", error)
+
     def test_apply_rejects_commit_dirty_and_script_mismatch(self):
         args = self._args()
         _, error = experiment.preregistration_apply(

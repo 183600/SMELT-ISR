@@ -32967,7 +32967,14 @@ def preregistration_apply(
             return None
         if numeric:
             try:
-                same = float(current) == float(expected)
+                # 不能用 float 比较：2**53 以上的整数会因浮点
+                # 舍入而把不同取值判成相同，从而静默接受与预
+                # 注册不一致的 common_step/steps。稳定键保留
+                # 整数精度，同时维持 int/float 同值等价。
+                same = (
+                    _stable_factor_key(current)
+                    == _stable_factor_key(expected)
+                )
             except (TypeError, ValueError, OverflowError):
                 same = False
         else:
