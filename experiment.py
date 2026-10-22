@@ -6571,6 +6571,47 @@ def audit_data_splits(
                 "评估集规模/统计功效可能与预期不符"
             )
 
+    # 验证集标签噪声即使占比很低也必须显式提示：val 用于
+    # checkpoint 选择、早停与超参/基线调参，少量损坏标签会
+    # 系统性地改变选型结果，而不像 train 噪声那样只增加方差。
+    # 这里只告警不拒绝（合法二进制语料仍可训练），严格模式
+    # 或 --drop-train-* 清洗负责处理。
+    val_info = splits_report.get("val")
+    val_label_noise: Dict[str, object] = {
+        "invalid_tokens": 0,
+        "utf8_replacements": 0,
+        "nul_bytes": 0,
+        "has_label_noise": False,
+        "used_for_selection": True,
+    }
+    if isinstance(val_info, dict):
+        for key in (
+            "invalid_tokens",
+            "utf8_replacements",
+            "nul_bytes",
+        ):
+            val_label_noise[key] = int(val_info.get(key, 0) or 0)
+        val_label_noise["has_label_noise"] = any(
+            int(val_label_noise[key]) > 0
+            for key in (
+                "invalid_tokens",
+                "utf8_replacements",
+                "nul_bytes",
+            )
+        )
+        if val_label_noise["has_label_noise"]:
+            warnings.append(
+                "val: 验证集含标签噪声（越界 token "
+                f"{val_label_noise['invalid_tokens']}、"
+                "非法 UTF-8 "
+                f"{val_label_noise['utf8_replacements']}、"
+                f"NUL {val_label_noise['nul_bytes']}）；"
+                "val 用于 checkpoint/早停选型，损坏标签会"
+                "扭曲模型选择。默认仅告警；请用 "
+                "--strict-data-audit 拒绝训练，或先清洗/"
+                "重新切分数据"
+            )
+
     # test 在训练期间保持尘封：这里只根据切分边界核对它的
     # 实际占比，不读取任何 test 内容。这样吸附导致的测试集
     # 缩水在训练前就能被发现。
@@ -6914,6 +6955,7 @@ def audit_data_splits(
         "leakage_scan_coverage": scan_coverage,
         "content_chunks": content_chunks,
         "degenerate_runs": degenerate_runs,
+        "val_label_noise": val_label_noise,
         "groups": groups_report,
         "warnings": warnings,
         "violations": violations,
@@ -34095,6 +34137,54 @@ def run_self_test():
     )
     assert not enforce_strict_data_audit(low_noise_audit)
     assert low_noise_audit["leakage_violations"] == []
+
+    # 验证集标签噪声：即使占比远低于告警阈值也必须记录并提示，
+    # 因为 val 参与 checkpoint/早停选型；默认只告警，严格模式
+    # 仍拒绝，不能用「占比很低」把选型污染洗白。
+    val_noise_rng = random.Random(20241022)
+    val_noise_body = bytes(
+        val_noise_rng.choice(
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+        for _ in range(20000)
+    )
+    val_noise_body = (
+        val_noise_body[:18500]
+        + b"\xff"
+        + val_noise_body[18500:]
+    )
+    with tempfile.NamedTemporaryFile() as val_noise_file:
+        val_noise_file.write(val_noise_body)
+        val_noise_file.flush()
+
+        val_noise_dataset = ByteDataset(
+            val_noise_file.name,
+            seq_len=8,
+        )
+        val_noise_audit = audit_data_splits(
+            val_noise_dataset,
+            include_test=False,
+        )
+
+    assert val_noise_audit["val_label_noise"] == {
+        "invalid_tokens": 0,
+        "utf8_replacements": 1,
+        "nul_bytes": 0,
+        "has_label_noise": True,
+        "used_for_selection": True,
+    }
+    assert not any(
+        "train: 检测到" in warning
+        and "UTF-8" in warning
+        for warning in val_noise_audit["warnings"]
+    )
+    assert any(
+        "val: 验证集含标签噪声" in warning
+        and "选型" in warning
+        for warning in val_noise_audit["warnings"]
+    )
+    assert val_noise_audit["violations"]
+    assert not enforce_strict_data_audit(val_noise_audit)
 
     # 合法文本可能包含字面替换字符 U+FFFD：它编码为合法 UTF-8，
     # 不能被完整性审计误判为标签噪声。审计与逐字节清洗必须
