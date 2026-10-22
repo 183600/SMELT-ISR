@@ -22991,6 +22991,7 @@ def _component_evidence_summary(
 def ablation_component_verdicts(
     factorial: Dict[str, object],
     coverage: Dict[str, object],
+    metric_preregistration: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """
     把全因子效应汇总成「每个创新点是否各自有用」的联合判定。
@@ -23001,9 +23002,12 @@ def ablation_component_verdicts(
 
     - 主效应（跨均衡开关加权）支持该组件；
     - 简单效应没有显著变差或混杂；
-    - 消融组合完整、结构/计算量/同种子随机性没有阻塞；
+    - 消融组合完整、结构/计算量/同种子随机性/数值失败率
+      没有阻塞；
     - 全因子各格共享同一组随机种子（否则不同组件是在不同
-      种子子集上比较）。
+      种子子集上比较）；
+    - 当前分析指标与训练前预注册的主指标一致（否则在多个
+      指标之间挑一个支持结论的，属于指标选择偏差）。
 
     只有全部组件均为 ``supported`` 且无 blocker 时，
     ``all_components_supported`` 才为 True；部分显著只返回
@@ -23301,6 +23305,40 @@ def ablation_component_verdicts(
             "共同步数敏感性翻转: "
             + ", ".join(sorted(component_flips))
         )
+    preregistration = (
+        metric_preregistration
+        if isinstance(metric_preregistration, dict)
+        else {}
+    )
+    metric_mismatch_runs = [
+        str(run)
+        for run in (
+            preregistration.get("metric_mismatch_runs") or []
+        )
+    ]
+    metric_mismatch_details = [
+        str(item)
+        for item in (
+            preregistration.get("metric_mismatch_details") or []
+        )
+    ]
+    preregistration_missing_runs = [
+        str(run)
+        for run in (
+            preregistration.get("preregistration_missing_runs")
+            or []
+        )
+    ]
+    analysis_metric = factorial.get("metric")
+    if metric_mismatch_runs:
+        blockers.append(
+            f"当前分析指标 {analysis_metric} 与 "
+            f"{len(metric_mismatch_runs)} 个运行训练前预注册的"
+            "主指标不一致（"
+            + "; ".join(metric_mismatch_details)
+            + "）：在多个指标之间事后挑选支持结论的那个属于"
+            "指标选择偏差，组件联合判定只能作为探索性结果"
+        )
 
     statuses = {
         str(component["component"]): str(component["status"])
@@ -23356,6 +23394,13 @@ def ablation_component_verdicts(
         "statuses": statuses,
         "all_components_supported": all_supported,
         "blockers": blockers,
+        "metric_preregistration": {
+            "analysis_metric": analysis_metric,
+            "metric_mismatch_runs": metric_mismatch_runs,
+            "preregistration_missing_runs": (
+                preregistration_missing_runs
+            ),
+        },
         "advisory": advisory,
     }
 
@@ -28827,12 +28872,16 @@ def print_comparison_analysis(
     coverage["common_step_sensitivity"] = (
         common_step_sensitivity
     )
+    hypotheses = hypothesis_registry(rows, metric)
     # 组件级联合判定：把分散的主效应/简单效应拼成每个创新点
     # 的单一 verdict，并集中列出阻塞条件。只有全部组件都有
-    # 无混杂的支持证据时才允许宣称「各自有用」。
+    # 无混杂的支持证据时才允许宣称「各自有用」；当前分析指标
+    # 还必须与训练前预注册的主指标一致，避免在多个指标之间
+    # 事后挑选支持结论的那个。
     component_verdicts = ablation_component_verdicts(
         factorial,
         coverage,
+        metric_preregistration=hypotheses,
     )
     # 伪重复：同一实验单元里同一随机种子出现多次（如复制运行
     # 目录）不是独立重复实验，必须点名，不能让它悄悄抬高样本数、
@@ -28854,7 +28903,6 @@ def print_comparison_analysis(
         for aggregate in aggregates
         if aggregate.get("deterministic_repeat_conflicts")
     ]
-    hypotheses = hypothesis_registry(rows, metric)
     alignment = hypothesis_alignment(
         rows,
         aggregates,
@@ -41910,6 +41958,30 @@ def run_self_test():
             component_verdicts["statuses"]["balance_loss"]
             == "supported"
         )
+        # 统计上全部支持还不够：当前分析指标若与训练前预注册
+        # 的主指标不一致，等于在多个指标里事后挑一个支持结论
+        # 的，必须阻塞「各自有用」的联合判定。
+        metric_mismatch_verdicts = ablation_component_verdicts(
+            factorial,
+            component_coverage,
+            metric_preregistration={
+                "metric_mismatch_runs": ["A_seed1"],
+                "metric_mismatch_details": [
+                    "A_seed1（预注册 val_loss，当前判定 "
+                    "val_macro_f1）"
+                ],
+            },
+        )
+        assert not metric_mismatch_verdicts[
+            "all_components_supported"
+        ]
+        assert any(
+            "指标选择偏差" in blocker
+            for blocker in metric_mismatch_verdicts["blockers"]
+        )
+        assert metric_mismatch_verdicts[
+            "metric_preregistration"
+        ]["analysis_metric"] == factorial["metric"]
         not_supported_factorial = json.loads(
             json.dumps(
                 _json_safe(factorial),
