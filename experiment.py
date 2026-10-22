@@ -15798,6 +15798,13 @@ def selection_bias_report(
         "unbiased_runs": 0,
         "available_unbiased_metrics": [],
         "advisory": None,
+        # 选型机会：每个 best_val 运行参与「取最优」的验证点数。
+        # 验证点越多，抽到极端低点的机会越多，best_val 的乐观
+        # 偏差也越大；不同运行数量不等时，选型偏差本身在组间
+        # 不可比。
+        "selection_opportunities": [],
+        "opportunity_imbalance": None,
+        "opportunity_advisory": None,
     }
 
     if not report["applicable"]:
@@ -15826,6 +15833,7 @@ def selection_bias_report(
                 "selection_metric": row.get("selection_metric"),
                 "selected_step": row.get("end_step"),
                 "trained_steps": row.get("trained_steps"),
+                "n_eval_points": row.get("curve_n_eval_points"),
             })
         elif selected == "last":
             report["last_step_runs"].append(name)
@@ -15833,6 +15841,57 @@ def selection_bias_report(
             report["unknown_selection_runs"].append(name)
 
     report["eligible_runs"] = eligible_runs
+
+    # best_val 是「在 T 个验证点里取最小」：T 越大，极值噪声
+    # 带来的乐观偏差越大。跨运行比较时若各运行的 T 不同，
+    # 偏差幅度也不同，必须把 T 一并披露。
+    opportunities = []
+    for entry in report["biased_runs"]:
+        value = entry.get("n_eval_points")
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            opportunities.append({
+                "run": entry["run"],
+                "n_eval_points": int(value),
+            })
+    report["selection_opportunities"] = opportunities
+    if len(opportunities) >= 2:
+        counts = [
+            entry["n_eval_points"] for entry in opportunities
+        ]
+        low = min(counts)
+        high = max(counts)
+        if high > low:
+            ratio = (
+                float(high) / float(low) if low > 0 else None
+            )
+            report["opportunity_imbalance"] = {
+                "min_eval_points": low,
+                "max_eval_points": high,
+                "ratio": ratio,
+                "runs": opportunities,
+            }
+            report["opportunity_advisory"] = (
+                "best_val 运行参与选型的验证点数不同（"
+                f"{low}~{high}"
+                + (
+                    f"，最多相差 {ratio:.2f}×"
+                    if ratio is not None
+                    else ""
+                )
+                + "）：验证点更多的运行有更多机会抽到低点，"
+                "选型乐观偏差也更大，且该偏差在组间不可比；"
+                "请用共同步数指标复核方法差异"
+            )
+    elif report["biased_runs"] and not opportunities:
+        report["opportunity_advisory"] = (
+            "best_val 运行缺少验证点数量记录"
+            "（curve_n_eval_points，旧运行）：无法核对各运行"
+            "的选型机会是否相同"
+        )
 
     metric_reports = (
         _as_dict(common_step).get("metric_reports")
@@ -26791,6 +26850,16 @@ def print_comparison_analysis(
             "无法确认 final 指标是否经过验证集选型: "
             + ", ".join(selection_bias["unknown_selection_runs"])
         )
+    if selection_bias.get("opportunity_imbalance"):
+        print(
+            "  [selection-opportunities] [warn] "
+            + str(selection_bias["opportunity_advisory"])
+        )
+    elif selection_bias.get("opportunity_advisory"):
+        print(
+            "  [selection-opportunities] [note] "
+            + str(selection_bias["opportunity_advisory"])
+        )
 
     if aggregates:
         # 聚合表只展示 val 口径：test 指标不参与跨运行
@@ -35398,6 +35467,39 @@ def run_self_test():
     assert bias_report["unbiased_runs"] == 2
     assert bias_report["advisory"]
     assert bias_report["eligible_runs"] == 2
+    # 旧记录没有验证点数量：必须明确「无法核对选型机会」，
+    # 不能静默当成各运行机会相同。
+    assert bias_report["selection_opportunities"] == []
+    assert bias_report["opportunity_advisory"] is not None
+
+    # 选型机会不平衡：3 个验证点 vs 5 个验证点，验证点更多的
+    # 运行取到极端低点的机会更大，报告必须点名该可比性问题。
+    common_rows[0]["curve_n_eval_points"] = 3
+    common_rows[1]["curve_n_eval_points"] = 5
+    opportunity_bias = selection_bias_report(
+        common_rows,
+        "val_loss",
+        common_report,
+    )
+    assert len(opportunity_bias["selection_opportunities"]) == 2
+    imbalance = opportunity_bias["opportunity_imbalance"]
+    assert imbalance is not None
+    assert imbalance["min_eval_points"] == 3
+    assert imbalance["max_eval_points"] == 5
+    assert abs(float(imbalance["ratio"]) - 5.0 / 3.0) < 1e-12
+    assert "验证点数不同" in str(
+        opportunity_bias["opportunity_advisory"]
+    )
+    # 相同验证点数不构成机会不平衡。
+    common_rows[1]["curve_n_eval_points"] = 3
+    balanced_opportunity = selection_bias_report(
+        common_rows,
+        "val_loss",
+        common_report,
+    )
+    assert balanced_opportunity["opportunity_imbalance"] is None
+    common_rows[1]["curve_n_eval_points"] = 5
+
     # 确定性基线不做 checkpoint 选型，不能进偏差比例的分母：
     # 混入 ngram 运行后，比例分母仍必须是参与选型的运行数。
     mixed_rows = list(common_rows) + [
