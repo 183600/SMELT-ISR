@@ -40450,6 +40450,135 @@ def _snapshot_device(snapshot: Dict[str, object]) -> torch.device:
             return torch.device("cpu")
 
 
+def _apply_environment_determinism(
+    snapshot: Dict[str, object],
+) -> Dict[str, object]:
+    """把归档快照里的运行期确定性/线程开关应用到当前进程。
+
+    这些开关由训练入口的 ``set_seed`` / ``configure_cuda_precision``
+    / ``configure_cpu_threads`` 设置，不是安装环境自带的属性。
+    如果 ``--check-environment`` 在全新进程里直接构造当前快照，
+    PyTorch 的默认值（确定性算法关闭、cuDNN benchmark 开启）
+    会让同一台机器、同一套依赖也必然 MISMATCH。核对前先按归档
+    值恢复这些可控开关，再比较依赖/硬件是否真的变化。
+
+    返回 ``{"applied": [...], "errors": {...}}``；无法应用的项
+    保留错误信息，后续比较仍会如实报告差异。
+    """
+    applied: List[str] = []
+    errors: Dict[str, str] = {}
+    determinism = snapshot.get("determinism")
+    if not isinstance(determinism, dict):
+        return {"applied": applied, "errors": errors}
+
+    def _bool(name: str) -> Optional[bool]:
+        value = determinism.get(name)
+        if isinstance(value, bool):
+            return value
+        return None
+
+    deterministic = _bool("deterministic_algorithms")
+    warn_only = _bool(
+        "deterministic_algorithms_warn_only"
+    )
+    if deterministic is not None:
+        try:
+            torch.use_deterministic_algorithms(
+                deterministic,
+                warn_only=bool(warn_only),
+            )
+            applied.append("deterministic_algorithms")
+            if warn_only is not None:
+                applied.append(
+                    "deterministic_algorithms_warn_only"
+                )
+        except (RuntimeError, ValueError) as error:
+            errors["deterministic_algorithms"] = str(error)
+
+    for name, backend in (
+        ("cudnn_deterministic", torch.backends.cudnn),
+        ("cudnn_benchmark", torch.backends.cudnn),
+    ):
+        value = _bool(name)
+        if value is None:
+            continue
+        try:
+            setattr(backend, name[len("cudnn_"):], value)
+            applied.append(name)
+        except (AttributeError, RuntimeError) as error:
+            errors[name] = str(error)
+
+    cuda_matmul = torch.backends.cuda.matmul
+    for name in (
+        "allow_tf32_matmul",
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        value = _bool(name)
+        if value is None:
+            continue
+        attr = (
+            "allow_tf32"
+            if name == "allow_tf32_matmul"
+            else name
+        )
+        if not hasattr(cuda_matmul, attr):
+            continue
+        try:
+            setattr(cuda_matmul, attr, value)
+            applied.append(name)
+        except (AttributeError, RuntimeError) as error:
+            errors[name] = str(error)
+    allow_tf32_cudnn = _bool("allow_tf32_cudnn")
+    if allow_tf32_cudnn is not None:
+        try:
+            torch.backends.cudnn.allow_tf32 = allow_tf32_cudnn
+            applied.append("allow_tf32_cudnn")
+        except (AttributeError, RuntimeError) as error:
+            errors["allow_tf32_cudnn"] = str(error)
+
+    threads = determinism.get("torch_num_threads")
+    if (
+        isinstance(threads, int)
+        and not isinstance(threads, bool)
+        and threads > 0
+    ):
+        try:
+            torch.set_num_threads(threads)
+            applied.append("torch_num_threads")
+        except (RuntimeError, ValueError) as error:
+            errors["torch_num_threads"] = str(error)
+    interop = determinism.get("torch_num_interop_threads")
+    if (
+        isinstance(interop, int)
+        and not isinstance(interop, bool)
+        and interop > 0
+    ):
+        try:
+            if torch.get_num_interop_threads() != interop:
+                torch.set_num_interop_threads(interop)
+            applied.append("torch_num_interop_threads")
+        except (RuntimeError, ValueError) as error:
+            errors["torch_num_interop_threads"] = str(error)
+
+    env_names = {
+        "cublas_workspace_config": "CUBLAS_WORKSPACE_CONFIG",
+        "omp_num_threads": "OMP_NUM_THREADS",
+        "mkl_num_threads": "MKL_NUM_THREADS",
+    }
+    for name, env_name in env_names.items():
+        if name not in determinism:
+            continue
+        value = determinism.get(name)
+        if value is None:
+            os.environ.pop(env_name, None)
+            applied.append(name)
+        elif isinstance(value, str):
+            os.environ[env_name] = value
+            applied.append(name)
+    return {"applied": applied, "errors": errors}
+
+
 def check_environment_snapshot(
     path: Path,
     *,
@@ -40462,12 +40591,17 @@ def check_environment_snapshot(
     与数据相同，浮点归约顺序也可能不同，不能把结果当作逐位复现。
     """
     expected, source = load_environment_snapshot(Path(path))
+    # 确定性/线程开关是运行期配置，不是安装环境；先按归档值恢复，
+    # 否则全新进程的 PyTorch 默认值会让同一环境必然 MISMATCH。
+    applied = _apply_environment_determinism(expected)
     actual = build_environment_snapshot(_snapshot_device(expected))
     report = compare_environment_snapshots(expected, actual)
     report.update({
         "source": str(source),
         "strict": bool(strict),
         "schema": expected.get("schema"),
+        "applied_environment_settings": applied["applied"],
+        "environment_setting_errors": applied["errors"],
         "ok": (
             report["strict_ok"] if strict else report["ok"]
         ),

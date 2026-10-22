@@ -4602,6 +4602,63 @@ class EnvironmentSnapshotTests(unittest.TestCase):
             report["expected_environment_id_consistent"]
         )
 
+    def test_check_environment_restores_run_time_determinism(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "environment.json"
+            snapshot = experiment.build_environment_snapshot()
+            path.write_text(
+                json.dumps(snapshot), encoding="utf-8"
+            )
+            determinism = snapshot["determinism"]
+            old_deterministic = (
+                torch.are_deterministic_algorithms_enabled()
+            )
+            old_warn = (
+                torch.is_deterministic_algorithms_warn_only_enabled()
+            )
+            old_cudnn_deterministic = (
+                torch.backends.cudnn.deterministic
+            )
+            old_cudnn_benchmark = torch.backends.cudnn.benchmark
+            try:
+                # 模拟全新核对进程的默认状态：训练入口设置的
+                # 确定性开关尚未应用。
+                torch.use_deterministic_algorithms(
+                    not bool(
+                        determinism["deterministic_algorithms"]
+                    ),
+                    warn_only=not bool(
+                        determinism[
+                            "deterministic_algorithms_warn_only"
+                        ]
+                    ),
+                )
+                torch.backends.cudnn.deterministic = not bool(
+                    determinism["cudnn_deterministic"]
+                )
+                torch.backends.cudnn.benchmark = not bool(
+                    determinism["cudnn_benchmark"]
+                )
+                report = experiment.check_environment_snapshot(path)
+            finally:
+                torch.use_deterministic_algorithms(
+                    old_deterministic, warn_only=old_warn
+                )
+                torch.backends.cudnn.deterministic = (
+                    old_cudnn_deterministic
+                )
+                torch.backends.cudnn.benchmark = old_cudnn_benchmark
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(
+            report["actual_environment_id"],
+            snapshot["environment_id"],
+        )
+        self.assertIn(
+            "deterministic_algorithms",
+            report["applied_environment_settings"],
+        )
+        self.assertEqual(report["environment_setting_errors"], {})
+
     def test_config_summary_id_must_match_environment_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
