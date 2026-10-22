@@ -13919,6 +13919,16 @@ def run_statistical_baseline(
         "run_metadata": ngram_run_metadata,
         "sanity_check": None,
     }
+    # 与神经训练入口一致：环境快照单独落一份 environment.json，
+    # config.json 顶层只保留带文件哈希的摘要。统计基线也是独立
+    # 实验单元，--check-environment 与归档清单必须能核对它产自
+    # 哪套数值环境。
+    environment_record = write_run_environment_record(
+        out_dir,
+        ngram_run_metadata,
+    )
+    if environment_record is not None:
+        payload["environment"] = environment_record
     payload["comparison_protocol_sha256"] = _sha256_text(
         json.dumps(
             _json_safe(payload["comparison_protocol"]),
