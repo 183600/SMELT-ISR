@@ -4782,6 +4782,37 @@ def _normalize_clean_against_test(args: object) -> bool:
     return effective
 
 
+def _saved_clean_against_test_effective(
+    saved_args: object,
+) -> bool:
+    """
+    从检查点/配置的 args 快照还原「清洗是否读取 test」。
+
+    旧代码可能只记录了两个同义入口中的一个（且另一个为
+    False）；必须按任一为真归一化，不能因为
+    ``clean_train_against_test`` 键存在就忽略
+    ``allow_eval_content_for_cleaning=True``。两个键都缺的
+    更老检查点按历史行为回退：启用了去重/共享块清洗即读取
+    test。
+    """
+    if not isinstance(saved_args, dict):
+        return False
+    if (
+        "clean_train_against_test" in saved_args
+        or "allow_eval_content_for_cleaning" in saved_args
+    ):
+        return bool(
+            saved_args.get("clean_train_against_test", False)
+            or saved_args.get(
+                "allow_eval_content_for_cleaning", False
+            )
+        )
+    return bool(
+        saved_args.get("deduplicate_train_groups", False)
+        or saved_args.get("drop_train_shared_chunks", False)
+    )
+
+
 def _iter_group_boundaries(
     buf: bytearray,
     separator: bytes,
@@ -21880,14 +21911,7 @@ def experiment_protocol_from_payload(
         # 共享块清洗就会读取 test。不能默认成新版的 False，
         # 否则会把「旧运行实际用过 test」误报成与新运行一致。
         "clean_train_against_test": (
-            bool(run_args.get("clean_train_against_test", False))
-            if "clean_train_against_test" in run_args
-            else bool(
-                run_args.get("deduplicate_train_groups", False)
-                or run_args.get(
-                    "drop_train_shared_chunks", False
-                )
-            )
+            _saved_clean_against_test_effective(run_args)
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
@@ -57837,22 +57861,9 @@ def main():
         # 与清洗开关一样是采样轨迹的一部分。旧检查点没有该键
         # 时回填历史行为（启用去重/共享块清洗即读取 test），
         # 不能按新默认值静默改变续跑的数据口径。
-        if "clean_train_against_test" in saved_args:
-            saved_clean_test = bool(
-                saved_args.get("clean_train_against_test")
-            )
-        elif "allow_eval_content_for_cleaning" in saved_args:
-            # 旧检查点可能只记录了两个同义入口中的另一个。
-            saved_clean_test = bool(
-                saved_args.get("allow_eval_content_for_cleaning")
-            )
-        else:
-            saved_clean_test = bool(
-                saved_args.get("deduplicate_train_groups", False)
-                or saved_args.get(
-                    "drop_train_shared_chunks", False
-                )
-            )
+        saved_clean_test = _saved_clean_against_test_effective(
+            saved_args
+        )
         if saved_clean_test and not (
             args.deduplicate_train_groups
             or args.drop_train_shared_chunks

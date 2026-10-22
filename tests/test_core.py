@@ -1603,6 +1603,36 @@ class PreregistrationTests(unittest.TestCase):
             sys.argv = original_argv
         self.assertIn("不在预注册", error)
 
+    def test_saved_cleaning_alias_uses_effective_or(self):
+        # 旧检查点可能只把 allow_eval_content_for_cleaning 记为
+        # True，而 clean_train_against_test 仍是 argparse 默认
+        # False；有效口径应为 OR，不能按单键取 False。
+        self.assertTrue(
+            experiment._saved_clean_against_test_effective({
+                "clean_train_against_test": False,
+                "allow_eval_content_for_cleaning": True,
+            })
+        )
+        self.assertTrue(
+            experiment._saved_clean_against_test_effective({
+                "clean_train_against_test": True,
+                "allow_eval_content_for_cleaning": False,
+            })
+        )
+        # 两个键都缺的最老检查点按历史行为回退。
+        self.assertTrue(
+            experiment._saved_clean_against_test_effective({
+                "deduplicate_train_groups": True,
+            })
+        )
+        self.assertFalse(
+            experiment._saved_clean_against_test_effective({
+                "clean_train_against_test": False,
+                "allow_eval_content_for_cleaning": False,
+                "deduplicate_train_groups": True,
+            })
+        )
+
     def test_resume_restores_cleaning_justification(self):
         args = self._args(domain_justification=None)
         saved = {
