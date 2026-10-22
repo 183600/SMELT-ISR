@@ -47,6 +47,10 @@
   "seeds": [42, 43, 44, 45, 46, 47],
   "budget_match": "smelt",
   "equivalence_margin": 0.01,
+  "run_order": {
+    "scheme": "randomized",
+    "seed": 20261022
+  },
   "data": {
     "sha256": "<corpus sha256>",
     "split_policy": "contiguous",
@@ -90,6 +94,21 @@
   与文件集合完全一致；显式 `--seed`、`--resume` 或最终
   `--evaluate-test` 使用其中一个；两者都未给出时自动按文件
   种子集合运行完整套件。
+- `power`（可选）是先验功效分析：`expected_seed_sd_relative`
+  （预期种子间标准差，相对基线均值）、`target_power`、`alpha`
+  与可选 `planned_comparisons`（默认等于 `comparisons` 数量，
+  不得更小）。按 Bonferroni 下界 `alpha/m` 与稳健符号翻转
+  要求计算所需种子数；当前 `seeds` 不足时默认拒绝启动。确需
+  在功效不足的设计上探索时，必须写
+  `underpowered_acknowledged: true` 并给出非空
+  `justification`，承认会随 `config.json` 的
+  `preregistration.power` 落盘。详见
+  [design_preparation.md](design_preparation.md)。
+- `run_order`（可选）冻结执行顺序：`scheme` 为 `grouped` /
+  `blocked` / `randomized`，`seed` 为确定性洗牌种子。推荐
+  `randomized`（随机化完整区组）：每个种子区组内所有臂都跑
+  一次、臂顺序随机化，避免机器漂移与臂效应混杂。命令行
+  `--run-order` / `--run-order-seed` 显式冲突时拒绝启动。
 - `budget_match` 为 `null` 或模式名；非 null 时等价于
   `--budget-match` 的完整计算图硬门。它按**本次运行的候选
   模式**解释：同一 study 若既包含 `base`（循环次数不同，
@@ -110,6 +129,39 @@
   `A`/`B` 与 `smelt` 时 `budget_match` 不能为 `null`。
   确需研究其它问题时，在 `notes` 中写明并单独预注册，
   不能靠删掉对照让预算/归因检查静默失效。
+
+### 2.1 设计预检（训练前，不烧算力）
+
+若在预注册中声明先验功效，示例（8 个种子、5 个比较，
+`expected_seed_sd_relative=0.005`、`min_effect=0.01` 时
+`required_seeds=8`，恰好充足；实际数值必须由试点/先前运行
+估计，不能照抄）：
+
+```json
+"seeds": [42, 43, 44, 45, 46, 47, 48, 49],
+"power": {
+  "expected_seed_sd_relative": 0.005,
+  "target_power": 0.8,
+  "alpha": 0.05,
+  "planned_comparisons": 5
+}
+```
+
+写好预注册文件后，先用 `--plan-design` 检查设计是否可执行：
+
+```bash
+python experiment.py --data corpus.txt --out runs/confirm-design \
+  --preregistration preregistration.json \
+  --suite-modes smelt local_base local_base_k2 A B B_early \
+  --run-order randomized --run-order-seed 20261022 \
+  --plan-design --hypothesis "延迟合并在完整计算图匹配下改善验证损失"
+```
+
+它不加载数据、不训练，只写出 `<out>/design_plan.json` 并打印
+运行清单、随机化区组顺序、先验功效与解析 token 预算。确认后
+再冻结代码并正式运行；正式运行会用同一 `--run-order-seed`
+重建同一顺序，子进程逐项核对计划指纹与自己的分配。详见
+[design_preparation.md](design_preparation.md)。
 
 运行入口：
 
@@ -159,6 +211,9 @@ python experiment.py --data corpus.txt --out runs/confirm \
 
 - 不根据验证结果改代码、改种子或改主指标；早停只作为**固定预算
   之外**的辅助结果报告。
+- 套件父进程在第一个子进程启动前写 `design_plan.json`；子进程
+  核对计划文件 SHA-256、`plan_id`、顺序/区组与自己的 label/seed/
+  mode 后才训练。实际开始/结束时间写 `run_order.json`。
 - 每臂保留失败目录；`failure_rate` 与成功条件指标一起报告。
 - 每臂至少一次 `--routing-interventions`（可选但建议），用于
   RQ4 的功能证据。
@@ -180,6 +235,10 @@ python experiment.py --data corpus.txt --out runs/confirm \
   的对比不能写成稳健结论，应增加独立种子或调查异常运行后
   重跑；n=3 的设计删除后不足最小种子数，标为
   `not_evaluable`，不能当作「删除后仍显著」。
+- 报告 `run_order`：计划指纹是否一致、是否仍用 `grouped`
+  顺序、去模式均值后指标与执行顺序的 Spearman 相关。强顺序
+  相关先检查机器负载/热漂移并重跑受影响区组，不能直接把臂间
+  差异解释为方法效应。该诊断是描述性的，不替代随机化设计。
 - 路由结论必须带机会水平（`jaccard_chance_*`、`lift`）与干预
   结果，不能只报负载熵/死专家数。
 

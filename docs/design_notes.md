@@ -365,6 +365,49 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   主检验；但它把「显著但只靠少数种子」与「多数种子同向且
   删除后仍显著」区分开。
 
+## 实验设计与准备
+
+训练前的设计与分析阶段同样重要：一个功效不足或顺序混杂的
+设计，无法靠事后统计补救。当前实现把三项准备动作落到代码：
+
+- **先验功效（`power`）**：预注册文件可声明
+  `expected_seed_sd_relative`（预期种子间标准差，相对基线
+  均值）、`target_power`、`alpha` 与可选
+  `planned_comparisons`（默认等于 `comparisons` 数量，不得
+  更小）。`preregistration_power_plan` 按 Bonferroni 下界
+  `alpha/m` 计算配对 t 所需种子数，并同时满足精确符号翻转
+  所需 `ceil(log2(2m/alpha))`，取较大值作为
+  `required_seeds`。种子数不足时预注册入口默认拒绝启动；
+  确需探索时必须写 `underpowered_acknowledged: true` 与
+  `justification`，承认随 `config.json` 的
+  `preregistration.power` 落盘。
+- **随机化完整区组（`run_order`）**：`--run-order
+  {grouped,blocked,randomized}` 与 `--run-order-seed` 控制
+  套件执行顺序，默认 `randomized`——每个种子是一个完整区组，
+  区组内所有臂都跑一次、臂顺序由 `(order_seed, seed)` 确定性
+  洗牌。`grouped` 保留历史顺序，但模式与时间/机器漂移完全
+  混杂，只用于兼容旧运行。预注册可用 `run_order` 冻结方案与
+  种子，命令行显式冲突拒绝启动。
+- **设计计划（`design_plan.json`）**：套件父进程在训练前
+  写运行清单、执行顺序/区组、先验功效、种子计划与解析 token
+  预算，`plan_id` 是去掉时间戳后的规范化指纹。
+  `--plan-design` 只生成/打印计划、不加载数据也不训练，供
+  冻结前检查。子进程通过环境变量收到计划文件、SHA-256、
+  `plan_id` 与 (order_index, block, position)，开跑前重新
+  哈希并核对 label/seed/mode/balance；计划被改或分配不符即
+  拒绝训练。实际开始/结束时间写 `<out>/run_order.json`
+  （失败条目也保留），父进程结束后再核对全部子运行的
+  `plan_id` 一致。
+- **顺序漂移诊断（`run_order`）**：`--compare` 与套件汇总
+  报告计划指纹是否混杂、是否仍使用 grouped、去模式均值后
+  指标与执行顺序的 Spearman 相关与近似 p 值、各模式内部的
+  顺序相关。强相关以 `[warn]` 提示先检查机器负载/热漂移或
+  重跑受影响区组；这是描述性诊断，不是把时间作为协变量的
+  正式区组模型，随机化只能平衡漂移、不能消除它。
+
+完整字段、计算口径与推荐流程见
+[design_preparation.md](design_preparation.md)。
+
 ## 对比实验与消融协议
 
 对比结论只有在「除待验证模块外，其余设置完全一致」时才可信。
@@ -845,7 +888,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   降级为「不能归因」。
 - **汇总报告**：套件运行结束后把受控变量检查、聚合统计、
   单因子对比、消融覆盖、因子主效应/交互与混杂降级结果写入
-  `<out>/comparison_analysis.json`；`--compare` 只读运行
+  `<out>/comparison_analysis.json`（另含 `design` 设计计划摘要
+  与 `run_order` 顺序漂移诊断）；`--compare` 只读运行
   目录、不写文件。
 
 ## 可复现性与实验追踪
@@ -952,6 +996,11 @@ A B）、`--allow-underpowered`（显式允许套件在 <3 个种子下
 `--baseline-tuning-mode` 选模式）。关键套件至少需要 3 个
 不同随机种子，否则直接报错；3~5 个只能支持 t 检验，稳健双检验
 至少需要 6 个种子，否则用显式豁免并标记 `robust_claim_possible=false`。
+设计准备相关：`--plan-design`（只生成/打印
+`design_plan.json`，不训练）、`--run-order
+{grouped,blocked,randomized}`（默认 randomized 完整区组）、
+`--run-order-seed`（确定性洗牌种子）；预注册文件另有可选
+`power` 与 `run_order` 块。
 套件逐进程调用自身，结束后自动输出完整对比分析并写入
 `<out>/comparison_analysis.json`（调参套件写
 `<out>/baseline_tuning.json`）。基线训练可用

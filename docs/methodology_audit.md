@@ -489,6 +489,49 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 不是反复换种子直到显著；n=3 的设计无法做删除后仍满足最小
 种子数的检验，只能标为不可判定。
 
+## 27. 实验设计与准备（本轮补充）
+
+**判定：原预注册只要求「至少 3 个种子」，但没有训练前的功效
+论证；套件执行顺序按模式分组，时间/机器漂移与处理效应完全
+混杂。** 3 个种子只保证 t 检验可算，不保证能检出预注册的最小
+效应；而把所有 A 的种子跑完再跑 B，会让热漂移、缓存预热与
+集群负载变化系统性地落在某个臂上。两类问题都无法在分析阶段
+用统计方法补救，必须在准备阶段修。
+
+**已修正：**
+
+- 新增预注册可选 `power` 块：声明预期种子间标准差（相对基线
+  均值）、目标功效、alpha 与家族规模，按 Bonferroni 下界
+  `alpha/m` 计算配对 t 所需种子数，并同时满足精确符号翻转
+  所需 `ceil(log2(2m/alpha))`。种子数不足时默认拒绝启动；
+  显式 `underpowered_acknowledged=true` 必须给出 justification，
+  承认随 `config.json` 的 `preregistration.power` 落盘。
+- 新增 `--plan-design`：不加载数据、不训练，只生成/打印
+  `design_plan.json`——运行清单、随机化区组顺序、先验功效与
+  解析 token 预算，供冻结前检查。
+- 新增 `--run-order {grouped,blocked,randomized}` 与
+  `--run-order-seed`，默认 `randomized`：每个种子是完整区组，
+  区组内臂顺序确定性随机化；`grouped` 仅保留用于兼容旧运行。
+  预注册可用 `run_order` 冻结方案与种子，命令行冲突拒绝启动。
+- `design_plan.json` 的 `plan_id` 是去掉时间戳后的规范化指纹；
+  子进程通过环境变量收到计划文件、SHA-256、`plan_id` 与
+  (order_index, block, position)，开跑前重新哈希并核对
+  label/seed/mode/balance。计划被改、指纹不符或分配不符都
+  拒绝训练，而不是先跑完再在报告里解释。
+- 实际开始/结束时间写入 `<out>/run_order.json`（失败条目也
+  保留）；套件结束后父进程核对全部子运行的 `plan_id` 一致。
+- `--compare` 与套件汇总新增 `run_order` 诊断：计划指纹是否
+  混杂、是否仍用 grouped、去模式均值后指标与执行顺序的
+  Spearman 相关与近似 p 值、每个模式内部的顺序相关。强相关
+  以 `[warn]` 提示先查机器漂移，不能直接解释臂间差异。
+
+仍有限制：这是**随机化与描述性诊断**，不是把时间作为协变量的
+正式区组模型；每个区组内只有一次观测，无法估计区组×处理交互。
+`power` 的预期标准差仍由研究者声明，声明过小会低估所需种子数；
+`required_seeds` 只是设计阶段近似，不替代分析阶段的 MDE 与
+等价性检验。机器/负载漂移若与区组内位置相关，随机化只能平衡、
+不能消除，仍需调查或重跑。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -497,17 +540,24 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 2. 固定数据协议：`--split-policy chronological` + 时间清单，
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
    默认 val-only 清洗。
-3. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
-   **至少 6 个种子**，固定 `--common-step` 与训练预算；
-   用 `--budget-match` 报告完整计算图比例。
-4. 统计：主检验配对 t + 符号翻转（明确对称性假设）；报告
-   失败率、MDE、门槛检验、TOST 与 `fragility_summary`；
-   删除种子后不再显著的结论不能写成稳健，不把不显著读成等价。
-5. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
+3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
+   最小效应、目标功效）与 `run_order`（randomized + 种子），
+   用 `--plan-design` 检查所需种子数、随机化区组与 token 预算；
+   功效不足时先加种子，而不是跑完再解释。
+4. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
+   **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
+   固定 `--common-step` 与训练预算；用 `--budget-match` 报告
+   完整计算图比例；按同一 `--run-order-seed` 执行随机化区组。
+5. 统计：主检验配对 t + 符号翻转（明确对称性假设）；报告
+   失败率、MDE、门槛检验、TOST、`fragility_summary` 与
+   `run_order`；删除种子后不再显著的结论不能写成稳健，
+   不把不显著读成等价；顺序强相关先查漂移。
+6. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
    每个候选只解封一次；用 `--final-test-comparison` 报告全部
    候选，而不是只报告最好的那个。
-6. 外部归档：把 `git archive`、全部 config/metrics（含失败）、
-   分析脚本与最终报告上传到不可变存储，记录 DOI/校验和。
-   归档前对每个最终运行目录执行 `--write-manifest`，上传/
-   解压后再执行 `--verify-manifest --verify-manifest-strict`；
-   清单是快照，续跑或补测后必须重新生成。
+7. 外部归档：把 `git archive`、全部 config/metrics（含失败）、
+   `design_plan.json`/`run_order.json`、分析脚本与最终报告
+   上传到不可变存储，记录 DOI/校验和。归档前对每个最终运行
+   目录执行 `--write-manifest`，上传/解压后再执行
+   `--verify-manifest --verify-manifest-strict`；清单是快照，
+   续跑或补测后必须重新生成。

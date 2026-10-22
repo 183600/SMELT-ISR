@@ -9,10 +9,12 @@ import importlib.util
 import io
 import json
 import math
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import torch
@@ -580,6 +582,396 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(arms["A"]["planned_runs"], 2)
         self.assertEqual(arms["A"]["failed_runs"], 1)
         self.assertAlmostEqual(arms["A"]["failure_rate"], 0.5)
+
+
+class DesignPreparationTests(unittest.TestCase):
+    """先验功效、随机化区组顺序与设计计划核对。"""
+
+    def _payload(self):
+        return {
+            "study_id": "smelt-isr-design-test",
+            "frozen_commit": "a" * 40,
+            "primary_metric": "val_loss",
+            "common_step": 100,
+            "min_effect": 0.01,
+            "direction": "decrease",
+            "baseline_mode": "smelt",
+            "comparisons": [
+                ["smelt", "A"],
+                ["smelt", "B"],
+            ],
+            "seeds": [42, 43, 44],
+            "budget_match": "smelt",
+            "steps": 200,
+            "data": {
+                "sha256": "b" * 64,
+                "split_policy": "contiguous",
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+            },
+        }
+
+    def _args(self, **overrides):
+        values = dict(
+            primary_metric=None,
+            hypothesis_direction=None,
+            hypothesis_min_effect=None,
+            hypothesis_baseline=None,
+            common_step=None,
+            budget_match=None,
+            equivalence_margin=0.01,
+            steps=200,
+            seeds=None,
+            seed=42,
+            mode="A",
+            statistical_baseline=False,
+            resume=None,
+            evaluate_test=False,
+            run_order=None,
+            run_order_seed=None,
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_order_sweep_plan_randomized_complete_blocks(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=["A", "B"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        grouped = experiment.order_sweep_plan(
+            plan, "grouped", 0
+        )
+        self.assertEqual(
+            [item["label"] for item in grouped],
+            [item["label"] for item in plan],
+        )
+        self.assertEqual(
+            [item["order_index"] for item in grouped],
+            [1, 2, 3, 4, 5, 6],
+        )
+
+        blocked = experiment.order_sweep_plan(
+            plan, "blocked", 0
+        )
+        for block in (1, 2, 3):
+            labels = [
+                item["label"]
+                for item in blocked
+                if item["block"] == block
+            ]
+            self.assertEqual(
+                labels, [f"A_seed{block}", f"B_seed{block}"]
+            )
+
+        randomized = experiment.order_sweep_plan(
+            plan, "randomized", 7
+        )
+        repeated = experiment.order_sweep_plan(
+            plan, "randomized", 7
+        )
+        self.assertEqual(
+            [item["label"] for item in randomized],
+            [item["label"] for item in repeated],
+        )
+        for block in (1, 2, 3):
+            block_items = [
+                item
+                for item in randomized
+                if item["block"] == block
+            ]
+            self.assertEqual(len(block_items), 2)
+            self.assertEqual(
+                {item["mode"] for item in block_items},
+                {"A", "B"},
+            )
+            self.assertEqual(
+                [item["position_in_block"] for item in block_items],
+                [1, 2],
+            )
+        # 随机化不是把整组顺序倒过来：不同区组可以使用不同的
+        # 臂顺序，且同一计划必须可复现。
+        different = experiment.order_sweep_plan(
+            plan, "randomized", 11
+        )
+        self.assertNotEqual(
+            [item["label"] for item in randomized],
+            [item["label"] for item in different],
+        )
+
+    def test_run_order_drift_detects_monotonic_trend(self):
+        rows = []
+        for index, (mode, value) in enumerate(
+            (
+                ("A", 1.0),
+                ("B", 2.0),
+                ("A", 3.0),
+                ("B", 4.0),
+                ("A", 5.0),
+                ("B", 6.0),
+            ),
+            start=1,
+        ):
+            rows.append({
+                "run": f"{mode}{index}",
+                "mode": mode,
+                "val_loss": value,
+                "design_order_index": index,
+                "design_block": index,
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": "randomized",
+            })
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertTrue(report["available"])
+        self.assertGreater(
+            abs(report["detrended_spearman"]), 0.9
+        )
+        self.assertEqual(report["verdict"], "warn")
+        self.assertTrue(report["warnings"])
+
+    def test_run_order_drift_flags_grouped_scheme(self):
+        rows = [
+            {
+                "run": f"A{seed}",
+                "mode": "A",
+                "val_loss": 1.0 + seed,
+                "design_order_index": seed,
+                "design_block": seed,
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": "grouped",
+            }
+            for seed in (1, 2, 3)
+        ]
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertEqual(report["verdict"], "warn")
+        self.assertTrue(
+            any("grouped" in warning for warning in report["warnings"])
+        )
+
+    def test_preregistration_power_rejects_underpowered_design(self):
+        payload = self._payload()
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.05,
+            "target_power": 0.8,
+            "alpha": 0.05,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("power", error)
+        self.assertIn("不足", error)
+
+        payload["power"]["underpowered_acknowledged"] = True
+        payload["power"]["justification"] = "探索性试点"
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        record = experiment.preregistration_record(
+            payload,
+            "prereg.json",
+            "c" * 64,
+            [],
+            self._args(),
+        )
+        self.assertFalse(record["power"]["adequate"])
+        self.assertTrue(
+            record["power"]["underpowered_acknowledged"]
+        )
+
+    def test_preregistration_power_accepts_adequate_design(self):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 62))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+        }
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        plan = experiment.preregistration_power_plan(
+            payload["power"], 0.01, len(payload["seeds"]), 2
+        )
+        self.assertTrue(plan["adequate"])
+        self.assertEqual(plan["required_seeds_for_t"], 3)
+        self.assertEqual(
+            plan["required_seeds_for_robust_sign_flip"], 7
+        )
+        self.assertEqual(plan["required_seeds"], 7)
+
+    def test_preregistration_power_cannot_understate_family(self):
+        payload = self._payload()
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 1,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("planned_comparisons", error)
+
+    def test_preregistration_run_order_applied_and_conflict_rejected(self):
+        payload = self._payload()
+        payload["run_order"] = {
+            "scheme": "randomized",
+            "seed": 7,
+        }
+        args = self._args()
+        with mock.patch.object(
+            sys, "argv", ["experiment.py"]
+        ):
+            applied, error = experiment.preregistration_apply(
+                args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+                current_script_sha256="c" * 64,
+            )
+        self.assertIsNone(error)
+        self.assertIn("run_order.scheme", applied)
+        self.assertEqual(args.run_order, "randomized")
+        self.assertEqual(args.run_order_seed, 7)
+
+        conflict_args = self._args(run_order="grouped")
+        with mock.patch.object(
+            sys, "argv", ["experiment.py", "--run-order", "grouped"]
+        ):
+            _, error = experiment.preregistration_apply(
+                conflict_args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+                current_script_sha256="c" * 64,
+            )
+        self.assertIsNotNone(error)
+        self.assertIn("run_order", error)
+
+    def test_design_plan_roundtrip_and_tamper_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                preregistration_record=None,
+                run_order="randomized",
+                run_order_seed=5,
+            )
+            plan = experiment.build_sweep_plan(
+                seeds=[1, 2, 3],
+                modes=["A", "B"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            ordered = experiment.order_sweep_plan(
+                plan, "randomized", 5
+            )
+            design = experiment.write_design_plan(
+                root, ordered, "randomized", 5, args
+            )
+            self.assertEqual(design["planned_runs"], 6)
+            self.assertEqual(
+                design["training_budget"]["total_tokens"], 960
+            )
+            item = next(
+                entry
+                for entry in ordered
+                if entry["order_index"] == 3
+            )
+            child_args = argparse.Namespace(
+                out=str(root / str(item["label"])),
+                seed=item["seed"],
+                mode=item["mode"],
+                balance_coef=item["balance_coef"],
+            )
+            env = {
+                "SMELT_DESIGN_PLAN_FILE": str(design["path"]),
+                "SMELT_DESIGN_PLAN_SHA256": design[
+                    "file_sha256"
+                ],
+                "SMELT_DESIGN_PLAN_ID": design["plan_id"],
+                "SMELT_DESIGN_ORDER_SCHEME": design[
+                    "order_scheme"
+                ],
+                "SMELT_DESIGN_ORDER_SEED": str(
+                    design["order_seed"]
+                ),
+                "SMELT_DESIGN_ORDER_INDEX": str(
+                    item["order_index"]
+                ),
+                "SMELT_DESIGN_BLOCK": str(item["block"]),
+                "SMELT_DESIGN_BLOCK_POSITION": str(
+                    item["position_in_block"]
+                ),
+            }
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                assignment = experiment.verify_design_assignment(
+                    child_args
+                )
+            self.assertEqual(
+                assignment["order_index"], item["order_index"]
+            )
+            self.assertEqual(
+                assignment["plan_id"], design["plan_id"]
+            )
+
+            # 计划文件在开跑前被改：指纹不一致必须拒绝。
+            path = Path(design["path"])
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["runs"][0]["label"] = "tampered"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    experiment.verify_design_assignment(child_args)
+
+    def test_design_plan_consistency_detects_missing_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / "good"
+            bad = root / "bad"
+            missing = root / "missing"
+            for path, plan_id in (
+                (good, "plan-1"),
+                (bad, "plan-2"),
+                (missing, None),
+            ):
+                path.mkdir()
+                payload = {}
+                if plan_id is not None:
+                    payload["design_assignment"] = {
+                        "plan_id": plan_id
+                    }
+                (path / "config.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            error = experiment.design_plan_consistency_error(
+                [str(good)], "plan-1"
+            )
+            self.assertIsNone(error)
+            error = experiment.design_plan_consistency_error(
+                [str(good), str(bad), str(missing)], "plan-1"
+            )
+            self.assertIsNotNone(error)
+            self.assertIn("bad", error)
+            self.assertIn("missing", error)
 
 
 class RoutingTests(unittest.TestCase):

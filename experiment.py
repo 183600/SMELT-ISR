@@ -20509,6 +20509,37 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             key for key in provenance_keys if key in metadata
         )
 
+        # 执行顺序设计：套件父进程在训练前写入 design_plan.json，
+        # 子进程把自己的分配（计划指纹/序号/区组位置）写入
+        # config.json。分析期用它诊断时间漂移与「计划被替换」。
+        assignment = config_payload.get("design_assignment")
+        if not isinstance(assignment, dict):
+            assignment = {}
+        row["design_assignment"] = assignment or None
+        row["design_plan_id"] = assignment.get("plan_id")
+        row["design_plan_file_sha256"] = assignment.get(
+            "plan_file_sha256"
+        )
+        row["design_order_scheme"] = assignment.get(
+            "order_scheme"
+        )
+        row["design_order_seed"] = assignment.get("order_seed")
+        row["design_order_index"] = assignment.get(
+            "order_index"
+        )
+        row["design_block"] = assignment.get("block")
+        row["design_block_position"] = assignment.get(
+            "position_in_block"
+        )
+        original_metadata = config_payload.get(
+            "original_run_metadata"
+        )
+        if not isinstance(original_metadata, dict):
+            original_metadata = metadata
+        row["run_started_utc"] = original_metadata.get(
+            "timestamp_utc"
+        )
+
         row["n_params"] = config_payload.get("n_params")
 
         efficiency = config_payload.get("efficiency") or {}
@@ -31206,9 +31237,40 @@ _PREREGISTRATION_OPTIONAL_FIELDS = (
     "equivalence_margin",
     "steps",
     "frozen_script_sha256",
+    "power",
+    "run_order",
     "notes",
     "metadata",
 )
+
+# 预注册的**先验功效分析**（power）与**运行顺序设计**
+# （run_order）。二者回答的是「训练开始前，这个设计有没有
+# 能力回答研究问题」，而不是训练结束后的解释：
+# - power：声明预期种子间标准差与最小有意义效应，按家族
+#   校正后的 alpha 计算所需种子数；种子数不足时默认拒绝，
+#   除非显式承认并写明理由；
+# - run_order：把「哪个臂先跑」从便利顺序变成预先声明的
+#   随机化完整区组（randomized complete block），避免机器
+#   热漂移/负载漂移与处理效应混杂。
+_POWER_KEYS = (
+    "expected_seed_sd_relative",
+    "target_power",
+    "alpha",
+    "planned_comparisons",
+    "underpowered_acknowledged",
+    "justification",
+)
+
+_RUN_ORDER_KEYS = ("scheme", "seed")
+
+# grouped 保留历史顺序（按模式分组，时间漂移与臂完全混杂）；
+# blocked 按种子成区组、区组内保持原有臂顺序；randomized 在
+# 每个种子区组内随机化臂顺序（推荐的确证设计）。
+_RUN_ORDER_SCHEMES = ("grouped", "blocked", "randomized")
+
+_DESIGN_PLAN_SCHEMA_VERSION = 1
+_DESIGN_PLAN_FILENAME = "design_plan.json"
+_RUN_ORDER_FILENAME = "run_order.json"
 
 _PREREGISTRATION_DATA_OPTIONAL_FIELDS = (
     "group_separator",
@@ -31249,6 +31311,69 @@ def _preregistration_sha256_text(value: object) -> bool:
         isinstance(value, str)
         and re.fullmatch(r"[0-9a-fA-F]{64}", value)
     )
+
+
+def preregistration_power_plan(
+    power: Dict[str, object],
+    min_effect: float,
+    n_seeds: int,
+    comparisons_count: int,
+) -> Dict[str, object]:
+    """
+    先验功效分析：在训练前判断预注册的种子数能否检出预注册
+    的最小有意义效应。
+
+    预期种子间标准差与最小效应都按**相对基线均值**解释，因此
+    二者相除后是尺度无关的效应量（Cohen's d 的配对版本），
+    不需要事先知道基线均值。多重比较按 Bonferroni 下界
+    ``alpha / planned_comparisons`` 计算；这与分析阶段的 Holm
+    首步阈值一致，是保守口径，不会把功效说得比实际更乐观。
+
+    同时给出精确符号翻转在家族校正下所需的最小种子数。稳健
+    主张（配对 t 与符号翻转同时显著）要求二者都满足；只用 t
+    检验的主张仍可用 ``required_seeds_for_t`` 判断。
+    """
+    sd = float(power["expected_seed_sd_relative"])
+    target = float(power.get("target_power", _TARGET_POWER))
+    alpha = float(power.get("alpha", _SIGNIFICANCE_LEVEL))
+    planned_comparisons = int(
+        power.get("planned_comparisons", comparisons_count)
+    )
+    family_size = max(1, planned_comparisons)
+    alpha_adjusted = alpha / family_size
+    required_t = _seeds_to_detect(
+        float(min_effect),
+        sd,
+        target_power=target,
+        alpha=alpha_adjusted,
+    )
+    required_robust = _sign_flip_required_seeds(alpha, family_size)
+    required = max(required_t or 0, required_robust)
+    acknowledged = bool(
+        power.get("underpowered_acknowledged", False)
+    )
+    adequate = required_t is not None and n_seeds >= required
+    return {
+        "expected_seed_sd_relative": sd,
+        "min_effect_relative": float(min_effect),
+        "target_power": target,
+        "alpha": alpha,
+        "planned_comparisons": family_size,
+        "alpha_bonferroni": alpha_adjusted,
+        "required_seeds_for_t": required_t,
+        "required_seeds_for_robust_sign_flip": required_robust,
+        "required_seeds": required,
+        "planned_seeds": int(n_seeds),
+        "adequate": adequate,
+        "underpowered_acknowledged": acknowledged,
+        "justification": power.get("justification"),
+        "note": (
+            "所需种子数把声明的预期种子间标准差当作真实 sigma；"
+            "它本身也是估计，规划时应留余量。adequacy 只表示"
+            "设计在声明效应下有目标功效，不保证真实效应一定"
+            "达到最小有意义效应"
+        ),
+    }
 
 
 def preregistration_schema_error(
@@ -31424,6 +31549,147 @@ def preregistration_schema_error(
             "才能做显著性检验；预注册研究不能把单次运行当作"
             "可推断的重复实验"
         )
+
+    # 先验功效：种子数 ≥3 只保证 t 检验在数学上可算，不保证
+    # 能检出预注册的最小效应。power 块把「预期种子间波动」与
+    # 「最小有意义效应」一起固定，训练前就能发现「3 个种子
+    # 对 1% 效应几乎没有功效」这类注定不确定的设计。
+    power = payload.get("power", _PREREGISTRATION_MISSING)
+    if power is not _PREREGISTRATION_MISSING:
+        if not isinstance(power, dict):
+            return "power 必须是对象"
+        unknown_power = sorted(
+            set(power) - set(_POWER_KEYS)
+        )
+        if unknown_power:
+            return "power 含未知字段: " + ", ".join(
+                unknown_power
+            )
+        for key in (
+            "expected_seed_sd_relative",
+            "target_power",
+            "alpha",
+        ):
+            if key not in power:
+                return f"power 缺少必需字段: {key}"
+        error = _preregistration_finite_number(
+            power["expected_seed_sd_relative"],
+            "power.expected_seed_sd_relative",
+            minimum=0.0,
+        )
+        if error is not None:
+            return error
+        if float(power["expected_seed_sd_relative"]) <= 0.0:
+            return (
+                "power.expected_seed_sd_relative 必须是正数"
+                "（相对基线均值的种子间标准差）"
+            )
+        error = _preregistration_finite_number(
+            power["target_power"],
+            "power.target_power",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if error is not None:
+            return error
+        if not 0.0 < float(power["target_power"]) < 1.0:
+            return "power.target_power 必须在 (0, 1) 内"
+        error = _preregistration_finite_number(
+            power["alpha"],
+            "power.alpha",
+            minimum=0.0,
+            maximum=0.5,
+        )
+        if error is not None:
+            return error
+        if not 0.0 < float(power["alpha"]) < 0.5:
+            return "power.alpha 必须在 (0, 0.5) 内"
+        planned_comparisons = power.get(
+            "planned_comparisons", len(comparisons)
+        )
+        if (
+            isinstance(planned_comparisons, bool)
+            or not isinstance(planned_comparisons, int)
+            or planned_comparisons < 1
+        ):
+            return "power.planned_comparisons 必须是正整数"
+        if int(planned_comparisons) < len(comparisons):
+            return (
+                "power.planned_comparisons 小于 comparisons 数量："
+                "家族规模被低估会让功效与多重比较校正过于乐观"
+            )
+        acknowledged = power.get(
+            "underpowered_acknowledged", False
+        )
+        if not isinstance(acknowledged, bool):
+            return (
+                "power.underpowered_acknowledged 必须是布尔值"
+            )
+        justification = power.get("justification")
+        if justification is not None and not isinstance(
+            justification, str
+        ):
+            return "power.justification 必须是字符串"
+        if acknowledged and not str(justification or "").strip():
+            return (
+                "power.underpowered_acknowledged=true 时必须提供"
+                " non-empty justification，说明为何仍要在功效"
+                "不足的设计上运行"
+            )
+        plan = preregistration_power_plan(
+            power,
+            float(min_effect),
+            len(normalized_seeds),
+            len(comparisons),
+        )
+        if not plan["adequate"] and not plan["underpowered_acknowledged"]:
+            required_text = (
+                "无法在 128 个种子内达到目标功效"
+                if plan["required_seeds_for_t"] is None
+                else f"至少需要 {plan['required_seeds']} 个种子"
+            )
+            return (
+                "预注册 power 分析显示当前种子数 "
+                f"{len(normalized_seeds)} 不足：在预期种子间"
+                f"标准差 {plan['expected_seed_sd_relative']:g}、"
+                f"最小效应 {plan['min_effect_relative']:g}、"
+                f"家族规模 {plan['planned_comparisons']}、目标功效 "
+                f"{plan['target_power']:g} 下，{required_text}"
+                "（配对 t 口径 "
+                f"{plan['required_seeds_for_t']}，稳健符号翻转口径 "
+                f"{plan['required_seeds_for_robust_sign_flip']}）。"
+                "请增加 seeds，或在 power 中显式设置 "
+                "underpowered_acknowledged=true 并写明 justification"
+            )
+
+    run_order = payload.get("run_order", _PREREGISTRATION_MISSING)
+    if run_order is not _PREREGISTRATION_MISSING:
+        if not isinstance(run_order, dict):
+            return "run_order 必须是对象"
+        unknown_order = sorted(
+            set(run_order) - set(_RUN_ORDER_KEYS)
+        )
+        if unknown_order:
+            return "run_order 含未知字段: " + ", ".join(
+                unknown_order
+            )
+        if run_order.get("scheme") not in _RUN_ORDER_SCHEMES:
+            return (
+                "run_order.scheme 必须是 "
+                + " / ".join(_RUN_ORDER_SCHEMES)
+            )
+        order_seed = run_order.get("seed")
+        if (
+            isinstance(order_seed, bool)
+            or not isinstance(order_seed, int)
+            or order_seed < 0
+            or order_seed > MAX_SEED
+        ):
+            return (
+                "run_order.seed 必须是 [0, "
+                f"{MAX_SEED}] 内的整数（随机化顺序的可复现"
+                "种子）"
+            )
 
     budget_match = payload.get("budget_match")
     if budget_match is not None and (
@@ -31876,6 +32142,25 @@ def preregistration_apply(
         if error is not None:
             return applied, error
 
+    # 运行顺序也是预注册设计的一部分：同一份 study 若在训练前
+    # 声明了随机化完整区组，就不能在执行时改回按臂分组（后者
+    # 会让机器漂移与处理效应混杂）。
+    if "run_order" in payload:
+        run_order = payload["run_order"]
+        for attr, key in (
+            ("run_order", "scheme"),
+            ("run_order_seed", "seed"),
+        ):
+            error = assign(
+                attr,
+                f"run_order.{key}",
+                run_order[key],  # type: ignore[index]
+                numeric=(key == "seed"),
+                respect_explicit=True,
+            )
+            if error is not None:
+                return applied, error
+
     common_step = int(payload["common_step"])
     if int(getattr(args, "steps", 0) or 0) < common_step:
         return applied, (
@@ -32280,6 +32565,14 @@ def preregistration_record(
     args: argparse.Namespace,
 ) -> Dict[str, object]:
     """生成写入 config.json 的预注册核对记录。"""
+    power_record: Optional[Dict[str, object]] = None
+    if isinstance(payload.get("power"), dict):
+        power_record = preregistration_power_plan(
+            payload["power"],  # type: ignore[arg-type]
+            float(payload["min_effect"]),  # type: ignore[arg-type]
+            len(payload["seeds"]),  # type: ignore[arg-type]
+            len(payload["comparisons"]),  # type: ignore[arg-type]
+        )
     return {
         "source": str(source),
         "file_sha256": file_sha256,
@@ -32296,6 +32589,11 @@ def preregistration_record(
         "comparisons": payload.get("comparisons"),
         "seeds": payload.get("seeds"),
         "budget_match": payload.get("budget_match"),
+        # 先验功效与运行顺序是训练前设计的一部分：随每个运行
+        # 落盘，分析/归档时能核对「这个种子数当时是否被认为
+        # 足够」以及「执行顺序是否按预注册的区组随机化」。
+        "power": power_record,
+        "run_order": payload.get("run_order"),
         "applied_fields": list(applied_fields),
         "run_mode": getattr(args, "mode", None),
         "run_seed": getattr(args, "seed", None),
@@ -34643,6 +34941,7 @@ def print_comparison_analysis(
     coverage["randomness_unverified"] = randomness[
         "unverified"
     ]
+    order_audit = run_order_drift_report(rows, metric)
     factorial = factorial_effects(
         aggregates,
         group_keys,
@@ -36728,6 +37027,37 @@ def print_comparison_analysis(
             if isinstance(entry, dict)
         ]
 
+    print()
+    print("[order] 执行顺序/时间漂移诊断")
+    if not order_audit.get("available"):
+        print("  " + str(order_audit.get("reason")))
+    else:
+        rho = order_audit.get("detrended_spearman")
+        p_value = order_audit.get("detrended_p_value")
+        rho_text = (
+            f"{float(rho):+.2f}"
+            if isinstance(rho, (int, float))
+            else "NA"
+        )
+        p_text = (
+            f"{float(p_value):.3f}"
+            if isinstance(p_value, (int, float))
+            else "NA"
+        )
+        print(
+            f"  顺序方案={','.join(order_audit.get('order_schemes') or []) or 'NA'}，"
+            f"带顺序记录的运行={order_audit.get('n_runs')}，"
+            f"区组={order_audit.get('n_blocks')}；"
+            f"去模式均值后 ρ(order,{metric})={rho_text}（p={p_text}）"
+        )
+        for warning in order_audit.get("warnings") or []:
+            print(f"  [warn] {warning}")
+        if order_audit.get("verdict") == "ok":
+            print(
+                "  未发现强顺序相关；随机化区组平衡了时间片，"
+                "但描述性诊断不能证明没有漂移"
+            )
+
     return {
         "factors": factors,
         "metric": metric,
@@ -36767,6 +37097,7 @@ def print_comparison_analysis(
         "compute_matched": compute_matched,
         "common_step": common_step,
         "selection_bias": selection_bias,
+        "run_order": order_audit,
         "equivalence_margin": equivalence_margin,
         "equivalence_margin_preregistration": (
             margin_preregistration
@@ -38651,6 +38982,12 @@ def write_run_config(
         "preregistration": getattr(
             args, "preregistration_record", None
         ),
+        # 设计计划分配（套件子进程）：计划指纹、执行序号、区组与
+        # 区组内位置。--compare 的顺序漂移诊断只使用与分析直接
+        # 相关的最少字段，完整分配随 config.json 归档。
+        "design_assignment": getattr(
+            args, "design_assignment", None
+        ),
         # 训练前预注册的判定口径：主指标、预期方向、最小有意义
         # 效应。对比阶段据此核对「观测方向/幅度是否与训练前的
         # 预期一致」以及「分析指标是否是预注册的主指标」，
@@ -38909,6 +39246,19 @@ def write_run_config(
             ):
                 payload["preregistration"] = previous[
                     "preregistration"
+                ]
+
+            # 设计计划分配同样属于原运行：手工 resume 一个套件
+            # 子运行时没有父进程环境变量，不能把「它当时是哪个
+            # 区组/顺序」洗掉；顺序漂移诊断需要这段历史。
+            if (
+                payload.get("design_assignment") is None
+                and isinstance(
+                    previous.get("design_assignment"), dict
+                )
+            ):
+                payload["design_assignment"] = previous[
+                    "design_assignment"
                 ]
 
             # resume 会重写 run_metadata（新的 timestamp/command/
@@ -54898,6 +55248,8 @@ _SWEEP_SINGLE_VALUE_FLAGS = (
     "--seed",
     "--mode",
     "--balance-coef",
+    "--run-order",
+    "--run-order-seed",
 )
 _SWEEP_MULTI_VALUE_FLAGS = (
     "--seeds",
@@ -54912,6 +55264,7 @@ _SWEEP_BOOL_FLAGS = (
     "--suite-baseline-tuning",
     "--allow-underpowered",
     "--allow-partial-ablation",
+    "--plan-design",
 )
 
 # 基线调参协议：简单基线（默认 dense）先在 val 上做预注册的
@@ -55211,6 +55564,722 @@ def build_baseline_tuning_plan(
     return plan
 
 
+def resolve_run_order(args: argparse.Namespace) -> Tuple[str, int]:
+    """
+    解析预注册/命令行声明的运行顺序设计。
+
+    默认 ``randomized``：每个种子是一个完整区组，区组内的臂
+    顺序随机化。旧行为 ``grouped`` 会先把一个臂的所有种子跑完
+    再跑下一个臂，机器热漂移、共享缓存与集群负载随时间变化
+    时，这些漂移与臂效应完全混杂。
+    """
+    scheme = getattr(args, "run_order", None) or "randomized"
+    if scheme not in _RUN_ORDER_SCHEMES:
+        raise ValueError(
+            "运行顺序方案必须是 "
+            + " / ".join(_RUN_ORDER_SCHEMES)
+        )
+    order_seed = getattr(args, "run_order_seed", None)
+    if order_seed is None:
+        order_seed = 0
+    if (
+        isinstance(order_seed, bool)
+        or not isinstance(order_seed, int)
+        or order_seed < 0
+        or order_seed > MAX_SEED
+    ):
+        raise ValueError(
+            f"运行顺序种子必须是 [0, {MAX_SEED}] 内的整数"
+        )
+    return str(scheme), int(order_seed)
+
+
+def _order_block_rng(
+    order_seed: int,
+    block_seed: int,
+) -> random.Random:
+    """
+    由 (order_seed, block_seed) 派生确定性的区组洗牌 RNG。
+
+    不使用 Python 内置 hash()：它受 PYTHONHASHSEED 影响，会让
+    「同一个设计计划」在不同进程/机器上得到不同顺序，破坏
+    预注册顺序的可复现性。
+    """
+    digest = hashlib.sha256(
+        f"smelt-isr-run-order:{int(order_seed)}:{int(block_seed)}".encode(
+            "utf-8"
+        )
+    ).digest()
+    return random.Random(int.from_bytes(digest[:16], "big"))
+
+
+def order_sweep_plan(
+    plan: List[Dict[str, object]],
+    scheme: str = "randomized",
+    order_seed: int = 0,
+) -> List[Dict[str, object]]:
+    """
+    给运行计划加上执行顺序与区组信息。
+
+    - ``grouped``：保留原顺序（历史行为；模式与时间混杂）；
+    - ``blocked``：按种子组成完整区组，区组内保持原臂顺序；
+    - ``randomized``：按种子组成完整区组，区组内随机化臂
+      顺序（随机化完整区组设计）。
+
+    同一区组内每个臂出现一次，因此「先跑/后跑」在臂之间被
+    平衡，而不是让某个臂系统性地占据更晚的时间片。
+    """
+    if scheme not in _RUN_ORDER_SCHEMES:
+        raise ValueError(f"未知的运行顺序方案: {scheme}")
+
+    if scheme == "grouped":
+        ordered = [dict(item) for item in plan]
+    else:
+        blocks: Dict[object, List[Dict[str, object]]] = {}
+        for item in plan:
+            blocks.setdefault(item.get("seed"), []).append(
+                dict(item)
+            )
+        ordered = []
+        for block_seed, block in blocks.items():
+            if scheme == "randomized":
+                rng = _order_block_rng(order_seed, int(block_seed))
+                rng.shuffle(block)
+            ordered.extend(block)
+
+    positions: Dict[object, int] = {}
+    for index, item in enumerate(ordered, start=1):
+        block_seed = item.get("seed")
+        positions[block_seed] = positions.get(block_seed, 0) + 1
+        item["order_index"] = index
+        item["block"] = block_seed
+        item["position_in_block"] = positions[block_seed]
+    return ordered
+
+
+def planned_comparisons_for_plan(
+    plan: List[Dict[str, object]],
+) -> int:
+    """
+    计划中实际会做的两两比较数（用于保守的家族校正）。
+
+    单臂/多种子设计没有跨臂比较，家族规模按 1 计；多臂设计
+    按不同模式的两两组合数计。消融的主效应/交互家族通常更
+    小，但用两两组合数是保守上界，不会把所需种子数说少。
+    """
+    modes = {
+        str(item.get("mode"))
+        for item in plan
+        if item.get("mode") is not None
+    }
+    if len(modes) >= 2:
+        return len(modes) * (len(modes) - 1) // 2
+    return 1
+
+
+def _training_budget_summary(
+    args: argparse.Namespace,
+    n_runs: int,
+) -> Dict[str, object]:
+    """计划阶段可算的训练预算（token 量，不是实际计时）。"""
+    steps = int(getattr(args, "steps", 0) or 0)
+    batch = int(getattr(args, "batch_size", 0) or 0)
+    seq_len = int(getattr(args, "seq_len", 0) or 0)
+    tokens_per_run = steps * batch * seq_len
+    return {
+        "steps": steps,
+        "batch_size": batch,
+        "seq_len": seq_len,
+        "tokens_per_run": tokens_per_run,
+        "runs": int(n_runs),
+        "total_tokens": tokens_per_run * int(n_runs),
+        "note": (
+            "解析预算：steps × batch_size × seq_len；不含评估、"
+            "重算与优化器开销，也不是墙钟时间估计"
+        ),
+    }
+
+
+def _atomic_write_json(
+    path: Path,
+    payload: Dict[str, object],
+) -> None:
+    """原子写 JSON：中途失败不留下半截文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def write_design_plan(
+    out_root: Path,
+    plan: List[Dict[str, object]],
+    scheme: str,
+    order_seed: int,
+    args: argparse.Namespace,
+    *,
+    kind: str = "sweep",
+    planned_comparisons: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    把「准备阶段」的设计写成可核对的 ``design_plan.json``。
+
+    内容包含：执行顺序与区组、每个运行的身份、先验功效分析、
+    种子计划与解析训练预算。``plan_id`` 是去掉时间戳后的规范化
+    指纹，子进程会在开跑前核对它；看到统计结果后再改顺序/臂
+    会让指纹不一致，而不是静默变成另一项研究。
+    """
+    out_root = Path(out_root)
+    prereg = getattr(args, "preregistration_record", None)
+    if not isinstance(prereg, dict):
+        prereg = {}
+    power = prereg.get("power")
+    if not isinstance(power, dict):
+        power = None
+    if planned_comparisons is None:
+        planned_comparisons = (
+            int(power["planned_comparisons"])
+            if power is not None
+            and isinstance(power.get("planned_comparisons"), int)
+            else planned_comparisons_for_plan(plan)
+        )
+    seeds = [
+        int(seed)
+        for seed in (getattr(args, "seeds", None) or [])
+    ]
+    seed_plan = (
+        _build_seed_plan(
+            seeds,
+            bool(getattr(args, "allow_underpowered", False)),
+            planned_comparisons=int(planned_comparisons),
+        )
+        if seeds
+        else None
+    )
+    budget = _training_budget_summary(args, len(plan))
+
+    runs: List[Dict[str, object]] = []
+    for item in plan:
+        entry: Dict[str, object] = {
+            "order_index": item.get("order_index"),
+            "block": item.get("block"),
+            "position_in_block": item.get("position_in_block"),
+            "label": item.get("label"),
+            "mode": item.get("mode"),
+            "seed": item.get("seed"),
+            "balance_coef": item.get("balance_coef"),
+        }
+        for key in (
+            "lr",
+            "dense_fnn_hidden",
+            "weight_decay",
+            "tuning_axis",
+            "tuning_value",
+        ):
+            if key in item:
+                entry[key] = item[key]
+        runs.append(entry)
+
+    core: Dict[str, object] = {
+        "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
+        "kind": kind,
+        "study_id": prereg.get("study_id"),
+        "preregistration_file_sha256": prereg.get(
+            "file_sha256"
+        ),
+        "order": {"scheme": scheme, "seed": int(order_seed)},
+        "planned_runs": len(runs),
+        "runs": runs,
+        "planned_comparisons": int(planned_comparisons),
+        "power": power,
+        "seed_plan": seed_plan,
+        "training_budget": budget,
+    }
+    plan_id = _sha256_text(
+        json.dumps(
+            _json_safe(core),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    payload = dict(core)
+    payload["plan_id"] = plan_id
+    payload["created_utc"] = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat()
+    path = out_root / _DESIGN_PLAN_FILENAME
+    _atomic_write_json(path, payload)
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "path": str(path),
+        "file_sha256": file_sha256,
+        "plan_id": plan_id,
+        "kind": kind,
+        "order_scheme": scheme,
+        "order_seed": int(order_seed),
+        "planned_runs": len(runs),
+        "planned_comparisons": int(planned_comparisons),
+        "power": power,
+        "seed_plan": seed_plan,
+        "training_budget": budget,
+    }
+
+
+_DESIGN_ASSIGNMENT_ENV_KEYS = (
+    "SMELT_DESIGN_PLAN_FILE",
+    "SMELT_DESIGN_PLAN_SHA256",
+    "SMELT_DESIGN_PLAN_ID",
+    "SMELT_DESIGN_ORDER_SCHEME",
+    "SMELT_DESIGN_ORDER_SEED",
+    "SMELT_DESIGN_ORDER_INDEX",
+    "SMELT_DESIGN_BLOCK",
+    "SMELT_DESIGN_BLOCK_POSITION",
+)
+
+
+def verify_design_assignment(
+    args: argparse.Namespace,
+) -> Optional[Dict[str, object]]:
+    """
+    子进程开跑前核对父进程写入的设计计划与本次分配。
+
+    套件通过环境变量传入计划文件、指纹与 (order_index, block,
+    position)。子进程重新哈希计划文件、确认自己的 label/seed/
+    mode/balance 与计划条目一致后才开始训练。这样「父进程把
+    计划写进报告、子进程却按另一套顺序跑」不可能静默发生。
+    """
+    values = {
+        key: os.environ.get(key)
+        for key in _DESIGN_ASSIGNMENT_ENV_KEYS
+    }
+    present = [key for key, value in values.items() if value]
+    if not present:
+        return None
+    if len(present) != len(values):
+        missing = [
+            key for key, value in values.items() if not value
+        ]
+        raise ValueError(
+            "设计计划环境变量不完整，缺少: "
+            + ", ".join(missing)
+        )
+
+    plan_path = Path(str(values["SMELT_DESIGN_PLAN_FILE"]))
+    try:
+        raw = plan_path.read_bytes()
+    except OSError as error:
+        raise ValueError(
+            f"无法读取设计计划 {plan_path}: {error}"
+        ) from error
+    file_sha256 = hashlib.sha256(raw).hexdigest()
+    if file_sha256 != values["SMELT_DESIGN_PLAN_SHA256"]:
+        raise ValueError(
+            "设计计划文件在设计后被修改（SHA-256 不一致）："
+            "执行顺序/臂集合不能再声称是预注册的设计"
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"设计计划 {plan_path} 不是合法 JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"设计计划 {plan_path} 必须是 JSON 对象")
+    if payload.get("plan_id") != values["SMELT_DESIGN_PLAN_ID"]:
+        raise ValueError(
+            "设计计划的 plan_id 与环境变量不一致："
+            "计划内容被替换或改写"
+        )
+    order = payload.get("order")
+    if not isinstance(order, dict):
+        raise ValueError("设计计划缺少 order 对象")
+    if order.get("scheme") != values["SMELT_DESIGN_ORDER_SCHEME"]:
+        raise ValueError(
+            "设计计划的运行顺序方案与环境变量不一致"
+        )
+    if str(order.get("seed")) != str(
+        values["SMELT_DESIGN_ORDER_SEED"]
+    ):
+        raise ValueError(
+            "设计计划的运行顺序种子与环境变量不一致"
+        )
+
+    try:
+        order_index = int(str(values["SMELT_DESIGN_ORDER_INDEX"]))
+        block = int(str(values["SMELT_DESIGN_BLOCK"]))
+        position = int(str(values["SMELT_DESIGN_BLOCK_POSITION"]))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "设计计划环境变量中的序号/区组不是整数"
+        ) from error
+
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("设计计划缺少 runs 列表")
+    entry = next(
+        (
+            item
+            for item in runs
+            if isinstance(item, dict)
+            and item.get("order_index") == order_index
+        ),
+        None,
+    )
+    if entry is None:
+        raise ValueError(
+            f"设计计划中没有 order_index={order_index} 的运行"
+        )
+
+    out_path = Path(args.out)
+    plan_root = plan_path.parent.resolve()
+    if out_path.parent.resolve() != plan_root:
+        raise ValueError(
+            "设计计划不在本次 --out 的父目录："
+            "不能用另一项研究的顺序计划启动本运行"
+        )
+    if entry.get("label") != out_path.name:
+        raise ValueError(
+            f"设计计划第 {order_index} 个运行是 "
+            f"{entry.get('label')!r}，当前 --out 是 "
+            f"{out_path.name!r}"
+        )
+    if int(entry.get("seed")) != int(args.seed):
+        raise ValueError(
+            "设计计划中的 seed 与当前 --seed 不一致"
+        )
+    if entry.get("mode") is not None and str(
+        entry.get("mode")
+    ) != str(args.mode):
+        raise ValueError(
+            "设计计划中的 mode 与当前 --mode 不一致"
+        )
+    recorded_balance = entry.get("balance_coef")
+    if recorded_balance is not None:
+        try:
+            same_balance = abs(
+                float(recorded_balance)
+                - float(args.balance_coef)
+            ) <= 1e-12
+        except (TypeError, ValueError):
+            same_balance = False
+        if not same_balance:
+            raise ValueError(
+                "设计计划中的 balance_coef 与当前命令行不一致"
+            )
+    if int(entry.get("block")) != block:
+        raise ValueError(
+            "设计计划中的区组与当前分配不一致"
+        )
+    if int(entry.get("position_in_block")) != position:
+        raise ValueError(
+            "设计计划中的区组内位置与当前分配不一致"
+        )
+
+    return {
+        "plan_file": str(plan_path),
+        "plan_file_sha256": file_sha256,
+        "plan_id": payload.get("plan_id"),
+        "study_id": payload.get("study_id"),
+        "kind": payload.get("kind"),
+        "order_scheme": order.get("scheme"),
+        "order_seed": int(order.get("seed")),
+        "order_index": order_index,
+        "block": block,
+        "position_in_block": position,
+        "label": entry.get("label"),
+    }
+
+
+def design_plan_consistency_error(
+    run_paths: List[str],
+    plan_id: str,
+) -> Optional[str]:
+    """核对全部子运行记录的设计计划指纹是否与父进程一致。"""
+    missing: List[str] = []
+    mismatched: List[str] = []
+    for path in run_paths:
+        config_path = Path(path) / "config.json"
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                config_payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            missing.append(Path(path).name)
+            continue
+        assignment = (
+            config_payload.get("design_assignment")
+            if isinstance(config_payload, dict)
+            else None
+        )
+        recorded = (
+            assignment.get("plan_id")
+            if isinstance(assignment, dict)
+            else None
+        )
+        if recorded is None:
+            missing.append(Path(path).name)
+        elif str(recorded) != str(plan_id):
+            mismatched.append(Path(path).name)
+    if not missing and not mismatched:
+        return None
+    details = []
+    if missing:
+        details.append(
+            "缺少设计计划记录: " + ", ".join(missing)
+        )
+    if mismatched:
+        details.append(
+            "设计计划指纹不一致: " + ", ".join(mismatched)
+        )
+    return (
+        "子运行没有按同一份设计计划执行（"
+        + "；".join(details)
+        + "）：不能把这些运行合并成一项研究"
+    )
+
+
+def _average_ranks(values: List[float]) -> List[float]:
+    """平均秩（并列取平均），供 Spearman 相关使用。"""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    index = 0
+    while index < len(order):
+        end = index + 1
+        while (
+            end < len(order)
+            and values[order[end]] == values[order[index]]
+        ):
+            end += 1
+        average = (index + end + 1) / 2.0
+        for position in range(index, end):
+            ranks[order[position]] = average
+        index = end
+    return ranks
+
+
+def _spearman_correlation(
+    x: List[float],
+    y: List[float],
+) -> Optional[float]:
+    """Spearman 秩相关；样本不足或秩方差为零时返回 None。"""
+    if len(x) != len(y) or len(x) < 3:
+        return None
+    rank_x = _average_ranks(x)
+    rank_y = _average_ranks(y)
+    mean_x = sum(rank_x) / len(rank_x)
+    mean_y = sum(rank_y) / len(rank_y)
+    covariance = sum(
+        (a - mean_x) * (b - mean_y)
+        for a, b in zip(rank_x, rank_y)
+    )
+    variance_x = sum((a - mean_x) ** 2 for a in rank_x)
+    variance_y = sum((b - mean_y) ** 2 for b in rank_y)
+    if variance_x <= 0.0 or variance_y <= 0.0:
+        return None
+    return covariance / math.sqrt(variance_x * variance_y)
+
+
+def run_order_drift_report(
+    rows: List[Dict[str, object]],
+    metric: str = "val_loss",
+) -> Dict[str, object]:
+    """
+    诊断「执行时间/顺序」是否可能与处理效应混杂。
+
+    设计上的修复是随机化完整区组；这里只做**描述性**核对：
+    1. 计划指纹是否一致（不同研究不能混在一起）；
+    2. 是否仍使用 grouped 顺序（模式与时间完全混杂）；
+    3. 去掉模式均值后，指标与执行顺序的 Spearman 相关。
+    正/负强相关提示机器漂移、缓存预热或负载变化可能在臂之间
+    制造系统性差异。它不是显著性检验，也不替代随机化设计。
+    """
+    entries: List[Dict[str, object]] = []
+    for row in rows:
+        if row.get("deterministic"):
+            continue
+        index = row.get("design_order_index")
+        value = row.get(metric)
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or value is None
+        ):
+            continue
+        numeric = _finite_float(value)
+        if numeric is None:
+            continue
+        entries.append({
+            "run": row.get("run"),
+            "mode": str(row.get("mode")),
+            "order_index": index,
+            "block": row.get("design_block"),
+            "position_in_block": row.get(
+                "design_block_position"
+            ),
+            "value": numeric,
+            "plan_id": row.get("design_plan_id"),
+            "scheme": row.get("design_order_scheme"),
+        })
+
+    if not entries:
+        return {
+            "available": False,
+            "verdict": "unavailable",
+            "reason": (
+                "运行没有设计计划/执行顺序记录（旧运行或非套件"
+                "单跑），无法核对顺序漂移"
+            ),
+        }
+
+    plan_ids = sorted({
+        str(entry["plan_id"])
+        for entry in entries
+        if entry.get("plan_id")
+    })
+    schemes = sorted({
+        str(entry["scheme"])
+        for entry in entries
+        if entry.get("scheme")
+    })
+    warnings: List[str] = []
+    if len(plan_ids) > 1:
+        warnings.append(
+            "运行来自多份设计计划（plan_id 不一致）："
+            "不能把不同顺序方案拼成一项研究"
+        )
+    if "grouped" in schemes:
+        warnings.append(
+            "执行顺序是 grouped：同一臂的所有种子先跑完，"
+            "时间/机器漂移与臂效应完全混杂；确证实验应使用"
+            "randomized 完整区组"
+        )
+    if len(entries) < 3:
+        return {
+            "available": True,
+            "verdict": "insufficient",
+            "n_runs": len(entries),
+            "plan_ids": plan_ids,
+            "order_schemes": schemes,
+            "warnings": warnings,
+            "reason": "带顺序记录的运行少于 3 个，无法估计漂移",
+        }
+
+    # 去掉模式均值：臂间真实差异不应被误读成时间漂移。
+    mode_means: Dict[str, List[float]] = {}
+    for entry in entries:
+        mode_means.setdefault(
+            str(entry["mode"]), []
+        ).append(float(entry["value"]))
+    means = {
+        mode: sum(values) / len(values)
+        for mode, values in mode_means.items()
+    }
+    indices = [float(entry["order_index"]) for entry in entries]
+    residuals = [
+        float(entry["value"]) - means[str(entry["mode"])]
+        for entry in entries
+    ]
+    rho = _spearman_correlation(indices, residuals)
+    p_value = None
+    if rho is not None and len(entries) > 2:
+        denominator = max(1e-12, 1.0 - rho * rho)
+        statistic = rho * math.sqrt(
+            (len(entries) - 2) / denominator
+        )
+        p_value = _two_sided_t_p_value(
+            statistic, float(len(entries) - 2)
+        )
+    if (
+        rho is not None
+        and abs(rho) >= 0.7
+        and len(entries) >= 4
+    ):
+        warnings.append(
+            "去模式均值后指标与执行顺序的 |Spearman ρ|="
+            f"{abs(rho):.2f}（p="
+            + ("NA" if p_value is None else f"{p_value:.3f}")
+            + "）：存在顺序/时间漂移迹象，应检查机器负载与"
+            "热漂移，并用随机化区组复核"
+        )
+
+    by_mode: List[Dict[str, object]] = []
+    for mode, values in mode_means.items():
+        mode_entries = [
+            entry for entry in entries
+            if str(entry["mode"]) == mode
+        ]
+        mode_rho = _spearman_correlation(
+            [float(entry["order_index"]) for entry in mode_entries],
+            [float(entry["value"]) for entry in mode_entries],
+        )
+        mode_p = None
+        if mode_rho is not None and len(mode_entries) > 2:
+            denominator = max(1e-12, 1.0 - mode_rho * mode_rho)
+            statistic = mode_rho * math.sqrt(
+                (len(mode_entries) - 2) / denominator
+            )
+            mode_p = _two_sided_t_p_value(
+                statistic, float(len(mode_entries) - 2)
+            )
+        if (
+            mode_rho is not None
+            and abs(mode_rho) >= 0.8
+            and len(mode_entries) >= 4
+        ):
+            warnings.append(
+                f"模式 {mode} 内部指标随执行顺序单调变化"
+                f"（ρ={mode_rho:.2f}）：该臂的结果可能包含"
+                "时间漂移"
+            )
+        by_mode.append({
+            "mode": mode,
+            "n_runs": len(mode_entries),
+            "spearman_rho": mode_rho,
+            "p_value": mode_p,
+        })
+
+    return {
+        "available": True,
+        "verdict": "warn" if warnings else "ok",
+        "n_runs": len(entries),
+        "n_blocks": len({
+            entry["block"] for entry in entries
+        }),
+        "plan_ids": plan_ids,
+        "order_schemes": schemes,
+        "detrended_spearman": rho,
+        "detrended_p_value": p_value,
+        "by_mode": by_mode,
+        "warnings": warnings,
+        "note": (
+            "这是描述性诊断，不是显著性检验；随机化完整区组"
+            "只能平衡时间漂移，不能消除它。若出现强顺序相关，"
+            "应检查机器/负载并重跑受影响区组"
+        ),
+    }
+
+
 def _sweep_child_env(seed: int) -> Dict[str, str]:
     """
     套件子进程的环境变量：显式固定 PYTHONHASHSEED。
@@ -55231,10 +56300,46 @@ def _sweep_child_env(seed: int) -> Dict[str, str]:
     return env
 
 
+def _write_run_order_log(
+    out_root: Path,
+    design: Optional[Dict[str, object]],
+    plan: List[Dict[str, object]],
+    records: List[Dict[str, object]],
+) -> None:
+    """把计划顺序与实际开始/结束时间落盘（失败条目也保留）。"""
+    payload: Dict[str, object] = {
+        "planned_runs": len(plan),
+        "plan_id": (
+            design.get("plan_id")
+            if isinstance(design, dict)
+            else None
+        ),
+        "plan_file_sha256": (
+            design.get("file_sha256")
+            if isinstance(design, dict)
+            else None
+        ),
+        "order": (
+            {
+                "scheme": design.get("order_scheme"),
+                "seed": design.get("order_seed"),
+            }
+            if isinstance(design, dict)
+            else None
+        ),
+        "runs": records,
+        "updated_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+    }
+    _atomic_write_json(out_root / _RUN_ORDER_FILENAME, payload)
+
+
 def _execute_sweep_plan(
     base_argv: List[str],
     plan: List[Dict[str, object]],
     out_root: Path,
+    design: Optional[Dict[str, object]] = None,
 ) -> List[str]:
     """
     逐运行以独立子进程执行计划中的每个条目；覆盖 --seed/--out
@@ -55244,11 +56349,42 @@ def _execute_sweep_plan(
     每个子进程都带上按 seed 固定的 PYTHONHASHSEED 环境
     （见 ``_sweep_child_env``），避免同种子运行因 hash 随机化
     产生差异。
+
+    给出 ``design`` 时，子进程还会收到设计计划文件、指纹与
+    (order_index, block, position)。子进程开跑前会重新核对，
+    防止报告里的顺序与实际执行顺序不一致；实际开始/结束时间
+    写到 ``run_order.json``，供顺序漂移诊断使用。
     """
     run_paths: List[str] = []
+    order_records: List[Dict[str, object]] = [
+        {
+            "order_index": item.get("order_index", index),
+            "block": item.get("block"),
+            "position_in_block": item.get("position_in_block"),
+            "label": item.get("label"),
+            "mode": item.get("mode"),
+            "seed": item.get("seed"),
+            "status": "planned",
+            "started_utc": None,
+            "finished_utc": None,
+            "returncode": None,
+        }
+        for index, item in enumerate(plan, start=1)
+    ]
+    if design is not None:
+        _write_run_order_log(out_root, design, plan, order_records)
 
     for index, item in enumerate(plan, start=1):
         run_out = out_root / str(item["label"])
+        record = next(
+            (
+                entry
+                for entry in order_records
+                if entry["order_index"]
+                == item.get("order_index", index)
+            ),
+            None,
+        )
 
         command = [
             sys.executable,
@@ -55283,14 +56419,67 @@ def _execute_sweep_plan(
                 repr(float(item["weight_decay"])),
             ]
 
+        child_env = _sweep_child_env(int(item["seed"]))
+        if design is not None:
+            child_env.update({
+                "SMELT_DESIGN_PLAN_FILE": str(design["path"]),
+                "SMELT_DESIGN_PLAN_SHA256": str(
+                    design["file_sha256"]
+                ),
+                "SMELT_DESIGN_PLAN_ID": str(design["plan_id"]),
+                "SMELT_DESIGN_ORDER_SCHEME": str(
+                    design["order_scheme"]
+                ),
+                "SMELT_DESIGN_ORDER_SEED": str(
+                    design["order_seed"]
+                ),
+                "SMELT_DESIGN_ORDER_INDEX": str(
+                    item.get("order_index", index)
+                ),
+                "SMELT_DESIGN_BLOCK": str(item.get("block")),
+                "SMELT_DESIGN_BLOCK_POSITION": str(
+                    item.get("position_in_block")
+                ),
+            })
+
         print(
             f"[sweep] ({index}/{len(plan)}) 运行 {item['label']}"
+            + (
+                f"（区组 {item.get('block')} 内第 "
+                f"{item.get('position_in_block')} 个）"
+                if design is not None
+                else ""
+            )
         )
+        if record is not None:
+            record["status"] = "running"
+            record["started_utc"] = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
+            if design is not None:
+                _write_run_order_log(
+                    out_root, design, plan, order_records
+                )
 
         completed = subprocess.run(
             command,
-            env=_sweep_child_env(int(item["seed"])),
+            env=child_env,
         )
+
+        if record is not None:
+            record["finished_utc"] = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
+            record["returncode"] = int(completed.returncode)
+            record["status"] = (
+                "completed"
+                if completed.returncode == 0
+                else "failed"
+            )
+            if design is not None:
+                _write_run_order_log(
+                    out_root, design, plan, order_records
+                )
 
         if completed.returncode != 0:
             print(
@@ -57176,6 +58365,20 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
 
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
+    # 调参候选同样按随机化完整区组执行：候选按学习率/容量排序
+    # 后依次跑完，会让「后跑的候选」同时承受更晚的时间片。
+    order_scheme, order_seed = resolve_run_order(args)
+    plan = order_sweep_plan(plan, order_scheme, order_seed)
+    design = write_design_plan(
+        out_root,
+        plan,
+        order_scheme,
+        order_seed,
+        args,
+        kind="baseline_tuning",
+        planned_comparisons=1,
+    )
+    print_design_summary(design)
 
     print(
         "[suite-baseline-tuning] 基线调参：mode="
@@ -57216,7 +58419,9 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             f"{len(seeds)} 个"
         )
 
-    run_paths = _execute_sweep_plan(base_argv, plan, out_root)
+    run_paths = _execute_sweep_plan(
+        base_argv, plan, out_root, design=design
+    )
 
     # 套件必须使用同一份预注册文件：若文件在运行中途被编辑，
     # 各子运行实际执行的协议就不再相同，不能合并成一项研究。
@@ -57230,6 +58435,12 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
         )
         if sweep_prereg_error is not None:
             raise SystemExit(sweep_prereg_error)
+
+    design_error = design_plan_consistency_error(
+        run_paths, str(design["plan_id"])
+    )
+    if design_error is not None:
+        raise SystemExit(design_error)
 
     rows = compare_runs(run_paths)
     # --compare-metric 可以是等计算量 loss；调参报告必须与
@@ -57288,7 +58499,21 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     report["seed_plan"] = _build_seed_plan(
         seeds,
         args.allow_underpowered,
+        planned_comparisons=1,
     )
+    report["design"] = {
+        key: design.get(key)
+        for key in (
+            "path",
+            "file_sha256",
+            "plan_id",
+            "kind",
+            "order_scheme",
+            "order_seed",
+            "planned_runs",
+            "training_budget",
+        )
+    }
     if len(seeds) < _MIN_SEEDS_FOR_STATS:
         report["issues"].append(
             f"每个候选只有 {len(seeds)} 个种子"
@@ -57318,19 +58543,17 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             )
 
 
-def run_experiment_sweep(args: argparse.Namespace) -> None:
+def build_sweep_execution(
+    args: argparse.Namespace,
+    out_root: Path,
+) -> Tuple[List[Dict[str, object]], Dict[str, object], int]:
     """
-    执行多随机种子 / 模式套件 / 全因子消融 / 基线调参套件，
-    并输出受控变量检查 + Mean ± Std + 显著性检验 + 消融
-    覆盖报告（基线调参套件输出调参报告）。
+    构造并落盘套件执行计划：运行清单 → 顺序/区组 → 设计记录。
+
+    训练开始前就固定「跑哪些单元、按什么顺序跑、每个种子区组
+    内臂如何排列」，并写入 design_plan.json。之后子进程核对
+    同一份计划，事后无法把顺序/臂集合改成更有利的版本。
     """
-    if args.suite_baseline_tuning:
-        run_baseline_tuning_sweep(args)
-        return
-
-    factors = parse_factor_spec(args.compare_factors)
-
-    base_argv = strip_sweep_args(sys.argv[1:])
     plan = build_sweep_plan(
         seeds=list(args.seeds),
         modes=(
@@ -57347,9 +58570,99 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             else None
         ),
     )
+    scheme, order_seed = resolve_run_order(args)
+    prereg_record = getattr(args, "preregistration_record", None)
+    prereg_power = (
+        prereg_record.get("power")
+        if isinstance(prereg_record, dict)
+        else None
+    )
+    if (
+        isinstance(prereg_power, dict)
+        and isinstance(
+            prereg_power.get("planned_comparisons"), int
+        )
+    ):
+        planned_comparisons = int(
+            prereg_power["planned_comparisons"]
+        )
+    else:
+        planned_comparisons = planned_comparisons_for_plan(plan)
+    ordered = order_sweep_plan(plan, scheme, order_seed)
+    design = write_design_plan(
+        out_root,
+        ordered,
+        scheme,
+        order_seed,
+        args,
+        planned_comparisons=planned_comparisons,
+    )
+    return ordered, design, planned_comparisons
 
+
+def print_design_summary(design: Dict[str, object]) -> None:
+    """打印设计计划摘要（准备阶段可见，不必先烧算力）。"""
+    print(
+        "[design] 计划 "
+        f"{design['planned_runs']} 次运行；顺序="
+        f"{design['order_scheme']}（order_seed="
+        f"{design['order_seed']}）；计划指纹="
+        f"{str(design['plan_id'])[:12]}..."
+    )
+    budget = design.get("training_budget")
+    if isinstance(budget, dict):
+        print(
+            "[design] 解析训练预算："
+            f"{budget.get('total_tokens')} tokens（"
+            f"{budget.get('runs')} × {budget.get('tokens_per_run')}）"
+        )
+    power = design.get("power")
+    if isinstance(power, dict):
+        status = "充足" if power.get("adequate") else "不足"
+        print(
+            "[design][power] 先验功效："
+            f"计划 {power.get('planned_seeds')} 个种子，"
+            f"所需 {power.get('required_seeds')}（t="
+            f"{power.get('required_seeds_for_t')}, 稳健符号翻转="
+            f"{power.get('required_seeds_for_robust_sign_flip')}）"
+            f" → {status}"
+            + (
+                "；已显式承认功效不足"
+                if power.get("underpowered_acknowledged")
+                and not power.get("adequate")
+                else ""
+            )
+        )
+    else:
+        print(
+            "[design] 未提供预注册 power 块：种子数只保证检验"
+            "可算，不保证能检出预注册的最小效应；建议在 "
+            "preregistration.json 中声明 expected_seed_sd_relative"
+        )
+    print(
+        f"[design] 设计计划已写入 {design['path']}"
+        "（子进程开跑前会重新核对指纹与自己的分配）"
+    )
+
+
+def run_experiment_sweep(args: argparse.Namespace) -> None:
+    """
+    执行多随机种子 / 模式套件 / 全因子消融 / 基线调参套件，
+    并输出受控变量检查 + Mean ± Std + 显著性检验 + 消融
+    覆盖报告（基线调参套件输出调参报告）。
+    """
+    if args.suite_baseline_tuning:
+        run_baseline_tuning_sweep(args)
+        return
+
+    factors = parse_factor_spec(args.compare_factors)
+
+    base_argv = strip_sweep_args(sys.argv[1:])
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
+    plan, design, planned_comparisons = build_sweep_execution(
+        args, out_root
+    )
 
     if len(args.seeds) < _RECOMMENDED_SEEDS:
         print(
@@ -57366,7 +58679,10 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
                 "comparison_analysis.json 的 seed_plan）"
             )
 
-    run_paths = _execute_sweep_plan(base_argv, plan, out_root)
+    print_design_summary(design)
+    run_paths = _execute_sweep_plan(
+        base_argv, plan, out_root, design=design
+    )
 
     # 每个子进程都会重新读取预注册文件；文件在套件运行中途被
     # 修改时，各子运行会基于不同 sha256 训练。父进程必须核对
@@ -57386,6 +58702,13 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         if sweep_prereg_error is not None:
             raise SystemExit(sweep_prereg_error)
 
+    design_error = design_plan_consistency_error(
+        [str(path) for path in run_paths],
+        str(design["plan_id"]),
+    )
+    if design_error is not None:
+        raise SystemExit(design_error)
+
     rows = compare_runs(run_paths)
     analysis = print_comparison_analysis(
         rows,
@@ -57404,10 +58727,31 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         common_step=args.common_step,
     )
     # 种子计划随报告落盘：事后能核对本轮结论是在几个种子上
-    # 得出的、是否使用了低统计功效豁免。
+    # 得出的、是否使用了低统计功效豁免。家族规模用预注册/
+    # 计划中的比较数，避免把稳健符号翻转所需种子数说少。
     analysis["seed_plan"] = _build_seed_plan(
         args.seeds,
         args.allow_underpowered,
+        planned_comparisons=planned_comparisons,
+    )
+    analysis["design"] = {
+        key: design.get(key)
+        for key in (
+            "path",
+            "file_sha256",
+            "plan_id",
+            "kind",
+            "order_scheme",
+            "order_seed",
+            "planned_runs",
+            "planned_comparisons",
+            "power",
+            "seed_plan",
+            "training_budget",
+        )
+    }
+    analysis["run_order"] = run_order_drift_report(
+        rows, args.compare_metric
     )
     write_comparison_report(out_root, analysis)
 
@@ -58333,6 +59677,40 @@ def main():
     )
 
     parser.add_argument(
+        "--plan-design",
+        action="store_true",
+        help=(
+            "不训练：按 --seeds/--suite-modes/--suite-ablation "
+            "只生成并打印 design_plan.json（运行清单、随机化区组"
+            "顺序、先验功效、解析 token 预算），供冻结/预注册前"
+            "检查设计是否可执行；正式运行时同一份计划由子进程"
+            "逐项核对"
+        ),
+    )
+    parser.add_argument(
+        "--run-order",
+        type=str,
+        default=None,
+        choices=_RUN_ORDER_SCHEMES,
+        help=(
+            "套件的执行顺序设计：grouped=按臂分组（历史行为，"
+            "时间漂移与臂效应完全混杂）；blocked=按种子成完整"
+            "区组、区组内保持原臂顺序；randomized=区组内随机化"
+            "臂顺序（默认，随机化完整区组设计）"
+        ),
+    )
+    parser.add_argument(
+        "--run-order-seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help=(
+            "随机化区组顺序的确定性种子（默认 0）；同一计划"
+            "必须使用同一种子才能复现执行顺序，看到结果后换"
+            "顺序不再是原设计"
+        ),
+    )
+    parser.add_argument(
         "--seeds",
         nargs="+",
         type=int,
@@ -58960,7 +60338,7 @@ def main():
                 "超参数冻结后，改用全新目录对单个"
                 "最终运行评估一次测试集）"
             )
-        if args.data is None:
+        if args.data is None and not args.plan_design:
             parser.error("--seeds 需要 --data")
         if args.out is None:
             parser.error("--seeds 需要 --out")
@@ -58974,6 +60352,12 @@ def main():
             "--suite-baseline-tuning 必须配合 --seeds 使用"
             "（关键实验至少 3~5 个种子）"
         )
+    if args.run_order_seed is not None:
+        order_seed_message = seed_error(args.run_order_seed)
+        if order_seed_message:
+            parser.error(
+                f"--run-order-seed 无效: {order_seed_message}"
+            )
     if sum(
         bool(flag)
         for flag in (
@@ -59234,6 +60618,7 @@ def main():
                     "--suite-baseline-tuning",
                     bool(args.suite_baseline_tuning),
                 ),
+                ("--plan-design", bool(args.plan_design)),
             )
             if active
         ]
@@ -59280,8 +60665,70 @@ def main():
                 )
         return
 
+    # 设计预检：只生成/打印计划，不训练、不读数据。研究者在
+    # 冻结与预注册前应先看这个顺序与功效，而不是先烧完算力
+    # 再发现种子数不足或执行顺序把时间与臂混在一起。
+    if args.plan_design:
+        conflicts = [
+            flag
+            for flag, active in (
+                ("--resume", args.resume is not None),
+                ("--evaluate-test", bool(args.evaluate_test)),
+                ("--sanity-only", bool(args.sanity_only)),
+                (
+                    "--statistical-baseline",
+                    bool(args.statistical_baseline),
+                ),
+                (
+                    "--suite-baseline-tuning",
+                    bool(args.suite_baseline_tuning),
+                ),
+                (
+                    "--final-test-comparison",
+                    args.final_test_comparison is not None,
+                ),
+            )
+            if active
+        ]
+        if conflicts:
+            parser.error(
+                "--plan-design 只做设计预检，不能与以下训练/"
+                "评估参数同时使用: " + ", ".join(conflicts)
+            )
+        if args.seeds is None:
+            parser.error(
+                "--plan-design 需要 --seeds（或预注册文件中的 "
+                "seeds）来确定计划单元与区组"
+            )
+        if args.out is None:
+            parser.error("--plan-design 需要 --out 指定计划目录")
+        plan_root = Path(args.out)
+        try:
+            plan_root.mkdir(parents=True, exist_ok=True)
+            plan, design, _ = build_sweep_execution(
+                args, plan_root
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--plan-design 失败: {error}")
+        print_design_summary(design)
+        print("[design] 计划单元（执行顺序）:")
+        for item in plan:
+            print(
+                f"  {int(item['order_index']):>3}. "
+                f"区组 {item.get('block')} 内第 "
+                f"{item.get('position_in_block')} 个: "
+                f"{item.get('label')}（mode={item.get('mode')}, "
+                f"seed={item.get('seed')}）"
+            )
+        print(
+            "[design] 注意：--plan-design 不加载数据，数据指纹/"
+            "切分协议仍会在正式训练入口核对；确认计划后把该 "
+            "design_plan.json 与预注册文件一起冻结"
+        )
+        return
+
     if args.data is None:
-        parser.error("--data 必填（除非使用 --compare）")
+        parser.error("--data 必填（除非使用 --compare/--plan-design）")
     if args.out is None:
         parser.error("--out 必填（除非使用 --compare）")
 
@@ -59378,6 +60825,22 @@ def main():
     )
     if overwrite_error is not None:
         parser.error(overwrite_error)
+
+    # 套件子进程开跑前核对父进程的设计计划与自己的分配：
+    # 计划文件被改、指纹不符、序号/区组/seed/mode 对不上都
+    # 拒绝训练，而不是先跑完再在报告里解释顺序不同。
+    try:
+        args.design_assignment = verify_design_assignment(args)
+    except ValueError as error:
+        parser.error(f"设计计划核对失败: {error}")
+    if args.design_assignment:
+        print(
+            "[design] 执行分配：计划 "
+            f"{str(args.design_assignment.get('plan_id'))[:12]}...，"
+            f"顺序 {args.design_assignment.get('order_index')}"
+            f"（区组 {args.design_assignment.get('block')} 内第 "
+            f"{args.design_assignment.get('position_in_block')} 个）"
+        )
 
     start_step = 0
     rng_payload = None
