@@ -10249,7 +10249,6 @@ def _ar1_adjusted_mean_test(
     低于阈值时不调整。n_eff<3 时不给 p 值（有效证据不足），
     避免用 1 个有效窗口伪造显著性。
     """
-    values = [float(value) for value in values]
     n = len(values)
     if n < _MIN_SEEDS_FOR_STATS:
         return {
@@ -10261,7 +10260,8 @@ def _ar1_adjusted_mean_test(
             "df": None,
             "note": "insufficient_windows",
         }
-    if any(not math.isfinite(value) for value in values):
+    numeric = _finite_values(values)
+    if numeric is None:
         return {
             "applied": False,
             "lag1_autocorrelation": None,
@@ -10271,6 +10271,7 @@ def _ar1_adjusted_mean_test(
             "df": None,
             "note": "non_finite_values",
         }
+    values = numeric
 
     tensor = torch.tensor(values, dtype=torch.float64)
     rho1 = _lag1_autocorrelation(tensor)
@@ -23010,8 +23011,11 @@ def _paired_t_test(
     if n < _MIN_SEEDS_FOR_STATS:
         return {"test": "insufficient_seeds"}
 
-    mean = sum(differences) / n
-    std = _sample_std(differences)
+    values = _finite_values(differences)
+    if values is None:
+        return {"test": "invalid_values"}
+    mean = sum(values) / n
+    std = _sample_std(values)
 
     if std == 0.0:
         if mean == 0.0:
@@ -23054,7 +23058,7 @@ _RANDOMIZATION_MONTE_CARLO_REPLICATES = 20000
 def _randomization_seed(differences: List[float]) -> int:
     """由配对差值生成稳定的随机化种子（不触碰全局 RNG）。"""
     material = repr(
-        [float(value) for value in differences]
+        [_finite_float(value) for value in differences]
     ).encode("utf-8")
     return int.from_bytes(
         hashlib.blake2b(material, digest_size=8).digest(),
@@ -23083,8 +23087,8 @@ def _paired_sign_flip_test(
     if n < _MIN_SEEDS_FOR_STATS:
         return {"test": "insufficient_seeds"}
 
-    values = [float(value) for value in differences]
-    if any(not math.isfinite(value) for value in values):
+    values = _finite_values(differences)
+    if values is None:
         return {"test": "invalid_values"}
 
     mean = sum(values) / n
@@ -23262,8 +23266,14 @@ def _paired_window_bootstrap_ci(
     n = len(differences)
     if n < 2:
         return {"available": False, "reason": "insufficient_windows"}
+    numeric = _finite_values(differences)
+    if numeric is None:
+        return {
+            "available": False,
+            "reason": "non_finite_differences",
+        }
     generator = torch.Generator().manual_seed(int(seed))
-    values = torch.tensor(differences, dtype=torch.float64)
+    values = torch.tensor(numeric, dtype=torch.float64)
     indices = torch.randint(
         low=0,
         high=n,
@@ -24109,8 +24119,8 @@ def _leave_one_out_effect_stability(
     n = len(values)
     if n < _MIN_SEEDS_FOR_STATS:
         return {}
-    numeric = [float(value) for value in values]
-    if any(not math.isfinite(value) for value in numeric):
+    numeric = _finite_values(values)
+    if numeric is None:
         return {}
 
     total = sum(numeric)
@@ -24156,8 +24166,8 @@ def _exact_sign_test(
     2/2^n（n 个非零差值同向），因此 n≤5 时该检验在 0.05
     水平上不可能显著，报告必须显式记录这一分辨率限制。
     """
-    numeric = [float(value) for value in differences]
-    if any(not math.isfinite(value) for value in numeric):
+    numeric = _finite_values(differences)
+    if numeric is None:
         return {
             "test": "exact_binomial_sign",
             "available": False,
@@ -24171,12 +24181,16 @@ def _exact_sign_test(
         p_value = 1.0
         min_attainable = 1.0
     else:
+        # 用整数分母做真除法：n>1023 时 float(2**n) 会溢出，
+        # 而 Python 的大整数除法对可表示的结果仍能正确舍入。
+        denominator = 2 ** n
         tail = sum(
             math.comb(n, index)
             for index in range(min(positives, negatives) + 1)
-        ) / float(2 ** n)
+        ) / denominator
         p_value = min(1.0, 2.0 * tail)
-        min_attainable = min(1.0, 2.0 / float(2 ** n))
+        # math.ldexp 直接给出 2^(1-n)，n 极大时安全地下溢到 0。
+        min_attainable = min(1.0, math.ldexp(2.0, -n))
     alpha_value = float(alpha)
     return {
         "test": "exact_binomial_sign",
@@ -24244,8 +24258,7 @@ def _paired_result_fragility(
     因此沿用原位置阈值仍适用（删除后 p 排序可能变化，但
     不会放宽判定）。
     """
-    numeric = [float(value) for value in differences]
-    n = len(numeric)
+    n = len(differences)
     if n < _MIN_SEEDS_FOR_STATS:
         return {
             "available": False,
@@ -24253,7 +24266,8 @@ def _paired_result_fragility(
             "n": n,
             "min_seeds": _MIN_SEEDS_FOR_STATS,
         }
-    if any(not math.isfinite(value) for value in numeric):
+    numeric = _finite_values(differences)
+    if numeric is None:
         return {
             "available": False,
             "reason": "non_finite_differences",
@@ -24607,6 +24621,12 @@ def _welch_t_test(
     if n_a < _MIN_SEEDS_FOR_STATS or n_b < _MIN_SEEDS_FOR_STATS:
         return {"test": "insufficient_seeds"}
 
+    numeric_a = _finite_values(values_a)
+    numeric_b = _finite_values(values_b)
+    if numeric_a is None or numeric_b is None:
+        return {"test": "invalid_values"}
+    values_a = numeric_a
+    values_b = numeric_b
     mean_a = sum(values_a) / n_a
     mean_b = sum(values_b) / n_b
     var_a = _sample_std(values_a) ** 2

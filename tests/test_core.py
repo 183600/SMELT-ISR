@@ -4132,6 +4132,35 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._axis_value_equal(huge, huge + 1)
         )
         experiment._axis_value_sort_key(huge)
+        self.assertEqual(
+            experiment._paired_t_test([huge, 1.0, 2.0]),
+            {"test": "invalid_values"},
+        )
+        self.assertEqual(
+            experiment._paired_sign_flip_test(
+                [huge, 1.0, 2.0, 3.0]
+            ),
+            {"test": "invalid_values"},
+        )
+        self.assertEqual(
+            experiment._welch_t_test(
+                [huge, 1.0, 2.0],
+                [1.0, 2.0, 3.0],
+            ),
+            {"test": "invalid_values"},
+        )
+        self.assertEqual(
+            experiment._paired_result_fragility(
+                [huge, 1.0, 2.0]
+            )["reason"],
+            "non_finite_differences",
+        )
+        # n>1023 时 2**n 不能再转 float；精确符号检验仍需
+        # 给出可判定的 p 值与最小可达 p。
+        sign = experiment._exact_sign_test([1.0] * 2000)
+        self.assertTrue(sign["available"])
+        self.assertEqual(sign["p_value"], 0.0)
+        self.assertEqual(sign["min_attainable_p"], 0.0)
 
     def test_paper_protocol_keeps_undisclosed_warmup_defaults(self):
         previous = sys.argv
