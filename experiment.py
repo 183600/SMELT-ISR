@@ -13442,6 +13442,100 @@ def run_statistical_baseline(
                     print(f"  - {failure}")
                 test_windows = None
             else:
+                # 研究级访问账本与神经路径同一协议：路径级封条
+                # 挡不住「新建目录/换 seed 后再次访问同一测试
+                # 集」。统计基线也是候选，必须进入同一账本，
+                # 否则 --final-test-comparison 会漏报它的访问。
+                ledger_path = (
+                    Path(args.test_ledger)
+                    if getattr(args, "test_ledger", None)
+                    else out_dir / "test_access_ledger.jsonl"
+                )
+                if getattr(args, "test_ledger", None) is None:
+                    print(
+                        "[test] [warn] 未指定 --test-ledger：访问"
+                        "账本只写在本次输出目录，无法阻止其它目录"
+                        "重复解封同一测试集"
+                    )
+                access_key = _test_access_key(
+                    dataset.data_sha256,
+                    dataset.split_sha256,
+                    dataset.test_fraction,
+                )
+                access_check = check_test_access_ledger(
+                    ledger_path,
+                    access_key,
+                    out_dir,
+                )
+                if (
+                    access_check["repeat_access"]
+                    and not getattr(
+                        args,
+                        "allow_repeat_test_access",
+                        False,
+                    )
+                ):
+                    raise SystemExit(
+                        "[test] 拒绝解封：访问账本显示同一测试集"
+                        "已被其它候选解封（"
+                        + ", ".join(
+                            str(item.get("out_dir"))
+                            for item in access_check[
+                                "other_candidates"
+                            ][:5]
+                        )
+                        + "）。最终确认应冻结候选后统一解封；"
+                        "如确需重复访问，显式加 "
+                        "--allow-repeat-test-access，最终报告"
+                        "必须列出全部访问"
+                    )
+                append_test_access_ledger(
+                    ledger_path,
+                    {
+                        **access_key,
+                        "out_dir": str(out_dir),
+                        "study_id": getattr(
+                            args, "study_id", None
+                        ),
+                        "seed": args.seed,
+                        "model": "ngram",
+                        "ngram_order": best_order,
+                        "ngram_alpha": best_alpha,
+                        "script_sha256": ngram_run_metadata.get(
+                            "script_sha256"
+                        ),
+                        "git_commit": ngram_run_metadata.get(
+                            "git_commit"
+                        ),
+                        "hypothesis": getattr(
+                            args, "hypothesis", None
+                        ),
+                        "primary_metric": getattr(
+                            args, "primary_metric", None
+                        ),
+                        "allow_repeat_access": bool(
+                            getattr(
+                                args,
+                                "allow_repeat_test_access",
+                                False,
+                            )
+                        ),
+                        "accessed_utc": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                        "note": (
+                            "统计基线测试集访问账本；同一 "
+                            "data/split 指纹的全部访问都应进入"
+                            "最终报告"
+                        ),
+                    },
+                )
+                print(
+                    "[test] 访问账本已记录: "
+                    f"{ledger_path}（历史访问 "
+                    f"{access_check['matching_accesses'] + 1} 次）"
+                )
+
                 # 与神经训练路径同一封存协议：先落
                 # test_started 记录与持久封条，再访问测试
                 # 窗口；评估中途崩溃也不能重复解封。
