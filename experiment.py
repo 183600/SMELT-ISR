@@ -17338,6 +17338,39 @@ def _intervention_eval(
     }
 
 
+def _routing_shuffle_indices(
+    n_experts: int,
+    shape: torch.Size,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """为每个 token 无放回抽取 top-k 个随机专家。
+
+    原来的 `torch.randint` 有放回抽样会把同一专家分配给一个
+    token 的多个 slot（E=4、k=2 时约 1/4 的行），模型随后把
+    重复 slot 合并成单专家满权重，随机路由的分布已经偏离
+    「均匀随机 top-k」。这里对每行随机打分再取前 k 个不同的
+    专家，保持 assignment 数与均匀权重口径。
+    """
+    rows = int(shape[0]) if len(shape) > 0 else 0
+    slots = int(shape[-1]) if len(shape) > 0 else 0
+    if rows <= 0 or slots <= 0:
+        return torch.empty(shape, dtype=torch.int64)
+    if slots > n_experts:
+        raise ValueError(
+            "routing_shuffle 的 top-k 不能超过专家数"
+        )
+    scores = torch.rand(
+        (rows, int(n_experts)),
+        generator=generator,
+    )
+    selected = torch.topk(
+        scores,
+        k=slots,
+        dim=-1,
+    ).indices
+    return selected.reshape(shape)
+
+
 def analyze_routing_interventions(
     model: nn.Module,
     dataset: ByteDataset,
@@ -17409,17 +17442,20 @@ def analyze_routing_interventions(
     # 干预实验会跨进程得到不同路由，RQ4 的功能证据不可复现。
     def _make_override(module: SparseMoE, module_index: int):
         generator = torch.Generator(device="cpu")
+        # 只在创建 override 时播种一次，让随机流在后续每次
+        # route 调用（两轮、多个 batch）之间自然推进。原先在
+        # 闭包里每调用一次就 manual_seed，所有同形状调用拿到
+        # 完全相同的 assignment，round1/round2 与不同 batch 被
+        # 人为绑定，随机化失去意义。
+        generator.manual_seed(
+            _routing_shuffle_seed(seed, module_index)
+        )
 
         def _override(indices, weights, logits):
-            generator.manual_seed(
-                _routing_shuffle_seed(seed, module_index)
-            )
-            new_indices = torch.randint(
-                0,
+            new_indices = _routing_shuffle_indices(
                 int(module.n_experts),
                 indices.shape,
-                generator=generator,
-                device="cpu",
+                generator,
             ).to(indices.device)
             new_weights = torch.full_like(
                 weights,
@@ -24518,6 +24554,7 @@ def aggregate_runs(
             "effective_seed_count": 0,
             "samples": {},
             "costs": {},
+            "ci95": {},
             "window_payloads": [],
             "numerical_status": "failed",
             "numerical_failures": [

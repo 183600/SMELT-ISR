@@ -477,6 +477,28 @@ class RoutingInterventionReproducibilityTests(unittest.TestCase):
             first, experiment._routing_shuffle_seed(7, 1)
         )
 
+    def test_routing_shuffle_is_distinct_and_advances(self):
+        generator = torch.Generator().manual_seed(0)
+        first = experiment._routing_shuffle_indices(
+            4, torch.Size([64, 2]), generator
+        )
+        second = experiment._routing_shuffle_indices(
+            4, torch.Size([64, 2]), generator
+        )
+        # 每个 token 的 top-k 必须是无放回的不同专家。
+        self.assertTrue(
+            bool(
+                (first[:, 0] != first[:, 1]).all()
+            )
+        )
+        self.assertTrue(
+            bool(
+                (second[:, 0] != second[:, 1]).all()
+            )
+        )
+        # 第二次调用不能复用第一次的随机 assignment。
+        self.assertFalse(torch.equal(first, second))
+
     def test_routing_shuffle_reproducible_across_fresh_models(self):
         class _FixedEvalDataset:
             def __init__(self, seq_len):
