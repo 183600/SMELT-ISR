@@ -23794,11 +23794,12 @@ def _observed_seed_sd(
     """
     由检验口径的标准误还原观测到的（近似）种子间标准差。
 
-    配对设计 se = sd/√n，直接 sd = se·√n。Welch 两臂样本量
-    不等时，把「等臂规划下与当前 se 等价的每臂种子数」取调和
-    均值 n_eq = 2·n_a·n_b/(n_a+n_b)，对应 sd = se·√n_eq；用
-    min(n_a, n_b) 会把所需种子数说得比实际乐观。无法确定口径
-    时返回 None。
+    配对设计 se = sd/√n，直接 sd = se·√n。Welch 的
+    se² = s_a²/n_a + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
+    因此 s = se·√(n_a·n_b/(n_a+n_b))。用调和均值
+    n_eq = 2·n_a·n_b/(n_a+n_b) 表示即 s = se·√(n_eq/2)；
+    直接把 n_eq 当配对 n 会把 sd 高估 √2，进而把所需种子数
+    高估约 2 倍。无法确定口径时返回 None。
     """
     n_pairs = contrast.get("n_pairs")
     n_baseline = contrast.get("n_baseline")
@@ -23820,7 +23821,9 @@ def _observed_seed_sd(
             2.0 * n_baseline * n_variant
             / (n_baseline + n_variant)
         )
-        return se_value * math.sqrt(n_equivalent)
+        # Welch se 已包含两臂合并后的 √(1/n_a+1/n_b)，
+        # 不能把 n_eq 当作配对样本数直接开方。
+        return se_value * math.sqrt(n_equivalent / 2.0)
     return None
 
 
@@ -24477,6 +24480,66 @@ def aggregate_runs(
                 aggregate["samples"].pop(metric, None)
 
         aggregates.append(aggregate)
+
+    # 整格全部数值失败的实验单元也必须出现在聚合结果里：否则
+    # 下游表格/对比会把它当成「没有这个方案」，失败率与
+    # numerical_failures 证据一起消失，正好把最需要披露的臂
+    # 静默隐藏。这里生成一个没有可用样本、但带完整失败明细的
+    # 占位单元。
+    usable_keys = set(order)
+    for key in failed_by_key:
+        if key in usable_keys:
+            continue
+        failures = failed_by_key[key]
+        factor_values = [
+            _row_factor_value(failures[0], name)
+            for name in group_keys
+        ]
+        if group_keys:
+            label = ", ".join(
+                f"{name}={_format_factor_value(value)}"
+                for name, value in zip(
+                    group_keys, factor_values
+                )
+            )
+        else:
+            label = "(全部运行)"
+        aggregates.append({
+            "label": label,
+            "keys": dict(zip(group_keys, factor_values)),
+            "n_runs": 0,
+            "n_planned_runs": len(failures),
+            "all_runs_failed": True,
+            "runs": [],
+            "seeds": [],
+            "duplicate_seeds": [],
+            "deterministic": False,
+            "deterministic_repeat_runs": [],
+            "effective_seed_count": 0,
+            "samples": {},
+            "costs": {},
+            "window_payloads": [],
+            "numerical_status": "failed",
+            "numerical_failures": [
+                {
+                    "run": str(row.get("run")),
+                    "curve_status": row.get("curve_status"),
+                    "nonfinite_events": row.get(
+                        "nonfinite_events"
+                    ),
+                    "numerical_stop": row.get(
+                        "numerical_stop"
+                    ),
+                    "numerical_polluted": row.get(
+                        "numerical_polluted"
+                    ),
+                    "prior_numerical_stop": row.get(
+                        "prior_numerical_stop"
+                    ),
+                }
+                for row in failures
+            ],
+        })
 
     aggregates.sort(
         key=lambda aggregate: [
@@ -27240,11 +27303,12 @@ def _contrast_display(
                 caveat += family_text + "）"
 
     # 伪重复：同一单元里同一随机种子出现多次（复制的运行）
-    # 不是独立重复实验，配对检验不可用，结论的统计功效存疑。
+    # 不是独立重复实验；检验前已折叠为每 seed 一个观测，仍按
+    # 共同种子配对，复制运行不增加 n。
     if contrast.get("duplicate_seeds"):
         caveat += (
-            "（实验单元含重复随机种子，按非配对 Welch 处理，"
-            "重复运行不能算独立重复）"
+            "（实验单元含重复随机种子，已折叠为每 seed 一个观测，"
+            "重复运行不增加 n，检验仍按共同种子配对）"
         )
 
     # 效率与精度权衡：效率倍率必须与涨点一起展示；显著改善

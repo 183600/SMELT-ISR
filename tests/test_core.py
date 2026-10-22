@@ -366,6 +366,68 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(result["n_baseline"], 3)
         self.assertEqual(result["n_variant"], 3)
 
+    def test_observed_seed_sd_matches_welch_definition(self):
+        # Welch se² = s²/n_a + s²/n_b；等臂 n 时 s = se·√(n/2)，
+        # 不能把调和均值 n_eq 直接当成配对样本数。
+        contrast = {
+            "n_pairs": 0,
+            "n_baseline": 3,
+            "n_variant": 3,
+            "se": 0.1,
+        }
+        self.assertAlmostEqual(
+            experiment._observed_seed_sd(contrast, 0.1),
+            0.1 * math.sqrt(1.5),
+        )
+        paired = {
+            "n_pairs": 3,
+            "n_baseline": 3,
+            "n_variant": 3,
+            "se": 0.1,
+        }
+        self.assertAlmostEqual(
+            experiment._observed_seed_sd(paired, 0.1),
+            0.1 * math.sqrt(3.0),
+        )
+
+    def test_all_failed_cell_stays_visible(self):
+        rows = [
+            {
+                "run": f"base{seed}",
+                "mode": "local_base",
+                "seed": seed,
+                "val_loss": 3.0 + seed / 100.0,
+            }
+            for seed in (1, 2, 3)
+        ]
+        rows += [
+            {
+                "run": f"Afailed{seed}",
+                "mode": "A",
+                "seed": seed,
+                "val_loss": float("nan"),
+                "numerical_status": "failed",
+            }
+            for seed in (1, 2, 3)
+        ]
+        aggregates = experiment.aggregate_runs(rows, ["mode"])
+        by_mode = {
+            aggregate["keys"]["mode"]: aggregate
+            for aggregate in aggregates
+        }
+        self.assertIn("local_base", by_mode)
+        failed = by_mode["A"]
+        self.assertTrue(failed["all_runs_failed"])
+        self.assertEqual(failed["n_runs"], 0)
+        self.assertEqual(failed["n_planned_runs"], 3)
+        self.assertEqual(
+            {
+                item["run"]
+                for item in failed["numerical_failures"]
+            },
+            {"Afailed1", "Afailed2", "Afailed3"},
+        )
+
     def test_failure_rate_report(self):
         rows = [
             {"run": "a1", "mode": "A", "numerical_status": "ok"},
