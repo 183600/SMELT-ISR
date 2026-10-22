@@ -26799,33 +26799,60 @@ def _cost_comparison(
             "variant_std": std_b,
         }
 
+        relative_se = None
+        critical = None
+        df = None
+        ci_method = None
+        low = None
+        high = None
         if (
             std_a is not None
             and std_b is not None
             and n_a >= 2
             and n_b >= 2
+            and cost_a > 0.0
+            and cost_b > 0.0
         ):
             # 对数尺度的 delta 方法：相对标准误由两侧的
-            # 变异系数与独立观测数共同决定。
-            term_a = (std_a / cost_a) ** 2 / n_a
-            term_b = (std_b / cost_b) ** 2 / n_b
+            # 变异系数与独立观测数共同决定。先用乘法检查
+            # 平方是否落在 float 范围内，避免 **2 抛
+            # OverflowError；变体成本为 0 时也不能除零。
+            relative_a = std_a / cost_a
+            relative_b = std_b / cost_b
+            term_a = relative_a * relative_a / n_a
+            term_b = relative_b * relative_b / n_b
             relative_variance = term_a + term_b
-            relative_se = math.sqrt(relative_variance)
-
-            # Welch-Satterthwaite 自由度：两侧方差与样本量都
-            # 参与，避免把 n=3 的计时波动当成已知方差。
-            df = None
-            denominator = (
-                term_a ** 2 / (n_a - 1)
-                + term_b ** 2 / (n_b - 1)
-            )
-            critical = None
-            if denominator > 0.0:
-                df = relative_variance ** 2 / denominator
-                critical = _t_critical(
-                    df,
-                    _COST_RATIO_CI_ALPHA,
-                )
+            if (
+                math.isfinite(relative_a)
+                and math.isfinite(relative_b)
+                and math.isfinite(term_a)
+                and math.isfinite(term_b)
+                and math.isfinite(relative_variance)
+                and relative_variance >= 0.0
+            ):
+                relative_se = math.sqrt(relative_variance)
+                # Welch-Satterthwaite 自由度：用相对项计算，
+                # 避免对方差本身再平方而溢出。
+                scale_term = max(term_a, term_b)
+                if scale_term > 0.0:
+                    scaled_a = term_a / scale_term
+                    scaled_b = term_b / scale_term
+                    denominator = (
+                        scaled_a * scaled_a / (n_a - 1)
+                        + scaled_b * scaled_b / (n_b - 1)
+                    )
+                    if (
+                        denominator > 0.0
+                        and math.isfinite(denominator)
+                    ):
+                        df = (
+                            (scaled_a + scaled_b) ** 2
+                            / denominator
+                        )
+                        critical = _t_critical(
+                            df,
+                            _COST_RATIO_CI_ALPHA,
+                        )
             if critical is None:
                 # 零方差时区间退化为点估计；理论上不应
                 # 走到这里，保留正态近似仅作数值兜底。
@@ -26834,27 +26861,54 @@ def _cost_comparison(
                 ci_method = "normal_fallback"
             else:
                 ci_method = "welch_t"
-            low = ratio * math.exp(-critical * relative_se)
-            high = ratio * math.exp(critical * relative_se)
-            detail["relative_se"] = round(relative_se, 6)
-            detail["ci_method"] = ci_method
-            detail["ci_df"] = (
-                round(df, 3) if df is not None else None
-            )
-            detail["ci_t_critical"] = round(critical, 6)
-            detail["ratio_ci95"] = [
-                round(low, 6),
-                round(high, 6),
-            ]
-            detail["ci_excludes_one"] = bool(
-                low > 1.0 or high < 1.0
-            )
-            detail["resolvable"] = True
-            if field in _COST_TIMING_FIELDS and (
-                relative_se > _COST_NOISE_CV_LIMIT
-                or not detail["ci_excludes_one"]
-            ):
-                timing_noise_fields.append(field)
+            if relative_se is not None:
+                exponent = critical * relative_se
+                if exponent <= 709.0:
+                    low = ratio * math.exp(-exponent)
+                    high = ratio * math.exp(exponent)
+                elif ratio == 0.0:
+                    low = 0.0
+                    high = 0.0
+                if (
+                    low is not None
+                    and high is not None
+                    and math.isfinite(low)
+                    and math.isfinite(high)
+                ):
+                    detail["relative_se"] = round(
+                        relative_se, 6
+                    )
+                    detail["ci_method"] = ci_method
+                    detail["ci_df"] = (
+                        round(df, 3)
+                        if df is not None
+                        else None
+                    )
+                    detail["ci_t_critical"] = round(
+                        critical, 6
+                    )
+                    detail["ratio_ci95"] = [
+                        round(low, 6),
+                        round(high, 6),
+                    ]
+                    detail["ci_excludes_one"] = bool(
+                        low > 1.0 or high < 1.0
+                    )
+                    detail["resolvable"] = True
+                    if field in _COST_TIMING_FIELDS and (
+                        relative_se > _COST_NOISE_CV_LIMIT
+                        or not detail["ci_excludes_one"]
+                    ):
+                        timing_noise_fields.append(field)
+                else:
+                    relative_se = None
+            if relative_se is None:
+                detail["relative_se"] = None
+                detail["ratio_ci95"] = None
+                detail["ci_excludes_one"] = None
+                detail["resolvable"] = False
+                if field in _COST_TIMING_FIELDS:
+                    unverifiable_timing_fields.append(field)
         else:
             detail["relative_se"] = None
             detail["ratio_ci95"] = None

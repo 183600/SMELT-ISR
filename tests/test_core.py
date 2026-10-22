@@ -4766,6 +4766,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
 
+    def test_cost_comparison_tolerates_zero_and_huge_variants(self):
+        def cell(mean, std=1.0, n=3):
+            return {
+                "costs": {
+                    "n_params": {
+                        "mean": mean,
+                        "std": std,
+                        "n": n,
+                    }
+                }
+            }
+
+        # 变体成本为 0 时不能在做变异系数时除零。
+        _, verdict = experiment._cost_comparison(
+            cell(1.0), cell(0.0), "improvement", True
+        )
+        self.assertIsNotNone(verdict)
+        # 成本倍率极大时 exp/平方不能抛 OverflowError；无法给出
+        # 有限区间时应明确标为不可分辨。
+        cost, _ = experiment._cost_comparison(
+            cell(1e-100), cell(1e100), "improvement", True
+        )
+        detail = cost["uncertainty"]["n_params"]
+        self.assertFalse(detail["resolvable"])
+        self.assertIsNone(detail["ratio_ci95"])
+
     def test_contrasts_tolerate_out_of_range_means_and_counts(self):
         huge = 10**400
 
