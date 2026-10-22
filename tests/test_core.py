@@ -974,6 +974,21 @@ class DesignPreparationTests(unittest.TestCase):
             self.assertIn("bad", error)
             self.assertIn("missing", error)
 
+    def test_resolve_run_order_rejects_empty_scheme(self):
+        args = argparse.Namespace(
+            run_order="", run_order_seed=0
+        )
+        with self.assertRaises(ValueError):
+            experiment.resolve_run_order(args)
+        self.assertEqual(
+            experiment.resolve_run_order(
+                argparse.Namespace(
+                    run_order=None, run_order_seed=None
+                )
+            ),
+            ("randomized", 0),
+        )
+
     def test_design_plan_recomputes_canonical_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

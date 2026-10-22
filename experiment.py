@@ -55591,7 +55591,9 @@ def resolve_run_order(args: argparse.Namespace) -> Tuple[str, int]:
     再跑下一个臂，机器热漂移、共享缓存与集群负载随时间变化
     时，这些漂移与臂效应完全混杂。
     """
-    scheme = getattr(args, "run_order", None) or "randomized"
+    scheme = getattr(args, "run_order", None)
+    if scheme is None:
+        scheme = "randomized"
     if scheme not in _RUN_ORDER_SCHEMES:
         raise ValueError(
             "运行顺序方案必须是 "
