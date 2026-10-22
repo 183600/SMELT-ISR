@@ -10659,6 +10659,14 @@ def _lag1_autocorrelation(
     n = int(numeric.numel())
     if n < 4 or not bool(torch.isfinite(numeric).all()):
         return None
+    # 合法的大数值（如 1e308）会让 ``head.mean()`` 与平方和溢出
+    # 成 inf；此时 ``inf / inf`` 得到 NaN，后续 clamp 会把它变成
+    # 伪造的 rho=1（常数序列也会被误判为强正自相关）。自相关对
+    # 公共尺度不变，按最大绝对值归一化后再计算；正常量级保持
+    # 原路径，避免改变历史结果的末位舍入。
+    scale = float(numeric.abs().max().item())
+    if scale > 1.0e150:
+        numeric = numeric / scale
     head = numeric[:-1]
     tail = numeric[1:]
     head = head - head.mean()

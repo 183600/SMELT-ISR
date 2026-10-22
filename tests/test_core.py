@@ -6275,5 +6275,27 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             sys.argv = previous
 
 
+class NumericalScaleTests(unittest.TestCase):
+    def test_lag1_autocorrelation_is_scale_stable(self):
+        small = torch.tensor(
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
+            dtype=torch.float64,
+        )
+        large = small * 1.0e300
+        expected = experiment._lag1_autocorrelation(small)
+        self.assertIsNotNone(expected)
+        actual = experiment._lag1_autocorrelation(large)
+        self.assertIsNotNone(actual)
+        self.assertAlmostEqual(actual, expected, places=12)
+
+        # 常数序列没有可定义的自相关；超大常数不能因均值溢出
+        # 被误判成 rho=1。
+        self.assertIsNone(
+            experiment._lag1_autocorrelation(
+                torch.full((8,), 1.0e308, dtype=torch.float64)
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
