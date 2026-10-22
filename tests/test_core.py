@@ -1150,6 +1150,49 @@ class DesignPreparationTests(unittest.TestCase):
                         child_args
                     )
 
+            # 浮点值不能被 int() 静默截断成合法分配。
+            entry["seed"] = 1.9
+            payload["plan_id"] = experiment._design_plan_id(
+                payload
+            )
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            env["SMELT_DESIGN_PLAN_SHA256"] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            env["SMELT_DESIGN_PLAN_ID"] = payload["plan_id"]
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    experiment.verify_design_assignment(
+                        child_args
+                    )
+
+            # 极大的 balance_coef 也不能让 float() 溢出逃逸。
+            entry["seed"] = item["seed"]
+            entry["balance_coef"] = 10**400
+            payload["plan_id"] = experiment._design_plan_id(
+                payload
+            )
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            env["SMELT_DESIGN_PLAN_SHA256"] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            env["SMELT_DESIGN_PLAN_ID"] = payload["plan_id"]
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    experiment.verify_design_assignment(
+                        child_args
+                    )
+
     def test_run_order_drift_skips_deterministic_modes(self):
         rows = [
             {
@@ -1327,6 +1370,29 @@ class DesignPreparationTests(unittest.TestCase):
                     5,
                     base_args,
                 )
+
+    def test_run_order_drift_handles_unhashable_block_record(self):
+        rows = []
+        for index in (1, 2, 3, 4):
+            rows.append({
+                "run": f"r{index}",
+                "mode": "A" if index % 2 else "B",
+                "val_loss": float(index),
+                "design_order_index": index,
+                # 损坏的旧 config 可能把区组写成对象/列表；
+                # 诊断报告不能因此抛 TypeError。
+                "design_block": (
+                    {"bad": index} if index == 1 else index
+                ),
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": "randomized",
+            })
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["n_blocks"], 4)
 
     def test_run_order_drift_zero_variance_is_insufficient(self):
         rows = []

@@ -56122,13 +56122,14 @@ def verify_design_assignment(
         raise ValueError(
             "设计计划环境变量中的顺序种子不是整数"
         ) from error
-    try:
-        plan_order_seed = int(str(order.get("seed")))
-    except (TypeError, ValueError) as error:
+    plan_order_seed = order.get("seed")
+    if isinstance(plan_order_seed, bool) or not isinstance(
+        plan_order_seed, int
+    ):
         raise ValueError(
             "设计计划中的顺序种子不是整数"
-        ) from error
-    if plan_order_seed != order_seed:
+        )
+    if int(plan_order_seed) != order_seed:
         raise ValueError(
             "设计计划的运行顺序种子与环境变量不一致"
         )
@@ -56172,15 +56173,23 @@ def verify_design_assignment(
             f"{entry.get('label')!r}，当前 --out 是 "
             f"{out_path.name!r}"
         )
-    try:
-        entry_seed = int(entry.get("seed"))
-        entry_block = int(entry.get("block"))
-        entry_position = int(entry.get("position_in_block"))
-    except (TypeError, ValueError) as error:
+    entry_seed = entry.get("seed")
+    entry_block = entry.get("block")
+    entry_position = entry.get("position_in_block")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (entry_seed, entry_block, entry_position)
+    ):
+        # 不能对 1.9 之类数值做 int() 截断：计划文件里的
+        # seed/区组必须是精确整数，否则“分配不符”会被静默
+        # 四舍五入成一个合法分配。
         raise ValueError(
             "设计计划条目的 seed/区组/区组内位置不是整数："
             "计划内容损坏或被改写"
-        ) from error
+        )
+    entry_seed = int(entry_seed)
+    entry_block = int(entry_block)
+    entry_position = int(entry_position)
     if entry_seed != int(args.seed):
         raise ValueError(
             "设计计划中的 seed 与当前 --seed 不一致"
@@ -56193,13 +56202,22 @@ def verify_design_assignment(
         )
     recorded_balance = entry.get("balance_coef")
     if recorded_balance is not None:
-        try:
-            same_balance = abs(
-                float(recorded_balance)
-                - float(args.balance_coef)
-            ) <= 1e-12
-        except (TypeError, ValueError):
+        if isinstance(recorded_balance, bool) or not isinstance(
+            recorded_balance, (int, float)
+        ):
             same_balance = False
+        else:
+            try:
+                same_balance = (
+                    math.isfinite(float(recorded_balance))
+                    and math.isfinite(float(args.balance_coef))
+                    and abs(
+                        float(recorded_balance)
+                        - float(args.balance_coef)
+                    ) <= 1e-12
+                )
+            except (TypeError, ValueError, OverflowError):
+                same_balance = False
         if not same_balance:
             raise ValueError(
                 "设计计划中的 balance_coef 与当前命令行不一致"
@@ -56506,7 +56524,8 @@ def run_order_drift_report(
             "verdict": "insufficient",
             "n_runs": len(entries),
             "n_blocks": len({
-                entry["block"] for entry in entries
+                _stable_factor_key(entry["block"])
+                for entry in entries
             }),
             "plan_ids": plan_ids,
             "order_schemes": schemes,
@@ -56531,7 +56550,8 @@ def run_order_drift_report(
         "verdict": "warn" if warnings else "ok",
         "n_runs": len(entries),
         "n_blocks": len({
-            entry["block"] for entry in entries
+            _stable_factor_key(entry["block"])
+            for entry in entries
         }),
         "plan_ids": plan_ids,
         "order_schemes": schemes,
