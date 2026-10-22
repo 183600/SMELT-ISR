@@ -256,6 +256,33 @@ class PaperFidelityTests(unittest.TestCase):
         self.assertIsNone(report["protocol_faithful"])
         self.assertFalse(report["is_full_reproduction"])
 
+    def test_decay_branch_satisfies_protocol(self):
+        cfg = experiment.Config(
+            **experiment.paper_preset(
+                "100M", 85, "smelt"
+            )["config"],
+            document_masks=True,
+            document_separator=[10],
+        )
+        branch = dict(PAPER_PROTOCOL)
+        branch["stable_steps"] = 20000
+        branch["steps"] = (
+            20000 + experiment.PAPER_PROTOCOL["decay_steps"]
+        )
+        branch["save_at_steps"] = []
+        report = experiment.paper_fidelity_report(
+            cfg, branch
+        )
+        self.assertNotIn(
+            "protocol_stable_phase",
+            report["protocol_checks"],
+        )
+        self.assertTrue(
+            report["protocol_faithful"],
+            report["protocol_checks"],
+        )
+        self.assertTrue(report["is_full_reproduction"])
+
     def test_protocol_deviation_detected(self):
         cfg = experiment.Config(
             **experiment.paper_preset(

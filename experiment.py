@@ -1160,7 +1160,7 @@ def _paper_protocol_checks(
         and stable < stable_target
         and steps == stable + decay_steps
     )
-    return {
+    checks = {
         "protocol_wsd_schedule": (
             str(protocol.get("lr_schedule", "")) == "wsd"
         ),
@@ -1183,6 +1183,11 @@ def _paper_protocol_checks(
             or branch_run
         ),
     }
+    if branch_run:
+        # 分支运行本身不包含稳定期；稳定期由它的父运行负责，
+        # 不能把「这条分支没跑稳定期」记成协议偏离。
+        checks.pop("protocol_stable_phase")
+    return checks
 
 
 def paper_fidelity_report(
@@ -20443,6 +20448,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "optimizer_eps",
     "lr",
     "lr_schedule",
+    # WSD（论文 3.1 节）的稳定期终点与衰减终点决定整条学习率
+    # 轨迹；cosine 运行时这两个值为 None。
+    "wsd_stable_steps",
+    "wsd_final_lr_ratio",
     "warmup_steps",
     "total_steps",
     # 实际有效训练长度：total_steps 只是计划值，早停或
@@ -20454,6 +20463,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "weight_decay",
     "grad_clip",
     "batch_size",
+    # 文档级 segment mask 改变注意力可见性；分隔符字节决定
+    # 文档边界位置，两者都是模型语义的一部分。
+    "document_masks",
+    "document_separator",
     "data_augmentation",
     # 早停设置决定「实际训练轮数」：total_steps 相同但早停
     # patience 不同时，某个运行可能提前结束，与「训练同样久」
@@ -21153,6 +21166,14 @@ def build_comparison_protocol(
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
         "batch_size": args.batch_size,
+        # 文档级 segment mask 改变注意力可见性，属于模型语义，
+        # 跨运行对比必须一致（包括分隔符字节）。
+        "document_masks": bool(cfg.document_masks),
+        "document_separator": (
+            list(cfg.document_separator)
+            if cfg.document_separator is not None
+            else None
+        ),
         # 当前字节级管线不做数据增强；显式记录空操作，
         # 未来加入增强后不同运行会立刻被对比检查发现。
         "data_augmentation": "none",
@@ -21379,6 +21400,15 @@ def experiment_protocol_from_payload(
         "weight_decay": run_args.get("weight_decay"),
         "grad_clip": run_args.get("grad_clip"),
         "batch_size": run_args.get("batch_size"),
+        # 历史运行没有文档级 mask；缺记录时回填 False。
+        "document_masks": (
+            bool(run_args.get("document_masks", False))
+            if has_training
+            else None
+        ),
+        "document_separator": run_args.get(
+            "document_separator"
+        ),
         "data_augmentation": "none" if has_training else None,
         # 早停 / 数值环境 / 实现开关：旧运行的 args 里已记录
         # 的部分直接回填（无法唯一确定的留 None 由检查器标记
