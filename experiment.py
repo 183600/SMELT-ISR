@@ -5254,6 +5254,7 @@ def read_time_order_manifest(
     才可以称为「按时间切分」；否则拒绝启动。
     """
     records: List[str] = []
+    parsed: List[datetime.datetime] = []
     with open(path, encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             text = line.strip()
@@ -5262,7 +5263,8 @@ def read_time_order_manifest(
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:
-                payload = None
+                # 纯文本清单：整行就是一个 ISO-8601 时间戳。
+                payload = text
             if isinstance(payload, dict):
                 value = payload.get("timestamp")
             elif isinstance(payload, str):
@@ -5274,7 +5276,7 @@ def read_time_order_manifest(
                     f"时间清单第 {line_number} 行缺少 timestamp"
                 )
             try:
-                datetime.datetime.fromisoformat(
+                timestamp = datetime.datetime.fromisoformat(
                     value.replace("Z", "+00:00")
                 )
             except ValueError as error:
@@ -5283,24 +5285,44 @@ def read_time_order_manifest(
                     f"{value!r}（{error}）"
                 )
             records.append(value)
+            parsed.append(timestamp)
     if not records:
         raise ValueError("时间清单为空")
-    parsed = [
-        datetime.datetime.fromisoformat(
-            value.replace("Z", "+00:00")
+
+    # 带时区与不带时区的时间戳不能直接比较（Python 会抛
+    # TypeError）。这里显式拒绝混合清单，要求用户统一口径，
+    # 而不是假定 naive 时间戳的时区或让进程裸崩溃。
+    awareness = {
+        "aware"
+        if timestamp.tzinfo is not None
+        and timestamp.utcoffset() is not None
+        else "naive"
+        for timestamp in parsed
+    }
+    if len(awareness) > 1:
+        raise ValueError(
+            "时间清单不能混用带时区与不带时区的 ISO-8601 "
+            "时间戳；请统一写成同一时区（或全部省略时区）"
         )
-        for value in records
-    ]
+
     violations = [
         index
         for index in range(1, len(parsed))
         if parsed[index] < parsed[index - 1]
     ]
+    min_index = min(
+        range(len(parsed)),
+        key=parsed.__getitem__,
+    )
+    max_index = max(
+        range(len(parsed)),
+        key=parsed.__getitem__,
+    )
     return {
         "path": path,
         "records": len(records),
-        "min_timestamp": records[0],
-        "max_timestamp": records[-1],
+        "min_timestamp": records[min_index],
+        "max_timestamp": records[max_index],
         "monotonic_non_decreasing": not violations,
         "order_violations": violations[:20],
         "order_violation_count": len(violations),

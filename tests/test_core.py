@@ -639,6 +639,54 @@ class ProcessTests(unittest.TestCase):
             )
             self.assertFalse(check_same["repeat_access"])
 
+    def test_time_order_manifest_accepts_plain_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "times.txt"
+            path.write_text(
+                "2020-01-01\n2020-01-02\n2020-01-03\n",
+                encoding="utf-8",
+            )
+            evidence = experiment.read_time_order_manifest(
+                str(path)
+            )
+            self.assertEqual(evidence["records"], 3)
+            self.assertTrue(evidence["monotonic_non_decreasing"])
+            self.assertEqual(
+                evidence["min_timestamp"], "2020-01-01"
+            )
+            self.assertEqual(
+                evidence["max_timestamp"], "2020-01-03"
+            )
+
+    def test_time_order_manifest_reports_actual_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "times.txt"
+            path.write_text(
+                "2020-01-03\n2020-01-01\n2020-01-02\n",
+                encoding="utf-8",
+            )
+            evidence = experiment.read_time_order_manifest(
+                str(path)
+            )
+            self.assertFalse(evidence["monotonic_non_decreasing"])
+            self.assertEqual(evidence["order_violations"], [1])
+            self.assertEqual(
+                evidence["min_timestamp"], "2020-01-01"
+            )
+            self.assertEqual(
+                evidence["max_timestamp"], "2020-01-03"
+            )
+
+    def test_time_order_manifest_rejects_mixed_timezones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "times.txt"
+            path.write_text(
+                "2020-01-01\n2020-01-02T00:00:00Z\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                experiment.read_time_order_manifest(str(path))
+
 
 if __name__ == "__main__":
     unittest.main()
