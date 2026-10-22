@@ -40696,6 +40696,14 @@ def environment_mode_error(args) -> Optional[str]:
                 is not None,
             ),
             (
+                "--verify-manifest-strict",
+                bool(
+                    getattr(
+                        args, "verify_manifest_strict", False
+                    )
+                ),
+            ),
+            (
                 "--compare",
                 getattr(args, "compare", None) is not None,
             ),

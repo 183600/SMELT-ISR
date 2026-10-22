@@ -4546,6 +4546,15 @@ class EnvironmentSnapshotTests(unittest.TestCase):
         )
         self.assertIn("--data", conflict)
 
+        strict_manifest = experiment.environment_mode_error(
+            argparse.Namespace(
+                check_environment="run",
+                check_environment_strict=False,
+                verify_manifest_strict=True,
+            )
+        )
+        self.assertIn("--verify-manifest-strict", strict_manifest)
+
         ok = experiment.environment_mode_error(
             argparse.Namespace(
                 check_environment="run",
