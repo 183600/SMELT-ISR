@@ -258,12 +258,13 @@ jobs:
           # ================= 科研方法改进阶段（sci）：提示词池，每次运行时随机选一个 =================
           # SCI_1 为通用提示词：只要求改进科研方法，不指定改进哪一方面；
           # SCI_2~SCI_6 各自只聚焦一个方面：实验设计与准备 / 数据处理 / 可复现性与工程规范 / 对比实验与消融 / 结果分析。
-          PROMPT_SCI_1='改进这个项目的科研方法。本项目研究 SMELT 的独立二轮路由（延迟合并）：第一轮专家输出保持独立分支、第二轮对每个分支独立路由、最后才合并；对照体系有 base/smelt/dense 基线与等计算量对照（local_base、B_early、local_base_k2）。方法学锚点是 docs/design_notes.md（数据协议、结果分析方法、对比实验与消融协议、可复现性与实验追踪）与 docs/methodology_audit.md 的修正记录；改进前先对照检查协议落实的缺口——对照缺失、统计口径松弛、数据纪律漏洞，发现缺口就实际修改代码补齐。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_2='从实验设计与准备的角度改进这个项目的科研方法：检查基线与对照设计——base/smelt/dense 基线要充分调优（学习率等关键超参），A/B 的机制主张必须与等价计算对照分离：local_base（等专家计算量）、B_early（等计算量合并位置）、local_base_k2（只改合并时机）缺一不可，没有它们就无法区分延迟合并本身的贡献与单纯加宽加深的贡献。检查评估指标是否对齐主张——除验证损失外要报路由与专家维度证据：专家利用率与负载均衡、分支独立性检验、二轮路由与一轮路由的 Jaccard 及其相对机会水平的超出量，这是独立分支主张的直接证据。检查复现保真度——默认配置是小规模原型不是论文复现，paper_fidelity 的偏离项要逐项如实列出，不得默认当作论文口径下结论。发现以上问题就实际修改代码与实验脚本来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_3='从数据处理的角度改进这个项目的科研方法：检查切分纪律——语料按时间先后连续切分 train/val/test（默认 90/5/5），三段连续、互不重叠、切分时不随机打乱，训练期的批级 shuffle 由随机窗口起点承担、不改变 split 边界；传入群组分隔符时切分位置吸附群组边界，任何群组整体落同一侧、两侧零重叠。检查测试集尘封——训练循环只访问 train、周期验证只访问 val，test 只在训练完全结束后显式解封评估一次，同一输出目录拒绝重复评估；模型选型只用 val，best.pt 由验证选型指标原子写入，final 与唯一一次 test 都在验证选出的模型上评估。检查数据审计——值域校验、UTF-8 完整性（跨切分点多字节字符预热解码，不误报标签噪声）、字节直方图 JS 距离、滑窗近重复扫描；val 标签噪声无论占比多低都单独记录告警（它参与选型会系统性扭曲 checkpoint 选择）；split 指纹与有效训练集指纹进受控变量核对。发现以上问题就实际修改代码来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法：检查自测纪律——正式实验前 --self-test 全绿：梯度流通、自回归因果性、分支信息隔离、k=1 时方案 B 与 SMELT 的数学等价、同种子两次运行逐位一致、梯度探针负例校验；CI 快速回归的覆盖只增不减。检查随机种子——Python/NumPy/PyTorch/CUDA 与采样器种子全部固定；断点恢复时数据指纹、划分比例、群组分隔符与存档不一致要明确提示而不是静默继续。检查实验追踪——每轮训练的受控变量协议（优化器、学习率策略、训练步数、整体与逐 split 数据指纹、早停/AMP/设备等）写进 config.json 供 --compare 自动核对；metrics.jsonl 完整记录选型指标、选中步与早停证据，训练曲线逐评测点落盘。发现以上问题就实际修改代码来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法：检查受控变量核对——--compare 必须核对除声明因子外设置完全一致，并识别重复种子的伪重复（同一种子跑两遍不是两个独立证据）；共同训练步数必须一致，步数不同的 run 不进同一比较。检查消融完整性——--suite-ablation 的 (1+N)×2 全因子要覆盖 A/B 两个延迟合并方案并自动检查组合完整性，缺组合就无法支撑机制结论。检查统计可靠性——--seeds 多种子汇报 Mean 与 Std 并做显著性检验，同时报告 80% 功效的最小可检出效应（MDE）与 TOST 等价性判定：不显著不会被误读成等价，等价边界（默认相对基线均值 1%）要披露；学习率选型无法区分各方案时如实写无法区分，不挑好看的数字。发现以上问题就实际修改实验代码来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法：检查统计解读纪律——显著性与 MDE 并报，检不出差不等于没有差，TOST 等价性写明边界；数值失败的 run 按幸存者偏差处理：报告失败率与失败模式（路由振荡、专家塌缩、NaN），只分析活下来的 run 会系统性高估方法。检查机制分析——专家专门化证据（各专家被何种输入选中）、二轮与一轮路由的 Jaccard 相对机会水平的超出量、负载均衡损失的实际分布与路由熵，这些是独立计算轨迹主张的实证。补充坏案例分析——把路由异常与损失尖峰的样本定位出来归因（数据异常？路由边界条件？容量瓶颈？），这是提出新改进的最重要来源；分支隔离被打破的样本要逐个核对。发现以上问题就实际修改代码与实验脚本来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_1='改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_2='从实验设计与准备的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_3='从数据处理的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          PROMPT_SINGLE='确保需要是单因素实验的实验都是单因素实验。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_CLEAN='不要修改算力申请.md；不要删除实验结果、审计记录、性能/预算/修复记录或 docs 下的分析文档——这些是审计链的一部分，必须保留或归档到外部不可变存储。只清理临时文件（*.tmp、opencode 临时配置、agent 自己生成的临时清单），不要用删除来“清理”历史记录。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
           PROMPT_APPLY='确保算力申请.md没有错误。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
@@ -271,6 +272,7 @@ jobs:
           PERF_TIMEOUT=$((3*3600))     # 3h
           BUG_TIMEOUT=$((3*3600))      # 3h
           SCI_TIMEOUT=$((3*3600))      # 3h
+          SINGLE_TIMEOUT=$((3600))     # 1h（单因素实验检查）
           CLEAN_TIMEOUT=$((3*3600))    # 3h
           APPLY_TIMEOUT=$((3*3600))    # 3h
 
@@ -713,7 +715,7 @@ jobs:
             esac
           }
 
-          # ================= 测试门（bug / sci 阶段提交后都执行）=================
+          # ================= 测试门（bug / sci / single 阶段提交后都执行）=================
           # 在写代码阶段（bug / sci）的 opencode 调用提交之后触发（调用点见主循环的
           # case "$phase" in bug|sci）。
           # 不再掷骰抽样——每次都跑一遍本仓库的测试；
@@ -809,9 +811,9 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> apply（clean 的清理工作交给收尾的 shell 步骤）-----
-            # for phase in perf bug sci clean apply; do
-            for phase in bug sci apply; do
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> single -> apply（clean 的清理工作交给收尾的 shell 步骤）-----
+            # for phase in perf bug sci single clean apply; do
+            for phase in bug sci single apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
@@ -830,6 +832,7 @@ jobs:
                   echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
                 ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
+                single) P="$PROMPT_SINGLE"; T="$SINGLE_TIMEOUT" ;;
                 apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
               esac
 
@@ -850,9 +853,9 @@ jobs:
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
-              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
+              # ⭐ 测试门：bug / sci / single 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
               case "$phase" in
-                bug|sci) maybe_run_tests "$i" ;;
+                bug|sci|single) maybe_run_tests "$i" ;;
               esac
 
               sleep 5
