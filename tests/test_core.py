@@ -2159,6 +2159,15 @@ class PreregistrationTests(unittest.TestCase):
         self.assertTrue(args.clean_train_against_test)
         self.assertTrue(args.allow_eval_content_for_cleaning)
 
+    def test_optional_data_null_matches_data_checker(self):
+        payload = self._payload()
+        payload["data"]["cleaning"] = None
+        payload["data"]["entity_manifest_sha256"] = None
+        payload["data"]["time_order_manifest_sha256"] = None
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+
 
 class ArtifactManifestTests(unittest.TestCase):
     """归档清单：内容可复核、路径不可逃逸、新增文件可披露。"""
@@ -2562,6 +2571,379 @@ class ArtifactManifestTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 1)
             finally:
                 sys.argv = old_argv
+
+
+class EdgeCaseRegressionTests(unittest.TestCase):
+    """本轮审计修复的边界条件回归。"""
+
+    def test_group_split_without_test_ends_at_eof(self):
+        # 旧实现会把 cut_val 落在 19，ByteDataset 随即把
+        # [19,25) 当成 test，尽管 test_fraction=0。
+        buf = bytearray(b"a" * 25)
+        for position in (5, 18, 19, 24):
+            buf[position] = 10
+        cut_train, cut_val = experiment._snap_group_split(
+            buf,
+            b"\n",
+            nominal_train=5,
+            nominal_val_end=5,
+            min_len=2,
+            has_test=False,
+        )
+        self.assertEqual(cut_train, 6)
+        self.assertEqual(cut_val, 25)
+
+    def test_empty_group_separator_is_rejected(self):
+        with self.assertRaises(ValueError):
+            list(experiment._iter_group_boundaries(
+                bytearray(b"abc"), b"", 0
+            ))
+        with self.assertRaises(ValueError):
+            list(experiment._iter_group_spans(
+                bytearray(b"abc"), b"", 0, 3
+            ))
+
+    def test_overlapping_separator_does_not_create_extra_document(self):
+        ids = torch.tensor([[65, 65, 65]])
+        segments = experiment.document_segment_ids(ids, [65, 65])
+        self.assertEqual(segments.tolist(), [[0, 0, 0]])
+
+    def test_split_overlap_with_gap_is_not_cancelled(self):
+        record = experiment._split_isolation_record(
+            {
+                "train": (0, 30),
+                "val": (20, 50),
+                "test": (60, 70),
+            },
+            70,
+        )
+        self.assertEqual(record["overlap_bytes"], 10)
+        self.assertFalse(record["covers_all_bytes"])
+
+    def test_metrics_truncation_drops_partial_trailing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                '{"step":1,"val_loss":3.0}\n'
+                '{"step":2,"val_lo',
+                encoding="utf-8",
+            )
+            experiment._truncate_metrics_after_step(path, 1)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write('{"step":2,"val_loss":2.0}\n')
+            records = experiment.read_metrics_records(path)
+        self.assertEqual([row["step"] for row in records], [1, 2])
+
+    def test_metrics_truncation_terminates_valid_last_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text('{"step":1}', encoding="utf-8")
+            experiment._truncate_metrics_after_step(path, 1)
+            self.assertTrue(
+                path.read_text(encoding="utf-8").endswith("\n")
+            )
+            path.write_text('{"step":2}', encoding="utf-8")
+            experiment._truncate_metrics_after_step(path, 1)
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+
+    def test_update_run_config_refuses_to_overwrite_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            config = run_dir / "config.json"
+            config.write_text("{not json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                experiment.update_run_config(
+                    run_dir, "final", {"val_loss": 1.0}
+                )
+            self.assertEqual(
+                config.read_text(encoding="utf-8"), "{not json"
+            )
+
+    def test_resume_split_error_detects_missing_current_split(self):
+        error = experiment.resume_split_change_error(
+            {"train": "a", "test": "b"},
+            {"train": "a", "val": "c"},
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("test", error)
+
+    def test_build_protocol_normalizes_cleaning_alias(self):
+        cfg = _tiny_config()
+        args = argparse.Namespace(
+            lr=1e-3,
+            warmup_steps=1,
+            steps=2,
+            weight_decay=0.0,
+            grad_clip=1.0,
+            batch_size=1,
+            clean_train_against_test=False,
+            allow_eval_content_for_cleaning=True,
+        )
+        protocol = experiment.build_comparison_protocol(
+            cfg, args
+        )
+        self.assertTrue(protocol["clean_train_against_test"])
+        self.assertTrue(
+            protocol["allow_eval_content_for_cleaning"]
+        )
+
+    def test_protocol_fallback_reads_document_separator_from_config(self):
+        protocol = experiment.experiment_protocol_from_payload({
+            "config": {
+                "mode": "smelt",
+                "document_masks": True,
+                "document_separator": [10],
+            },
+            "args": {"lr": 1e-3},
+        })
+        self.assertEqual(protocol["document_separator"], [10])
+        self.assertTrue(protocol["document_masks"])
+
+    def test_fragility_not_evaluable_is_not_reported_as_stable(self):
+        contrast = {
+            "baseline": "base",
+            "variant": "A",
+            "factor": "mode",
+            "p_value": 0.003,
+            "paired_differences": [1.0, 1.1, 0.9],
+            "paired_seeds": [1, 2, 3],
+            "significant": True,
+        }
+        experiment._apply_multiple_comparison_correction([contrast])
+        self.assertEqual(
+            contrast["fragility"]["verdict"], "not_evaluable"
+        )
+        summary = experiment._fragility_summary([contrast])
+        self.assertEqual(
+            summary["verdict_counts"], {"not_evaluable": 1}
+        )
+        self.assertIn("无法评估", summary["advisories"][0])
+
+    def test_fragility_deduplicates_reversed_comparison(self):
+        first = {
+            "baseline": "local_base",
+            "variant": "A",
+            "factor": "mode",
+            "significant": True,
+            "fragility": {
+                "available": True,
+                "verdict": "stable",
+                "n": 5,
+                "n_positive": 5,
+                "n_negative": 0,
+                "alpha": 0.05,
+            },
+        }
+        reversed_entry = dict(first)
+        reversed_entry["baseline"] = "A"
+        reversed_entry["variant"] = "local_base"
+        summary = experiment._fragility_summary(
+            [first, reversed_entry]
+        )
+        self.assertEqual(len(summary["entries"]), 1)
+
+    def test_fragility_does_not_claim_nonsignificant_holm_result(self):
+        first = {
+            "baseline": "b",
+            "variant": "A",
+            "factor": "mode",
+            "p_value": 0.028008456010145746,
+            "paired_differences": [0.2, 1, 1, 1],
+            "paired_seeds": [1, 2, 3, 4],
+            "significant": True,
+        }
+        second = {
+            "baseline": "b",
+            "variant": "B",
+            "factor": "mode",
+            "p_value": 0.041102615679308056,
+            "paired_differences": [0.2, 2, 2, 2],
+            "paired_seeds": [1, 2, 3, 4],
+            "significant": True,
+        }
+        experiment._apply_multiple_comparison_correction(
+            [first, second]
+        )
+        self.assertFalse(second["significant"])
+        self.assertEqual(
+            second["fragility"]["verdict"], "not_significant"
+        )
+        self.assertNotIn(
+            "fragile",
+            experiment._fragility_summary(
+                [first, second]
+            )["verdict_counts"],
+        )
+
+    def test_fragility_reports_p_value_of_minimal_deletion_set(self):
+        report = experiment._paired_result_fragility(
+            [2.0, 2.0, 2.0, 2.0, 2.0, 0.5],
+            alpha=0.05,
+        )
+        self.assertEqual(
+            report["min_seed_deletions_to_lose_significance"], 3
+        )
+        self.assertGreater(
+            report["min_seed_deletions_p_value"], 0.05
+        )
+        self.assertNotEqual(
+            report["min_seed_deletions_p_value"],
+            report["max_leave_one_out_p_value"],
+        )
+
+    def test_fragility_marks_untested_deletion_levels(self):
+        report = experiment._paired_result_fragility(
+            [1.0] * 59 + [0.5],
+            alpha=0.05,
+        )
+        self.assertFalse(report["deletions_tested_exhaustively"])
+        self.assertEqual(report["max_deletions_tested"], 2)
+        self.assertEqual(report["configured_max_deletions"], 3)
+
+    def test_exact_sign_test_all_zero_is_resolution_limited(self):
+        report = experiment._exact_sign_test([0.0, 0.0])
+        self.assertEqual(report["n_nonzero"], 0)
+        self.assertTrue(report["resolution_limited"])
+
+    def test_factorial_duplicate_seeds_are_raw_and_deduplicated(self):
+        def cell():
+            return {
+                "samples": {
+                    "val_loss": [
+                        {"seed": 42, "value": 1.0},
+                        {"seed": 42, "value": 1.2},
+                    ]
+                }
+            }
+        _mapping, _complete, duplicates = (
+            experiment._cell_seed_values(cell(), "val_loss")
+        )
+        self.assertEqual(duplicates, [42])
+        effect = experiment._paired_linear_effect(
+            {"a": cell(), "b": cell()},
+            {"a": 1.0, "b": -1.0},
+            "val_loss",
+        )
+        self.assertEqual(effect["duplicate_seeds"], [42])
+
+    def test_manifest_strict_requires_verify_mode(self):
+        args = argparse.Namespace(
+            write_manifest="run",
+            verify_manifest=None,
+            verify_manifest_strict=True,
+        )
+        error = experiment.manifest_mode_error(args)
+        self.assertIsNotNone(error)
+        self.assertIn("--verify-manifest", error)
+
+    def test_manifest_rejects_compare_report(self):
+        args = argparse.Namespace(
+            write_manifest="run",
+            verify_manifest=None,
+            verify_manifest_strict=False,
+            compare_report="report.json",
+        )
+        self.assertIsNotNone(experiment.manifest_mode_error(args))
+
+    def test_load_selected_model_rejects_bad_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "best.pt"
+            torch.save(
+                {"model": {}, "step": None, "val_loss": 1.0},
+                path,
+            )
+            self.assertIsNone(
+                experiment.load_selected_model(
+                    path, torch.device("cpu")
+                )
+            )
+
+    def test_baseline_tuning_rejects_boolean_or_nonfinite_lr(self):
+        base = {
+            "comparison_family": "baseline_tuning",
+            "mode": "dense",
+            "metric": "val_loss",
+            "winner": {"lr": True, "metric_mean": 1.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning.json"
+            path.write_text(json.dumps(base), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                experiment.load_baseline_tuning(path)
+            base["winner"] = {
+                "lr": float("nan"),
+                "metric_mean": 1.0,
+            }
+            path.write_text(
+                json.dumps(base), encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                experiment.load_baseline_tuning(path)
+
+    def test_paper_protocol_keeps_undisclosed_warmup_defaults(self):
+        previous = sys.argv
+        sys.argv = ["experiment.py", "--paper-protocol"]
+        try:
+            args = argparse.Namespace(
+                paper_cell=None,
+                paper_arch=None,
+                paper_protocol=True,
+                mode="B",
+                lr_schedule="cosine",
+                wsd_stable_steps=None,
+                wsd_final_lr_ratio=0.1,
+                save_at_steps=None,
+                document_masks=False,
+                group_separator=None,
+                seq_len=128,
+                steps=2000,
+                batch_size=32,
+                warmup_steps=100,
+                eval_interval=200,
+            )
+            experiment.apply_paper_cli(args)
+        finally:
+            sys.argv = previous
+        self.assertEqual(args.warmup_steps, 100)
+        self.assertEqual(args.eval_interval, 200)
+
+    def test_paper_cell_rejects_explicit_residual_scale(self):
+        class _Parser:
+            def error(self, message):
+                raise SystemExit(message)
+
+        previous = sys.argv
+        sys.argv = [
+            "experiment.py",
+            "--paper-cell",
+            "200M:95",
+            "--residual-scale",
+            "0.5",
+        ]
+        try:
+            args = argparse.Namespace(
+                mode="B",
+                paper_cell="200M:95",
+                paper_arch=None,
+                paper_protocol=False,
+                residual_scaling="paper",
+                residual_scale=0.5,
+                lr_schedule="cosine",
+                wsd_stable_steps=None,
+                wsd_final_lr_ratio=0.1,
+                save_at_steps=None,
+                document_masks=False,
+                group_separator=None,
+                seq_len=128,
+                steps=2000,
+                batch_size=32,
+                warmup_steps=100,
+                eval_interval=200,
+            )
+            with self.assertRaises(SystemExit):
+                experiment.apply_paper_cli(args, _Parser())
+        finally:
+            sys.argv = previous
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -993,6 +994,10 @@ def _paper_config_kwargs(
         "k2": int(cell.active_experts),
         "mode": cell.arch,
         "residual_scaling": "paper",
+        # 论文的 1/r 循环残差语义以全局 residual_scale=1.0 为
+        # 前提；显式改成其它值会再乘一次，必须在预设冲突检查
+        # 中拒绝，而不能让 fidelity 仍报告架构忠实。
+        "residual_scale": 1.0,
     }
 
 
@@ -1528,6 +1533,9 @@ def apply_paper_cli(args, parser=None) -> None:
             # 论文网格的循环区域残差 1/r 是架构语义的一部分；
             # 显式 --residual-scaling global 不能被预设静默覆盖。
             "residual_scaling": "--residual-scaling",
+            # residual_scale 会在 1/r 之外再乘一次；显式改成
+            # 0.5 会让 loop_residual_scale 变成 0.25，必须拒绝。
+            "residual_scale": "--residual-scale",
         }
         conflicts = []
         for key, flag in conflict_keys.items():
@@ -1577,9 +1585,11 @@ def apply_paper_cli(args, parser=None) -> None:
                 PAPER_PROTOCOL["global_batch_sequences"]
             ),
             "steps": int(PAPER_PROTOCOL["stable_steps"]),
-            "warmup_steps": 2000,
+            # warmup / 评估间隔论文未披露（PAPER_UNDISCLOSED），
+            # 不能借 --paper-protocol 静默改成任意常数；继续
+            # 使用本仓库的命令行默认值，与文档和 fidelity 报告
+            # 的「未披露项沿用默认」保持一致。
             "lr_schedule": "wsd",
-            "eval_interval": 1000,
             "save_at_steps": list(
                 PAPER_PROTOCOL["branch_steps"]
             ),
@@ -1674,10 +1684,15 @@ def resume_split_change_error(
         split
         for split, saved_hash in saved_split_sha256.items()
         if (
-            split in current_split_sha256
-            and isinstance(saved_hash, str)
+            isinstance(saved_hash, str)
             and saved_hash
-            and saved_hash != current_split_sha256[split]
+            and (
+                # 旧检查点记录过的 split 在当前划分中消失，同样
+                # 说明划分口径已经变化；不能因为缺少可比对象
+                # 就静默放行。
+                split not in current_split_sha256
+                or saved_hash != current_split_sha256[split]
+            )
         )
     ]
     if not mismatched:
@@ -2309,6 +2324,30 @@ def document_segment_ids(
         starts &= (
             input_ids[:, offset:offset + span] == value
         )
+    separator_bytes = bytes(byte_values)
+    # 分隔符自身有非空 border（如 "\n\n"、"aba"）时，候选匹配
+    # 可能相互重叠；群组扫描（bytes.find）采用不重叠的贪心
+    # 匹配，文档 mask 必须同口径，否则会在同一群组内部凭空
+    # 插入边界。无 border 时任意两个匹配都不可能重叠，继续
+    # 走全向量化路径。
+    self_overlapping = any(
+        separator_bytes[:border]
+        == separator_bytes[-border:]
+        for border in range(1, len(separator_bytes))
+    )
+    if self_overlapping and bool(starts.any()):
+        starts_cpu = starts.cpu()
+        selected_cpu = torch.zeros_like(starts_cpu)
+        for row in range(batch):
+            next_allowed = 0
+            for position in torch.nonzero(
+                starts_cpu[row], as_tuple=False
+            ).flatten().tolist():
+                if position < next_allowed:
+                    continue
+                selected_cpu[row, position] = True
+                next_allowed = position + len(byte_values)
+        starts = selected_cpu.to(input_ids.device)
     boundary = torch.zeros(
         (batch, length),
         dtype=torch.long,
@@ -4838,6 +4877,10 @@ def _iter_group_boundaries(
     边界是群的起始字节；文件末尾 N 永远是一个合法边界。
     只产出 > start 的边界。
     """
+    if not separator:
+        # bytes.find(b"") 永远返回 position，len=0 会让循环原地
+        # 踏步；调用方必须先拒绝空分隔符，而不是挂死进程。
+        raise ValueError("群组分隔符不能为空字节串")
     position = start
 
     while True:
@@ -4867,6 +4910,8 @@ def _iter_group_spans(
     群组不产出区间。文本完整性审计用它把用户显式配置的群组
     分隔符（可能是 NUL 或非 UTF-8 字节）排除在损坏统计之外。
     """
+    if not separator:
+        raise ValueError("群组分隔符不能为空字节串")
     position = start
 
     while position < end:
@@ -5181,6 +5226,12 @@ def _snap_group_split(
 
         if cut_val > upper_val:
             return
+        # 没有 test split 时 val 必须延伸到文件末尾：否则
+        # ByteDataset 会把 cut_val 之后的字节当成 test，凭空
+        # 产生一个 test_fraction=0 却非空的测试集。这里不能
+        # 只把 total 当作上界，必须把 cut_val 固定为 total。
+        if not has_test and cut_val != total:
+            return
 
         lower = cut_val - min_len
         candidates: List[int] = []
@@ -5277,17 +5328,20 @@ def _split_isolation_record(
             for start, end in bounds.values()
         )
     )
-    if bounds:
-        covered = sum(
-            end - start for start, end in bounds.values()
-        )
-        span = (
-            max(end for _, end in bounds.values())
-            - min(start for start, _ in bounds.values())
-        )
-        overlap_bytes = max(0, covered - span)
-    else:
-        overlap_bytes = 0
+    # 逐对求交，而不是 covered - span：后者在同时存在空隙与
+    # 重叠时会相互抵消（例如 train=[0,30)、val=[20,50)、
+    # test=[60,70) 会被算成 0，而 train∩val 实际为 10 字节）。
+    ranges = list(bounds.values())
+    overlap_bytes = 0
+    for left_index in range(len(ranges)):
+        for right_index in range(left_index + 1, len(ranges)):
+            left_start, left_end = ranges[left_index]
+            right_start, right_end = ranges[right_index]
+            overlap_bytes += max(
+                0,
+                min(left_end, right_end)
+                - max(left_start, right_start),
+            )
 
     return {
         "split_order": list(order),
@@ -8073,7 +8127,13 @@ def _plan_train_corruption_cleaning(
             ])
 
     stats["post_clean_train_bytes"] = (
-        train_end - int(stats["dropped_bytes"])
+        train_end
+        - sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                list(already_excluded) + excluded
+            )
+        )
     )
     return excluded, stats
 
@@ -8243,7 +8303,13 @@ def _plan_train_degenerate_cleaning(
             ])
 
     stats["post_clean_train_bytes"] = (
-        train_end - int(stats["dropped_bytes"])
+        train_end
+        - sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                list(already_excluded) + excluded
+            )
+        )
     )
     return excluded, stats
 
@@ -8330,7 +8396,13 @@ def _plan_train_degenerate_run_cleaning(
             ])
 
     stats["post_clean_train_bytes"] = (
-        train_end - int(stats["dropped_bytes"])
+        train_end
+        - sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                list(already_excluded) + excluded
+            )
+        )
     )
     return excluded, stats
 
@@ -8483,7 +8555,13 @@ def _plan_train_shared_chunk_cleaning(
             ])
 
     stats["post_clean_train_bytes"] = (
-        train_end - int(stats["dropped_bytes"])
+        train_end
+        - sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                list(already_excluded) + excluded
+            )
+        )
     )
     return excluded, stats
 
@@ -21721,12 +21799,11 @@ def build_comparison_protocol(
         # 训练集清洗是否对照 test：默认 False；True 意味着
         # 训练样本选择读取过 test，不能与其他运行混为同一
         # 数据协议。
-        "clean_train_against_test": bool(
-            getattr(
-                args,
-                "clean_train_against_test",
-                False,
-            )
+        # 两个同义入口按 OR 归一化；直接调用本函数（未经 main
+        # 的 _normalize_clean_against_test）时也不能只读其中一个
+        # 键，否则同一清洗口径会被记成两个不同协议。
+        "clean_train_against_test": _clean_against_test_effective(
+            args
         ),
         "drop_train_corrupt_groups": bool(
             getattr(args, "drop_train_corrupt_groups", False)
@@ -21740,10 +21817,8 @@ def build_comparison_protocol(
         "drop_train_degenerate_runs": bool(
             getattr(args, "drop_train_degenerate_runs", False)
         ),
-        "allow_eval_content_for_cleaning": bool(
-            getattr(
-                args, "allow_eval_content_for_cleaning", False
-            )
+        "allow_eval_content_for_cleaning": (
+            _clean_against_test_effective(args)
         ),
         "allow_entity_overlap": bool(
             getattr(args, "allow_entity_overlap", False)
@@ -21898,13 +21973,21 @@ def experiment_protocol_from_payload(
         "grad_clip": run_args.get("grad_clip"),
         "batch_size": run_args.get("batch_size"),
         # 历史运行没有文档级 mask；缺记录时回填 False。
+        # config.json 的 Config 字段是旧运行唯一可靠的来源：
+        # argparse 没有 document_separator 这个 dest，只读
+        # run_args 会把它误报成缺失。
         "document_masks": (
-            bool(run_args.get("document_masks", False))
+            bool(_pick(
+                run_args.get("document_masks"),
+                cfg.get("document_masks"),
+                False,
+            ))
             if has_training
             else None
         ),
-        "document_separator": run_args.get(
-            "document_separator"
+        "document_separator": _pick(
+            run_args.get("document_separator"),
+            cfg.get("document_separator"),
         ),
         "data_augmentation": "none" if has_training else None,
         # 早停 / 数值环境 / 实现开关：旧运行的 args 里已记录
@@ -23600,8 +23683,11 @@ def _exact_sign_test(
             n > 0 and p_value <= alpha_value
         ),
         "min_attainable_p": min_attainable,
+        # n=0（全部差值为 0）时最小可达 p=1，同样不可能达到
+        # alpha；它也必须被标为分辨率受限，不能与「有分辨率但
+        # 未发现方向」混为一谈。
         "resolution_limited": bool(
-            n > 0 and min_attainable > alpha_value
+            min_attainable > alpha_value
         ),
         "note": (
             "只看差值方向、不使用幅度；零差值被丢弃。"
@@ -23741,7 +23827,11 @@ def _paired_result_fragility(
         max(0, n - _MIN_SEEDS_FOR_STATS),
     )
     min_deletions: Optional[int] = None
+    min_deletions_p_value: Optional[float] = None
     deletions_tested = 0
+    # 已实际进入枚举的最大删除个数：组合数超过上限时下一层
+    # 从未被测试，不能把配置上限冒充成已覆盖范围。
+    max_deletions_tested = 0
     exhaustive = True
     if significant and max_deletions > 0:
         for delete_count in range(1, max_deletions + 1):
@@ -23749,6 +23839,7 @@ def _paired_result_fragility(
             if combinations > _FRAGILITY_MAX_SUBSETS:
                 exhaustive = False
                 break
+            max_deletions_tested = delete_count
             found = False
             for combo in itertools.combinations(
                 range(n), delete_count
@@ -23767,6 +23858,7 @@ def _paired_result_fragility(
                     and float(reduced_p) > alpha_value
                 ):
                     min_deletions = delete_count
+                    min_deletions_p_value = float(reduced_p)
                     found = True
                     break
             if found:
@@ -23819,9 +23911,11 @@ def _paired_result_fragility(
             entry.get("seed") for entry in sign_flip_loo
         ],
         "min_seed_deletions_to_lose_significance": min_deletions,
+        "min_seed_deletions_p_value": min_deletions_p_value,
         "deletions_tested": deletions_tested,
         "deletions_tested_exhaustively": bool(exhaustive),
-        "max_deletions_tested": max_deletions,
+        "max_deletions_tested": max_deletions_tested,
+        "configured_max_deletions": max_deletions,
         "note": (
             "删除种子后重新做配对 t 检验；alpha 为家族校正后"
             "阈值。fragile 表示去掉不超过 max_deletions_tested "
@@ -23851,11 +23945,15 @@ def _fragility_summary(
         if not fragility.get("available"):
             continue
         # 同一个对比可能同时出现在单因子对比与
-        # --compare-baseline 直接对比里；脆弱性结论相同，
-        # 不能因此重复计数或重复打印。
+        # --compare-baseline 直接对比里（方向也可能相反，
+        # 例如 local_base→A 与 A→local_base）；脆弱性结论
+        # 相同，不能因此重复计数或重复打印。按无序的对比
+        # 双方 + 因子去重。
         key = (
-            str(contrast.get("baseline")),
-            str(contrast.get("variant")),
+            tuple(sorted((
+                str(contrast.get("baseline")),
+                str(contrast.get("variant")),
+            ))),
             str(contrast.get("factor")),
         )
         if key in seen:
@@ -23870,6 +23968,12 @@ def _fragility_summary(
             "significant": bool(contrast.get("significant")),
             "fragility_index": fragility.get(
                 "min_seed_deletions_to_lose_significance"
+            ),
+            # 删除 fragility_index 个种子后实际得到的 p 值；
+            # 不能拿 max_leave_one_out_p_value（单删最大值）
+            # 冒充成组删除后的 p。
+            "fragility_index_p_value": fragility.get(
+                "min_seed_deletions_p_value"
             ),
             "n": fragility.get("n"),
             "n_positive": fragility.get("n_positive"),
@@ -23900,6 +24004,10 @@ def _fragility_summary(
         entry for entry in entries
         if entry.get("verdict") == "direction_mixed"
     ]
+    not_evaluable = [
+        entry for entry in entries
+        if entry.get("verdict") == "not_evaluable"
+    ]
     advisories: List[str] = []
     if fragile:
         advisories.append(
@@ -23909,8 +24017,27 @@ def _fragility_summary(
             + "; ".join(
                 f"{entry['baseline']}→{entry['variant']}"
                 f"（删 {entry['fragility_index']} 个种子后"
-                f"p>{float(entry['alpha']):.3f}）"
+                + (
+                    f"p={float(entry['fragility_index_p_value']):.4f}"
+                    if isinstance(
+                        entry.get("fragility_index_p_value"),
+                        (int, float),
+                    )
+                    else "显著性消失"
+                )
+                + f"，alpha={float(entry['alpha']):.3f}）"
                 for entry in fragile
+            )
+        )
+    if not_evaluable:
+        advisories.append(
+            "以下显著对比无法评估删除种子后的显著性是否存活"
+            "（剩余观测不足最小种子数）：不能把「未发现脆弱性」"
+            "读成稳健结论，也不能当作「删除后仍显著」："
+            + "; ".join(
+                f"{entry['baseline']}→{entry['variant']}"
+                f"（n={entry.get('n')}）"
+                for entry in not_evaluable
             )
         )
     if direction_mixed:
@@ -23942,6 +24069,7 @@ def _fragility_summary(
         "verdict_counts": verdict_counts,
         "fragile": fragile,
         "direction_mixed": direction_mixed,
+        "not_evaluable": not_evaluable,
         "advisories": advisories,
     }
 
@@ -25728,22 +25856,6 @@ def _apply_multiple_comparison_correction(
     ):
         _attach_family_power(contrast, len(eligible))
         contrast["holm_alpha_threshold"] = holm_threshold
-        # 脆弱性检查必须用与最终判定一致的家族校正 alpha；
-        # 用未校正 0.05 会把「只在单检验下显著」误报成稳健。
-        paired_values = contrast.get("paired_differences")
-        if isinstance(paired_values, list):
-            contrast["fragility"] = _paired_result_fragility(
-                paired_values,
-                contrast.get("paired_seeds"),
-                alpha=float(
-                    holm_threshold
-                    if holm_threshold is not None
-                    else contrast.get(
-                        "alpha_bonferroni",
-                        _SIGNIFICANCE_LEVEL,
-                    )
-                ),
-            )
 
     for contrast, holm_p, bh_p in zip(
         eligible,
@@ -25785,6 +25897,42 @@ def _apply_multiple_comparison_correction(
                     else None
                 ),
             )
+
+        # 脆弱性检查必须与最终 Holm 判定同口径。Holm step-down
+        # 在某个秩位失败后就会停止：此时后续对比的
+        # alpha/(m-rank+1) 阈值在统计上并不成立，不能仅凭
+        # 未校正 p 值就把该对比标成 stable/fragile。因此只在
+        # 最终 corrected 为真时保留脆弱性判定；否则显式降级
+        # 为 not_significant，避免汇总把已失败检验算进
+        # stable/fragile 计数。
+        paired_values = contrast.get("paired_differences")
+        if isinstance(paired_values, list):
+            threshold = contrast.get("holm_alpha_threshold")
+            fragility = _paired_result_fragility(
+                paired_values,
+                contrast.get("paired_seeds"),
+                alpha=float(
+                    threshold
+                    if threshold is not None
+                    else contrast.get(
+                        "alpha_bonferroni",
+                        _SIGNIFICANCE_LEVEL,
+                    )
+                ),
+            )
+            if (
+                not corrected
+                and fragility.get("available")
+                and fragility.get("verdict") != "not_significant"
+            ):
+                fragility["verdict"] = "not_significant"
+                fragility["holm_step_down_valid"] = False
+                fragility["note"] = (
+                    str(fragility.get("note", ""))
+                    + " 该对比未通过 Holm step-down 的最终"
+                    "显著性判定，脆弱性结论降级为 not_significant。"
+                )
+            contrast["fragility"] = fragility
 
     # 符号翻转检验与 t 检验同属一个显著性家族：它只在配对
     # 对比上执行，但同样要受多重比较约束。展示层用二者是否
@@ -26155,14 +26303,18 @@ def _cell_seed_values(
     samples = cell.get("samples", {}).get(metric, [])
     collapsed = _collapse_seed_samples(samples)
     seed_counts: Dict[object, int] = {}
+    seed_values: Dict[object, object] = {}
     for sample in samples:
         seed = sample.get("seed")
         if seed is None:
             continue
         key = _stable_factor_key(seed)
         seed_counts[key] = seed_counts.get(key, 0) + 1
+        seed_values.setdefault(key, seed)
     duplicate_seeds = [
-        seed_key
+        # 对外报告原始 seed 值（与 factor_contrasts /
+        # _contrast_test 一致），而不是内部稳定键元组。
+        seed_values[seed_key]
         for seed_key, count in seed_counts.items()
         if count > 1
     ]
@@ -26197,6 +26349,7 @@ def _paired_linear_effect(
     maps: Dict[str, Dict[object, Tuple[object, float]]] = {}
     complete = True
     duplicate_seeds: List[object] = []
+    duplicate_seed_keys: set = set()
     for key in coefficients:
         if key not in cells:
             return {"test": "missing_cell"}
@@ -26205,7 +26358,14 @@ def _paired_linear_effect(
         )
         maps[key] = mapping
         complete = complete and cell_complete
-        duplicate_seeds.extend(cell_duplicates)
+        # 同一个复制种子可能同时出现在多个组成单元里；它只应
+        # 在报告中出现一次，并保留原始 seed 值而非内部稳定键。
+        for seed in cell_duplicates:
+            seed_key = _stable_factor_key(seed)
+            if seed_key in duplicate_seed_keys:
+                continue
+            duplicate_seed_keys.add(seed_key)
+            duplicate_seeds.append(seed)
 
     if not maps:
         return {"test": "missing_cell"}
@@ -28030,14 +28190,35 @@ def _contrast_display(
             deleted = fragility.get(
                 "min_seed_deletions_to_lose_significance"
             )
-            max_p = fragility.get("max_leave_one_out_p_value")
-            caveat += (
-                f"（脆弱：删除 {deleted} 个种子后显著性消失，"
-                f"最大 LOO p={float(max_p):.4f}"
-                if isinstance(max_p, (int, float))
-                else "（脆弱：删除少量种子后显著性消失"
+            deleted_p = fragility.get(
+                "min_seed_deletions_p_value"
             )
-            caveat += "；不能作为稳健结论）"
+            alpha_value = fragility.get("alpha")
+            if isinstance(deleted, int) and isinstance(
+                deleted_p, (int, float)
+            ):
+                caveat += (
+                    f"（脆弱：删除 {deleted} 个种子后 "
+                    f"p={float(deleted_p):.4f}"
+                    + (
+                        f" > alpha={float(alpha_value):.4f}"
+                        if isinstance(
+                            alpha_value, (int, float)
+                        )
+                        else ""
+                    )
+                    + "，显著性消失；不能作为稳健结论）"
+                )
+            elif isinstance(deleted, int):
+                caveat += (
+                    f"（脆弱：删除 {deleted} 个种子后显著性"
+                    "消失；不能作为稳健结论）"
+                )
+            else:
+                caveat += (
+                    "（脆弱：删除单个种子后效应方向翻转；"
+                    "不能作为稳健结论）"
+                )
         elif (
             fragility_verdict == "direction_mixed"
             and contrast.get("significant")
@@ -31333,9 +31514,16 @@ def preregistration_schema_error(
             return f"data.group_separator 无效: {error}"
 
     cleaning = data.get("cleaning", _PREREGISTRATION_MISSING)
-    if cleaning is not _PREREGISTRATION_MISSING:
+    # 可选的 cleaning 允许显式 null（等价于未声明/全部关闭），
+    # 与 preregistration_data_error 的「None 视为未声明」以及
+    # group_separator: null 的口径保持一致；否则同一份文件会
+    # 被 schema 拒绝却被数据核对接受。
+    if (
+        cleaning is not _PREREGISTRATION_MISSING
+        and cleaning is not None
+    ):
         if not isinstance(cleaning, dict):
-            return "data.cleaning 必须是对象"
+            return "data.cleaning 必须是对象或 null"
         unknown = sorted(
             set(cleaning) - set(_PREREGISTRATION_CLEANING_KEYS)
         )
@@ -31360,7 +31548,13 @@ def preregistration_schema_error(
         "entity_manifest_sha256",
         "time_order_manifest_sha256",
     ):
-        if key in data and not _preregistration_sha256_text(data[key]):
+        # 显式 null 与缺省同义（数据核对也只把非 None 值当作
+        # 已声明清单），不能让两个校验器给出相反结论。
+        if (
+            key in data
+            and data[key] is not None
+            and not _preregistration_sha256_text(data[key])
+        ):
             return f"data.{key} 必须是 64 位十六进制 SHA-256"
 
     return None
@@ -35431,9 +35625,13 @@ def print_comparison_analysis(
         stable_count = int(counts.get("stable", 0))
         fragile_count = int(counts.get("fragile", 0))
         mixed_count = int(counts.get("direction_mixed", 0))
+        not_evaluable_count = int(
+            counts.get("not_evaluable", 0)
+        )
         print(
             f"  稳健={stable_count}，脆弱={fragile_count}，"
-            f"方向混合={mixed_count}"
+            f"方向混合={mixed_count}，"
+            f"不可判定={not_evaluable_count}"
         )
         for message in fragility_summary.get("advisories", []):
             print(f"  [warn] {message}")
@@ -35444,12 +35642,30 @@ def print_comparison_analysis(
             and entry.get("significant")
         ]
         for entry in fragility_flagged:
+            deleted = entry.get("fragility_index")
+            deleted_p = entry.get("fragility_index_p_value")
+            alpha_value = entry.get("alpha")
+            if isinstance(deleted, int) and isinstance(
+                deleted_p, (int, float)
+            ):
+                detail = (
+                    f"删除 {deleted} 个种子后 "
+                    f"p={float(deleted_p):.4f}"
+                    + (
+                        f" > alpha={float(alpha_value):.4f}"
+                        if isinstance(
+                            alpha_value, (int, float)
+                        )
+                        else ""
+                    )
+                )
+            elif isinstance(deleted, int):
+                detail = f"删除 {deleted} 个种子后显著性消失"
+            else:
+                detail = "删除单个种子后效应方向翻转"
             print(
                 f"  [fragile] {entry['baseline']}→"
-                f"{entry['variant']}: 删除 "
-                f"{entry['fragility_index']} 个种子后"
-                f" p={entry.get('max_leave_one_out_p_value')}"
-                f" > alpha={float(entry.get('alpha', 0.05)):.4f}；"
+                f"{entry['variant']}: {detail}；"
                 f"符号方向 正/负={entry.get('n_positive')}/"
                 f"{entry.get('n_negative')}，不能作为稳健结论"
             )
@@ -36536,13 +36752,33 @@ def write_comparison_report_file(
         ),
         **analysis,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            _json_safe(payload),
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    # 与 config/manifest 一样先写临时文件再原子替换：序列化
+    # 中途失败不能留下半截 JSON，也不能跟随已有符号链接去
+    # 覆盖链接目标。
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(
+                _json_safe(payload),
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     print(f"[report] 对比分析已写入 {path}")
     return path
 
@@ -37495,7 +37731,9 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "timestamp_utc": datetime.datetime.now(
             datetime.timezone.utc
         ).isoformat(),
-        "command": " ".join(sys.argv),
+        # 逐参数 shell quote：含空格的路径（--data "my data.txt"）
+        # 不能记录成无法复制重放的 "my data.txt"。
+        "command": shlex.join(sys.argv),
         # 相对数据路径 / 相对 --out 只有结合工作目录才能还原；
         # 脚本路径与解释器则用于区分同名入口与不同虚拟环境。
         "cwd": os.getcwd(),
@@ -37842,7 +38080,9 @@ def _manifest_current_provenance() -> Dict[str, object]:
         ),
         "platform": platform.platform(),
         "cwd": os.getcwd(),
-        "command": " ".join(sys.argv),
+        # 逐参数 shell quote：含空格的路径（--data "my data.txt"）
+        # 不能记录成无法复制重放的 "my data.txt"。
+        "command": shlex.join(sys.argv),
     }
 
 
@@ -38133,18 +38373,27 @@ def manifest_mode_error(args) -> Optional[str]:
             "--write-manifest 与 --verify-manifest 不能同时使用："
             "先写清单，再单独调用校验"
         )
+    # strict 只对校验模式有意义；与 --write-manifest 同用时也
+    # 必须拒绝，不能因为「不是两个模式都缺」就静默忽略。
+    if (
+        getattr(args, "verify_manifest_strict", False)
+        and verify_mode is None
+    ):
+        return (
+            "--verify-manifest-strict 必须与 "
+            "--verify-manifest 一起使用"
+        )
     if write_mode is None and verify_mode is None:
-        if getattr(args, "verify_manifest_strict", False):
-            return (
-                "--verify-manifest-strict 必须与 "
-                "--verify-manifest 一起使用"
-            )
         return None
 
     conflicts = [
         flag
         for flag, active in (
             ("--compare", getattr(args, "compare", None) is not None),
+            (
+                "--compare-report",
+                getattr(args, "compare_report", None) is not None,
+            ),
             (
                 "--final-test-comparison",
                 getattr(args, "final_test_comparison", None)
@@ -38703,10 +38952,20 @@ def update_run_config(out_dir: Path, key: str, value) -> None:
         try:
             with open(path, encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                payload = loaded
-        except (OSError, json.JSONDecodeError):
-            payload = {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            # 不能把损坏的 config.json 当成空对象再用只含一个新
+            # 键的内容原子替换：那会静默抹掉整份运行追踪信息。
+            # 让调用方显式失败并保留原文件，便于人工恢复。
+            raise ValueError(
+                f"无法读取 {path}，拒绝用单键配置覆盖已有追踪"
+                f"信息: {error}"
+            ) from error
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"{path} 顶层不是 JSON 对象，拒绝用单键配置"
+                "覆盖已有追踪信息"
+            )
+        payload = loaded
 
     payload[key] = value
 
@@ -38812,16 +39071,24 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
     threshold = int(step)
     kept_lines: List[str] = []
     dropped = 0
+    changed = False
     with open(path, encoding="utf-8") as handle:
-        for line in handle:
+        lines = handle.readlines()
+    for index, line in enumerate(lines):
+        last_line = index == len(lines) - 1
+        # 文件末尾没有换行的最后一行：若解析失败（崩溃时写了
+        # 半条 JSON），必须丢弃；若解析成功，保留但补换行。
+        # 否则 resume 以追加模式写下的第一条记录会和它粘成
+        # 一行，导致新记录被 read_metrics_records 静默跳过。
+        if last_line and not line.endswith("\n"):
             stripped = line.strip()
             if not stripped:
-                kept_lines.append(line)
+                changed = True
                 continue
             try:
                 record = json.loads(stripped)
             except json.JSONDecodeError:
-                kept_lines.append(line)
+                changed = True
                 continue
             record_step = (
                 record.get("step")
@@ -38834,9 +39101,34 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
                 and record_step > threshold
             ):
                 dropped += 1
-                continue
+            else:
+                kept_lines.append(line + "\n")
+            changed = True
+            continue
+        stripped = line.strip()
+        if not stripped:
             kept_lines.append(line)
-    if dropped == 0:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            kept_lines.append(line)
+            continue
+        record_step = (
+            record.get("step")
+            if isinstance(record, dict)
+            else None
+        )
+        if (
+            isinstance(record_step, int)
+            and not isinstance(record_step, bool)
+            and record_step > threshold
+        ):
+            dropped += 1
+            changed = True
+            continue
+        kept_lines.append(line)
+    if not changed and dropped == 0:
         return
     temp_path = path.with_name(path.name + ".resume_tmp")
     with open(temp_path, "w", encoding="utf-8") as handle:
@@ -39660,6 +39952,15 @@ def load_selected_model(
         return None
 
     if not isinstance(payload, dict) or "model" not in payload:
+        return None
+    if not isinstance(payload.get("model"), dict):
+        return None
+    step = payload.get("step")
+    if (
+        isinstance(step, bool)
+        or not isinstance(step, int)
+        or step < 0
+    ):
         return None
 
     return payload
@@ -56383,9 +56684,14 @@ def load_baseline_tuning(path: Path) -> Dict[str, object]:
 
     校验失败抛 ValueError，由入口转为明确的参数错误。
     """
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"不允许非有限数值常量 {value}")
+
     try:
         with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
+            payload = json.load(
+                f, parse_constant=reject_constant
+            )
     except OSError as error:
         raise ValueError(f"无法读取 {path}: {error}") from error
     except json.JSONDecodeError as error:
@@ -56405,17 +56711,32 @@ def load_baseline_tuning(path: Path) -> Dict[str, object]:
     if not isinstance(payload.get("metric"), str):
         raise ValueError(f"{path} 缺少 metric 字段")
     winner = payload.get("winner")
-    if not isinstance(winner, dict) or not isinstance(
-        winner.get("lr"), (int, float)
+    winner_lr = (
+        winner.get("lr") if isinstance(winner, dict) else None
+    )
+    if (
+        isinstance(winner_lr, bool)
+        or not isinstance(winner_lr, (int, float))
+        or not math.isfinite(float(winner_lr))
+        or float(winner_lr) <= 0.0
     ):
         raise ValueError(
-            f"{path} 没有有效 winner（winner.lr 必须是数值）；"
-            "调参失败的报告不能作为基线来源"
+            f"{path} 没有有效 winner（winner.lr 必须是有限"
+            "正数）；调参失败的报告不能作为基线来源"
         )
-    if winner.get("metric_mean") is None:
+    winner_metric = (
+        winner.get("metric_mean")
+        if isinstance(winner, dict)
+        else None
+    )
+    if (
+        isinstance(winner_metric, bool)
+        or not isinstance(winner_metric, (int, float))
+        or not math.isfinite(float(winner_metric))
+    ):
         raise ValueError(
-            f"{path} 的 winner 没有可用指标均值，"
-            "不能作为基线来源"
+            f"{path} 的 winner 没有可用指标均值（必须是"
+            "有限数值），不能作为基线来源"
         )
     return payload
 
@@ -56996,6 +57317,24 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             )
 
     run_paths = _execute_sweep_plan(base_argv, plan, out_root)
+
+    # 每个子进程都会重新读取预注册文件；文件在套件运行中途被
+    # 修改时，各子运行会基于不同 sha256 训练。父进程必须核对
+    # 全部子运行的 file_sha256 与本次冻结文件一致，不能把混合
+    # 协议当成同一项预注册研究。
+    prereg_record = getattr(
+        args, "preregistration_record", None
+    )
+    if (
+        isinstance(prereg_record, dict)
+        and prereg_record.get("file_sha256")
+    ):
+        sweep_prereg_error = preregistration_sweep_error(
+            [str(path) for path in run_paths],
+            str(prereg_record["file_sha256"]),
+        )
+        if sweep_prereg_error is not None:
+            raise SystemExit(sweep_prereg_error)
 
     rows = compare_runs(run_paths)
     analysis = print_comparison_analysis(
@@ -58211,6 +58550,15 @@ def main():
     # 口径，却在 config/预注册核对里显示成不同协议。
     _normalize_clean_against_test(args)
 
+    # --compare-report 是 --compare 的落盘开关；这个检查必须
+    # 在任何只读入口（manifest / final-test-comparison）提前
+    # return 之前完成，否则这些模式会静默忽略该参数。
+    if args.compare_report is not None and args.compare is None:
+        parser.error(
+            "--compare-report 只能配合 --compare 使用："
+            "它保存的是只读对比分析，不参与训练"
+        )
+
     # 归档清单模式同样是只读入口：必须在论文预设、预注册与
     # 数据加载之前分流，避免 --write-manifest 被当成一次训练。
     manifest_error = manifest_mode_error(args)
@@ -58817,6 +59165,34 @@ def main():
             "它保存的是只读对比分析，不参与训练"
         )
     if args.compare is not None:
+        # --compare 只读运行目录，不接受任何会在该分支之后被
+        # 跳过、从而被静默忽略的训练/评估参数。
+        compare_conflicts = [
+            flag
+            for flag, active in (
+                (
+                    "--resume",
+                    args.resume is not None,
+                ),
+                ("--evaluate-test", bool(args.evaluate_test)),
+                ("--sanity-only", bool(args.sanity_only)),
+                (
+                    "--statistical-baseline",
+                    bool(args.statistical_baseline),
+                ),
+                (
+                    "--suite-baseline-tuning",
+                    bool(args.suite_baseline_tuning),
+                ),
+            )
+            if active
+        ]
+        if compare_conflicts:
+            parser.error(
+                "--compare 是只读对比入口，不能与以下训练/评估"
+                "参数同时使用（否则会被静默忽略）: "
+                + ", ".join(compare_conflicts)
+            )
         # 路径写错时 compare_runs 仍会为不存在的目录生成整行 "-"
         # 的幽灵运行，后续分析再对这些空运行报告「无对照/无基线」
         # 并正常退出 0。对比对象本身不存在不是数据缺口，必须在
@@ -59070,6 +59446,30 @@ def main():
         }
 
         saved_args = rng_payload.get("args", {})
+        # 检查点自带的 args.out 是它所属运行目录的可核对身份。
+        # 若用 A 目录的检查点续跑到 B 目录，B 的 config.json 会
+        # 继承 A 的 original_run_metadata/hypothesis/efficiency，
+        # 把两次无关运行混成一条溯源链；数据指纹也会一半来自 B。
+        if isinstance(saved_args, dict):
+            saved_out = saved_args.get("out")
+            if isinstance(saved_out, str) and saved_out:
+                try:
+                    same_run_dir = (
+                        Path(saved_out).resolve()
+                        == out_dir.resolve()
+                    )
+                except OSError:
+                    same_run_dir = False
+                if not same_run_dir:
+                    parser.error(
+                        f"--resume 检查点属于输出目录 "
+                        f"{saved_out!r}，与当前 --out "
+                        f"{str(out_dir)!r} 不一致：不能把别的"
+                        "运行目录的检查点续到本目录，否则会"
+                        "继承无关的原始运行身份/预注册/效率"
+                        "记录。请使用该检查点自己的 --out，"
+                        "或在全新目录从头训练"
+                    )
         if _restore_resume_cleaning_justification(
             args, saved_args
         ):
@@ -60075,6 +60475,11 @@ def main():
                 "data_val_fraction": dataset.val_fraction,
                 "data_test_fraction": dataset.test_fraction,
                 "data_group_separator": args.group_separator,
+                # resume 会从检查点恢复真实 mode/seed；预注册
+                # 记录若保留入口默认值（B/42）会指向错误的运行。
+                "run_mode": getattr(args, "mode", None),
+                "run_seed": getattr(args, "seed", None),
+                "run_seeds": getattr(args, "seeds", None),
                 "data_verified": True,
             })
         print(
@@ -60095,6 +60500,20 @@ def main():
             )
         except (OSError, ValueError) as error:
             parser.error(f"--entity-manifest 无效: {error}")
+        if not entity_audit.get("available"):
+            # 显式给出实体清单却没有群组边界时，审计无法建立
+            # 「实体 → 群组 → split」映射；绝不能打印「审计
+            # 通过」并继续训练，否则实体隔离声明被静默绕过。
+            parser.error(
+                "--entity-manifest 需要 --group-separator："
+                "没有群组边界就无法把实体清单映射到 split，"
+                "实体隔离审计无法执行"
+                + (
+                    f"（{entity_audit.get('reason')}）"
+                    if entity_audit.get("reason")
+                    else ""
+                )
+            )
         args.data_entity_audit = entity_audit
         if entity_audit.get("cross_split_entities"):
             message = (
@@ -61959,13 +62378,30 @@ def main():
             str(selected_model_path),
             torch.device("cpu"),
         )
-
+        selected_step: Optional[int] = None
+        if selected_payload is not None:
+            try:
+                selected_step = int(
+                    selected_payload.get("step", -1)
+                )
+            except (TypeError, ValueError, OverflowError):
+                selected_step = None
+        restore_error: Optional[str] = None
         if (
             selected_payload is not None
-            and int(selected_payload.get("step", -1))
-            == best_selection_step
+            and selected_step == best_selection_step
         ):
-            restore_selected_weights(model, selected_payload)
+            try:
+                restore_selected_weights(model, selected_payload)
+            except Exception as error:
+                # best.pt 可能被截断/替换成键名不匹配的存档。
+                # 文档承诺损坏时回退到最后一步参数，不能让
+                # load_state_dict 的 RuntimeError 中断最终评估。
+                restore_error = str(error)
+                selected_payload = None
+        if selected_payload is not None and selected_step == (
+            best_selection_step
+        ):
             selection_policy = "best_val"
             payload_val_loss = selected_payload.get("val_loss")
             if (
@@ -61987,10 +62423,12 @@ def main():
             )
         else:
             selection_note = (
-                "best.pt 缺失或与验证记录不一致"
+                "best.pt 缺失、损坏或与验证记录不一致"
                 "（如从旧检查点恢复）；最终评估回退到"
                 "最后一步参数，模型未经验证集选择"
             )
+            if restore_error:
+                selection_note += f"（恢复失败: {restore_error}）"
             print(f"[select] {selection_note}")
 
     # 最终评估总是重新跑一遍：与周期验证不同，它还要计算
