@@ -6625,6 +6625,65 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertFalse(result["available"])
         json.dumps(result, allow_nan=False)
 
+    def test_linear_effect_no_common_seed_sum_does_not_overflow(self):
+        cells = {
+            "a": {
+                "samples": {
+                    "val_loss": [{"seed": 1, "value": 1.0}]
+                },
+                "val_loss_mean": 1.0e308,
+            },
+            "b": {
+                "samples": {
+                    "val_loss": [{"seed": 2, "value": 1.0}]
+                },
+                "val_loss_mean": -1.0e308,
+            },
+        }
+        result = experiment._paired_linear_effect(
+            cells,
+            {"a": 1.0, "b": -1.0},
+            "val_loss",
+        )
+        self.assertIsNone(result["effect"])
+        self.assertEqual(result["test"], "invalid_values")
+        json.dumps(result, allow_nan=False)
+
+    def test_factorial_reference_mean_does_not_overflow(self):
+        def cell(mode, balance, mean):
+            return {
+                "label": f"{mode}/{balance}",
+                "keys": {"mode": mode, "balance_coef": balance},
+                "samples": {
+                    "val_loss": [
+                        {"seed": 1, "value": 1.0}
+                    ]
+                },
+                "val_loss_mean": mean,
+                "val_loss_std": 0.0,
+                "n_runs": 1,
+                "effective_seed_count": 1,
+                "costs": {},
+                "window_payloads": [],
+            }
+
+        cells = [
+            cell("local_base", 0.0, 1.0e308),
+            cell("local_base", 0.01, 1.0e308),
+            cell("A", 0.0, -1.0e308),
+            cell("A", 0.01, -1.0e308),
+        ]
+        report = experiment.factorial_effects(
+            cells, ["mode", "balance_coef"], "val_loss"
+        )
+        self.assertTrue(report["effects"])
+        for effect in report["effects"]:
+            self.assertTrue(
+                math.isfinite(effect["mean_baseline"]),
+                effect["effect_name"],
+            )
+        json.dumps(report, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],

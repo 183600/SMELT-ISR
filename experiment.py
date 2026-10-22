@@ -28943,15 +28943,34 @@ def _paired_linear_effect(
             "aligned_seeds": False,
             "n_pairs": 0,
         }
-    effect = sum(
+    terms = [
         coefficient * float(mean)
         for coefficient, mean in zip(
             coefficients.values(), means
         )
-    )
+    ]
+    # 有限均值乘系数、再求和仍可能溢出（如 +1e308 与 -(-1e308)
+    # 在交互效应里相加）。先按最大绝对值归一化再组合，保留真实
+    # 的相消；仍不可表示时返回 None，不能把 inf 当点估计。
+    if any(not math.isfinite(term) for term in terms):
+        effect = None
+    else:
+        scale = max((abs(term) for term in terms), default=0.0)
+        if scale == 0.0:
+            effect = 0.0
+        else:
+            effect = math.fsum(
+                term / scale for term in terms
+            ) * scale
+            if not math.isfinite(effect):
+                effect = None
     return {
         "effect": effect,
-        "test": "no_common_seeds",
+        "test": (
+            "no_common_seeds"
+            if effect is not None
+            else "invalid_values"
+        ),
         "p_value": None,
         "se": None,
         "df": None,
@@ -29273,12 +29292,9 @@ def factorial_effects(
                     )
                     if mean is not None:
                         reference_values.append(mean)
-                reference_mean = (
-                    sum(reference_values)
-                    / len(reference_values)
-                    if reference_values
-                    else None
-                )
+                # 有限参考均值直接求和仍可能溢出（如 +1e308
+                # 与 -(-1e308)）；用带缩放的均值保留真实相消。
+                reference_mean = _mean(reference_values)
 
                 effect_record = {
                     "design": design_label,
