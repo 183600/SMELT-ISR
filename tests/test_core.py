@@ -1505,6 +1505,19 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIn("无法读取", error)
         self.assertIn("SHA-256", error)
 
+    def test_apply_accepts_uppercase_frozen_script_sha256(self):
+        payload = self._payload()
+        payload["frozen_script_sha256"] = "D" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256="d" * 64,
+        )
+        self.assertIsNone(error)
+
     def test_apply_allows_frozen_commit_ancestor(self):
         args = self._args()
         _, error = experiment.preregistration_apply(

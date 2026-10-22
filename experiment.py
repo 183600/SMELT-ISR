@@ -30915,7 +30915,8 @@ def preregistration_apply(
             )
         if (
             not current_script_sha256
-            or str(expected_script) != current_script_sha256
+            or str(expected_script).lower()
+            != str(current_script_sha256).lower()
         ):
             return applied, (
                 "当前 experiment.py 的 SHA-256 与预注册 "
@@ -30936,7 +30937,10 @@ def preregistration_apply(
                 "当前 experiment.py 的 SHA-256：不能把未核对的"
                 "脚本当作冻结版本"
             )
-        if str(expected_script) != current_script_sha256:
+        if (
+            str(expected_script).lower()
+            != str(current_script_sha256).lower()
+        ):
             return applied, (
                 "当前 experiment.py 的 SHA-256 与预注册 "
                 "frozen_script_sha256 不一致：同一 commit 的"
