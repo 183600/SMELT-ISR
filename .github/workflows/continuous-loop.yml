@@ -12,7 +12,7 @@ on:
 # ⭐ 关键 1：同一时间只允许一个 run，新的排队等待（不取消旧的）
 # 上一个 run 一结束，队列里的下一个立刻开始 → "上一个结束立刻触发下一个"
 concurrency:
-  group: continuous-loop
+  group: continuous-loop-v2
   cancel-in-progress: false
 
 # ⭐ 关键 2：全局环境从源头防日志乱码
