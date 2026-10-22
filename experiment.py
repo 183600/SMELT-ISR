@@ -4459,6 +4459,16 @@ _AUDIT_CONDITIONAL_SHIFT_WARN = 0.1
 # 训练集没有覆盖评估集的监督模式，泛化指标会包含大量外推。
 _AUDIT_UNSEEN_TRANSITION_WARN = 0.5
 
+# 时间边界分布漂移：全局直方图会把「train 尾部已经漂移、val
+# 头部继续漂移」相互抵消。分别取 train 尾部与 val 头部（以及
+# val 尾部与 test 头部）各一个块，比较字节分布的 JS 距离。
+# 块大小取相邻 split 较小者的 10%，限制在 [4KiB, 1MiB]；
+# split 太小时不做边界审计，避免把抽样噪声当漂移。
+_AUDIT_BOUNDARY_BLOCK_FRACTION = 0.1
+_AUDIT_BOUNDARY_MIN_BYTES = 4096
+_AUDIT_BOUNDARY_MAX_BYTES = 1024 * 1024
+_AUDIT_BOUNDARY_SHIFT_WARN = 0.1
+
 # 单个字节占比超过该阈值时疑似填充/退化数据（异常值检查）。
 _AUDIT_TOP_BYTE_WARN = 0.5
 
@@ -4544,6 +4554,160 @@ def _byte_bigram_counts(
         )
 
     return counts
+
+
+def _effective_edge_histogram(
+    dataset: "ByteDataset",
+    split: str,
+    max_bytes: int,
+    from_start: bool,
+) -> Tuple[Optional[torch.Tensor], int]:
+    """
+    取 split 有效内容的头部或尾部连续字节，返回归一化字节分布
+    与实际字节数。train 的清洗区间不参与边界漂移统计，避免把
+    模型从未见过的字节当成训练尾部。
+    """
+    tokens = getattr(dataset, split)
+    total = int(tokens.numel())
+    if total <= 0 or max_bytes <= 0:
+        return None, 0
+
+    intervals = _subtract_byte_intervals(
+        0,
+        total,
+        (
+            dataset.train_excluded_spans
+            if split == "train"
+            else []
+        ),
+    )
+    if not intervals:
+        return None, 0
+
+    ordered = intervals if from_start else list(reversed(intervals))
+    remaining = max_bytes
+    counts = torch.zeros(256, dtype=torch.float64)
+    used = 0
+
+    for begin, end in ordered:
+        if remaining <= 0:
+            break
+
+        take = min(end - begin, remaining)
+        if take <= 0:
+            continue
+
+        if from_start:
+            chunk = tokens[begin:begin + take]
+        else:
+            chunk = tokens[end - take:end]
+
+        counts += torch.bincount(
+            chunk.to(torch.int64),
+            minlength=256,
+        ).to(torch.float64)
+        used += take
+        remaining -= take
+
+    if used <= 0:
+        return None, 0
+
+    return counts / counts.sum(), used
+
+
+def _temporal_boundary_shift_audit(
+    dataset: "ByteDataset",
+    split_names: List[str],
+    warnings: List[str],
+) -> Dict[str, object]:
+    """
+    时间边界分布漂移审计：全局直方图可能让「train 尾部已经
+    漂移」和「val 头部继续漂移」相互抵消。分别取相邻 split
+    的尾/头块做字节 JS 距离，专门检查切分边界附近是否存在
+    全局统计看不到的分布突变。
+
+    test 只在 include_test=True（解封评估）时参与，训练期间
+    不会读取 test 内容。数据太少或清洗后有效内容不足时跳过，
+    避免把小块抽样噪声当成漂移。
+    """
+    pairs: Dict[str, object] = {}
+
+    for left, right in (
+        ("train", "val"),
+        ("val", "test"),
+    ):
+        if left not in split_names or right not in split_names:
+            continue
+
+        left_total = (
+            int(dataset.effective_train_bytes)
+            if left == "train"
+            else int(
+                dataset.split_bounds[left][1]
+                - dataset.split_bounds[left][0]
+            )
+        )
+        right_total = int(
+            dataset.split_bounds[right][1]
+            - dataset.split_bounds[right][0]
+        )
+        smaller = min(left_total, right_total)
+
+        if smaller < 2 * _AUDIT_BOUNDARY_MIN_BYTES:
+            continue
+
+        block_bytes = int(
+            smaller * _AUDIT_BOUNDARY_BLOCK_FRACTION
+        )
+        block_bytes = max(
+            _AUDIT_BOUNDARY_MIN_BYTES,
+            min(block_bytes, _AUDIT_BOUNDARY_MAX_BYTES),
+        )
+
+        left_hist, left_used = _effective_edge_histogram(
+            dataset,
+            left,
+            block_bytes,
+            from_start=False,
+        )
+        right_hist, right_used = _effective_edge_histogram(
+            dataset,
+            right,
+            block_bytes,
+            from_start=True,
+        )
+        if (
+            left_hist is None
+            or right_hist is None
+            or left_used <= 0
+            or right_used <= 0
+        ):
+            continue
+
+        distance = _js_distance(left_hist, right_hist)
+        key = f"{left}_tail_{right}_head"
+        pairs[key] = {
+            "js": round(distance, 6),
+            "left_bytes": left_used,
+            "right_bytes": right_used,
+        }
+
+        if distance > _AUDIT_BOUNDARY_SHIFT_WARN:
+            warnings.append(
+                f"{key}: 时间边界字节分布偏移较大"
+                f"（JS 距离 {distance:.4f}，各取 "
+                f"{left_used}/{right_used} 字节）；"
+                "全局直方图可能掩盖切分边界附近的分布突变，"
+                "需检查时间漂移或切分点"
+            )
+
+    return {
+        "block_fraction": _AUDIT_BOUNDARY_BLOCK_FRACTION,
+        "min_bytes": _AUDIT_BOUNDARY_MIN_BYTES,
+        "max_bytes": _AUDIT_BOUNDARY_MAX_BYTES,
+        "warn_js": _AUDIT_BOUNDARY_SHIFT_WARN,
+        "pairs": pairs,
+    }
 
 
 def _js_distance(
@@ -6306,6 +6470,12 @@ def audit_data_splits(
                     "指标包含大量外推，需检查切分/分布偏移"
                 )
 
+    temporal_boundary_shift = _temporal_boundary_shift_audit(
+        dataset,
+        split_names,
+        warnings,
+    )
+
     duplicate_windows: Dict[str, object] = {}
 
     for split, scan in scans.items():
@@ -6482,6 +6652,7 @@ def audit_data_splits(
         "distribution_shift_conditional": (
             distribution_shift_conditional
         ),
+        "temporal_boundary_shift": temporal_boundary_shift,
         "unseen_transition_share": unseen_transition_share,
         "seen_context_share": seen_context_share,
         "duplicate_windows": duplicate_windows,
@@ -32093,6 +32264,50 @@ def run_self_test():
     # 合法 UTF-8、无重复的语料没有任何严格级别的致命问题。
     assert boundary_audit["violations"] == []
     assert enforce_strict_data_audit(boundary_audit)
+
+    # 时间边界漂移：train 尾部与 val 头部单独比较，避免全局
+    # 直方图把边界两侧的分布突变平均掉。这里 train 尾部以 B
+    # 为主、val 头部以 C 为主，全局比例却都很低。
+    temporal_payload = (
+        b"A" * 29900
+        + b"B" * 100
+        + b"C" * 100
+        + b"A" * 9900
+    )
+    with tempfile.NamedTemporaryFile() as temporal_file:
+        temporal_file.write(temporal_payload)
+        temporal_file.flush()
+
+        temporal_dataset = ByteDataset(
+            temporal_file.name,
+            seq_len=8,
+            val_fraction=0.25,
+            test_fraction=0.0,
+        )
+        temporal_audit = audit_data_splits(
+            temporal_dataset,
+            include_test=False,
+        )
+
+    temporal_shift = temporal_audit[
+        "temporal_boundary_shift"
+    ]
+    assert "test" not in temporal_audit["splits"]
+    assert set(temporal_shift["pairs"]) == {
+        "train_tail_val_head"
+    }
+    temporal_pair = temporal_shift["pairs"][
+        "train_tail_val_head"
+    ]
+    assert temporal_pair["js"] > 0.1
+    assert (
+        temporal_pair["js"]
+        > temporal_audit["distribution_shift"]["train_val"]
+    )
+    assert any(
+        "时间边界" in warning
+        for warning in temporal_audit["warnings"]
+    )
 
     # 群组分隔符解析：转义、字面量、Unicode 与非法输入。
     assert parse_group_separator("\\n\\n") == b"\n\n"
