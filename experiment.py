@@ -23678,6 +23678,13 @@ def factor_contrasts(
                 "duplicate_seeds": bool(
                     test.get("duplicate_seeds")
                 ),
+                # 伪重复的折叠口径与组内差异必须随对比结果一起
+                # 落盘；只保留 duplicate_seeds 会丢掉
+                # within_seed_sd_max，无法判断复制运行是否真的
+                # 是确定性复制。
+                "pseudo_replication": test.get(
+                    "pseudo_replication"
+                ),
                 "partial_pairing": test.get("partial_pairing"),
                 "significant": significant,
                 "verdict": verdict,
@@ -34906,7 +34913,7 @@ def run_self_test():
             seq_len=8,
             d_model=16,
             n_heads=4,
-            n_layers=5,
+            n_layers=3,
             n_experts=3,
             expert_hidden=24,
         ).validate()
@@ -37279,7 +37286,7 @@ def run_self_test():
     assert isolation["overlap_bytes"] == 0
     assert (
         isolation["policy"]
-        == "chronological_contiguous_no_shuffle"
+        == "prefix_contiguous_no_shuffle"
     )
     overlapping_isolation = _split_isolation_record(
         {
@@ -40392,12 +40399,14 @@ def run_self_test():
 
         def probe_attention_step(
             inputs: torch.Tensor,
+            *args,
             _original=original_probe_step,
+            **kwargs,
         ) -> torch.Tensor:
             expected_attention_flops[0] += (
                 4 * int(inputs.size(-2)) * int(inputs.numel())
             )
-            return _original(inputs)
+            return _original(inputs, *args, **kwargs)
 
         probe_module.attention_step = probe_attention_step
         probe_modules.append(probe_module)
@@ -41254,14 +41263,15 @@ def run_self_test():
 
     class _BalanceScaleStub:
         moe = _BalanceScaleMoe()
+        residual_scale = 1.0
 
         def __init__(self):
             self.calls = []
 
-        def attention_step(self, value):
+        def attention_step(self, value, scale=None):
             return value
 
-        def moe_step(self, value, top_k):
+        def moe_step(self, value, top_k, scale=None):
             self.calls.append(top_k)
             return value, torch.tensor(float(top_k))
 
@@ -46621,14 +46631,19 @@ def run_self_test():
                 "A", ["prereg_seed1"], 4.4
             ),
         ]
+        supported_contrast = _synthetic_contrast(
+            "smelt", "A", 4.5, 4.4, True
+        )
+        # 门槛检验需要的统计精度证据：方向调整后的 95% 置信
+        # 下界必须整体高于预注册门槛，不能只靠点估计过线。
+        supported_contrast.update({
+            "ci95_low": -0.105,
+            "ci95_high": -0.095,
+        })
         supported_alignment = hypothesis_alignment(
             prereg_rows,
             alignment_aggregates,
-            [
-                _synthetic_contrast(
-                    "smelt", "A", 4.5, 4.4, True
-                )
-            ],
+            [supported_contrast],
             "val_loss",
         )
         assert supported_alignment["checks"][0]["status"] == (
@@ -46900,8 +46915,11 @@ def run_self_test():
         )
         assert extreme_roc["max_majority_accuracy"] == 0.9995
         assert extreme_roc["pr_auc_chance_mean"] == 0.001
+        # ROC-AUC 不以真实类别为条件之外的 prevalence 变化而
+        # 「虚高」，提示应强调随机水平仍是 0.5、但低 prevalence
+        # 下 precision/recall 与 PR-AUC 才是排序诊断的关键。
         assert any(
-            "1:1000" in message and "过于乐观" in message
+            "随机水平 0.5" in message and "PR-AUC" in message
             for message in extreme_roc["advisories"]
         )
         extreme_pr = imbalance_metric_advisory(
