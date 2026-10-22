@@ -97,10 +97,18 @@ class Config:
     balance_coef: float = 0.01
     residual_scale: float = 1.0
 
+    # 初始化方案。module_order 是历史行为：按模块构造顺序消耗
+    # 全局 RNG，不同 mode 的模块数量/构造顺序不同，同一种子下
+    # 共享层会得到不同初始权重。name_hash 按参数名与运行种子
+    # 派生独立随机流，使共享参数在不同 mode 间逐位一致，避免
+    # 把初始化差异混进 A/B/local_base 的配对比较。
+    init_scheme: str = "module_order"
+
     # LanguageModel 可以构建的模式；ngram 仅供统计基线运行写
     # config.json 使用。
     MODEL_MODES = {"smelt", "local_base", "A", "B", "dense"}
     ALL_MODES = MODEL_MODES | {"ngram"}
+    INIT_SCHEMES = {"module_order", "name_hash"}
 
     @property
     def effective_dense_fnn_hidden(self) -> int:
@@ -147,6 +155,11 @@ class Config:
         ):
             raise ValueError(
                 "dense_fnn_hidden 必须是正整数或 None"
+            )
+        if self.init_scheme not in self.INIT_SCHEMES:
+            raise ValueError(
+                "init_scheme 必须是 "
+                + " / ".join(sorted(self.INIT_SCHEMES))
             )
 
     @property
@@ -2251,7 +2264,10 @@ class LanguageModel(nn.Module):
         # 由训练入口根据命令行参数开启，默认关闭。
         self.grad_checkpoint = False
 
-        self.apply(self._init_weights)
+        if cfg.init_scheme == "name_hash":
+            self._init_weights_by_name()
+        else:
+            self.apply(self._init_weights)
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -2261,6 +2277,55 @@ class LanguageModel(nn.Module):
                 mean=0.0,
                 std=0.02,
             )
+
+    def _init_weights_by_name(self) -> None:
+        """
+        初始化不依赖模块构造顺序，只依赖运行种子与参数名。
+
+        同一参数名在不同 mode 中会得到完全相同的初始权重，
+        A/B/local_base 的共享层因此可以在同种子下逐位配对；
+        mode 独有的参数按各自名字取独立随机流。使用 CPU
+        generator 生成后再搬运，保证同一份代码在 CPU/CUDA
+        上得到相同的初始值。
+        """
+        base_seed = int(torch.initial_seed())
+        seen: set = set()
+        for module_name, module in self.named_modules():
+            if not isinstance(module, (nn.Linear, nn.Embedding)):
+                continue
+            weight = module.weight
+            if id(weight) in seen:
+                continue
+            seen.add(id(weight))
+            name = (
+                f"{module_name}.weight"
+                if module_name
+                else "weight"
+            )
+            digest = hashlib.sha256(
+                f"{base_seed}:{name}".encode("utf-8")
+            ).digest()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(
+                int.from_bytes(digest[:8], "little")
+                & ((1 << 63) - 1)
+            )
+            values = torch.empty(
+                weight.shape,
+                dtype=torch.float32,
+            )
+            values.normal_(
+                0.0,
+                0.02,
+                generator=generator,
+            )
+            with torch.no_grad():
+                weight.copy_(
+                    values.to(
+                        device=weight.device,
+                        dtype=weight.dtype,
+                    )
+                )
 
     def _call(self, fn, *args):
         """
@@ -17217,6 +17282,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 就会绕过受控变量核对。把它写进协议后，只有显式声明为
     # 因子时才允许不同。
     "mode",
+    # 初始化方案决定同种子下共享层是否真的从同一组权重出发；
+    # 跨方案比较会把初始化差异混入方法效应，必须受控。
+    "init_scheme",
     "optimizer",
     "optimizer_betas",
     "optimizer_eps",
@@ -17798,6 +17866,9 @@ def build_comparison_protocol(
         # 模型模式是结构差异本身；默认作为实验因子，但一旦
         # 因子列表没有它，就必须按受控变量核对。
         "mode": cfg.mode,
+        # 初始化方案：name_hash 下同种子的共享参数逐位一致，
+        # module_order 下不同 mode 的构造顺序会改变共享层初始化。
+        "init_scheme": cfg.init_scheme,
         # 优化器固定为 AdamW（betas/eps 使用 PyTorch 默认值），
         # 显式记录以便未来更换优化器时立即被对比检查发现。
         "optimizer": "AdamW",
@@ -17947,6 +18018,13 @@ def experiment_protocol_from_payload(
         # 是唯一确定的实际模式；用它回填，避免跨模式对比在
         # 因子列表漏掉 mode 时静默通过。
         "mode": cfg.get("mode"),
+        # 历史运行只有按模块构造顺序初始化这一种方案；新运行
+        # 记录实际方案。缺记录的旧运行不能默认成 name_hash。
+        "init_scheme": (
+            cfg.get("init_scheme")
+            if cfg.get("init_scheme") is not None
+            else ("module_order" if has_training else None)
+        ),
         # 代码历史上只有一种优化器与一种调度，能唯一确定时
         # 回退；否则留 None。
         "optimizer": "AdamW" if has_training else None,
@@ -18166,15 +18244,20 @@ def parse_factor_spec(spec: str) -> List[str]:
         key
         for key in keys
         if key
-        in {"model_selection", "selection_metric"}
+        in {
+            "model_selection",
+            "selection_metric",
+            "init_scheme",
+        }
     ]
     if locked:
         raise ValueError(
-            "选型协议不能声明为实验因子: "
+            "实现/选型协议不能声明为实验因子: "
             + ", ".join(locked)
-            + "（--selection-metric 决定 checkpoint 怎么选，"
-            "跨运行必须一致；需要比较选型规则时请单独做方法学"
-            "实验，而不是把它混进方法对比）"
+            + "（初始化方案决定共享层是否同起点，"
+            "--selection-metric 决定 checkpoint 怎么选，"
+            "跨运行必须一致；需要比较这些规则时请单独做"
+            "方法学实验，而不是把它们混进方法对比）"
         )
 
     return keys
@@ -30591,6 +30674,67 @@ def run_self_test():
 
         for grad in gradients:
             assert torch.isfinite(grad).all()
+
+    # name_hash 初始化：同一运行种子下，不同 mode 的共享参数
+    # 必须逐位一致；历史 module_order 会因构造顺序不同而漂移。
+    set_seed(123)
+    named_moe = LanguageModel(
+        Config(
+            **common,
+            mode="B",
+            init_scheme="name_hash",
+        )
+    )
+    set_seed(123)
+    named_dense = LanguageModel(
+        Config(
+            **common,
+            mode="dense",
+            init_scheme="name_hash",
+        )
+    )
+    named_moe_state = named_moe.state_dict()
+    named_dense_state = named_dense.state_dict()
+    named_shared = set(named_moe_state) & set(
+        named_dense_state
+    )
+    assert named_shared
+    for key in named_shared:
+        assert torch.equal(
+            named_moe_state[key],
+            named_dense_state[key],
+        ), f"name_hash 初始化在共享参数 {key} 上未对齐"
+
+    set_seed(123)
+    ordered_moe = LanguageModel(
+        Config(
+            **common,
+            mode="B",
+            init_scheme="module_order",
+        )
+    )
+    set_seed(123)
+    ordered_dense = LanguageModel(
+        Config(
+            **common,
+            mode="dense",
+            init_scheme="module_order",
+        )
+    )
+    ordered_shared = (
+        set(ordered_moe.state_dict())
+        & set(ordered_dense.state_dict())
+    )
+    assert any(
+        not torch.equal(
+            ordered_moe.state_dict()[key],
+            ordered_dense.state_dict()[key],
+        )
+        for key in ordered_shared
+    ), (
+        "module_order 下 MoE 与 dense 的共享层初始化应当不同"
+        "（自测用于证明该历史方案确实存在初始化混杂）"
+    )
 
     # dense 基线：无 MoE、无循环——每个 Block 的 attention
     # 与 FFN 恰好各执行一次；smelt 的中间区域则执行两轮。
@@ -46429,6 +46573,20 @@ def main():
         ),
     )
     parser.add_argument(
+        "--init-scheme",
+        type=str,
+        default="name_hash",
+        choices=sorted(Config.INIT_SCHEMES),
+        help=(
+            "参数初始化方案。name_hash（默认）按运行种子与"
+            "参数名派生独立随机流，使同种子下不同 mode 的"
+            "共享层拿到相同初始权重，配对对比不会混入初始化"
+            "差异；module_order 是历史行为（按模块构造顺序"
+            "消耗全局 RNG），跨 mode 对比时共享层初始化不同，"
+            "不建议用于方法比较"
+        ),
+    )
+    parser.add_argument(
         "--statistical-baseline",
         action="store_true",
         help=(
@@ -47917,6 +48075,7 @@ def main():
             dense_fnn_hidden=dense_fnn_hidden,
             balance_coef=args.balance_coef,
             residual_scale=args.residual_scale,
+            init_scheme=args.init_scheme,
         )
 
     if rng_payload is not None:
@@ -47936,6 +48095,7 @@ def main():
             "dense_fnn_hidden",
             "balance_coef",
             "residual_scale",
+            "init_scheme",
         }
         ignored = {}
         for field in config_fields:
