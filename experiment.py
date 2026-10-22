@@ -26906,31 +26906,18 @@ def factorial_effects(
     ):
         _attach_family_power(effect, len(eligible))
         effect["holm_alpha_threshold"] = holm_threshold
-        paired_values = effect.get("paired_differences")
-        if isinstance(paired_values, list):
-            effect["fragility"] = _paired_result_fragility(
-                paired_values,
-                effect.get("paired_seeds"),
-                alpha=float(
-                    holm_threshold
-                    if holm_threshold is not None
-                    else effect.get(
-                        "alpha_bonferroni",
-                        _SIGNIFICANCE_LEVEL,
-                    )
-                ),
-            )
     holm = _holm_bonferroni(effect_p_values)
     for effect, adjusted in zip(eligible, holm):
         effect["p_value_holm"] = adjusted
         effect["significant_raw"] = bool(
             float(effect["p_value"]) <= _SIGNIFICANCE_LEVEL
         )
-        effect["significant"] = bool(
+        corrected = bool(
             adjusted is not None
             and float(adjusted) <= _SIGNIFICANCE_LEVEL
         )
-        if not effect["significant"]:
+        effect["significant"] = corrected
+        if not corrected:
             effect["claim"] = "not_significant"
         elif effect["kind"] == "interaction":
             effect["claim"] = "interaction_detected"
@@ -26940,6 +26927,32 @@ def factorial_effects(
             effect["claim"] = "harms_component"
         else:
             effect["claim"] = "not_significant"
+
+        # 与单因子对比同口径：Holm step-down 失败后的位置
+        # 阈值不再有效，非显著效应不能进入 stable/fragile 计数。
+        paired_values = effect.get("paired_differences")
+        if isinstance(paired_values, list):
+            threshold = effect.get("holm_alpha_threshold")
+            fragility = _paired_result_fragility(
+                paired_values,
+                effect.get("paired_seeds"),
+                alpha=float(
+                    threshold
+                    if threshold is not None
+                    else effect.get(
+                        "alpha_bonferroni",
+                        _SIGNIFICANCE_LEVEL,
+                    )
+                ),
+            )
+            if (
+                not corrected
+                and fragility.get("available")
+                and fragility.get("verdict") != "not_significant"
+            ):
+                fragility["verdict"] = "not_significant"
+                fragility["holm_step_down_valid"] = False
+            effect["fragility"] = fragility
 
     # 符号翻转检验与 t 检验同家族校正；两者结论不一致时
     # 主效应/交互的显著性依赖分布假设，不能作为稳健结论。
