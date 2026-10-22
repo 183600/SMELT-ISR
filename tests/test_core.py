@@ -6391,6 +6391,30 @@ class NumericalScaleTests(unittest.TestCase):
             contrast,
         )
 
+    def test_environment_identity_falls_back_for_minimal_snapshots(self):
+        expected = {
+            "schema": experiment._ENVIRONMENT_SCHEMA,
+            "python": {"version": None},
+            "unknown_field": "expected",
+        }
+        actual = {
+            "schema": experiment._ENVIRONMENT_SCHEMA,
+            "python": {"version": None},
+            "unknown_field": "actual",
+        }
+        expected_identity = experiment._environment_identity_payload(
+            expected
+        )
+        actual_identity = experiment._environment_identity_payload(
+            actual
+        )
+        # 没有已知身份字段时不能退化成同一个空对象哈希。
+        self.assertNotEqual(expected_identity, actual_identity)
+        report = experiment.compare_environment_snapshots(
+            expected, actual
+        )
+        self.assertFalse(report["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

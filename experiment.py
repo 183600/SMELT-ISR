@@ -40959,8 +40959,27 @@ def _environment_identity_payload(
     }
     # 兼容只含少量字段的旧/手工快照：如果上面全是空值，退回
     # 对整份快照（去掉时间与身份字段）做指纹，避免所有无效
-    # 快照共享同一个空对象哈希。
-    if not any(identity.values()):
+    # 快照共享同一个空对象哈希。注意不能直接
+    # ``any(identity.values())``：identity 的每一项都是非空
+    # dict（即使其中所有叶子都是 None），那样判断永远为真，
+    # 回退分支永远不可达。
+    def _has_identity_value(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                _has_identity_value(item)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(
+                _has_identity_value(item) for item in value
+            )
+        if isinstance(value, (set, frozenset)):
+            return any(
+                _has_identity_value(item) for item in value
+            )
+        return value is not None and value != ""
+
+    if not _has_identity_value(identity):
         return {
             key: value
             for key, value in snapshot.items()
