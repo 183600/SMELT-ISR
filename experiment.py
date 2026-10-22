@@ -21396,14 +21396,21 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
     print("-" * len(header))
 
     def _value(value, spec=".4f", scale=1.0):
-        if value is None:
+        # config/metrics 里的数值可能损坏（含超出 float 范围的
+        # 整数或 NaN/Inf）；展示层按缺失值处理，不能让一行坏
+        # 记录中断整张对比表。
+        number = _finite_float(value)
+        if number is None:
             return "-"
-        return format(float(value) * scale, spec)
+        scaled = number * scale
+        if not math.isfinite(scaled):
+            return "-"
+        return format(scaled, spec)
 
     for row in rows:
-        flops = row.get("flops_per_forward")
+        flops = _finite_float(row.get("flops_per_forward"))
         gflops = (
-            f"{float(flops) / 1e9:.3f}"
+            f"{flops / 1e9:.3f}"
             if flops is not None
             else "-"
         )
@@ -21457,9 +21464,10 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
         print("-" * len(routing_header))
 
         def _rv(value, spec=".4f") -> str:
-            if value is None:
+            number = _finite_float(value)
+            if number is None:
                 return "-"
-            return format(float(value), spec)
+            return format(number, spec)
 
         for row in routing_rows:
             print(

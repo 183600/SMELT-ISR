@@ -5770,6 +5770,53 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(len(alignment["checks"]), 1)
         self.assertIsNone(alignment["checks"][0]["min_effect"])
 
+    def test_print_comparison_tolerates_out_of_range_numbers(self):
+        huge = 10 ** 400
+        rows = [
+            {
+                "run": "huge",
+                "mode": "B",
+                "n_params": huge,
+                "val_loss": huge,
+                "val_macro_nll": huge,
+                "val_bits_per_byte": huge,
+                "val_token_accuracy": huge,
+                "val_macro_f1": huge,
+                "latency_ms_per_forward": huge,
+                "training_ms_per_step": huge,
+                "flops_per_forward": huge,
+                "peak_memory_mb": huge,
+                "routing_available": True,
+                "routing_jaccard_branch": huge,
+                "routing_slot_reuse_branch": huge,
+                "routing_branch_self_reuse": huge,
+                "routing_r1_load_entropy": huge,
+                "routing_r2_load_entropy": huge,
+                "routing_r2_dead_experts": huge,
+                "routing_r2_router_entropy": huge,
+                "routing_branch_cosine": huge,
+            }
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_comparison(rows)
+        text = output.getvalue()
+        self.assertIn("huge", text)
+        self.assertIn("val_loss", text)
+        # 正常有限值仍然正常格式化。
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_comparison([
+                {
+                    "run": "ok",
+                    "mode": "B",
+                    "val_loss": 1.25,
+                    "flops_per_forward": 2e9,
+                }
+            ])
+        self.assertIn("1.2500", output.getvalue())
+        self.assertIn("2.000", output.getvalue())
+
     def test_paired_stats_keep_large_finite_effects(self):
         huge = 1.0e308
         test = experiment._paired_t_test([huge, huge, huge])
