@@ -23381,6 +23381,16 @@ def ablation_component_verdicts(
             + "）：在多个指标之间事后挑选支持结论的那个属于"
             "指标选择偏差，组件联合判定只能作为探索性结果"
         )
+    if preregistration_missing_runs:
+        blockers.append(
+            f"{len(preregistration_missing_runs)} 个运行没有"
+            "训练前预注册主指标（"
+            + ", ".join(preregistration_missing_runs[:5])
+            + ("..." if len(preregistration_missing_runs) > 5 else "")
+            + "）：无法核对判定指标是否在看结果前声明，"
+            "不能排除指标选择偏差，组件联合判定只能作为"
+            "探索性结果"
+        )
 
     statuses = {
         str(component["component"]): str(component["status"])
@@ -42155,6 +42165,21 @@ def run_self_test():
         assert metric_mismatch_verdicts[
             "metric_preregistration"
         ]["analysis_metric"] == factorial["metric"]
+        missing_prereg_verdicts = ablation_component_verdicts(
+            factorial,
+            component_coverage,
+            metric_preregistration={
+                "preregistration_missing_runs": ["A_seed1"],
+                "preregistered_runs": [],
+            },
+        )
+        assert not missing_prereg_verdicts[
+            "all_components_supported"
+        ]
+        assert any(
+            "没有训练前预注册主指标" in blocker
+            for blocker in missing_prereg_verdicts["blockers"]
+        ), missing_prereg_verdicts["blockers"]
         not_supported_factorial = json.loads(
             json.dumps(
                 _json_safe(factorial),
