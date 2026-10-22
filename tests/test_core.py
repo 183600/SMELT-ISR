@@ -453,6 +453,9 @@ class ReproducibilityTests(unittest.TestCase):
                 "script_sha256": "script-sha",
                 "git_commit": "commit-sha",
                 "git_dirty": False,
+                "pythonhashseed_at_start": "7",
+                "rng_seed_manifest": {"seed": 7},
+                "deterministic_algorithms": True,
             },
             comparison_protocol_sha256="protocol-sha",
         )
@@ -470,6 +473,12 @@ class ReproducibilityTests(unittest.TestCase):
         self.assertEqual(
             header["comparison_protocol_sha256"],
             "protocol-sha",
+        )
+        self.assertEqual(
+            header["pythonhashseed_at_start"], "7"
+        )
+        self.assertEqual(
+            header["rng_seed_manifest"], {"seed": 7}
         )
 
     def test_tracking_provenance_prefers_original_run(self):

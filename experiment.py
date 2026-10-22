@@ -965,6 +965,15 @@ def configure_cuda_precision(allow_tf32: bool = False) -> None:
     torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
     torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
 
+    # float32_matmul_precision 与上面的 TF32 开关在部分版本里
+    # 联动，但环境变量/用户代码可能把它留成别的档位。这里显式
+    # 固定：关闭 TF32 时用 highest（完整 fp32），开启时用 high
+    #（允许 TensorFloat32）。实际生效值仍写入 run_metadata。
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(
+            "high" if allow_tf32 else "highest"
+        )
+
 
 def pythonhashseed_error(
     require_pythonhashseed: bool,
@@ -35022,6 +35031,15 @@ def tracking_header_fields(
         "script_sha256": run_metadata.get("script_sha256"),
         "git_commit": run_metadata.get("git_commit"),
         "git_dirty": run_metadata.get("git_dirty"),
+        "pythonhashseed_at_start": run_metadata.get(
+            "pythonhashseed_at_start"
+        ),
+        "rng_seed_manifest": run_metadata.get(
+            "rng_seed_manifest"
+        ),
+        "deterministic_algorithms": run_metadata.get(
+            "deterministic_algorithms"
+        ),
         "run_started_utc": (
             run_started_utc
             or run_metadata.get("timestamp_utc")
@@ -39453,16 +39471,34 @@ def run_self_test():
     # 在测试结束后恢复原状态（自测不能污染后续运行的数值环境）。
     saved_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
     saved_tf32_cudnn = torch.backends.cudnn.allow_tf32
+    saved_matmul_precision = (
+        torch.get_float32_matmul_precision()
+        if hasattr(torch, "get_float32_matmul_precision")
+        else None
+    )
     try:
         configure_cuda_precision(False)
         assert torch.backends.cuda.matmul.allow_tf32 is False
         assert torch.backends.cudnn.allow_tf32 is False
+        if hasattr(torch, "get_float32_matmul_precision"):
+            assert (
+                torch.get_float32_matmul_precision()
+                == "highest"
+            )
         configure_cuda_precision(True)
         assert torch.backends.cuda.matmul.allow_tf32 is True
         assert torch.backends.cudnn.allow_tf32 is True
+        if hasattr(torch, "get_float32_matmul_precision"):
+            assert (
+                torch.get_float32_matmul_precision() == "high"
+            )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = saved_tf32_matmul
         torch.backends.cudnn.allow_tf32 = saved_tf32_cudnn
+        if saved_matmul_precision is not None:
+            torch.set_float32_matmul_precision(
+                saved_matmul_precision
+            )
 
     # sanity check 必须能在小批量上过拟合，且结束后恢复调用前的
     # RNG 状态（不影响主训练轨迹）。启用 grad_checkpoint 跑通
