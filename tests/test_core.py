@@ -2168,6 +2168,17 @@ class PreregistrationTests(unittest.TestCase):
             experiment.preregistration_schema_error(payload)
         )
 
+    def test_schema_rejects_out_of_range_seed(self):
+        payload = self._payload()
+        payload["seeds"] = [
+            42,
+            43,
+            experiment.MAX_SEED + 1,
+        ]
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn(str(experiment.MAX_SEED), error)
+
 
 class ArtifactManifestTests(unittest.TestCase):
     """归档清单：内容可复核、路径不可逃逸、新增文件可披露。"""
@@ -2657,6 +2668,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 )
             self.assertEqual(
                 config.read_text(encoding="utf-8"), "{not json"
+            )
+
+    def test_local_test_ledger_counts_as_sealed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            self.assertFalse(
+                experiment.test_evaluation_sealed(run_dir)
+            )
+            (run_dir / "test_access_ledger.jsonl").write_text(
+                "", encoding="utf-8"
+            )
+            self.assertTrue(
+                experiment.test_evaluation_sealed(run_dir)
             )
 
     def test_resume_split_error_detects_missing_current_split(self):

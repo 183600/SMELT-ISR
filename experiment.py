@@ -31395,8 +31395,14 @@ def preregistration_schema_error(
             isinstance(seed, bool)
             or not isinstance(seed, int)
             or seed < 0
+            or seed > MAX_SEED
         ):
-            return f"seeds[{index}] 必须是非负整数"
+            # 与 seed_error/set_seed 使用同一个合法域，避免
+            # 预注册文件通过 schema 后到 NumPy 播种才抛错。
+            return (
+                f"seeds[{index}] 必须是 [0, {MAX_SEED}] 内的"
+                "整数"
+            )
         normalized_seeds.append(seed)
     if len(set(normalized_seeds)) != len(normalized_seeds):
         return "seeds 存在重复随机种子"
@@ -39197,7 +39203,14 @@ def test_evaluation_sealed(out_dir: Path) -> bool:
     if test_record_exists(out_dir / "metrics.jsonl"):
         return True
 
-    return _test_seal_path(out_dir).exists()
+    if _test_seal_path(out_dir).exists():
+        return True
+
+    # 访问账本先于 test_started/封条写入；若进程恰好在两者之间
+    # 崩溃，前两项都看不到解封事实，但本目录的账本已经记录了
+    # 一次测试访问。存在即视为已解封，宁可保守拒绝也不能让
+    # 同一目录在 resume 后再次消耗测试集。
+    return (out_dir / "test_access_ledger.jsonl").exists()
 
 
 def fresh_out_dir_error(
