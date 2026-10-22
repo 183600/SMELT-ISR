@@ -1542,6 +1542,43 @@ class PreregistrationTests(unittest.TestCase):
             sys.argv = original_argv
         self.assertIn("不在预注册", error)
 
+    def test_resume_restores_cleaning_justification(self):
+        args = self._args(domain_justification=None)
+        saved = {
+            "domain_justification": "synthetic records are corrupt",
+        }
+        restored = experiment._restore_resume_cleaning_justification(
+            args, saved
+        )
+        self.assertTrue(restored)
+        self.assertEqual(
+            args.domain_justification,
+            "synthetic records are corrupt",
+        )
+        # 显式给出的新依据不能被检查点静默覆盖。
+        explicit = self._args(
+            domain_justification="new justification"
+        )
+        restored = experiment._restore_resume_cleaning_justification(
+            explicit, saved
+        )
+        self.assertFalse(restored)
+        self.assertEqual(
+            explicit.domain_justification,
+            "new justification",
+        )
+        # 旧检查点可能只记录 config 字段名。
+        legacy = self._args(domain_justification=None)
+        restored = experiment._restore_resume_cleaning_justification(
+            legacy,
+            {"cleaning_domain_justification": "legacy justification"},
+        )
+        self.assertTrue(restored)
+        self.assertEqual(
+            legacy.domain_justification,
+            "legacy justification",
+        )
+
     def test_sweep_detects_preregistration_file_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

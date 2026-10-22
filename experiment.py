@@ -52819,6 +52819,34 @@ def run_self_test():
 # Training
 # ============================================================
 
+def _restore_resume_cleaning_justification(
+    args: argparse.Namespace,
+    saved_args: Dict[str, object],
+) -> bool:
+    """
+    resume 时恢复检查点里记录的清洗领域依据。
+
+    清洗开关本身会按检查点恢复（否则训练样本集合会变），
+    但 ``--domain-justification`` 若也必须重新手打，合法的
+    续跑会被入口校验拒绝；或者用户随手写一句新依据，把原
+    审计文本静默替换掉。显式命令行优先；否则按存档恢复。
+
+    返回是否恢复了值。
+    """
+    current = getattr(args, "domain_justification", None)
+    if current is not None and str(current).strip():
+        return False
+    for key in (
+        "domain_justification",
+        "cleaning_domain_justification",
+    ):
+        saved = saved_args.get(key)
+        if isinstance(saved, str) and saved.strip():
+            args.domain_justification = saved
+            return True
+    return False
+
+
 def hypothesis_check_error(
     args: argparse.Namespace,
 ) -> Optional[str]:
@@ -57409,6 +57437,13 @@ def main():
         }
 
         saved_args = rng_payload.get("args", {})
+        if _restore_resume_cleaning_justification(
+            args, saved_args
+        ):
+            print(
+                "resume restored domain_justification from "
+                "checkpoint (训练集清洗依据是数据协议的一部分)"
+            )
         amp_change_error = resume_amp_change_error(
             saved_args,
             args.amp_dtype,
