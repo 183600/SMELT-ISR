@@ -20508,6 +20508,73 @@ def _contrast_test(
     result["n_pairs"] = 0
     if duplicate_seeds:
         result["duplicate_seeds"] = True
+
+    # 种子集合部分重叠时，主检验退回 Welch 会丢掉共同种子的
+    # 配对信息（共同种子上的难度是共享的）。这里补一个仅用
+    # 共同种子的完整案例配对敏感性分析：它是稳健性参考，
+    # 不能替代主检验——缺失机制与结果相关时，共同子集不是
+    # 随机样本。
+    if duplicate_seeds:
+        result["partial_pairing"] = {
+            "available": False,
+            "reason": "duplicate_seeds",
+            "common_seeds": common_seeds,
+        }
+    elif len(common_seeds) >= _MIN_SEEDS_FOR_STATS:
+        differences = [
+            by_seed_b[seed] - by_seed_a[seed]
+            for seed in common_seeds
+        ]
+        paired_result = _paired_t_test(differences)
+        paired_result["n_pairs"] = len(common_seeds)
+        randomization = _paired_sign_flip_test(differences)
+        paired_effect = _paired_effect_size(
+            paired_result.get("effect"),
+            paired_result,
+        )
+        result["partial_pairing"] = {
+            "available": True,
+            "common_seeds": common_seeds,
+            "n_common": len(common_seeds),
+            "n_baseline": len(samples_a),
+            "n_variant": len(samples_b),
+            "common_share": (
+                float(len(common_seeds))
+                / float(min(len(samples_a), len(samples_b)))
+                if samples_a and samples_b
+                else None
+            ),
+            "effect": paired_result.get("effect"),
+            "test": paired_result.get("test"),
+            "t": paired_result.get("t"),
+            "df": paired_result.get("df"),
+            "se": paired_result.get("se"),
+            "p_value": paired_result.get("p_value"),
+            "randomization_p_value": randomization.get(
+                "p_value"
+            ),
+            "randomization_method": randomization.get("method"),
+            "randomization_min_attainable_p": randomization.get(
+                "min_attainable_p"
+            ),
+            "randomization_can_reach_significance": (
+                randomization.get("can_reach_significance")
+            ),
+            "cohens_dz": paired_effect.get("cohens_dz"),
+            "hedges_gz": paired_effect.get("hedges_gz"),
+            "note": (
+                "仅使用两侧都有记录的共同种子做完整案例配对；"
+                "若缺失与结果相关，子集可能有偏，不能替代主检验"
+                "（Welch），只作稳健性参考"
+            ),
+        }
+    else:
+        result["partial_pairing"] = {
+            "available": False,
+            "reason": "insufficient_common_seeds",
+            "common_seeds": common_seeds,
+            "n_common": len(common_seeds),
+        }
     return result
 
 
@@ -21092,6 +21159,7 @@ def factor_contrasts(
                 "duplicate_seeds": bool(
                     test.get("duplicate_seeds")
                 ),
+                "partial_pairing": test.get("partial_pairing"),
                 "significant": significant,
                 "verdict": verdict,
                 "cost": cost,
@@ -22023,6 +22091,27 @@ def _contrast_display(
         if dz_hedges is not None:
             dz_text += f"（Hedges gz={float(dz_hedges):.2f}）"
         noise_text += dz_text
+    # 种子集合不完全相同时，主检验是 Welch；共同种子上的
+    # 配对敏感性能说明丢掉配对是否改变了结论，但缺失机制
+    # 可能非随机，不能替代主检验。
+    partial = contrast.get("partial_pairing")
+    if (
+        contrast.get("test") == "welch_t"
+        and isinstance(partial, dict)
+        and partial.get("available")
+    ):
+        partial_p = partial.get("p_value")
+        partial_effect = partial.get("effect")
+        partial_text = (
+            f"；共同种子配对敏感性"
+            f"（n={partial.get('n_common')}"
+        )
+        if isinstance(partial_effect, (int, float)):
+            partial_text += f", Δ={float(partial_effect):+.4f}"
+        if isinstance(partial_p, (int, float)):
+            partial_text += f", p={float(partial_p):.4f}"
+        partial_text += "，不替代主检验）"
+        noise_text += partial_text
 
     ci_low = contrast.get("ci95_low")
     ci_high = contrast.get("ci95_high")
@@ -22500,6 +22589,7 @@ def compare_cells_to_baseline(
             "duplicate_seeds": bool(
                 result.get("duplicate_seeds")
             ),
+            "partial_pairing": result.get("partial_pairing"),
             "significant": significant,
             "verdict": verdict,
             "cost": cost,
@@ -35932,6 +36022,75 @@ def run_self_test():
         paired_contrast["randomization_can_reach_significance"]
         is False
     )
+
+    # 种子集合部分重叠：主检验必须仍是 Welch（不能静默缩小
+    # 样本），但共同种子上要给出配对敏感性分析，避免把配对
+    # 信息全部丢掉。
+    partial_contrast = _contrast_test(
+        [
+            {"seed": 1, "value": 3.0},
+            {"seed": 2, "value": 3.3},
+            {"seed": 3, "value": 2.7},
+            {"seed": 4, "value": 3.1},
+        ],
+        [
+            {"seed": 1, "value": 2.8},
+            {"seed": 2, "value": 3.0},
+            {"seed": 3, "value": 2.6},
+            {"seed": 5, "value": 3.0},
+        ],
+    )
+    assert partial_contrast["test"] == "welch_t"
+    assert partial_contrast["n_pairs"] == 0
+    partial_sensitivity = partial_contrast["partial_pairing"]
+    assert partial_sensitivity["available"] is True
+    assert partial_sensitivity["common_seeds"] == [1, 2, 3]
+    assert partial_sensitivity["n_common"] == 3
+    assert partial_sensitivity["test"] == "paired_t"
+    assert partial_sensitivity["p_value"] is not None
+    assert abs(float(partial_sensitivity["effect"]) + 0.2) < 1e-12
+    assert partial_sensitivity["cohens_dz"] is not None
+
+    # 共同种子不足 3 个：不能做配对，必须明确不可用。
+    insufficient_partial = _contrast_test(
+        [
+            {"seed": 1, "value": 3.0},
+            {"seed": 2, "value": 3.1},
+            {"seed": 3, "value": 3.2},
+            {"seed": 4, "value": 3.3},
+        ],
+        [
+            {"seed": 3, "value": 3.0},
+            {"seed": 4, "value": 3.1},
+            {"seed": 5, "value": 3.2},
+            {"seed": 6, "value": 3.3},
+        ],
+    )
+    assert insufficient_partial["partial_pairing"]["available"] is False
+    assert (
+        insufficient_partial["partial_pairing"]["reason"]
+        == "insufficient_common_seeds"
+    )
+    partial_display = _contrast_display(
+        {
+            "factor": "mode",
+            "baseline_value": "local_base",
+            "variant_value": "A",
+            "baseline": "mode=local_base",
+            "delta": -0.2,
+            "p_value": 0.20,
+            "test": "welch_t",
+            "n_pairs": 0,
+            "verdict": "improvement",
+            "significant": False,
+            "delta_over_noise": 0.5,
+            "partial_pairing": partial_sensitivity,
+        },
+        "val_loss",
+    )
+    assert "共同种子配对敏感性" in partial_display
+    assert "不替代主检验" in partial_display
+
     small_n_display = _contrast_display(
         {
             "factor": "mode",
