@@ -21695,10 +21695,9 @@ def _cell_cost_mean(
     entry = costs.get(field)
     if not isinstance(entry, dict):
         return None
-    mean = entry.get("mean")
-    if mean is None:
-        return None
-    return float(mean)
+    # 旧/损坏的分析记录可能把 mean 写成 10**400；float() 会
+    # 溢出并让整份效率对比崩溃。不可用值按缺失处理。
+    return _finite_float(entry.get("mean"))
 
 
 def _cell_cost_std(
@@ -21712,10 +21711,7 @@ def _cell_cost_std(
     entry = costs.get(field)
     if not isinstance(entry, dict):
         return None
-    std = entry.get("std")
-    if std is None:
-        return None
-    return float(std)
+    return _finite_float(entry.get("std"))
 
 
 def _cell_cost_n(
@@ -21730,7 +21726,11 @@ def _cell_cost_n(
     if not isinstance(entry, dict):
         return 0
     count = entry.get("n")
-    if isinstance(count, int) and count > 0:
+    if (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count > 0
+    ):
         return count
     return 0
 
@@ -27253,7 +27253,7 @@ def _paired_linear_effect(
     # 没有共同种子：仍给出由聚合均值组合的点估计，但明确
     # 标记不能做配对检验（缺失/不同种子不能伪造显著性）。
     means = [
-        cells[key].get(f"{metric}_mean")
+        _finite_float(cells[key].get(f"{metric}_mean"))
         for key in coefficients
     ]
     if any(mean is None for mean in means):

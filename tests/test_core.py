@@ -4477,6 +4477,39 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )["reason"],
             "non_finite_differences",
         )
+        # 效率均值/标准差与无共同种子时的聚合均值也不能因
+        # 超大整数在 float() 处崩溃。
+        self.assertIsNone(
+            experiment._cell_cost_mean(
+                {"costs": {"n_params": {"mean": huge}}},
+                "n_params",
+            )
+        )
+        self.assertIsNone(
+            experiment._cell_cost_std(
+                {"costs": {"n_params": {"std": huge}}},
+                "n_params",
+            )
+        )
+        factorial = experiment._paired_linear_effect(
+            {
+                "a": {
+                    "samples": {
+                        "val_loss": [{"seed": 1, "value": 1.0}]
+                    },
+                    "val_loss_mean": huge,
+                },
+                "b": {
+                    "samples": {
+                        "val_loss": [{"seed": 2, "value": 1.0}]
+                    },
+                    "val_loss_mean": huge,
+                },
+            },
+            {"a": 1.0, "b": -1.0},
+            "val_loss",
+        )
+        self.assertEqual(factorial["test"], "missing_metric")
         # n>1023 时 2**n 不能再转 float；精确符号检验仍需
         # 给出可判定的 p 值与最小可达 p。
         sign = experiment._exact_sign_test([1.0] * 2000)
