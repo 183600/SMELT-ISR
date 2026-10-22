@@ -40160,6 +40160,27 @@ def _nested_differences(
     return []
 
 
+def _environment_identifier(
+    snapshot: Dict[str, object],
+    identity: Dict[str, object],
+) -> Tuple[str, bool]:
+    """返回快照声明的 environment_id 及其与内容是否自洽。
+
+    归档文件可能被截断或手工编辑：如果只比较声明的 id，修改
+    关键包内容却保留旧 id 时会被误判为「同一环境」。规范化
+    快照（带 schema）必须满足 id == SHA256(identity)；缺少 id
+    的旧/手工快照按内容重新计算，不虚报一致。没有 schema 的
+    最小字典保持旧行为，只用于比较调用方显式给出的 id。
+    """
+    canonical = _canonical_json_sha256(identity)
+    recorded = snapshot.get("environment_id")
+    if not isinstance(recorded, str) or not recorded:
+        return canonical, True
+    if snapshot.get("schema") != _ENVIRONMENT_SCHEMA:
+        return recorded, True
+    return recorded, recorded == canonical
+
+
 def compare_environment_snapshots(
     expected: Dict[str, object],
     actual: Optional[Dict[str, object]] = None,
@@ -40167,10 +40188,11 @@ def compare_environment_snapshots(
     """
     比较归档环境与当前环境，返回可机读差异。
 
-    ``ok`` 只要求 environment_id 一致（决定数值结果的关键依赖/
-    编译选项/设备/确定性开关）；``strict_ok`` 还要求完整包清单
-    逐项一致。CLI 默认用 ``ok``，``--check-environment-strict``
-    用 ``strict_ok``。
+    ``ok`` 要求 environment_id 一致，且归档/当前快照声明的 id
+    与各自内容自洽（决定数值结果的关键依赖/编译选项/设备/
+    确定性开关）；``strict_ok`` 还要求完整包清单逐项一致。
+    CLI 默认用 ``ok``，``--check-environment-strict`` 用
+    ``strict_ok``。
     """
     actual = (
         actual
@@ -40181,12 +40203,12 @@ def compare_environment_snapshots(
 
     expected_identity = _environment_identity_payload(expected)
     actual_identity = _environment_identity_payload(actual)
-    expected_id = expected.get("environment_id")
-    if not isinstance(expected_id, str) or not expected_id:
-        expected_id = _canonical_json_sha256(expected_identity)
-    actual_id = actual.get("environment_id")
-    if not isinstance(actual_id, str) or not actual_id:
-        actual_id = _canonical_json_sha256(actual_identity)
+    expected_id, expected_id_consistent = _environment_identifier(
+        expected, expected_identity
+    )
+    actual_id, actual_id_consistent = _environment_identifier(
+        actual, actual_identity
+    )
 
     expected_packages = _environment_package_map(expected)
     actual_packages = _environment_package_map(actual)
@@ -40234,11 +40256,20 @@ def compare_environment_snapshots(
         expected_identity, actual_identity
     )
     same_id = expected_id == actual_id
+    identity_consistent = (
+        expected_id_consistent and actual_id_consistent
+    )
     all_packages_match = not (added or removed or changed)
     return {
         "expected_environment_id": expected_id,
         "actual_environment_id": actual_id,
         "environment_id_matches": same_id,
+        "expected_environment_id_consistent": (
+            expected_id_consistent
+        ),
+        "actual_environment_id_consistent": (
+            actual_id_consistent
+        ),
         "package_differences": {
             "added": added,
             "removed": removed,
@@ -40247,8 +40278,12 @@ def compare_environment_snapshots(
         "critical_package_differences": critical_differences,
         "runtime_differences": runtime_differences,
         "all_packages_match": all_packages_match,
-        "ok": same_id,
-        "strict_ok": same_id and all_packages_match,
+        "ok": same_id and identity_consistent,
+        "strict_ok": (
+            same_id
+            and identity_consistent
+            and all_packages_match
+        ),
     }
 
 
@@ -40289,6 +40324,22 @@ def _environment_snapshot_from_config(
                     isinstance(loaded, dict)
                     and loaded.get("schema") == _ENVIRONMENT_SCHEMA
                 ):
+                    # 摘要里的 id 必须指向文件里实际记录的环境；
+                    # 否则同一份 config.json 可以带着旧 id、却让
+                    # 核对读取另一个（哈希已同步更新的）快照。
+                    summary_id = environment.get(
+                        "environment_id"
+                    )
+                    loaded_id = loaded.get("environment_id")
+                    if (
+                        isinstance(summary_id, str)
+                        and summary_id
+                        and summary_id != loaded_id
+                    ):
+                        raise ValueError(
+                            f"config.json 记录的环境 id 与 "
+                            f"{candidate} 不一致"
+                        )
                     return loaded
         elif environment.get("schema") == _ENVIRONMENT_SCHEMA:
             return environment
@@ -40357,14 +40408,31 @@ def load_environment_snapshot(
 def _snapshot_device(snapshot: Dict[str, object]) -> torch.device:
     device = snapshot.get("device")
     device_type = "cpu"
+    device_index: Optional[int] = None
     if isinstance(device, dict):
         raw_type = device.get("type")
         if raw_type in ("cuda", "mps", "cpu"):
             device_type = str(raw_type)
+        # 归档的是 cuda:1 时，核对必须检查 cuda:1 的型号/算力，
+        # 不能退化成默认 cuda:0：多卡机器上不同卡可能不是同一
+        # 设备。index 只接受非负整数（bool 是 int 子类，需排除）。
+        raw_index = device.get("index")
+        if (
+            isinstance(raw_index, int)
+            and not isinstance(raw_index, bool)
+            and raw_index >= 0
+            and device_type != "cpu"
+        ):
+            device_index = int(raw_index)
     try:
-        return torch.device(device_type)
+        if device_index is None:
+            return torch.device(device_type)
+        return torch.device(device_type, device_index)
     except (RuntimeError, ValueError):
-        return torch.device("cpu")
+        try:
+            return torch.device(device_type)
+        except (RuntimeError, ValueError):
+            return torch.device("cpu")
 
 
 def check_environment_snapshot(

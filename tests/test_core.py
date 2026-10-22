@@ -4582,6 +4582,72 @@ class EnvironmentSnapshotTests(unittest.TestCase):
                 sys.argv = old_argv
 
 
+    def test_environment_id_must_match_snapshot_content(self):
+        snapshot = experiment.build_environment_snapshot()
+        altered = json.loads(json.dumps(snapshot))
+        altered["packages"]["critical"][0]["version"] = (
+            "0.0.0-drift"
+        )
+        # 只改内容、保留旧 id：不能因为两个快照声明的 id 相同就
+        # 把被篡改/损坏的归档当成同一环境。
+        report = experiment.compare_environment_snapshots(
+            snapshot, altered
+        )
+        self.assertFalse(report["ok"], report)
+        self.assertFalse(report["strict_ok"], report)
+        self.assertFalse(
+            report["actual_environment_id_consistent"]
+        )
+        self.assertTrue(
+            report["expected_environment_id_consistent"]
+        )
+
+    def test_config_summary_id_must_match_environment_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = experiment.build_environment_snapshot()
+            environment_path = root / "environment.json"
+            environment_path.write_text(
+                json.dumps(snapshot), encoding="utf-8"
+            )
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({
+                    "environment": {
+                        "schema": snapshot["schema"],
+                        "environment_id": "0" * 64,
+                        "file": "environment.json",
+                        "file_sha256": experiment._sha256_file(
+                            environment_path
+                        ),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                experiment.check_environment_snapshot(config_path)
+
+    def test_snapshot_device_preserves_non_default_index(self):
+        device = experiment._snapshot_device({
+            "device": {"type": "cuda", "index": 1},
+        })
+        self.assertEqual(device.type, "cuda")
+        self.assertEqual(device.index, 1)
+        # CPU 没有可区分的设备号；非法/布尔 index 不能触发
+        # torch.device 构造错误。
+        self.assertIsNone(
+            experiment._snapshot_device({
+                "device": {"type": "cpu", "index": 1},
+            }).index
+        )
+        self.assertEqual(
+            experiment._snapshot_device({
+                "device": {"type": "cuda", "index": True},
+            }).type,
+            "cuda",
+        )
+
+
 class EdgeCaseRegressionTests(unittest.TestCase):
     """本轮审计修复的边界条件回归。"""
 
