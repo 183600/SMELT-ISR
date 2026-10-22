@@ -431,6 +431,29 @@ class PaperCliTests(unittest.TestCase):
         finally:
             sys.argv = previous
 
+    def test_conflicting_residual_scaling_flag_is_rejected(self):
+        class _Parser:
+            def error(self, message):
+                raise SystemExit(message)
+
+        previous = sys.argv
+        sys.argv = [
+            "experiment.py",
+            "--paper-cell",
+            "200M:95",
+            "--residual-scaling",
+            "global",
+        ]
+        try:
+            args = self._namespace(
+                paper_cell="200M:95",
+                residual_scaling="global",
+            )
+            with self.assertRaises(SystemExit):
+                experiment.apply_paper_cli(args, _Parser())
+        finally:
+            sys.argv = previous
+
     def test_paper_protocol_without_document_boundaries(self):
         # 没有 --group-separator 时不阻断运行，但不会假装启用
         # 了文档级 mask：document_masks 保持 False，审计会记为

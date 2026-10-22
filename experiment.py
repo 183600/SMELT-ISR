@@ -1525,6 +1525,9 @@ def apply_paper_cli(args, parser=None) -> None:
             "top_k": "--top-k",
             "k1": "--k1",
             "k2": "--k2",
+            # 论文网格的循环区域残差 1/r 是架构语义的一部分；
+            # 显式 --residual-scaling global 不能被预设静默覆盖。
+            "residual_scaling": "--residual-scaling",
         }
         conflicts = []
         for key, flag in conflict_keys.items():
