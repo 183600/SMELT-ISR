@@ -6296,6 +6296,41 @@ class NumericalScaleTests(unittest.TestCase):
             )
         )
 
+    def test_paired_window_bootstrap_is_scale_stable(self):
+        small = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
+        large = [value * 1.0e300 for value in small]
+        small_ci = experiment._paired_window_bootstrap_ci(small, 7)
+        large_ci = experiment._paired_window_bootstrap_ci(large, 7)
+        self.assertTrue(small_ci["available"])
+        self.assertTrue(large_ci["available"])
+        self.assertTrue(math.isfinite(large_ci["low"]))
+        self.assertTrue(math.isfinite(large_ci["high"]))
+        scale = 1.0e300
+        self.assertAlmostEqual(
+            large_ci["low"] / scale,
+            small_ci["low"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_ci["high"] / scale,
+            small_ci["high"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_ci["lag1_autocorrelation"],
+            small_ci["lag1_autocorrelation"],
+            places=12,
+        )
+
+        # 常数超大差值不能因重采样总和溢出而给出 NaN 区间。
+        constant = experiment._paired_window_bootstrap_ci(
+            [1.0e308] * 8,
+            7,
+        )
+        self.assertEqual(constant["low"], 1.0e308)
+        self.assertEqual(constant["high"], 1.0e308)
+        self.assertIsNone(constant["lag1_autocorrelation"])
+
 
 if __name__ == "__main__":
     unittest.main()

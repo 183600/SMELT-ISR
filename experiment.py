@@ -23994,6 +23994,15 @@ def _paired_window_bootstrap_ci(
         }
     generator = torch.Generator().manual_seed(int(seed))
     values = torch.tensor(numeric, dtype=torch.float64)
+    # 合法的大差值（如 1e308）在重采样求均值时会把总和溢出成
+    # inf，percentile 区间随之变成 NaN。均值对公共尺度等变，
+    # 先按最大绝对值归一化，算出区间后再还原；正常量级保持
+    # 原路径，避免改变历史区间。
+    scale = float(values.abs().max().item())
+    if scale > 1.0e150:
+        values = values / scale
+    else:
+        scale = 1.0
     indices = torch.randint(
         low=0,
         high=n,
@@ -24013,6 +24022,8 @@ def _paired_window_bootstrap_ci(
         half_width = (high - low) / 2.0 * inflation
         low = midpoint - half_width
         high = midpoint + half_width
+    low *= scale
+    high *= scale
     return {
         "available": True,
         "low": low,
@@ -24141,7 +24152,12 @@ def paired_window_comparison(
         }
 
     n_windows = len(loss_differences)
-    mean_diff = sum(loss_differences) / n_windows
+    mean_diff = _mean(loss_differences)
+    if mean_diff is None:
+        return {
+            "status": "invalid_values",
+            "reason": "窗口差值没有可用的有限均值",
+        }
     better_fraction = (
         sum(1 for value in loss_differences if value < 0.0)
         / n_windows
