@@ -6365,6 +6365,32 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(constant["low"], 1.0e308)
         self.assertEqual(constant["high"], 1.0e308)
 
+    def test_equivalence_seed_estimate_handles_huge_se(self):
+        contrast = {
+            "mean_baseline": 1.0,
+            "delta": 0.999999,
+            "n_pairs": 3,
+            "n_baseline": 3,
+            "n_variant": 3,
+            "test": "paired_t",
+        }
+        # se 合法但极大：所需种子数不可表示，不能抛出
+        # OverflowError 中断整份对比报告。
+        experiment._attach_power_equivalence(
+            contrast,
+            0.999999,
+            {"se": 1.0e307, "df": 2.0},
+            2.0,
+        )
+        self.assertEqual(
+            contrast["equivalence_blocker"],
+            "insufficient_precision",
+        )
+        self.assertNotIn(
+            "equivalence_seeds_to_achieve",
+            contrast,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

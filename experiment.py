@@ -26666,18 +26666,24 @@ def _attach_power_equivalence(
             # 半宽从 (needed-|Δ|) 压到 (margin-|Δ|)，需要
             # n_needed = n·((needed-|Δ|)/(margin-|Δ|))^2。
             current_n = _current_seed_count(contrast)
-            if current_n is not None and current_n > 0:
-                contrast["equivalence_seeds_to_achieve"] = int(
-                    math.ceil(
-                        current_n
-                        * (
-                            noise_half_width
-                            / (margin_abs - abs(float(delta)))
-                        )
-                        ** 2
+            denominator = margin_abs - abs(float(delta))
+            if (
+                current_n is not None
+                and current_n > 0
+                and denominator > 0.0
+                and math.isfinite(noise_half_width)
+            ):
+                # 合法但极大的 se 会让 ratio 或 ratio² 溢出成
+                # inf；此时无法给出有限的所需种子数，显式省略
+                # 该字段，而不是让 int(math.ceil(inf)) 抛
+                # OverflowError 中断整份对比报告。
+                ratio = noise_half_width / denominator
+                required = current_n * ratio * ratio
+                if math.isfinite(required):
+                    contrast["equivalence_seeds_to_achieve"] = int(
+                        math.ceil(required)
                     )
-                )
-                _attach_sd_uncertainty_note(contrast)
+                    _attach_sd_uncertainty_note(contrast)
         else:
             contrast["equivalence_blocker"] = None
 
