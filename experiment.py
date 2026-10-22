@@ -31046,13 +31046,19 @@ def preregistration_apply(
                 f"{preregistered_seeds} 不一致：确证套件的种子"
                 "集合必须在训练前固定，不能事后增删"
             )
+    elif getattr(args, "resume", None) is not None:
+        # 续跑的真实 seed 在检查点里；入口此时看到的只是
+        # argparse 默认值，不能拿它做预注册核对。等 resume
+        # 恢复 seed 后再核对（见
+        # _preregistration_restored_seed_error），否则原运行
+        # seed 不是默认值时合法续跑会被误拒。
+        pass
     elif (
         _argv_has_flag("--seed")
-        or getattr(args, "resume", None) is not None
         or bool(getattr(args, "evaluate_test", False))
     ):
-        # resume / 最终 test 解封都是单条轨迹，不能展开成
-        # 多种子套件；它们只能使用预注册种子之一。
+        # 最终 test 解封是单条轨迹，不能展开成多种子套件；
+        # 它只能使用预注册种子之一。
         if int(getattr(args, "seed", -1)) not in preregistered_seeds:
             return applied, (
                 f"--seed={getattr(args, 'seed', None)} 不在预注册"
@@ -31064,6 +31070,46 @@ def preregistration_apply(
         applied.append("seeds")
 
     return applied, None
+
+
+def _preregistration_restored_seed_error(
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """
+    续跑恢复真实 seed 后，再核对它是否属于预注册种子集合。
+
+    入口阶段无法知道检查点里的 seed；若拿 argparse 默认的 42
+    去核对，原运行使用 1/2/3 等合法预注册种子的续跑会被误拒。
+    """
+    if getattr(args, "resume", None) is None:
+        return None
+    if getattr(args, "seeds", None) is not None:
+        return None
+    record = getattr(args, "preregistration_record", None)
+    if not isinstance(record, dict):
+        return None
+    seeds = record.get("seeds")
+    if not isinstance(seeds, list):
+        return None
+    restored_seed = getattr(args, "seed", None)
+    if isinstance(restored_seed, bool) or not isinstance(
+        restored_seed, int
+    ):
+        return (
+            f"续跑恢复的 --seed={restored_seed!r} 不是整数，"
+            "无法核对预注册种子集合"
+        )
+    normalized = []
+    for seed in seeds:
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            normalized.append(seed)
+    if restored_seed not in normalized:
+        return (
+            f"续跑从检查点恢复的 seed={restored_seed} 不在"
+            f"预注册 seeds={normalized} 中：确证运行只能使用"
+            "预注册种子之一"
+        )
+    return None
 
 
 def _preregistration_file_sha256(
@@ -58123,6 +58169,14 @@ def main():
 
         # 恢复后的 TF32 状态可能来自检查点，重新应用。
         configure_cuda_precision(args.allow_tf32)
+
+    # 续跑的真实 seed 已由检查点恢复；现在才能按预注册种子
+    # 集合核对。入口阶段对 resume 做了延迟，避免误用默认 42。
+    restored_seed_error = (
+        _preregistration_restored_seed_error(args)
+    )
+    if restored_seed_error is not None:
+        parser.error(restored_seed_error)
 
     # 选型指标解析：默认 val_loss；预注册主指标且周期验证能算
     # 时跟随主指标（假设按什么判定，checkpoint 就按什么选）。

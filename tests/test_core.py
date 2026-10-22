@@ -1579,6 +1579,37 @@ class PreregistrationTests(unittest.TestCase):
         )
         self.assertIn("B", error)
 
+    def test_apply_defers_resume_seed_check(self):
+        payload = self._payload()
+        args = self._args(
+            resume="checkpoint.pt",
+            seed=42,
+        )
+        previous = sys.argv
+        try:
+            sys.argv = ["experiment.py", "--resume", "checkpoint.pt"]
+            applied, error = experiment.preregistration_apply(
+                args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+            )
+        finally:
+            sys.argv = previous
+        self.assertIsNone(error)
+        self.assertIsNone(args.seeds)
+        # 恢复后的 seed 才按预注册集合核对。
+        args.preregistration_record = {"seeds": [1, 2, 3]}
+        args.seed = 42
+        self.assertIn(
+            "不在预注册",
+            experiment._preregistration_restored_seed_error(args),
+        )
+        args.seed = 2
+        self.assertIsNone(
+            experiment._preregistration_restored_seed_error(args)
+        )
+
     def test_apply_seed_sets_are_fixed(self):
         args = self._args(seeds=[42, 43])
         _, error = experiment.preregistration_apply(
