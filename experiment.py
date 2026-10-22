@@ -16343,6 +16343,12 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["hypothesis_min_effect"] = preregistration.get(
             "min_effect"
         )
+        # 预注册的等价界（--equivalence-margin 在训练前写入）：
+        # TOST 的等价界越宽越容易判等价，看到数据后再放宽就能
+        # 「制造」等价结论，因此分析期必须能核对它没有被改动。
+        row["hypothesis_equivalence_margin"] = (
+            preregistration.get("equivalence_margin")
+        )
         # 预注册的对照基线（--hypothesis-baseline）：主指标/
         # 方向/最小效应都声明了，若对照臂可以事后挑，整个
         # 检验仍然可以被 baseline shopping 操纵。旧运行没有
@@ -25918,6 +25924,132 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     )
 
 
+def equivalence_margin_preregistration(
+    rows: List[Dict[str, object]],
+    equivalence_margin: Optional[float],
+) -> Dict[str, object]:
+    """
+    核对分析期使用的 TOST 等价界是否等于训练前预注册的界。
+
+    等价界越宽，越容易把「不确定」判成「等价」；如果允许看到
+    数据后再调宽 `--equivalence-margin`，等价性结论就可以被
+    事后制造。训练入口已把等价界写入
+    ``hypothesis_preregistration.equivalence_margin``，这里逐
+    运行核对：
+
+    - ``consistent``：当前界与全部新运行预注册值一致；
+    - ``widened_post_hoc``：当前界宽于预注册界，等价结论只能
+      作为探索性/非确证性结果；
+    - ``narrowed_post_hoc``：当前界更窄（更严格），不构成
+      「制造等价」的风险，但仍不是训练前声明的口径；
+    - ``inconsistent_declarations``：不同运行预注册了不同界，
+      无法裁决；
+    - ``unverifiable``：旧运行没有记录，或缺当前界。
+    """
+    current = None
+    if isinstance(equivalence_margin, (int, float)) and not isinstance(
+        equivalence_margin, bool
+    ):
+        value = float(equivalence_margin)
+        if math.isfinite(value) and value > 0.0:
+            current = value
+
+    declared: Dict[str, float] = {}
+    missing: List[str] = []
+    invalid: List[str] = []
+    for row in rows:
+        run = str(row.get("run"))
+        value = row.get("hypothesis_equivalence_margin")
+        if value is None:
+            missing.append(run)
+            continue
+        if isinstance(value, bool) or not isinstance(
+            value, (int, float)
+        ):
+            invalid.append(run)
+            continue
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            invalid.append(run)
+            continue
+        declared[run] = numeric
+
+    values = sorted(set(declared.values()))
+    report: Dict[str, object] = {
+        "current_margin": current,
+        "declared_margins": declared,
+        "declared_values": values,
+        "missing_runs": missing,
+        "invalid_runs": invalid,
+        "status": None,
+        "ok": None,
+        "widened_post_hoc": False,
+        "advisories": [],
+    }
+
+    if not declared:
+        report["status"] = "unverifiable"
+        report["advisories"].append(
+            "没有任何运行记录训练前预注册的等价界"
+            "（旧版运行）：无法核对当前 --equivalence-margin "
+            "是否被事后调整；等价结论只能作为探索性证据"
+        )
+        return report
+
+    if len(values) > 1:
+        report["status"] = "inconsistent_declarations"
+        report["ok"] = False
+        report["advisories"].append(
+            "不同运行预注册的等价界不一致（"
+            + ", ".join(format(value, "g") for value in values)
+            + "）：无法确定统一的事先声明口径，等价结论只能"
+            "作为探索性证据；请统一 --equivalence-margin 后重跑"
+        )
+        return report
+
+    declared_value = values[0]
+    if current is None:
+        report["status"] = "unverifiable"
+        report["advisories"].append(
+            "当前分析没有可用的等价界，无法与训练前预注册的 "
+            f"{format(declared_value, 'g')} 核对"
+        )
+        return report
+
+    if math.isclose(
+        current,
+        declared_value,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    ):
+        report["status"] = "consistent"
+        report["ok"] = True
+        return report
+
+    report["ok"] = False
+    if current > declared_value:
+        report["status"] = "widened_post_hoc"
+        report["widened_post_hoc"] = True
+        report["advisories"].append(
+            "当前等价界 "
+            f"±{current:.4%} 宽于训练前预注册的 "
+            f"±{declared_value:.4%}：事后放宽等价界会提高"
+            "「等价」的判定率，本次等价性结论不能作为确证性"
+            "证据；应使用预注册界，或把新界作为新的预注册"
+            "假设重新实验"
+        )
+    else:
+        report["status"] = "narrowed_post_hoc"
+        report["advisories"].append(
+            "当前等价界 "
+            f"±{current:.4%} 窄于训练前预注册的 "
+            f"±{declared_value:.4%}：更严格的界不会「制造」"
+            "等价，但口径已不是训练前声明的那个；报告需"
+            "注明两者差异"
+        )
+    return report
+
+
 def resolve_preregistered_baseline(
     rows: List[Dict[str, object]],
     baseline_mode: Optional[str],
@@ -26072,6 +26204,10 @@ def print_comparison_analysis(
         str(resolved_baseline)
         if resolved_baseline is not None
         else None
+    )
+    margin_preregistration = equivalence_margin_preregistration(
+        rows,
+        equivalence_margin,
     )
 
     # 等训练计算量的 loss：A/B 每步 FLOPs 高于 smelt，等步数
@@ -27084,6 +27220,20 @@ def print_comparison_analysis(
             f"±{float(equivalence_margin) * 100:.1f}%；"
             "不显著 ≠ 等价）"
         )
+        margin_status = margin_preregistration.get("status")
+        if margin_status == "consistent":
+            print(
+                "  等价界预注册: OK（当前界与训练前写入 "
+                "hypothesis_preregistration 的取值一致）"
+            )
+        else:
+            for advisory in margin_preregistration.get(
+                "advisories", []
+            ):
+                print(
+                    "  [equivalence-preregistration] [warn] "
+                    + str(advisory)
+                )
         if not equivalence_entries:
             print(
                 "  无可用检验（至少需要两个实验单元且每侧 "
@@ -27778,6 +27928,9 @@ def print_comparison_analysis(
         "common_step": common_step,
         "selection_bias": selection_bias,
         "equivalence_margin": equivalence_margin,
+        "equivalence_margin_preregistration": (
+            margin_preregistration
+        ),
         "target_power": _TARGET_POWER,
         "power_equivalence": equivalence_entries,
         "n_runs": len(rows),
@@ -28719,6 +28872,11 @@ def write_run_config(
             # 避免分析期换一个更容易战胜的臂当基线。
             "baseline": getattr(
                 args, "hypothesis_baseline", None
+            ),
+            # 预注册等价界：TOST 的界越宽越容易判等价；训练
+            # 前固化取值，分析期才可核对它没有被事后放宽。
+            "equivalence_margin": getattr(
+                args, "equivalence_margin", None
             ),
         },
         "reference_baselines": reference_baselines,
@@ -36469,6 +36627,76 @@ def run_self_test():
             "val_loss",
         )
         assert "Hedges g=" in display_with_g
+
+        # 等价界预注册：训练前写入 config.json，分析期放宽必须
+        # 被点名，不能把事后调宽的 TOST 当成确证性证据。
+        margin_consistent = equivalence_margin_preregistration(
+            [
+                {
+                    "run": "A_seed1",
+                    "hypothesis_equivalence_margin": 0.01,
+                },
+                {
+                    "run": "local_base_seed1",
+                    "hypothesis_equivalence_margin": 0.01,
+                },
+            ],
+            0.01,
+        )
+        assert margin_consistent["status"] == "consistent"
+        assert margin_consistent["ok"] is True
+        assert margin_consistent["widened_post_hoc"] is False
+
+        margin_widened = equivalence_margin_preregistration(
+            [{
+                "run": "A_seed1",
+                "hypothesis_equivalence_margin": 0.01,
+            }],
+            0.05,
+        )
+        assert margin_widened["status"] == "widened_post_hoc"
+        assert margin_widened["ok"] is False
+        assert margin_widened["widened_post_hoc"] is True
+        assert any(
+            "放宽" in advisory
+            for advisory in margin_widened["advisories"]
+        )
+
+        margin_narrowed = equivalence_margin_preregistration(
+            [{
+                "run": "A_seed1",
+                "hypothesis_equivalence_margin": 0.05,
+            }],
+            0.01,
+        )
+        assert margin_narrowed["status"] == "narrowed_post_hoc"
+        assert margin_narrowed["widened_post_hoc"] is False
+
+        margin_missing = equivalence_margin_preregistration(
+            [{"run": "old_run"}],
+            0.01,
+        )
+        assert margin_missing["status"] == "unverifiable"
+        assert margin_missing["ok"] is None
+
+        margin_inconsistent = equivalence_margin_preregistration(
+            [
+                {
+                    "run": "A_seed1",
+                    "hypothesis_equivalence_margin": 0.01,
+                },
+                {
+                    "run": "A_seed2",
+                    "hypothesis_equivalence_margin": 0.02,
+                },
+            ],
+            0.01,
+        )
+        assert (
+            margin_inconsistent["status"]
+            == "inconsistent_declarations"
+        )
+        assert margin_inconsistent["ok"] is False
 
         # 所需种子数是「sd 点估计」的插件估计：必须登记口径，
         # 并给出 sd 的相对标准误 1/√(2(n-1))（n=3 时约 50%），
