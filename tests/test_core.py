@@ -215,6 +215,32 @@ class CostModelTests(unittest.TestCase):
             expected * 2,
         )
 
+    def test_dense_profile_counts_dense_ffn_flops(self):
+        # dense 默认 H_ffn = top_k * expert_hidden = 32。
+        # 每层 SwiGLU FFN = 6*D*H = 6*32*32；共 4 层。
+        cfg = _tiny_config(mode="dense")
+        profile = experiment.mode_cost_profile(cfg)
+        breakdown = profile["analytic_flops_breakdown"]
+        expected_ffn = 4 * 6 * 32 * 32
+        self.assertEqual(breakdown["dense_ffn"], expected_ffn)
+        self.assertEqual(
+            profile["analytic_flops_per_token"],
+            sum(breakdown.values()),
+        )
+        # 等计算口径下，稠密 FFN 的激活 FLOPs 应与 baseline
+        # 单次前向激活的 top_k 个专家相同；dense 少了路由开销。
+        base = experiment.mode_cost_profile(
+            _tiny_config(mode="base")
+        )
+        self.assertEqual(
+            breakdown["dense_ffn"],
+            base["analytic_flops_breakdown"]["experts"],
+        )
+        self.assertGreater(
+            base["analytic_flops_per_token"],
+            profile["analytic_flops_per_token"],
+        )
+
     def test_budget_search_reports_recommendation(self):
         cfg = _tiny_config(mode="A")
         report = experiment.budget_match_report(

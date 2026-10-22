@@ -401,10 +401,23 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
     router_flops = 2 * dim * experts
     # 每个专家 assignment：gate_up 为 D×(2·H)，down 为 H×D。
     expert_flops = 2 * dim * (2 * expert_hidden) + 2 * expert_hidden * dim
+    # dense 模式的稠密 SwiGLU FFN 与 Expert 结构相同，但每层
+    # 都执行且没有路由开销；漏掉这一项会把 dense 基线低估为
+    # 「只有 Attention」，预算匹配与解析/实测 FLOPs 对照都会失真。
+    dense_ffn_flops = (
+        layers
+        * (
+            2 * dim * (2 * cfg.effective_dense_fnn_hidden)
+            + 2 * cfg.effective_dense_fnn_hidden * dim
+        )
+        if mode == "dense"
+        else 0
+    )
     analytic_flops = (
         attention_executions * attention_flops
         + router_calls * router_flops
         + expert_assignments * expert_flops
+        + dense_ffn_flops
     )
     # KV cache 每 token 字节数（fp16 存储 K 和 V）：每个物理层
     # 为 K、V 各存一个 kv_dim 向量，fp16 每元素 2 字节；B/B_early
@@ -429,6 +442,7 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
             "attention": int(attention_executions * attention_flops),
             "router": int(router_calls * router_flops),
             "experts": int(expert_assignments * expert_flops),
+            "dense_ffn": int(dense_ffn_flops),
         },
         "analytic_formula": {
             "expert_assignments": {
@@ -464,6 +478,12 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
             }.get(
                 mode,
                 "n_layers (Attention 跨分支共享)",
+            ),
+            "dense_ffn": (
+                "n_layers * (4*D*H_dense + 2*D*H_dense)，"
+                "H_dense=dense_fnn_hidden 或 top_k*expert_hidden"
+                if mode == "dense"
+                else "0（无稠密 FFN）"
             ),
             "note": (
                 "只匹配 k1*k2≈2*top_k 会漏掉第一阶段成本；"
