@@ -56345,6 +56345,14 @@ def _spearman_correlation(
     return covariance / math.sqrt(variance_x * variance_y)
 
 
+def _drift_block_key(value: object) -> object:
+    """区组值的可哈希诊断键；损坏/超大数值也不能让报告崩溃。"""
+    try:
+        return _stable_factor_key(value)
+    except (TypeError, ValueError, OverflowError):
+        return ("repr", repr(value))
+
+
 def run_order_drift_report(
     rows: List[Dict[str, object]],
     metric: str = "val_loss",
@@ -56541,7 +56549,7 @@ def run_order_drift_report(
             "verdict": "insufficient",
             "n_runs": len(entries),
             "n_blocks": len({
-                _stable_factor_key(entry["block"])
+                _drift_block_key(entry["block"])
                 for entry in entries
             }),
             "plan_ids": plan_ids,
@@ -56567,7 +56575,7 @@ def run_order_drift_report(
         "verdict": "warn" if warnings else "ok",
         "n_runs": len(entries),
         "n_blocks": len({
-            _stable_factor_key(entry["block"])
+            _drift_block_key(entry["block"])
             for entry in entries
         }),
         "plan_ids": plan_ids,

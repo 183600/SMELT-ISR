@@ -1382,7 +1382,9 @@ class DesignPreparationTests(unittest.TestCase):
                 # 损坏的旧 config 可能把区组写成对象/列表；
                 # 诊断报告不能因此抛 TypeError。
                 "design_block": (
-                    {"bad": index} if index == 1 else index
+                    {"bad": index}
+                    if index == 1
+                    else (10**400 if index == 2 else index)
                 ),
                 "design_block_position": 1,
                 "design_plan_id": "plan-1",
