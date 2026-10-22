@@ -4,7 +4,9 @@
 
 1. **先验功效分析**：用预期的种子间波动、最小有意义效应与
    预期数据脱落率，在训练前判断计划种子数是否足够，并同时
-   报告计划可用种子数下的实际功效与 MDE；
+   报告计划可用种子数下的实际功效与 MDE；若研究要主张
+   「无实质差异」，还要检查 TOST 在预注册等价界内的功效
+   （2.2 节）；
 2. **随机化/平衡完整区组**：把「哪个臂先跑」从便利顺序变成
    预先声明的顺序，避免机器热漂移/负载漂移与处理效应混杂；
 3. **设计计划冻结**：把运行清单、顺序、位置平衡、功效与预算
@@ -76,6 +78,7 @@ python experiment.py \
 | `planned_comparisons` | 否 | 检验家族规模，默认等于 `comparisons` 数量；**不得小于**它（低报会高估功效） |
 | `planned_contrasts` | 否 | 计划主张的对比类型数组，可选 `pairwise` / `simple` / `main` / `interaction`，默认 `["pairwise"]`；消融设计应声明 `["pairwise","main","interaction","simple"]` |
 | `expected_attrition_rate` | 否 | 预期因 NaN/Inf、数值停止或数据问题而不可用的运行比例（默认 0）；必须在 `[0, 1)` 内 |
+| `plan_equivalence` | 否 | 本次研究是否要**主张等价性**（默认 false）。为 true 时必须在预注册顶层声明 `equivalence_margin`，且 `adequate` 同时要求 TOST 功效达标 |
 | `underpowered_acknowledged` | 否 | 显式承认功效不足仍要运行（默认 false） |
 | `justification` | 条件 | `underpowered_acknowledged=true` 时必填，写明理由 |
 
@@ -106,6 +109,11 @@ python experiment.py \
   0.5/0.75/1.0/1.25/1.5/2.0 重算所需种子数：先验 sd 本身是估计，
   只报一个 `required_seeds` 会把估计误差藏起来。若 sd 估计偏小
   25% 就需要更多种子，应在冻结前留余量或承认设计脆弱。
+  若声明了 `plan_equivalence`，敏感性表的
+  `adequate_at_planned_seeds` 同时反映显著性与等价性两类功效。
+- 若声明 `power.plan_equivalence: true`，还会计算等价性设计
+  字段（见 2.2 节）；`adequate` 不再只看「能否检出最小效应」，
+  而要求显著性功效与等价性功效同时达标。
 
 ### 2.1 对比类型不同，方差也不同
 
@@ -142,6 +150,62 @@ true` 与 `justification`；该承认会随 `config.json` 的
 也是估计，规划时应留余量。`adequate=true` 只表示「在声明效应下
 有目标功效」，不保证真实效应一定达到最小有意义效应。预期脱落率
 也只能来自试点或历史数据，不能用本轮结果事后反推。
+
+### 2.2 等价性主张也要先验功效
+
+「不显著 ≠ 等价」不仅是一句分析阶段的提醒，也是设计阶段
+必须回答的问题：在预注册等价界内主张「无实质差异」，需
+要足够的精度。等价性检验（TOST）在真实差异为零时的功效
+取决于 `margin / se`；界越窄、种子间波动越大，所需种子越
+多。只在分析阶段做 TOST、却从不检查其功效，会把「设计
+根本不可能主张等价」误读成「数据不支持等价」。
+
+声明方式：
+
+```json
+"equivalence_margin": 0.01,
+"power": {
+  "expected_seed_sd_relative": 0.005,
+  "target_power": 0.8,
+  "alpha": 0.05,
+  "planned_comparisons": 5,
+  "plan_equivalence": true
+}
+```
+
+- `equivalence_margin` 必须在**预注册顶层**显式给出；
+  `--equivalence-margin` 的命令行默认值不能代替训练前声明。
+- `plan_equivalence=true` 时，`adequate` 同时要求：
+  1）在声明的最小效应下有目标显著性功效；2）若真实差异
+  为零，在声明界内有目标 TOST 功效。任一不足且未显式
+  `underpowered_acknowledged`，预注册入口与正式套件都会
+  在开跑前拒绝。
+- 只把 TOST 作为探索性结果时保持 `plan_equivalence=false`
+  或不写该字段；报告仍会给出信息性的等价性功效，但不改变
+  显著性功效的判定。
+
+每个对比类型都会按自己的方差乘数计算等价性字段：
+
+| 字段 | 含义 |
+|---|---|
+| `equivalence_power_at_null_difference` | 计划可用种子下、真实差异为零时的 TOST 功效 |
+| `required_seeds_for_equivalence` | 达到目标 TOST 功效所需的可用配对数 |
+| `required_seeds_for_equivalence_with_attrition` | 按预期脱落率折算后的启动种子数 |
+| `equivalence_margin_for_target_power` | 当前精度在目标功效下能支持的最小等价界 |
+| `equivalence_adequate` | 该对比类型的等价性设计是否足够 |
+
+顶层 `equivalence` 块按最吃种子的对比类型汇总，并记录
+`binding_contrast` 与 `claim_planned`。若
+`equivalence_margin_for_target_power` 大于声明的
+`equivalence_margin`，说明当前种子数精度不足；正确反应是
+**增加种子**，而不是事后放宽等价界。等价界越宽越容易
+「制造」等价结论，因此它和 `min_effect` 一样必须在训练前
+固定，并随 `config.json` 的 `preregistration.power` 落盘。
+
+注意：这里的功效按真实差异为零计算，是「若确实无实质差异，
+能否在界内主张等价」的概率；它不保证真实差异为零，也不
+替代分析阶段的 TOST 与 `equivalence_margin_needed`。若真实
+差异非零但仍在界内，TOST 功效通常低于该规划值，应留余量。
 
 ## 3. 运行顺序：随机化/平衡完整区组
 
@@ -239,7 +303,11 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
 1. 用试点/先前运行估计**两格配对差值**的种子间标准差与预期
    脱落率，写出 `power` 块；消融设计还要声明 `planned_contrasts`
    （至少含 `interaction`），并查看 `contrast_power`、
-   `power_sensitivity`、实际功效与 MDE；
+   `power_sensitivity`、实际功效与 MDE；若研究要主张「无实质
+   差异」，在顶层写 `equivalence_margin` 并设
+   `power.plan_equivalence=true`，同时查看
+   `equivalence.required_seeds_with_attrition` 与
+   `equivalence.margin_for_target_power`；
 2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置平衡、
    对比类型功效（`binding_contrast` 通常是交互）与 token 预算；
    调整种子数或最小效应后再冻结；
@@ -258,6 +326,7 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
 
 - `docs/experiment_protocol.md` 的冻结 → 预注册 → 运行 → 统一
   解封流程不变；本文件补上「预注册前如何判断设计可执行」；
-- `docs/methodology_audit.md` 第 29 节记录本轮修正；
+- `docs/methodology_audit.md` 第 29、33 节记录设计与等价性
+  功效修正；
 - 设计计划不替代 `artifact_manifest.json`：前者是训练前设计，
   后者是训练后归档内容完整性；两者都应随最终报告保存。

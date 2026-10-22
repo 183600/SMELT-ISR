@@ -880,6 +880,74 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
   同分布数据后缺口是否仍存在」。正式实验应把该记录与数据
   指纹、清洗开关一起冻结。
 
+## 33. 等价性主张的先验功效（本轮补充）
+
+**判定：此前的先验功效只回答「能否检出预注册的最小效应」，
+没有回答「能否在预注册等价界内主张无实质差异」。** 分析
+阶段虽然报告 TOST、`equivalence_margin_needed` 与
+`equivalence_seeds_to_achieve`，但这些都是事后诊断：若设计
+从一开始就不具备在声明界内主张等价的精度，正确结论只能是
+「不确定」，而报告仍可能把大量算力投入到无法回答研究问题
+的设计上。更严重的是，等价界越宽越容易得到「等价」结论；
+允许用 `--equivalence-margin` 的默认值代替训练前声明，或
+看到数据后放宽界，会直接制造结论。
+
+**已修正：**
+
+- 预注册 `power` 新增可选 `plan_equivalence`（默认 false）。
+  设为 true 时表示等价性（TOST）是本次研究的主张之一，
+  必须在预注册顶层显式声明正数 `equivalence_margin`；
+  `--equivalence-margin` 的命令行默认值不能代替该声明。
+- 新增 `_tost_power`：按真实差异、标准误、自由度、等价界
+  与单侧 alpha 精确计算 TOST 功效。TOST 通过等价于观测
+  差值整体落在 `±(margin − t_{1−α,df}·se)` 内，因此功效
+  可由中心 t 分布 CDF 直接得到，不依赖正态近似。
+- 新增 `_seeds_for_tost` 与 `_tost_margin_for_power`：前者
+  在真实差异为零时反推达到目标 TOST 功效所需的可用配对
+  数；后者给出当前精度在目标功效下能支持的最小等价界。
+  两者都按对比类型的方差乘数计算（交互仍需更宽界或更多
+  种子），并与显著性功效共享家族校正 alpha/m。
+- `preregistration_power_plan` 在每个 `contrast_power` 条目
+  中新增 `equivalence_power_at_null_difference`、
+  `required_seeds_for_equivalence`、
+  `required_seeds_for_equivalence_with_attrition`、
+  `equivalence_margin_for_target_power` 与
+  `equivalence_adequate`，并在顶层 `equivalence` 块按最吃
+  种子的对比类型汇总 `binding_contrast`、
+  `margin_for_target_power` 与 `claim_planned`。
+- `plan_equivalence=true` 时 `adequate` 同时要求显著性功效
+  与等价性功效达标；预注册入口对「声明了等价性主张但功效
+  不足」直接拒绝，正式套件在第一个子进程前重算后也会拒绝，
+  除非显式 `underpowered_acknowledged`/`--allow-underpowered`。
+  未声明等价性主张时，等价性字段只作为信息，不改变显著性
+  功效的判定，避免把一个探索性 TOST 误当硬门。
+- `design_plan.json` 的 `power` 会随实际家族规模与对比类型
+  重算等价性所需种子；`--plan-design` 打印等价性功效、所需
+  启动种子与当前精度可支持的最小界。若最小界大于声明界，
+  提示增加种子而不是放宽界。
+- 新增回归测试：TOST 功效随种子数单调、所需种子数与
+  `margin_for_target_power` 的数值回归、未声明
+  `equivalence_margin` 时拒绝等价性主张、等价性功效不足时
+  预注册/设计计划硬门拒绝、未主张等价时只作信息性报告、
+  设计计划按更大的实际家族与交互方差重算等价性字段。
+
+**仍有限制：**
+
+- 规划按真实差异为零计算，是「若确实无实质差异，能否在
+  界内主张等价」的概率；真实差异非零但仍在界内时 TOST
+  功效通常更低，设计应留余量。它不保证真实差异为零。
+- TOST 功效使用与显著性功效相同的声明 `expected_seed_sd_relative`
+  和配对 t 近似；sd 估计偏小会同时高估两类功效。等价性的
+  `margin_for_target_power` 同样是插件估计，不是精确样本量
+  公式。
+- 当前只覆盖对称等价界（`±margin`）。非劣性/优效性单侧
+  设计、按终点分层的 alpha 分配与序贯设计仍未实现；需要在
+  预注册中另行说明并作为新研究阶段。
+- 等价性主张与显著性主张共用同一个 Holm/Bonferroni 家族；
+  若二者混在同一家族，等价性功效会更保守。报告仍以分析
+  阶段的实际家族与 TOST 结果为准，设计阶段的 adequacy 不
+  替代最终判定。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -897,7 +965,12 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
    并承认位置可能不均衡），用 `--plan-design` 检查所需启动
    种子数、按对比类型分层的实际功效/MDE（`binding_contrast`，
    消融通常是 `interaction`）、sd 敏感性、位置平衡与 token
-   预算；功效不足时先加种子，而不是跑完再解释。
+   预算；功效不足时先加种子，而不是跑完再解释。若研究要
+   主张「无实质差异」，同时在顶层写 `equivalence_margin` 并
+   设 `power.plan_equivalence=true`，检查
+   `equivalence.required_seeds_with_attrition` 与
+   `equivalence.margin_for_target_power`；不能靠事后放宽
+   等价界制造等价结论。
 4. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
    **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
    固定 `--common-step` 与训练预算；用 `--budget-match` 报告

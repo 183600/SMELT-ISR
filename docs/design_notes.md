@@ -437,6 +437,18 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `underpowered_acknowledged: true`（附 `justification`）或
   冒烟运行加 `--allow-underpowered`。承认会随 `config.json` 的
   `preregistration.power` 落盘。
+- **等价性主张的先验功效（`plan_equivalence`）**：显著性功效
+  回答「能否检出最小效应」，不回答「能否主张无实质差异」。
+  预注册可在 `power` 中设 `plan_equivalence: true`，并在顶层
+  声明 `equivalence_margin`；此时还按真实差异为零、家族校正
+  后的 alpha 与同一对比类型的方差计算 TOST 功效、所需启动
+  种子（`required_seeds_for_equivalence_with_attrition`）与
+  当前精度能支持的最小等价界
+  （`equivalence_margin_for_target_power`）。`adequate` 同时
+  要求显著性功效与等价性功效达标；只把 TOST 当探索性结果时
+  保持 false，报告仍给出信息性字段。等价界必须训练前声明，
+  不能用命令行默认值代替，也不能看到数据后放宽；若当前精度
+  支持的最小界大于声明界，应增加种子。
 - **随机化/平衡完整区组（`run_order`）**：`--run-order
   {grouped,blocked,randomized,counterbalanced}` 与
   `--run-order-seed` 控制套件执行顺序，默认 `randomized`——

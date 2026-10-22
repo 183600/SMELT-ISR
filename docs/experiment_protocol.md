@@ -101,7 +101,11 @@
   （要主张的对比类型数组 `pairwise` / `simple` / `main` /
   `interaction`，默认 `["pairwise"]`；消融设计应声明
   `interaction`）、可选 `expected_attrition_rate`（预期因数值
-  失败/数据问题不可用的运行比例，`[0, 1)`）。按 Bonferroni 下界
+  失败/数据问题不可用的运行比例，`[0, 1)`）、可选
+  `plan_equivalence`（默认 false；为 true 时表示等价性（TOST）
+  是本次研究的主张之一，必须在预注册顶层声明
+  `equivalence_margin`，且 `adequate` 同时要求 TOST 功效
+  达标）。按 Bonferroni 下界
   `alpha/m`、稳健符号翻转要求与预期脱落折算的可用种子数计算
   所需启动种子数；不同对比类型的方差不同：主效应是两两对比的
   0.5 倍、简单效应相同、交互是 2 倍，因此 `adequate` 按最吃
@@ -110,9 +114,14 @@
   默认拒绝启动；正式套件还会按实际展开的运行计划（含全部臂
   两两对比与消融主效应/交互/简单效应）重算一次，仍不足且未
   显式承认时在第一个子进程启动前拒绝。报告同时给出计划可用
-  种子数下的实际功效、MDE 与 sd 敏感性。确需在功效不足的
-  设计上探索时，必须写 `underpowered_acknowledged: true` 并
-  给出非空 `justification`，承认会随 `config.json` 的
+  种子数下的实际功效、MDE 与 sd 敏感性。若 `plan_equivalence`
+  为 true，还按真实差异为零计算 TOST 在预注册
+  `equivalence_margin` 内的功效、所需启动种子与当前精度能
+  支持的最小界；等价性功效不足同样在开跑前拒绝，不能用
+  命令行默认界代替训练前声明，也不能事后放宽界。确需在
+  功效不足的设计上探索时，必须写
+  `underpowered_acknowledged: true` 并给出非空
+  `justification`，承认会随 `config.json` 的
   `preregistration.power` 落盘。详见
   [design_preparation.md](design_preparation.md)。
 - `run_order`（可选）冻结执行顺序：`scheme` 为 `grouped` /
@@ -158,9 +167,17 @@
   "target_power": 0.8,
   "alpha": 0.05,
   "planned_comparisons": 5,
-  "expected_attrition_rate": 0.1
+  "expected_attrition_rate": 0.1,
+  "plan_equivalence": false
 }
 ```
+
+若要主张「无实质差异」而不是「有差异」，把
+`plan_equivalence` 设为 `true`，并在预注册顶层加
+`"equivalence_margin": 0.01`。此时 `--plan-design` 会额外
+打印等价性功效与所需种子；`equivalence.adequate=false` 会
+在正式运行前拒绝启动，除非显式承认功效不足。注意等价界
+越宽越容易主张等价，不能看到数据后放宽。
 
 该示例对应 `--suite-modes` 的两两对比（`planned_contrasts`
 默认 `pairwise`）。若同一设计改跑 `--suite-ablation`，必须把
@@ -268,6 +285,11 @@ python experiment.py --data corpus.txt --out runs/confirm \
   自己的 `mde_80`/`power_at_effect`。不能把「交互不显著」直接读成
   「没有交互」。
 - 不显著 ≠ 等价；只有 TOST 校正后通过才能说「无实质差异」。
+  若预注册声明了 `power.plan_equivalence=true`，先对照
+  `design.power.equivalence`（或 `preregistration.power.equivalence`）
+  的 `required_seeds_with_attrition` 与 `margin_for_target_power`：
+  等价性功效不足时，分析阶段不能把「TOST 未通过」解释成
+  「两者不同」，也不能事后放宽等价界。
 - 共同步数用预注册的 `--common-step`；报告
   `target_step_rule` 与 `target_step_data_dependent`。
 - 报告 `failure_rates`、`pseudo_replication`、差分缺失、

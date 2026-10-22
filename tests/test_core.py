@@ -1893,6 +1893,173 @@ class DesignPreparationTests(unittest.TestCase):
         ]
         self.assertEqual(required, sorted(required))
 
+    def test_tost_power_and_equivalence_seed_planning(self):
+        # 真实差异为零时，n=3（df=2）在 1% 界内达不到 80% 功效，
+        # n=4 达到；功率必须随种子数单调不减。
+        power_three = experiment._tost_power(
+            0.0, 0.005 / math.sqrt(3.0), 2.0, 0.01, 0.05
+        )
+        power_four = experiment._tost_power(
+            0.0, 0.005 / math.sqrt(4.0), 3.0, 0.01, 0.05
+        )
+        self.assertIsNotNone(power_three)
+        self.assertIsNotNone(power_four)
+        self.assertLess(power_three, 0.8)
+        self.assertGreaterEqual(power_four, 0.8)
+        self.assertEqual(
+            experiment._seeds_for_tost(
+                0.005, 0.01, 0.8, 0.05
+            ),
+            4,
+        )
+        margin_needed = experiment._tost_margin_for_power(
+            0.005 / math.sqrt(8.0), 7.0, 0.8, 0.05
+        )
+        self.assertIsNotNone(margin_needed)
+        self.assertLess(margin_needed, 0.01)
+        # 等价界越小，所需种子越多；界为零时不可判定。
+        self.assertGreaterEqual(
+            experiment._seeds_for_tost(0.005, 0.005, 0.8, 0.05)
+            or 10**9,
+            experiment._seeds_for_tost(0.005, 0.01, 0.8, 0.05)
+            or 0,
+        )
+        self.assertIsNone(
+            experiment._seeds_for_tost(0.005, 0.0, 0.8, 0.05)
+        )
+
+    def test_preregistration_power_equivalence_is_gated_only_when_claimed(self):
+        power = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 2,
+            "plan_equivalence": True,
+        }
+        plan = experiment.preregistration_power_plan(
+            power, 0.01, 20, 2, equivalence_margin=0.0005
+        )
+        self.assertTrue(plan["superiority_adequate"])
+        self.assertFalse(plan["equivalence_adequate"])
+        self.assertFalse(plan["adequate"])
+        self.assertEqual(
+            plan["equivalence"]["claim_planned"], True
+        )
+        self.assertTrue(
+            all(
+                entry["equivalence_adequate_at_planned_seeds"]
+                is False
+                for entry in plan["power_sensitivity"]
+            )
+        )
+        self.assertTrue(
+            all(
+                entry["adequate_at_planned_seeds"] is False
+                for entry in plan["power_sensitivity"]
+            )
+        )
+        gate = experiment.design_power_gate_error(
+            {"power": plan}
+        )
+        self.assertIsNotNone(gate)
+        self.assertIn("等价性", gate)
+
+        # 不主张等价时，TOST 只是信息性结果，不能反过来
+        # 把显著性功效足够的设计判成不可执行。
+        power["plan_equivalence"] = False
+        informational = experiment.preregistration_power_plan(
+            power, 0.01, 20, 2, equivalence_margin=0.0005
+        )
+        self.assertTrue(informational["adequate"])
+        self.assertFalse(
+            informational["equivalence_adequate"]
+        )
+        self.assertTrue(
+            all(
+                entry["adequate_at_planned_seeds"]
+                for entry in informational["power_sensitivity"]
+            )
+        )
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                {"power": informational}
+            )
+        )
+
+    def test_preregistration_equivalence_claim_requires_declared_margin(self):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 62))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "plan_equivalence": True,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("equivalence_margin", error)
+
+        payload["equivalence_margin"] = 0.0005
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("等价性", error)
+
+        payload["power"]["underpowered_acknowledged"] = True
+        payload["power"]["justification"] = "探索性等价性试点"
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        record = experiment.preregistration_record(
+            payload,
+            "prereg.json",
+            "c" * 64,
+            [],
+            self._args(),
+        )
+        self.assertFalse(
+            record["power"]["equivalence_adequate"]
+        )
+        self.assertTrue(
+            record["power"]["underpowered_acknowledged"]
+        )
+
+    def test_design_power_recomputes_equivalence_for_larger_family(self):
+        power = {
+            "expected_seed_sd_relative": 0.005,
+            "min_effect_relative": 0.01,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 1,
+            "planned_contrasts": ["pairwise"],
+            "planned_seeds": 8,
+            "plan_equivalence": True,
+            "equivalence_margin_relative": 0.01,
+            "underpowered_acknowledged": False,
+        }
+        adjusted = experiment._design_power_for_family(
+            power, 3, ["pairwise", "interaction"]
+        )
+        self.assertEqual(adjusted["planned_comparisons"], 3)
+        self.assertIn(
+            "interaction", adjusted["planned_contrasts"]
+        )
+        self.assertEqual(
+            adjusted["equivalence"]["margin_relative"], 0.01
+        )
+        self.assertTrue(
+            adjusted["equivalence"]["claim_planned"]
+        )
+        # 交互的方差是两两对比的 2 倍；等价性设计也必须按
+        # 更吃种子的类型重算，而不是沿用 pairwise 的结论。
+        self.assertIn(
+            "interaction", adjusted["contrast_power"]
+        )
+        self.assertIsNotNone(
+            adjusted["contrast_power"]["interaction"].get(
+                "required_seeds_for_equivalence"
+            )
+        )
+
     def test_preregistration_power_rejects_invalid_attrition(self):
         payload = self._payload()
         payload["power"] = {

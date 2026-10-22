@@ -26084,6 +26084,174 @@ def _tost_test(
     }
 
 
+def _tost_power(
+    effect: float,
+    se: float,
+    df: float,
+    margin: float,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Optional[float]:
+    """
+    等价性检验（TOST）在给定真实效应下的统计功效。
+
+    TOST 的两个单侧检验同时通过，等价于标准化后的观测差值
+    落在 ``±(margin - t_{1-alpha,df}·se)`` 内：
+
+        P(TOST 通过) = F_t(upper; df) - F_t(lower; df)
+
+    其中 ``lower = (-(margin - c·se) - effect) / se``、
+    ``upper = ((margin - c·se) - effect) / se``，
+    ``c = t_{1-alpha,df}``。``effect=0``（真实差异为零）是
+    等价性设计最常用的规划情形；``margin`` 相对基线均值时，
+    ``effect`` 与 ``se`` 也必须用同一相对尺度。
+
+    ``margin <= c·se`` 时区间为空，功效为 0。返回 None 表示
+    输入不可用，而不是「功效为零」。
+    """
+    try:
+        effect_value = float(effect)
+        se_value = float(se)
+        df_value = float(df)
+        margin_value = abs(float(margin))
+        alpha_value = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    if (
+        not math.isfinite(effect_value)
+        or not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or not math.isfinite(margin_value)
+        or not (0.0 < alpha_value < 0.5)
+        or df_value <= 0.0
+        or margin_value <= 0.0
+    ):
+        return None
+    if se_value <= 0.0:
+        # 零标准误：差异精确已知，界内必然通过、界外必然不通过。
+        return 1.0 if abs(effect_value) < margin_value else 0.0
+
+    critical = _t_critical(df_value, 2.0 * alpha_value)
+    if critical is None:
+        return None
+    half_width = margin_value - critical * se_value
+    if half_width <= 0.0:
+        return 0.0
+
+    lower = (-half_width - effect_value) / se_value
+    upper = (half_width - effect_value) / se_value
+    cdf_upper = _t_cdf(upper, df_value)
+    cdf_lower = _t_cdf(lower, df_value)
+    if cdf_upper is None or cdf_lower is None:
+        return None
+    return min(1.0, max(0.0, cdf_upper - cdf_lower))
+
+
+def _seeds_for_tost(
+    sd: float,
+    margin: float,
+    target_power: float = _TARGET_POWER,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+    max_seeds: int = 128,
+    variance_factor: float = 1.0,
+) -> Optional[int]:
+    """
+    在真实差异为零、等价界为 ``margin`` 时达到目标 TOST 功效
+    所需的可用配对数。
+
+    与 ``_seeds_to_detect`` 一样把声明的种子间标准差当作真实
+    sigma；``sd`` 是两格配对差值的标准差，``variance_factor``
+    把主效应/交互的方差差异纳入（与 ``_CONTRAST_VARIANCE_FACTORS``
+    同口径）。``margin`` 与 ``sd`` 必须是同一相对尺度。
+    """
+    try:
+        sd_value = float(sd)
+        margin_value = abs(float(margin))
+        target = float(target_power)
+        factor = float(variance_factor)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(sd_value)
+        or not math.isfinite(margin_value)
+        or not math.isfinite(target)
+        or not math.isfinite(factor)
+        or not (0.0 < target < 1.0)
+        or margin_value <= 0.0
+        or factor <= 0.0
+    ):
+        return None
+    if sd_value <= 0.0:
+        return _MIN_SEEDS_FOR_STATS
+
+    sd_contrast = sd_value * math.sqrt(factor)
+    for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
+        se = sd_contrast / math.sqrt(float(n))
+        power = _tost_power(
+            0.0, se, float(n - 1), margin_value, alpha
+        )
+        if power is not None and power >= target:
+            return n
+    return None
+
+
+def _tost_margin_for_power(
+    se: float,
+    df: float,
+    target_power: float = _TARGET_POWER,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Optional[float]:
+    """
+    当前精度下、真实差异为零时达到目标 TOST 功效所需的最小
+    等价界。
+
+    它回答「按当前种子数，我最多能主张多宽的等价性」：若该
+    值大于预注册的 ``equivalence_margin``，说明当前设计即使
+    真实差异为零也无法在声明界内主张等价，属于精度不足，
+    应增加种子而不是放宽等价界。返回 None 表示不可计算。
+    """
+    try:
+        se_value = float(se)
+        df_value = float(df)
+        target = float(target_power)
+        alpha_value = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(se_value)
+        or not math.isfinite(df_value)
+        or not math.isfinite(target)
+        or not (0.0 < target < 1.0)
+        or not (0.0 < alpha_value < 0.5)
+        or df_value <= 0.0
+    ):
+        return None
+    if se_value <= 0.0:
+        return 0.0
+
+    low = 0.0
+    high = max(1.0, se_value * 10.0)
+    for _ in range(8):
+        power = _tost_power(0.0, se_value, df_value, high, alpha_value)
+        if power is not None and power >= target:
+            break
+        high *= 2.0
+    else:
+        return None
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        power = _tost_power(
+            0.0, se_value, df_value, mid, alpha_value
+        )
+        if power is None:
+            return None
+        if power < target:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
 def _attach_sd_uncertainty_note(
     contrast: Dict[str, object],
 ) -> None:
@@ -32995,6 +33163,7 @@ _POWER_KEYS = (
     "planned_comparisons",
     "planned_contrasts",
     "expected_attrition_rate",
+    "plan_equivalence",
     "underpowered_acknowledged",
     "justification",
 )
@@ -33069,8 +33238,18 @@ def _contrast_power_entry(
     target: float,
     attrition: float,
     required_robust: int,
+    *,
+    equivalence_margin: Optional[float] = None,
 ) -> Dict[str, object]:
-    """按某一对比类型的方差乘数计算功效/所需种子数。"""
+    """按某一对比类型的方差乘数计算功效/所需种子数。
+
+    ``equivalence_margin`` 给定时，同时按同一对比类型的方差
+    计算「真实差异为零时 TOST 能否主张等价」所需的种子数与
+    计划可用种子下的等价性功效。显著性（能否检出最小效应）
+    与等价性（能否在预注册界内主张无实质差异）是两个不同的
+    设计目标：前者防「漏掉真效应」，后者防把「功效不足的
+    不显著」读成「等价」。
+    """
     factor = _CONTRAST_VARIANCE_FACTORS[contrast]
     sd_contrast = sd * math.sqrt(factor)
     if alpha_adjusted > 0.0:
@@ -33111,7 +33290,7 @@ def _contrast_power_entry(
         and int(planned_seeds)
         >= int(required_with_attrition or required)
     )
-    return {
+    entry: Dict[str, object] = {
         "contrast": contrast,
         "label": _CONTRAST_LABELS[contrast],
         "variance_factor": factor,
@@ -33126,6 +33305,71 @@ def _contrast_power_entry(
         "minimum_detectable_effect_relative": mde,
         "adequate": adequate,
     }
+
+    # 等价性设计：在真实差异为零时，TOST 需要观测到的标准化
+    # 差值整体落在 ±(margin - t·se) 内。margin 与 sd 同尺度
+    # （相对基线均值）。主效应/交互的方差乘数同样适用：交互
+    # 的差值方差更大，主张「交互等价」需要更宽的界或更多种子。
+    if (
+        equivalence_margin is not None
+        and math.isfinite(float(equivalence_margin))
+        and float(equivalence_margin) > 0.0
+    ):
+        margin = float(equivalence_margin)
+        required_eq = _seeds_for_tost(
+            sd_contrast,
+            margin,
+            target_power=target,
+            alpha=alpha_adjusted if alpha_adjusted > 0.0 else 0.0,
+            variance_factor=1.0,
+        ) if alpha_adjusted > 0.0 else None
+        required_eq_with_attrition = (
+            int(
+                math.ceil(
+                    float(required_eq) / (1.0 - attrition)
+                )
+            )
+            if required_eq is not None
+            else None
+        )
+        eq_power = None
+        eq_margin_needed = None
+        if (
+            alpha_adjusted > 0.0
+            and usable_seeds >= _MIN_SEEDS_FOR_STATS
+        ):
+            eq_se = sd_contrast / math.sqrt(float(usable_seeds))
+            eq_df = float(usable_seeds - 1)
+            eq_power = _tost_power(
+                0.0,
+                eq_se,
+                eq_df,
+                margin,
+                alpha_adjusted,
+            )
+            eq_margin_needed = _tost_margin_for_power(
+                eq_se,
+                eq_df,
+                target,
+                alpha_adjusted,
+            )
+        entry.update({
+            "equivalence_margin_relative": margin,
+            "equivalence_power_at_null_difference": eq_power,
+            "required_seeds_for_equivalence": required_eq,
+            "required_seeds_for_equivalence_with_attrition": (
+                required_eq_with_attrition
+            ),
+            "equivalence_margin_for_target_power": (
+                eq_margin_needed
+            ),
+            "equivalence_adequate": (
+                required_eq is not None
+                and int(planned_seeds)
+                >= int(required_eq_with_attrition or required_eq)
+            ),
+        })
+    return entry
 
 
 def _pick_binding_contrast(
@@ -33167,6 +33411,7 @@ def preregistration_power_plan(
     n_seeds: int,
     comparisons_count: int,
     contrast_types: Optional[List[str]] = None,
+    equivalence_margin: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     先验功效分析：在训练前判断预注册的种子数能否检出预注册
@@ -33193,6 +33438,15 @@ def preregistration_power_plan(
     同时给出精确符号翻转在家族校正下所需的最小种子数。稳健
     主张（配对 t 与符号翻转同时显著）要求二者都满足；只用 t
     检验的主张仍可用 ``required_seeds_for_t`` 判断。
+
+    ``equivalence_margin`` 给定时，额外计算等价性（TOST）设计：
+    真实差异为零时，在预注册等价界内主张「无实质差异」所需
+    的可用配对数、计划可用种子下的等价性功效，以及当前精度
+    能支持的最小等价界。``power.plan_equivalence=true`` 表示
+    等价性是本次研究的主张之一，此时 ``adequate`` 同时要求
+    显著性功效与等价性功效达标；否则只报告信息性字段，不
+    改变显著性功效的判定。等价界必须在预注册顶层显式给出
+    （``--equivalence-margin`` 的默认值不能代替事先声明）。
     """
     sd = float(power["expected_seed_sd_relative"])
     target = float(power.get("target_power", _TARGET_POWER))
@@ -33218,6 +33472,27 @@ def preregistration_power_plan(
     acknowledged = bool(
         power.get("underpowered_acknowledged", False)
     )
+    plan_equivalence = bool(power.get("plan_equivalence", False))
+    if equivalence_margin is None:
+        equivalence_margin = power.get(
+            "equivalence_margin_relative"
+        )
+    try:
+        equivalence_margin_value = (
+            None
+            if equivalence_margin is None
+            else float(equivalence_margin)
+        )
+    except (TypeError, ValueError, OverflowError):
+        equivalence_margin_value = None
+    if (
+        equivalence_margin_value is not None
+        and (
+            not math.isfinite(equivalence_margin_value)
+            or equivalence_margin_value <= 0.0
+        )
+    ):
+        equivalence_margin_value = None
 
     # 预期数据脱落/数值失败：功效公式里的 n 是**可用**运行数，
     # 不是启动数。若某个臂历史上约有 20% 的运行会 NaN 发散，
@@ -33257,6 +33532,7 @@ def preregistration_power_plan(
             target,
             attrition,
             required_robust,
+            equivalence_margin=equivalence_margin_value,
         )
         for contrast in contrasts
     }
@@ -33270,9 +33546,68 @@ def preregistration_power_plan(
     required_with_attrition = binding_entry[
         "required_seeds_with_attrition"
     ]
-    adequate = all(
+    superiority_adequate = all(
         bool(entry["adequate"])
         for entry in contrast_power.values()
+    )
+
+    # 等价性设计：与显著性功效分开报告。若 plan_equivalence=true，
+    # 等价性是主张之一， inadequacy 必须进入总体 adequate；
+    # 否则只作为信息，提醒「当前设计即使真实差异为零也无法在
+    # 声明界内主张等价」。
+    equivalence: Optional[Dict[str, object]] = None
+    equivalence_adequate: Optional[bool] = None
+    if equivalence_margin_value is not None:
+        eq_binding = _pick_binding_contrast(
+            {
+                contrast: {
+                    "required_seeds_for_t": entry.get(
+                        "required_seeds_for_equivalence"
+                    )
+                }
+                for contrast, entry in contrast_power.items()
+            },
+            contrasts,
+        )
+        eq_entry = contrast_power[eq_binding]
+        eq_required = eq_entry.get(
+            "required_seeds_for_equivalence"
+        )
+        eq_required_attrition = eq_entry.get(
+            "required_seeds_for_equivalence_with_attrition"
+        )
+        equivalence_adequate = all(
+            bool(entry.get("equivalence_adequate"))
+            for entry in contrast_power.values()
+        )
+        equivalence = {
+            "claim_planned": plan_equivalence,
+            "margin_relative": equivalence_margin_value,
+            "binding_contrast": eq_binding,
+            "binding_contrast_label": _CONTRAST_LABELS[eq_binding],
+            "planned_usable_seeds": usable_seeds,
+            "power_at_null_difference": eq_entry.get(
+                "equivalence_power_at_null_difference"
+            ),
+            "required_seeds_for_equivalence": eq_required,
+            "required_seeds_with_attrition": (
+                eq_required_attrition
+            ),
+            "margin_for_target_power": eq_entry.get(
+                "equivalence_margin_for_target_power"
+            ),
+            "adequate": equivalence_adequate,
+            "note": (
+                "等价性功效按真实差异为零、TOST 每个单侧检验的 "
+                "alpha/m 与同一配对差值标准差计算；margin 越宽越容易"
+                "主张等价，因此界必须在训练前固定。若 "
+                "margin_for_target_power 大于声明的界，说明"
+                "当前种子数精度不足以在该界内主张等价，应加"
+                "种子而不是放宽界。"
+            ),
+        }
+    adequate = bool(superiority_adequate) and (
+        not plan_equivalence or bool(equivalence_adequate)
     )
 
     # 在计划可用种子数下报告实际能达到的功效与 MDE：仅说
@@ -33302,6 +33637,7 @@ def preregistration_power_plan(
                 target,
                 attrition,
                 required_robust,
+                equivalence_margin=equivalence_margin_value,
             )
             for contrast in contrasts
         }
@@ -33309,6 +33645,18 @@ def preregistration_power_plan(
             scaled_entries, contrasts
         )
         scaled_entry = scaled_entries[scaled_binding]
+        scaled_superiority = all(
+            bool(entry["adequate"])
+            for entry in scaled_entries.values()
+        )
+        scaled_equivalence = (
+            all(
+                bool(entry.get("equivalence_adequate"))
+                for entry in scaled_entries.values()
+            )
+            if equivalence_margin_value is not None
+            else None
+        )
         sensitivity.append({
             "sd_multiplier": multiplier,
             "expected_seed_sd_relative": scaled_sd,
@@ -33319,9 +33667,18 @@ def preregistration_power_plan(
             "required_seeds_with_attrition": scaled_entry[
                 "required_seeds_with_attrition"
             ],
-            "adequate_at_planned_seeds": all(
-                bool(entry["adequate"])
-                for entry in scaled_entries.values()
+            "superiority_adequate_at_planned_seeds": (
+                scaled_superiority
+            ),
+            "equivalence_adequate_at_planned_seeds": (
+                scaled_equivalence
+            ),
+            "adequate_at_planned_seeds": (
+                scaled_superiority
+                and (
+                    not plan_equivalence
+                    or bool(scaled_equivalence)
+                )
             ),
         })
 
@@ -33352,6 +33709,11 @@ def preregistration_power_plan(
         "achieved_power_at_min_effect": achieved_power,
         "minimum_detectable_effect_relative": mde,
         "power_sensitivity": sensitivity,
+        "plan_equivalence": plan_equivalence,
+        "equivalence_margin_relative": equivalence_margin_value,
+        "equivalence": equivalence,
+        "superiority_adequate": superiority_adequate,
+        "equivalence_adequate": equivalence_adequate,
         "adequate": adequate,
         "underpowered_acknowledged": acknowledged,
         "justification": power.get("justification"),
@@ -33364,7 +33726,11 @@ def preregistration_power_plan(
             "在声明效应下有目标功效，不保证真实效应一定达到"
             "最小有意义效应。planned_usable_seeds 按声明的"
             "预期脱落率折算，required_seeds_with_attrition 是"
-            "达到目标功效所需的启动种子数"
+            "达到目标功效所需的启动种子数。plan_equivalence=true"
+            "时 adequate 还要求等价性（TOST）功效达标；等价性"
+            "功效按真实差异为零计算，是「若确实无实质差异，"
+            "能否在预注册界内主张等价」的概率，不保证真实"
+            "差异为零"
         ),
     }
 
@@ -33628,6 +33994,36 @@ def preregistration_schema_error(
                 "（预期因数值失败/数据问题而不可用的运行比例；"
                 "1 表示全部运行都会脱落，无法设计）"
             )
+        plan_equivalence = power.get(
+            "plan_equivalence", False
+        )
+        if not isinstance(plan_equivalence, bool):
+            return (
+                "power.plan_equivalence 必须是布尔值"
+            )
+        if plan_equivalence:
+            declared_margin = payload.get(
+                "equivalence_margin",
+                _PREREGISTRATION_MISSING,
+            )
+            if declared_margin is _PREREGISTRATION_MISSING:
+                return (
+                    "power.plan_equivalence=true 时必须在预注册"
+                    "顶层声明 equivalence_margin：等价界越宽越"
+                    "容易主张「无实质差异」，不能用 "
+                    "--equivalence-margin 的命令行默认值代替"
+                    "训练前声明"
+                )
+            error = _preregistration_finite_number(
+                declared_margin,
+                "equivalence_margin",
+                minimum=0.0,
+                maximum=1.0,
+            )
+            if error is not None:
+                return error
+            if float(declared_margin) <= 0.0:
+                return "equivalence_margin 必须是正数"
         acknowledged = power.get(
             "underpowered_acknowledged", False
         )
@@ -33660,7 +34056,55 @@ def preregistration_schema_error(
             contrast_types=_normalize_contrast_types(
                 planned_contrasts
             ),
+            equivalence_margin=(
+                None
+                if payload.get(
+                    "equivalence_margin",
+                    _PREREGISTRATION_MISSING,
+                )
+                is _PREREGISTRATION_MISSING
+                else payload.get("equivalence_margin")
+            ),
         )
+        if (
+            not plan["underpowered_acknowledged"]
+            and plan.get("plan_equivalence")
+            and not plan.get("equivalence_adequate")
+        ):
+            equivalence = plan.get("equivalence") or {}
+            eq_required = equivalence.get(
+                "required_seeds_with_attrition"
+            )
+            eq_margin_needed = equivalence.get(
+                "margin_for_target_power"
+            )
+            eq_required_text = (
+                f"至少需要 {eq_required} 个启动种子"
+                if eq_required is not None
+                else "无法在 128 个可用种子内达到目标功效"
+            )
+            return (
+                "预注册 power 分析显示等价性（TOST）功效不足："
+                "在等价界 ±"
+                f"{float(equivalence.get('margin_relative') or 0.0):g}、"
+                "真实差异为零、目标功效 "
+                f"{plan['target_power']:g}、家族规模 "
+                f"{plan['planned_comparisons']} 下，"
+                f"{eq_required_text}，计划只有 "
+                f"{plan['planned_seeds']} 个（计划可用 "
+                f"{plan['planned_usable_seeds']} 个）。"
+                + (
+                    f"当前精度在目标功效下只能支持约 ±"
+                    f"{float(eq_margin_needed):g} 的等价界；"
+                    if eq_margin_needed is not None
+                    else ""
+                )
+                + "等价性主张不能靠事后再放宽界来「制造」："
+                "请增加 seeds，或把 plan_equivalence 设为 false "
+                "并只把 TOST 作为探索性结果；确需在不足设计中"
+                "运行，请显式设置 underpowered_acknowledged=true "
+                "并写明 justification"
+            )
         if not plan["adequate"] and not plan["underpowered_acknowledged"]:
             required_text = (
                 "无法在 128 个种子内达到目标功效"
@@ -34612,6 +35056,9 @@ def preregistration_record(
             float(payload["min_effect"]),  # type: ignore[arg-type]
             len(payload["seeds"]),  # type: ignore[arg-type]
             len(payload["comparisons"]),  # type: ignore[arg-type]
+            equivalence_margin=payload.get(
+                "equivalence_margin"
+            ),
         )
     return {
         "source": str(source),
@@ -59548,6 +59995,9 @@ def _design_power_for_family(
             int(planned_seeds),  # type: ignore[arg-type]
             effective_family,
             contrast_types=effective_contrasts,
+            equivalence_margin=adjusted.get(
+                "equivalence_margin_relative"
+            ),
         )
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         # 手工构造/旧版记录可能没有重算所需的原始字段；
@@ -62779,6 +63229,53 @@ def print_design_summary(design: Dict[str, object]) -> None:
                     "[design][power] 交互的方差是两两对比的 2 倍，"
                     "所需种子约为 2 倍；消融设计应按该口径准备种子"
                 )
+        equivalence = power.get("equivalence")
+        if isinstance(equivalence, dict):
+            eq_power = equivalence.get(
+                "power_at_null_difference"
+            )
+            eq_required = equivalence.get(
+                "required_seeds_with_attrition"
+            )
+            eq_margin_needed = equivalence.get(
+                "margin_for_target_power"
+            )
+            claim = "硬门" if equivalence.get(
+                "claim_planned"
+            ) else "信息性"
+            print(
+                "[design][equivalence] "
+                f"{claim}：等价界 ±"
+                f"{float(equivalence.get('margin_relative') or 0.0):.2%}，"
+                "真实差异为零时 "
+                + (
+                    f"功效≈{float(eq_power):.2f}"
+                    if eq_power is not None
+                    else "功效无法计算"
+                )
+                + (
+                    f"，所需启动种子 {eq_required}"
+                    if eq_required is not None
+                    else "，128 个种子内无法达到目标功效"
+                )
+                + (
+                    "；当前精度可支持的最小界≈"
+                    f"±{float(eq_margin_needed):.2%}"
+                    if eq_margin_needed is not None
+                    else ""
+                )
+            )
+            if (
+                equivalence.get("claim_planned")
+                and not equivalence.get("adequate")
+                and not power.get("underpowered_acknowledged")
+            ):
+                print(
+                    "[design][equivalence][warn] 等价性主张功效"
+                    "不足：请增加种子，或取消 "
+                    "plan_equivalence（把 TOST 降为探索性"
+                    "结果），不能事后放宽等价界"
+                )
     else:
         print(
             "[design] 未提供预注册 power 块：种子数只保证检验"
@@ -62811,6 +63308,43 @@ def design_power_gate_error(
         or allow_underpowered
     ):
         return None
+    if (
+        power.get("plan_equivalence")
+        and not power.get("equivalence_adequate")
+    ):
+        equivalence = power.get("equivalence") or {}
+        eq_required = equivalence.get(
+            "required_seeds_with_attrition"
+        )
+        eq_margin_needed = equivalence.get(
+            "margin_for_target_power"
+        )
+        eq_required_text = (
+            f"至少需要 {eq_required} 个启动种子"
+            if eq_required is not None
+            else "无法在 128 个可用种子内达到目标功效"
+        )
+        return (
+            "设计计划显示等价性（TOST）功效不足：等价界 ±"
+            f"{float(equivalence.get('margin_relative') or 0.0):g}、"
+            "真实差异为零、目标功效 "
+            f"{power.get('target_power')}、家族规模 "
+            f"{power.get('planned_comparisons')} 下，"
+            f"{eq_required_text}，计划只有 "
+            f"{power.get('planned_seeds')} 个"
+            + (
+                f"；当前精度可支持的最小界约 ±"
+                f"{float(eq_margin_needed):g}"
+                if eq_margin_needed is not None
+                else ""
+            )
+            + "。等价性主张不能靠事后放宽界来「制造」：请增加 "
+            "--seeds，或把 power.plan_equivalence 设为 false "
+            "并只把 TOST 作为探索性结果；确需在不足设计中运行，"
+            "请显式设置 underpowered_acknowledged=true 并写明 "
+            "justification，或加 --allow-underpowered。调整后"
+            "请使用新的 --out（被拒绝的设计计划已落盘）"
+        )
     binding = str(power.get("binding_contrast") or "pairwise")
     binding_label = str(
         power.get("binding_contrast_label")
@@ -62963,19 +63497,35 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         )
     }
     analysis_power = analysis["design"].get("power")
-    if (
-        isinstance(analysis_power, dict)
-        and not analysis_power.get("adequate")
-    ):
-        print(
-            "[analysis][warn] 本轮设计功效不足（最吃种子的对比 "
-            f"{analysis_power.get('binding_contrast')}，需要 "
-            f"{analysis_power.get('required_seeds_with_attrition')} "
-            "个启动种子，计划 "
-            f"{analysis_power.get('planned_seeds')} 个）："
-            "结论只能作为探索性证据，不能把交互/主效应的不显著"
-            "读成「没有效应」；该豁免已随 design.power 落盘"
-        )
+    if isinstance(analysis_power, dict):
+        if (
+            analysis_power.get("plan_equivalence")
+            and not analysis_power.get("equivalence_adequate")
+        ):
+            equivalence = (
+                analysis_power.get("equivalence") or {}
+            )
+            print(
+                "[analysis][warn] 本轮设计的等价性（TOST）功效"
+                "不足（等价界 ±"
+                f"{float(equivalence.get('margin_relative') or 0.0):g}，"
+                "需要 "
+                f"{equivalence.get('required_seeds_with_attrition')} "
+                "个启动种子，计划 "
+                f"{analysis_power.get('planned_seeds')} 个）："
+                "不能把 TOST 未通过读成「两者不同」，也不能"
+                "事后放宽等价界；等价结论只能作为探索性证据"
+            )
+        elif not analysis_power.get("adequate"):
+            print(
+                "[analysis][warn] 本轮设计功效不足（最吃种子的对比 "
+                f"{analysis_power.get('binding_contrast')}，需要 "
+                f"{analysis_power.get('required_seeds_with_attrition')} "
+                "个启动种子，计划 "
+                f"{analysis_power.get('planned_seeds')} 个）："
+                "结论只能作为探索性证据，不能把交互/主效应的不显著"
+                "读成「没有效应」；该豁免已随 design.power 落盘"
+            )
     analysis["run_order"] = run_order_drift_report(
         rows, args.compare_metric
     )
@@ -63934,7 +64484,10 @@ def main():
             "「不显著」只能说明未发现差异，不等于无差异；"
             "报告在预先声明的等价界内给出 TOST 判定，以及 "
             "80%% 功效下的最小可检出效应（MDE）与所需种子数，"
-            "避免把功效不足误读成方法等价"
+            "避免把功效不足误读成方法等价。若要把等价性作为"
+            "研究主张，必须在预注册 power 中设 "
+            "plan_equivalence=true 并在顶层声明该界，设计预检"
+            "会同时检查 TOST 功效；命令行默认值不能代替声明"
         ),
     )
 
