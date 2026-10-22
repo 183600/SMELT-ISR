@@ -1377,8 +1377,12 @@ class DesignPreparationTests(unittest.TestCase):
             rows.append({
                 "run": f"r{index}",
                 "mode": "A" if index % 2 else "B",
-                "val_loss": float(index),
-                "design_order_index": index,
+                "val_loss": (
+                    10**400 if index == 2 else float(index)
+                ),
+                "design_order_index": (
+                    10**400 if index == 3 else index
+                ),
                 # 损坏的旧 config 可能把区组写成对象/列表；
                 # 诊断报告不能因此抛 TypeError。
                 "design_block": (
@@ -1394,7 +1398,9 @@ class DesignPreparationTests(unittest.TestCase):
             rows, "val_loss"
         )
         self.assertTrue(report["available"])
-        self.assertEqual(report["n_blocks"], 4)
+        # 指标为 10**400 的运行不可用（不是有限浮点），不进入
+        # 相关性样本；剩余区组仍必须可哈希计数而不是崩溃。
+        self.assertEqual(report["n_blocks"], 3)
 
     def test_run_order_drift_flags_mixed_schemes(self):
         rows = []

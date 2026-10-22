@@ -19018,10 +19018,15 @@ def _finite_float(value: object) -> Optional[float]:
         value, (int, float)
     ):
         return None
-    value = float(value)
-    if not math.isfinite(value):
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        # JSON 允许任意大整数；float(10**400) 会溢出。分析
+        # 管线应把这种值当作不可用，而不是让整份报告崩溃。
         return None
-    return value
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def _as_dict(value: object) -> Dict[str, object]:
@@ -56476,7 +56481,10 @@ def run_order_drift_report(
         mode: sum(values) / len(values)
         for mode, values in mode_means.items()
     }
-    indices = [float(entry["order_index"]) for entry in entries]
+    # 保留原始整数序号：Spearman 只需要排序与秩，不需要把
+    # 序号转成浮点。手工改坏 config 里的超大整数转 float 会
+    # 溢出，且顺序大小本身不参与数值运算。
+    indices = [entry["order_index"] for entry in entries]
     residuals = [
         float(entry["value"]) - means[str(entry["mode"])]
         for entry in entries
@@ -56511,7 +56519,7 @@ def run_order_drift_report(
             if str(entry["mode"]) == mode
         ]
         mode_rho = _spearman_correlation(
-            [float(entry["order_index"]) for entry in mode_entries],
+            [entry["order_index"] for entry in mode_entries],
             [float(entry["value"]) for entry in mode_entries],
         )
         mode_p = None
