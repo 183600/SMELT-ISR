@@ -1051,6 +1051,90 @@ class DesignPreparationTests(unittest.TestCase):
                         child_args
                     )
 
+    def test_design_plan_rejects_malformed_assignment_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                preregistration_record=None,
+                run_order="randomized",
+                run_order_seed=5,
+            )
+            plan = experiment.build_sweep_plan(
+                seeds=[1, 2, 3],
+                modes=["A", "B"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            ordered = experiment.order_sweep_plan(
+                plan, "randomized", 5
+            )
+            design = experiment.write_design_plan(
+                root, ordered, "randomized", 5, args
+            )
+            item = next(
+                entry
+                for entry in ordered
+                if entry["order_index"] == 3
+            )
+            child_args = argparse.Namespace(
+                out=str(root / str(item["label"])),
+                seed=item["seed"],
+                mode=item["mode"],
+                balance_coef=item["balance_coef"],
+            )
+            path = Path(design["path"])
+            payload = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            entry = next(
+                run
+                for run in payload["runs"]
+                if run["order_index"] == item["order_index"]
+            )
+            entry["seed"] = None
+            # 同步刷新文件指纹与 plan_id，确保拒绝理由不是
+            # 「文件被改」而是「条目字段损坏」。
+            payload["plan_id"] = experiment._design_plan_id(
+                payload
+            )
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            env = {
+                "SMELT_DESIGN_PLAN_FILE": str(path),
+                "SMELT_DESIGN_PLAN_SHA256": hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest(),
+                "SMELT_DESIGN_PLAN_ID": payload["plan_id"],
+                "SMELT_DESIGN_ORDER_SCHEME": design[
+                    "order_scheme"
+                ],
+                "SMELT_DESIGN_ORDER_SEED": str(
+                    design["order_seed"]
+                ),
+                "SMELT_DESIGN_ORDER_INDEX": str(
+                    item["order_index"]
+                ),
+                "SMELT_DESIGN_BLOCK": str(item["block"]),
+                "SMELT_DESIGN_BLOCK_POSITION": str(
+                    item["position_in_block"]
+                ),
+            }
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    experiment.verify_design_assignment(
+                        child_args
+                    )
+
     def test_run_order_drift_skips_deterministic_modes(self):
         rows = [
             {

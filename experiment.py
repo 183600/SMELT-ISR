@@ -55961,9 +55961,21 @@ def verify_design_assignment(
         raise ValueError(
             "设计计划的运行顺序方案与环境变量不一致"
         )
-    if str(order.get("seed")) != str(
-        values["SMELT_DESIGN_ORDER_SEED"]
-    ):
+    try:
+        order_seed = int(
+            str(values["SMELT_DESIGN_ORDER_SEED"])
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "设计计划环境变量中的顺序种子不是整数"
+        ) from error
+    try:
+        plan_order_seed = int(str(order.get("seed")))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "设计计划中的顺序种子不是整数"
+        ) from error
+    if plan_order_seed != order_seed:
         raise ValueError(
             "设计计划的运行顺序种子与环境变量不一致"
         )
@@ -56007,7 +56019,16 @@ def verify_design_assignment(
             f"{entry.get('label')!r}，当前 --out 是 "
             f"{out_path.name!r}"
         )
-    if int(entry.get("seed")) != int(args.seed):
+    try:
+        entry_seed = int(entry.get("seed"))
+        entry_block = int(entry.get("block"))
+        entry_position = int(entry.get("position_in_block"))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "设计计划条目的 seed/区组/区组内位置不是整数："
+            "计划内容损坏或被改写"
+        ) from error
+    if entry_seed != int(args.seed):
         raise ValueError(
             "设计计划中的 seed 与当前 --seed 不一致"
         )
@@ -56030,11 +56051,11 @@ def verify_design_assignment(
             raise ValueError(
                 "设计计划中的 balance_coef 与当前命令行不一致"
             )
-    if int(entry.get("block")) != block:
+    if entry_block != block:
         raise ValueError(
             "设计计划中的区组与当前分配不一致"
         )
-    if int(entry.get("position_in_block")) != position:
+    if entry_position != position:
         raise ValueError(
             "设计计划中的区组内位置与当前分配不一致"
         )
@@ -56046,7 +56067,7 @@ def verify_design_assignment(
         "study_id": payload.get("study_id"),
         "kind": payload.get("kind"),
         "order_scheme": order.get("scheme"),
-        "order_seed": int(order.get("seed")),
+        "order_seed": order_seed,
         "order_index": order_index,
         "block": block,
         "position_in_block": position,
