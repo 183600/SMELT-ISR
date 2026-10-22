@@ -2300,6 +2300,40 @@ class ArtifactManifestTests(unittest.TestCase):
                 {item["reason"] for item in report["mismatched"]},
             )
 
+    def test_manifest_run_summary_prefers_original_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            config = json.loads(
+                (root / "config.json").read_text()
+            )
+            config["original_run_metadata"] = {
+                "timestamp_utc": "2025-01-01T00:00:00+00:00",
+                "script_sha256": "original-script",
+                "git_commit": "original-commit",
+                "git_dirty": False,
+            }
+            config["run_metadata"] = {
+                "timestamp_utc": "2026-01-01T00:00:00+00:00",
+                "script_sha256": "resumed-script",
+                "git_commit": "resumed-commit",
+                "git_dirty": True,
+            }
+            (root / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            payload = experiment.build_artifact_manifest(root)
+            summary = payload["run"]
+            self.assertEqual(
+                summary["run_started_utc"],
+                "2025-01-01T00:00:00+00:00",
+            )
+            self.assertEqual(
+                summary["script_sha256"], "original-script"
+            )
+            self.assertEqual(
+                summary["git_commit"], "original-commit"
+            )
+
     def test_manifest_entry_limit_counts_across_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")

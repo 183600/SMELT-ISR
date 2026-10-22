@@ -37174,7 +37174,12 @@ def _manifest_run_summary(
     if not isinstance(config, dict):
         return None
 
-    metadata = config.get("run_metadata")
+    # 续跑会重写 run_metadata；归档摘要必须指向最初运行的
+    # 时间/代码身份（original_run_metadata），而不是最后一次
+    # 续跑的时间。与 load_tracking_provenance 保持同一口径。
+    metadata = config.get("original_run_metadata")
+    if not isinstance(metadata, dict):
+        metadata = config.get("run_metadata")
     if not isinstance(metadata, dict):
         metadata = {}
     data = config.get("data")
