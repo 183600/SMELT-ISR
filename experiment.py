@@ -237,6 +237,42 @@ def resume_split_change_error(
     )
 
 
+def resume_amp_change_error(
+    saved_args: object,
+    current_amp_dtype: Optional[object],
+) -> Optional[str]:
+    """
+    检查续跑检查点与当前的混合精度环境是否一致。
+    """
+    if (
+        not isinstance(saved_args, dict)
+        or "amp_dtype" not in saved_args
+    ):
+        return None
+
+    saved_dtype = saved_args.get("amp_dtype")
+    saved_text = (
+        str(saved_dtype)
+        if saved_dtype is not None
+        else "float32"
+    )
+    current_text = (
+        str(current_amp_dtype)
+        if current_amp_dtype is not None
+        else "float32"
+    )
+    if saved_text == current_text:
+        return None
+
+    return (
+        "resume 检查点的混合精度环境为 "
+        f"{saved_text}，当前设备会使用 {current_text}："
+        "autocast dtype 与 GradScaler 状态会改变浮点路径和"
+        "优化器轨迹。请在同一设备能力/同一 AMP 设置下续跑，"
+        "或换用全新的 --out 目录从头训练。"
+    )
+
+
 def seed_error(seed: int) -> Optional[str]:
     """
     校验随机种子的统一合法域；返回错误消息或 None。
@@ -32914,6 +32950,33 @@ def run_self_test():
     assert split_change_error is not None
     assert "val" in split_change_error
 
+    assert resume_amp_change_error({}, "torch.bfloat16") is None
+    assert (
+        resume_amp_change_error({"amp_dtype": None}, None)
+        is None
+    )
+    assert (
+        resume_amp_change_error(
+            {"amp_dtype": "torch.float16"},
+            "torch.float16",
+        )
+        is None
+    )
+    assert (
+        resume_amp_change_error(
+            {"amp_dtype": torch.float16},
+            "torch.float16",
+        )
+        is None
+    )
+    amp_change_error = resume_amp_change_error(
+        {"amp_dtype": "torch.float16"},
+        "torch.bfloat16",
+    )
+    assert amp_change_error is not None
+    assert "torch.float16" in amp_change_error
+    assert "torch.bfloat16" in amp_change_error
+
     # set_seed 必须让 Python / NumPy / PyTorch 的随机流可复现。
     set_seed(2024)
     first_draw = (
@@ -46377,6 +46440,12 @@ def main():
         }
 
         saved_args = rng_payload.get("args", {})
+        amp_change_error = resume_amp_change_error(
+            saved_args,
+            args.amp_dtype,
+        )
+        if amp_change_error is not None:
+            parser.error(amp_change_error)
         saved_data_sha256 = saved_args.get("data_sha256")
         saved_data_val_fraction = saved_args.get(
             "data_val_fraction"
