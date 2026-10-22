@@ -4783,6 +4783,74 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._factor_sort_rank(right),
         )
 
+    def test_factor_keys_accept_unhashable_values(self):
+        # 手工编辑/损坏的计划可能把 set 放进处理轴；稳定键必须
+        # 仍可哈希，否则 planned_comparisons_for_plan 等会把键
+        # 放进 set/dict 时崩溃。
+        key = experiment._stable_factor_key({1, 2})
+        self.assertEqual(hash(key), hash(key))
+        self.assertEqual(
+            key,
+            experiment._stable_factor_key(frozenset({2, 1})),
+        )
+        plan = [
+            {
+                "label": "a",
+                "mode": "A",
+                "balance_coef": {0.0},
+                "seed": 1,
+            },
+            {
+                "label": "b",
+                "mode": "A",
+                "balance_coef": {0.0},
+                "seed": 2,
+            },
+        ]
+        self.assertEqual(
+            experiment.planned_comparisons_for_plan(plan), 1
+        )
+        self.assertEqual(
+            experiment.planned_contrast_types_for_plan(plan), []
+        )
+        report = experiment.run_order_balance_report(
+            experiment.order_sweep_plan(plan, "randomized", 3)
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(
+            experiment._stable_factor_key({"a": 1, 2: 3}),
+            experiment._stable_factor_key({"a": 1, 2: 3}),
+        )
+
+    def test_statistics_tolerate_large_finite_floats(self):
+        huge = 1.0e308
+        self.assertEqual(experiment._mean([huge, huge]), huge)
+        self.assertEqual(experiment._mean([huge, -huge]), 0.0)
+        self.assertEqual(experiment._median([huge, huge]), huge)
+        self.assertEqual(experiment._median([huge, -huge]), 0.0)
+        self.assertEqual(
+            experiment._sample_std([huge, huge]), 0.0
+        )
+        # 两个相反的大数，标准差仍在 float 范围内：直接对
+        # 1e308 ** 2 会抛 OverflowError。
+        self.assertIsNotNone(
+            experiment._sample_std([huge, -huge])
+        )
+        self.assertEqual(
+            experiment._welch_t_test(
+                [huge, huge, huge],
+                [huge, huge, huge],
+            )["note"],
+            "zero_variance",
+        )
+        self.assertEqual(
+            experiment._welch_t_test(
+                [0.0, 1e200, 2e200],
+                [0.0, 1e200, 2e200],
+            )["test"],
+            "invalid_values",
+        )
+
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [
             {"seed": 1, "value": 10.0},

@@ -18614,14 +18614,22 @@ def _timing_summary(
 
     ordered = sorted(float(value) for value in timings)
     count = len(ordered)
-    mean = sum(ordered) / count
-    variance = (
-        sum((value - mean) ** 2 for value in ordered)
-        / (count - 1)
-        if count > 1
-        else 0.0
-    )
-    std = math.sqrt(variance)
+    mean = _mean(ordered)
+    if mean is None:
+        return {
+            "n": count,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "p99": None,
+            "min": None,
+            "max": None,
+            "std": None,
+            "coefficient_of_variation": None,
+        }
+    std = _sample_std(ordered)
+    if std is None:
+        std = 0.0
 
     return {
         "n": count,
@@ -22485,14 +22493,37 @@ def suite_factor_error(
 def _stable_factor_key(value):
     """
     把因子值转换成可哈希、可比较的稳定表示。
+
+    正常因子值来自 JSON（标量、列表、字典），但旧配置/手工
+    编辑的计划可能混入 set 或其它不可哈希对象。后者若原样
+    返回，会让 ``planned_comparisons_for_plan`` 等把稳定键
+    放进 set/dict 的地方抛 TypeError；这里统一降级为可哈希
+    且确定性的表示。
     """
     if isinstance(value, (list, tuple)):
         return tuple(_stable_factor_key(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        # set 本身无序；排序后再转 tuple，保证同一集合在不同
+        # 进程/插入顺序下得到同一个因子键。
+        return (
+            "set",
+            tuple(
+                sorted(
+                    (_stable_factor_key(item) for item in value),
+                    key=repr,
+                )
+            ),
+        )
     if isinstance(value, dict):
+        # 键可能是损坏记录里的混合类型；按 repr 排序而不是让
+        # Python 直接比较 int/str 而抛 TypeError。
         return tuple(
             sorted(
-                (key, _stable_factor_key(item))
-                for key, item in value.items()
+                (
+                    (key, _stable_factor_key(item))
+                    for key, item in value.items()
+                ),
+                key=lambda pair: repr(pair[0]),
             )
         )
     if isinstance(value, bool):
@@ -22508,6 +22539,12 @@ def _stable_factor_key(value):
         if math.isfinite(value) and value.is_integer():
             return ("number", int(value))
         return ("number", value)
+    try:
+        hash(value)
+    except TypeError:
+        # 自定义不可哈希对象无法保留身份；使用稳定表示作为
+        # 兜底，至少不让整份计划/报告崩溃。
+        return ("unhashable", repr(value))
     return ("value", value)
 
 
@@ -22969,10 +23006,16 @@ def _finite_values(values: List[float]) -> Optional[List[float]]:
 
 
 def _mean(values: List[float]) -> Optional[float]:
+    """有限数值的算术平均；用缩放求和避免大数值溢出。"""
     numeric = _finite_values(values)
     if not numeric:
         return None
-    return sum(numeric) / len(numeric)
+    scale = max(abs(value) for value in numeric)
+    if scale == 0.0:
+        return 0.0
+    total = math.fsum(value / scale for value in numeric)
+    result = (total / len(numeric)) * scale
+    return result if math.isfinite(result) else None
 
 
 def _median(values: List[float]) -> Optional[float]:
@@ -22984,21 +23027,43 @@ def _median(values: List[float]) -> Optional[float]:
     middle = len(ordered) // 2
     if len(ordered) % 2 == 1:
         return ordered[middle]
-    return (ordered[middle - 1] + ordered[middle]) / 2.0
+    # 先各自折半再相加：两个 1e308 直接相加会溢出成 inf。
+    return ordered[middle - 1] / 2.0 + ordered[middle] / 2.0
 
 
 def _sample_std(values: List[float]) -> Optional[float]:
     """
-    样本标准差（ddof=1）；少于 2 个观测时返回 None。
+    样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时
+    返回 None。
+
+    先把数据按最大绝对值缩放再算方差，避免合法的大浮点数在
+    ``(value - mean) ** 2`` 处抛 OverflowError。正常量级的输入
+    与直接公式结果一致。
     """
     numeric = _finite_values(values)
     if numeric is None or len(numeric) < 2:
         return None
-    mean = sum(numeric) / len(numeric)
-    variance = sum(
-        (value - mean) ** 2 for value in numeric
-    ) / (len(numeric) - 1)
-    return math.sqrt(max(0.0, variance))
+    scale = max(abs(value) for value in numeric)
+    if scale == 0.0:
+        return 0.0
+    normalized = [value / scale for value in numeric]
+    mean = math.fsum(normalized) / len(normalized)
+    variance = math.fsum(
+        (value - mean) ** 2 for value in normalized
+    ) / (len(normalized) - 1)
+    if not math.isfinite(variance) or variance < 0.0:
+        return None
+    result = math.sqrt(variance) * scale
+    return result if math.isfinite(result) else None
+
+
+def _sample_variance(values: List[float]) -> Optional[float]:
+    """样本方差（ddof=1）；溢出/不可用时返回 None。"""
+    std = _sample_std(values)
+    if std is None:
+        return None
+    variance = std * std
+    return variance if math.isfinite(variance) else None
 
 
 def _betacf(a: float, b: float, x: float) -> float:
@@ -24732,13 +24797,23 @@ def _welch_t_test(
         return {"test": "invalid_values"}
     values_a = numeric_a
     values_b = numeric_b
-    mean_a = sum(values_a) / n_a
-    mean_b = sum(values_b) / n_b
-    var_a = _sample_std(values_a) ** 2
-    var_b = _sample_std(values_b) ** 2
+    mean_a = _mean(values_a)
+    mean_b = _mean(values_b)
+    if mean_a is None or mean_b is None:
+        return {"test": "invalid_values"}
+    var_a = _sample_variance(values_a)
+    var_b = _sample_variance(values_b)
+    if var_a is None or var_b is None:
+        # 合法但大到超出 float 范围的方差：无法给出有限检验量，
+        # 按不可用处理，而不是让 **2 抛 OverflowError。
+        return {"test": "invalid_values"}
 
-    se_squared = var_a / n_a + var_b / n_b
+    term_a = var_a / n_a
+    term_b = var_b / n_b
+    se_squared = term_a + term_b
     delta = mean_b - mean_a
+    if not math.isfinite(se_squared) or not math.isfinite(delta):
+        return {"test": "invalid_values"}
 
     if se_squared == 0.0:
         if delta == 0.0:
@@ -24761,11 +24836,20 @@ def _welch_t_test(
             "se": 0.0,
         }
 
-    t = delta / math.sqrt(se_squared)
-    df = se_squared ** 2 / (
-        (var_a / n_a) ** 2 / (n_a - 1)
-        + (var_b / n_b) ** 2 / (n_b - 1)
+    # Welch-Satterthwaite 自由度用相对方差计算：直接对
+    # (var/n)**2 求值在方差接近 float 上限时会溢出，而公共
+    # 缩放因子在分子分母中会抵消。
+    scale = max(term_a, term_b)
+    scaled_a = term_a / scale
+    scaled_b = term_b / scale
+    denominator = (
+        scaled_a * scaled_a / (n_a - 1)
+        + scaled_b * scaled_b / (n_b - 1)
     )
+    if denominator <= 0.0 or not math.isfinite(denominator):
+        return {"test": "invalid_values"}
+    t = delta / math.sqrt(se_squared)
+    df = (scaled_a + scaled_b) ** 2 / denominator
     return {
         "test": "welch_t",
         "t": t,
