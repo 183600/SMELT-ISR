@@ -17432,6 +17432,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "allow_eval_duplicates",
     "eval_interval",
     "eval_batches",
+    # bootstrap 重采样次数决定验证/测试置信区间的蒙特卡洛
+    # 精度：不同运行用不同的 --eval-bootstrap 会得到不同宽度
+    # 的误差线，跨运行比较误差线时口径不再一致。
+    "eval_bootstrap",
     "data_sha256",
     # final/test 评估所用模型的选型口径：旧运行（无记录）是
     # 最后一步参数，新运行是验证集选中的最优验证点；两者混在
@@ -17468,6 +17472,10 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "allow_eval_duplicates",
     "batch_size",
     "eval_batches",
+    # 神经模型与 ngram 统计基线都用同一评估窗口 bootstrap
+    # 口径报告区间；重采样次数不同会让跨 family 的误差线
+    # 无法直接比较。
+    "eval_bootstrap",
     "data_augmentation",
 )
 
@@ -18027,6 +18035,11 @@ def build_comparison_protocol(
         ),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
+        # 固定评估窗口 bootstrap 的重采样次数：区间宽度与
+        # 蒙特卡洛精度的一部分，不能跨运行静默改变。
+        "eval_bootstrap": getattr(
+            args, "eval_bootstrap", None
+        ),
         "data_sha256": getattr(args, "data_sha256", None),
         # 逐 split 内容指纹：同源文件但不同群组吸附/清洗/切分
         # 结果的运行不能算同一数据协议。
@@ -18225,6 +18238,9 @@ def experiment_protocol_from_payload(
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
+        # 旧运行未记录时保持 None（检查器标为缺记录），
+        # 不能默认成当前 CLI 的 500。
+        "eval_bootstrap": run_args.get("eval_bootstrap"),
         "data_sha256": data.get("sha256"),
         # 逐 split 指纹：新运行写在 data.split_sha256；旧运行
         # 没有该字段时保持 None，由检查器列为「未核对」而不是
@@ -38757,6 +38773,10 @@ def run_self_test():
         "allow_eval_duplicates"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    # bootstrap 重采样次数决定误差线的蒙特卡洛精度，必须在
+    # 神经运行之间以及神经/统计基线之间保持一致。
+    assert "eval_bootstrap" in COMPARISON_PROTOCOL_KEYS
+    assert "eval_bootstrap" in _CROSS_FAMILY_PROTOCOL_KEYS
     # 旧 ngram 运行的 comparison_protocol 缺少清洗/泄露键时，
     # 必须从 args 回填它实际使用的数据口径；不能因为统计基线
     # 没有优化器就把这些键一律当成 False，否则会伪造「与神经
@@ -38794,6 +38814,9 @@ def run_self_test():
         "allow_corrupt_test_labels",
     ):
         assert legacy_statistical_protocol[key] is True, key
+    # 旧运行没有 eval_bootstrap 记录时不能默认成当前 CLI
+    # 的 500；保持 None 让对比检查显式标为缺记录。
+    assert legacy_statistical_protocol["eval_bootstrap"] is None
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
             name: str,
@@ -51124,6 +51147,28 @@ def main():
                 "(周期验证步点是验证协议的一部分)"
             )
             args.eval_interval = saved_eval_interval
+
+        # eval_bootstrap 决定最终验证/测试置信区间的重采样
+        # 次数，是评估协议的一部分；resume 时按存档恢复，
+        # 避免续跑用当前命令行默认值静默改写原运行口径。
+        saved_eval_bootstrap = rng_payload.get(
+            "args",
+            {},
+        ).get("eval_bootstrap")
+
+        if (
+            isinstance(saved_eval_bootstrap, int)
+            and not isinstance(saved_eval_bootstrap, bool)
+            and saved_eval_bootstrap >= 0
+            and saved_eval_bootstrap != args.eval_bootstrap
+        ):
+            print(
+                "resume restored eval_bootstrap "
+                f"{args.eval_bootstrap} -> "
+                f"{saved_eval_bootstrap} "
+                "(bootstrap 次数是评估协议的一部分)"
+            )
+            args.eval_bootstrap = saved_eval_bootstrap
 
         # 确定性实现开关与 CPU 线程数会改变浮点行为；resume
         # 时按存档恢复，避免「同一随机流 + 不同数值环境」的
