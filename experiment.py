@@ -22666,19 +22666,36 @@ def ablation_component_verdicts(
         ("structural_confounds", "结构设置混杂"),
         ("width_confounds", "专家宽度/计算量混杂"),
         ("randomness_confounds", "同种子随机性混杂"),
+        ("randomness_unverified", "同种子随机性未核对"),
     ):
         values = coverage.get(key) or []
         if values:
             blockers.append(
                 f"{label}（{len(values)} 项）：主效应不能归因"
             )
-    for entry in coverage.get("compute_parity") or []:
+    parity_entries = coverage.get("compute_parity") or []
+    for entry in parity_entries:
         if not entry.get("matched"):
+            ratio = entry.get("ratio")
+            ratio_text = (
+                f"（{float(ratio):.2f}×）"
+                if isinstance(ratio, (int, float))
+                and not isinstance(ratio, bool)
+                else ""
+            )
             blockers.append(
                 f"{entry.get('delayed_mode')} 与 local_base 的"
                 f" {entry.get('field')} 不匹配"
-                f"（{float(entry.get('ratio', 0.0)):.2f}×）"
+                + ratio_text
             )
+    if (
+        factorial.get("metric") != _COMPUTE_MATCHED_METRIC
+        and not parity_entries
+    ):
+        blockers.append(
+            "所有运行都缺 FLOPs/参数量记录：计算量对齐"
+            "未核对，不能把差异归因到组件"
+        )
     alignment = coverage.get("global_seed_alignment")
     if isinstance(alignment, dict) and alignment.get(
         "applicable"
@@ -22700,6 +22717,20 @@ def ablation_component_verdicts(
                 f"{alignment.get('n_common_seeds', 0)} 个"
                 f"（< {_MIN_SEEDS_FOR_STATS}）"
             )
+    duplicate_effects = [
+        effect
+        for effect in effects
+        if effect.get("duplicate_seeds")
+    ]
+    if duplicate_effects:
+        blockers.append(
+            "存在重复随机种子（复制运行已折叠，不是独立重复）："
+            + "; ".join(
+                f"{effect.get('delayed_mode')}/"
+                f"{effect.get('effect_name')}"
+                for effect in duplicate_effects[:5]
+            )
+        )
     if factorial.get("incomplete_designs"):
         blockers.append(
             "存在不完整的 2×2 设计："
@@ -40829,7 +40860,13 @@ def run_self_test():
             "structural_confounds": [],
             "width_confounds": [],
             "randomness_confounds": [],
-            "compute_parity": [],
+            "randomness_unverified": [],
+            "compute_parity": [{
+                "delayed_mode": "A",
+                "field": "flops_per_forward",
+                "matched": True,
+                "ratio": 1.0,
+            }],
             "low_replicate_cells": [],
         }
         component_verdicts = ablation_component_verdicts(
@@ -40882,6 +40919,24 @@ def run_self_test():
         assert any(
             "种子" in blocker
             for blocker in misaligned_verdicts["blockers"]
+        )
+
+        # 没有任何 FLOPs/参数量记录时不能把「未核对」当成
+        # 「已对齐」：即使各组件统计上支持，也必须阻塞联合判定。
+        no_compute_coverage = json.loads(
+            json.dumps(component_coverage)
+        )
+        no_compute_coverage["compute_parity"] = []
+        no_compute_verdicts = ablation_component_verdicts(
+            factorial,
+            no_compute_coverage,
+        )
+        assert not no_compute_verdicts[
+            "all_components_supported"
+        ]
+        assert any(
+            "计算量对齐未核对" in blocker
+            for blocker in no_compute_verdicts["blockers"]
         )
 
         # 共同步数敏感性：final 口径显示 A 恒定改善，但周期
