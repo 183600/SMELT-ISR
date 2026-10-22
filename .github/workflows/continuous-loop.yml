@@ -272,7 +272,7 @@ jobs:
           PERF_TIMEOUT=$((3*3600))     # 3h
           BUG_TIMEOUT=$((3*3600))      # 3h
           SCI_TIMEOUT=$((3*3600))      # 3h
-          SINGLE_TIMEOUT=$((3600))     # 1h（单因素实验检查）
+          SINGLE_TIMEOUT=$((3600))     # 1h（并入 sci 的单因素实验检查）
           CLEAN_TIMEOUT=$((3*3600))    # 3h
           APPLY_TIMEOUT=$((3*3600))    # 3h
 
@@ -714,7 +714,7 @@ jobs:
             esac
           }
 
-          # ================= 测试门（bug / sci / single 阶段提交后都执行）=================
+          # ================= 测试门（bug / sci 阶段提交后都执行）=================
           # 在写代码阶段（bug / sci）的 opencode 调用提交之后触发（调用点见主循环的
           # case "$phase" in bug|sci）。
           # 不再掷骰抽样——每次都跑一遍本仓库的测试；
@@ -810,9 +810,9 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci -> single -> apply（clean 的清理工作交给收尾的 shell 步骤）-----
-            # for phase in perf bug sci single clean apply; do
-            for phase in bug sci single apply; do
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（含单因素检查）-> apply（clean 的清理工作交给收尾的 shell 步骤）-----
+            # for phase in perf bug sci clean apply; do
+            for phase in bug sci apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
@@ -831,7 +831,6 @@ jobs:
                   echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
                 ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
-                single) P="$PROMPT_SINGLE"; T="$SINGLE_TIMEOUT" ;;
                 apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
               esac
 
@@ -849,12 +848,18 @@ jobs:
               esac
               run_phase "$phase" "$P" "$T"
 
+              # 单因素实验检查并入 sci：同一次 sci 阶段内追加一次调用
+              if [ "$phase" = "sci" ]; then
+                echo ">>> iteration #$i | phase=sci-single | budget=${SINGLE_TIMEOUT}s（并入 sci）"
+                run_phase "sci-single" "$PROMPT_SINGLE" "$SINGLE_TIMEOUT"
+              fi
+
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
-              # ⭐ 测试门：bug / sci / single 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
+              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
               case "$phase" in
-                bug|sci|single) maybe_run_tests "$i" ;;
+                bug|sci) maybe_run_tests "$i" ;;
               esac
 
               sleep 5
