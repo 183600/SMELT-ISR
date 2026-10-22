@@ -22898,6 +22898,7 @@ _COMPONENT_BLOCKING_CLAIMS = frozenset({
     "capacity_confounded",
     "randomness_confounded",
     "attrition_confounded",
+    "balance_confounded",
     "unverified_controls",
 })
 
@@ -23178,6 +23179,7 @@ def ablation_component_verdicts(
         ("attrition_confounds", "数值失败/脱落不平衡"),
         ("randomness_confounds", "同种子随机性混杂"),
         ("randomness_unverified", "同种子随机性未核对"),
+        ("balance_confounds", "均衡强度混杂"),
     ):
         values = coverage.get(key) or []
         if values:
@@ -28047,6 +28049,21 @@ def annotate_factorial_confounds(
             "归因到待验证设计"
         )
 
+    balance_confounds = coverage.get("balance_confounds") or []
+    if balance_confounds:
+        for effect in factorial.get("effects", []):
+            effect["balance_confounded"] = True
+            if effect.get("claim") in positive_claims | {
+                "confounded",
+                "unverified_controls",
+            }:
+                effect["claim"] = "balance_confounded"
+        factorial.setdefault("advisories", []).append(
+            "均衡损失强度（balance_coef × 有效路由宽度）在"
+            "消融单元间不一致：主效应/交互混入均衡压力差异，"
+            "不能归因到延迟合并或均衡损失本身"
+        )
+
     attrition_confounds = coverage.get(
         "attrition_confounds"
     ) or []
@@ -28892,6 +28909,11 @@ def print_comparison_analysis(
         allow_partial=allow_partial_ablation,
     )
     balance_scale = balance_strength_report(rows)
+    coverage["balance_confounds"] = (
+        list(balance_scale.get("advisories") or [])
+        if balance_scale.get("confounded")
+        else []
+    )
     randomness = same_seed_randomness_check(rows)
     coverage["randomness_confounds"] = randomness[
         "confounds"
@@ -42824,6 +42846,28 @@ def run_self_test():
             float(old_balance_report["strength_ratio"]) - 1.5
         ) < 1e-9
         assert old_balance_report["advisories"]
+        balance_confounded_effect = {
+            "claim": "supports_component",
+        }
+        balance_confounded_factorial = {
+            "effects": [balance_confounded_effect],
+        }
+        annotate_factorial_confounds(
+            balance_confounded_factorial,
+            {"ok": True},
+            {
+                "balance_confounds": old_balance_report[
+                    "advisories"
+                ],
+            },
+        )
+        assert (
+            balance_confounded_effect["claim"]
+            == "balance_confounded"
+        )
+        assert _component_evidence_summary(
+            [balance_confounded_effect]
+        )["status"] == "blocked"
 
         balance_new_base_path = _write_analysis_run(
             "balance_scale_new_base",
