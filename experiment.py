@@ -22842,6 +22842,12 @@ def factorial_effects(
             holm_p is not None
             and float(holm_p) <= _SIGNIFICANCE_LEVEL
         )
+    for effect in report["effects"]:
+        if (
+            effect.get("claim") == "supports_component"
+            and effect.get("equivalent")
+        ):
+            effect["claim"] = "not_practically_significant"
 
     for effect in report["effects"]:
         if effect.get("test") == "no_common_seeds":
@@ -42712,6 +42718,10 @@ def run_self_test():
                 "mean_effect"
             ] + 0.10
         ) < 1e-9
+        assert (
+            by_effect["delayed_merge_at_balance_off"]["claim"]
+            == "not_practically_significant"
+        )
         assert abs(
             by_effect["delayed_merge_at_balance_on"][
                 "mean_effect"
