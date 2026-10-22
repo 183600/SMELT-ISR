@@ -25630,21 +25630,28 @@ def _contrast_interval(
     但 CI 直接给出效应量的可行范围：极宽的区间说明现有种子数
     只能排除「差异为 0」，还不足以定位效应大小。
     """
-    effect = test.get("effect")
-    se = test.get("se")
-    df = test.get("df")
-    if effect is None or se is None or df is None:
+    effect = _finite_float(test.get("effect"))
+    se = _finite_float(test.get("se"))
+    df = _finite_float(test.get("df"))
+    if effect is None or se is None or df is None or se < 0.0:
         return {}
 
-    critical = _t_critical(float(df))
+    critical = _t_critical(df)
     if critical is None:
         return {}
 
-    low = float(effect) - critical * float(se)
-    high = float(effect) + critical * float(se)
+    half_width = critical * se
+    low = effect - half_width
+    high = effect + half_width
+    # 合法但极大的有限 effect/se 会让区间端点越过 float 上限。
+    # 此时没有可落盘的有限区间；省略 95% CI，而不是写入
+    # ±inf（非标准 JSON，也会把「数值上无穷宽」伪装成一个
+    # 可以计算的端点）。
+    if not math.isfinite(low) or not math.isfinite(high):
+        return {}
     return {
-        "effect": float(effect),
-        "se": float(se),
+        "effect": effect,
+        "se": se,
         "t_critical": critical,
         "ci95_low": low,
         "ci95_high": high,
@@ -25713,6 +25720,11 @@ def _attach_family_adjusted_intervals(
             continue
         low = effect - critical * se
         high = effect + critical * se
+        # 同时区间端点也可能因超大有限 se 溢出。无法用有限数
+        # 表示时不写该套区间，避免把 ±inf 落盘；逐检验区间与
+        # 原始检验结果仍保留。
+        if not math.isfinite(low) or not math.isfinite(high):
+            continue
         excludes_zero = bool(low > 0.0 or high < 0.0)
         item["ci_family_adjusted_low"] = low
         item["ci_family_adjusted_high"] = high

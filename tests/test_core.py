@@ -6501,6 +6501,23 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertNotIn("ci95_high", aggregate["costs"]["n_params"])
         json.dumps(aggregate, allow_nan=False)
 
+    def test_contrast_intervals_omit_unrepresentable_bounds(self):
+        test = {
+            "effect": -1.0e308,
+            "se": 1.0e308,
+            "df": 2.0,
+        }
+        self.assertEqual(experiment._contrast_interval(test), {})
+        item = dict(
+            test,
+            p_value=0.01,
+            significant=True,
+        )
+        experiment._attach_family_adjusted_intervals([item])
+        self.assertNotIn("ci_family_adjusted_low", item)
+        self.assertNotIn("ci_family_adjusted_high", item)
+        json.dumps(item, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
