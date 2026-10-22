@@ -905,6 +905,36 @@ class ProcessTests(unittest.TestCase):
             [],
         )
 
+    def test_invalid_span_scanner_warmups_offset_boundary(self):
+        # offset 落在一个合法 2 字节字符中间（d8 8e =
+        # U+060E）：不能把 offset 处的续字节误报为非法。
+        data = b"\x80)t\xb8\x83\xd8\x8e\x02M\x12"
+        spans = experiment._invalid_utf8_nul_spans(
+            memoryview(data),
+            6,
+            4,
+            True,
+        )
+        self.assertEqual(spans, [])
+        # 同一段里真正的非法续字节仍必须报告。
+        self.assertEqual(
+            experiment._invalid_utf8_nul_spans(
+                memoryview(data), 3, 1, True
+            ),
+            [(3, 4, "invalid_utf8")],
+        )
+        # offset=0 的全局扫描不受预热影响。
+        self.assertEqual(
+            experiment._invalid_utf8_nul_spans(
+                memoryview(data), 0, len(data), True
+            ),
+            [
+                (0, 1, "invalid_utf8"),
+                (3, 4, "invalid_utf8"),
+                (4, 5, "invalid_utf8"),
+            ],
+        )
+
     def test_drop_corrupt_bytes_catches_trailing_lead_byte(self):
         # train 末尾的非法 lead byte 需要后继字节才能判定，
         # 但清洗范围仍必须把它删掉，不能留给训练窗口。

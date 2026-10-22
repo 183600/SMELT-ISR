@@ -7870,10 +7870,26 @@ def _invalid_utf8_nul_spans(
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="surrogateescape"
     )
+
+    # 预热：offset 可能落在一个合法的多字节字符中间（split 边界
+    # 不保证在字符边界上）。先把 offset 前最多 3 个字节喂给
+    # 解码器，并记录它缓冲了多少「属于 offset 之前」的字节。
+    # 之后解码出的第一个字符若消费了这些前缀字节，只能把其中
+    # 落在 [offset, ...) 的实际字节数推进 cursor，不能把整个
+    # 字符都算到本段（否则跨边界的合法字符会被误报为损坏）。
+    pre_offset_pending = 0
+    if offset > 0:
+        decoder.decode(
+            bytes(raw[max(0, offset - 3):offset]),
+            final=False,
+        )
+        pre_offset_pending = len(decoder.getstate()[0])
+
     spans: List[Tuple[int, int, str]] = []
     position = offset
     end = offset + length
-    pending_start = offset
+    cursor = offset
+    skip_prefix = pre_offset_pending
 
     while position < end:
         stop = min(position + chunk, end)
@@ -7882,7 +7898,6 @@ def _invalid_utf8_nul_spans(
             block,
             final=final and stop >= end,
         )
-        cursor = pending_start
 
         for character in text:
             encoded = character.encode(
@@ -7896,15 +7911,30 @@ def _invalid_utf8_nul_spans(
                 size == 1
                 and 0xDC80 <= codepoint <= 0xDCFF
             ):
+                # 前缀遗留的非法字节可能先于本段被吐出；只跳过
+                # 属于 offset 之前的那几个代理码点。
+                if skip_prefix > 0:
+                    skip_prefix -= 1
+                    continue
                 spans.append(
                     (cursor, cursor + 1, "invalid_utf8")
                 )
+            elif size > skip_prefix and skip_prefix > 0:
+                # 合法的跨边界字符：只把 offset 之后的字节数
+                # 推进 cursor，跳过整个字符的统计。
+                cursor += size - skip_prefix
+                skip_prefix = 0
+                continue
             elif character == "\x00":
                 spans.append((cursor, cursor + 1, "nul"))
 
+            if skip_prefix > 0:
+                # 理论上只有前缀遗留的非法字节会走到这里；安全
+                # 起见不把尚未消费完的前缀算进本段。
+                skip_prefix -= 1
+                continue
             cursor += size
 
-        pending_start = cursor
         position = stop
 
     return spans
