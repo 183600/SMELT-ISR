@@ -1394,6 +1394,32 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertTrue(report["available"])
         self.assertEqual(report["n_blocks"], 4)
 
+    def test_run_order_drift_flags_mixed_schemes(self):
+        rows = []
+        for index, scheme in enumerate(
+            ("randomized", "grouped", "blocked", "randomized"),
+            start=1,
+        ):
+            rows.append({
+                "run": f"r{index}",
+                "mode": "A" if index % 2 else "B",
+                "val_loss": float(index),
+                "design_order_index": index,
+                "design_block": index,
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": scheme,
+            })
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertTrue(
+            any(
+                "多种执行顺序方案" in warning
+                for warning in report["warnings"]
+            )
+        )
+
     def test_run_order_drift_zero_variance_is_insufficient(self):
         rows = []
         for index, mode in enumerate(("A", "B", "A", "B"), start=1):

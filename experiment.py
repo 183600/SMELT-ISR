@@ -56431,6 +56431,12 @@ def run_order_drift_report(
             "运行来自多份设计计划（plan_id 不一致）："
             "不能把不同顺序方案拼成一项研究"
         )
+    if len(schemes) > 1:
+        warnings.append(
+            "运行混合了多种执行顺序方案（"
+            + ", ".join(schemes)
+            + "）：顺序效应无法用单一区组设计解释"
+        )
     if "grouped" in schemes:
         warnings.append(
             "执行顺序是 grouped：同一臂的所有种子先跑完，"
