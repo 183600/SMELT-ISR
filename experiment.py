@@ -22580,6 +22580,25 @@ def ablation_component_verdicts(
         "reasons": balance_reasons,
     })
 
+    sensitivity = coverage.get("common_step_sensitivity")
+    component_flips: Dict[str, object] = (
+        sensitivity.get("component_flips", {})
+        if isinstance(sensitivity, dict)
+        and sensitivity.get("applicable")
+        else {}
+    )
+    for component in components:
+        flipped = component_flips.get(
+            str(component["component"])
+        ) or []
+        if flipped and component["status"] == "supported":
+            component["status"] = "inconclusive"
+            component["reasons"].append(
+                "final 选型口径支持，但共同步数无偏口径下"
+                "至少一个效应不再支持：结论对 checkpoint "
+                "选择敏感"
+            )
+
     blockers: List[str] = []
     if coverage.get("partial"):
         blockers.append(
@@ -22659,6 +22678,11 @@ def ablation_component_verdicts(
             + str(len(coverage["low_replicate_cells"]))
             + " 项）"
         )
+    if component_flips:
+        blockers.append(
+            "共同步数敏感性翻转: "
+            + ", ".join(sorted(component_flips))
+        )
 
     statuses = {
         str(component["component"]): str(component["status"])
@@ -22716,6 +22740,213 @@ def ablation_component_verdicts(
         "blockers": blockers,
         "advisory": advisory,
     }
+
+
+def _factorial_effect_key(
+    effect: Dict[str, object],
+) -> Tuple[str, str, str]:
+    """跨口径匹配同一设计、上下文与效应名。"""
+    return (
+        str(effect.get("delayed_mode")),
+        str(
+            _stable_factor_key(
+                effect.get("context") or {}
+            )
+        ),
+        str(effect.get("effect_name")),
+    )
+
+
+def factorial_common_step_sensitivity(
+    aggregates: List[Dict[str, object]],
+    group_keys: List[str],
+    metric: str,
+    primary: Dict[str, object],
+    coverage: Dict[str, object],
+    controlled: Optional[Dict[str, object]] = None,
+    equivalence_margin: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    在共同步数无偏口径上重估全因子效应，检查主结论是否翻转。
+
+    判定指标若是验证集选中的 ``final`` 指标，主效应/交互的
+    显著性可能来自 winner's curse；共同步数派生指标只取各运行
+    最后一个共同评估步的即时值，不经过 checkpoint 选择。这里
+    对同一设计重估效应，并逐项比较 claim 与效应方向：
+
+    - ``support_flips``：final 口径支持组件，但共同步数口径
+      不再支持（不显著、变差、混杂或缺证据）；
+    - ``sign_flips``：两口径的效应方向相反；
+    - ``component_flips``：把支持翻转归到具体组件，供联合
+      判定把它们降级为阻塞。
+
+    共同步数口径仍受计算量/结构/种子对齐约束，因此沿用同一
+    coverage 标注；它替代不了等计算量分析。
+    """
+    report: Dict[str, object] = {
+        "applicable": False,
+        "metric": metric,
+        "common_step_metric": None,
+        "reason": None,
+        "effects": [],
+        "support_flips": [],
+        "sign_flips": [],
+        "claim_flips": [],
+        "component_flips": {},
+        "any_flip": False,
+        "advisory": None,
+    }
+    if metric not in _SELECTION_BIASED_METRICS:
+        report["reason"] = (
+            "当前指标不是验证集选型后的 final 指标，"
+            "无需做共同步数敏感性复核"
+        )
+        return report
+    derived = _common_step_metric_name(metric)
+    report["common_step_metric"] = derived
+    if derived is None:
+        report["reason"] = (
+            "当前指标没有共同步数派生口径（只有周期验证会"
+            "计算的指标才有），无法复核选型偏差"
+        )
+        return report
+    if not primary.get("applicable"):
+        report["reason"] = (
+            "主全因子分析不适用，无法做共同步数敏感性复核"
+        )
+        return report
+
+    common = factorial_effects(
+        aggregates,
+        group_keys,
+        derived,
+        equivalence_margin=equivalence_margin,
+    )
+    report["applicable"] = bool(common.get("applicable"))
+    if not common.get("applicable"):
+        report["reason"] = (
+            "共同步数口径下 mode/balance_coef 未形成可估计的"
+            "全因子设计（可能派生指标缺格）"
+        )
+        return report
+    annotate_factorial_confounds(
+        common,
+        controlled or {},
+        coverage,
+    )
+
+    primary_effects = {
+        _factorial_effect_key(effect): effect
+        for effect in primary.get("effects", [])
+        if isinstance(effect, dict)
+    }
+    common_effects = {
+        _factorial_effect_key(effect): effect
+        for effect in common.get("effects", [])
+        if isinstance(effect, dict)
+    }
+    component_flips: Dict[str, List[Dict[str, object]]] = {}
+    for key, primary_effect in primary_effects.items():
+        common_effect = common_effects.get(key)
+        primary_claim = str(primary_effect.get("claim"))
+        common_claim = (
+            str(common_effect.get("claim"))
+            if common_effect is not None
+            else "missing"
+        )
+        primary_mean = _finite_float(
+            primary_effect.get("mean_effect")
+        )
+        common_mean = (
+            _finite_float(common_effect.get("mean_effect"))
+            if common_effect is not None
+            else None
+        )
+        sign_flip = bool(
+            primary_mean is not None
+            and common_mean is not None
+            and primary_mean != 0.0
+            and common_mean != 0.0
+            and (primary_mean > 0.0)
+            != (common_mean > 0.0)
+        )
+        support_flip = bool(
+            primary_claim == "supports_component"
+            and common_claim != "supports_component"
+        )
+        claim_flip = primary_claim != common_claim
+        record = {
+            "delayed_mode": primary_effect.get("delayed_mode"),
+            "context": primary_effect.get("context"),
+            "effect_name": primary_effect.get("effect_name"),
+            "description": primary_effect.get("description"),
+            "primary_claim": primary_claim,
+            "common_step_claim": common_claim,
+            "primary_mean_effect": primary_mean,
+            "common_step_mean_effect": common_mean,
+            "primary_significant": bool(
+                primary_effect.get("significant")
+            ),
+            "common_step_significant": bool(
+                common_effect.get("significant")
+                if common_effect is not None
+                else False
+            ),
+            "support_flip": support_flip,
+            "sign_flip": sign_flip,
+            "claim_flip": claim_flip,
+        }
+        report["effects"].append(record)
+        if support_flip:
+            report["support_flips"].append(record)
+        if sign_flip:
+            report["sign_flips"].append(record)
+        if claim_flip:
+            report["claim_flips"].append(record)
+        if support_flip:
+            effect_name = str(
+                primary_effect.get("effect_name")
+            )
+            delayed_mode = str(
+                primary_effect.get("delayed_mode")
+            )
+            if effect_name.startswith("balance_loss"):
+                component_name = "balance_loss"
+            elif effect_name.startswith("delayed_merge"):
+                component_name = f"delayed_merge_{delayed_mode}"
+            else:
+                component_name = "interaction"
+            component_flips.setdefault(
+                component_name, []
+            ).append(record)
+
+    report["component_flips"] = component_flips
+    report["any_flip"] = bool(
+        report["support_flips"]
+        or report["sign_flips"]
+        or report["claim_flips"]
+    )
+    if report["support_flips"]:
+        report["advisory"] = (
+            "final 选型口径支持组件的效应在共同步数无偏口径下"
+            "不再支持：主结论依赖 checkpoint 选型，"
+            "不能宣称组件有用"
+        )
+    elif report["sign_flips"]:
+        report["advisory"] = (
+            "共同步数口径下至少一个效应方向与 final 口径相反："
+            "结论对选型偏差敏感"
+        )
+    elif report["claim_flips"]:
+        report["advisory"] = (
+            "共同步数口径下至少一个效应的显著性/混杂判定"
+            "与 final 口径不同：结论不稳健"
+        )
+    else:
+        report["advisory"] = (
+            "共同步数无偏口径与 final 口径的效应 claim 一致"
+        )
+    return report
 
 
 def _current_seed_count(
@@ -27805,6 +28036,21 @@ def print_comparison_analysis(
             controlled,
             matched_coverage,
         )
+    # 选型偏差敏感性：final 指标来自 best_val，可能把种子噪声
+    # 吸收成「组件有用」。在共同步数无偏口径上重估同一全因子，
+    # 支持翻转为不支持时必须降级组件判定。
+    common_step_sensitivity = factorial_common_step_sensitivity(
+        aggregates,
+        group_keys,
+        metric,
+        factorial,
+        coverage,
+        controlled=controlled,
+        equivalence_margin=equivalence_margin,
+    )
+    coverage["common_step_sensitivity"] = (
+        common_step_sensitivity
+    )
     # 组件级联合判定：把分散的主效应/简单效应拼成每个创新点
     # 的单一 verdict，并集中列出阻塞条件。只有全部组件都有
     # 无混杂的支持证据时才允许宣称「各自有用」。
@@ -29374,6 +29620,50 @@ def print_comparison_analysis(
                 "「不显著」本身不构成等价证据"
             )
 
+    if common_step_sensitivity["applicable"]:
+        print()
+        print(
+            "[factorial common-step] 在 "
+            f"{common_step_sensitivity['common_step_metric']} "
+            "上复核选型偏差（无 checkpoint 选择的即时口径）"
+        )
+        if common_step_sensitivity["effects"]:
+            def _delta_text(value: object) -> str:
+                if value is None:
+                    return "-"
+                return f"{float(value):+.4f}"
+
+            for item in common_step_sensitivity["effects"]:
+                flag = ""
+                if item["support_flip"]:
+                    flag = " [FLIP]"
+                elif item["sign_flip"]:
+                    flag = " [SIGN-FLIP]"
+                elif item["claim_flip"]:
+                    flag = " [claim-changed]"
+                print(
+                    "  "
+                    f"{item.get('delayed_mode')}/"
+                    f"{item.get('effect_name')}: "
+                    f"final={item['primary_claim']} "
+                    f"(Δ={_delta_text(item.get('primary_mean_effect'))}), "
+                    "common-step="
+                    f"{item['common_step_claim']} "
+                    f"(Δ={_delta_text(item.get('common_step_mean_effect'))})"
+                    + flag
+                )
+        else:
+            print("  无共同步数效应可比较")
+        if common_step_sensitivity["support_flips"]:
+            print(
+                "  [warn] "
+                + str(common_step_sensitivity["advisory"])
+            )
+        else:
+            print(
+                "  " + str(common_step_sensitivity["advisory"])
+            )
+
     if component_verdicts["applicable"]:
         print()
         print(
@@ -29584,6 +29874,9 @@ def print_comparison_analysis(
         "ablation_coverage": coverage,
         "balance_scale": balance_scale,
         "factorial_effects": factorial,
+        "factorial_common_step_sensitivity": (
+            common_step_sensitivity
+        ),
         "ablation_component_verdicts": component_verdicts,
         "factorial_effects_compute_matched": (
             factorial_compute_matched
@@ -38411,6 +38704,9 @@ def run_self_test():
             precision_recall: Optional[Dict[str, float]] = None,
             preregistration: Optional[Dict[str, object]] = None,
             curve_status: Optional[str] = None,
+            periodic_val_loss: Optional[
+                List[Tuple[int, float]]
+            ] = None,
             n_params: Optional[int] = None,
             flops: Optional[int] = None,
             ngram_tuning_metric: Optional[str] = None,
@@ -38501,6 +38797,15 @@ def run_self_test():
                 encoding="utf-8",
             ) as f:
                 json.dump(config_payload, f)
+
+            for step, periodic_loss in periodic_val_loss or []:
+                write_jsonl_record(
+                    run_dir / "metrics.jsonl",
+                    {
+                        "step": step,
+                        "val_loss": periodic_loss,
+                    },
+                )
 
             if curve_status is not None:
                 write_jsonl_record(
@@ -40487,6 +40792,130 @@ def run_self_test():
         assert any(
             "种子" in blocker
             for blocker in misaligned_verdicts["blockers"]
+        )
+
+        # 共同步数敏感性：final 口径显示 A 恒定改善，但周期
+        # 曲线在共同步数点的 A 效应均值恰好为 0。选型口径的
+        # 支持必须在无偏口径下降级，不能继续宣称组件有用。
+        sensitivity_paths = []
+        for seed, offset, common_delta in (
+            (1, 0.0, 0.02),
+            (2, 0.02, -0.01),
+            (3, -0.02, -0.01),
+        ):
+            sensitivity_paths.extend([
+                _write_analysis_run(
+                    f"sens_local_off_s{seed}",
+                    "local_base",
+                    seed,
+                    3e-4,
+                    10,
+                    0.0,
+                    3.00 + offset,
+                    periodic_val_loss=[
+                        (10, 4.00 + offset),
+                    ],
+                ),
+                _write_analysis_run(
+                    f"sens_A_off_s{seed}",
+                    "A",
+                    seed,
+                    3e-4,
+                    10,
+                    0.0,
+                    2.90 + offset,
+                    periodic_val_loss=[
+                        (10, 4.00 + offset + common_delta),
+                    ],
+                ),
+                _write_analysis_run(
+                    f"sens_local_on_s{seed}",
+                    "local_base",
+                    seed,
+                    3e-4,
+                    10,
+                    0.01,
+                    2.95 + offset,
+                    periodic_val_loss=[
+                        (10, 3.95 + offset),
+                    ],
+                ),
+                _write_analysis_run(
+                    f"sens_A_on_s{seed}",
+                    "A",
+                    seed,
+                    3e-4,
+                    10,
+                    0.01,
+                    2.85 + offset,
+                    periodic_val_loss=[
+                        (
+                            10,
+                            3.95
+                            + offset
+                            + common_delta,
+                        ),
+                    ],
+                ),
+            ])
+        sensitivity_rows = compare_runs(sensitivity_paths)
+        sensitivity_common = annotate_common_step_metrics(
+            sensitivity_rows
+        )
+        assert sensitivity_common["ok"], sensitivity_common
+        sensitivity_aggregates = aggregate_runs(
+            sensitivity_rows,
+            ["mode", "balance_coef"],
+        )
+        sensitivity_primary = factorial_effects(
+            sensitivity_aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        sensitivity_report = (
+            factorial_common_step_sensitivity(
+                sensitivity_aggregates,
+                ["mode", "balance_coef"],
+                "val_loss",
+                sensitivity_primary,
+                component_coverage,
+                controlled={"ok": True, "unchecked_keys": []},
+            )
+        )
+        assert sensitivity_report["applicable"]
+        assert any(
+            item["effect_name"] == "delayed_merge_main"
+            and item["effect_name"] in {
+                str(record["effect_name"])
+                for record in sensitivity_report[
+                    "support_flips"
+                ]
+            }
+            for item in sensitivity_primary["effects"]
+        ), sensitivity_report
+        assert "delayed_merge_A" in sensitivity_report[
+            "component_flips"
+        ]
+        sensitivity_coverage = json.loads(
+            json.dumps(component_coverage)
+        )
+        sensitivity_coverage[
+            "common_step_sensitivity"
+        ] = sensitivity_report
+        sensitivity_verdicts = ablation_component_verdicts(
+            sensitivity_primary,
+            sensitivity_coverage,
+        )
+        assert not sensitivity_verdicts[
+            "all_components_supported"
+        ]
+        assert (
+            sensitivity_verdicts["statuses"]["delayed_merge_A"]
+            == "inconclusive"
+        )
+        assert any(
+            "共同步数" in blocker
+            for blocker in sensitivity_verdicts["blockers"]
         )
 
         # 全局种子对齐：每个 2×2 内部对齐但 A/B 使用不同
