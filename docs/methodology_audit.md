@@ -8,7 +8,8 @@
 > 最小效应门槛检验、失败率报告、固定共同步数、块 bootstrap、
 > 数据切分口径声明、测试内容参与清洗的披露、测试集访问账本与
 > 工作流冻结开关。本轮另补上结果脆弱性/单种子依赖检查与精确
-> 符号检验（见第 26 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> 符号检验（见第 26 节），以及同时置信区间与种子×窗口两层
+> 不确定性/方差分解（见第 28 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
 > context、文档级 segment attention mask、WSD 调度与
 > `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
 > 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
@@ -209,8 +210,11 @@ Welch、每个运行一个样本」，与实际不符；折叠时也没有检查
 **已修正：** 新增 `--eval-bootstrap-block N`：N>1 时用循环移动块
 bootstrap 重采样连续窗口，报告 `bootstrap_unit` 与
 `bootstrap_block_size`。仍有限制：没有按文档/来源的 cluster
-bootstrap，也没有把种子层级并入窗口区间；窗口级比较仍只应作为
-辅助证据，主检验是种子级。
+bootstrap；但种子层级已并入窗口区间：逐窗口配对的跨种子汇总
+另给种子×窗口两层 bootstrap 与方差分解（见第 28 节），
+`dominant_source` 区分该补种子还是扩评估集。两层区间仍只
+条件于当前固定窗口，窗口级比较仍只应作为辅助证据，主检验是
+种子级。
 
 ## 12. 最小有意义效应（第 13 项）
 
@@ -532,6 +536,74 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 等价性检验。机器/负载漂移若与区组内位置相关，随机化只能平衡、
 不能消除，仍需调查或重跑。
 
+## 28. 结果分析：同时置信区间与种子×窗口两层不确定性（本轮补充）
+
+**判定：此前的区间与判定口径不完全一致，且窗口级与种子级
+不确定性从未被放进同一个区间。**
+
+1. 每个对比/因子效应报告的是**逐检验** 95% CI，但显著性判定
+   用的是 Holm 校正后的 p 值。家族 m>1 时，读者会看到
+   「95% CI 不含 0，却 significant=false」；这不是数学矛盾，
+   而是「描述单个参数的区间」与「控制族错误率的判定」回答了
+   不同问题。原报告没有把这一区别写进结果字段，容易被误读为
+   实现错误，或反过来被拿来主张未校正的显著性。
+2. `_paired_window_bootstrap_ci` 只在一个种子的窗口内重采样，
+   `_cell_window_paired_analysis` 只把各种子的窗口均值再平均；
+   两者都没有给出「同时考虑训练种子与评估窗口」的区间，也没有
+   回答「下一步该加种子还是该扩大评估集」。这是本文件第 11 节
+   已披露、但一直未实现的限制。
+
+**已修正：**
+
+- 新增 `_attach_family_adjusted_intervals`：对单因子对比、
+  `--compare-baseline` 直接对比与全因子主效应/交互，在各自
+  检验家族内附加 **Bonferroni 同时区间**（置信水平
+  `1−α/m`）。字段为 `ci_family_adjusted_low/high`、
+  `ci_family_adjusted_alpha`、`ci_family_adjusted_family_size`、
+  `ci_family_adjusted_method`、`ci_family_adjusted_excludes_zero`
+  与 `ci_family_adjusted_decision_consistent`。逐检验 95% CI
+  （`ci95_*`）保留用于描述效应量范围。同时区间不含 0 是
+  Holm 校正后显著的**充分条件**，不是必要条件；报告不再把
+  两者混成一个判定。展示层在 m>1 时同时打印两套区间，并注明
+  `Bonferroni α/m`。
+- 新增 `_hierarchical_window_bootstrap_ci`：对 seed × window
+  交叉设计做两向 bootstrap——有放回重采样种子，同时有放回
+  重采样同一批固定窗口（所有抽中的种子共用同一组窗口下标，
+  保留同一窗口跨种子配对的结构），最后对交叉重采样后的窗口
+  差值取种子平均。区间反映「换一批训练种子 + 换一批同分布
+  评估窗口」的联合不确定性；随机种子由差值内容确定性派生，
+  报告可复现。结果写入每个对比的
+  `window_paired.hierarchical_bootstrap_ci95`。
+- 新增 `_window_variance_components`：用两向 ANOVA 分解
+  seed × window 交叉设计的方差分量（种子主效应 τ²、窗口主效应
+  ω²、种子×窗口交互 σ²），报告换种子且换窗口时的
+  `τ²/S + ω²/W + σ²/(S·W)`、固定窗口时的
+  `τ²/S + σ²/(S·W)`，以及三层标准差、方差占比
+  （`variance_share_seed/window/interaction`）、
+  `seed_mean_reliability`、`dominant_source` 与
+  `new_seed_mean_prediction_interval_95`（同一批固定窗口上换一个
+  新种子的预测区间）。直接取种子均值的样本方差会把窗口抽样
+  噪声算进种子层，这里用 ANOVA 均方扣除。`dominant_source`
+  给出可执行建议：种子主效应占主导时增加评估窗口无济于事；
+  窗口主效应占主导时盲目加种子不经济；交互占主导时需要同时
+  增加两者。
+- 两层结果随 `comparison_analysis.json` 落盘；展示层新增
+  `[window]` 行内的两层 bootstrap 区间与方差占比，不再只报
+  「固定窗口上的点估计 + 单种子窗口 bootstrap」。
+- 新增回归测试：同时区间的族规模/宽度/判定一致性、两层
+  bootstrap 的可复现性与退化处理、方差占比与预测区间、
+  逐窗口分析不把原始差值落进 `per_seed` 明细。
+
+仍有限制：Bonferroni 同时区间比 Holm 保守，家族很大时区间
+可能宽到没有实际信息量；两层 bootstrap 在 3~6 个种子时种子
+重采样很粗，百分位区间可能偏窄或不稳定，只作描述性证据，不能
+替代增加独立种子。方差分解与预测区间都条件于**这批固定评估
+窗口**，不覆盖换文档/来源的外推；按文档/来源的 cluster
+bootstrap 仍未实现。交叉 bootstrap 把窗口当可交换单位，未做
+AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都会
+偏小，应同时查看逐种子 `window_lag1_autocorrelation`。预测
+区间是频率派 t 近似，不是贝叶斯后验预测。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -550,8 +622,11 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
    完整计算图比例；按同一 `--run-order-seed` 执行随机化区组。
 5. 统计：主检验配对 t + 符号翻转（明确对称性假设）；报告
    失败率、MDE、门槛检验、TOST、`fragility_summary` 与
-   `run_order`；删除种子后不再显著的结论不能写成稳健，
-   不把不显著读成等价；顺序强相关先查漂移。
+   `run_order`；逐检验 95% CI 只描述效应量，校正后的结论以
+   Holm 为准，并同时报告 Bonferroni `α/m` 同时区间；窗口级
+   证据同时报告种子×窗口两层 bootstrap 与方差占比，用它
+   决定补种子还是扩评估集。删除种子后不再显著的结论不能写成
+   稳健，不把不显著读成等价；顺序强相关先查漂移。
 6. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
    每个候选只解封一次；用 `--final-test-comparison` 报告全部
    候选，而不是只报告最好的那个。

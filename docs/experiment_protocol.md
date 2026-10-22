@@ -222,6 +222,17 @@ python experiment.py --data corpus.txt --out runs/confirm \
 
 - 主检验：同种子配对 t（双侧）+ 对称性假设下的符号翻转；两者
   都做 Holm 校正。报告效应量、95% CI、MDE、门槛检验与 TOST。
+- 逐检验 95% CI 只描述效应量，不能替代多重比较校正后的判定：
+  家族 m>1 时报告另附 Bonferroni `α/m` 同时区间
+  （`ci_family_adjusted_*`）。同时区间不含 0 是 Holm 显著的
+  充分条件；若逐检验 CI 不含 0 而校正后不显著，结论以校正后
+  判定为准，不得把逐检验区间当作显著证据。
+- 窗口级证据同时报告种子×窗口两层 bootstrap 区间
+  （`window_paired.hierarchical_bootstrap_ci95`）与方差分解
+  （`window_paired.variance_components`）。`dominant_source`
+  为 `training_seed` 时优先增加独立种子；为
+  `evaluation_windows` 时优先扩大/改进评估集；两层区间都只
+  条件于当前固定窗口，不能外推到换文档/来源。
 - 不显著 ≠ 等价；只有 TOST 校正后通过才能说「无实质差异」。
 - 共同步数用预注册的 `--common-step`；报告
   `target_step_rule` 与 `target_step_data_dependent`。

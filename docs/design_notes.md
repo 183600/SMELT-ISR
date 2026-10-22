@@ -327,8 +327,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   在相同数据上的指标；跨运行对比只使用 val 口径指标，test 结果
   只在单个运行自身的 `metrics.jsonl` 中报告，避免「挑 test 最好」
   的隐式测试集调参。同时输出受控变量检查、按实验单元聚合的
-  Mean ± Std、单因子显著性检验（含 Holm 多重比较校正与
-  95% 置信区间）与消融覆盖报告（见下节）。默认只打印；显式
+  Mean ± Std、单因子显著性检验（含 Holm 多重比较校正、逐检验
+  95% CI 与 Bonferroni 同时区间）与消融覆盖报告（见下节）。
+  默认只打印；显式
   传 `--compare-report FILE` 时把完整分析（含 `fragility_summary`）
   写入 JSON，便于随运行目录一起归档与复核，而不是只留在终端。
 - **结果脆弱性（单种子敏感性）**：显著性检验回答的是「整批
@@ -364,6 +365,43 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   该检查是**描述性敏感性分析**，不新增显著性检验，也不替代
   主检验；但它把「显著但只靠少数种子」与「多数种子同向且
   删除后仍显著」区分开。
+- **同时置信区间（与多重比较判定同族）**：每个对比/因子效应
+  的 `ci95_low/high` 是**逐检验**区间，对应未校正 p 值；显著性
+  判定却以 Holm 校正为准。家族 m>1 时两者可能「看起来矛盾」
+  （CI 不含 0 但 `significant=false`）。报告因此另附
+  `ci_family_adjusted_low/high`：按 Bonferroni `α/m` 构造的
+  **同时区间**，保证整个家族参数同时被覆盖的概率 ≥ `1−α`。
+  `ci_family_adjusted_excludes_zero` 是 Holm 显著的充分条件，
+  不是必要条件；`ci_family_adjusted_decision_consistent` 只在
+  同时区间不含 0 而判定不显著时才会为 False（实现/口径错误）。
+  展示层在 m>1 时同时打印逐检验与同时区间，并注明
+  `Bonferroni α/m`。逐检验 CI 继续用于描述效应量范围，不能
+  替代校正后的显著性。
+- **种子×窗口两层不确定性**：`paired_window_comparison` 的
+  bootstrap 只覆盖单个种子的窗口抽样，`_cell_window_paired_analysis`
+  只把各种子均值再平均。新增
+  `_hierarchical_window_bootstrap_ci`：对 seed × window 交叉
+  设计做两向 bootstrap——有放回重采样种子，同时用同一组窗口
+  下标重采样固定窗口，保留同一窗口跨种子配对的结构，最后对
+  交叉重采样后的窗口差值取种子平均。新增
+  `_window_variance_components`：用两向 ANOVA 分解 seed × window
+  交叉设计的方差分量（种子主效应 τ²、窗口主效应 ω²、交互 σ²），
+  报告换种子且换窗口的 `τ²/S + ω²/W + σ²/(S·W)`、固定窗口的
+  `τ²/S + σ²/(S·W)`、三层标准差与方差占比
+  （`variance_share_seed/window/interaction`）、
+  `seed_mean_reliability`、`dominant_source` 与同一批固定窗口
+  上「换一个新种子」的 `new_seed_mean_prediction_interval_95`。
+  直接取种子均值的样本方差会把窗口抽样噪声算进种子层，这里用
+  ANOVA 均方扣除。`dominant_source=training_seed` 时增加评估
+  窗口不能显著收窄区间，应增加独立种子；`evaluation_windows`
+  时盲目加种子不经济，应扩大/改进评估集；
+  `seed_window_interaction` 时两者都要补。这些字段随
+  `window_paired` 写入 `comparison_analysis.json`，展示层在
+  `[window]` 行内给出两向区间与方差占比。交叉 bootstrap 把
+  窗口当可交换单位、未做 AR(1) 膨胀；窗口正自相关时两层区间
+  与窗口/交互方差分量都会偏小，应同时查看逐种子
+  `window_lag1_autocorrelation`。方差分解与预测区间都条件于
+  当前固定窗口，不覆盖换文档/来源的外推。
 
 ## 实验设计与准备
 
@@ -602,6 +640,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   校正的 `window_p_value_ar1`（标准误乘 √(n/n_eff)，自由度
   n_eff−1，只放宽不收窄）；n_eff<3 时不给校正 p 值并标记
   `effective_windows_below_three`，而不是继续报原始显著性。
+  上面的窗口 bootstrap 仍只覆盖「一个种子内的窗口抽样」。
+  跨种子汇总的 `window_paired` 另给 seed × window 交叉的两向
+  bootstrap（同时重采样种子与同一批窗口下标）与方差分解，见
+  上文「种子×窗口两层不确定性」；`dominant_source` 直接提示该补
+  种子还是扩大评估集。两层区间与方差分解都条件于这批固定
+  窗口，不能外推到换文档/来源。
   **AUC 覆盖率**：AUC 需要保留逐 token 概率，默认最多
   100,000 个评估位置（`_AUC_MAX_TOKENS`）。超过上限时不再
   截取评估序列前缀（会让后段窗口系统性缺席），而是在全局

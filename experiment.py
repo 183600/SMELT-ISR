@@ -23291,6 +23291,7 @@ def _paired_window_bootstrap_ci(
 def paired_window_comparison(
     payload_a: Dict[str, object],
     payload_b: Dict[str, object],
+    include_differences: bool = False,
 ) -> Dict[str, object]:
     """
     两个运行在同一批固定评估窗口上的配对比较。
@@ -23312,6 +23313,9 @@ def paired_window_comparison(
       训练随机性仍由种子级检验负责；
     - 差异方向按「b 相对 a」给出：loss 类指标越低越好，
       accuracy 类指标越高越好。
+
+    ``include_differences=True`` 时额外返回逐窗口差值列表，供
+    跨种子的两向 bootstrap 使用；默认不返回以控制报告体积。
     """
     fingerprint_a = _eval_window_fingerprint(payload_a)
     fingerprint_b = _eval_window_fingerprint(payload_b)
@@ -23471,6 +23475,11 @@ def paired_window_comparison(
                 if value > 0.0
             ) / len(accuracy_differences)
         )
+    # 默认不把逐窗口差值写进结果（报告体积大）；两层 bootstrap
+    # 需要按种子聚集的原始差值，调用方显式要求才返回，并在
+    # 归档前由调用方取出、不落入 per_seed 明细。
+    if include_differences:
+        result["loss_differences"] = list(loss_differences)
     return result
 
 
@@ -23499,6 +23508,422 @@ def _cell_window_payloads_by_seed(
         else:
             by_seed[value] = payload
     return by_seed, sorted(duplicate_seeds)
+
+
+def _clean_window_differences(
+    per_seed_differences: Dict[int, List[float]],
+) -> Dict[int, List[float]]:
+    """过滤非有限窗口差值；保留可排序的整数种子键。"""
+    cleaned: Dict[int, List[float]] = {}
+    for seed in sorted(per_seed_differences):
+        values = per_seed_differences.get(seed)
+        if not isinstance(values, list):
+            continue
+        numeric = [
+            float(value)
+            for value in values
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
+        if len(numeric) != len(values):
+            continue
+        if not numeric or any(
+            not math.isfinite(value) for value in numeric
+        ):
+            continue
+        cleaned[int(seed)] = numeric
+    return cleaned
+
+
+def _hierarchical_window_bootstrap_ci(
+    per_seed_differences: Dict[int, List[float]],
+    replicates: int = _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+) -> Dict[str, object]:
+    """
+    种子 × 评估窗口交叉设计的 bootstrap 区间。
+
+    现有 ``paired_window_comparison`` 的 bootstrap 只在一个种子的
+    窗口内重采样，``_cell_window_paired_analysis`` 又只把各 seed
+    的窗口均值平均后当点估计——两者都没有回答「同时考虑训练
+    随机性与评估窗口抽样时，总体均值差有多不确定」。
+
+    固定评估窗口在所有种子上是**同一批**，因此设计是
+    seed × window 交叉，而不是窗口嵌套在种子里。这里做两向
+    （crossed）bootstrap：
+
+    1. 有放回重采样种子；
+    2. 有放回重采样同一批固定窗口（所有抽中的种子共用同一组
+       窗口下标，保留「同一窗口跨种子配对」的结构）；
+    3. 对交叉重采样后的窗口差值取种子平均，得到一次统计量。
+
+    区间反映「换一批训练种子 + 换一批同分布评估窗口」的联合
+    不确定性。种子数很少（3~6）时种子重采样很粗，百分位
+    区间可能偏窄/不稳定；它只作为两层不确定性的描述，不能
+    替代增加独立种子，也不改变种子级主检验的判定。
+    """
+    cleaned = _clean_window_differences(per_seed_differences)
+    usable = {
+        seed: values
+        for seed, values in cleaned.items()
+        if len(values) >= 2
+    }
+    if len(usable) < 2:
+        return {
+            "available": False,
+            "reason": "insufficient_seeds_or_windows",
+            "n_seeds": len(usable),
+            "note": (
+                "两层 bootstrap 至少需要 2 个种子且每个种子至少 "
+                "2 个评估窗口；不足时不伪造区间"
+            ),
+        }
+    seed_order = sorted(usable)
+    window_counts = {
+        len(usable[seed]) for seed in seed_order
+    }
+    if len(window_counts) != 1:
+        return {
+            "available": False,
+            "reason": "inconsistent_window_counts",
+            "n_seeds": len(seed_order),
+            "window_counts": [
+                len(usable[seed]) for seed in seed_order
+            ],
+            "note": (
+                "固定评估窗口在各运行间应逐位相同；窗口数不一致"
+                "时不能用同一组窗口下标做交叉 bootstrap"
+            ),
+        }
+    seed_count = len(seed_order)
+    window_count = len(usable[seed_order[0]])
+    flatten = [
+        value
+        for seed in seed_order
+        for value in usable[seed]
+    ]
+    generator = torch.Generator().manual_seed(
+        _randomization_seed(flatten)
+    )
+    # (R, S) 的种子重采样下标与 (R, W) 的窗口重采样下标：
+    # 所有抽中的种子共用同一组窗口下标，保留跨种子配对结构。
+    seed_indices = torch.randint(
+        low=0,
+        high=seed_count,
+        size=(int(replicates), seed_count),
+        generator=generator,
+    )
+    window_indices = torch.randint(
+        low=0,
+        high=window_count,
+        size=(int(replicates), window_count),
+        generator=generator,
+    )
+    resampled_means = torch.empty(
+        (int(replicates), seed_count),
+        dtype=torch.float64,
+    )
+    for column, seed in enumerate(seed_order):
+        values = torch.tensor(
+            usable[seed], dtype=torch.float64
+        )
+        resampled_means[:, column] = values[
+            window_indices
+        ].mean(dim=1)
+    draws = torch.gather(
+        resampled_means, 1, seed_indices
+    ).mean(dim=1)
+    low = float(torch.quantile(draws, 0.025).item())
+    high = float(torch.quantile(draws, 0.975).item())
+    return {
+        "available": True,
+        "low": low,
+        "high": high,
+        "replicates": int(replicates),
+        "n_seeds": seed_count,
+        "n_windows": window_count,
+        "n_windows_min": window_count,
+        "n_windows_max": window_count,
+        "method": "crossed_seed_window_percentile_bootstrap",
+        "resampling": "seeds_and_windows_with_replacement",
+        "note": (
+            "同时反映训练种子与固定评估窗口两层不确定性；"
+            "窗口按可交换单位重采样，未做 AR(1) 膨胀，"
+            "正自相关时区间可能偏窄；种子数少时重采样较粗，"
+            "区间只作描述，不能替代增加独立种子或扩大评估集"
+        ),
+    }
+
+
+def _window_variance_components(
+    per_seed_differences: Dict[int, List[float]],
+) -> Dict[str, object]:
+    """
+    用两向方差分析把 seed × window 交叉设计的方差分开。
+
+    固定评估窗口在所有种子上是同一批，设计是 seed × window
+    交叉而非窗口嵌套。对可加模型
+
+        d_{s,w} = μ + a_s + b_w + e_{s,w}
+
+    用 ANOVA 平方和估计三个方差分量：种子主效应 τ²、窗口主效应
+    ω² 与种子×窗口交互/残差 σ²。总体均值 d̄ 的方差为
+
+        Var(d̄) = τ²/S + ω²/W + σ²/(S·W)      （换种子且换窗口）
+
+    若只换种子、仍用这批固定窗口，窗口主效应 b_w 被平均成常数，
+    只剩
+
+        Var(d̄ | 固定窗口) = τ²/S + σ²/(S·W) 。
+
+    报告两层（三层）方差占比、种子均值的可靠性，以及「换一个
+    新种子、仍用这批固定窗口」的预测区间。方差占比决定下一步
+    该加种子还是该扩大评估集：种子主效应占主导时增加窗口无济于
+    事；窗口主效应占主导时盲目加种子也不经济；交互占主导时
+    需要同时增加两者。这是描述性的方差分解，不是新的显著性
+    检验。
+
+    直接取种子均值的样本方差会把窗口抽样噪声算进种子层，这里
+    用两向 ANOVA 的均方扣除，避免重复计入。
+    """
+    cleaned = _clean_window_differences(per_seed_differences)
+    usable = {
+        seed: values
+        for seed, values in cleaned.items()
+        if len(values) >= 2
+    }
+    if not usable:
+        return {
+            "available": False,
+            "reason": "no_seed_with_multiple_windows",
+        }
+    seed_order = sorted(usable)
+    window_counts = [
+        len(usable[seed]) for seed in seed_order
+    ]
+    seed_count = len(seed_order)
+    if len(set(window_counts)) != 1:
+        return {
+            "available": False,
+            "reason": "unbalanced_window_counts",
+            "n_seeds": seed_count,
+            "window_counts": window_counts,
+            "note": (
+                "两向方差分解要求每个种子使用同一批固定窗口；"
+                "窗口数不一致时不做该分解"
+            ),
+        }
+    window_count = window_counts[0]
+    if seed_count < 2 or window_count < 2:
+        return {
+            "available": False,
+            "reason": "insufficient_seeds_for_variance_components",
+            "n_seeds": seed_count,
+            "n_windows": window_count,
+            "note": (
+                "至少需要 2 个种子与 2 个窗口才能分离种子层与"
+                "窗口层方差；不足时不伪造分解"
+            ),
+        }
+
+    matrix = [usable[seed] for seed in seed_order]
+    grand_mean = (
+        sum(sum(row) for row in matrix)
+        / float(seed_count * window_count)
+    )
+    seed_means = [
+        sum(row) / float(window_count) for row in matrix
+    ]
+    window_means = [
+        sum(matrix[index][column] for index in range(seed_count))
+        / float(seed_count)
+        for column in range(window_count)
+    ]
+    ss_seed = window_count * sum(
+        (mean - grand_mean) ** 2 for mean in seed_means
+    )
+    ss_window = seed_count * sum(
+        (mean - grand_mean) ** 2 for mean in window_means
+    )
+    ss_total = sum(
+        (value - grand_mean) ** 2
+        for row in matrix
+        for value in row
+    )
+    # 浮点误差可能让三项之和大一点点；截断到 0 而不是产生
+    # 负的方差分量。
+    ss_error = max(0.0, ss_total - ss_seed - ss_window)
+    df_seed = seed_count - 1
+    df_window = window_count - 1
+    df_error = df_seed * df_window
+    ms_seed = ss_seed / float(df_seed)
+    ms_window = ss_window / float(df_window)
+    ms_error = ss_error / float(df_error) if df_error > 0 else 0.0
+
+    # 两向随机效应方差分量（可能为负，按惯例截断到 0，并记录）。
+    raw_seed_var = (ms_seed - ms_error) / float(window_count)
+    raw_window_var = (ms_window - ms_error) / float(seed_count)
+    seed_var = max(0.0, raw_seed_var)
+    window_var = max(0.0, raw_window_var)
+    error_var = max(0.0, ms_error)
+
+    mean_seed_var = seed_var / float(seed_count)
+    mean_window_var = window_var / float(window_count)
+    mean_error_var = error_var / float(
+        seed_count * window_count
+    )
+    total_mean_var = (
+        mean_seed_var + mean_window_var + mean_error_var
+    )
+    same_window_mean_var = mean_seed_var + mean_error_var
+
+    components: Dict[str, object] = {
+        "available": True,
+        "n_seeds": seed_count,
+        "n_windows": window_count,
+        "n_windows_total": seed_count * window_count,
+        "n_windows_min": window_count,
+        "n_windows_max": window_count,
+        "seed_mean_effect": grand_mean,
+        "between_seed_sd": math.sqrt(seed_var),
+        "window_sd": math.sqrt(window_var),
+        "within_seed_sd_mean": math.sqrt(error_var),
+        "within_seed_mean_sd": math.sqrt(
+            error_var / float(window_count)
+        ),
+        "variance_components_single_observation": {
+            "seed": seed_var,
+            "window": window_var,
+            "interaction": error_var,
+            "raw_seed": raw_seed_var,
+            "raw_window": raw_window_var,
+            "truncated_at_zero": bool(
+                raw_seed_var < 0.0 or raw_window_var < 0.0
+            ),
+        },
+        "variance_components_of_mean": {
+            "seed": mean_seed_var,
+            "window": mean_window_var,
+            "interaction": mean_error_var,
+            "total": total_mean_var,
+        },
+        "variance_of_mean": total_mean_var,
+        "std_error_of_mean": math.sqrt(total_mean_var),
+        "variance_of_mean_same_windows": same_window_mean_var,
+        "std_error_of_mean_same_windows": math.sqrt(
+            same_window_mean_var
+        ),
+        "variance_share_seed": None,
+        "variance_share_window": None,
+        "variance_share_interaction": None,
+        "variance_share_seed_same_windows": None,
+        "variance_share_interaction_same_windows": None,
+        "seed_mean_reliability": None,
+        "dominant_source": None,
+        "dominant_source_same_windows": None,
+        "mean_squares": {
+            "seed": ms_seed,
+            "window": ms_window,
+            "error": ms_error,
+        },
+        "degrees_of_freedom": {
+            "seed": df_seed,
+            "window": df_window,
+            "error": df_error,
+        },
+        "method": "two_way_anova_variance_components",
+        "note": (
+            "方差分解针对 seed × window 交叉设计；窗口主效应"
+            "只在换评估窗口时计入，换种子但仍用固定窗口时不"
+            "计入。窗口沿评估序列正自相关时窗口/交互分量会"
+            "偏小；种子数少时方差分量估计很粗，占比只作"
+            "方向性参考"
+        ),
+    }
+
+    if total_mean_var > 0.0:
+        share_seed = mean_seed_var / total_mean_var
+        share_window = mean_window_var / total_mean_var
+        share_interaction = mean_error_var / total_mean_var
+        components["variance_share_seed"] = share_seed
+        components["variance_share_window"] = share_window
+        components["variance_share_interaction"] = (
+            share_interaction
+        )
+        if share_seed >= 0.8:
+            dominant = "training_seed"
+            advisory = (
+                "不确定性主要来自训练种子：增加评估窗口不能"
+                "显著收窄区间，应增加独立种子或降低种子间"
+                "方差"
+            )
+        elif share_window >= 0.8:
+            dominant = "evaluation_windows"
+            advisory = (
+                "不确定性主要来自评估窗口：盲目增加种子不"
+                "经济，应扩大/改进评估集或降低窗口级噪声"
+            )
+        elif share_interaction >= 0.8:
+            dominant = "seed_window_interaction"
+            advisory = (
+                "不确定性主要来自种子×窗口交互：需要同时增加"
+                "独立种子并扩大评估集，单补一层不够"
+            )
+        else:
+            dominant = "mixed"
+            advisory = (
+                "种子、窗口与交互三层方差都不小：需要同时"
+                "增加独立种子并扩大评估集，单补一层不够"
+            )
+        components["dominant_source"] = dominant
+        components["advisory"] = advisory
+
+    if same_window_mean_var > 0.0:
+        components["variance_share_seed_same_windows"] = (
+            mean_seed_var / same_window_mean_var
+        )
+        components["variance_share_interaction_same_windows"] = (
+            mean_error_var / same_window_mean_var
+        )
+        if mean_seed_var / same_window_mean_var >= 0.8:
+            components["dominant_source_same_windows"] = (
+                "training_seed"
+            )
+        elif mean_error_var / same_window_mean_var >= 0.8:
+            components["dominant_source_same_windows"] = (
+                "seed_window_interaction"
+            )
+        else:
+            components["dominant_source_same_windows"] = "mixed"
+
+    reliability_denominator = seed_var + (
+        error_var / float(window_count)
+    )
+    if reliability_denominator > 0.0:
+        components["seed_mean_reliability"] = (
+            seed_var / reliability_denominator
+        )
+
+    if seed_count >= 3:
+        critical = _t_critical(float(seed_count - 1))
+        if critical is not None:
+            predicted_sd = math.sqrt(
+                seed_var + error_var / float(window_count)
+            )
+            components[
+                "new_seed_mean_prediction_interval_95"
+            ] = {
+                "low": grand_mean - critical * predicted_sd,
+                "high": grand_mean + critical * predicted_sd,
+                "df": seed_count - 1,
+                "t_critical": critical,
+                "method": "t_prediction_new_seed_mean",
+                "note": (
+                    "同一批固定评估窗口上「换一个新训练种子」"
+                    "的均值差预测区间；不包含窗口主效应，"
+                    "不是换评估集的外推"
+                ),
+            }
+    return components
 
 
 def _cell_window_paired_analysis(
@@ -23560,10 +23985,21 @@ def _cell_window_paired_analysis(
         }
 
     per_seed: List[Dict[str, object]] = []
+    seed_loss_differences: Dict[int, List[float]] = {}
     for seed in common_seeds:
         comparison = paired_window_comparison(
-            payloads_a[seed], payloads_b[seed]
+            payloads_a[seed],
+            payloads_b[seed],
+            include_differences=True,
         )
+        differences = comparison.pop("loss_differences", None)
+        if (
+            comparison.get("status") == "ok"
+            and isinstance(differences, list)
+        ):
+            seed_loss_differences[int(seed)] = [
+                float(value) for value in differences
+            ]
         per_seed.append({"seed": seed, **comparison})
 
     usable = [
@@ -23591,6 +24027,15 @@ def _cell_window_paired_analysis(
     overall_mean = sum(mean_diffs) / len(mean_diffs)
     favoring = sum(1 for value in mean_diffs if value < 0.0)
     against = sum(1 for value in mean_diffs if value > 0.0)
+    # 两层不确定性：逐窗口 bootstrap（现有字段）只覆盖一个种子
+    # 的窗口抽样；这里再把种子作为 cluster 纳入，并给出方差
+    # 分解，回答「该加种子还是该扩大评估集」。
+    hierarchical = _hierarchical_window_bootstrap_ci(
+        seed_loss_differences
+    )
+    variance_components = _window_variance_components(
+        seed_loss_differences
+    )
     overlap_fractions = [
         entry.get("overlap_fraction")
         for entry in usable
@@ -23615,9 +24060,14 @@ def _cell_window_paired_analysis(
     notes.append(
         "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
     )
+    variance_advisory = variance_components.get("advisory")
+    if isinstance(variance_advisory, str) and variance_advisory:
+        notes.append(variance_advisory)
     return {
         "available": True,
         "n_seeds": len(usable),
+        "hierarchical_bootstrap_ci95": hierarchical,
+        "variance_components": variance_components,
         "seeds": [int(entry["seed"]) for entry in usable],
         "per_seed": per_seed,
         "mean_loss_diff": overall_mean,
@@ -24258,6 +24708,91 @@ def _contrast_interval(
         "ci95_high": high,
         "ci95_excludes_zero": (low > 0.0) or (high < 0.0),
     }
+
+
+def _attach_family_adjusted_intervals(
+    items: Sequence[Dict[str, object]],
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> None:
+    """
+    为同一检验家族附加 Bonferroni 同时（simultaneous）置信区间。
+
+    逐条对比报告的点估计 95% CI 是**逐检验**区间：它对应未校正
+    的 p 值，而不是 Holm 校正后的判定。家族里有 m 个检验时，
+    读者可能看到「95% CI 不含 0，但 significant=false」——这不是
+    实现矛盾，而是逐检验区间与族错误率控制回答了两个不同问题。
+    为了不把这种差异留给读者猜测，这里另给一套同时区间：
+
+    - 置信水平 ``1 - alpha/m``（Bonferroni），保证整个家族参数
+      同时被覆盖的概率至少 ``1 - alpha``；
+    - 区间不含 0 ⇔ Bonferroni 校正后显著，因此它是比 Holm 更
+      保守的**充分条件**，而不是与 Holm 判定冲突的第二套判定；
+    - 逐检验 95% CI 继续保留，用于描述效应量的可行范围，不能
+      拿它替代多重比较校正后的显著性。
+
+    记录 ``ci_family_adjusted_*``；缺少 effect/se/df 的条目跳过。
+    """
+    eligible: List[
+        Tuple[Dict[str, object], float, float, float]
+    ] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        effect = _finite_float(item.get("effect"))
+        if effect is None:
+            effect = _finite_float(item.get("mean_effect"))
+        if effect is None:
+            effect = _finite_float(item.get("delta"))
+        se = _finite_float(item.get("se"))
+        df = _finite_float(item.get("df"))
+        if (
+            effect is None
+            or se is None
+            or df is None
+            or se <= 0.0
+            or df <= 0.0
+        ):
+            continue
+        eligible.append((item, effect, se, df))
+
+    family_size = sum(
+        1
+        for item in items
+        if isinstance(item, dict) and item.get("p_value") is not None
+    )
+    if family_size == 0:
+        family_size = len(eligible)
+    if family_size == 0:
+        return
+    adjusted_alpha = float(alpha) / float(family_size)
+    for item, effect, se, df in eligible:
+        critical = _t_critical(df, adjusted_alpha)
+        if critical is None:
+            continue
+        low = effect - critical * se
+        high = effect + critical * se
+        excludes_zero = bool(low > 0.0 or high < 0.0)
+        item["ci_family_adjusted_low"] = low
+        item["ci_family_adjusted_high"] = high
+        item["ci_family_adjusted_alpha"] = adjusted_alpha
+        item["ci_family_adjusted_family_size"] = family_size
+        item["ci_family_adjusted_critical"] = critical
+        item["ci_family_adjusted_method"] = (
+            "bonferroni_simultaneous_t"
+        )
+        item["ci_family_adjusted_excludes_zero"] = excludes_zero
+        # 同时区间不含 0 必然蕴含 Holm 显著（Bonferroni 比
+        # Holm 保守）；反向不成立。若出现反向，说明区间与
+        # 判定用了不同口径，必须在报告里暴露而不是静默。
+        item["ci_family_adjusted_decision_consistent"] = bool(
+            (not excludes_zero) or bool(item.get("significant"))
+        )
+        item["ci_family_adjusted_note"] = (
+            "同时区间按 Bonferroni α/m 构造（m="
+            f"{family_size}），比 Holm step-down 保守；"
+            "不含 0 是校正后显著的充分条件，但不是必要条件。"
+            "逐检验 95% CI 仍只用于描述效应量范围。"
+        )
 
 
 def _normal_cdf(value: float) -> float:
@@ -26084,6 +26619,11 @@ def _apply_multiple_comparison_correction(
             and float(holm_p) <= _SIGNIFICANCE_LEVEL
         )
 
+    # 多重比较校正后的显著性以 Holm 为准；展示层的逐检验 95%
+    # CI 与它可能「看起来矛盾」。另附 Bonferroni 同时区间，
+    # 让「校正后仍不含 0」有一个与家族规模一致的区间口径。
+    _attach_family_adjusted_intervals(eligible)
+
 
 def factor_contrasts(
     aggregates: List[Dict[str, object]],
@@ -27016,6 +27556,10 @@ def factorial_effects(
                 fragility["verdict"] = "not_significant"
                 fragility["holm_step_down_valid"] = False
             effect["fragility"] = fragility
+
+    # 因子效应与单因子对比同口径：附 Bonferroni 同时区间，
+    # 避免「逐检验 95% CI 不含 0」被误读成校正后显著的结论。
+    _attach_family_adjusted_intervals(eligible)
 
     # 符号翻转检验与 t 检验同家族校正；两者结论不一致时
     # 主效应/交互的显著性依赖分布假设，不能作为稳健结论。
@@ -28061,6 +28605,45 @@ def _format_window_paired(
             parts.append(
                 "AR(1) 校正 p: " + ", ".join(ar1_p_values)
             )
+    hierarchical = window_paired.get(
+        "hierarchical_bootstrap_ci95"
+    )
+    if isinstance(hierarchical, dict) and hierarchical.get(
+        "available"
+    ):
+        parts.append(
+            "两层 bootstrap 95%CI=["
+            f"{float(hierarchical['low']):+.4f},"
+            f"{float(hierarchical['high']):+.4f}]"
+            f"（种子 {hierarchical.get('n_seeds')} × 窗口，"
+            f"{hierarchical.get('replicates')} 次）"
+        )
+    variance = window_paired.get("variance_components")
+    if isinstance(variance, dict) and variance.get("available"):
+        share_seed = variance.get("variance_share_seed")
+        share_window = variance.get("variance_share_window")
+        share_interaction = variance.get(
+            "variance_share_interaction"
+        )
+        dominant = variance.get("dominant_source")
+        if (
+            isinstance(share_seed, (int, float))
+            and isinstance(share_window, (int, float))
+            and isinstance(share_interaction, (int, float))
+        ):
+            source_text = {
+                "training_seed": "种子层",
+                "evaluation_windows": "窗口层",
+                "seed_window_interaction": "种子×窗口交互",
+                "mixed": "多层",
+            }.get(str(dominant), "多层")
+            parts.append(
+                "方差占比: 种子 "
+                f"{float(share_seed) * 100:.0f}% / 窗口 "
+                f"{float(share_window) * 100:.0f}% / 交互 "
+                f"{float(share_interaction) * 100:.0f}%"
+                f"（主要来自{source_text}）"
+            )
     notes = window_paired.get("notes")
     if isinstance(notes, list) and notes:
         parts.append("（" + "；".join(str(note) for note in notes) + "）")
@@ -28190,6 +28773,25 @@ def _contrast_display(
         if ci_low is not None and ci_high is not None
         else ""
     )
+    # 逐检验 95% CI 与 Holm 判定回答不同问题：家族 m>1 时
+    # 另给 Bonferroni 同时区间，避免读者把「CI 不含 0 但
+    # significant=false」误解为矛盾。
+    adjusted_low = contrast.get("ci_family_adjusted_low")
+    adjusted_high = contrast.get("ci_family_adjusted_high")
+    adjusted_family = contrast.get(
+        "ci_family_adjusted_family_size"
+    )
+    if (
+        adjusted_low is not None
+        and adjusted_high is not None
+        and isinstance(adjusted_family, int)
+        and adjusted_family > 1
+    ):
+        ci_text += (
+            f"；同时95%CI=[{float(adjusted_low):+.4f},"
+            f"{float(adjusted_high):+.4f}]"
+            f"(Bonferroni α/{adjusted_family}，比Holm保守)"
+        )
 
     verdict_map = {
         "improvement": "改善",
@@ -34415,6 +35017,21 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
             " 95%CI=["
             f"{float(effect['ci95_low']):+.4f},"
             f"{float(effect['ci95_high']):+.4f}]"
+        )
+    adjusted_low = effect.get("ci_family_adjusted_low")
+    adjusted_high = effect.get("ci_family_adjusted_high")
+    adjusted_family = effect.get("ci_family_adjusted_family_size")
+    if (
+        adjusted_low is not None
+        and adjusted_high is not None
+        and isinstance(adjusted_family, int)
+        and adjusted_family > 1
+    ):
+        ci_text += (
+            "；同时95%CI=["
+            f"{float(adjusted_low):+.4f},"
+            f"{float(adjusted_high):+.4f}]"
+            f"(Bonferroni α/{adjusted_family}，比Holm保守)"
         )
     qualifiers = []
     if effect.get("test") == "no_common_seeds":

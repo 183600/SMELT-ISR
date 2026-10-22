@@ -584,6 +584,212 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(arms["A"]["failed_runs"], 1)
         self.assertAlmostEqual(arms["A"]["failure_rate"], 0.5)
 
+    def test_family_adjusted_intervals_are_simultaneous(self):
+        # 三臂两两对比构成一个 m=3 的检验家族；逐检验 95%CI
+        # 与 Holm 判定可能不一致，必须另给 Bonferroni 同时区间。
+        values = {
+            "local_base": [10.00, 10.03, 9.98, 10.01],
+            "A": [9.50, 9.44, 9.52, 9.47],
+            "B": [9.20, 9.10, 9.16, 9.12],
+        }
+        rows = [
+            {
+                "run": f"{mode}{seed}",
+                "mode": mode,
+                "seed": seed,
+                "val_loss": value,
+            }
+            for mode, series in values.items()
+            for seed, value in enumerate(series, start=1)
+        ]
+        aggregates = experiment.aggregate_runs(rows, ["mode"])
+        contrasts = experiment.factor_contrasts(
+            aggregates, ["mode"], "val_loss"
+        )
+        self.assertEqual(len(contrasts), 3)
+        for contrast in contrasts:
+            self.assertEqual(
+                contrast["ci_family_adjusted_family_size"], 3
+            )
+            self.assertAlmostEqual(
+                contrast["ci_family_adjusted_alpha"], 0.05 / 3
+            )
+            point_width = (
+                float(contrast["ci95_high"])
+                - float(contrast["ci95_low"])
+            )
+            adjusted_width = (
+                float(contrast["ci_family_adjusted_high"])
+                - float(contrast["ci_family_adjusted_low"])
+            )
+            self.assertGreaterEqual(
+                adjusted_width, point_width - 1e-12
+            )
+            # 同时区间不含 0 必然蕴含 Holm 显著（充分条件）；
+            # 反向不成立，不能反过来要求 significant 蕴含
+            # 同时区间不含 0。
+            if contrast["ci_family_adjusted_excludes_zero"]:
+                self.assertTrue(contrast["significant"])
+            self.assertTrue(
+                contrast["ci_family_adjusted_decision_consistent"]
+            )
+        display = experiment._contrast_display(
+            contrasts[0], "val_loss"
+        )
+        self.assertIn("95%CI", display)
+        self.assertIn("同时95%CI", display)
+
+    def test_hierarchical_window_bootstrap_and_variance_components(self):
+        per_seed = {
+            1: [-0.50, -0.48, -0.52, -0.51],
+            2: [-0.20, -0.22, -0.18, -0.19],
+            3: [-0.80, -0.78, -0.82, -0.79],
+        }
+        bootstrap = experiment._hierarchical_window_bootstrap_ci(
+            per_seed
+        )
+        self.assertTrue(bootstrap["available"])
+        self.assertEqual(bootstrap["n_seeds"], 3)
+        self.assertLess(
+            bootstrap["low"], bootstrap["high"]
+        )
+        self.assertLessEqual(
+            bootstrap["low"], -0.5
+        )
+        self.assertGreaterEqual(
+            bootstrap["high"], -0.5
+        )
+        repeated = experiment._hierarchical_window_bootstrap_ci(
+            per_seed
+        )
+        self.assertEqual(
+            repeated["low"], bootstrap["low"]
+        )
+        self.assertEqual(
+            repeated["high"], bootstrap["high"]
+        )
+        single = experiment._hierarchical_window_bootstrap_ci(
+            {1: [-0.5, -0.4]}
+        )
+        self.assertFalse(single["available"])
+
+        components = experiment._window_variance_components(
+            per_seed
+        )
+        self.assertTrue(components["available"])
+        self.assertEqual(components["n_seeds"], 3)
+        self.assertGreater(components["between_seed_sd"], 0.0)
+        self.assertGreater(
+            components["within_seed_sd_mean"], 0.0
+        )
+        self.assertAlmostEqual(
+            float(components["variance_share_seed"])
+            + float(components["variance_share_window"])
+            + float(components["variance_share_interaction"]),
+            1.0,
+        )
+        self.assertEqual(
+            components["dominant_source"], "training_seed"
+        )
+        self.assertIn(
+            "增加独立种子", components["advisory"]
+        )
+        prediction = components[
+            "new_seed_mean_prediction_interval_95"
+        ]
+        self.assertLessEqual(
+            prediction["low"],
+            components["seed_mean_effect"],
+        )
+        self.assertGreaterEqual(
+            prediction["high"],
+            components["seed_mean_effect"],
+        )
+        # 只有一个种子时不能分离种子层方差，不能因此伪造
+        # 方差占比或预测区间。
+        one_seed = experiment._window_variance_components(
+            {1: [-0.5, -0.4, -0.6]}
+        )
+        self.assertFalse(one_seed["available"])
+        self.assertEqual(
+            one_seed["reason"],
+            "insufficient_seeds_for_variance_components",
+        )
+        self.assertNotIn(
+            "new_seed_mean_prediction_interval_95", one_seed
+        )
+
+    def test_window_paired_analysis_reports_two_level_uncertainty(self):
+        def payload(series):
+            return {
+                "split": "val",
+                "data_sha256": "deadbeef",
+                "split_sha256": "cafebabe",
+                "seq_len": 8,
+                "batch_size": 8,
+                "batches": 1,
+                "n_windows": len(series),
+                "overlap_fraction": 0.0,
+                "windows": [
+                    {
+                        "loss_sum": float(loss) * 10.0,
+                        "tokens": 10,
+                        "correct": 0,
+                    }
+                    for loss in series
+                ],
+            }
+
+        base = [4.0, 4.1, 4.2, 3.9]
+        variant_by_seed = {
+            1: [loss - 0.5 for loss in base],
+            2: [loss - 0.2 for loss in base],
+            3: [loss - 0.8 for loss in base],
+        }
+        cell_a = {
+            "window_payloads": [
+                {
+                    "seed": seed,
+                    "run": f"base{seed}",
+                    "payload": payload(base),
+                }
+                for seed in (1, 2, 3)
+            ]
+        }
+        cell_b = {
+            "window_payloads": [
+                {
+                    "seed": seed,
+                    "run": f"variant{seed}",
+                    "payload": payload(series),
+                }
+                for seed, series in variant_by_seed.items()
+            ]
+        }
+        report = experiment._cell_window_paired_analysis(
+            cell_a, cell_b
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["n_seeds"], 3)
+        hierarchical = report["hierarchical_bootstrap_ci95"]
+        self.assertTrue(hierarchical["available"])
+        self.assertEqual(hierarchical["n_seeds"], 3)
+        components = report["variance_components"]
+        self.assertTrue(components["available"])
+        self.assertEqual(components["n_seeds"], 3)
+        self.assertEqual(
+            components["dominant_source"], "training_seed"
+        )
+        # 原始逐窗口差值只供两层 bootstrap 使用，不落进
+        # per_seed 明细（否则报告体量随窗口数膨胀）。
+        for entry in report["per_seed"]:
+            self.assertNotIn("loss_differences", entry)
+        display = experiment._format_window_paired(
+            {"window_paired": report}
+        )
+        self.assertIn("两层 bootstrap 95%CI", display)
+        self.assertIn("方差占比", display)
+
 
 class DesignPreparationTests(unittest.TestCase):
     """先验功效、随机化区组顺序与设计计划核对。"""
