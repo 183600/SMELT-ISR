@@ -382,6 +382,37 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 - 增量解码：未实现 KV cache；`kv_cache_bytes_per_token` 只是
   容量估计。论文的 KV cache 匹配需要真正的解码路径。
 
+## 24. 预注册的可执行性（本轮补充）
+
+**判定：原实现只有「把判定口径写进 config.json」的预注册，
+没有训练前独立冻结、事后只能核对的预注册文件。** 文档要求先写
+`preregistration.json`，但入口不读取它：同一命令行可以在看到
+数据/结果后补写主指标、方向、最小效应、共同步数、对照臂与
+种子集合，再把 `config.json` 当作「预注册」证据——这在审计上
+无法与真正的预注册区分。
+
+**已修正：**
+
+- 新增 `--preregistration FILE`：结构校验（必需字段、对照臂、
+  种子数、数据类型）、重复键/非有限常量拒绝、冻结提交
+  `frozen_commit`（或 `frozen_script_sha256`）核对、脏工作区
+  拒绝。
+- 文件补齐未显式给出的主指标/方向/最小效应/对照基线/
+  `common_step`/`steps`/`--budget-match`/`--seeds`/等价界；
+  命令行显式值冲突时拒绝启动，不能「以命令行覆盖预注册」。
+- 数据加载后核对 `sha256`、`split_policy`、`val_fraction`/
+  `test_fraction`、可选 `group_separator`、清洗开关与实体/
+  时间清单指纹；不一致时拒绝训练。
+- 核对记录写入 `config.json` 的 `preregistration`（文件
+  SHA-256、study_id、冻结提交、补齐字段、实际数据指纹与
+  运行模式/种子），resume 时保留；`--compare` 等只读入口
+  不接受该参数。
+
+仍有限制：`--preregistration` 只覆盖神经训练/多种子套件，
+统计基线仍用单独的 `--primary-metric` 口径；没有实现
+「先冻结候选、再统一解封 test」的单一状态机，测试集流程
+仍按第 5 节人工执行。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /

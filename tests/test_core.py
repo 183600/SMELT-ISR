@@ -1263,5 +1263,311 @@ class ProcessTests(unittest.TestCase):
         )
 
 
+class PreregistrationTests(unittest.TestCase):
+    """外部预注册文件：结构校验、命令行冲突与数据指纹核对。"""
+
+    def _payload(self):
+        return {
+            "study_id": "smelt-isr-test",
+            "frozen_commit": "a" * 40,
+            "primary_metric": "val_loss",
+            "common_step": 100,
+            "min_effect": 0.01,
+            "direction": "decrease",
+            "baseline_mode": "smelt",
+            "comparisons": [
+                ["smelt", "A"],
+                ["smelt", "B"],
+            ],
+            "seeds": [42, 43, 44],
+            "budget_match": "smelt",
+            "steps": 200,
+            "data": {
+                "sha256": "b" * 64,
+                "split_policy": "contiguous",
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+            },
+        }
+
+    def _args(self, **overrides):
+        values = dict(
+            primary_metric=None,
+            hypothesis_direction=None,
+            hypothesis_min_effect=None,
+            hypothesis_baseline=None,
+            common_step=None,
+            budget_match=None,
+            equivalence_margin=0.01,
+            steps=200,
+            seeds=None,
+            seed=42,
+            mode="A",
+            statistical_baseline=False,
+        )
+        values.update(overrides)
+        return experiment.argparse.Namespace(**values)
+
+    def _dataset(self):
+        return experiment.argparse.Namespace(
+            data_sha256="b" * 64,
+            val_fraction=0.1,
+            test_fraction=0.1,
+        )
+
+    def test_schema_requires_full_protocol(self):
+        payload = self._payload()
+        payload.pop("common_step")
+        self.assertIn(
+            "common_step",
+            experiment.preregistration_schema_error(payload),
+        )
+        payload = self._payload()
+        payload["seeds"] = [42, 43]
+        self.assertIn(
+            "至少需要",
+            experiment.preregistration_schema_error(payload),
+        )
+        payload = self._payload()
+        payload["comparisons"] = []
+        self.assertIn(
+            "comparisons",
+            experiment.preregistration_schema_error(payload),
+        )
+        payload = self._payload()
+        payload["seed"] = [42, 43, 44]
+        self.assertIn(
+            "未知字段",
+            experiment.preregistration_schema_error(payload),
+        )
+
+    def test_loader_rejects_duplicate_keys(self):
+        payload = self._payload()
+        text = json.dumps(payload, ensure_ascii=False)
+        text = text.replace(
+            '"study_id": "smelt-isr-test"',
+            '"study_id": "smelt-isr-test", '
+            '"study_id": "duplicate"',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prereg.json"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(ValueError) as context:
+                experiment.load_preregistration(path)
+        self.assertIn("重复键", str(context.exception))
+
+    def test_loader_accepts_valid_file(self):
+        payload = self._payload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prereg.json"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            loaded, digest = experiment.load_preregistration(path)
+        self.assertEqual(loaded["study_id"], "smelt-isr-test")
+        self.assertEqual(len(digest), 64)
+
+    def test_apply_fills_omitted_cli_values(self):
+        args = self._args()
+        applied, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256="c" * 64,
+        )
+        self.assertIsNone(error)
+        self.assertIn("primary_metric", applied)
+        self.assertIn("seeds", applied)
+        self.assertEqual(args.primary_metric, "val_loss")
+        self.assertEqual(args.hypothesis_direction, "decrease")
+        self.assertEqual(args.common_step, 100)
+        self.assertEqual(args.seeds, [42, 43, 44])
+
+    def test_apply_rejects_explicit_conflict(self):
+        args = self._args(primary_metric="val_macro_f1")
+        applied, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("primary_metric", error)
+
+    def test_apply_rejects_commit_dirty_and_script_mismatch(self):
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="c" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIn("frozen_commit", error)
+
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="a" * 40,
+            working_tree_dirty=True,
+        )
+        self.assertIn("未提交修改", error)
+
+        payload = self._payload()
+        payload["frozen_script_sha256"] = "d" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit=None,
+            working_tree_dirty=False,
+            current_script_sha256="e" * 64,
+        )
+        self.assertIn("SHA-256", error)
+
+    def test_apply_allows_frozen_commit_ancestor(self):
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="c" * 40,
+            working_tree_dirty=False,
+            frozen_code_matches=True,
+        )
+        self.assertIsNone(error)
+
+    def test_apply_rejects_common_step_beyond_steps(self):
+        payload = self._payload()
+        payload.pop("steps")
+        args = self._args(steps=50)
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIn("common_step", error)
+
+    def test_apply_checks_planned_suite_modes(self):
+        payload = self._payload()
+        payload["comparisons"] = [["smelt", "A"]]
+        args = self._args(mode="B", suite_modes=["A"])
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIsNone(error)
+
+        args = self._args(mode="B", suite_modes=["A", "B"])
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIn("B", error)
+
+    def test_apply_seed_sets_are_fixed(self):
+        args = self._args(seeds=[42, 43])
+        _, error = experiment.preregistration_apply(
+            args,
+            self._payload(),
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+        )
+        self.assertIn("seeds", error)
+
+        args = self._args(seed=99)
+        original_argv = sys.argv
+        try:
+            sys.argv = ["experiment.py", "--seed", "99"]
+            _, error = experiment.preregistration_apply(
+                args,
+                self._payload(),
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+            )
+        finally:
+            sys.argv = original_argv
+        self.assertIn("不在预注册", error)
+
+    def test_sweep_detects_preregistration_file_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "seed42"
+            second = root / "seed43"
+            first.mkdir()
+            second.mkdir()
+            (first / "config.json").write_text(
+                json.dumps({
+                    "preregistration": {
+                        "file_sha256": "a" * 64,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (second / "config.json").write_text(
+                json.dumps({
+                    "preregistration": {
+                        "file_sha256": "b" * 64,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            error = experiment.preregistration_sweep_error(
+                [str(first), str(second)],
+                "a" * 64,
+            )
+        self.assertIn("seed43", error)
+        self.assertIn("中途", error)
+
+    def test_data_checks_sha_splits_cleaning_and_separator(self):
+        payload = self._payload()
+        payload["data"]["group_separator"] = "\\n\\n"
+        payload["data"]["cleaning"] = {
+            "deduplicate_train_groups": False,
+        }
+        args = self._args(
+            split_policy="contiguous",
+            group_separator="\\n\\n",
+            deduplicate_train_groups=False,
+        )
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            )
+        )
+
+        wrong_sha = self._dataset()
+        wrong_sha.data_sha256 = "c" * 64
+        self.assertIn(
+            "data.sha256",
+            experiment.preregistration_data_error(
+                args, payload, wrong_sha
+            ),
+        )
+
+        args.deduplicate_train_groups = True
+        self.assertIn(
+            "data.cleaning",
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            ),
+        )
+
+        args.deduplicate_train_groups = False
+        args.group_separator = "<|doc|>"
+        self.assertIn(
+            "group_separator",
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

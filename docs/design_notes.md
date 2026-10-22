@@ -679,6 +679,25 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   另外，单标签多分类的 F1 / precision / recall 必须注明
   macro / micro / weighted 口径（三者结论可能显著不同），
   假设只写「F1 提升」会被单独点名。
+- **外部预注册文件（`--preregistration`）**：训练前的判定口径
+  不能只写在命令行或事后的 `config.json` 里，否则「先看结果、
+  再补预注册」无法与真正的预注册区分。入口支持一份独立 JSON：
+  `study_id`、`frozen_commit`（或 `frozen_script_sha256`）、
+  `primary_metric`、`direction`、`min_effect`、`common_step`、
+  `steps`、`baseline_mode`、`comparisons`、`seeds`、
+  `budget_match` 与数据协议（`sha256`、`split_policy`、
+  `val_fraction`/`test_fraction`，可选
+  `group_separator`/`cleaning`/清单指纹）。文件补齐未显式给出
+  的命令行值；显式冲突、冻结提交不在当前 HEAD 历史中
+  （或 `experiment.py` 自冻结后已改变）、工作区脏或数据/
+  清洗指纹不一致时拒绝启动。`--seed` 只能是预注册种子之一，
+  `--seeds` 必须与文件集合完全一致；两者都未给出时按文件
+  种子集合运行套件。核对记录（文件 SHA-256、study_id、冻结
+  提交、补齐字段、实际数据指纹）写入 `config.json` 的
+  `preregistration` 字段，resume 时保留原记录。结构校验还
+  拒绝重复 JSON 键、NaN/Infinity、少于 3 个种子、未覆盖
+  `baseline_mode` 的对比与重复/自比较。
+
 - **选型指标与判定口径对齐**：模型 checkpoint 默认按
   `val_loss` 选型并早停，但若预注册主指标是 macro F1 等
   分类指标，按 loss 选出的模型并不是按假设口径选出的。

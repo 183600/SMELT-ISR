@@ -23,14 +23,17 @@
 
 ## 2. 预注册
 
-在训练前写入 `preregistration.json`：
+在训练前写入 `preregistration.json`，并**先提交该文件**（预注册
+入口会拒绝脏工作区）：
 
 ```json
 {
   "study_id": "smelt-isr-confirm-001",
   "frozen_commit": "<git sha>",
+  "frozen_script_sha256": "<可选：experiment.py 的 SHA-256>",
   "primary_metric": "val_loss_at_common_step",
   "common_step": 20000,
+  "steps": 20000,
   "min_effect": 0.01,
   "direction": "decrease",
   "baseline_mode": "smelt",
@@ -43,41 +46,114 @@
   ],
   "seeds": [42, 43, 44, 45, 46, 47],
   "budget_match": "smelt",
+  "equivalence_margin": 0.01,
   "data": {
     "sha256": "<corpus sha256>",
     "split_policy": "contiguous",
-    "entity_manifest": null
+    "val_fraction": 0.05,
+    "test_fraction": 0.05,
+    "group_separator": "\n\n",
+    "cleaning": {
+      "deduplicate_train_groups": false,
+      "drop_train_shared_chunks": false,
+      "drop_train_corrupt_groups": false,
+      "drop_train_corrupt_bytes": false,
+      "drop_train_degenerate_groups": false,
+      "drop_train_degenerate_runs": false,
+      "clean_train_against_test": false,
+      "allow_eval_content_for_cleaning": false
+    }
   }
 }
 ```
 
-要求：
+字段要求：
 
-- **至少 6 个种子**：配对 t 与精确符号翻转同时显著才有定义；
-  n=3/4/5 时符号翻转的最小双侧 p 分别为 0.25/0.125/0.0625，
-  数学上不可能达到 0.05。家族校正后按 `ceil(log2(2m/α))` 增加。
-- `common_step` 必须训练前固定；不要用默认的「各运行最后验证步
-  最小值」（该步由观察到的端点决定）。
-- `--budget-match` 必须通过；报告完整计算图的解析与实测 FLOPs
-  比例，而不是只匹配 `k1·k2`。
-- 对照必须包含：`local_base_k2`（合并时机机制对照）、
-  `local_base`（等专家计算量性能对照）、`B_early`（B 的等计算量
-  合并位置对照）。
+- `frozen_commit` 必须是 7~64 位十六进制 git commit。当前
+  `HEAD` 可以与它相同，也可以是它的后代（通常是在记录
+  `frozen_commit` 之后又提交了预注册文件本身）；但
+  `git diff frozen_commit..HEAD -- experiment.py` 必须为空——
+  冻结后改代码必须开始新研究阶段。工作区有未提交修改、或
+  提供了 `frozen_script_sha256` 而脚本内容不同，同样拒绝
+  启动。没有 git 时必须提供 `frozen_script_sha256`。
+- `primary_metric` 必须是评估管线真正计算的指标；`common_step`
+  必须是正整数且不超过 `steps`；`min_effect` 是相对
+  `baseline_mode` 均值的比例；`direction` 为 `decrease` 或
+  `increase`。
+- `comparisons` 声明的对照臂必须覆盖本次运行实际展开的模式
+  （单次 `--mode`，或 `--suite-modes` / `--suite-ablation`
+  计划中的全部臂）；`baseline_mode` 必须出现在至少一个对比中；
+  重复/自比较会被拒绝。
+- `seeds` 至少 3 个且不重复。3~5 个种子只能做 t 检验；
+  「配对 t + 符号翻转同时显著」的稳健主张至少需要 6 个，
+  家族校正后按 `ceil(log2(2m/α))` 增加。显式 `--seeds` 必须
+  与文件集合完全一致；显式 `--seed`、`--resume` 或最终
+  `--evaluate-test` 使用其中一个；两者都未给出时自动按文件
+  种子集合运行完整套件。
+- `budget_match` 为 `null` 或模式名；非 null 时等价于
+  `--budget-match` 的完整计算图硬门。它按**本次运行的候选
+  模式**解释：同一 study 若既包含 `base`（循环次数不同，
+  不能套 `smelt` 门）又包含需要预算门的 `A`/`B`，应拆成两个
+  冻结阶段；`comparisons` 含 `A`/`B`/`local_base` 与 `smelt`
+  的对照时不允许 `null`。
+- `data` 必填 `sha256`、`split_policy`、`val_fraction`、
+  `test_fraction`；可选的 `group_separator`、`cleaning`、
+  `entity_manifest_sha256`、`time_order_manifest_sha256`
+  也会在数据加载后逐项核对。清洗开关会改变实际参与训练/
+  去重的字节，必须在预注册中固定。
+- 顶层与 `data` 都拒绝未知字段：拼写错误（如把 `seeds`
+  写成 `seed`）会让协议静默失效，不能当作「多写了一个
+  备注」放行；要写备注请用 `notes` / `metadata`。
+- 延迟合并与 `smelt` 的预算对照必须包含
+  `local_base_k2`（只改合并时机）、`local_base`（等专家
+  计算量）与 `B_early`（B 的等计算量合并位置）；比较
+  `A`/`B` 与 `smelt` 时 `budget_match` 不能为 `null`。
+  确需研究其它问题时，在 `notes` 中写明并单独预注册，
+  不能靠删掉对照让预算/归因检查静默失效。
+
+运行入口：
+
+```bash
+python experiment.py --data corpus.txt --out runs/confirm \
+  --preregistration preregistration.json \
+  --suite-modes smelt local_base local_base_k2 A B B_early \
+  --hypothesis "延迟合并在完整计算图匹配下改善验证损失" \
+  --rq RQ1
+```
+
+- 文件会补齐未显式给出的 `--primary-metric` /
+  `--hypothesis-direction` / `--hypothesis-min-effect` /
+  `--hypothesis-baseline` / `--common-step` / `--budget-match` /
+  `--seeds` / `--steps`；命令行显式值若与文件不同，直接拒绝，
+  不存在「以命令行覆盖预注册」的路径。
+- 数据加载后会核对语料/切分/清洗指纹；不一致时拒绝训练。
+  核对结果（文件 SHA-256、study_id、冻结提交、补齐字段、
+  实际数据指纹、运行模式/种子）写入 `config.json` 的
+  `preregistration` 字段，供归档审计与人工复核。
+- 多种子套件结束后，父进程按每个子运行的
+  `preregistration.file_sha256` 反查是否仍是同一份文件；
+  中途编辑预注册会导致整批被拒绝汇总，而不是把不同协议的
+  种子拼成一项研究。
+- `--compare` / `--sanity-only` / `--statistical-baseline` /
+  `--suite-baseline-tuning` 不接受 `--preregistration`：它们
+  不执行同一套训练协议。确证实验若需要新阶段（改代码、改
+  数据、改对照），必须重新冻结、写新文件；不能编辑旧文件
+  后继续。
 
 ## 3. 运行
 
 ```bash
 export EXPERIMENT_FREEZE=true
 python experiment.py --data corpus.txt --out runs/confirm \
-  --seeds 42 43 44 45 46 47 \
+  --preregistration preregistration.json \
   --suite-modes smelt local_base local_base_k2 A B B_early \
-  --steps 20000 --common-step 20000 \
-  --budget-match smelt \
   --hypothesis "延迟合并在完整计算图匹配下改善验证损失" \
-  --rq RQ1 --primary-metric val_loss_at_common_step \
-  --hypothesis-direction decrease --hypothesis-min-effect 0.01 \
-  --hypothesis-baseline smelt
+  --rq RQ1
 ```
+
+不加 `--preregistration` 而手工给 `--seeds/--common-step/
+--budget-match/--primary-metric/...` 的运行仍可执行，但只能作为
+探索性运行：没有独立文件证明这些口径在训练前已固定。
 
 运行期间：
 

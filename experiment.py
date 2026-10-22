@@ -30154,6 +30154,980 @@ def hypothesis_ambiguous_averaging_metrics(
     ]
 
 
+# ============================================================
+# 外部预注册文件（--preregistration）
+# ============================================================
+
+# 预注册不是训练后写进 config.json 的一段说明，而应是训练前
+# 独立固定、事后只能核对不能改写的协议。文件字段覆盖判定口径、
+# 共同步数、对照臂、种子集合与数据协议；入口只允许用文件
+# 补齐未显式给出的命令行参数，显式冲突直接拒绝启动。
+_PREREGISTRATION_REQUIRED_FIELDS = (
+    "study_id",
+    "frozen_commit",
+    "primary_metric",
+    "common_step",
+    "min_effect",
+    "direction",
+    "baseline_mode",
+    "comparisons",
+    "seeds",
+    "budget_match",
+    "data",
+)
+
+_PREREGISTRATION_DATA_REQUIRED_FIELDS = (
+    "sha256",
+    "split_policy",
+    "val_fraction",
+    "test_fraction",
+)
+
+# 可选的清洗协议：清洗会改变实际参与训练/去重的字节范围，
+# 看到验证结果后再改清洗开关等于事后改数据。字段名与命令行
+# dest 一致，便于逐项核对。
+_PREREGISTRATION_CLEANING_KEYS = (
+    "deduplicate_train_groups",
+    "drop_train_shared_chunks",
+    "drop_train_corrupt_groups",
+    "drop_train_corrupt_bytes",
+    "drop_train_degenerate_groups",
+    "drop_train_degenerate_runs",
+    "clean_train_against_test",
+    "allow_eval_content_for_cleaning",
+)
+
+_PREREGISTRATION_OPTIONAL_FIELDS = (
+    "equivalence_margin",
+    "steps",
+    "frozen_script_sha256",
+    "notes",
+    "metadata",
+)
+
+_PREREGISTRATION_DATA_OPTIONAL_FIELDS = (
+    "group_separator",
+    "cleaning",
+    "entity_manifest_sha256",
+    "time_order_manifest_sha256",
+)
+
+_PREREGISTRATION_MISSING = object()
+
+
+def _preregistration_finite_number(
+    value: object,
+    label: str,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float)
+    ):
+        return f"{label} 必须是有限数值"
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return f"{label} 必须是有限数值"
+    if not math.isfinite(number):
+        return f"{label} 必须是有限数值"
+    if minimum is not None and number < minimum:
+        return f"{label} 必须 >= {minimum:g}"
+    if maximum is not None and number > maximum:
+        return f"{label} 必须 <= {maximum:g}"
+    return None
+
+
+def _preregistration_sha256_text(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+    )
+
+
+def preregistration_schema_error(
+    payload: Dict[str, object],
+) -> Optional[str]:
+    """
+    校验预注册文件的结构与取值域，返回错误消息或 None。
+
+    这里只检查「文件自身是否完整、可判定」；命令行、代码
+    提交与数据指纹的一致性由
+    ``preregistration_apply`` / ``preregistration_data_error``
+    核对。结构上缺字段时不能默认通过：缺 ``common_step``
+    会让分析回退到数据依赖端点，缺 ``comparisons`` 则无法
+    核对本次运行的臂是否属于同一项研究，二者都会把预注册
+    退化成事后说明。
+    """
+    missing = [
+        key
+        for key in _PREREGISTRATION_REQUIRED_FIELDS
+        if key not in payload
+    ]
+    if missing:
+        return "缺少必需字段: " + ", ".join(missing)
+    unknown = sorted(
+        set(payload)
+        - set(_PREREGISTRATION_REQUIRED_FIELDS)
+        - set(_PREREGISTRATION_OPTIONAL_FIELDS)
+    )
+    if unknown:
+        return "含未知字段（拼写错误会让协议静默失效）: " + ", ".join(
+            unknown
+        )
+    if "notes" in payload and not isinstance(payload["notes"], str):
+        return "notes 必须是字符串"
+    if "metadata" in payload and not isinstance(
+        payload["metadata"], dict
+    ):
+        return "metadata 必须是对象"
+
+    study_id = payload.get("study_id")
+    if (
+        not isinstance(study_id, str)
+        or not study_id.strip()
+        or "\n" in study_id
+        or "\r" in study_id
+    ):
+        return "study_id 必须是非空单行字符串"
+
+    frozen_commit = payload.get("frozen_commit")
+    if (
+        not isinstance(frozen_commit, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{7,64}", frozen_commit)
+    ):
+        return (
+            "frozen_commit 必须是 7~64 位十六进制 git commit "
+            "（冻结代码版本，不能用分支名或工作区状态代替）"
+        )
+
+    primary_metric = payload.get("primary_metric")
+    if not isinstance(primary_metric, str) or not primary_metric:
+        return "primary_metric 必须是非空字符串"
+    if (
+        primary_metric not in COMPARISON_METRIC_KEYS
+        and primary_metric not in _NGRAM_TUNING_METRIC_KEYS
+    ):
+        return (
+            f"primary_metric={primary_metric} 不是评估管线计算的"
+            "指标"
+        )
+
+    common_step = payload.get("common_step")
+    if (
+        isinstance(common_step, bool)
+        or not isinstance(common_step, int)
+        or common_step <= 0
+    ):
+        return "common_step 必须是正整数（训练前固定的比较步）"
+
+    min_effect = payload.get("min_effect")
+    error = _preregistration_finite_number(
+        min_effect,
+        "min_effect",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if error is not None:
+        return error
+    if float(min_effect) <= 0.0:  # type: ignore[arg-type]
+        return "min_effect 必须是正数（相对基线均值的比例）"
+
+    direction = payload.get("direction")
+    if direction not in ("decrease", "increase"):
+        return "direction 必须是 decrease 或 increase"
+
+    baseline_mode = payload.get("baseline_mode")
+    if (
+        not isinstance(baseline_mode, str)
+        or baseline_mode not in Config.ALL_MODES
+    ):
+        return (
+            "baseline_mode 必须是已知模式: "
+            + ", ".join(sorted(Config.ALL_MODES))
+        )
+
+    comparisons = payload.get("comparisons")
+    if not isinstance(comparisons, list) or not comparisons:
+        return "comparisons 必须是非空的 [arm_a, arm_b] 列表"
+    seen_pairs = set()
+    declared_modes = set()
+    for index, pair in enumerate(comparisons):
+        if (
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or not all(
+                isinstance(arm, str) and arm for arm in pair
+            )
+        ):
+            return (
+                f"comparisons[{index}] 必须是长度为 2 的模式名"
+                "列表（如 [\"smelt\", \"A\"]）"
+            )
+        first, second = str(pair[0]), str(pair[1])
+        if first == second:
+            return (
+                f"comparisons[{index}] 的两臂相同（{first}）："
+                "自比较没有信息量"
+            )
+        unknown = [
+            arm
+            for arm in (first, second)
+            if arm not in Config.ALL_MODES
+        ]
+        if unknown:
+            return (
+                f"comparisons[{index}] 含未知模式: "
+                + ", ".join(unknown)
+            )
+        canonical = tuple(sorted((first, second)))
+        if canonical in seen_pairs:
+            return f"comparisons 存在重复对比: {first} vs {second}"
+        seen_pairs.add(canonical)
+        declared_modes.update((first, second))
+    if str(baseline_mode) not in declared_modes:
+        return (
+            f"baseline_mode={baseline_mode} 没有出现在 "
+            "comparisons 中：预注册的对照臂必须参与至少一个"
+            "声明的比较"
+        )
+
+    seeds = payload.get("seeds")
+    if not isinstance(seeds, list) or not seeds:
+        return "seeds 必须是非空的整数列表"
+    normalized_seeds = []
+    for index, seed in enumerate(seeds):
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or seed < 0
+        ):
+            return f"seeds[{index}] 必须是非负整数"
+        normalized_seeds.append(seed)
+    if len(set(normalized_seeds)) != len(normalized_seeds):
+        return "seeds 存在重复随机种子"
+    if len(normalized_seeds) < _MIN_SEEDS_FOR_STATS:
+        return (
+            f"seeds 至少需要 {_MIN_SEEDS_FOR_STATS} 个独立种子"
+            "才能做显著性检验；预注册研究不能把单次运行当作"
+            "可推断的重复实验"
+        )
+
+    budget_match = payload.get("budget_match")
+    if budget_match is not None and (
+        not isinstance(budget_match, str)
+        or budget_match not in Config.MODEL_MODES
+    ):
+        return (
+            "budget_match 必须是 null 或模型模式之一: "
+            + ", ".join(sorted(Config.MODEL_MODES))
+        )
+    # A/B/local_base 与 smelt 的预算并不天然相同；预注册若声明
+    # 这类比较却不给 budget_match，就会在分析期把「机制收益」
+    # 与「多算」混在一起。base/smelt 的循环次数不同，不能套用
+    # 同一个预算门，因此只对延迟合并相关模式硬性要求。
+    if budget_match is None:
+        for first, second in comparisons:
+            arms = {str(first), str(second)}
+            if (
+                "smelt" in arms
+                and arms & {"A", "B", "local_base"}
+            ):
+                return (
+                    "comparisons 声明了延迟合并与 smelt 的对照，"
+                    "但 budget_match=null：必须用完整计算图预算门"
+                    "（如 budget_match=smelt）报告等计算量口径"
+                )
+
+    equivalence_margin = payload.get(
+        "equivalence_margin", _PREREGISTRATION_MISSING
+    )
+    if equivalence_margin is not _PREREGISTRATION_MISSING:
+        error = _preregistration_finite_number(
+            equivalence_margin,
+            "equivalence_margin",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if error is not None:
+            return error
+        if float(equivalence_margin) <= 0.0:  # type: ignore[arg-type]
+            return "equivalence_margin 必须是正数"
+
+    steps = payload.get("steps", _PREREGISTRATION_MISSING)
+    if steps is not _PREREGISTRATION_MISSING:
+        if (
+            isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps <= 0
+        ):
+            return "steps 必须是正整数"
+        if int(steps) < int(common_step):
+            return (
+                "steps 小于 common_step：训练预算内取不到"
+                "预注册的共同步数指标"
+            )
+
+    frozen_script = payload.get(
+        "frozen_script_sha256", _PREREGISTRATION_MISSING
+    )
+    if (
+        frozen_script is not _PREREGISTRATION_MISSING
+        and not _preregistration_sha256_text(frozen_script)
+    ):
+        return "frozen_script_sha256 必须是 64 位十六进制 SHA-256"
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return "data 必须是对象"
+    missing_data = [
+        key
+        for key in _PREREGISTRATION_DATA_REQUIRED_FIELDS
+        if key not in data
+    ]
+    if missing_data:
+        return "data 缺少必需字段: " + ", ".join(missing_data)
+    unknown_data = sorted(
+        set(data)
+        - set(_PREREGISTRATION_DATA_REQUIRED_FIELDS)
+        - set(_PREREGISTRATION_DATA_OPTIONAL_FIELDS)
+    )
+    if unknown_data:
+        return (
+            "data 含未知字段（拼写错误会让协议静默失效）: "
+            + ", ".join(unknown_data)
+        )
+    if not _preregistration_sha256_text(data.get("sha256")):
+        return "data.sha256 必须是 64 位十六进制 SHA-256"
+    if data.get("split_policy") not in ("contiguous", "chronological"):
+        return "data.split_policy 必须是 contiguous 或 chronological"
+    for key in ("val_fraction", "test_fraction"):
+        error = _preregistration_finite_number(
+            data.get(key),
+            f"data.{key}",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if error is not None:
+            return error
+    if (
+        float(data["val_fraction"])  # type: ignore[arg-type]
+        + float(data["test_fraction"])  # type: ignore[arg-type]
+        >= 1.0
+    ):
+        return "data.val_fraction + data.test_fraction 必须小于 1"
+
+    group_separator = data.get(
+        "group_separator", _PREREGISTRATION_MISSING
+    )
+    if (
+        group_separator is not _PREREGISTRATION_MISSING
+        and group_separator is not None
+        and not isinstance(group_separator, str)
+    ):
+        return "data.group_separator 必须是字符串或 null"
+    if isinstance(group_separator, str):
+        try:
+            parse_group_separator(group_separator)
+        except ValueError as error:
+            return f"data.group_separator 无效: {error}"
+
+    cleaning = data.get("cleaning", _PREREGISTRATION_MISSING)
+    if cleaning is not _PREREGISTRATION_MISSING:
+        if not isinstance(cleaning, dict):
+            return "data.cleaning 必须是对象"
+        unknown = sorted(
+            set(cleaning) - set(_PREREGISTRATION_CLEANING_KEYS)
+        )
+        if unknown:
+            return "data.cleaning 含未知开关: " + ", ".join(unknown)
+        for key, value in cleaning.items():
+            if not isinstance(value, bool):
+                return f"data.cleaning.{key} 必须是布尔值"
+
+    for key in (
+        "entity_manifest_sha256",
+        "time_order_manifest_sha256",
+    ):
+        if key in data and not _preregistration_sha256_text(data[key]):
+            return f"data.{key} 必须是 64 位十六进制 SHA-256"
+
+    return None
+
+
+def load_preregistration(
+    path: object,
+) -> Tuple[Dict[str, object], str]:
+    """
+    读取并校验预注册 JSON，返回 ``(payload, file_sha256)``。
+
+    - 拒绝重复键：JSON 中同名键以后一个为准，会让「文件里
+      写了什么」产生歧义；
+    - 拒绝 NaN/Infinity 常量：它们不是合法 JSON，且会污染
+      后续数值比较；
+    - 结构校验失败抛 ValueError，由入口转成参数错误。
+    """
+    file_path = Path(path)
+    try:
+        raw = file_path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"无法读取 {file_path}: {error}") from error
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"{file_path} 不是 UTF-8 文本: {error}"
+        ) from error
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"不允许非有限数值常量 {value}")
+
+    def no_duplicate_keys(pairs):
+        result: Dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"存在重复键 {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            text,
+            parse_constant=reject_constant,
+            object_pairs_hook=no_duplicate_keys,
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"{file_path} 不是合法 JSON: {error}"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{file_path} 必须是 JSON 对象")
+    schema_error = preregistration_schema_error(payload)
+    if schema_error is not None:
+        raise ValueError(
+            f"{file_path} 预注册无效: {schema_error}"
+        )
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def preregistration_frozen_commit_status(
+    frozen_commit: str,
+) -> Optional[bool]:
+    """
+    当前 HEAD 是否仍包含冻结提交的代码。
+
+    预注册文件本身通常要在记录 ``frozen_commit`` 之后提交，
+    因此 HEAD 必然比冻结提交多一个（或多个只改预注册/文档的）
+    提交；要求二者完全相等会让协议无法执行。这里允许
+    ``frozen_commit`` 是 HEAD 的祖先，但要求
+    ``experiment.py`` 从冻结提交到 HEAD 逐字节未变。任何代码
+    变更都返回 False；git 不可用/提交不存在时返回 None。
+    """
+    head = _git_output("rev-parse", "HEAD")
+    if not isinstance(head, str) or not head:
+        return None
+    frozen = frozen_commit.strip()
+    if (
+        head.lower() == frozen.lower()
+        or head.lower().startswith(frozen.lower())
+        or frozen.lower().startswith(head.lower())
+    ):
+        return True
+    repository = str(Path(__file__).resolve().parent)
+    try:
+        ancestor = subprocess.run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                frozen,
+                "HEAD",
+            ],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if ancestor.returncode != 0:
+            return False
+        unchanged = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--quiet",
+                frozen,
+                "HEAD",
+                "--",
+                "experiment.py",
+            ],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return unchanged.returncode == 0
+
+
+def preregistration_apply(
+    args: argparse.Namespace,
+    payload: Dict[str, object],
+    *,
+    current_commit: Optional[str] = None,
+    working_tree_dirty: Optional[bool] = None,
+    current_script_sha256: Optional[str] = None,
+    frozen_code_matches: Optional[bool] = None,
+) -> Tuple[List[str], Optional[str]]:
+    """
+    把预注册文件落到本次运行的命令行参数上。
+
+    规则：
+    - 命令行为空（None）的字段由文件补齐，并记录
+      ``applied_fields``；
+    - 命令行显式给出且与文件不同则拒绝启动——预注册不能在
+      看到数据后按当前命令「就高」；
+    - ``--seed`` 允许只跑预注册中的一个臂/一个种子；``--seeds``
+      必须与预注册种子集合完全一致；二者都未给出时按预注册
+      种子集合运行完整套件；
+    - 冻结提交、工作区脏状态与脚本指纹不一致时拒绝启动。
+
+    返回 ``(applied_fields, error)``。
+    """
+    applied: List[str] = []
+
+    def assign(
+        attr: str,
+        key: str,
+        expected: object,
+        *,
+        numeric: bool = False,
+        respect_explicit: bool = False,
+    ) -> Optional[str]:
+        current = getattr(args, attr, None)
+        if respect_explicit and not _argv_has_flag(
+            "--" + attr.replace("_", "-")
+        ):
+            current = None
+        if current is None:
+            setattr(args, attr, expected)
+            applied.append(key)
+            return None
+        if numeric:
+            try:
+                same = float(current) == float(expected)
+            except (TypeError, ValueError):
+                same = False
+        else:
+            same = current == expected
+        if same:
+            return None
+        return (
+            f"命令行 {attr}={current!r} 与预注册文件 {key}="
+            f"{expected!r} 不一致：预注册字段不能在训练开始前"
+            "被命令行覆盖；如需新研究阶段，请重新冻结并写新的"
+            "预注册文件"
+        )
+
+    # 代码版本先核对：之后的字段一致性都建立在「同一份代码」
+    # 之上。没有 git 时退回脚本指纹；两者都无法核对则拒绝，
+    # 而不是默认通过。
+    frozen_commit = str(payload["frozen_commit"])
+    if current_commit:
+        same_commit = (
+            current_commit.lower() == frozen_commit.lower()
+            or current_commit.lower().startswith(
+                frozen_commit.lower()
+            )
+            or frozen_commit.lower().startswith(
+                current_commit.lower()
+            )
+        )
+        if not same_commit and frozen_code_matches is not True:
+            return applied, (
+                f"当前 git commit {current_commit[:12]}... 与预注册"
+                f" frozen_commit {frozen_commit[:12]}... 不一致，"
+                "且无法确认冻结提交是当前 HEAD 的祖先并保持 "
+                "experiment.py 未变：确证实验必须在冻结的代码"
+                "版本上运行（仅允许在冻结提交之后增加预注册/"
+                "文档提交）"
+            )
+    else:
+        expected_script = payload.get("frozen_script_sha256")
+        if not expected_script:
+            return applied, (
+                "无法读取当前 git commit，且预注册文件没有 "
+                "frozen_script_sha256：不能核对代码版本，"
+                "拒绝把未冻结的运行当作确证实验"
+            )
+        if (
+            not current_script_sha256
+            or str(expected_script) != current_script_sha256
+        ):
+            return applied, (
+                "当前 experiment.py 的 SHA-256 与预注册 "
+                "frozen_script_sha256 不一致：代码在冻结后"
+                "被修改"
+            )
+    if working_tree_dirty:
+        return applied, (
+            "工作区存在未提交修改：预注册要求冻结代码，"
+            "git status --porcelain 必须为空；请提交/还原"
+            "改动后重跑，而不是把脏工作区当作冻结版本"
+        )
+    expected_script = payload.get("frozen_script_sha256")
+    if expected_script is not None and current_script_sha256 is not None:
+        if str(expected_script) != current_script_sha256:
+            return applied, (
+                "当前 experiment.py 的 SHA-256 与预注册 "
+                "frozen_script_sha256 不一致：同一 commit 的"
+                "脚本内容也必须是冻结内容"
+            )
+
+    for attr, key in (
+        ("primary_metric", "primary_metric"),
+        ("hypothesis_direction", "direction"),
+        ("hypothesis_min_effect", "min_effect"),
+        ("hypothesis_baseline", "baseline_mode"),
+        ("common_step", "common_step"),
+        ("budget_match", "budget_match"),
+    ):
+        if key == "budget_match" and payload[key] is None:
+            continue
+        error = assign(
+            attr,
+            key,
+            payload[key],
+            numeric=key in ("min_effect", "common_step"),
+        )
+        if error is not None:
+            return applied, error
+
+    # 等价界有非 None 默认值：只有命令行未显式给出时才允许
+    # 用预注册值覆盖，否则默认值会把文件里的界误判成冲突。
+    if "equivalence_margin" in payload:
+        error = assign(
+            "equivalence_margin",
+            "equivalence_margin",
+            payload["equivalence_margin"],
+            numeric=True,
+            respect_explicit=True,
+        )
+        if error is not None:
+            return applied, error
+
+    if "steps" in payload:
+        error = assign(
+            "steps",
+            "steps",
+            payload["steps"],
+            numeric=True,
+        )
+        if error is not None:
+            return applied, error
+
+    common_step = int(payload["common_step"])
+    if int(getattr(args, "steps", 0) or 0) < common_step:
+        return applied, (
+            f"--steps={getattr(args, 'steps', None)} 小于预注册 "
+            f"common_step={common_step}：训练结束前取不到该步的"
+            "指标，预注册的主分析无法执行"
+        )
+
+    # 计划运行的臂必须属于预注册声明的对照；否则这不是同一
+    # 项研究，而是一个借着预注册文件运行的新实验。套件要按
+    # 将要实际展开的模式集合核对，而不是只看 --mode 默认值：
+    # 否则 `--suite-modes A`（默认 mode=B 不在该 study）会被
+    # 误拒。
+    if not getattr(args, "statistical_baseline", False):
+        declared_modes = {
+            str(arm)
+            for pair in payload["comparisons"]  # type: ignore[union-attr]
+            for arm in pair
+        }
+        planned_modes: set = set()
+        if bool(getattr(args, "suite_ablation", False)):
+            planned_modes.add("local_base")
+            planned_modes.update(
+                str(mode)
+                for mode in (
+                    getattr(args, "ablation_modes", None)
+                    or _DELAYED_MERGE_MODES
+                )
+            )
+        elif getattr(args, "suite_modes", None):
+            planned_modes.update(
+                str(mode) for mode in args.suite_modes
+            )
+        else:
+            planned_modes.add(str(getattr(args, "mode", "")))
+        undeclared = sorted(planned_modes - declared_modes)
+        if undeclared:
+            return applied, (
+                "计划运行的臂 "
+                + ", ".join(undeclared)
+                + " 不在预注册 comparisons 声明的模式中："
+                "该运行不是预注册研究的一部分"
+            )
+
+    preregistered_seeds = [
+        int(seed)
+        for seed in payload["seeds"]  # type: ignore[union-attr]
+    ]
+    current_seeds = getattr(args, "seeds", None)
+    if current_seeds is not None:
+        if set(int(seed) for seed in current_seeds) != set(
+            preregistered_seeds
+        ):
+            return applied, (
+                f"--seeds={list(current_seeds)} 与预注册 seeds="
+                f"{preregistered_seeds} 不一致：确证套件的种子"
+                "集合必须在训练前固定，不能事后增删"
+            )
+    elif (
+        _argv_has_flag("--seed")
+        or getattr(args, "resume", None) is not None
+        or bool(getattr(args, "evaluate_test", False))
+    ):
+        # resume / 最终 test 解封都是单条轨迹，不能展开成
+        # 多种子套件；它们只能使用预注册种子之一。
+        if int(getattr(args, "seed", -1)) not in preregistered_seeds:
+            return applied, (
+                f"--seed={getattr(args, 'seed', None)} 不在预注册"
+                f" seeds={preregistered_seeds} 中：单次运行只能"
+                "是预注册种子之一"
+            )
+    else:
+        args.seeds = list(preregistered_seeds)
+        applied.append("seeds")
+
+    return applied, None
+
+
+def _preregistration_file_sha256(
+    path: object,
+) -> Optional[str]:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def preregistration_sweep_error(
+    run_paths: List[str],
+    expected_file_sha256: str,
+) -> Optional[str]:
+    """
+    核对套件中的每个子运行是否都使用了同一份预注册文件。
+
+    预注册套件由父进程逐个子进程执行；若文件在运行中途被
+    编辑，前后种子就会在不同协议下训练，但父进程看到的仍是
+    当前文件。这里用每个子运行 config.json 里的
+    ``preregistration.file_sha256`` 反查，发现不一致时拒绝
+    把整批结果当作同一项预注册研究。
+    """
+    mismatched: List[str] = []
+    missing: List[str] = []
+    for path in run_paths:
+        config_path = Path(path) / "config.json"
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            missing.append(Path(path).name)
+            continue
+        record = (
+            config.get("preregistration")
+            if isinstance(config, dict)
+            else None
+        )
+        if not isinstance(record, dict):
+            missing.append(Path(path).name)
+            continue
+        if record.get("file_sha256") != expected_file_sha256:
+            mismatched.append(
+                f"{Path(path).name}"
+                f"（{record.get('file_sha256')}）"
+            )
+    if missing:
+        return (
+            "以下子运行缺少预注册核对记录（config.json 不可读或"
+            "不是 --preregistration 入口产生）: "
+            + ", ".join(sorted(missing))
+        )
+    if mismatched:
+        return (
+            "以下子运行使用的预注册文件 SHA-256 与父进程不一致"
+            f"（预期 {expected_file_sha256}）: "
+            + ", ".join(sorted(mismatched))
+            + "；预注册文件不能在套件运行中途被修改，"
+            "请重新冻结并从全新目录重跑"
+        )
+    return None
+
+
+def preregistration_data_error(
+    args: argparse.Namespace,
+    payload: Dict[str, object],
+    dataset: object,
+) -> Optional[str]:
+    """
+    核对预注册的数据协议与本次实际加载的数据是否一致。
+
+    只核对 ``dataset`` 上已构造出的真实指纹/比例，不接受
+    「文件名相同」「路径相同」这类弱证据；清洗开关、显式
+    分隔符与清单指纹也逐项核对，因为它们都会改变实际参与
+    训练或评估的字节。
+    """
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return "预注册文件缺少 data 对象"
+
+    actual_sha = getattr(dataset, "data_sha256", None)
+    if (
+        not isinstance(actual_sha, str)
+        or actual_sha.lower() != str(data["sha256"]).lower()
+    ):
+        return (
+            f"预注册 data.sha256={data['sha256']} 与实际语料 "
+            f"SHA-256={actual_sha} 不一致：冻结后才能开始确证"
+            "运行，换数据必须重新预注册"
+        )
+
+    declared_policy = str(data["split_policy"])
+    current_policy = str(
+        getattr(args, "split_policy", "contiguous")
+    )
+    if declared_policy != current_policy:
+        return (
+            f"预注册 data.split_policy={declared_policy} 与当前 "
+            f"--split-policy={current_policy} 不一致：切分口径"
+            "决定了「前缀」能否被解释为时间外推"
+        )
+
+    for key in ("val_fraction", "test_fraction"):
+        declared = float(data[key])  # type: ignore[arg-type]
+        actual = getattr(dataset, key, None)
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not math.isclose(
+                float(actual),
+                declared,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            return (
+                f"预注册 data.{key}={declared:g} 与实际切分 "
+                f"{key}={actual!r} 不一致"
+            )
+
+    declared_group = data.get(
+        "group_separator", _PREREGISTRATION_MISSING
+    )
+    if declared_group is not _PREREGISTRATION_MISSING:
+        current_group = getattr(args, "group_separator", None)
+        try:
+            declared_bytes = (
+                None
+                if declared_group is None
+                else parse_group_separator(str(declared_group))
+            )
+            current_bytes = (
+                None
+                if current_group is None
+                else parse_group_separator(str(current_group))
+            )
+        except ValueError as error:
+            return f"预注册/命令行群组分隔符无效: {error}"
+        if declared_bytes != current_bytes:
+            return (
+                "预注册 data.group_separator 与当前 "
+                "--group-separator 不一致：群组边界改变会改变"
+                "切分吸附位置与实际训练字节"
+            )
+
+    cleaning = data.get("cleaning")
+    if isinstance(cleaning, dict):
+        for key, expected in cleaning.items():
+            actual = bool(getattr(args, key, False))
+            if actual != bool(expected):
+                return (
+                    f"预注册 data.cleaning.{key}={bool(expected)} "
+                    f"与当前 {actual} 不一致：清洗开关会改变"
+                    "实际参与训练/去重的数据，不能在看到结果后"
+                    "再改"
+                )
+
+    for key, attr in (
+        ("entity_manifest_sha256", "entity_manifest"),
+        ("time_order_manifest_sha256", "time_order_manifest"),
+    ):
+        expected = data.get(key)
+        if expected is None:
+            continue
+        path = getattr(args, attr, None)
+        if not path:
+            return (
+                f"预注册声明了 data.{key}，但当前没有 --"
+                f"{attr.replace('_', '-')}：无法核对清单内容"
+            )
+        actual = _preregistration_file_sha256(path)
+        if actual is None:
+            return f"无法读取 --{attr.replace('_', '-')}={path}"
+        if actual != str(expected).lower():
+            return (
+                f"--{attr.replace('_', '-')}={path} 的 SHA-256 "
+                f"{actual} 与预注册 data.{key}={expected} 不一致"
+            )
+
+    return None
+
+
+def preregistration_record(
+    payload: Dict[str, object],
+    source: object,
+    file_sha256: str,
+    applied_fields: List[str],
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    """生成写入 config.json 的预注册核对记录。"""
+    return {
+        "source": str(source),
+        "file_sha256": file_sha256,
+        "study_id": payload.get("study_id"),
+        "frozen_commit": payload.get("frozen_commit"),
+        "frozen_script_sha256": payload.get(
+            "frozen_script_sha256"
+        ),
+        "primary_metric": payload.get("primary_metric"),
+        "common_step": payload.get("common_step"),
+        "direction": payload.get("direction"),
+        "min_effect": payload.get("min_effect"),
+        "baseline_mode": payload.get("baseline_mode"),
+        "comparisons": payload.get("comparisons"),
+        "seeds": payload.get("seeds"),
+        "budget_match": payload.get("budget_match"),
+        "applied_fields": list(applied_fields),
+        "run_mode": getattr(args, "mode", None),
+        "run_seed": getattr(args, "seed", None),
+        "run_seeds": getattr(args, "seeds", None),
+        "data_sha256": getattr(args, "data_sha256", None),
+        "data_split_sha256": getattr(
+            args, "data_split_sha256", None
+        ),
+        "data_split_policy": getattr(
+            args, "split_policy", "contiguous"
+        ),
+        "data_verified": bool(
+            getattr(args, "data_sha256", None) is not None
+        ),
+    }
+
+
 def hypothesis_preregistration_error(
     args: argparse.Namespace,
 ) -> Optional[str]:
@@ -35749,6 +36723,14 @@ def write_run_config(
         "hypothesis_check_skipped": bool(
             args.skip_hypothesis_check
         ),
+        # 外部预注册文件的核对记录：文件 SHA-256、study_id、
+        # 冻结提交、由文件补齐的字段、实际数据指纹与模式/种子。
+        # 与 hypothesis_preregistration 分开保存：后者只是本次
+        # 运行生效的判定口径，前者证明这些口径在训练前已被一份
+        # 独立文件固定并可核对。
+        "preregistration": getattr(
+            args, "preregistration_record", None
+        ),
         # 训练前预注册的判定口径：主指标、预期方向、最小有意义
         # 效应。对比阶段据此核对「观测方向/幅度是否与训练前的
         # 预期一致」以及「分析指标是否是预注册的主指标」，
@@ -35994,6 +36976,20 @@ def write_run_config(
                 payload["hypothesis_preregistration"] = (
                     current_prereg
                 )
+
+            # 外部预注册记录同样不能在 resume 时被抹掉：它是
+            # 「这份运行在训练前对照过哪份独立文件」的唯一证据。
+            # 当前 resume 若重新提供了预注册文件，则保留本次
+            # 核对后的记录；否则继承原记录。
+            if (
+                payload.get("preregistration") is None
+                and isinstance(
+                    previous.get("preregistration"), dict
+                )
+            ):
+                payload["preregistration"] = previous[
+                    "preregistration"
+                ]
 
             # resume 会重写 run_metadata（新的 timestamp/command/
             # 环境快照）。保留最初运行的元数据快照与续跑次数，
@@ -54195,6 +55191,19 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
 
     run_paths = _execute_sweep_plan(base_argv, plan, out_root)
 
+    # 套件必须使用同一份预注册文件：若文件在运行中途被编辑，
+    # 各子运行实际执行的协议就不再相同，不能合并成一项研究。
+    prereg_record = getattr(
+        args, "preregistration_record", None
+    )
+    if isinstance(prereg_record, dict):
+        sweep_prereg_error = preregistration_sweep_error(
+            run_paths,
+            str(prereg_record.get("file_sha256")),
+        )
+        if sweep_prereg_error is not None:
+            raise SystemExit(sweep_prereg_error)
+
     rows = compare_runs(run_paths)
     # --compare-metric 可以是等计算量 loss；调参报告必须与
     # 当前对比指标同口径。调参候选只有学习率不同、每步 FLOPs
@@ -54558,6 +55567,20 @@ def main():
         help=(
             "显式跳过假设检查（只建议纯工程目的的临时运行"
             "使用；跳过会被记录进 config.json）"
+        ),
+    )
+    parser.add_argument(
+        "--preregistration",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "训练前冻结的预注册 JSON（study_id / frozen_commit / "
+            "主指标 / 方向 / 最小效应 / 共同步数 / 对照臂 / "
+            "种子集合 / 数据指纹）。文件补齐未显式给出的命令行"
+            "参数；显式冲突、代码提交不一致、工作区脏或数据"
+            "指纹不一致时拒绝启动。--compare / --sanity-only / "
+            "--suite-baseline-tuning 不适用"
         ),
     )
     parser.add_argument(
@@ -55485,6 +56508,75 @@ def main():
     # --paper-cell 决定模型结构，--paper-protocol 决定训练协议
     # 与 WSD 调度参数。
     apply_paper_cli(args, parser)
+
+    # 外部预注册必须在任何训练/数据准备工作之前落地：它补齐
+    # 未显式给出的判定口径与种子集合，并核对冻结提交。显式
+    # 冲突直接拒绝，而不是让「先跑再写预注册」冒充确证实验。
+    if args.preregistration is not None:
+        if any(
+            flag
+            for flag in (
+                args.compare is not None,
+                args.final_test_comparison is not None,
+                args.sanity_only,
+                args.statistical_baseline,
+                args.suite_baseline_tuning,
+            )
+        ):
+            parser.error(
+                "--preregistration 只适用于神经训练/多种子确证"
+                "运行：--compare / --final-test-comparison / "
+                "--sanity-only / --statistical-baseline / "
+                "--suite-baseline-tuning 不执行预注册的训练协议"
+            )
+        try:
+            preregistration_payload, preregistration_sha256 = (
+                load_preregistration(args.preregistration)
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        applied_fields, preregistration_error = (
+            preregistration_apply(
+                args,
+                preregistration_payload,
+                current_commit=_git_output("rev-parse", "HEAD"),
+                working_tree_dirty=bool(
+                    _git_output("status", "--porcelain")
+                ),
+                current_script_sha256=_script_sha256(),
+                frozen_code_matches=(
+                    preregistration_frozen_commit_status(
+                        str(
+                            preregistration_payload[
+                                "frozen_commit"
+                            ]
+                        )
+                    )
+                ),
+            )
+        )
+        if preregistration_error is not None:
+            parser.error(preregistration_error)
+        args.preregistration_record = preregistration_record(
+            preregistration_payload,
+            args.preregistration,
+            preregistration_sha256,
+            applied_fields,
+            args,
+        )
+        print(
+            "[prereg] study_id="
+            f"{preregistration_payload['study_id']}，冻结提交 "
+            f"{str(preregistration_payload['frozen_commit'])[:12]}...，"
+            "种子="
+            f"{preregistration_payload['seeds']}"
+            + (
+                "；由文件补齐: " + ", ".join(applied_fields)
+                if applied_fields
+                else "；命令行与预注册逐项一致"
+            )
+        )
+
     if (
         args.wsd_stable_steps is not None
         and args.wsd_stable_steps < 0
@@ -57181,6 +58273,38 @@ def main():
     args.data_split_isolation = dict(
         dataset.split_isolation
     )
+
+    # 数据指纹/切分比例/清洗开关必须与训练前冻结的预注册逐项
+    # 一致；数据是协议的一部分，不能只看「路径还是那个文件」。
+    if args.preregistration is not None:
+        data_preregistration_error = preregistration_data_error(
+            args,
+            preregistration_payload,
+            dataset,
+        )
+        if data_preregistration_error is not None:
+            parser.error(data_preregistration_error)
+        if isinstance(
+            getattr(args, "preregistration_record", None),
+            dict,
+        ):
+            args.preregistration_record.update({
+                "data_sha256": dataset.data_sha256,
+                "data_split_sha256": dict(
+                    dataset.split_sha256
+                ),
+                "data_split_policy": args.split_policy,
+                "data_val_fraction": dataset.val_fraction,
+                "data_test_fraction": dataset.test_fraction,
+                "data_group_separator": args.group_separator,
+                "data_verified": True,
+            })
+        print(
+            "[prereg] 数据协议核对通过：语料 "
+            f"{dataset.data_sha256[:12]}...，切分 "
+            f"{args.split_policy}，val/test="
+            f"{dataset.val_fraction:g}/{dataset.test_fraction:g}"
+        )
 
     args.data_entity_audit = None
     if args.entity_manifest is not None:
