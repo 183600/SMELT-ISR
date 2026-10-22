@@ -57863,6 +57863,32 @@ def main():
             )
             args.eval_bootstrap = saved_eval_bootstrap
 
+        # bootstrap 的重采样单位（i.i.d. 窗口 vs 移动块）与次数
+        # 一样决定置信区间宽度，且已写入 comparison_protocol；
+        # resume 时若回落到命令行默认值，续跑段与原始段的评估
+        # 口径就不再一致，config 里的协议指纹也会被静默改写。
+        saved_eval_bootstrap_block = rng_payload.get(
+            "args",
+            {},
+        ).get("eval_bootstrap_block")
+
+        if (
+            isinstance(saved_eval_bootstrap_block, int)
+            and not isinstance(saved_eval_bootstrap_block, bool)
+            and saved_eval_bootstrap_block > 0
+            and saved_eval_bootstrap_block
+            != args.eval_bootstrap_block
+        ):
+            print(
+                "resume restored eval_bootstrap_block "
+                f"{args.eval_bootstrap_block} -> "
+                f"{saved_eval_bootstrap_block} "
+                "(bootstrap 重采样单位是评估协议的一部分)"
+            )
+            args.eval_bootstrap_block = (
+                saved_eval_bootstrap_block
+            )
+
         # 周期排序指标决定是否存在避开选型偏差的共同步数 AUC
         # 指标；resume 时按存档恢复，避免续跑静默改变评估协议
         # 和可用的敏感性分析口径。
