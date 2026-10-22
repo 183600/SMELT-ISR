@@ -81,18 +81,23 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `seq_len + 1` 字节（如单个群组过大）则显式报错，不拆分群组。
   `data_audit.groups` 记录分隔符与每个 split 的完整群组数；
   `comparison_protocol.group_separator` 把分隔符纳入受控变量。
-- **训练集去重**：`--deduplicate-train-groups` 只从 train 剔除与
-  val/test 或更早 train 群组内容完全相同的群组，val/test 字节与切分
+- **训练集去重**：`--deduplicate-train-groups` 默认只从 train 剔除与
+  val 或更早 train 群组内容完全相同的群组，val/test 字节与切分
   位置不变；被剔除内容不进入神经窗口、unigram / n-gram 计数或分布
   审计，`data_audit` 的 `effective_bytes` / `effective_windows` 与
   `config.data.split_fractions` 记录清洗后的真实训练口径。训练期只用
   切分边界核对 test 占比（不读 test 内容）；解封前独立探针再核对
-  test 固定窗口的输入/标签逐位对齐。
+  test 固定窗口的输入/标签逐位对齐。默认不使用 test 内容决定剔除
+  哪些训练群组；train/test 重复留到解封时由泄露门拦截。只有显式
+  `--clean-train-against-test` 才恢复「用 test 清洗 train」的旧行为，
+  并把 `test_used_for_cleaning` / `cleaning_eval_splits` 写入
+  `train_cleaning` 与受控协议（该运行不再被视为完全尘封测试集）。
 - **跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
-  群组分隔符）用与审计相同的内容定义分块指纹，把与 val/test 共享
-  连续字节块的整个训练群组从 train 剔除；val/test 字节、切分位置与
-  内容指纹逐位不变，清洗后同一审计必须归零。它补上「精确群组指纹
-  抓不到嵌入片段」的空档，与 `--deduplicate-train-groups` 可叠加。
+  群组分隔符）用与审计相同的内容定义分块指纹，把与 val（默认；
+  显式 `--clean-train-against-test` 时含 test）共享连续字节块的整个
+  训练群组从 train 剔除；val/test 字节、切分位置与内容指纹逐位不变，
+  清洗后同一审计必须归零。它补上「精确群组指纹抓不到嵌入片段」的
+  空档，与 `--deduplicate-train-groups` 可叠加。
 - **连续字节流标签噪声清洗**：无群组分隔符时，
   `--drop-train-corrupt-bytes` 只从 train 剔除非法 UTF-8 字节与
   NUL 字节本身（不修补、不发明标签），val/test 字节与切分位置

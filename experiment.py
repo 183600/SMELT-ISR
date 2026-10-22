@@ -3126,6 +3126,8 @@ class ByteDataset:
       train/val/test 任意两侧之间都不共享半个群组；
     - 训练期间 test 保持尘封：训练循环只访问 train，周期性验证
       只访问 val，test 仅在最终评估（--evaluate-test）时访问一次；
+      训练集清洗默认也只对照 val 与更早的 train 群组，绝不用
+      test 内容决定剔除哪些训练样本（那会让训练数据依赖 test）；
     - 本管线不做任何依赖全局统计量的预处理（标准化、归一化、
       缺失值填充等）；若后续扩展为连续值特征，必须只在 train 上
       fit，再 transform val/test，禁止在划分前用全量数据统计。
@@ -3148,6 +3150,7 @@ class ByteDataset:
         drop_train_corrupt_bytes: bool = False,
         drop_train_degenerate_groups: bool = False,
         drop_train_degenerate_runs: bool = False,
+        clean_train_against_test: bool = False,
     ):
         data_path = Path(filename)
 
@@ -3269,6 +3272,23 @@ class ByteDataset:
             drop_train_degenerate_groups
         )
 
+        # test 只用于最终评估。训练集清洗若读取 test 群组/内容，
+        # 训练样本集合就会依赖 test，「只解封一次」的协议被绕过；
+        # 默认只对照 val 与更早的 train，旧行为必须显式开启并被
+        # 记录。未启用任何对照 eval split 的清洗时该开关无效果。
+        self.clean_train_against_test = bool(
+            clean_train_against_test
+        )
+        if self.clean_train_against_test and not (
+            deduplicate_train_groups
+            or drop_train_shared_chunks
+        ):
+            raise ValueError(
+                "clean_train_against_test 需要同时启用 "
+                "deduplicate_train_groups 或 "
+                "drop_train_shared_chunks"
+            )
+
         # 训练集清洗（可选的群组级/字节级）：只剔除 train 中
         # 与 val/test 或更早训练群组完全重复的群组、损坏字节或
         # 退化群组。被剔除的字节不会进入任何训练窗口；val/test
@@ -3356,16 +3376,26 @@ class ByteDataset:
         dedup_excluded: List[Tuple[int, int]] = []
         dedup_stats: Optional[Dict[str, object]] = None
 
+        # 默认只用 val（验证集用于选型/早停）作为训练集清洗的
+        # 对照；test 必须保持尘封，不能参与「剔除哪些训练群组」
+        # 的决定。显式 clean_train_against_test 才恢复旧行为，
+        # 并把该事实写入 train_cleaning 供审计/对比核对。
+        cleaning_eval_ranges: Dict[
+            str, Tuple[int, int]
+        ] = {"val": (n_train, n_val_end)}
+        if self.clean_train_against_test:
+            cleaning_eval_ranges["test"] = (
+                n_val_end,
+                len(tokens),
+            )
+
         if deduplicate_train_groups:
             dedup_excluded, dedup_stats = (
                 _plan_train_group_dedup(
                     self._raw_buffer,
                     group_separator,
                     n_train,
-                    {
-                        "val": (n_train, n_val_end),
-                        "test": (n_val_end, len(tokens)),
-                    },
+                    cleaning_eval_ranges,
                 )
             )
 
@@ -3382,10 +3412,7 @@ class ByteDataset:
                     self._raw_buffer,
                     group_separator,
                     n_train,
-                    {
-                        "val": (n_train, n_val_end),
-                        "test": (n_val_end, len(tokens)),
-                    },
+                    cleaning_eval_ranges,
                     shared_min_chunk,
                     max(
                         _AUDIT_CHUNK_MAX_BYTES,
@@ -3509,6 +3536,15 @@ class ByteDataset:
                 "dropped_bytes": dropped_bytes,
                 "post_clean_train_bytes": (
                     n_train - dropped_bytes
+                ),
+                # 清洗对照了哪些 split：test 出现在这里意味着
+                # 训练集内容选择读取过测试集，违反默认尘封协议；
+                # 只有显式开关才会出现。
+                "cleaning_eval_splits": sorted(
+                    cleaning_eval_ranges
+                ),
+                "test_used_for_cleaning": bool(
+                    self.clean_train_against_test
                 ),
             })
 
@@ -6680,6 +6716,22 @@ def audit_data_splits(
             "content_health": content_health,
             "train_cleaning": dataset.train_cleaning,
         }
+
+        if (
+            isinstance(dataset.train_cleaning, dict)
+            and dataset.train_cleaning.get(
+                "test_used_for_cleaning"
+            )
+        ):
+            message = (
+                "train: 训练集清洗对照了 test 内容"
+                "（显式开启 --clean-train-against-test）："
+                "训练样本集合依赖测试集，最终 test 指标不再"
+                "来自完全尘封的数据；该事实已写入 train_cleaning"
+                "并参与跨运行协议核对"
+            )
+            warnings.append(message)
+            violations.append(message)
 
         if (
             content_health is not None
@@ -10859,6 +10911,13 @@ def run_statistical_baseline(
                 getattr(
                     args,
                     "drop_train_shared_chunks",
+                    False,
+                )
+            ),
+            "clean_train_against_test": bool(
+                getattr(
+                    args,
+                    "clean_train_against_test",
                     False,
                 )
             ),
@@ -17413,6 +17472,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
+    # 训练集清洗是否读取 test 内容：默认 False（test 尘封）；
+    # True 会让训练样本集合依赖 test，必须作为协议差异核对。
+    "clean_train_against_test",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
@@ -17467,6 +17529,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
+    "clean_train_against_test",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
@@ -18029,6 +18092,16 @@ def build_comparison_protocol(
         "drop_train_shared_chunks": bool(
             getattr(args, "drop_train_shared_chunks", False)
         ),
+        # 训练集清洗是否对照 test：默认 False；True 意味着
+        # 训练样本选择读取过 test，不能与其他运行混为同一
+        # 数据协议。
+        "clean_train_against_test": bool(
+            getattr(
+                args,
+                "clean_train_against_test",
+                False,
+            )
+        ),
         "drop_train_corrupt_groups": bool(
             getattr(args, "drop_train_corrupt_groups", False)
         ),
@@ -18238,6 +18311,19 @@ def experiment_protocol_from_payload(
         ),
         "drop_train_shared_chunks": bool(
             run_args.get("drop_train_shared_chunks", False)
+        ),
+        # 旧运行没有该键时按历史行为回填：旧版只要启用去重/
+        # 共享块清洗就会读取 test。不能默认成新版的 False，
+        # 否则会把「旧运行实际用过 test」误报成与新运行一致。
+        "clean_train_against_test": (
+            bool(run_args.get("clean_train_against_test", False))
+            if "clean_train_against_test" in run_args
+            else bool(
+                run_args.get("deduplicate_train_groups", False)
+                or run_args.get(
+                    "drop_train_shared_chunks", False
+                )
+            )
         ),
         "drop_train_corrupt_groups": bool(
             run_args.get("drop_train_corrupt_groups", False)
@@ -34321,6 +34407,84 @@ def run_self_test():
     assert raw_ngram.train_total == 48
     assert cleaned_ngram.train_total == 28
 
+    # test 尘封协议：训练集去重默认只对照 val 与更早 train，
+    # 不能读取 test 群组来决定剔除哪些训练样本。同一份数据在
+    # 显式 --clean-train-against-test 时才会恢复旧的 train/test
+    # 依赖行为，并把该事实写入清洗记录。
+    sealed_dedup_groups = [
+        b"A" * 10,
+        b"B" * 10,
+        b"C" * 10,
+        b"V" * 10,
+        b"A" * 10,
+    ]
+    sealed_dedup_payload = (
+        separator.join(sealed_dedup_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as sealed_dedup_file:
+        sealed_dedup_file.write(sealed_dedup_payload)
+        sealed_dedup_file.flush()
+
+        sealed_dedup_dataset = ByteDataset(
+            sealed_dedup_file.name,
+            seq_len=4,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            group_separator=separator,
+            deduplicate_train_groups=True,
+        )
+        leaky_dedup_dataset = ByteDataset(
+            sealed_dedup_file.name,
+            seq_len=4,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            group_separator=separator,
+            deduplicate_train_groups=True,
+            clean_train_against_test=True,
+        )
+
+        sealed_dedup_audit = audit_data_splits(
+            sealed_dedup_dataset,
+            include_test=True,
+        )
+        leaky_dedup_audit = audit_data_splits(
+            leaky_dedup_dataset,
+            include_test=True,
+        )
+
+    assert sealed_dedup_dataset.split_bounds == {
+        "train": (0, 36),
+        "val": (36, 48),
+        "test": (48, 60),
+    }
+    # 默认：train 中的 A 与 test 的 A 重复，但不允许用 test
+    # 内容清洗 train；重复留到解封时由泄露门拦截。
+    assert sealed_dedup_dataset.train_excluded_spans == []
+    assert sealed_dedup_dataset.train_cleaning[
+        "test_used_for_cleaning"
+    ] is False
+    assert sealed_dedup_dataset.train_cleaning[
+        "cleaning_eval_splits"
+    ] == ["val"]
+    assert sealed_dedup_dataset.effective_train_bytes == 36
+    assert sealed_dedup_audit["leakage_violations"]
+    assert not enforce_data_leakage_gate(sealed_dedup_audit)
+
+    # 显式开启：读取 test 内容剔除 train 中的重复群组，审计
+    # 不再有 train/test 重复，但清洗记录必须暴露该依赖。
+    assert leaky_dedup_dataset.train_excluded_spans == [(0, 10)]
+    assert leaky_dedup_dataset.train_cleaning[
+        "test_used_for_cleaning"
+    ] is True
+    assert leaky_dedup_dataset.train_cleaning[
+        "cleaning_eval_splits"
+    ] == ["test", "val"]
+    assert leaky_dedup_dataset.train_cleaning[
+        "dropped_duplicate_of"
+    ]["test"] == 1
+    assert leaky_dedup_dataset.effective_train_bytes == 26
+    assert leaky_dedup_audit["leakage_violations"] == []
+
     # 统计基线的评估误差线：与神经模型同口径的逐窗口 bootstrap
     # 与逐窗口记录（供配对比较）。ngram 是确定性的，换 seed
     # 不是独立重复，窗口抽样是它唯一可报告的评估不确定性。
@@ -38837,6 +39001,13 @@ def run_self_test():
         "allow_corrupt_test_labels"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    # 训练集清洗是否读取 test 内容决定训练样本集合是否依赖
+    # 测试集，必须在神经运行之间以及神经/ngram 之间核对。
+    assert "clean_train_against_test" in COMPARISON_PROTOCOL_KEYS
+    assert (
+        "clean_train_against_test"
+        in _CROSS_FAMILY_PROTOCOL_KEYS
+    )
     # 评估集重复豁免同样改变评估样本资格，必须进入协议核对，
     # 否则一个跑过 --allow-eval-duplicates、一个没跑，会被误判
     # 为同一评估口径。
@@ -38897,6 +39068,12 @@ def run_self_test():
     # 的 500；保持 None 让对比检查显式标为缺记录。
     assert legacy_statistical_protocol["eval_bootstrap"] is None
     assert legacy_statistical_protocol["periodic_auc"] is None
+    # 旧版去重默认读取 test：缺键时按历史行为回填 True，
+    # 不能假装它和新版默认的 val-only 清洗一致。
+    assert (
+        legacy_statistical_protocol["clean_train_against_test"]
+        is True
+    )
     # 旧神经运行没有 periodic_auc 字段时按历史行为回退为
     # False；若当时按 AUC 选型，周期验证实际计算了排序指标，
     # 必须回退为生效值 True。
@@ -48714,11 +48891,23 @@ def main():
         action="store_true",
         help=(
             "训练集跨 split 近似重复清洗（需要 "
-            "--group-separator）：用内容定义分块找出与 "
-            "val/test 共享至少一个完整窗口长度连续块的训练"
+            "--group-separator）：用内容定义分块找出与 val "
+            "（默认；显式 --clean-train-against-test 时含 "
+            "test）共享至少一个完整窗口长度连续块的训练"
             "群组，并整组剔除；精确群组去重抓不到的「长群组"
             "里嵌入评估片段/错位复制」泄露也会被清除。"
             "val/test 的字节与切分位置完全不变"
+        ),
+    )
+    parser.add_argument(
+        "--clean-train-against-test",
+        action="store_true",
+        help=(
+            "允许训练集去重/共享块清洗读取 test 内容（默认"
+            "禁止）：默认只对照 val 与更早 train 群组，test "
+            "保持尘封，train/test 重复留到解封时由泄露门"
+            "拦截；显式开启会让训练样本集合依赖 test，"
+            "该事实写入 config.json 并参与受控协议核对"
         ),
     )
     parser.add_argument(
@@ -50112,6 +50301,42 @@ def main():
                     saved_shared_drop
                 )
 
+        # 清洗是否读取 test 决定训练样本集合是否依赖测试集，
+        # 与清洗开关一样是采样轨迹的一部分。旧检查点没有该键
+        # 时回填历史行为（启用去重/共享块清洗即读取 test），
+        # 不能按新默认值静默改变续跑的数据口径。
+        if "clean_train_against_test" in saved_args:
+            saved_clean_test = bool(
+                saved_args.get("clean_train_against_test")
+            )
+        else:
+            saved_clean_test = bool(
+                saved_args.get("deduplicate_train_groups", False)
+                or saved_args.get(
+                    "drop_train_shared_chunks", False
+                )
+            )
+        if saved_clean_test and not (
+            args.deduplicate_train_groups
+            or args.drop_train_shared_chunks
+        ):
+            print(
+                "resume checkpoint recorded test-dependent train "
+                "cleaning, but the cleaning switches restored from "
+                "the checkpoint are off; ignoring the stale flag"
+            )
+            saved_clean_test = False
+        if saved_clean_test != bool(
+            args.clean_train_against_test
+        ):
+            print(
+                "resume restored clean_train_against_test "
+                f"{bool(args.clean_train_against_test)} -> "
+                f"{saved_clean_test} (训练集清洗是采样轨迹的"
+                "一部分)"
+            )
+            args.clean_train_against_test = saved_clean_test
+
         # 标签噪声清洗同样改变实际参与训练的样本集合，是采样
         # 轨迹的一部分；按存档恢复，避免续跑悄悄换回含损坏标签
         # 的另一套训练数据。
@@ -50416,6 +50641,17 @@ def main():
             "内容而不改动 val/test"
         )
 
+    if args.clean_train_against_test and not (
+        args.deduplicate_train_groups
+        or args.drop_train_shared_chunks
+    ):
+        parser.error(
+            "--clean-train-against-test 需要与 "
+            "--deduplicate-train-groups 或 "
+            "--drop-train-shared-chunks 一起使用：没有训练集"
+            "清洗时 test 不会被读取"
+        )
+
     if (
         args.drop_train_corrupt_groups
         and group_separator_bytes is None
@@ -50484,6 +50720,9 @@ def main():
             ),
             drop_train_degenerate_runs=(
                 args.drop_train_degenerate_runs
+            ),
+            clean_train_against_test=(
+                args.clean_train_against_test
             ),
         )
     except (OSError, ValueError) as error:
