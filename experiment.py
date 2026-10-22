@@ -7605,11 +7605,14 @@ def _interval_byte_counts(
     跨越被删除内容的虚假计数。
     """
     counts = torch.zeros(256, dtype=torch.int64)
+    # 分块大小必须至少推进一个字节；0/负值会让 while 原地
+    # 踏步而不是报错或返回。调用方可能传实验性小块做核对。
+    step_bytes = max(1, int(chunk_bytes))
 
     for span_start, span_end in intervals:
         position = span_start
         while position < span_end:
-            stop = min(position + chunk_bytes, span_end)
+            stop = min(position + step_bytes, span_end)
             block = torch.frombuffer(
                 raw[position:stop],
                 dtype=torch.uint8,
@@ -7641,6 +7644,9 @@ def _interval_bigram_counts(
         vocab_size * vocab_size,
         dtype=torch.int64,
     )
+    # 二元组分块至少取 2 字节：chunk_bytes=1 时 stop-1 会把
+    # position 推回原处，造成死循环；0/负值同理。
+    step_bytes = max(2, int(chunk_bytes))
 
     for span_start, span_end in intervals:
         if span_end - span_start < 2:
@@ -7648,7 +7654,7 @@ def _interval_bigram_counts(
 
         position = span_start
         while position < span_end - 1:
-            stop = min(position + chunk_bytes, span_end)
+            stop = min(position + step_bytes, span_end)
             block = torch.frombuffer(
                 raw[position:stop],
                 dtype=torch.uint8,

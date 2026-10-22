@@ -2814,6 +2814,28 @@ class ProcessTests(unittest.TestCase):
             )
         )
 
+    def test_interval_counts_advance_for_tiny_chunk_sizes(self):
+        raw = memoryview(bytearray(b"abracadabra"))
+        expected_bytes = 11
+        expected_bigrams = 10
+        for chunk_bytes in (0, -1, 1, 2, 3, 100):
+            byte_counts = experiment._interval_byte_counts(
+                raw,
+                [(0, expected_bytes)],
+                chunk_bytes=chunk_bytes,
+            )
+            bigram_counts = experiment._interval_bigram_counts(
+                raw,
+                [(0, expected_bytes)],
+                chunk_bytes=chunk_bytes,
+            )
+            self.assertEqual(
+                int(byte_counts.sum()), expected_bytes
+            )
+            self.assertEqual(
+                int(bigram_counts.sum()), expected_bigrams
+            )
+
     def test_include_test_in_cleaning_alias_is_effective(self):
         groups = [
             b"DUPAAAAA" if index == 0 else
