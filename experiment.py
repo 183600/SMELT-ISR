@@ -1164,9 +1164,10 @@ def _paper_protocol_checks(
     }
     # 稳定期跑满 196075 步；或者从六个分支点之一分叉、
     # 再跑满 10B token（9537 步）的 cosine-decay 分支。
+    # 196075 本身也是合法分支点（从完整稳定期末端进入 decay），
+    # 不能把这条分支误判成「缺少稳定期」的稳定训练。
     branch_run = (
         stable in branch_points
-        and stable < stable_target
         and steps == stable + decay_steps
     )
     checks = {

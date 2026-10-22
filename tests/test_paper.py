@@ -297,6 +297,36 @@ class PaperFidelityTests(unittest.TestCase):
         )
         self.assertTrue(report["is_full_reproduction"])
 
+    def test_decay_branch_from_end_of_stable_phase(self):
+        # 196075 也在 PAPER_PROTOCOL["branch_steps"] 中：从完整稳定期
+        # 末端进入 10B-token decay 同样是一条合法的分支运行，
+        # 不应被误判成「缺少稳定期」。
+        cfg = experiment.Config(
+            **experiment.paper_preset(
+                "100M", 85, "smelt"
+            )["config"],
+            document_masks=True,
+            document_separator=[10],
+        )
+        branch = dict(PAPER_PROTOCOL)
+        branch["steps"] = (
+            experiment.PAPER_PROTOCOL["stable_steps"]
+            + experiment.PAPER_PROTOCOL["decay_steps"]
+        )
+        branch["save_at_steps"] = []
+        report = experiment.paper_fidelity_report(
+            cfg, branch
+        )
+        self.assertNotIn(
+            "protocol_stable_phase",
+            report["protocol_checks"],
+        )
+        self.assertTrue(
+            report["protocol_faithful"],
+            report["protocol_checks"],
+        )
+        self.assertTrue(report["is_full_reproduction"])
+
     def test_protocol_deviation_detected(self):
         cfg = experiment.Config(
             **experiment.paper_preset(
