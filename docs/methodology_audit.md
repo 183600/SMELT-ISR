@@ -7,7 +7,8 @@
 > 循环区域 1/r 残差缩放、GQA/KV 估计、伪重复处理、种子功效下限、
 > 最小效应门槛检验、失败率报告、固定共同步数、块 bootstrap、
 > 数据切分口径声明、测试内容参与清洗的披露、测试集访问账本与
-> 工作流冻结开关。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> 工作流冻结开关。本轮另补上结果脆弱性/单种子依赖检查与精确
+> 符号检验（见第 26 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
 > context、文档级 segment attention mask、WSD 调度与
 > `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
 > 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
@@ -443,6 +444,51 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 也不能替代不可变存储；续跑、补测或追加分析后必须重新生成，
 否则校验会正确报告旧清单已过期。
 
+## 26. 结果脆弱性与单种子依赖（本轮补充）
+
+**判定：原实现报告了显著性、置信区间、符号翻转、leave-one-out
+方向稳定性与 TOST，但没有回答「这个显著结论是否只由一两个
+随机种子撑起来」。** leave-one-out 只检查删除一个种子后效应
+**方向**是否翻转；一个极端差值可以让方向保持不变、却把 p 值
+从显著拉回不显著。把「方向稳定」当成「结论稳健」会系统性
+高估小样本结果的可靠性。
+
+**已修正：**
+
+- 每个配对对比保存逐种子差值（`paired_differences` /
+  `paired_seeds`）与差值分布，结果分析可直接复核哪些种子
+  驱动了显著性，而不是只相信汇总 p 值。
+- 新增 `_exact_sign_test`：精确二项符号检验，只看差值方向、
+  不使用幅度，回答「多数种子是否与均值效应同向」。零差值
+  丢弃并记录；最小可达双侧 p=2/2^n，n≤5 时 0.05 水平上
+  不可能显著，报告显式标记 `resolution_limited`。
+- 新增 `_paired_result_fragility`：逐一/成组删除种子后重做
+  配对 t 检验，报告 `max_leave_one_out_p_value`、
+  `significance_survives_leave_one_out`、
+  `min_seed_deletions_to_lose_significance`（在组合数上限内
+  枚举，超限时标 `deletions_tested_exhaustively=false`）与
+  `verdict`（`stable` / `fragile` / `direction_mixed` /
+  `not_significant` / `not_evaluable`）。删除后剩余观测少于
+  最小种子数时判 `not_evaluable`，不伪造「删除后仍显著」。
+- 脆弱性比较使用该对比在 Holm 家族中的实际位置阈值
+  `α/(m-rank+1)`（`holm_alpha_threshold`），与最终判定同口径；
+  删除种子不改变家族规模，沿用原位置阈值是保守近似。
+- `comparison_analysis.json` 顶层新增 `fragility_summary`
+  （判定分布、fragile 列表、direction_mixed 列表与 advisory）；
+  展示层新增 `[fragility]` 小节与 `[fragile]` 点名。全因子
+  消融的主效应/交互同样附该分析；组件联合判定遇到 fragile
+  的支持效应时降级为 `inconclusive`，不再宣称该组件有用。
+- 只读 `--compare` 新增 `--compare-report FILE`：默认仍只
+  打印、不写文件；显式给出路径才把完整分析（含
+  `fragility_summary`）落盘，避免结果分析只存在于终端输出、
+  无法随运行目录归档与复核。
+
+仍有限制：这是描述性敏感性分析，不是新的显著性检验；它
+回答「删除种子后显著性是否存活」，不回答「这些种子为什么
+异常」。fragile 的正确反应是增加独立种子或调查异常运行，
+不是反复换种子直到显著；n=3 的设计无法做删除后仍满足最小
+种子数的检验，只能标为不可判定。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -455,7 +501,8 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
    **至少 6 个种子**，固定 `--common-step` 与训练预算；
    用 `--budget-match` 报告完整计算图比例。
 4. 统计：主检验配对 t + 符号翻转（明确对称性假设）；报告
-   失败率、MDE、门槛检验、TOST；不把不显著读成等价。
+   失败率、MDE、门槛检验、TOST 与 `fragility_summary`；
+   删除种子后不再显著的结论不能写成稳健，不把不显著读成等价。
 5. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
    每个候选只解封一次；用 `--final-test-comparison` 报告全部
    候选，而不是只报告最好的那个。

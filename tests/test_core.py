@@ -363,6 +363,113 @@ class CostModelTests(unittest.TestCase):
 
 
 class StatisticsTests(unittest.TestCase):
+    def test_exact_sign_test_drops_zero_and_reports_resolution(self):
+        six = experiment._exact_sign_test(
+            [1.0, 1.0, 1.0, 1.0, 1.0, -1.0]
+        )
+        self.assertEqual(six["n_positive"], 5)
+        self.assertEqual(six["n_negative"], 1)
+        self.assertEqual(six["n_nonzero"], 6)
+        self.assertAlmostEqual(six["p_value"], 0.21875)
+        self.assertAlmostEqual(six["min_attainable_p"], 0.03125)
+        # n=5 的最小可达双侧 p=0.0625，0.05 水平上不可能显著。
+        five = experiment._exact_sign_test(
+            [1.0, 2.0, 3.0, 4.0, 5.0]
+        )
+        self.assertAlmostEqual(five["min_attainable_p"], 0.0625)
+        self.assertTrue(five["resolution_limited"])
+        with_zero = experiment._exact_sign_test(
+            [1.0, 0.0, 1.0, 0.0, -1.0]
+        )
+        self.assertEqual(with_zero["n_zero"], 2)
+        self.assertEqual(with_zero["n_nonzero"], 3)
+
+    def test_fragility_detects_single_seed_dependence(self):
+        # 5 个种子里 4 个差值约 1、1 个 3：整体显著，但删掉
+        # 任意一个「1」后只剩 4 个观测，p 值回到 0.09。
+        report = experiment._paired_result_fragility(
+            [1.0, 1.0, 1.0, 1.0, 3.0],
+            seeds=[1, 2, 3, 4, 5],
+            alpha=0.05,
+        )
+        self.assertTrue(report["available"])
+        self.assertFalse(
+            report["significance_survives_leave_one_out"]
+        )
+        self.assertEqual(
+            report["min_seed_deletions_to_lose_significance"], 1
+        )
+        self.assertEqual(report["verdict"], "fragile")
+        self.assertEqual(report["n_positive"], 5)
+        self.assertTrue(report["direction_consistent"])
+
+    def test_fragility_stable_when_all_seed_deletions_remain_significant(self):
+        report = experiment._paired_result_fragility(
+            [1.0, 1.0, 1.0, 1.0, 1.2],
+            alpha=0.05,
+        )
+        self.assertEqual(report["verdict"], "stable")
+        self.assertTrue(
+            report["significance_survives_leave_one_out"]
+        )
+        self.assertIsNone(
+            report["min_seed_deletions_to_lose_significance"]
+        )
+        self.assertTrue(report["deletions_tested_exhaustively"])
+
+    def test_fragility_marks_three_seed_design_not_evaluable(self):
+        report = experiment._paired_result_fragility(
+            [1.0, 1.1, 0.9],
+            alpha=0.05,
+        )
+        self.assertEqual(report["verdict"], "not_evaluable")
+        self.assertFalse(report["leave_one_out_evaluable"])
+
+    def test_fragility_flags_magnitude_driven_direction_mix(self):
+        # 7 个 +5、1 个 -1：均值显著，且删除 3 个种子后仍显著，
+        # 但多数种子同向的符号检验无法解释均值效应。
+        report = experiment._paired_result_fragility(
+            [5.0] * 7 + [-1.0],
+            alpha=0.05,
+        )
+        self.assertEqual(report["verdict"], "direction_mixed")
+        self.assertFalse(report["direction_consistent"])
+
+    def test_factor_contrasts_attach_fragility_and_summary(self):
+        rows = []
+        differences = [1.0, 1.0, 1.0, 1.0, 3.0]
+        for index, difference in enumerate(differences):
+            seed = index + 1
+            rows.append({
+                "run": f"base{seed}",
+                "mode": "local_base",
+                "seed": seed,
+                "val_loss": 10.0,
+            })
+            rows.append({
+                "run": f"A{seed}",
+                "mode": "A",
+                "seed": seed,
+                "val_loss": 10.0 + difference,
+            })
+        aggregates = experiment.aggregate_runs(rows, ["mode"])
+        contrasts = experiment.factor_contrasts(
+            aggregates, ["mode"], "val_loss"
+        )
+        self.assertEqual(len(contrasts), 1)
+        contrast = contrasts[0]
+        self.assertEqual(
+            contrast["paired_differences"],
+            differences,
+        )
+        self.assertEqual(
+            contrast["fragility"]["verdict"], "fragile"
+        )
+        summary = experiment._fragility_summary(contrasts)
+        self.assertEqual(summary["verdict_counts"]["fragile"], 1)
+        self.assertEqual(len(summary["fragile"]), 1)
+        self.assertIn("删除少量种子", summary["advisories"][0])
+
     def test_seed_plan_flags_robust_impossible(self):
         plan = experiment._build_seed_plan(
             [1, 2, 3, 4, 5], False
@@ -615,6 +722,28 @@ class RoutingInterventionReproducibilityTests(unittest.TestCase):
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_compare_report_file_writes_analysis_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reports" / "analysis.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                written = experiment.write_comparison_report_file(
+                    path,
+                    {
+                        "metric": "val_loss",
+                        "fragility_summary": {
+                            "verdict_counts": {"stable": 1}
+                        },
+                    },
+                )
+            self.assertEqual(written, path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["metric"], "val_loss")
+            self.assertEqual(
+                payload["fragility_summary"]["verdict_counts"],
+                {"stable": 1},
+            )
+            self.assertIn("generated_at", payload)
+
     def test_set_seed_records_effective_manifest(self):
         experiment.set_seed(321)
         manifest = experiment._LAST_SEED_MANIFEST

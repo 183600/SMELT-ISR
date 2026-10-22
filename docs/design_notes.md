@@ -250,6 +250,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   记录最小可达 p 值，样本量不足以在 0.05 水平显著时明确
   提示「不显著 ≠ 无效应」。leave-one-out 逐一去掉一个种子
   重算效应，方向翻转或归零时提示结论可能由单个种子驱动。
+- `_exact_sign_test`、`_paired_result_fragility`、
+  `_fragility_summary`：精确符号检验（只看差值方向）、
+  删除 1~3 个种子后的显著性敏感性分析（含最少删除数、
+  `stable`/`fragile`/`direction_mixed`/`not_evaluable` 判定）
+  与报告级汇总；详见「结果分析方法」的结果脆弱性条目。
+- `_holm_rank_thresholds`：按 Holm step-down 的实际位置给出
+  `alpha/(m-rank+1)` 阈值，供脆弱性检查与最终显著性判定同口径。
 - `cross_family_protocol_check`：神经运行与 ngram 统计基线
   之间的数据/评估口径核对（数据指纹、切分比例、评估窗口数、
   batch size、数据增强等）；口径不一致时禁止把 ngram 当作
@@ -321,7 +328,42 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   只在单个运行自身的 `metrics.jsonl` 中报告，避免「挑 test 最好」
   的隐式测试集调参。同时输出受控变量检查、按实验单元聚合的
   Mean ± Std、单因子显著性检验（含 Holm 多重比较校正与
-  95% 置信区间）与消融覆盖报告（见下节）。
+  95% 置信区间）与消融覆盖报告（见下节）。默认只打印；显式
+  传 `--compare-report FILE` 时把完整分析（含 `fragility_summary`）
+  写入 JSON，便于随运行目录一起归档与复核，而不是只留在终端。
+- **结果脆弱性（单种子敏感性）**：显著性检验回答的是「整批
+  种子的均值是否偏离 0」，不回答「这个结论是否由一两个运行
+  撑起来」。原有的 leave-one-out 只检查**方向**是否翻转；一个
+  极端差值可以让方向保持不变、但把 p 值从显著拉回不显著。
+  因此每个配对对比现在同时报告 `fragility`：
+  - 逐种子配对差值（`paired_differences` / `paired_seeds`）与
+    差值分布（均值、中位数、sd、min/max、正/负/零计数）；
+  - 精确符号检验（`sign_test`）：只看差值方向、不看幅度，
+    回答「多数种子是否与均值效应同向」；零差值丢弃，并显式
+    记录最小可达双侧 p=2/2^n（n≤5 时 0.05 水平上不可能显著）；
+  - 删除一个/两个/三个种子（最多 `min(3, n−3)` 个，保证剩余
+    观测仍满足最小种子数）后重做配对 t 检验的完整结果
+    （`leave_one_out`、`max_leave_one_out_p_value`、
+    `significance_survives_leave_one_out`），以及最少删除几个
+    种子会失去显著性（`min_seed_deletions_to_lose_significance`，
+    在组合数上限内枚举；超出上限时 `deletions_tested_exhaustively=false`）；
+  - 判定 `verdict`：`stable`（在测试的删除范围内仍显著且方向
+    一致）、`fragile`（删除少量种子后失去显著性或方向翻转）、
+    `direction_mixed`（均值显著但差值方向不一致，可能由少数
+    大幅差值驱动）、`not_significant`、`n=3` 时的
+    `not_evaluable`（删除一个后不足最小种子数，不能伪装成
+    「删除后仍显著」）。
+  脆弱性比较使用**该对比在 Holm 家族中的实际位置阈值**
+  `holm_alpha_threshold=α/(m-rank+1)`，而不是统一用 α 或
+  α/m：删除种子不改变家族规模，沿用原位置阈值是保守近似，
+  不会把 Holm 后段本应显著的对比误判为不显著。报告顶层落盘
+  `fragility_summary`（判定分布、fragile 列表与 advisory），
+  展示层以 `[fragility]` / `[fragile]` 单独点名。全因子消融
+  的主效应/交互同样附该分析；组件联合判定遇到 fragile 的
+  支持效应时降级为 `inconclusive`，不再宣称组件有用。
+  该检查是**描述性敏感性分析**，不新增显著性检验，也不替代
+  主检验；但它把「显著但只靠少数种子」与「多数种子同向且
+  删除后仍显著」区分开。
 
 ## 对比实验与消融协议
 
@@ -888,6 +930,8 @@ token accuracy/macro 与 weighted F1、precision、recall
 `--skip-efficiency`（跳过结束时的效率测量）、
 `--compare RUN_DIR...`（只读对比多个运行目录，不训练；含受控
 变量检查、Mean ± Std、显著性检验与功效/等价性分析）、
+`--compare-report FILE`（配合 `--compare` 把完整分析写入 JSON；
+默认只打印）、
 `--compare-factors`、`--compare-baseline MODE`、`--compare-metric`、
 `--equivalence-margin REL`（TOST 等价界，相对基线均值，默认
 0.01 = 1%；报告以此区分「无实质差异」与「未发现显著差异」，

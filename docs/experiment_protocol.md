@@ -172,6 +172,14 @@ python experiment.py --data corpus.txt --out runs/confirm \
   `target_step_rule` 与 `target_step_data_dependent`。
 - 报告 `failure_rates`、`pseudo_replication`、差分缺失、
   `scale_guard` 与 `budget_match_report`。
+- 只读对比用 `--compare ... --compare-report runs/analysis.json`
+  把完整分析落盘；默认的 `--compare` 只打印，终端输出不是
+  可归档的分析记录。归档时把该 JSON 与输入运行目录一起保存。
+- 报告 `fragility_summary`：每个显著对比都要回答「删除
+  1~3 个种子后显著性是否仍在」。`fragile` / `direction_mixed`
+  的对比不能写成稳健结论，应增加独立种子或调查异常运行后
+  重跑；n=3 的设计删除后不足最小种子数，标为
+  `not_evaluable`，不能当作「删除后仍显著」。
 - 路由结论必须带机会水平（`jaccard_chance_*`、`lift`）与干预
   结果，不能只报负载熵/死专家数。
 

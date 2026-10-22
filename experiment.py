@@ -23546,6 +23546,406 @@ def _leave_one_out_effect_stability(
     }
 
 
+def _exact_sign_test(
+    differences: List[float],
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Dict[str, object]:
+    """
+    配对差值中位数为 0 的精确符号检验（双侧二项检验）。
+
+    与配对 t 检验（均值）和符号翻转检验（均值、要求差值分布
+    关于 0 对称）不同，符号检验只看每个种子上的差值方向，
+    完全不使用差值幅度：少数几个幅度极大的种子可以把均值
+    拉显著，但只要多数种子方向相反，符号检验就不会显著。
+    这正是「显著结论是否只由少数运行驱动」的直接检查。
+
+    零差值按惯例丢弃（不提供方向信息），n 为非零差值个数。
+    精确双侧 p 值按 P=0.5 的二项分布计算；最小可达 p 值为
+    2/2^n（n 个非零差值同向），因此 n≤5 时该检验在 0.05
+    水平上不可能显著，报告必须显式记录这一分辨率限制。
+    """
+    numeric = [float(value) for value in differences]
+    if any(not math.isfinite(value) for value in numeric):
+        return {
+            "test": "exact_binomial_sign",
+            "available": False,
+            "reason": "non_finite_differences",
+        }
+    nonzero = [value for value in numeric if value != 0.0]
+    n = len(nonzero)
+    positives = sum(1 for value in nonzero if value > 0.0)
+    negatives = n - positives
+    if n == 0:
+        p_value = 1.0
+        min_attainable = 1.0
+    else:
+        tail = sum(
+            math.comb(n, index)
+            for index in range(min(positives, negatives) + 1)
+        ) / float(2 ** n)
+        p_value = min(1.0, 2.0 * tail)
+        min_attainable = min(1.0, 2.0 / float(2 ** n))
+    alpha_value = float(alpha)
+    return {
+        "test": "exact_binomial_sign",
+        "available": True,
+        "null_hypothesis": "median_paired_difference = 0",
+        "n_nonzero": n,
+        "n_zero": len(numeric) - n,
+        "n_positive": positives,
+        "n_negative": negatives,
+        "p_value": p_value,
+        "alpha": alpha_value,
+        "significant": bool(
+            n > 0 and p_value <= alpha_value
+        ),
+        "min_attainable_p": min_attainable,
+        "resolution_limited": bool(
+            n > 0 and min_attainable > alpha_value
+        ),
+        "note": (
+            "只看差值方向、不使用幅度；零差值被丢弃。"
+            "最小可达双侧 p=2/2^n，n≤5 时在 0.05 水平上"
+            "不可能显著"
+        ),
+    }
+
+
+# 逐一删除种子做敏感性分析时，最多尝试删除多少个种子。
+# n=6 时删除 3 个只剩 3 个，仍满足最小种子数；更大的 n
+# 只枚举到 3 个，避免组合数失控（超过上限时明确记录
+# 「未穷尽」，不能把未检查读成稳健）。
+_FRAGILITY_MAX_DELETIONS = 3
+_FRAGILITY_MAX_SUBSETS = 5000
+
+
+def _paired_result_fragility(
+    differences: List[float],
+    seeds: Optional[Sequence[object]] = None,
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Dict[str, object]:
+    """
+    配对结果的「单种子脆弱性」分析：显著性是否依赖少数种子。
+
+    现有 leave-one-out 只检查**方向**是否翻转，不检查**显著性**
+    是否消失。一个由单个极端差值撑起来的显著结果，去掉该种子
+    后方向可能仍在，但 p 值已回到不显著；只看方向会把它误报成
+    稳健。这里对每个可删除的种子子集重做配对 t 检验，报告：
+
+    - ``max_leave_one_out_p_value``：删除任一种子后的最大 p；
+    - ``significance_survives_leave_one_out``：是否所有单删
+      结果在给定 alpha 下仍显著；
+    - ``min_seed_deletions_to_lose_significance``：最少删除
+      几个种子后不再显著（在 ``deletions_tested`` 范围内）；
+    - ``verdict``：``stable`` / ``fragile`` /
+      ``direction_mixed`` / ``not_significant`` /
+      ``insufficient_seeds`` / ``not_evaluable``；
+    - ``sign_test``：精确符号检验，单独回答「多数种子方向是否
+      与均值效应一致」。
+
+    ``alpha`` 应传**家族校正后**的阈值（该对比在 Holm
+    step-down 中的位置阈值 alpha/(m-rank+1)），否则用未校正
+    的 0.05 会系统性高估稳健性。删除种子不改变家族规模，
+    因此沿用原位置阈值仍适用（删除后 p 排序可能变化，但
+    不会放宽判定）。
+    """
+    numeric = [float(value) for value in differences]
+    n = len(numeric)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {
+            "available": False,
+            "reason": "insufficient_seeds",
+            "n": n,
+            "min_seeds": _MIN_SEEDS_FOR_STATS,
+        }
+    if any(not math.isfinite(value) for value in numeric):
+        return {
+            "available": False,
+            "reason": "non_finite_differences",
+            "n": n,
+        }
+
+    mean = sum(numeric) / n
+    sd = _sample_std(numeric)
+    base_test = _paired_t_test(numeric)
+    base_p = base_test.get("p_value")
+    if base_p is None:
+        return {
+            "available": False,
+            "reason": "no_p_value",
+            "n": n,
+            "note": (
+                "差值零方差或检验不可用：不能做删除种子的"
+                "显著性敏感性分析"
+            ),
+        }
+    alpha_value = float(alpha)
+    significant = bool(float(base_p) <= alpha_value)
+    # 删除一个种子后仍要有至少 _MIN_SEEDS_FOR_STATS 个观测，
+    # 才能重做配对 t 检验；n=3 时单删只剩 2 个，不能伪装成
+    # 「删除后仍显著」。
+    leave_one_out_evaluable = bool(
+        n > _MIN_SEEDS_FOR_STATS
+    )
+
+    labels: List[object] = (
+        list(seeds)
+        if isinstance(seeds, (list, tuple))
+        and len(seeds) == n
+        else list(range(n))
+    )
+    # 单删：报告每个被删除种子的影响，而不只给最大 p。
+    leave_one_out: List[Dict[str, object]] = []
+    for index in range(n):
+        reduced = numeric[:index] + numeric[index + 1:]
+        reduced_test = _paired_t_test(reduced)
+        reduced_p = reduced_test.get("p_value")
+        reduced_effect = reduced_test.get("effect")
+        if reduced_effect is None:
+            reduced_effect = _mean(reduced)
+        leave_one_out.append({
+            "seed": labels[index],
+            "effect": reduced_effect,
+            "p_value": reduced_p,
+            "significant": bool(
+                reduced_p is not None
+                and float(reduced_p) <= alpha_value
+            ),
+        })
+    valid_loo_p = [
+        float(entry["p_value"])
+        for entry in leave_one_out
+        if entry.get("p_value") is not None
+    ]
+    max_loo_p = max(valid_loo_p) if valid_loo_p else None
+    survives_loo = (
+        bool(
+            valid_loo_p
+            and all(value <= alpha_value for value in valid_loo_p)
+        )
+        if leave_one_out_evaluable
+        else None
+    )
+    sign_flip_loo = [
+        entry
+        for entry in leave_one_out
+        if isinstance(entry.get("effect"), (int, float))
+        and not isinstance(entry.get("effect"), bool)
+        and float(entry["effect"]) * mean < 0.0
+    ]
+
+    # 最少删除几个种子会失去显著性。只在剩余样本仍满足最小
+    # 种子数时删除；删除 1 个已足够时不必枚举 2/3 个。
+    max_deletions = min(
+        _FRAGILITY_MAX_DELETIONS,
+        max(0, n - _MIN_SEEDS_FOR_STATS),
+    )
+    min_deletions: Optional[int] = None
+    deletions_tested = 0
+    exhaustive = True
+    if significant and max_deletions > 0:
+        for delete_count in range(1, max_deletions + 1):
+            combinations = math.comb(n, delete_count)
+            if combinations > _FRAGILITY_MAX_SUBSETS:
+                exhaustive = False
+                break
+            found = False
+            for combo in itertools.combinations(
+                range(n), delete_count
+            ):
+                deleted = set(combo)
+                reduced = [
+                    value
+                    for index, value in enumerate(numeric)
+                    if index not in deleted
+                ]
+                reduced_test = _paired_t_test(reduced)
+                reduced_p = reduced_test.get("p_value")
+                deletions_tested += 1
+                if (
+                    reduced_p is not None
+                    and float(reduced_p) > alpha_value
+                ):
+                    min_deletions = delete_count
+                    found = True
+                    break
+            if found:
+                break
+
+    sign_test = _exact_sign_test(numeric, alpha=alpha_value)
+    n_positive = int(sign_test.get("n_positive", 0))
+    n_negative = int(sign_test.get("n_negative", 0))
+    direction_consistent = bool(
+        n_positive == 0 or n_negative == 0
+    )
+    if not significant:
+        verdict = "not_significant"
+    elif not leave_one_out_evaluable:
+        verdict = "not_evaluable"
+    elif min_deletions is not None:
+        verdict = "fragile"
+    elif sign_flip_loo:
+        verdict = "fragile"
+    elif not direction_consistent:
+        verdict = "direction_mixed"
+    else:
+        verdict = "stable"
+
+    return {
+        "available": True,
+        "verdict": verdict,
+        "alpha": alpha_value,
+        "n": n,
+        "mean_difference": mean,
+        "median_difference": _median(numeric),
+        "sd_difference": sd,
+        "min_difference": min(numeric),
+        "max_difference": max(numeric),
+        "n_positive": n_positive,
+        "n_negative": n_negative,
+        "n_zero": int(sign_test.get("n_zero", 0)),
+        "fraction_positive": (
+            float(n_positive) / float(n_positive + n_negative)
+            if n_positive + n_negative > 0
+            else None
+        ),
+        "direction_consistent": direction_consistent,
+        "sign_test": sign_test,
+        "leave_one_out": leave_one_out,
+        "leave_one_out_evaluable": leave_one_out_evaluable,
+        "max_leave_one_out_p_value": max_loo_p,
+        "significance_survives_leave_one_out": survives_loo,
+        "leave_one_out_sign_flip_seeds": [
+            entry.get("seed") for entry in sign_flip_loo
+        ],
+        "min_seed_deletions_to_lose_significance": min_deletions,
+        "deletions_tested": deletions_tested,
+        "deletions_tested_exhaustively": bool(exhaustive),
+        "max_deletions_tested": max_deletions,
+        "note": (
+            "删除种子后重新做配对 t 检验；alpha 为家族校正后"
+            "阈值。fragile 表示去掉不超过 max_deletions_tested "
+            "个种子后显著性消失，不能作为稳健结论。"
+            + (
+                " 组合数超过上限，只检查了部分删除组合。"
+                if not exhaustive
+                else ""
+            )
+        ),
+    }
+
+
+def _fragility_summary(
+    contrasts: Sequence[Dict[str, object]],
+    label: str = "single_factor",
+) -> Dict[str, object]:
+    """
+    汇总一组对比的脆弱性判定，供报告顶层落盘与展示。
+    """
+    entries: List[Dict[str, object]] = []
+    seen: set = set()
+    for contrast in contrasts:
+        fragility = contrast.get("fragility")
+        if not isinstance(fragility, dict):
+            continue
+        if not fragility.get("available"):
+            continue
+        # 同一个对比可能同时出现在单因子对比与
+        # --compare-baseline 直接对比里；脆弱性结论相同，
+        # 不能因此重复计数或重复打印。
+        key = (
+            str(contrast.get("baseline")),
+            str(contrast.get("variant")),
+            str(contrast.get("factor")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            "family": label,
+            "baseline": contrast.get("baseline"),
+            "variant": contrast.get("variant"),
+            "factor": contrast.get("factor"),
+            "verdict": fragility.get("verdict"),
+            "significant": bool(contrast.get("significant")),
+            "fragility_index": fragility.get(
+                "min_seed_deletions_to_lose_significance"
+            ),
+            "n": fragility.get("n"),
+            "n_positive": fragility.get("n_positive"),
+            "n_negative": fragility.get("n_negative"),
+            "sign_test_p_value": (
+                _as_dict(fragility.get("sign_test")).get(
+                    "p_value"
+                )
+            ),
+            "max_leave_one_out_p_value": fragility.get(
+                "max_leave_one_out_p_value"
+            ),
+            "alpha": fragility.get("alpha"),
+        })
+
+    verdict_counts: Dict[str, int] = {}
+    for entry in entries:
+        verdict = str(entry.get("verdict"))
+        verdict_counts[verdict] = (
+            verdict_counts.get(verdict, 0) + 1
+        )
+    fragile = [
+        entry for entry in entries
+        if entry.get("verdict") == "fragile"
+        and entry.get("significant")
+    ]
+    direction_mixed = [
+        entry for entry in entries
+        if entry.get("verdict") == "direction_mixed"
+    ]
+    advisories: List[str] = []
+    if fragile:
+        advisories.append(
+            "以下显著对比在删除少量种子后不再显著（结论由"
+            "少数运行驱动，不能作为稳健结论）；需要更多独立"
+            "种子或先调查这些种子的异常来源："
+            + "; ".join(
+                f"{entry['baseline']}→{entry['variant']}"
+                f"（删 {entry['fragility_index']} 个种子后"
+                f"p>{float(entry['alpha']):.3f}）"
+                for entry in fragile
+            )
+        )
+    if direction_mixed:
+        advisories.append(
+            "以下显著对比的配对差值方向不一致（均值显著，但"
+            "并非多数种子同向；精确符号检验与 t 检验口径"
+            "不同）："
+            + "; ".join(
+                f"{entry['baseline']}→{entry['variant']}"
+                f"（正/负={entry['n_positive']}/"
+                f"{entry['n_negative']}）"
+                for entry in direction_mixed
+            )
+        )
+    if not advisories and entries:
+        significant_entries = [
+            entry for entry in entries
+            if entry.get("significant")
+        ]
+        advisories.append(
+            "已检查的显著配对结果未发现单种子脆弱性；"
+            "该检查是描述性的，不替代显著性检验"
+            if significant_entries
+            else "没有校正后显著的配对结果可供脆弱性判定："
+            "不要把「未发现脆弱性」读成「存在稳健效应」"
+        )
+    return {
+        "entries": entries,
+        "verdict_counts": verdict_counts,
+        "fragile": fragile,
+        "direction_mixed": direction_mixed,
+        "advisories": advisories,
+    }
+
+
 def _welch_t_test(
     values_a: List[float],
     values_b: List[float],
@@ -24400,6 +24800,31 @@ def _holm_bonferroni(
     return adjusted
 
 
+def _holm_rank_thresholds(
+    p_values: List[Optional[float]],
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> List[Optional[float]]:
+    """
+    Holm step-down 每个检验位置对应的显著性阈值 alpha/(m-rank+1)。
+
+    脆弱性分析要按「该对比在家族中的实际位置」比较删除种子后
+    的 p 值；统一用 alpha/m 会把 Holm 后段本应显著的对比误判为
+    不显著。删除种子不会改变家族规模，因此沿用原位置阈值是
+    保守近似（删除后 p 排序可能变化，但不会放宽判定）。
+    """
+    total = sum(1 for p in p_values if p is not None)
+    thresholds: List[Optional[float]] = [None] * len(p_values)
+    if total == 0:
+        return thresholds
+    ranked = sorted(
+        (index for index, p in enumerate(p_values) if p is not None),
+        key=lambda index: float(p_values[index]),
+    )
+    for position, index in enumerate(ranked):
+        thresholds[index] = float(alpha) / float(total - position)
+    return thresholds
+
+
 def _benjamini_hochberg(
     p_values: List[Optional[float]],
 ) -> List[Optional[float]]:
@@ -24940,6 +25365,10 @@ def _contrast_test(
         result["n_variant"] = len(by_seed_b)
         result["pseudo_replication"] = pseudo_replication
         result["duplicate_seeds"] = bool(duplicate_seeds)
+        # 保留逐种子配对差值与种子标签：结果分析要能复核
+        # 「哪些种子驱动了显著性」，而不是只相信汇总 p 值。
+        result["paired_differences"] = list(differences)
+        result["paired_seeds"] = list(common_seeds)
         result.update(
             _leave_one_out_effect_stability(differences)
         )
@@ -25289,12 +25718,32 @@ def _apply_multiple_comparison_correction(
     p_values = [float(contrast["p_value"]) for contrast in eligible]
     holm_values = _holm_bonferroni(p_values)
     bh_values = _benjamini_hochberg(p_values)
+    holm_thresholds = _holm_rank_thresholds(p_values)
 
     # 功效口径与家族校正口径必须一致：MDE/所需种子/所需等价界
     # 按 Holm 第一步阈值 alpha/m 补算，否则报告一边用校正后
     # 判定、一边用未校正功效，会高估现有实验的可判定性。
-    for contrast in eligible:
+    for contrast, holm_threshold in zip(
+        eligible, holm_thresholds
+    ):
         _attach_family_power(contrast, len(eligible))
+        contrast["holm_alpha_threshold"] = holm_threshold
+        # 脆弱性检查必须用与最终判定一致的家族校正 alpha；
+        # 用未校正 0.05 会把「只在单检验下显著」误报成稳健。
+        paired_values = contrast.get("paired_differences")
+        if isinstance(paired_values, list):
+            contrast["fragility"] = _paired_result_fragility(
+                paired_values,
+                contrast.get("paired_seeds"),
+                alpha=float(
+                    holm_threshold
+                    if holm_threshold is not None
+                    else contrast.get(
+                        "alpha_bonferroni",
+                        _SIGNIFICANCE_LEVEL,
+                    )
+                ),
+            )
 
     for contrast, holm_p, bh_p in zip(
         eligible,
@@ -25599,6 +26048,10 @@ def factor_contrasts(
                 "std_baseline": std_a,
                 "std_variant": std_b,
                 "delta": delta,
+                "paired_differences": test.get(
+                    "paired_differences"
+                ),
+                "paired_seeds": test.get("paired_seeds"),
                 "delta_over_noise": noise_ratio,
                 "hedges_g": hedges_g,
                 "cohens_dz": paired_effect_size.get(
@@ -25775,10 +26228,15 @@ def _paired_linear_effect(
         raw_seeds.append(first_cell[seed_key][0])
 
     if effect_values:
-        raw_seeds = sorted(
-            raw_seeds,
-            key=_factor_sort_rank,
+        # 标签与数值必须一起排序：只排 raw_seeds 会让 paired_seeds
+        # 与 paired_differences/effect_values 错位，脆弱性分析
+        # 的 LOO 标签就会指向错误的种子。
+        ordered = sorted(
+            zip(raw_seeds, effect_values),
+            key=lambda pair: _factor_sort_rank(pair[0]),
         )
+        raw_seeds = [seed for seed, _ in ordered]
+        effect_values = [value for _, value in ordered]
         result = _paired_t_test(effect_values)
         randomization = _paired_sign_flip_test(effect_values)
         stability = _leave_one_out_effect_stability(
@@ -25795,6 +26253,8 @@ def _paired_linear_effect(
         )
         return {
             "effect": effect,
+            "paired_differences": list(effect_values),
+            "paired_seeds": list(raw_seeds),
             "cohens_dz": paired_effect_size.get("cohens_dz"),
             "hedges_gz": paired_effect_size.get("hedges_gz"),
             "test": result.get("test"),
@@ -26205,6 +26665,10 @@ def factorial_effects(
                     },
                     "mean_effect": effect_value,
                     "delta": effect_value,
+                    "paired_differences": result.get(
+                        "paired_differences"
+                    ),
+                    "paired_seeds": result.get("paired_seeds"),
                     "direction": direction,
                     "mde_80": mde,
                     "test": result.get("test"),
@@ -26273,11 +26737,30 @@ def factorial_effects(
     ]
     # 主效应/交互家族的功效口径同步按家族规模校正（与下方
     # Holm 判定同口径），见 _attach_family_power。
-    for effect in eligible:
-        _attach_family_power(effect, len(eligible))
-    holm = _holm_bonferroni([
+    effect_p_values = [
         float(effect["p_value"]) for effect in eligible
-    ])
+    ]
+    effect_thresholds = _holm_rank_thresholds(effect_p_values)
+    for effect, holm_threshold in zip(
+        eligible, effect_thresholds
+    ):
+        _attach_family_power(effect, len(eligible))
+        effect["holm_alpha_threshold"] = holm_threshold
+        paired_values = effect.get("paired_differences")
+        if isinstance(paired_values, list):
+            effect["fragility"] = _paired_result_fragility(
+                paired_values,
+                effect.get("paired_seeds"),
+                alpha=float(
+                    holm_threshold
+                    if holm_threshold is not None
+                    else effect.get(
+                        "alpha_bonferroni",
+                        _SIGNIFICANCE_LEVEL,
+                    )
+                ),
+            )
+    holm = _holm_bonferroni(effect_p_values)
     for effect, adjusted in zip(eligible, holm):
         effect["p_value_holm"] = adjusted
         effect["significant_raw"] = bool(
@@ -26462,8 +26945,16 @@ def _component_evidence_summary(
             "significant": effect.get("significant"),
             "equivalent": effect.get("equivalent"),
             "n_pairs": effect.get("n_pairs", 0),
+            "fragility_verdict": (
+                _as_dict(effect.get("fragility")).get("verdict")
+            ),
         }
         for effect in effects
+    ]
+    fragile_effects = [
+        summary
+        for summary in summaries
+        if summary.get("fragility_verdict") == "fragile"
     ]
 
     if any(claim in _COMPONENT_BLOCKING_CLAIMS for claim in claims):
@@ -26479,6 +26970,18 @@ def _component_evidence_summary(
             "evidence": summaries,
         }
     if all(claim == "supports_component" for claim in claims):
+        if fragile_effects:
+            return {
+                "status": "inconclusive",
+                "reason": (
+                    "效应校正后显著，但在删除少量随机种子后"
+                    "显著性消失（fragility=fragile）：结论由"
+                    "少数运行驱动，不能作为组件有用的稳健证据；"
+                    "应增加独立种子或调查异常种子"
+                ),
+                "evidence": summaries,
+                "fragile_effects": fragile_effects,
+            }
         if all(effect.get("equivalent") for effect in effects):
             return {
                 "status": "not_supported",
@@ -27514,6 +28017,40 @@ def _contrast_display(
             "结论可能由单个种子驱动，leave-one-out 稳健性不足）"
         )
 
+    # 方向稳定不等于显著性能在删除种子后存活：一个极端
+    # 差值可以让均值方向不变但 p 值被拉过阈值。这里单独
+    # 展示脆弱性判定，避免把「LOO 方向稳定」误读成稳健。
+    fragility = contrast.get("fragility")
+    if isinstance(fragility, dict) and fragility.get("available"):
+        fragility_verdict = fragility.get("verdict")
+        if (
+            fragility_verdict == "fragile"
+            and contrast.get("significant")
+        ):
+            deleted = fragility.get(
+                "min_seed_deletions_to_lose_significance"
+            )
+            max_p = fragility.get("max_leave_one_out_p_value")
+            caveat += (
+                f"（脆弱：删除 {deleted} 个种子后显著性消失，"
+                f"最大 LOO p={float(max_p):.4f}"
+                if isinstance(max_p, (int, float))
+                else "（脆弱：删除少量种子后显著性消失"
+            )
+            caveat += "；不能作为稳健结论）"
+        elif (
+            fragility_verdict == "direction_mixed"
+            and contrast.get("significant")
+        ):
+            sign_test = _as_dict(fragility.get("sign_test"))
+            caveat += (
+                "（方向混合：配对差值并非多数同向，"
+                f"符号检验 p={float(sign_test.get('p_value')):.4f}"
+                if isinstance(sign_test.get("p_value"), (int, float))
+                else "（方向混合：配对差值并非多数同向"
+            )
+            caveat += "，均值显著可能由少数大幅差值驱动）"
+
     if (
         contrast.get("randomization_method") == "exact"
         and contrast.get("randomization_can_reach_significance")
@@ -27874,6 +28411,10 @@ def compare_cells_to_baseline(
             "std_baseline": reference.get(f"{metric}_std"),
             "std_variant": aggregate.get(f"{metric}_std"),
             "delta": delta,
+            "paired_differences": result.get(
+                "paired_differences"
+            ),
+            "paired_seeds": result.get("paired_seeds"),
             "delta_over_noise": noise_ratio,
             "hedges_g": hedges_g,
             "cohens_dz": paired_effect_size.get("cohens_dz"),
@@ -34000,6 +34541,10 @@ def print_comparison_analysis(
     )
 
     higher_is_better = metric_higher_is_better(metric)
+    fragility_summary = _fragility_summary(
+        list(contrasts) + list(reference),
+        label="combined",
+    )
 
     print()
     print(
@@ -34859,6 +35404,60 @@ def print_comparison_analysis(
                     for contrast in missingness_flagged
                 )
             )
+
+    # 结果脆弱性：显著性是否只在「一个都不删」时成立。
+    # 这是描述性敏感性分析，不新增检验，但必须与显著性结论
+    # 一起读；删除种子后失去显著性的对比不能当作稳健结论。
+    print()
+    print(
+        "[fragility] 结果脆弱性检查（逐一/成组删除随机种子后"
+        "重做配对 t 检验；alpha 为家族校正后阈值）"
+    )
+    fragility_entries = fragility_summary.get("entries", [])
+    if not fragility_entries:
+        print(
+            "  无可用配对结果（旧运行缺少逐种子配对信息，"
+            "或检验不是配对 t）"
+        )
+    else:
+        counts = fragility_summary.get("verdict_counts", {})
+        print(
+            "  判定分布: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in sorted(counts.items())
+            )
+        )
+        stable_count = int(counts.get("stable", 0))
+        fragile_count = int(counts.get("fragile", 0))
+        mixed_count = int(counts.get("direction_mixed", 0))
+        print(
+            f"  稳健={stable_count}，脆弱={fragile_count}，"
+            f"方向混合={mixed_count}"
+        )
+        for message in fragility_summary.get("advisories", []):
+            print(f"  [warn] {message}")
+        fragility_flagged = [
+            entry
+            for entry in fragility_entries
+            if entry.get("verdict") == "fragile"
+            and entry.get("significant")
+        ]
+        for entry in fragility_flagged:
+            print(
+                f"  [fragile] {entry['baseline']}→"
+                f"{entry['variant']}: 删除 "
+                f"{entry['fragility_index']} 个种子后"
+                f" p={entry.get('max_leave_one_out_p_value')}"
+                f" > alpha={float(entry.get('alpha', 0.05)):.4f}；"
+                f"符号方向 正/负={entry.get('n_positive')}/"
+                f"{entry.get('n_negative')}，不能作为稳健结论"
+            )
+        print(
+            "  注：fragility 是描述性敏感性分析，不替代显著性"
+            "检验；但「显著」若依赖少数种子，应增加独立种子"
+            "或调查异常运行后再下结论"
+        )
 
     if baseline_mode:
         print(
@@ -35915,8 +36514,37 @@ def print_comparison_analysis(
         ),
         "target_power": _TARGET_POWER,
         "power_equivalence": equivalence_entries,
+        "fragility_summary": fragility_summary,
         "n_runs": len(rows),
     }
+
+
+def write_comparison_report_file(
+    path: Path,
+    analysis: Dict[str, object],
+) -> Path:
+    """
+    把对比分析写到显式指定的 JSON 文件（--compare-report）。
+
+    与 ``write_comparison_report`` 共用同一 payload 结构；
+    只读的 ``--compare`` 默认不写文件，显式给出路径才落盘。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.datetime.now().isoformat(
+            timespec="seconds"
+        ),
+        **analysis,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            _json_safe(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"[report] 对比分析已写入 {path}")
+    return path
 
 
 def write_comparison_report(
@@ -35927,25 +36555,10 @@ def write_comparison_report(
     把对比分析写入 out_dir/comparison_analysis.json。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "comparison_analysis.json"
-
-    payload = {
-        "generated_at": datetime.datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        **analysis,
-    }
-
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            _json_safe(payload),
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    print(f"[report] 对比分析已写入 {path}")
-    return path
+    return write_comparison_report_file(
+        out_dir / "comparison_analysis.json",
+        analysis,
+    )
 
 
 # ============================================================
@@ -57204,6 +57817,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--compare-report",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "配合 --compare：把完整对比分析（含 fragility_summary、"
+            "聚合、检验、功效/等价性与消融检查）写入指定 JSON "
+            "文件，而不是只打印到终端。只读入口默认不写文件；"
+            "显式给出该路径才落盘，便于把结果分析随运行一起归档"
+        ),
+    )
+    parser.add_argument(
         "--write-manifest",
         type=str,
         default=None,
@@ -58186,6 +58811,11 @@ def main():
         return
 
     # --compare 模式只读运行目录，不需要 --data / --out。
+    if args.compare_report is not None and args.compare is None:
+        parser.error(
+            "--compare-report 只能配合 --compare 使用："
+            "它保存的是只读对比分析，不参与训练"
+        )
     if args.compare is not None:
         # 路径写错时 compare_runs 仍会为不存在的目录生成整行 "-"
         # 的幽灵运行，后续分析再对这些空运行报告「无对照/无基线」
@@ -58204,7 +58834,7 @@ def main():
             )
         compare_rows = compare_runs(args.compare)
         print_comparison(compare_rows)
-        print_comparison_analysis(
+        compare_analysis = print_comparison_analysis(
             compare_rows,
             factors=parse_factor_spec(args.compare_factors),
             baseline_mode=args.compare_baseline,
@@ -58212,6 +58842,16 @@ def main():
             equivalence_margin=args.equivalence_margin,
             common_step=args.common_step,
         )
+        if args.compare_report is not None:
+            try:
+                write_comparison_report_file(
+                    Path(args.compare_report),
+                    compare_analysis,
+                )
+            except OSError as error:
+                parser.error(
+                    f"--compare-report 无法写入: {error}"
+                )
         return
 
     if args.data is None:
