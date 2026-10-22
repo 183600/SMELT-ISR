@@ -1502,11 +1502,16 @@ def apply_paper_cli(args, parser=None) -> None:
         if getattr(args, "wsd_stable_steps", None) is None:
             args.wsd_stable_steps = int(args.steps)
         if not getattr(args, "group_separator", None):
-            fail(
-                "--paper-protocol 需要 --group-separator 标注文档"
-                "边界：论文 3.1 节在 4096 packed context 内使用"
-                "文档级 segment attention mask，没有边界就无法"
-                "忠实复现"
+            if not _argv_has_flag("--document-masks"):
+                # 没有文档边界时无法构造 segment mask；不阻断
+                # 运行，但把 protocol_document_masks 记为偏离，
+                # 由 paper_fidelity 审计如实报告。
+                args.document_masks = False
+            print(
+                "[paper][warn] 未提供 --group-separator：无法构造"
+                "文档级 segment attention mask，论文 3.1 节协议"
+                "不完整（protocol_document_masks=false）；"
+                "忠实复现请用 --group-separator 标注文档边界"
             )
         print(
             "[paper][protocol] WSD + batch "

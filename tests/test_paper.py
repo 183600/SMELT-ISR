@@ -360,19 +360,20 @@ class PaperCliTests(unittest.TestCase):
         finally:
             sys.argv = previous
 
-    def test_paper_protocol_requires_document_boundaries(self):
-        class _Parser:
-            def error(self, message):
-                raise SystemExit(message)
-
+    def test_paper_protocol_without_document_boundaries(self):
+        # 没有 --group-separator 时不阻断运行，但不会假装启用
+        # 了文档级 mask：document_masks 保持 False，审计会记为
+        # protocol_document_masks=false。
         previous = sys.argv
         sys.argv = ["experiment.py", "--paper-protocol"]
         try:
             args = self._namespace(paper_protocol=True)
-            with self.assertRaises(SystemExit):
-                experiment.apply_paper_cli(args, _Parser())
+            experiment.apply_paper_cli(args)
         finally:
             sys.argv = previous
+        self.assertFalse(args.document_masks)
+        self.assertEqual(args.batch_size, 256)
+        self.assertEqual(args.lr_schedule, "wsd")
 
     def test_paper_protocol_values(self):
         previous = sys.argv
