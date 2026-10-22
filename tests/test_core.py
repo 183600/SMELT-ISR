@@ -3793,6 +3793,35 @@ class ArtifactManifestTests(unittest.TestCase):
                 {item["reason"] for item in report["mismatched"]},
             )
 
+    def test_manifest_symlink_loop_path_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            try:
+                (root / "a").symlink_to("b")
+                (root / "b").symlink_to("a")
+            except (OSError, NotImplementedError):
+                self.skipTest("当前平台不支持符号链接")
+            manifest_path = experiment.write_artifact_manifest(root)
+            payload = json.loads(manifest_path.read_text())
+            # 恶意/损坏清单可以声明一条穿过符号链接环的普通文件
+            # 路径；Path.resolve 会抛 RuntimeError，校验器必须把
+            # 它变成结构化失败而不是 traceback。
+            payload["files"].append({
+                "path": "a/x",
+                "type": "file",
+                "bytes": 1,
+                "sha256": "0" * 64,
+            })
+            manifest_path.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            report = experiment.verify_artifact_manifest(root)
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "path_resolution_error",
+            {item["reason"] for item in report["mismatched"]},
+        )
+
     def test_manifest_external_symlink_is_allowed_but_contained_links(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")

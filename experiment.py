@@ -39587,8 +39587,16 @@ def verify_artifact_manifest(
             check_path.resolve(strict=False).relative_to(
                 root_resolved
             )
-        except (OSError, ValueError):
-            fail(relative, "escapes_root")
+        except (OSError, ValueError, RuntimeError) as error:
+            # Path.resolve 遇到符号链接环会抛 RuntimeError（不是
+            # OSError）；恶意/损坏清单可用 a/x 这类路径触发它。
+            # 校验必须把它报告为路径解析失败，而不是让整个
+            # --verify-manifest 以 traceback 退出。
+            fail(
+                relative,
+                "path_resolution_error",
+                error=str(error),
+            )
             continue
         try:
             exists = target.exists()
