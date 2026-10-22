@@ -1881,7 +1881,7 @@ class PreregistrationTests(unittest.TestCase):
         payload = self._payload()
         args = self._args(
             split_policy="contiguous",
-            group_separator="\n\n",
+            group_separator=None,
             deduplicate_train_groups=True,
         )
         error = experiment.preregistration_data_error(
@@ -1895,7 +1895,7 @@ class PreregistrationTests(unittest.TestCase):
         }
         args = self._args(
             split_policy="contiguous",
-            group_separator="\n\n",
+            group_separator=None,
             deduplicate_train_groups=False,
             drop_train_shared_chunks=True,
         )
@@ -1907,7 +1907,7 @@ class PreregistrationTests(unittest.TestCase):
         # 全部关闭时，省略 cleaning 的旧预注册文件仍可核对通过。
         args = self._args(
             split_policy="contiguous",
-            group_separator="\n\n",
+            group_separator=None,
             deduplicate_train_groups=False,
             drop_train_shared_chunks=False,
             clean_train_against_test=False,
@@ -1920,6 +1920,34 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIsNone(
             experiment.preregistration_data_error(
                 args, self._payload(), self._dataset()
+            )
+        )
+
+    def test_data_rejects_undeclared_group_separator(self):
+        # 未声明 group_separator 等于不分群组；看到结果后再加
+        # 分隔符会改变吸附后的切分边界，必须拒绝。
+        payload = self._payload()
+        args = self._args(
+            split_policy="contiguous",
+            group_separator="\\n\\n",
+        )
+        error = experiment.preregistration_data_error(
+            args, payload, self._dataset()
+        )
+        self.assertIn("group_separator", error)
+
+        # 声明 null 与不声明同义；显式声明相同分隔符则通过。
+        payload["data"]["group_separator"] = None
+        self.assertIn(
+            "group_separator",
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            ),
+        )
+        payload["data"]["group_separator"] = "\\n\\n"
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
             )
         )
 

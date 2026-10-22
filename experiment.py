@@ -31276,8 +31276,20 @@ def preregistration_data_error(
     declared_group = data.get(
         "group_separator", _PREREGISTRATION_MISSING
     )
+    current_group = getattr(args, "group_separator", None)
+    # 未声明 group_separator 等价于声明「不使用群组切分」：
+    # 否则预注册后再加 --group-separator 会改变切分吸附位置与
+    # 实际 train/val/test 字节，绕过数据协议核对。
+    if (
+        declared_group is _PREREGISTRATION_MISSING
+        and current_group is not None
+    ):
+        return (
+            "预注册 data 未声明 group_separator，但当前使用了 "
+            f"--group-separator={current_group!r}：群组边界会"
+            "改变切分吸附位置与实际训练字节，必须在预注册中固定"
+        )
     if declared_group is not _PREREGISTRATION_MISSING:
-        current_group = getattr(args, "group_separator", None)
         try:
             declared_bytes = (
                 None
@@ -31294,7 +31306,7 @@ def preregistration_data_error(
         if declared_bytes != current_bytes:
             return (
                 "预注册 data.group_separator 与当前 "
-                "--group-separator 不一致：群组边界改变会改变"
+                "--group-separator 不一致：群组边界会改变"
                 "切分吸附位置与实际训练字节"
             )
 
