@@ -20029,6 +20029,19 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["protocol"] = experiment_protocol_from_payload(
             config_payload
         )
+        # 记录原 config.json 中 comparison_protocol 实际写出的键：
+        # 显式 null（如 cosine 调度下的 wsd_stable_steps、未启用
+        # 文档 mask 时的 document_separator）是已记录的可比值，
+        # 不能和旧运行缺少该键混为一谈。只有回退补齐的键才在
+        # 值仍为 None 时标记为「未核对」。
+        recorded_protocol = config_payload.get(
+            "comparison_protocol"
+        )
+        row["protocol_recorded_keys"] = (
+            sorted(str(key) for key in recorded_protocol)
+            if isinstance(recorded_protocol, dict)
+            else None
+        )
 
         # 训练前初始化指纹与首批训练数据指纹：同种子下
         # 若两者不一致，结构/指标差异就不能全部归因于
@@ -21874,16 +21887,24 @@ def cross_family_protocol_check(
     数、批量大小、数据增强等口径一致。这里只比较这些跨 family
     共用项，不一致时返回 violation，供对比报告拒绝归因。
     """
-    neural: List[Tuple[str, object]] = []
-    statistical: List[Tuple[str, object]] = []
+    neural: List[Tuple[str, object, Optional[set]]] = []
+    statistical: List[Tuple[str, object, Optional[set]]] = []
 
     for row in rows:
         protocol = row.get("protocol")
         if not isinstance(protocol, dict):
             protocol = {}
         family = protocol.get("comparison_family") or "neural"
+        recorded = row.get("protocol_recorded_keys")
+        recorded_keys = (
+            {str(key) for key in recorded}
+            if isinstance(recorded, (list, tuple, set, frozenset))
+            else None
+        )
         target = statistical if family == "statistical" else neural
-        target.append((str(row.get("run")), protocol))
+        target.append(
+            (str(row.get("run")), protocol, recorded_keys)
+        )
 
     checked: List[str] = []
     unchecked: List[str] = []
@@ -21901,31 +21922,39 @@ def cross_family_protocol_check(
         if key in factors:
             continue
 
-        neural_values = [
-            (run, protocol.get(key))
-            for run, protocol in neural
-        ]
-        statistical_values = [
-            (run, protocol.get(key))
-            for run, protocol in statistical
-        ]
+        def _values(entries):
+            return [
+                (
+                    run,
+                    protocol.get(key),
+                    recorded is not None and key in recorded,
+                )
+                for run, protocol, recorded in entries
+            ]
+
+        neural_values = _values(neural)
+        statistical_values = _values(statistical)
         all_values = neural_values + statistical_values
         present = [
             (run, value)
-            for run, value in all_values
-            if value is not None
+            for run, value, explicit_none in all_values
+            if value is not None or explicit_none
         ]
         missing_runs = [
-            run for run, value in all_values if value is None
+            run
+            for run, value, explicit_none in all_values
+            if value is None and not explicit_none
         ]
 
         if not present:
             unchecked.append(key)
             continue
         if not any(
-            value is not None for _, value in neural_values
+            value is not None or explicit_none
+            for _, value, explicit_none in neural_values
         ) or not any(
-            value is not None for _, value in statistical_values
+            value is not None or explicit_none
+            for _, value, explicit_none in statistical_values
         ):
             unchecked.append(key)
             continue
@@ -21939,7 +21968,8 @@ def cross_family_protocol_check(
             violations.append({
                 "key": key,
                 "values": {
-                    run: value for run, value in all_values
+                    run: value
+                    for run, value, _ in all_values
                 },
                 "missing_runs": missing_runs,
                 "note": (
@@ -21995,27 +22025,51 @@ def check_controlled_variables(
     # 列为「未核对」，不能让「没记录」静默混进 OK 结论。
     unchecked: List[str] = []
 
+    # 原 config.json 的 comparison_protocol 显式写出的键。显式
+    # null（如 cosine 调度下的 wsd_stable_steps、未启用分组时的
+    # group_separator）本身是一个可比较的协议值；只有回退补齐
+    # 后仍为 None 的键才是真正「未记录」。旧运行没有该清单时
+    # 保持 None，沿用「None 视为缺记录」的保守口径。
+    recorded_by_row: Dict[int, Optional[set]] = {}
+    for row in neural:
+        recorded = row.get("protocol_recorded_keys")
+        if isinstance(recorded, (list, tuple, set, frozenset)):
+            recorded_by_row[id(row)] = {
+                str(key) for key in recorded
+            }
+        else:
+            recorded_by_row[id(row)] = None
+
     for key in COMPARISON_PROTOCOL_KEYS:
         if key in factor_set:
             continue
 
-        values = [
-            (
-                str(row.get("run")),
-                row.get("protocol", {}).get(key)
-                if isinstance(row.get("protocol"), dict)
-                else None,
+        values = []
+        for row in neural:
+            name = str(row.get("run"))
+            protocol = row.get("protocol")
+            value = (
+                protocol.get(key)
+                if isinstance(protocol, dict)
+                else None
             )
-            for row in neural
-        ]
+            recorded = recorded_by_row[id(row)]
+            explicit_none = (
+                value is None
+                and recorded is not None
+                and str(key) in recorded
+            )
+            values.append((name, value, explicit_none))
 
         present = [
             (name, value)
-            for name, value in values
-            if value is not None
+            for name, value, explicit_none in values
+            if value is not None or explicit_none
         ]
         missing_runs = [
-            name for name, value in values if value is None
+            name
+            for name, value, explicit_none in values
+            if value is None and not explicit_none
         ]
 
         if not present:
@@ -22035,7 +22089,8 @@ def check_controlled_variables(
             violations.append({
                 "key": key,
                 "values": {
-                    name: value for name, value in values
+                    name: value
+                    for name, value, _ in values
                 },
                 "missing_runs": missing_runs,
             })

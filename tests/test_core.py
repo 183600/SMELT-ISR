@@ -687,6 +687,73 @@ class ProcessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 experiment.read_time_order_manifest(str(path))
 
+    def test_explicit_null_protocol_values_are_checked(self):
+        # cosine 调度下的 wsd_stable_steps、未启用分组/文档 mask
+        # 时的 separator 都是显式 null，不是「缺记录」。
+        keys = (
+            "wsd_stable_steps",
+            "document_separator",
+            "group_separator",
+        )
+        rows = []
+        for name in ("a", "b"):
+            rows.append({
+                "run": name,
+                "protocol": {
+                    "comparison_family": "neural",
+                    **{key: None for key in keys},
+                },
+                "protocol_recorded_keys": list(keys),
+            })
+        report = experiment.check_controlled_variables(rows, [])
+        for key in keys:
+            self.assertNotIn(key, report["unchecked_keys"])
+            self.assertIn(key, report["checked_keys"])
+        self.assertTrue(report["ok"], report["violations"])
+
+    def test_unrecorded_null_protocol_values_stay_unchecked(self):
+        keys = ("wsd_stable_steps", "document_separator")
+        rows = [
+            {
+                "run": name,
+                "protocol": {
+                    "comparison_family": "neural",
+                    **{key: None for key in keys},
+                },
+                "protocol_recorded_keys": [],
+            }
+            for name in ("a", "b")
+        ]
+        report = experiment.check_controlled_variables(rows, [])
+        for key in keys:
+            self.assertIn(key, report["unchecked_keys"])
+
+    def test_cross_family_explicit_null_is_compared(self):
+        recorded = ["group_separator"]
+        rows = [
+            {
+                "run": name,
+                "protocol": {
+                    "comparison_family": family,
+                    "group_separator": None,
+                },
+                "protocol_recorded_keys": recorded,
+            }
+            for name, family in (
+                ("neural", "neural"),
+                ("ngram", "statistical"),
+            )
+        ]
+        report = experiment.check_controlled_variables(rows, [])
+        self.assertNotIn(
+            "group_separator",
+            report["cross_family_unchecked_keys"],
+        )
+        self.assertIn(
+            "group_separator",
+            report["cross_family_checked_keys"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
