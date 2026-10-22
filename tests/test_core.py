@@ -908,6 +908,31 @@ class DesignPreparationTests(unittest.TestCase):
             [item["label"] for item in different],
         )
 
+    def test_order_plan_tolerates_unhashable_seed(self):
+        plan = [
+            {"label": "A_bad", "mode": "A", "balance_coef": 0.0, "seed": []},
+            {"label": "B_bad", "mode": "B", "balance_coef": 0.0, "seed": []},
+            {"label": "A_bad2", "mode": "A", "balance_coef": 0.0, "seed": {"x": 1}},
+            {"label": "B_bad2", "mode": "B", "balance_coef": 0.0, "seed": {"x": 1}},
+        ]
+        for scheme in ("grouped", "blocked", "randomized", "counterbalanced"):
+            ordered = experiment.order_sweep_plan(plan, scheme, 3)
+            self.assertEqual(len(ordered), 4, scheme)
+            self.assertEqual(
+                [item["order_index"] for item in ordered],
+                [1, 2, 3, 4],
+                scheme,
+            )
+            # 原始 seed 值必须保留给报告/子进程，而不是替换成
+            # 内部稳定键。
+            self.assertEqual(
+                sorted(
+                    repr(item["block"]) for item in ordered
+                ),
+                sorted(repr(item["seed"]) for item in ordered),
+                scheme,
+            )
+
     def test_run_order_drift_detects_monotonic_trend(self):
         rows = []
         for index, (mode, value) in enumerate(

@@ -56664,6 +56664,41 @@ def _order_block_rng(
     return random.Random(int.from_bytes(digest[:16], "big"))
 
 
+def _order_block_seed(value: object) -> int:
+    """区组 RNG 的整数种子；损坏计划里的非整数 seed 也不能崩。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    # 非整数 seed（手工编辑/旧格式损坏）没有 int() 可用的值；
+    # 用稳定键派生确定性种子，既避免 TypeError，也保证同一
+    # 计划重复生成时顺序不变。
+    return int.from_bytes(
+        hashlib.sha256(
+            repr(_stable_factor_key(value)).encode("utf-8")
+        ).digest()[:8],
+        "big",
+    )
+
+
+def _order_block_key(value: object) -> object:
+    """区组分组的哈希键；list/dict 等不可哈希 seed 用稳定包装。"""
+    try:
+        hash(value)
+    except TypeError:
+        return ("__unhashable_block__", repr(_stable_factor_key(value)))
+    return value
+
+
+def _order_block_sort_key(value: object):
+    """区组的确定性全序键，避免 None/str/数值混合比较崩溃。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return (0, value, "")
+    if isinstance(value, float) and math.isfinite(value):
+        return (0, value, "")
+    # 其余（字符串、None、不可哈希包装）统一按稳定表示的文本
+    # 排序；这不会改变正常整数种子的区组顺序。
+    return (1, repr(_stable_factor_key(value)), "")
+
+
 def _counterbalance_rng(order_seed: int) -> random.Random:
     """平衡区组排列的确定性 RNG（与区组洗牌分开命名空间）。"""
     digest = hashlib.sha256(
@@ -56713,7 +56748,7 @@ def _counterbalanced_order(
     if not blocks:
         return []
     block_keys = sorted(
-        blocks, key=_stable_factor_key
+        blocks, key=_order_block_sort_key
     )
     reference: Optional[List] = None
     keyed_blocks: Dict[object, Dict[object, Dict[str, object]]] = {}
@@ -56895,17 +56930,25 @@ def order_sweep_plan(
     else:
         blocks: Dict[object, List[Dict[str, object]]] = {}
         for item in plan:
-            blocks.setdefault(item.get("seed"), []).append(
-                dict(item)
-            )
+            # seed 来自损坏/手工编辑的计划时可能是 list/dict；
+            # 直接当 dict 键会抛 unhashable。稳定键只用于分组，
+            # item["seed"] 仍保留原始值供报告/子进程使用。
+            block_key = _order_block_key(item.get("seed"))
+            blocks.setdefault(block_key, []).append(dict(item))
         if scheme == "counterbalanced":
             ordered = _counterbalanced_order(blocks, order_seed)
         else:
             ordered = []
-            for block_seed, block in blocks.items():
+            for block_key, block in blocks.items():
                 if scheme == "randomized":
+                    block_seed = (
+                        block[0].get("seed")
+                        if block
+                        else block_key
+                    )
                     rng = _order_block_rng(
-                        order_seed, int(block_seed)
+                        order_seed,
+                        _order_block_seed(block_seed),
                     )
                     rng.shuffle(block)
                 ordered.extend(block)
@@ -56913,10 +56956,11 @@ def order_sweep_plan(
     positions: Dict[object, int] = {}
     for index, item in enumerate(ordered, start=1):
         block_seed = item.get("seed")
-        positions[block_seed] = positions.get(block_seed, 0) + 1
+        block_key = _order_block_key(block_seed)
+        positions[block_key] = positions.get(block_key, 0) + 1
         item["order_index"] = index
         item["block"] = block_seed
-        item["position_in_block"] = positions[block_seed]
+        item["position_in_block"] = positions[block_key]
     return ordered
 
 
