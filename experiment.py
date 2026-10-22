@@ -55902,6 +55902,17 @@ def write_design_plan(
             else actual_comparisons
         )
     planned_comparisons = int(planned_comparisons)
+    if (
+        power is not None
+        and isinstance(power.get("planned_comparisons"), int)
+        and not isinstance(
+            power.get("planned_comparisons"), bool
+        )
+    ):
+        planned_comparisons = max(
+            planned_comparisons,
+            int(power["planned_comparisons"]),
+        )
     # 内嵌的 power 记录必须与计划实际家族同口径，否则设计文件
     # 一边按实际家族算 seed_plan，一边保留低估的 required_seeds。
     power = _design_power_for_family(
