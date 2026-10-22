@@ -401,6 +401,92 @@ class ReproducibilityTests(unittest.TestCase):
             )["ok"]
         )
 
+    def test_fresh_out_dir_guard_protects_existing_tracking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            self.assertIsNone(
+                experiment.fresh_out_dir_error(
+                    out_dir,
+                    resume_path=None,
+                    allow_overwrite=False,
+                )
+            )
+            (out_dir / "metrics.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            error = experiment.fresh_out_dir_error(
+                out_dir,
+                resume_path=None,
+                allow_overwrite=False,
+            )
+            self.assertIsNotNone(error)
+            self.assertIn("metrics.jsonl", error)
+            self.assertIsNone(
+                experiment.fresh_out_dir_error(
+                    out_dir,
+                    resume_path=None,
+                    allow_overwrite=True,
+                )
+            )
+            self.assertIsNone(
+                experiment.fresh_out_dir_error(
+                    out_dir,
+                    resume_path="last.pt",
+                    allow_overwrite=False,
+                )
+            )
+
+    def test_tracking_provenance_prefers_original_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "config.json").write_text(
+                json.dumps({
+                    "original_run_metadata": {
+                        "timestamp_utc": "2026-01-01T00:00:00+00:00",
+                        "script_sha256": "original-script",
+                        "git_commit": "original-commit",
+                        "git_dirty": False,
+                    },
+                    "run_metadata": {
+                        "timestamp_utc": "2026-01-02T00:00:00+00:00",
+                        "script_sha256": "resumed-script",
+                        "git_commit": "resumed-commit",
+                        "git_dirty": True,
+                    },
+                    "resume_count": 2,
+                    "comparison_protocol_sha256": "protocol-sha",
+                }),
+                encoding="utf-8",
+            )
+            provenance = experiment.load_tracking_provenance(
+                run_dir
+            )
+            self.assertEqual(
+                provenance["run_started_utc"],
+                "2026-01-01T00:00:00+00:00",
+            )
+            self.assertEqual(
+                provenance["original_script_sha256"],
+                "original-script",
+            )
+            self.assertEqual(
+                provenance["original_git_commit"],
+                "original-commit",
+            )
+            self.assertEqual(provenance["resume_count"], 2)
+            self.assertEqual(
+                provenance["comparison_protocol_sha256"],
+                "protocol-sha",
+            )
+
+    def test_tracking_provenance_defaults_without_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provenance = experiment.load_tracking_provenance(
+                Path(tmp)
+            )
+            self.assertIsNone(provenance["run_started_utc"])
+            self.assertEqual(provenance["resume_count"], 0)
+
     def test_non_expert_digest_tracks_parameter_updates(self):
         model = experiment.LanguageModel(_tiny_config())
         before = experiment._non_expert_parameter_digest(

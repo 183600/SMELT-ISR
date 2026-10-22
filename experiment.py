@@ -11377,6 +11377,12 @@ def run_statistical_baseline(
         strict_determinism=args.strict_determinism,
     )
 
+    # 在入口处捕获运行身份：final 记录使用真正的启动时间，
+    # 而不是训练/计数结束后的时间。
+    ngram_run_metadata = collect_run_metadata(
+        torch.device("cpu")
+    )
+
     alpha_grid: List[float] = list(args.ngram_alpha_grid)
     tuning_metric, tuning_metric_source = (
         resolve_ngram_tuning_metric(args)
@@ -11827,6 +11833,26 @@ def run_statistical_baseline(
         "ngram_tuning_metric": tuning_metric,
         "ngram_tuning_metric_source": tuning_metric_source,
         "ngram_tuning": tuning_diagnostics,
+        # 统计基线同样自带实验追踪字段，便于 metrics.jsonl
+        # 脱离 config.json 单独归档。
+        "deterministic": True,
+        "seed": args.seed,
+        "data_sha256": dataset.data_sha256,
+        "data_split_sha256": dict(dataset.split_sha256),
+        "data_effective_train_sha256": (
+            dataset.effective_train_sha256
+        ),
+        "script_sha256": ngram_run_metadata.get(
+            "script_sha256"
+        ),
+        "git_commit": ngram_run_metadata.get("git_commit"),
+        "git_dirty": ngram_run_metadata.get("git_dirty"),
+        "run_started_utc": ngram_run_metadata.get(
+            "timestamp_utc"
+        ),
+        "run_completed_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
         **final_metrics,
     }
 
@@ -12211,11 +12237,17 @@ def run_statistical_baseline(
         "data_audit": data_audit,
         "data_protocol_check": data_protocol_check,
         "reference_baselines": reference,
-        "run_metadata": collect_run_metadata(
-            torch.device("cpu")
-        ),
+        "run_metadata": ngram_run_metadata,
         "sanity_check": None,
     }
+    payload["comparison_protocol_sha256"] = _sha256_text(
+        json.dumps(
+            _json_safe(payload["comparison_protocol"]),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
     with open(
         out_dir / "config.json",
@@ -34005,12 +34037,28 @@ def write_run_config(
     参考基线（uniform / unigram）与基线调参来源
     （--baseline-tuning-from）。
     """
+    comparison_protocol = build_comparison_protocol(cfg, args)
+    # 协议指纹：final/test 记录只带这一条短标识即可证明自己
+    # 对应哪一份完整受控变量集合，避免 metrics.jsonl 单独归档
+    # 时无法核对超参数是否在续跑/复制过程中被改动。
+    comparison_protocol_sha256 = _sha256_text(
+        json.dumps(
+            _json_safe(comparison_protocol),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
     payload = {
         "config": asdict(cfg),
         "args": vars(args),
         # 受控变量协议：--compare 用它核对「除声明因子外，
         # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
-        "comparison_protocol": build_comparison_protocol(cfg, args),
+        "comparison_protocol": comparison_protocol,
+        "comparison_protocol_sha256": (
+            comparison_protocol_sha256
+        ),
         "n_params": n_params,
         "paper_fidelity": getattr(args, "paper_fidelity", None),
         "cost_profile": getattr(args, "cost_profile", None),
@@ -34566,6 +34614,45 @@ def test_evaluation_sealed(out_dir: Path) -> bool:
     return _test_seal_path(out_dir).exists()
 
 
+def fresh_out_dir_error(
+    out_dir: Path,
+    *,
+    resume_path: Optional[str],
+    allow_overwrite: bool,
+) -> Optional[str]:
+    """
+    全新训练复用非空输出目录的错误消息（None 表示允许）。
+
+    训练会截断 metrics.jsonl 并覆盖 config.json；目录里已有
+    上一轮实验的追踪文件时，静默复用会把训练曲线、最终结果与
+    原始代码/数据指纹从审计链中抹掉。--resume 与显式豁免
+    --allow-overwrite-out 不走该拦截。
+    """
+    if resume_path is not None or allow_overwrite:
+        return None
+
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return None
+
+    existing_entries = sorted(
+        entry.name for entry in out_dir.iterdir()
+    )
+    if not existing_entries:
+        return None
+
+    preview = ", ".join(existing_entries[:5])
+    if len(existing_entries) > 5:
+        preview += ", ..."
+    return (
+        f"--out 目录非空（{preview}）：全新训练会截断 "
+        "metrics.jsonl 并覆盖 config.json，上一轮实验的训练"
+        "曲线、最终结果与代码/数据指纹将不可追溯。请换用全新"
+        "的 --out 目录；确需覆盖时显式传 "
+        "--allow-overwrite-out。"
+    )
+
+
 def write_test_evaluation_seal(
     out_dir: Path,
     record: Optional[Dict[str, object]] = None,
@@ -34839,6 +34926,67 @@ def print_final_test_comparison(
             "一次性解封测试集，并报告全部预注册比较；本命令"
             "只读汇总，不做选择或重复评估"
         ),
+    }
+
+
+def load_tracking_provenance(
+    out_dir: Path,
+) -> Dict[str, object]:
+    """
+    读取运行目录的原始追踪身份。
+
+    resume 会重写 config.json 的 run_metadata；final/test 记录若
+    只写当前段的启动时间与代码指纹，会把多次续跑的历史压缩成
+    最后一次。这里优先取 original_run_metadata（首次运行快照），
+    并返回 resume_count 与受控变量协议指纹，供 metrics.jsonl
+    脱离 config.json 归档时仍能定位原始运行。
+    """
+    path = out_dir / "config.json"
+    empty: Dict[str, object] = {
+        "run_started_utc": None,
+        "original_script_sha256": None,
+        "original_git_commit": None,
+        "original_git_dirty": None,
+        "resume_count": 0,
+        "comparison_protocol_sha256": None,
+    }
+    if not path.exists():
+        return empty
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return empty
+
+    if not isinstance(payload, dict):
+        return empty
+
+    original = payload.get("original_run_metadata")
+    if not isinstance(original, dict):
+        original = payload.get("run_metadata")
+    if not isinstance(original, dict):
+        original = {}
+
+    resume_count = payload.get("resume_count")
+    if (
+        not isinstance(resume_count, int)
+        or isinstance(resume_count, bool)
+        or resume_count < 0
+    ):
+        resume_count = 0
+
+    protocol_sha = payload.get("comparison_protocol_sha256")
+    if not isinstance(protocol_sha, str):
+        protocol_sha = None
+
+    return {
+        "run_started_utc": original.get("timestamp_utc"),
+        "original_script_sha256": original.get("script_sha256"),
+        "original_git_commit": original.get("git_commit"),
+        "original_git_dirty": original.get("git_dirty"),
+        "resume_count": resume_count,
+        "comparison_protocol_sha256": protocol_sha,
     }
 
 
@@ -52567,6 +52715,15 @@ def main():
         default=None,
         help="输出目录（--compare 模式可省略）",
     )
+    parser.add_argument(
+        "--allow-overwrite-out",
+        action="store_true",
+        help=(
+            "显式允许全新训练复用非空 --out 目录：默认拒绝，"
+            "因为训练会截断 metrics.jsonl 并覆盖 config.json，"
+            "使上一轮实验的训练曲线与最终结果不可追溯"
+        ),
+    )
     parser.add_argument("--resume", type=str, default=None)
 
     parser.add_argument(
@@ -53960,6 +54117,18 @@ def main():
             "使已有 test 记录不再对应最终模型。如需继续实验，"
             "请换用全新的 --out 目录。"
         )
+
+    # 全新训练会截断 metrics.jsonl 并覆盖 config.json；若目录
+    # 里已有上一轮实验的追踪文件，静默复用会把训练曲线、最终
+    # 结果与原始代码/数据指纹从审计链中抹掉。默认拒绝，必须
+    # 换新目录或显式承担覆盖风险。
+    overwrite_error = fresh_out_dir_error(
+        out_dir,
+        resume_path=args.resume,
+        allow_overwrite=args.allow_overwrite_out,
+    )
+    if overwrite_error is not None:
+        parser.error(overwrite_error)
 
     start_step = 0
     rng_payload = None
@@ -55974,6 +56143,11 @@ def main():
         ),
     )
 
+    # 原始运行身份（resume 时 config.json 会保留首次运行快照）；
+    # final/test 记录用它标注真正的 run_started_utc 与原始代码
+    # 版本，而不是最后一次续跑的时间。
+    tracking_provenance = load_tracking_provenance(out_dir)
+
     metrics_path = out_dir / "metrics.jsonl"
 
     # 曲线诊断的「是否学到东西」参照：从 uniform（ln 256，稻草人）
@@ -56863,10 +57037,45 @@ def main():
         # 种子、哪份数据、何时跑完」，不至于无法追溯。
         "seed": args.seed,
         "data_sha256": dataset.data_sha256,
+        # 逐 split 与有效训练集指纹：整体文件 sha256 相同仍可能
+        # 因切分比例/群组吸附/清洗不同而对应不同数据版本。
+        "data_split_sha256": dict(dataset.split_sha256),
+        "data_effective_train_sha256": (
+            dataset.effective_train_sha256
+        ),
         "script_sha256": run_metadata.get("script_sha256"),
         "git_commit": run_metadata.get("git_commit"),
         "git_dirty": run_metadata.get("git_dirty"),
-        "run_started_utc": run_metadata.get("timestamp_utc"),
+        # 原始运行身份：resume 不把首次运行的时间/代码版本
+        # 改写成最后一次续跑的。当前段信息单独保留。
+        "run_started_utc": (
+            tracking_provenance.get("run_started_utc")
+            or run_metadata.get("timestamp_utc")
+        ),
+        "run_segment_started_utc": run_metadata.get(
+            "timestamp_utc"
+        ),
+        "original_script_sha256": (
+            tracking_provenance.get(
+                "original_script_sha256"
+            )
+            or run_metadata.get("script_sha256")
+        ),
+        "original_git_commit": (
+            tracking_provenance.get("original_git_commit")
+            or run_metadata.get("git_commit")
+        ),
+        "original_git_dirty": tracking_provenance.get(
+            "original_git_dirty"
+        ),
+        "resume_count": tracking_provenance.get(
+            "resume_count", 0
+        ),
+        "comparison_protocol_sha256": (
+            tracking_provenance.get(
+                "comparison_protocol_sha256"
+            )
+        ),
         "run_completed_utc": datetime.datetime.now(
             datetime.timezone.utc
         ).isoformat(),
@@ -57540,10 +57749,42 @@ def main():
                     ),
                     "seed": args.seed,
                     "data_sha256": dataset.data_sha256,
+                    "data_split_sha256": dict(
+                        dataset.split_sha256
+                    ),
+                    "data_effective_train_sha256": (
+                        dataset.effective_train_sha256
+                    ),
                     "script_sha256": run_metadata.get(
                         "script_sha256"
                     ),
                     "git_commit": run_metadata.get("git_commit"),
+                    "run_started_utc": (
+                        tracking_provenance.get(
+                            "run_started_utc"
+                        )
+                        or run_metadata.get("timestamp_utc")
+                    ),
+                    "original_script_sha256": (
+                        tracking_provenance.get(
+                            "original_script_sha256"
+                        )
+                        or run_metadata.get("script_sha256")
+                    ),
+                    "original_git_commit": (
+                        tracking_provenance.get(
+                            "original_git_commit"
+                        )
+                        or run_metadata.get("git_commit")
+                    ),
+                    "resume_count": tracking_provenance.get(
+                        "resume_count", 0
+                    ),
+                    "comparison_protocol_sha256": (
+                        tracking_provenance.get(
+                            "comparison_protocol_sha256"
+                        )
+                    ),
                     "study_id": args.study_id,
                     "test_ledger": str(ledger_path),
                     "test_access": access_record,
