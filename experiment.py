@@ -26312,6 +26312,8 @@ def equivalence_margin_preregistration(
     missing: List[str] = []
     invalid: List[str] = []
     for row in rows:
+        if _is_deterministic_run(row):
+            continue
         run = str(row.get("run"))
         value = row.get("hypothesis_equivalence_margin")
         if value is None:
@@ -26377,7 +26379,27 @@ def equivalence_margin_preregistration(
         abs_tol=1e-15,
     ):
         report["status"] = "consistent"
-        report["ok"] = True
+        if missing or invalid:
+            report["ok"] = None
+            detail: List[str] = []
+            if missing:
+                detail.append(
+                    "以下运行没有预注册等价界（旧版运行）: "
+                    + ", ".join(missing)
+                )
+            if invalid:
+                detail.append(
+                    "以下运行的预注册等价界无效: "
+                    + ", ".join(invalid)
+                )
+            report["advisories"].append(
+                "当前等价界与已记录运行的预注册值一致，但"
+                + "；".join(detail)
+                + "：无法核对全部运行，等价结论只能视为对"
+                "已记录运行有效"
+            )
+        else:
+            report["ok"] = True
         return report
 
     report["ok"] = False
@@ -27586,7 +27608,10 @@ def print_comparison_analysis(
             "不显著 ≠ 等价）"
         )
         margin_status = margin_preregistration.get("status")
-        if margin_status == "consistent":
+        if (
+            margin_status == "consistent"
+            and margin_preregistration.get("ok") is True
+        ):
             print(
                 "  等价界预注册: OK（当前界与训练前写入 "
                 "hypothesis_preregistration 的取值一致）"
@@ -37192,6 +37217,24 @@ def run_self_test():
         assert margin_consistent["status"] == "consistent"
         assert margin_consistent["ok"] is True
         assert margin_consistent["widened_post_hoc"] is False
+
+        margin_partial = equivalence_margin_preregistration(
+            [
+                {
+                    "run": "A_seed1",
+                    "hypothesis_equivalence_margin": 0.01,
+                },
+                {"run": "old_run"},
+            ],
+            0.01,
+        )
+        assert margin_partial["status"] == "consistent"
+        assert margin_partial["ok"] is None
+        assert margin_partial["missing_runs"] == ["old_run"]
+        assert any(
+            "无法核对全部运行" in advisory
+            for advisory in margin_partial["advisories"]
+        )
 
         margin_widened = equivalence_margin_preregistration(
             [{
