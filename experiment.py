@@ -24961,6 +24961,68 @@ def _t_power(
     noncentrality = effect_value / se_value
     scale = critical / math.sqrt(df_value)
 
+    if scale > 10.0:
+        # alpha 很小 / df 很小时临界值巨大，固定 u 网格在
+        # u≈0 附近完全分辨不出被积函数的尖峰，会低估功效。
+        # 换到 w = scale·u 后按 w 做 Simpson：被积函数在
+        # w≈0 附近变成多项式尺度，且 w > δ+12 后正态尾概率
+        # 已可忽略，可安全截断。
+        u_max = (
+            math.sqrt(df_value - 1.0) + _T_POWER_TAIL
+            if df_value > 1.0
+            else _T_POWER_TAIL
+        )
+        w_max = min(
+            scale * u_max,
+            noncentrality + _T_POWER_TAIL,
+        )
+        target_step = 0.02 * min(1.0, scale)
+        intervals = max(
+            200,
+            int(math.ceil(w_max / target_step)),
+        )
+        if intervals % 2:
+            intervals += 1
+        intervals = min(intervals, 20000)
+        step = w_max / intervals
+        log_const = (
+            (1.0 - df_value / 2.0) * math.log(2.0)
+            - math.lgamma(df_value / 2.0)
+        )
+        total = 0.0
+        for index in range(intervals + 1):
+            w = index * step
+            u = w / scale
+            if index == 0 or index == intervals:
+                simpson = step / 3.0
+            elif index % 2 == 0:
+                simpson = 2.0 * step / 3.0
+            else:
+                simpson = 4.0 * step / 3.0
+            if u <= 0.0:
+                density = (
+                    math.sqrt(2.0 / math.pi)
+                    if df_value == 1.0
+                    else 0.0
+                )
+            else:
+                density = math.exp(
+                    log_const
+                    + (df_value - 1.0) * math.log(u)
+                    - u * u / 2.0
+                )
+            total += (
+                simpson
+                * density
+                * (
+                    _normal_cdf(-w - noncentrality)
+                    + 1.0
+                    - _normal_cdf(w - noncentrality)
+                )
+                / scale
+            )
+        return min(1.0, max(0.0, total))
+
     u_values, weighted = _t_power_nodes(df_value)
     total = 0.0
     for u, weight in zip(u_values, weighted):

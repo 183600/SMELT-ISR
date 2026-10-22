@@ -4284,6 +4284,17 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(0.0, 1.0, 2.0, 1e-5),
             1e-5,
         )
+        # 极小 alpha + df=2 时固定 u 网格会漏掉尖峰；换到
+        # w=scale·u 后应接近非中心 t 的参考值（scipy nct）。
+        self.assertAlmostEqual(
+            experiment._t_power(1.0, 1.0, 2.0, 1e-5),
+            1.9999800001667738e-05,
+            delta=1e-9,
+        )
+        self.assertGreater(
+            experiment._t_power(2.0, 1.0, 2.0, 1e-5),
+            experiment._t_power(1.0, 1.0, 2.0, 1e-5),
+        )
 
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
