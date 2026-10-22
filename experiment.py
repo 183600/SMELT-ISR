@@ -40456,6 +40456,12 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
             record_step, bool
         ):
             return record_step > threshold
+        # step 是任意 JSON 值时不能直接放进 frozenset 做成员判断：
+        # 损坏/手工编辑的记录可能写成 list/dict，会抛
+        # TypeError 并让整个 resume 失败。只有字符串才可能匹配
+        # 终态标签；其余值沿用「非终态说明，保留」的历史口径。
+        if not isinstance(record_step, str):
+            return False
         return record_step in _RESUME_TERMINAL_STEP_LABELS
 
     kept_lines: List[str] = []

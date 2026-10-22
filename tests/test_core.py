@@ -4563,6 +4563,29 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             ]
         self.assertEqual(steps, [10])
 
+    def test_resume_truncation_tolerates_unhashable_step(self):
+        # 手工编辑/损坏的 metrics 可能把 step 写成 list/dict；
+        # resume 裁剪不能因为无法哈希就直接抛 TypeError。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                json.dumps({"step": 10, "val_loss": 1.0})
+                + "\n"
+                + json.dumps({"step": [], "val_loss": 9.9})
+                + "\n"
+                + json.dumps({"step": {"bad": True}, "val_loss": 9.8})
+                + "\n"
+                + json.dumps({"step": "final", "val_loss": 9.7})
+                + "\n",
+                encoding="utf-8",
+            )
+            experiment._truncate_metrics_after_step(path, 10)
+            steps = [
+                record.get("step")
+                for record in experiment.read_metrics_records(path)
+            ]
+        self.assertEqual(steps, [10, [], {"bad": True}])
+
     def test_resume_cleaning_justification_tolerates_bad_args(self):
         args = argparse.Namespace(domain_justification=None)
         self.assertFalse(
