@@ -20609,8 +20609,26 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
     weighted、PR-AUC 等）见各运行 metrics.jsonl。
 
     """
+    # 运行名与模式名不能截断：local_base 与 local_base_k2 在
+    # 20/9 字符的固定列宽下会显示成同一前缀，读者无法区分
+    # 不同实验臂。列宽按实际内容扩展。
+    run_width = max(
+        20,
+        max(
+            (len(str(row.get("run"))) for row in rows),
+            default=3,
+        ),
+    )
+    mode_width = max(
+        9,
+        max(
+            (len(str(row.get("mode"))) for row in rows),
+            default=4,
+        ),
+    )
     header = (
-        f"{'run':<20} {'mode':<9} {'params':>9} "
+        f"{'run':<{run_width}} {'mode':<{mode_width}} "
+        f"{'params':>9} "
         f"{'val_loss':>9} {'macroNLL':>9} {'val_bpb':>8} "
         f"{'acc':>6} "
         f"{'macroF1':>8} "
@@ -20633,8 +20651,8 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             else "-"
         )
         print(
-            f"{str(row.get('run'))[:19]:<20} "
-            f"{str(row.get('mode'))[:8]:<9} "
+            f"{str(row.get('run')):<{run_width}} "
+            f"{str(row.get('mode')):<{mode_width}} "
             f"{str(row.get('n_params')):>9} "
             f"{_value(row.get('val_loss')):>9} "
             f"{_value(row.get('val_macro_nll')):>9} "
@@ -20662,8 +20680,18 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
             "测试集不参与；聚合与显著性检验见 --compare "
             "的对比分析）"
         )
+        routing_run_width = max(
+            20,
+            max(
+                (
+                    len(str(row.get("run")))
+                    for row in routing_rows
+                ),
+                default=3,
+            ),
+        )
         routing_header = (
-            f"{'run':<20} {'jac(branch)':>11} "
+            f"{'run':<{routing_run_width}} {'jac(branch)':>11} "
             f"{'slotReuse':>9} {'selfReuse':>9} "
             f"{'r1LoadH':>8} {'r2LoadH':>8} {'dead':>5} "
             f"{'routerH':>8} {'cosine':>8}"
@@ -20678,7 +20706,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
 
         for row in routing_rows:
             print(
-                f"{str(row.get('run'))[:19]:<20} "
+                f"{str(row.get('run')):<{routing_run_width}} "
                 f"{_rv(row.get('routing_jaccard_branch')):>11} "
                 f"{_rv(row.get('routing_slot_reuse_branch')):>9} "
                 f"{_rv(row.get('routing_branch_self_reuse')):>9} "
@@ -35422,8 +35450,18 @@ def print_comparison_analysis(
             "[curve] 跨运行训练曲线诊断（读取各运行 metrics.jsonl "
             "的 curve_analysis；不是最终单点）"
         )
+        curve_run_width = max(
+            20,
+            max(
+                (
+                    len(str(entry.get("run")))
+                    for entry in curve_diagnostics["runs"]
+                ),
+                default=3,
+            ),
+        )
         curve_header = (
-            f"{'run':<20} {'status':<14} {'best@':>7} "
+            f"{'run':<{curve_run_width}} {'status':<14} {'best@':>7} "
             f"{'regr%':>7} {'gap%':>7} {'recentVal%':>10} "
             f"{'gradSpike':>9} {'lr/peak':>8}"
         )
@@ -35437,7 +35475,7 @@ def print_comparison_analysis(
 
         for entry in curve_diagnostics["runs"]:
             print(
-                f"{entry['run'][:19]:<20} "
+                f"{str(entry['run']):<{curve_run_width}} "
                 f"{str(entry.get('status'))[:13]:<14} "
                 f"{str(entry.get('best_val_step') or '-'):>7} "
                 f"{_curve_value(entry.get('val_regression_from_best')):>7} "
@@ -35468,8 +35506,18 @@ def print_comparison_analysis(
             "label_noise_suspect": "labelNoise",
             "uncertain": "uncert",
         }
+        bad_run_width = max(
+            20,
+            max(
+                (
+                    len(str(entry.get("run")))
+                    for entry in bad_case_comparison["runs"]
+                ),
+                default=3,
+            ),
+        )
         bad_header = (
-            f"{'run':<20} {'acc':>7} {'wrong':>8} "
+            f"{'run':<{bad_run_width}} {'acc':>7} {'wrong':>8} "
             + " ".join(
                 f"{short_names.get(name, name[:9]):>10}"
                 for name in category_names
@@ -35486,7 +35534,7 @@ def print_comparison_analysis(
         for entry in bad_case_comparison["runs"]:
             shares = entry["error_category_shares"]
             print(
-                f"{entry['run'][:19]:<20} "
+                f"{str(entry['run']):<{bad_run_width}} "
                 f"{_bad_value(entry.get('token_accuracy')):>7} "
                 f"{str(entry.get('wrong_tokens')):>8} "
                 + " ".join(
