@@ -27555,6 +27555,10 @@ def _attrition_bounds(
     也不替代主检验：它回答「在最强/最弱的缺失结果下，效应
     方向是否可能反转」，不回答「缺失的概率是多少」。
     """
+    # observed_effect 可能来自手工/旧报告中的超范围数值；统一
+    # 转成有限 float（不可用则为 None），否则下面的差值与 JSON
+    # 落盘会把 inf 带出去。
+    observed_effect_value = _finite_float(observed_effect)
     report: Dict[str, object] = {
         "schema": _ATTRITION_BOUND_SCHEMA,
         "applicable": False,
@@ -27567,7 +27571,7 @@ def _attrition_bounds(
             "无穷宽"
         ),
         "complete_cases": False,
-        "observed_effect": observed_effect,
+        "observed_effect": observed_effect_value,
         "effect_min": None,
         "effect_max": None,
         "observed_effect_within_bounds": None,
@@ -27725,59 +27729,57 @@ def _attrition_bounds(
         effect_min, effect_max = effect_max, effect_min
     report["effect_min"] = effect_min
     report["effect_max"] = effect_max
-    report["max_abs_shift_from_observed"] = (
+    shift = (
         max(
-            abs(effect_min - observed_effect),
-            abs(effect_max - observed_effect),
+            abs(effect_min - observed_effect_value),
+            abs(effect_max - observed_effect_value),
         )
-        if observed_effect is not None
+        if observed_effect_value is not None
         else None
+    )
+    report["max_abs_shift_from_observed"] = (
+        shift if shift is not None and math.isfinite(shift) else None
     )
     tolerance = 1e-12
     report["observed_effect_within_bounds"] = bool(
-        observed_effect is not None
+        observed_effect_value is not None
         and effect_min - tolerance
-        <= observed_effect
+        <= observed_effect_value
         <= effect_max + tolerance
     )
     report["zero_within_bounds"] = bool(
         effect_min - tolerance <= 0.0 <= effect_max + tolerance
     )
 
+    def _bound_sign(value: Optional[float]) -> int:
+        if value is not None and value > tolerance:
+            return 1
+        if value is not None and value < -tolerance:
+            return -1
+        return 0
+
+    observed_sign = _bound_sign(observed_effect_value)
+    low_sign = _bound_sign(effect_min)
+    high_sign = _bound_sign(effect_max)
+    sign_robust = bool(
+        observed_sign != 0
+        and low_sign == observed_sign
+        and high_sign == observed_sign
+    )
+
     if total_missing == 0:
         report["verdict"] = "complete_cases"
-        report["sign_robust"] = True
+        # 即使没有缺失，完整案例的聚合均值口径也可能与配对
+        # 效应不同（种子不完全对齐）。方向稳健性仍须同时核对
+        # 观测效应与界的符号；观测效应为 0 时方向无定义。
+        report["sign_robust"] = sign_robust
         report["note"] = (
             "没有缺失/失败运行：完整案例即全部计划运行，"
             "无需做缺失敏感性外推"
         )
         return report
 
-    observed_sign = 0
-    if observed_effect is not None:
-        if observed_effect > tolerance:
-            observed_sign = 1
-        elif observed_effect < -tolerance:
-            observed_sign = -1
-    low_sign = (
-        1
-        if effect_min > tolerance
-        else -1
-        if effect_min < -tolerance
-        else 0
-    )
-    high_sign = (
-        1
-        if effect_max > tolerance
-        else -1
-        if effect_max < -tolerance
-        else 0
-    )
-    report["sign_robust"] = bool(
-        observed_sign != 0
-        and low_sign == observed_sign
-        and high_sign == observed_sign
-    )
+    report["sign_robust"] = sign_robust
     if report["zero_within_bounds"]:
         report["verdict"] = "crosses_zero"
         report["reason"] = (

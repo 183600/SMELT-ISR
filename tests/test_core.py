@@ -6553,6 +6553,39 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(contrast["n_variant"], 0)
         json.dumps(contrast, allow_nan=False)
 
+    def test_attrition_bounds_omit_overflowing_shift_and_sign(self):
+        cell = {
+            "label": "a",
+            "n_runs": 1,
+            "samples": {"val_loss": [{"value": 1.0e308}]},
+            "numerical_failures": [],
+        }
+        bounds = experiment._attrition_bounds(
+            {"a": cell},
+            {"a": 1.0},
+            "val_loss",
+            -1.0e308,
+        )
+        self.assertEqual(bounds["verdict"], "complete_cases")
+        self.assertIsNone(bounds["max_abs_shift_from_observed"])
+        # 观测效应与界方向相反时不能声称方向稳健；修复前
+        # complete_cases 分支无条件写 True。
+        self.assertFalse(bounds["sign_robust"])
+        json.dumps(bounds, allow_nan=False)
+
+        zero = experiment._attrition_bounds(
+            {
+                "a": dict(
+                    cell,
+                    samples={"val_loss": [{"value": 0.0}]},
+                )
+            },
+            {"a": 1.0},
+            "val_loss",
+            0.0,
+        )
+        self.assertFalse(zero["sign_robust"])
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
