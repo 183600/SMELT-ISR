@@ -31001,7 +31001,10 @@ def preregistration_apply(
     # 将要实际展开的模式集合核对，而不是只看 --mode 默认值：
     # 否则 `--suite-modes A`（默认 mode=B 不在该 study）会被
     # 误拒。
-    if not getattr(args, "statistical_baseline", False):
+    if (
+        not getattr(args, "statistical_baseline", False)
+        and getattr(args, "resume", None) is None
+    ):
         declared_modes = {
             str(arm)
             for pair in payload["comparisons"]  # type: ignore[union-attr]
@@ -31031,6 +31034,9 @@ def preregistration_apply(
                 + " 不在预注册 comparisons 声明的模式中："
                 "该运行不是预注册研究的一部分"
             )
+    # resume 的实际模式来自检查点，入口看到的只是 --mode 的
+    # argparse 默认值（B）；必须等恢复后再核对，否则原运行是
+    # base/smelt 的合法续跑会被默认 B 误拒。
 
     preregistered_seeds = [
         int(seed)
@@ -31108,6 +31114,42 @@ def _preregistration_restored_seed_error(
             f"续跑从检查点恢复的 seed={restored_seed} 不在"
             f"预注册 seeds={normalized} 中：确证运行只能使用"
             "预注册种子之一"
+        )
+    return None
+
+
+def _preregistration_restored_mode_error(
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """
+    续跑恢复真实 mode 后，再核对它是否属于预注册 comparison 臂。
+
+    入口阶段 --mode 只是 argparse 默认值 B；拿它核对会把
+    base/smelt 的合法续跑误判成预注册外的新实验。
+    """
+    if getattr(args, "resume", None) is None:
+        return None
+    if getattr(args, "seeds", None) is not None:
+        return None
+    record = getattr(args, "preregistration_record", None)
+    if not isinstance(record, dict):
+        return None
+    comparisons = record.get("comparisons")
+    if not isinstance(comparisons, list):
+        return None
+    declared_modes: set = set()
+    for pair in comparisons:
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            declared_modes.update(str(arm) for arm in pair)
+    if not declared_modes:
+        return None
+    restored_mode = getattr(args, "mode", None)
+    if str(restored_mode) not in declared_modes:
+        return (
+            f"续跑从检查点恢复的 mode={restored_mode!r} 不在"
+            "预注册 comparisons 声明的模式（"
+            + ", ".join(sorted(declared_modes))
+            + "）中：该续跑不属于预注册研究"
         )
     return None
 
@@ -58177,6 +58219,11 @@ def main():
     )
     if restored_seed_error is not None:
         parser.error(restored_seed_error)
+    restored_mode_error = (
+        _preregistration_restored_mode_error(args)
+    )
+    if restored_mode_error is not None:
+        parser.error(restored_mode_error)
 
     # 选型指标解析：默认 val_loss；预注册主指标且周期验证能算
     # 时跟随主指标（假设按什么判定，checkpoint 就按什么选）。

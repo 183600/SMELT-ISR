@@ -1579,6 +1579,38 @@ class PreregistrationTests(unittest.TestCase):
         )
         self.assertIn("B", error)
 
+    def test_apply_defers_resume_mode_check(self):
+        payload = self._payload()
+        payload["comparisons"] = [["base", "smelt"]]
+        args = self._args(
+            mode="B",
+            resume="checkpoint.pt",
+        )
+        previous = sys.argv
+        try:
+            sys.argv = ["experiment.py", "--resume", "checkpoint.pt"]
+            _, error = experiment.preregistration_apply(
+                args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+            )
+        finally:
+            sys.argv = previous
+        self.assertIsNone(error)
+        args.preregistration_record = {
+            "comparisons": [["base", "smelt"]],
+        }
+        args.mode = "base"
+        self.assertIsNone(
+            experiment._preregistration_restored_mode_error(args)
+        )
+        args.mode = "A"
+        self.assertIn(
+            "不在预注册",
+            experiment._preregistration_restored_mode_error(args),
+        )
+
     def test_apply_defers_resume_seed_check(self):
         payload = self._payload()
         args = self._args(
