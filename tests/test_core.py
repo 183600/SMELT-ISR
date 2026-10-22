@@ -4822,6 +4822,43 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._stable_factor_key({"a": 1, 2: 3}),
         )
 
+    def test_resume_checks_tolerate_corrupt_fingerprint_records(self):
+        # 非字符串数据指纹不能被当成「未记录」而静默放行续跑。
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_data_change_error(123, "abc"),
+        )
+        self.assertIsNone(
+            experiment.resume_data_change_error("", "abc")
+        )
+        # split 记录的键可能是损坏的混合类型；排序/拼接不能
+        # 抛 TypeError，损坏的哈希值也不能静默放行。
+        mixed = experiment.resume_split_change_error(
+            {1: "a", "val": "b"}, {}
+        )
+        self.assertIn("1", mixed)
+        self.assertIn("val", mixed)
+        corrupt = experiment.resume_split_change_error(
+            {"train": 1}, {"train": "a"}
+        )
+        self.assertIn("损坏", corrupt)
+        self.assertIsNone(
+            experiment.resume_split_change_error({}, {})
+        )
+        # 时序隔离记录的混合键同样必须可比较，且键顺序不影响
+        # 判定。
+        self.assertIsNone(
+            experiment.resume_split_isolation_change_error(
+                {1: "a", "b": 2},
+                {"b": 2, 1: "a"},
+            )
+        )
+        self.assertIsNotNone(
+            experiment.resume_split_isolation_change_error(
+                {1: "a"}, {1: "b"}
+            )
+        )
+
     def test_statistics_tolerate_large_finite_floats(self):
         huge = 1.0e308
         self.assertEqual(experiment._mean([huge, huge]), huge)

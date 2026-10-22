@@ -1649,8 +1649,20 @@ def resume_data_change_error(
     任何指标都无法归因。旧检查点没有数据指纹时无法核对，
     返回 None 由调用方保留兼容提示。
     """
-    if not saved_sha256 or not current_sha256:
+    if saved_sha256 is None or saved_sha256 == "":
         return None
+    if current_sha256 is None or current_sha256 == "":
+        return None
+    if not isinstance(saved_sha256, str) or not isinstance(
+        current_sha256, str
+    ):
+        # 非字符串只可能来自损坏的检查点/config；不能因为
+        # 无法切片比较就当成「没有变化」继续续跑。
+        return (
+            "resume 数据指纹记录格式损坏（不是字符串）："
+            "无法核对检查点与当前数据是否同一份，拒绝续跑；"
+            "请修复检查点或换用全新的 --out 目录从头训练。"
+        )
     if saved_sha256 == current_sha256:
         return None
     return (
@@ -1680,27 +1692,44 @@ def resume_split_change_error(
     if not isinstance(current_split_sha256, dict):
         return None
 
-    mismatched = [
-        split
-        for split, saved_hash in saved_split_sha256.items()
+    mismatched = []
+    invalid = []
+    for split, saved_hash in saved_split_sha256.items():
+        if not isinstance(saved_hash, str) or not saved_hash:
+            # 损坏的旧记录不能当作「没有变化」：无法核对时
+            # 续跑会把两套划分混在一起。
+            invalid.append(split)
+            continue
+        # 旧检查点记录过的 split 在当前划分中消失，同样说明
+        # 划分口径已经变化；不能因为缺少可比对象就静默放行。
         if (
-            isinstance(saved_hash, str)
-            and saved_hash
-            and (
-                # 旧检查点记录过的 split 在当前划分中消失，同样
-                # 说明划分口径已经变化；不能因为缺少可比对象
-                # 就静默放行。
-                split not in current_split_sha256
-                or saved_hash != current_split_sha256[split]
-            )
-        )
-    ]
-    if not mismatched:
+            split not in current_split_sha256
+            or saved_hash != current_split_sha256[split]
+        ):
+            mismatched.append(split)
+    if not mismatched and not invalid:
         return None
 
+    details = []
+    if mismatched:
+        details.append(
+            "变化的 split: "
+            + ", ".join(
+                sorted(
+                    (str(split) for split in mismatched)
+                )
+            )
+        )
+    if invalid:
+        details.append(
+            "记录损坏的 split: "
+            + ", ".join(
+                sorted(str(split) for split in invalid)
+            )
+        )
     return (
-        "resume 数据划分内容指纹已变化（split: "
-        + ", ".join(sorted(mismatched))
+        "resume 数据划分内容指纹已变化（"
+        + "；".join(details)
         + "）：整体数据 sha256 虽相同，但 train/val/test 的"
         "实际字节段不同（群组吸附、清洗开关或切分实现变化）。"
         "检查点的参数/优化器状态对应旧划分，续跑会把两套"
@@ -1755,14 +1784,38 @@ def resume_split_isolation_change_error(
     ):
         return None
 
+    def canonical(value):
+        """把记录转成键类型安全的可比较结构。
+
+        旧检查点可能混入 int/str 键；json.dumps(sort_keys=True)
+        会直接抛 TypeError。字典按键的稳定文本排序后转成
+        [键, 值] 列表，既保留键的类型信息，又保证比较确定性。
+        """
+        if isinstance(value, dict):
+            return [
+                [repr(key), canonical(item)]
+                for key, item in sorted(
+                    value.items(),
+                    key=lambda pair: repr(pair[0]),
+                )
+            ]
+        if isinstance(value, (list, tuple)):
+            return [canonical(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            return sorted(
+                (canonical(item) for item in value),
+                key=repr,
+            )
+        return value
+
     saved_key = json.dumps(
-        saved_isolation,
+        canonical(saved_isolation),
         ensure_ascii=False,
         sort_keys=True,
         default=str,
     )
     current_key = json.dumps(
-        current_isolation,
+        canonical(current_isolation),
         ensure_ascii=False,
         sort_keys=True,
         default=str,
