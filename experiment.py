@@ -20579,6 +20579,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "seq_len",
     "d_model",
     "n_heads",
+    # GQA 的 KV 头数决定注意力容量与 KV cache；同一 mode
+    # 下换 KV 头数就是换架构，不能只按 mode 归组后被当成
+    # 同一实验单元聚合。
+    "n_kv_heads",
     "n_layers",
     "n_experts",
     "expert_hidden",
@@ -20597,8 +20601,17 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 在有效宽度/强度层面点名。
     "dense_fnn_hidden",
     "residual_scale",
+    # 循环区域残差缩放口径（paper=1/r vs global）直接改变
+    # 架构语义；它不随 mode 唯一确定，必须作为受控变量。
+    # loop_residual_scale / loop_count 由该口径与 mode 派生，
+    # 不重复列入，避免跨模式对比被派生值误报为违规。
+    "residual_scaling",
     "val_fraction",
     "test_fraction",
+    # 切分口径（contiguous / chronological）决定“前缀”能否
+    # 被解释为时间切分；同样的 split_sha256 也可能来自不同
+    # 声明，必须逐项核对。
+    "split_policy",
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
@@ -20624,6 +20637,12 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
+    # 允许 val/test 内容参与训练集清洗、允许实体跨 split 重叠，
+    # 都是会改变训练数据边界的显式豁免。两个运行一个允许一个
+    # 不允许时，split 指纹即使碰巧相同也不是同一数据口径，
+    # 不能把差异归因到方法本身。
+    "allow_eval_content_for_cleaning",
+    "allow_entity_overlap",
     # 标签噪声豁免会改变 test 是否被封条拒绝；两个运行最终
     # 指标的可信资格不同，同样不能算同一评估口径。
     "allow_corrupt_test_labels",
@@ -20670,6 +20689,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "seq_len",
     "val_fraction",
     "test_fraction",
+    "split_policy",
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
@@ -20679,6 +20699,8 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "drop_train_degenerate_groups",
     "drop_train_degenerate_runs",
     "allow_data_leakage",
+    "allow_eval_content_for_cleaning",
+    "allow_entity_overlap",
     "allow_corrupt_test_labels",
     "allow_eval_duplicates",
     "batch_size",
@@ -20689,6 +20711,17 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "eval_bootstrap",
     "eval_bootstrap_block",
     "data_augmentation",
+)
+
+# 这些键不随 mode 唯一确定，却会改变模型/数据口径：同 mode
+# 的两条运行只要有一项不同，就已经不是同一个实验单元。展示层
+# 用它们把「看似单因子、实际多因子」的违规单独点名。
+SINGLE_FACTOR_DESIGN_KEYS: Tuple[str, ...] = (
+    "n_kv_heads",
+    "residual_scaling",
+    "split_policy",
+    "allow_eval_content_for_cleaning",
+    "allow_entity_overlap",
 )
 
 # 对比运行的「可复现性来源」核对项：代码指纹与数值环境。
@@ -32167,6 +32200,38 @@ def print_comparison_analysis(
 
     controlled = check_controlled_variables(rows, factors)
 
+    # 单因子设计审计：这些键不随 mode 唯一确定，任一不同就
+    # 说明两条运行不是同一实验单元；即使因子列表把它们漏掉，
+    # 也不能让「只改一个因子」的结论继续成立。
+    single_factor_design = {
+        "design_keys": list(SINGLE_FACTOR_DESIGN_KEYS),
+        "violations": [
+            violation["key"]
+            for violation in controlled["violations"]
+            if violation["key"] in SINGLE_FACTOR_DESIGN_KEYS
+        ],
+        "unchecked_keys": [
+            key
+            for key in SINGLE_FACTOR_DESIGN_KEYS
+            if key in controlled.get("unchecked_keys", [])
+        ],
+        "ok": not any(
+            violation["key"] in SINGLE_FACTOR_DESIGN_KEYS
+            for violation in controlled["violations"]
+        ),
+    }
+    single_factor_design["advisory"] = (
+        "模型结构/数据口径在运行间不一致：这些运行不是同一个"
+        "实验单元，不能作为单因子对比；请统一设置重跑，或把"
+        "该键显式声明为实验因子后按多水平单因子分析"
+        if not single_factor_design["ok"]
+        else (
+            "单因子设计所需的模型结构/数据口径键均已核对一致"
+            if not single_factor_design["unchecked_keys"]
+            else "部分单因子设计键在所有运行中未记录，无法核对一致"
+        )
+    )
+
     # 只有实际跨运行变化的因子才定义实验单元；恒定因子
     # （例如所有运行都是 k1=2）不参与分组，cell 标签保持
     # 简洁可读。seed 是重复实验维度，不进分组。
@@ -32382,6 +32447,16 @@ def print_comparison_analysis(
             "请统一这些设置后重跑，或在 --compare-factors 中"
             "显式声明为因子"
         )
+        design_violations = single_factor_design["violations"]
+        if design_violations:
+            print(
+                "  [single-factor] 差异涉及模型结构/数据口径（"
+                + ", ".join(design_violations)
+                + "）：这些运行不是同一个实验单元，不能把"
+                "它们当作「只改一个因子」的对比；请分别重跑"
+                "以保持其余设置一致，或显式声明该键为实验"
+                "因子后按多水平单因子分析"
+            )
 
     if controlled.get("unchecked_keys"):
         print(
@@ -34181,6 +34256,7 @@ def print_comparison_analysis(
         "factors": factors,
         "metric": metric,
         "controlled": controlled,
+        "single_factor_design": single_factor_design,
         "provenance": provenance,
         "numerical_failures": numerical_failures,
         "failure_rates": failure_rates,
@@ -43990,6 +44066,22 @@ def run_self_test():
     # AUC 选型会自动启用，与显式 --periodic-auc 是同一生效口径。
     assert "periodic_auc" in COMPARISON_PROTOCOL_KEYS
     assert "periodic_auc" not in _CROSS_FAMILY_PROTOCOL_KEYS
+    # 同 mode 换 GQA 头数、残差缩放口径或切分声明，仍然是换了
+    # 架构/数据口径；它们必须作为受控变量，否则会被聚合成同一
+    # 个实验单元，单因子对比就名不副实。允许 val/test 内容参与
+    # 清洗或实体跨 split 重叠同样是泄露豁免，必须核对。
+    for controlled_key in SINGLE_FACTOR_DESIGN_KEYS:
+        assert controlled_key in COMPARISON_PROTOCOL_KEYS
+    for cross_family_key in (
+        "split_policy",
+        "allow_eval_content_for_cleaning",
+        "allow_entity_overlap",
+    ):
+        assert cross_family_key in _CROSS_FAMILY_PROTOCOL_KEYS
+    assert "n_kv_heads" not in _CROSS_FAMILY_PROTOCOL_KEYS
+    assert "residual_scaling" not in _CROSS_FAMILY_PROTOCOL_KEYS
+    for factor_key in SINGLE_FACTOR_DESIGN_KEYS:
+        assert factor_key in parse_factor_spec(factor_key)
     assert not _periodic_auc_enabled(False, "val_loss")
     assert _periodic_auc_enabled(True, "val_loss")
     assert _periodic_auc_enabled(False, "val_pr_auc_macro")
@@ -44380,6 +44472,39 @@ def run_self_test():
             violation["key"] == "device_type"
             for violation in device_mismatch_controlled["violations"]
         ), device_mismatch_controlled["violations"]
+
+        # GQA 头数、残差缩放口径、切分声明与数据泄露豁免同样是
+        # 受控变量：只改这些键的运行不能与默认运行聚合成同一个
+        # 实验单元，否则「单因子」对比里实际混入了架构/数据差异。
+        design_mismatch_path = _write_analysis_run(
+            "A_seed42_design_mismatch",
+            "A",
+            42,
+            3e-4,
+            100,
+            0.01,
+            2.85,
+            protocol_overrides={
+                "n_kv_heads": 2,
+                # 旧运行的 fallback 是 global；这里显式写 paper，
+                # 模拟同 mode 的两条运行使用了不同残差缩放口径。
+                "residual_scaling": "paper",
+                "split_policy": "chronological",
+                "allow_eval_content_for_cleaning": True,
+                "allow_entity_overlap": True,
+            },
+        )
+        design_mismatch_controlled = check_controlled_variables(
+            compare_runs(run_paths + [design_mismatch_path]),
+            factors,
+        )
+        for key in SINGLE_FACTOR_DESIGN_KEYS:
+            assert any(
+                violation["key"] == key
+                for violation in design_mismatch_controlled[
+                    "violations"
+                ]
+            ), (key, design_mismatch_controlled["violations"])
 
         aggregates = aggregate_runs(analysis_rows, ["mode"])
         assert len(aggregates) == 2

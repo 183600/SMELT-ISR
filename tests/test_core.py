@@ -3,7 +3,9 @@
 Run with: python -m unittest discover -s tests -v
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import sys
@@ -753,6 +755,146 @@ class ProcessTests(unittest.TestCase):
         report = experiment.check_controlled_variables(rows, [])
         for key in keys:
             self.assertIn(key, report["unchecked_keys"])
+
+    def test_architecture_and_leakage_protocol_keys_are_controlled(self):
+        # 这些键都会改变模型/数据口径，却曾经只写进 config.json
+        # 而未进入受控变量列表：同 mode 的两条运行可以带着不同
+        # 的 residual scaling、GQA 或泄露豁免被聚合成同一个
+        # 实验单元，所谓「单因子」对比就不再是单因子。
+        defaults = {
+            "n_kv_heads": 4,
+            "residual_scaling": "paper",
+            "split_policy": "contiguous",
+            "allow_eval_content_for_cleaning": False,
+            "allow_entity_overlap": False,
+        }
+        self.assertEqual(
+            set(defaults),
+            set(experiment.SINGLE_FACTOR_DESIGN_KEYS),
+        )
+        for key in defaults:
+            self.assertIn(key, experiment.COMPARISON_PROTOCOL_KEYS)
+            # 也必须允许显式声明为实验因子，才能做真正的
+            # 单因子对比。
+            self.assertIn(key, experiment.parse_factor_spec(key))
+
+        changed = {
+            "n_kv_heads": 2,
+            "residual_scaling": "global",
+            "split_policy": "chronological",
+            "allow_eval_content_for_cleaning": True,
+            "allow_entity_overlap": True,
+        }
+        for key, variant in changed.items():
+            rows = []
+            for name, value in (("a", defaults[key]), ("b", variant)):
+                protocol = {"comparison_family": "neural", **defaults}
+                protocol[key] = value
+                rows.append({
+                    "run": name,
+                    "protocol": protocol,
+                    "protocol_recorded_keys": list(defaults),
+                })
+            report = experiment.check_controlled_variables(rows, [])
+            self.assertIn(key, report["checked_keys"])
+            self.assertTrue(
+                any(
+                    violation["key"] == key
+                    for violation in report["violations"]
+                ),
+                report["violations"],
+            )
+            self.assertFalse(report["ok"])
+
+        same_rows = [
+            {
+                "run": name,
+                "protocol": {
+                    "comparison_family": "neural",
+                    **defaults,
+                },
+                "protocol_recorded_keys": list(defaults),
+            }
+            for name in ("a", "b")
+        ]
+        same_report = experiment.check_controlled_variables(
+            same_rows, []
+        )
+        self.assertTrue(same_report["ok"], same_report["violations"])
+
+    def test_multiple_changed_axes_are_not_single_factor(self):
+        def cell(mode, residual_scaling):
+            return {
+                "label": (
+                    f"mode={mode}, residual_scaling="
+                    f"{residual_scaling}"
+                ),
+                "keys": {
+                    "mode": mode,
+                    "residual_scaling": residual_scaling,
+                },
+                "samples": {},
+                "n_runs": 0,
+            }
+
+        aggregates = [
+            cell("A", "paper"),
+            cell("A", "global"),
+            cell("B", "paper"),
+        ]
+        contrasts = experiment.factor_contrasts(
+            aggregates,
+            ["mode", "residual_scaling"],
+            "val_loss",
+        )
+        pairs = {
+            frozenset(contrast["cells"]): contrast
+            for contrast in contrasts
+        }
+        single = pairs[frozenset((
+            cell("A", "paper")["label"],
+            cell("A", "global")["label"],
+        ))]
+        self.assertFalse(single["confounded"])
+        self.assertEqual(
+            single["differing_factors"], ["residual_scaling"]
+        )
+        multi = pairs[frozenset((
+            cell("A", "global")["label"],
+            cell("B", "paper")["label"],
+        ))]
+        self.assertTrue(multi["confounded"])
+        self.assertEqual(
+            set(multi["differing_factors"]),
+            {"mode", "residual_scaling"},
+        )
+
+    def test_single_factor_design_audit_reports_structural_mismatch(self):
+        rows = [
+            {
+                "run": name,
+                "mode": "A",
+                "seed": 42,
+                "val_loss": 3.0,
+                "protocol": {
+                    "comparison_family": "neural",
+                    "n_kv_heads": kv_heads,
+                },
+                "protocol_recorded_keys": ["n_kv_heads"],
+            }
+            for name, kv_heads in (("a", 4), ("b", 2))
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode"],
+                metric="val_loss",
+            )
+        audit = report["single_factor_design"]
+        self.assertFalse(audit["ok"])
+        self.assertIn("n_kv_heads", audit["violations"])
+        self.assertIn("[single-factor]", output.getvalue())
 
     def test_ngram_bootstrap_honours_block_size(self):
         data = torch.tensor(

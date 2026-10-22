@@ -349,7 +349,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `--compare-factors`（默认因子包含 `k1/k2/balance_coef/`
   `dense_fnn_hidden`）里，也会退化为受控变量逐项核对——把
   因子列表收窄到 `mode,seed` 时，某个运行偷偷改大 `k1` 会被
-  立即抓住。旧版本记录的协议缺少后来新增的键时，用
+  立即抓住。同一 `mode` 下的 GQA KV 头数 `n_kv_heads`、循环
+  区域残差缩放口径 `residual_scaling`、切分声明 `split_policy`
+  以及泄露豁免 `allow_eval_content_for_cleaning` /
+  `allow_entity_overlap` 也纳入逐项核对：它们不随 `mode` 唯一确定，
+  一旦不同就必须拆成不同的实验单元或显式声明为因子，不能继续
+  当作同一个「单因子」对比。旧版本记录的协议缺少后来新增的键时，用
   `config/args/data` 中可唯一确定的值回填，避免新旧运行
   混用时把「未记录」误判成「值不同/缺失」。`--compare`
   默认要求这些协议项在声明因子之外逐项一致；不一致会以
