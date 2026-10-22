@@ -22756,6 +22756,22 @@ def ablation_component_verdicts(
                 for item in factorial["incomplete_designs"]
             )
         )
+    confounded_designs = factorial.get("confounded_designs") or []
+    if confounded_designs:
+        blockers.append(
+            "存在混杂的消融设计："
+            + "; ".join(
+                "同一上下文含多个正 balance_coef 取值（"
+                + ", ".join(
+                    format(float(value), "g")
+                    for value in item.get(
+                        "positive_balance_values", []
+                    )
+                )
+                + "）"
+                for item in confounded_designs
+            )
+        )
     if factorial.get("controlled_variables_ok") is False:
         blockers.append("受控变量检查存在违规")
     if factorial.get("unchecked_control_keys"):
@@ -40961,6 +40977,31 @@ def run_self_test():
             "计算量对齐未核对" in blocker
             for blocker in no_compute_verdicts["blockers"]
         )
+
+        # 同一消融上下文折叠多个正 balance_coef 会混入均衡
+        # 强度差异；即使其余效应都支持，也不能宣称各组件
+        # 各自有用。
+        confounded_factorial = json.loads(
+            json.dumps(
+                _json_safe(factorial),
+                ensure_ascii=False,
+            )
+        )
+        confounded_factorial["confounded_designs"] = [{
+            "context": {},
+            "positive_balance_values": [0.01, 0.02],
+        }]
+        confounded_verdicts = ablation_component_verdicts(
+            confounded_factorial,
+            component_coverage,
+        )
+        assert not confounded_verdicts[
+            "all_components_supported"
+        ]
+        assert any(
+            "混杂的消融设计" in blocker
+            for blocker in confounded_verdicts["blockers"]
+        ), confounded_verdicts["blockers"]
 
         # 共同步数敏感性：final 口径显示 A 恒定改善，但周期
         # 曲线在共同步数点的 A 效应均值恰好为 0。选型口径的
