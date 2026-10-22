@@ -6715,6 +6715,39 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertFalse(entry["matched"])
         json.dumps(report, allow_nan=False)
 
+    def test_compare_runs_sanitizes_nonfinite_config_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps({
+                    "scale_guard": {
+                        "tokens_seen": float("inf"),
+                    },
+                    "efficiency": {
+                        "latency_ms_per_forward": float("inf"),
+                    },
+                    "n_params": 10 ** 400,
+                }),
+                encoding="utf-8",
+            )
+            (run_dir / "metrics.jsonl").write_text(
+                json.dumps({
+                    "step": "final",
+                    "val_loss": float("inf"),
+                }),
+                encoding="utf-8",
+            )
+            rows = experiment.compare_runs([str(run_dir)])
+        self.assertIsNone(
+            rows[0]["scale_guard"]["tokens_seen"]
+        )
+        self.assertIsNone(rows[0]["latency_ms_per_forward"])
+        self.assertIsNone(rows[0]["val_loss"])
+        # 超大整数仍保持精确，不能因清洗被截断。
+        self.assertEqual(rows[0]["n_params"], 10 ** 400)
+        json.dumps(rows, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],

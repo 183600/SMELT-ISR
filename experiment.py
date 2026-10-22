@@ -21383,7 +21383,11 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             elif row["selected_model"] == "last":
                 protocol["model_selection"] = "last_step"
 
-        rows.append(row)
+        # config/metrics 来自旧版本或手工编辑的文件，可能含
+        # NaN/Inf（Python json 默认接受这些字面量）。它们进入
+        # 对比报告后会让严格 JSON 落盘失败，也会污染下游聚合；
+        # 统一把非有限浮点转成 None，保留字段与有限大整数精度。
+        rows.append(_json_safe(row))
 
     return rows
 
