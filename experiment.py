@@ -19072,12 +19072,22 @@ def _paired_sign_flip_test(
         min_attainable_p = (
             2.0 / permutations if permutations > 0 else None
         )
+        required_seeds = next(
+            (
+                candidate
+                for candidate in range(n, 65)
+                if 2.0 / (2 ** candidate)
+                <= _SIGNIFICANCE_LEVEL
+            ),
+            None,
+        )
     else:
         min_attainable_p = (
             1.0 / (permutations + 1)
             if permutations > 0
             else None
         )
+        required_seeds = None
 
     return {
         "test": "paired_sign_flip",
@@ -19089,6 +19099,7 @@ def _paired_sign_flip_test(
             min_attainable_p is not None
             and min_attainable_p <= _SIGNIFICANCE_LEVEL
         ),
+        "required_seeds_for_alpha": required_seeds,
         "effect": mean,
     }
 
@@ -20941,6 +20952,15 @@ def _contrast_test(
             result["randomization_can_reach_significance"] = (
                 randomization.get("can_reach_significance")
             )
+            result["randomization_required_seeds"] = (
+                randomization.get("required_seeds_for_alpha")
+            )
+            result["significant_robust_possible"] = bool(
+                randomization.get(
+                    "can_reach_significance", True
+                )
+                is not False
+            )
         return result
 
     values_a = [float(sample["value"]) for sample in samples_a]
@@ -21000,6 +21020,9 @@ def _contrast_test(
             ),
             "randomization_can_reach_significance": (
                 randomization.get("can_reach_significance")
+            ),
+            "randomization_required_seeds": (
+                randomization.get("required_seeds_for_alpha")
             ),
             "cohens_dz": paired_effect.get("cohens_dz"),
             "hedges_gz": paired_effect.get("hedges_gz"),
@@ -21340,6 +21363,15 @@ def _apply_multiple_comparison_correction(
             contrast.get("significant")
             and contrast.get("randomization_significant")
         )
+        # 精确符号翻转的最小可达 p 本身大于 alpha 时，
+        # significant_robust 在数学上不可能为 True；显式标注，
+        # 避免把「设计功效不足」误读成「效应不稳健」。
+        contrast["significant_robust_possible"] = bool(
+            contrast.get(
+                "randomization_can_reach_significance", True
+            )
+            is not False
+        )
 
     # 等价性（TOST）主张同样构成检验家族：对 m 个对比都声称
     # 「差异落在等价界内」，至少一个误判的概率同样随家族规模
@@ -21577,6 +21609,9 @@ def factor_contrasts(
                 "randomization_can_reach_significance": test.get(
                     "randomization_can_reach_significance"
                 ),
+                "randomization_required_seeds": test.get(
+                    "randomization_required_seeds"
+                ),
                 "leave_one_out_effect_min": test.get(
                     "leave_one_out_effect_min"
                 ),
@@ -21764,6 +21799,9 @@ def _paired_linear_effect(
             ),
             "randomization_can_reach_significance": (
                 randomization.get("can_reach_significance")
+            ),
+            "randomization_required_seeds": randomization.get(
+                "required_seeds_for_alpha"
             ),
             "se": result.get("se"),
             "n_pairs": len(effect_values),
@@ -22164,6 +22202,9 @@ def factorial_effects(
                     "randomization_can_reach_significance": result.get(
                         "randomization_can_reach_significance"
                     ),
+                    "randomization_required_seeds": result.get(
+                        "randomization_required_seeds"
+                    ),
                     "leave_one_out_effect_min": result.get(
                         "leave_one_out_effect_min"
                     ),
@@ -22258,6 +22299,12 @@ def factorial_effects(
         item["significant_robust"] = bool(
             item.get("significant")
             and item.get("randomization_significant")
+        )
+        item["significant_robust_possible"] = bool(
+            item.get(
+                "randomization_can_reach_significance", True
+            )
+            is not False
         )
 
     # 等价性主张与显著性同属一个推断家族：多个主效应/交互
@@ -23617,6 +23664,9 @@ def compare_cells_to_baseline(
             ),
             "randomization_can_reach_significance": result.get(
                 "randomization_can_reach_significance"
+            ),
+            "randomization_required_seeds": result.get(
+                "randomization_required_seeds"
             ),
             "leave_one_out_effect_min": result.get(
                 "leave_one_out_effect_min"
@@ -27524,6 +27574,30 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append(
             f"配对种子 {effect.get('n_pairs', 0)} < "
             f"{_MIN_SEEDS_FOR_STATS}"
+        )
+    if (
+        effect.get("randomization_method") == "exact"
+        and effect.get("randomization_can_reach_significance")
+        is False
+    ):
+        minimum = effect.get("randomization_min_attainable_p")
+        required = effect.get("randomization_required_seeds")
+        qualifiers.append(
+            "精确符号翻转最小可达 p="
+            + (
+                f"{float(minimum):.3f}"
+                if isinstance(minimum, (int, float))
+                else "NA"
+            )
+            + " > alpha（n="
+            + str(effect.get("n_pairs", 0))
+            + "）；"
+            + (
+                f"至少需 {required} 个独立种子"
+                if required is not None
+                else "需增加独立种子"
+            )
+            + "，不显著不能解读为无效应"
         )
     if effect.get("controlled_variables_ok") is False:
         qualifiers.append("受控变量检查未通过")
@@ -38000,6 +38074,8 @@ def run_self_test():
         float(sign_flip["min_attainable_p"]) - 0.25
     ) < 1e-12
     assert sign_flip["can_reach_significance"] is False
+    # 2/2^n <= 0.05 的最小 n 是 6：n=5 仍只能到 0.0625。
+    assert sign_flip["required_seeds_for_alpha"] == 6
     # 差值绝对值的符号对称分布：所有符号组合的 |均值| 都不小于
     # 观测值，p=1。
     sign_flip_null = _paired_sign_flip_test([1.0, -1.0, 1.0])
@@ -38059,6 +38135,12 @@ def run_self_test():
         paired_contrast["randomization_can_reach_significance"]
         is False
     )
+    assert paired_contrast[
+        "randomization_required_seeds"
+    ] == 6
+    assert paired_contrast[
+        "significant_robust_possible"
+    ] is False
 
     # 种子集合部分重叠：主检验必须仍是 Welch（不能静默缩小
     # 样本），但共同种子上要给出配对敏感性分析，避免把配对
@@ -40701,6 +40783,14 @@ def run_self_test():
         assert delayed_main["aligned_seeds"]
         assert delayed_main["significant"]
         assert delayed_main["claim"] == "supports_component"
+        assert delayed_main["randomization_required_seeds"] == 6
+        assert (
+            delayed_main["significant_robust_possible"]
+            is False
+        )
+        assert "至少需 6 个独立种子" in (
+            _format_factorial_effect(delayed_main)
+        )
         # 主效应/交互同样做 TOST：等价界相对所比较的对照
         # 均值，p 值接受家族校正。此处 1% 界（≈0.03）远小于
         # 0.10 的效应，不能主张等价。
