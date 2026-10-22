@@ -6446,6 +6446,40 @@ class NumericalScaleTests(unittest.TestCase):
             experiment._factor_sort_rank(float("nan")),
         )
 
+    def test_duplicate_chunk_examples_are_deterministically_sorted(self):
+        first = bytes(index % 251 for index in range(300))
+        second = bytes((index * 7 + 3) % 251 for index in range(300))
+        raw = bytearray(
+            first + b"|" + second + b"|" + first + b"|" + second
+        )
+        boundary = len(first) + 1 + len(second) + 1
+
+        class _FakeDataset:
+            seq_len = 8
+            group_separator = b"|"
+            train_excluded_spans = []
+            _raw = memoryview(raw)
+            _raw_buffer = raw
+            split_bounds = {
+                "train": (0, boundary),
+                "val": (boundary, len(raw)),
+                "test": (len(raw), len(raw)),
+            }
+
+        report = experiment._content_chunk_duplicate_audit(
+            _FakeDataset(), ["train", "val"]
+        )
+        examples = report["cross_split"]["train_val"]["examples"]
+        self.assertGreaterEqual(len(examples), 2)
+        digests = []
+        for start, _right_start, length in examples:
+            digest = hashlib.blake2b(
+                bytes(raw[start:start + length]),
+                digest_size=16,
+            ).digest()
+            digests.append(digest)
+        self.assertEqual(digests, sorted(digests))
+
 
 if __name__ == "__main__":
     unittest.main()

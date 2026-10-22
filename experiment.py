@@ -8000,7 +8000,9 @@ def _content_chunk_duplicate_audit(
         shared_bytes = 0
         examples = []
 
-        for digest in common:
+        # bytes 哈希随进程随机化；按摘要排序后再取示例，保证
+        # 同一归档/审计报告在不同 PYTHONHASHSEED 下逐字一致。
+        for digest in sorted(common):
             left_occurrences = left_index[digest]
             right_occurrences = right_index[digest]
             matched = min(
@@ -9041,7 +9043,7 @@ def _group_content_duplicate_audit(
                     left_index[digest][0],
                     right_index[digest][0],
                 ]
-                for digest in list(common)[:3]
+                for digest in sorted(common)[:3]
             ],
         }
 
@@ -9704,7 +9706,7 @@ def audit_data_splits(
             "shared_signatures": len(common),
             "examples": [
                 [left_sigs[digest][0], right_sigs[digest][0]]
-                for digest in list(common)[:3]
+                for digest in sorted(common)[:3]
             ],
         }
 
