@@ -35195,33 +35195,25 @@ def imbalance_metric_advisory(
         "advisories": [],
     }
 
+    # JSON 允许 10**400 这类超出 float 范围的整数：按不可用值
+    # 跳过，不能因为单个损坏记录让整份不平衡提示崩溃。
     entries = [
-        (str(row.get("run")), float(row["val_majority_accuracy"]))
+        (str(row.get("run")), value)
         for row in rows
-        if isinstance(
-            row.get("val_majority_accuracy"), (int, float)
-        )
-        and not isinstance(
-            row.get("val_majority_accuracy"), bool
-        )
-        and math.isfinite(
-            float(row["val_majority_accuracy"])
-        )
+        for value in [_finite_float(
+            row.get("val_majority_accuracy")
+        )]
+        if value is not None
     ]
 
     # PR-AUC 随机水平：只统计记录了该字段的运行。
     chances = [
-        float(row["val_pr_auc_macro_chance"])
+        value
         for row in rows
-        if isinstance(
-            row.get("val_pr_auc_macro_chance"), (int, float)
-        )
-        and not isinstance(
-            row.get("val_pr_auc_macro_chance"), bool
-        )
-        and math.isfinite(
-            float(row["val_pr_auc_macro_chance"])
-        )
+        for value in [_finite_float(
+            row.get("val_pr_auc_macro_chance")
+        )]
+        if value is not None
     ]
     chance_mean = _mean(chances)
     report["pr_auc_chance_mean"] = chance_mean

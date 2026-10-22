@@ -5407,6 +5407,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_imbalance_advisory_tolerates_out_of_range_rates(self):
+        huge = 10 ** 400
+        report = experiment.imbalance_metric_advisory(
+            [
+                {
+                    "run": "huge_majority",
+                    "val_majority_accuracy": huge,
+                },
+                {
+                    "run": "huge_chance",
+                    "val_pr_auc_macro_chance": huge,
+                },
+            ],
+            "val_loss",
+        )
+        self.assertIsNone(report["max_majority_accuracy"])
+        self.assertIsNone(report["most_imbalanced_run"])
+        self.assertIsNone(report["pr_auc_chance_mean"])
+
     def test_baseline_adequacy_tolerates_out_of_range_costs(self):
         huge = 10 ** 400
         rows = [
