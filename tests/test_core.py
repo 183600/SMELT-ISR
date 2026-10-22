@@ -5004,6 +5004,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         ]
         self.assertLess(raw["raw_seed"], 0.0)
         self.assertTrue(raw["truncated_at_zero"])
+        # 计时摘要换算单位后不能把 inf 写进报告。
+        timing = experiment._timing_summary([huge, huge])
+        self.assertIsNone(timing["mean"])
+        self.assertEqual(timing["std"], 0.0)
 
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [

@@ -18684,24 +18684,24 @@ def _timing_summary(
     if std is None:
         std = 0.0
 
+    def scaled(value: Optional[float]) -> Optional[float]:
+        """换算单位并取整；结果超出 float 范围时返回 None。"""
+        if value is None:
+            return None
+        result = value * unit_scale
+        if not math.isfinite(result):
+            return None
+        return round(result, 6)
+
     return {
         "n": count,
-        "mean": round(mean * unit_scale, 6),
-        "median": round(
-            float(_percentile(ordered, 0.5)) * unit_scale,
-            6,
-        ),
-        "p95": round(
-            float(_percentile(ordered, 0.95)) * unit_scale,
-            6,
-        ),
-        "p99": round(
-            float(_percentile(ordered, 0.99)) * unit_scale,
-            6,
-        ),
-        "min": round(ordered[0] * unit_scale, 6),
-        "max": round(ordered[-1] * unit_scale, 6),
-        "std": round(std * unit_scale, 6),
+        "mean": scaled(mean),
+        "median": scaled(_percentile(ordered, 0.5)),
+        "p95": scaled(_percentile(ordered, 0.95)),
+        "p99": scaled(_percentile(ordered, 0.99)),
+        "min": scaled(ordered[0]),
+        "max": scaled(ordered[-1]),
+        "std": scaled(std),
         "coefficient_of_variation": (
             round(std / mean, 6) if mean > 0.0 else None
         ),
