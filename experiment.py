@@ -40314,9 +40314,20 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
     kept_lines: List[str] = []
     dropped = 0
     changed = False
-    with open(path, encoding="utf-8") as handle:
-        lines = handle.readlines()
+    with open(path, "rb") as handle:
+        raw_lines = handle.readlines()
+    lines: List[Optional[str]] = []
+    for raw_line in raw_lines:
+        try:
+            lines.append(raw_line.decode("utf-8"))
+        except UnicodeDecodeError:
+            # 损坏行不能留在恢复后的文件里，也不能让整个
+            # resume 因一条坏记录失败。
+            lines.append(None)
     for index, line in enumerate(lines):
+        if line is None:
+            changed = True
+            continue
         last_line = index == len(lines) - 1
         # 文件末尾没有换行的最后一行：若解析失败（崩溃时写了
         # 半条 JSON），必须丢弃；若解析成功，保留但补换行。
@@ -40572,8 +40583,16 @@ def read_test_access_ledger(path: Path) -> List[Dict[str, object]]:
     if not path.exists():
         return []
     entries: List[Dict[str, object]] = []
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
+    # 账本可能由崩溃中的追加写入留下半行/非法 UTF-8；损坏的
+    # 行应跳过，不能让最终对比因一条坏记录整份读不出来。
+    with open(path, "rb") as handle:
+        for raw_line in handle:
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+            if not line:
+                continue
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
