@@ -28522,6 +28522,11 @@ def factor_contrasts(
                 if mean_a is not None and mean_b is not None
                 else None
             )
+            # 两端均值都有限但符号相反且接近 float 上限时，差值
+            # 本身会溢出成 ±inf。效应量必须是有限数，否则会被
+            # 原样写进 JSON 报告；按缺失处理并保留两端均值。
+            if delta is not None and not math.isfinite(delta):
+                delta = None
 
             pooled_std = None
             if std_a is not None and std_b is not None:
@@ -31159,6 +31164,10 @@ def compare_cells_to_baseline(
             and mean_variant is not None
             else None
         )
+        # 与 factor_contrasts 同口径：有限均值之差仍可能溢出，
+        # 不能把 ±inf 当作效应量落盘。
+        if delta is not None and not math.isfinite(delta):
+            delta = None
         p_value = _finite_float(result.get("p_value"))
         significant = (
             p_value is not None

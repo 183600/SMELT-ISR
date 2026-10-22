@@ -6586,6 +6586,34 @@ class NumericalScaleTests(unittest.TestCase):
         )
         self.assertFalse(zero["sign_robust"])
 
+    def test_contrast_delta_overflow_is_treated_as_missing(self):
+        def cell(mode, mean):
+            return {
+                "label": mode,
+                "keys": {"mode": mode},
+                "samples": {"val_loss": []},
+                "val_loss_mean": mean,
+                "val_loss_std": 1.0,
+                "n_runs": 0,
+                "effective_seed_count": 0,
+                "costs": {},
+            }
+
+        cells = [cell("A", 1.0e308), cell("B", -1.0e308)]
+        contrast = experiment.factor_contrasts(
+            cells, ["mode"], "val_loss"
+        )[0]
+        self.assertIsNone(contrast["delta"])
+        self.assertEqual(contrast["verdict"], "missing_metric")
+        json.dumps(contrast, allow_nan=False)
+
+        contrast = experiment.compare_cells_to_baseline(
+            cells, "A", "val_loss"
+        )[0]
+        self.assertIsNone(contrast["delta"])
+        self.assertEqual(contrast["verdict"], "missing_metric")
+        json.dumps(contrast, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
