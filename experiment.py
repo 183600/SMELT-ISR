@@ -58693,7 +58693,9 @@ def _counterbalanced_order(
         keyed_blocks[block_key] = {
             key: item for key, item in zip(keys, entries)
         }
-    if reference is None:
+    if not reference:
+        # 空区组（损坏/手工计划）没有可排列的处理单元：返回空
+        # 顺序，而不是在 len(base) 取模时抛 ZeroDivisionError。
         return []
 
     base = list(reference)

@@ -5473,6 +5473,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_counterbalanced_empty_blocks_do_not_divide_by_zero(self):
+        self.assertEqual(
+            experiment._counterbalanced_order({1: []}, 0), []
+        )
+        self.assertEqual(
+            experiment._counterbalanced_order({1: [], 2: []}, 0),
+            [],
+        )
+
     def test_sparkline_handles_out_of_range_and_nonfinite_values(self):
         huge = 10 ** 400
         self.assertEqual(experiment._sparkline([huge]), "")
