@@ -26685,13 +26685,16 @@ def _attach_power_equivalence(
                 and denominator > 0.0
                 and math.isfinite(noise_half_width)
             ):
-                # 合法但极大的 se 会让 ratio 或 ratio² 溢出成
-                # inf；此时无法给出有限的所需种子数，显式省略
-                # 该字段，而不是让 int(math.ceil(inf)) 抛
-                # OverflowError 中断整份对比报告。
+                # 合法但极大的 se 会让 ratio² 溢出；此时无法给
+                # 出有限的所需种子数，显式省略该字段，而不是让
+                # int(math.ceil(inf)) 抛 OverflowError 中断整份
+                # 对比报告。正常量级保留原公式以维持历史数值。
                 ratio = noise_half_width / denominator
-                required = current_n * ratio * ratio
-                if math.isfinite(required):
+                try:
+                    required = current_n * ratio ** 2
+                except OverflowError:
+                    required = None
+                if required is not None and math.isfinite(required):
                     contrast["equivalence_seeds_to_achieve"] = int(
                         math.ceil(required)
                     )
