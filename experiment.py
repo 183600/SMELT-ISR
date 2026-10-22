@@ -28467,6 +28467,23 @@ def balance_strength_report(
     return report
 
 
+def factorial_balance_strength(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    eligible = []
+    for row in rows:
+        protocol = row.get("protocol")
+        if not isinstance(protocol, dict):
+            continue
+        if str(protocol.get("mode") or "") not in {
+            "local_base",
+            *_DELAYED_MERGE_MODES,
+        }:
+            continue
+        eligible.append(row)
+    return balance_strength_report(eligible)
+
+
 def _format_factorial_effect(effect: Dict[str, object]) -> str:
     """把一条因子效应格式化为控制台行（主分析/等计算量分析共用）。"""
     p_holm = effect.get("p_value_holm")
@@ -28987,9 +29004,10 @@ def print_comparison_analysis(
         allow_partial=allow_partial_ablation,
     )
     balance_scale = balance_strength_report(rows)
+    factorial_balance_scale = factorial_balance_strength(rows)
     coverage["balance_confounds"] = (
-        list(balance_scale.get("advisories") or [])
-        if balance_scale.get("confounded")
+        list(factorial_balance_scale.get("advisories") or [])
+        if factorial_balance_scale.get("confounded")
         else []
     )
     randomness = same_seed_randomness_check(rows)
@@ -43041,6 +43059,26 @@ def run_self_test():
         )
         assert not new_balance_report["confounded"]
         assert not new_balance_report["width_varied"]
+
+        balance_smelt_path = _write_analysis_run(
+            "balance_scale_smelt",
+            "smelt",
+            1,
+            0.001,
+            10,
+            0.01,
+            val_loss=2.2,
+            protocol_overrides={"top_k": 4},
+        )
+        factorial_balance = factorial_balance_strength(
+            compare_runs([
+                balance_a_path,
+                balance_new_base_path,
+                balance_smelt_path,
+            ])
+        )
+        assert not factorial_balance["confounded"]
+        assert not factorial_balance["width_varied"]
 
         wide_balance_a_path = _write_analysis_run(
             "balance_scale_wide_a",
