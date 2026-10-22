@@ -114,6 +114,14 @@ class Config:
     # 旧运行 / global 口径在 comparison_protocol 中可区分。
     residual_scaling: str = "paper"
 
+    # 论文 3.1 节：训练序列打包进 4096-token 的 packed context，
+    # 并用文档级 segment attention mask 限制注意力只在同一篇
+    # 文档内（跨文档的 key 被屏蔽）。document_separator 是文档
+    # 边界字节串（通常与 --group-separator 相同），以字节列表
+    # 形式存档，保证 config.json 可 JSON 序列化。
+    document_masks: bool = False
+    document_separator: Optional[List[int]] = None
+
     # 初始化方案。module_order 是历史行为：按模块构造顺序消耗
     # 全局 RNG，不同 mode 的模块数量/构造顺序不同，同一种子下
     # 共享层会得到不同初始权重。name_hash 按参数名与运行种子
@@ -193,10 +201,17 @@ class Config:
             raise ValueError("d_model 必须能被正的 n_heads 整除")
         if self.effective_n_kv_heads <= 0:
             raise ValueError("n_kv_heads 必须为正整数")
-        if self.n_heads % self.effective_n_kv_heads != 0:
+        if self.effective_n_kv_heads > self.n_heads:
             raise ValueError(
-                "n_heads 必须能被 n_kv_heads 整除（GQA 分组）"
+                "n_kv_heads 必须小于等于 n_heads"
             )
+        # GQA 不要求 n_heads 能被 n_kv_heads 整除：整除时按
+        # n_heads // n_kv_heads 个连续 Q 头共享一个 KV 头
+        # （repeat_interleave，与历史行为逐位一致）；不整除时
+        # 按 Q 头 i 使用 KV 头 floor(i * n_kv / n_heads) 做
+        # 均匀映射（见 CausalSelfAttention.core）。论文没有披露
+        # head 几何，预算匹配需要在任意 GQA 比例下精确控制
+        # KV cache，因此这里不能强制整除。
         if self.n_layers < 4:
             raise ValueError("n_layers 必须大于等于 4")
         # 中间区域由 middle_start=n//4、middle_end=3n//4 定义，
@@ -216,6 +231,25 @@ class Config:
             raise ValueError(
                 "residual_scaling 必须是 "
                 + " / ".join(sorted(self.RESIDUAL_SCALINGS))
+            )
+        if self.document_masks:
+            if not self.document_separator:
+                raise ValueError(
+                    "document_masks 需要非空的 document_separator"
+                    "（文档边界字节串），否则无法构造 segment mask"
+                )
+            if any(
+                not isinstance(byte, int)
+                or not 0 <= byte <= 255
+                for byte in self.document_separator
+            ):
+                raise ValueError(
+                    "document_separator 必须是 0..255 的字节列表"
+                )
+        elif self.document_separator:
+            raise ValueError(
+                "提供了 document_separator 但未启用 document_masks；"
+                "请同时设置 document_masks=True 或清空分隔符"
             )
         if self.mode == "dense":
             hidden = self.effective_dense_fnn_hidden
@@ -556,45 +590,925 @@ def budget_match_report(
     return report
 
 
-def paper_fidelity_report(cfg: Config) -> Dict[str, object]:
-    """
-    对照 arXiv:2609.01343v1 的关键配置，列出复现状态。
+# ============================================================
+# 论文复现口径：arXiv:2609.01343v1
+# ============================================================
 
-    论文的关键配置：middle 50% 循环两次；循环区域内每个子层
-    残差按 1/r 缩放；每层 top-8 路由；GQA；FLOPs / 总参数 /
-    KV cache 三者匹配；4096 token 上下文与文档级 attention
-    mask。本基座是可运行的小规模复现，默认的 128 上下文 /
-    8 专家 / top-2 不是论文规模；报告把「已实现」与「偏离」
-    分开记录，避免把 SMELT 风格简化模型说成论文复现。
+PAPER_ID = "arXiv:2609.01343v1"
+PAPER_URL = "https://arxiv.org/html/2609.01343v1"
+
+# 论文 3.1 / 3.2 / 4.1 节明确给出的训练协议量。这里只收录论文明
+# 文写出的数字；学习率、warmup、weight decay、betas、均衡损失系数、
+# 初始化、head 几何、专家中间维与数据语料论文均未披露，单列在
+# PAPER_UNDISCLOSED 中，不伪装成已复现。
+PAPER_PROTOCOL: Dict[str, object] = {
+    "optimizer": "AdamW",
+    "lr_schedule": "wsd",
+    "context_length": 4096,
+    "packing": "document_packed_with_segment_attention_masks",
+    "global_batch_sequences": 256,
+    "tokens_per_step": 256 * 4096,
+    "stable_steps": 196075,
+    "stable_tokens": 196075 * 256 * 4096,
+    "decay_tokens": 10_000_000_000,
+    "decay_steps": math.ceil(10_000_000_000 / (256 * 4096)),
+    "branch_steps": (10000, 20000, 50000, 100000, 150000, 196075),
+    "validation_sources": 39,
+}
+
+PAPER_UNDISCLOSED = (
+    "learning_rate",
+    "warmup_steps",
+    "weight_decay",
+    "adam_betas",
+    "balance_loss_coef",
+    "init_scheme",
+    "attention_head_dim",
+    "n_kv_heads",
+    "expert_intermediate_dim",
+    "pretraining_corpus",
+)
+
+
+@dataclass(frozen=True)
+class PaperCell:
+    """论文附录 A 的一个网格单元（基线或 SMELT）。"""
+
+    arch: str
+    scale: str
+    sparsity: int
+    hidden: int
+    layers: int
+    total_experts: int
+    active_experts: int
+    active_params: float
+    total_params: float
+    measured_sparsity: float
+    flops_ratio: Optional[float] = None
+    kv_ratio: Optional[float] = None
+
+
+# 附录 A：Baseline 表。字段含义见 table：
+# (scale, sparsity label, H, L, total experts, active experts,
+#  active params [B], total params [B], measured S)
+_PAPER_BASE_ROWS = (
+    ("100M", 0, 672, 10, 8, 8, 0.100, 0.10, 0.000),
+    ("100M", 85, 672, 10, 64, 8, 0.100, 0.71, 0.860),
+    ("100M", 95, 672, 10, 192, 8, 0.101, 2.12, 0.952),
+    ("100M", 97, 672, 10, 336, 8, 0.102, 3.70, 0.972),
+    ("200M", 0, 1280, 12, 8, 8, 0.207, 0.21, 0.000),
+    ("200M", 85, 1280, 12, 64, 8, 0.207, 1.32, 0.843),
+    ("200M", 95, 1280, 12, 192, 8, 0.209, 3.87, 0.946),
+    ("200M", 97, 1280, 12, 336, 8, 0.212, 6.74, 0.969),
+    ("600M", 0, 1792, 20, 8, 8, 0.663, 0.66, 0.000),
+    ("600M", 85, 1792, 20, 64, 8, 0.665, 4.28, 0.845),
+    ("600M", 95, 1792, 20, 192, 8, 0.670, 12.54, 0.947),
+    ("600M", 97, 1792, 20, 336, 8, 0.675, 21.83, 0.969),
+    ("1.6B", 0, 2304, 30, 8, 8, 1.629, 1.63, 0.000),
+    ("1.6B", 85, 2304, 30, 64, 8, 1.632, 10.55, 0.845),
+    ("1.6B", 95, 2304, 30, 192, 8, 1.641, 30.94, 0.947),
+    ("1.6B", 97, 2304, 30, 336, 8, 1.651, 53.89, 0.969),
+)
+
+# 附录 A：SMELT 表，额外给出 F_SMELT/F_Base 与 KV_SMELT/KV_Base
+# 两列（论文报告的匹配后残余比例）。
+# (scale, sparsity label, H, L, total experts, active experts,
+#  active params [B], total params [B], measured S,
+#  F ratio, KV ratio)
+_PAPER_SMELT_ROWS = (
+    ("100M", 0, 576, 10, 16, 8, 0.071, 0.10, 0.000, 1.081, 1.018),
+    ("100M", 85, 576, 10, 96, 8, 0.067, 0.71, 0.868, 1.024, 0.964),
+    ("100M", 95, 576, 10, 288, 8, 0.069, 2.12, 0.955, 1.031, 0.964),
+    ("100M", 97, 576, 10, 504, 8, 0.070, 3.70, 0.974, 1.039, 0.964),
+    ("200M", 0, 1056, 12, 16, 8, 0.142, 0.21, 0.000, 1.039, 1.031),
+    ("200M", 85, 1056, 12, 96, 8, 0.140, 1.32, 0.846, 1.021, 1.031),
+    ("200M", 95, 1056, 12, 288, 8, 0.142, 3.89, 0.947, 1.029, 1.031),
+    ("200M", 97, 1056, 12, 504, 8, 0.145, 6.78, 0.969, 1.037, 1.031),
+    ("600M", 0, 1408, 20, 16, 8, 0.458, 0.67, 0.000, 1.046, 1.031),
+    ("600M", 85, 1408, 20, 96, 8, 0.443, 4.31, 0.851, 1.007, 1.031),
+    ("600M", 95, 1512, 20, 288, 8, 0.453, 12.44, 0.947, 1.024, 0.984),
+    ("600M", 97, 1512, 20, 504, 8, 0.459, 21.70, 0.969, 1.031, 0.984),
+    ("1.6B", 0, 1848, 30, 16, 8, 1.101, 1.64, 0.000, 1.022, 0.984),
+    ("1.6B", 85, 1848, 30, 96, 8, 1.081, 10.45, 0.846, 1.000, 0.984),
+    ("1.6B", 95, 1848, 30, 288, 8, 1.091, 30.90, 0.948, 1.004, 0.984),
+    ("1.6B", 97, 1848, 30, 504, 8, 1.103, 53.90, 0.970, 1.008, 0.984),
+)
+
+PAPER_SCALES = ("100M", "200M", "600M", "1.6B")
+PAPER_SPARSITIES = (0, 85, 95, 97)
+PAPER_ARCHS = ("base", "smelt")
+
+PAPER_CELLS: Dict[Tuple[str, str, int], PaperCell] = {}
+for _row in _PAPER_BASE_ROWS:
+    _cell = PaperCell("base", *_row)
+    PAPER_CELLS[(_cell.arch, _cell.scale, _cell.sparsity)] = _cell
+for _row in _PAPER_SMELT_ROWS:
+    _cell = PaperCell("smelt", *_row)
+    PAPER_CELLS[(_cell.arch, _cell.scale, _cell.sparsity)] = _cell
+del _row, _cell
+
+
+def _divisors(value: int) -> List[int]:
+    return [d for d in range(1, value + 1) if value % d == 0]
+
+
+def _normalize_scale(scale: str) -> str:
+    text = str(scale).strip()
+    if text.lower().endswith("b") or text.lower().endswith("m"):
+        text = text[:-1] + text[-1].upper()
+    for candidate in PAPER_SCALES:
+        if candidate.lower() == text.lower():
+            return candidate
+    raise ValueError(
+        f"未知的论文规模 {scale!r}；可选："
+        + ", ".join(PAPER_SCALES)
+    )
+
+
+def _normalize_sparsity(sparsity: object) -> int:
+    text = str(sparsity).strip().rstrip("%")
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise ValueError(
+            f"未知的稀疏度 {sparsity!r}；可选：0, 85, 95, 97"
+        ) from error
+    if value not in PAPER_SPARSITIES:
+        raise ValueError(
+            f"未知的稀疏度 {sparsity!r}；可选：0, 85, 95, 97"
+        )
+    return value
+
+
+def parse_paper_cell_label(label: str) -> Tuple[str, int]:
+    """解析 ``200M:95`` / ``200M@95`` / ``200M-95`` / ``200M/95``。"""
+
+    text = str(label).strip()
+    if not text:
+        raise ValueError("--paper-cell 不能为空")
+    parts = re.split(r"[:@/\s-]+", text, maxsplit=1)
+    if len(parts) != 2:
+        # 兼容 "200M95" 这种紧凑写法。
+        match = re.fullmatch(r"([0-9.]+[MmBb])([0-9]{1,2})%?", text)
+        if not match:
+            raise ValueError(
+                f"--paper-cell 格式应为 规模:稀疏度（如 200M:95），"
+                f"收到 {label!r}"
+            )
+        parts = [match.group(1), match.group(2)]
+    return _normalize_scale(parts[0]), _normalize_sparsity(parts[1])
+
+
+def paper_cell(
+    scale: str,
+    sparsity: object,
+    arch: str = "smelt",
+) -> PaperCell:
+    arch_name = str(arch).strip().lower()
+    if arch_name not in PAPER_ARCHS:
+        raise ValueError(
+            f"论文网格只有 {', '.join(PAPER_ARCHS)}，收到 {arch!r}"
+        )
+    key = (
+        arch_name,
+        _normalize_scale(scale),
+        _normalize_sparsity(sparsity),
+    )
+    if key not in PAPER_CELLS:
+        raise ValueError(f"论文附录 A 中没有单元 {key}")
+    return PAPER_CELLS[key]
+
+
+def _analytic_param_counts(cfg: Config) -> Dict[str, int]:
+    """按本实现的结构精确统计非 embedding 参数。
+
+    total  = L * (attn + 2*norm + router + E * expert) + final_norm
+    active = L * (attn + 2*norm + router + top_k * expert) + final_norm
+
+    其中 attn = 2*D^2 + 2*D*kv_dim（q/out 各 D^2，k/v 各 D*kv_dim），
+    expert = 3*D*H_exp（SwiGLU 的 gate_up 为 D×2H、down 为 H×D）。
+    ``_analytic_param_count_roundtrip`` 在自测里与本实现的
+    ``nn.Module`` 参数计数逐位核对。
     """
-    checks = {
-        "loop_middle_half": (
-            cfg.middle_end - cfg.middle_start == cfg.n_layers // 2
-        ),
-        "loop_twice": cfg.loop_count == 2,
-        "loop_residual_scaling_1_over_r": (
-            cfg.residual_scaling == "paper"
-        ),
-        "top_k_8": cfg.top_k == 8,
-        "gqa": cfg.effective_n_kv_heads < cfg.n_heads,
-        "context_4096": cfg.seq_len == 4096,
-    }
-    deviations = [name for name, ok in checks.items() if not ok]
+
+    dim = int(cfg.d_model)
+    head_dim = dim // int(cfg.n_heads)
+    kv_dim = int(cfg.effective_n_kv_heads) * head_dim
+    layers = int(cfg.n_layers)
+    experts = int(cfg.n_experts)
+    top_k = int(cfg.top_k)
+    hidden = int(cfg.expert_hidden)
+    per_layer_fixed = (
+        2 * dim * dim
+        + 2 * dim * kv_dim
+        + 2 * dim
+        + experts * dim
+    )
+    expert_params = 3 * dim * hidden
+    total = layers * (
+        per_layer_fixed + experts * expert_params
+    ) + dim
+    active = layers * (
+        per_layer_fixed + top_k * expert_params
+    ) + dim
     return {
-        "paper": "arXiv:2609.01343v1",
-        "checks": checks,
-        "deviations": deviations,
-        "is_full_reproduction": not deviations,
-        "interpretation": (
-            "没有偏离项才可称为论文配置的复现；存在偏离项时，"
-            "结论只能表述为「SMELT 风格架构」的结果，不能直接"
-            "声称复现或超过论文 SMELT"
+        "total": int(total),
+        "active": int(active),
+        "kv_dim": int(kv_dim),
+        "head_dim": int(head_dim),
+        "expert_params": int(expert_params),
+    }
+
+
+def _paper_base_head_geometry(hidden: int) -> Tuple[int, int, int]:
+    """Baseline 的 head 几何（论文未披露，按可复现规则选定）。
+
+    取 head_dim 最接近 64 的整除组合；KV 头数取 Q 头数的一半
+    （2:1 GQA）。论文只要求 GQA 与 KV cache 匹配，没有给出
+    head 维度；该选择写入 ``derived`` 字段并在审计中标注来源。
+    """
+
+    best: Optional[Tuple[int, int, int]] = None
+    for n_heads in _divisors(int(hidden)):
+        if n_heads < 2:
+            continue
+        head_dim = int(hidden) // n_heads
+        if not 32 <= head_dim <= 128:
+            continue
+        score = (abs(head_dim - 64), -head_dim, n_heads)
+        if best is None or score < best[0]:
+            best = (score, n_heads, head_dim)
+    if best is None:
+        raise ValueError(
+            f"H={hidden} 找不到 32≤head_dim≤128 的整除 head 几何"
+        )
+    n_heads = best[1]
+    head_dim = best[2]
+    n_kv_heads = max(1, n_heads // 2)
+    return n_heads, n_kv_heads, n_kv_heads * head_dim
+
+
+def _paper_smelt_head_geometry(
+    hidden: int,
+    target_kv_dim: int,
+) -> Tuple[int, int, int]:
+    """SMELT 的 head 几何：以论文报告的 KV 比例为第一目标。
+
+    在 H 的整除 head 划分与 1..n_heads 的 KV 头数中搜索，优先
+    最小化 ``|kv_dim / target - 1|``，其次让 head_dim 接近 64。
+    不强制 n_heads 整除 n_kv_heads：论文没有披露 head 几何，
+    预算匹配需要任意 GQA 比例（见 CausalSelfAttention.core 的
+    均匀映射）。
+    """
+
+    best: Optional[Tuple[Tuple[float, int, int], int, int, int]] = None
+    for n_heads in _divisors(int(hidden)):
+        if n_heads < 2:
+            continue
+        head_dim = int(hidden) // n_heads
+        if not 32 <= head_dim <= 128:
+            continue
+        for n_kv_heads in range(1, n_heads + 1):
+            kv_dim = n_kv_heads * head_dim
+            error = abs(kv_dim / float(target_kv_dim) - 1.0)
+            score = (round(error, 6), abs(head_dim - 64), n_heads)
+            if best is None or score < best[0]:
+                best = (score, n_heads, n_kv_heads, kv_dim)
+    if best is None:
+        raise ValueError(
+            f"H={hidden} 找不到可用的 GQA head 几何"
+        )
+    return best[1], best[2], best[3]
+
+
+def _paper_expert_hidden(
+    hidden: int,
+    layers: int,
+    experts: int,
+    total_params: float,
+    kv_dim: int,
+    active_experts: int = 8,
+) -> int:
+    """由论文的总参数目标反解专家中间维（按 8 对齐）。
+
+    论文未披露专家中间维；预算匹配把它作为自由量，这里按
+    「总非 embedding 参数与论文一致」求解，取 8 的倍数。
+    """
+
+    dim = int(hidden)
+    per_layer_fixed = (
+        2 * dim * dim
+        + 2 * dim * int(kv_dim)
+        + 2 * dim
+        + int(experts) * dim
+    )
+    budget = float(total_params) * 1e9
+    raw = (
+        budget - dim - int(layers) * per_layer_fixed
+    ) / (int(layers) * int(experts) * 3 * dim)
+    if not math.isfinite(raw) or raw < 8.0:
+        return 8
+    return int(round(raw / 8.0)) * 8
+
+
+def _paper_config_kwargs(
+    cell: PaperCell,
+    n_heads: int,
+    n_kv_heads: int,
+    expert_hidden: int,
+) -> Dict[str, object]:
+    return {
+        "seq_len": int(PAPER_PROTOCOL["context_length"]),
+        "d_model": int(cell.hidden),
+        "n_heads": int(n_heads),
+        "n_kv_heads": int(n_kv_heads),
+        "n_layers": int(cell.layers),
+        "n_experts": int(cell.total_experts),
+        "expert_hidden": int(expert_hidden),
+        "top_k": int(cell.active_experts),
+        "k1": int(cell.active_experts),
+        "k2": int(cell.active_experts),
+        "mode": cell.arch,
+        "residual_scaling": "paper",
+    }
+
+
+def paper_preset(
+    scale: str,
+    sparsity: object,
+    arch: str = "smelt",
+) -> Dict[str, object]:
+    """构造论文附录 A 某个单元的可运行配置（含推导量）。
+
+    论文只披露 H、L、专家总数、top-8、循环布局与参数/预算目标；
+    head 几何与专家中间维未披露，本函数按固定规则推导并记录在
+    ``derived`` 中，同时给出与论文目标相比的 measured 值，供
+    ``paper_fidelity_report`` 审计。返回值中的 ``config`` 可直接
+    作为 ``Config(**config)`` 的输入。
+    """
+
+    cell = paper_cell(scale, sparsity, arch)
+    base_cell = paper_cell(cell.scale, cell.sparsity, "base")
+    base_n_heads, base_n_kv, base_kv_dim = _paper_base_head_geometry(
+        base_cell.hidden
+    )
+    if cell.arch == "base":
+        n_heads, n_kv_heads, kv_dim = (
+            base_n_heads,
+            base_n_kv,
+            base_kv_dim,
+        )
+        kv_target = None
+    else:
+        if cell.kv_ratio is None:
+            raise ValueError(f"{cell} 缺少 KV 比例")
+        kv_target = int(round(cell.kv_ratio * base_kv_dim))
+        n_heads, n_kv_heads, kv_dim = _paper_smelt_head_geometry(
+            cell.hidden,
+            kv_target,
+        )
+    expert_hidden = _paper_expert_hidden(
+        cell.hidden,
+        cell.layers,
+        cell.total_experts,
+        cell.total_params,
+        kv_dim,
+        active_experts=cell.active_experts,
+    )
+    config = _paper_config_kwargs(
+        cell,
+        n_heads,
+        n_kv_heads,
+        expert_hidden,
+    )
+    cfg = Config(**config)
+    counts = _analytic_param_counts(cfg)
+    flops = int(
+        mode_cost_profile(cfg)["analytic_flops_per_token"]
+    )
+    return {
+        "paper": PAPER_ID,
+        "arch": cell.arch,
+        "scale": cell.scale,
+        "sparsity": cell.sparsity,
+        "cell": cell,
+        "config": config,
+        "derived": {
+            "n_heads": int(n_heads),
+            "n_kv_heads": int(n_kv_heads),
+            "head_dim": int(cell.hidden) // int(n_heads),
+            "kv_dim": int(kv_dim),
+            "base_kv_dim": int(base_kv_dim),
+            "kv_target": kv_target,
+            "expert_hidden": int(expert_hidden),
+            "top_k": int(cell.active_experts),
+            "context_length": int(cfg.seq_len),
+            "loop_span_layers": (
+                cfg.middle_start + 1,
+                cfg.middle_end,
+            ),
+        },
+        "measured": {
+            "total_params": int(counts["total"]),
+            "active_params": int(counts["active"]),
+            "flops_per_token": flops,
+        },
+        "targets": {
+            "total_params": float(cell.total_params),
+            "active_params": float(cell.active_params),
+            "flops_ratio": cell.flops_ratio,
+            "kv_ratio": cell.kv_ratio,
+            "compute_equivalent_sparsity": cell.measured_sparsity,
+        },
+    }
+
+
+def paper_cell_for_config(cfg: Config) -> Optional[PaperCell]:
+    """把运行配置映射回论文附录 A 的网格单元（匹配不到返回 None）。"""
+
+    if cfg.mode not in PAPER_ARCHS:
+        return None
+    for cell in PAPER_CELLS.values():
+        if cell.arch != cfg.mode:
+            continue
+        if (
+            cell.hidden == int(cfg.d_model)
+            and cell.layers == int(cfg.n_layers)
+            and cell.total_experts == int(cfg.n_experts)
+            and cell.active_experts == int(cfg.top_k)
+        ):
+            return cell
+    return None
+
+
+def _paper_budget_audit(
+    cfg: Config,
+    cell: PaperCell,
+) -> Dict[str, object]:
+    """把实测的 FLOPs / 总参数 / KV cache / S 与论文目标对照。
+
+    论文附录 A 的参数化来自未公开的 Transformer family；本仓库
+    实现（SwiGLU 专家、RMSNorm、学习式位置编码）只能保证公开
+    披露量的结构一致，不能保证逐位相同的参数/FLOPs。该审计
+    如实报告偏差，不据此伪装成数值复现。
+    """
+
+    counts = _analytic_param_counts(cfg)
+    flops = int(
+        mode_cost_profile(cfg)["analytic_flops_per_token"]
+    )
+    base_cfg = Config(
+        **paper_preset(cell.scale, cell.sparsity, "base")["config"]
+    )
+    base_counts = _analytic_param_counts(base_cfg)
+    base_flops = int(
+        mode_cost_profile(base_cfg)["analytic_flops_per_token"]
+    )
+    control_cfg = Config(
+        **paper_preset(cell.scale, 0, "base")["config"]
+    )
+    control_counts = _analytic_param_counts(control_cfg)
+    control_flops = int(
+        mode_cost_profile(control_cfg)["analytic_flops_per_token"]
+    )
+    flops_ratio = flops / base_flops
+    kv_ratio = counts["kv_dim"] / base_counts["kv_dim"]
+    sparsity = 1.0 - (
+        flops / control_flops
+    ) * (control_counts["total"] / counts["total"])
+    total_ratio = counts["total"] / (cell.total_params * 1e9)
+    active_ratio = counts["active"] / (
+        cell.active_params * 1e9
+    )
+    within: Dict[str, Optional[bool]] = {
+        "total_params_within_1pct": bool(
+            abs(total_ratio - 1.0) <= 0.01
         ),
+        "active_params_within_5pct": bool(
+            abs(active_ratio - 1.0) <= 0.05
+        ),
+        "sparsity_within_2pp": bool(
+            abs(sparsity - cell.measured_sparsity) <= 0.02
+        ),
+        "flops_ratio_within_4pct": (
+            None
+            if cell.flops_ratio is None
+            else bool(abs(flops_ratio - cell.flops_ratio) <= 0.04)
+        ),
+        "kv_ratio_within_4pct": (
+            None
+            if cell.kv_ratio is None
+            else bool(abs(kv_ratio - cell.kv_ratio) <= 0.04)
+        ),
+    }
+    return {
+        "measured": {
+            "total_params": int(counts["total"]),
+            "active_params": int(counts["active"]),
+            "flops_per_token": int(flops),
+            "flops_ratio_vs_base": float(flops_ratio),
+            "kv_ratio_vs_base": float(kv_ratio),
+            "compute_equivalent_sparsity": float(sparsity),
+            "total_params_ratio_vs_paper": float(total_ratio),
+            "active_params_ratio_vs_paper": float(active_ratio),
+        },
+        "paper": {
+            "total_params": float(cell.total_params),
+            "active_params": float(cell.active_params),
+            "flops_ratio": cell.flops_ratio,
+            "kv_ratio": cell.kv_ratio,
+            "compute_equivalent_sparsity": cell.measured_sparsity,
+        },
+        "tolerances": {
+            "total_params_relative": 0.01,
+            "active_params_relative": 0.05,
+            "flops_ratio_absolute": 0.04,
+            "kv_ratio_absolute": 0.04,
+            "sparsity_absolute": 0.02,
+        },
+        "within_paper_tolerance": within,
+        "all_within_tolerance": all(
+            value is not False for value in within.values()
+        ),
+        "note": (
+            "论文附录 A 的参数化未公开；本实现的参数统计口径为"
+            "「非 embedding 参数」，total/active 与 FLOPs 由"
+            "本仓库结构精确计算，S 按论文 Eq.1 由实测 FLOPs "
+            "与总参数推出。偏差不是实现缺陷的充分证据，也不"
+            "能把偏差忽略后声称数值复现"
+        ),
+    }
+
+
+def _paper_protocol_checks(
+    protocol: Dict[str, object],
+) -> Dict[str, bool]:
+    saved_steps = list(
+        protocol.get("save_at_steps") or []
+    )
+    stable = int(protocol.get("stable_steps", 0))
+    steps = int(protocol.get("steps", stable))
+    stable_target = int(PAPER_PROTOCOL["stable_steps"])
+    decay_steps = int(PAPER_PROTOCOL["decay_steps"])
+    branch_points = {
+        int(step) for step in PAPER_PROTOCOL["branch_steps"]
+    }
+    # 稳定期跑满 196075 步；或者从六个分支点之一分叉、
+    # 再跑满 10B token（9537 步）的 cosine-decay 分支。
+    branch_run = (
+        stable in branch_points
+        and stable < stable_target
+        and steps == stable + decay_steps
+    )
+    return {
+        "protocol_wsd_schedule": (
+            str(protocol.get("lr_schedule", "")) == "wsd"
+        ),
+        "protocol_batch_256": (
+            int(protocol.get("batch_size", 0)) == 256
+        ),
+        "protocol_stable_phase": (
+            stable == stable_target and steps == stable_target
+        ),
+        "protocol_decay_branch": bool(
+            stable == stable_target or branch_run
+        ),
+        "protocol_document_masks": bool(
+            protocol.get("document_masks")
+        ),
+        "protocol_branch_checkpoints": bool(
+            branch_points.issubset(
+                {int(step) for step in saved_steps}
+            )
+            or branch_run
+        ),
+    }
+
+
+def paper_fidelity_report(
+    cfg: Config,
+    protocol: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """对照 arXiv:2609.01343v1 审计当前配置的复现保真度。
+
+    复现分为两层：
+
+    1. **recipe（架构 + 协议）**：论文正文/附录 A 明确披露的量，
+       包括 H/L/专家数/top-8、middle-50% 循环两次的层位置、循环
+       区域子层残差 1/r、GQA、4096 上下文，以及 3.1 节的 WSD
+       协议、全局 batch 256、稳定期 196 075 步、六个分支点与
+       文档级 segment attention mask。``architecture_faithful``
+       与 ``protocol_faithful`` 分别给出结论，``is_full_reproduction``
+       仅在两者都成立时为真。
+    2. **budget（预算）**：论文 3.2 节要求 FLOPs / 总参数 / KV
+       cache 三者匹配，但附录 A 的参数化来自未公开 family，
+       本实现只能报告实测偏差（``budget_audit``），不把偏差
+       忽略后声称数值复现。
+
+    未被论文披露的学习率、warmup、weight decay、betas、均衡
+    损失系数、初始化、head 几何、专家中间维与语料列在
+    ``undisclosed`` 中；沿用本仓库默认值不等于论文原值。
+    """
+
+    cell = paper_cell_for_config(cfg)
+    arch = cfg.mode if cfg.mode in PAPER_ARCHS else None
+    loop_span = int(cfg.middle_end - cfg.middle_start)
+    expected_start = int(cfg.n_layers - loop_span) // 2
+    checks: Dict[str, bool] = {
+        "paper_cell_config": cell is not None,
+        "top_k_8": int(cfg.top_k) == 8,
+        "gqa": (
+            cfg.n_kv_heads is not None
+            and int(cfg.effective_n_kv_heads) < int(cfg.n_heads)
+        ),
+        "context_4096": int(cfg.seq_len) == int(
+            PAPER_PROTOCOL["context_length"]
+        ),
+        "loop_span_middle_half": (
+            loop_span == int(cfg.n_layers) // 2
+        ),
+        "loop_placement_paper": (
+            int(cfg.middle_start) == expected_start
+            and loop_span == int(cfg.n_layers) // 2
+        ),
+    }
+    if cfg.mode == "smelt":
+        checks["loop_twice"] = cfg.loop_count == 2
+        checks["loop_residual_scaling_1_over_r"] = (
+            cfg.residual_scaling == "paper"
+        )
+    elif cfg.mode == "base":
+        checks["unlooped_baseline"] = cfg.loop_count == 1
+    else:
+        checks["paper_arch_mode"] = False
+
+    preset_geometry: Optional[Dict[str, object]] = None
+    if cell is not None:
+        preset = paper_preset(
+            cell.scale,
+            cell.sparsity,
+            cell.arch,
+        )
+        derived = preset["derived"]
+        preset_geometry = {
+            "n_heads": derived["n_heads"],
+            "n_kv_heads": derived["n_kv_heads"],
+            "expert_hidden": derived["expert_hidden"],
+        }
+        checks["preset_geometry_matches"] = bool(
+            int(cfg.n_heads) == int(derived["n_heads"])
+            and int(cfg.effective_n_kv_heads)
+            == int(derived["n_kv_heads"])
+            and int(cfg.expert_hidden)
+            == int(derived["expert_hidden"])
+        )
+
+    protocol_checks: Dict[str, bool] = {}
+    if protocol is not None:
+        protocol_checks = _paper_protocol_checks(protocol)
+
+    architecture_faithful = all(checks.values())
+    protocol_faithful: Optional[bool] = (
+        all(protocol_checks.values())
+        if protocol is not None
+        else None
+    )
+    is_full_reproduction = bool(
+        architecture_faithful and protocol_faithful is True
+    )
+    deviations = [
+        name for name, ok in checks.items() if not ok
+    ] + [
+        name for name, ok in protocol_checks.items() if not ok
+    ]
+
+    budget_audit: Optional[Dict[str, object]] = None
+    if cell is not None and arch is not None:
+        budget_audit = _paper_budget_audit(cfg, cell)
+
+    if is_full_reproduction:
+        interpretation = (
+            "配置与训练协议均对齐论文披露口径；未被论文披露的"
+            "超参与数据不在复现范围内，预算偏差见 budget_audit，"
+            "数值结果不能声称与论文逐位一致"
+        )
+    elif architecture_faithful and protocol is None:
+        interpretation = (
+            "架构对齐论文附录 A 的公开披露项，但训练协议未按"
+            "3.1 节设置；不能称为完整复现"
+        )
+    elif cell is None:
+        interpretation = (
+            "当前配置不是论文附录 A 的任何网格单元；只能表述为"
+            "「SMELT 风格架构」的原型实验，不能声称复现论文"
+        )
+    else:
+        interpretation = (
+            "存在偏离项："
+            + ", ".join(deviations)
+            + "；不能声称复现论文 SMELT"
+        )
+
+    return {
+        "paper": PAPER_ID,
+        "paper_url": PAPER_URL,
+        "cell": (
+            None
+            if cell is None
+            else {
+                "arch": cell.arch,
+                "scale": cell.scale,
+                "sparsity": cell.sparsity,
+                "hidden": cell.hidden,
+                "layers": cell.layers,
+                "total_experts": cell.total_experts,
+                "active_experts": cell.active_experts,
+            }
+        ),
+        "preset_geometry": preset_geometry,
+        "checks": checks,
+        "protocol_checks": protocol_checks,
+        "deviations": deviations,
+        "architecture_faithful": bool(architecture_faithful),
+        "protocol_faithful": protocol_faithful,
+        "is_full_reproduction": is_full_reproduction,
+        "budget_audit": budget_audit,
+        "undisclosed": list(PAPER_UNDISCLOSED),
+        "protocol": dict(PAPER_PROTOCOL),
+        "interpretation": interpretation,
         "scale_note": (
             "论文标度 100M–1.6B、4096 上下文、top-8 + GQA；"
             "本仓库默认是小规模原型，规模外推需要另行验证"
         ),
     }
+
+
+def _preset_summary(preset: Dict[str, object]) -> str:
+    cell = preset["cell"]
+    derived = preset["derived"]
+    measured = preset["measured"]
+    return (
+        f"{cell.arch} {cell.scale} S≈{cell.sparsity}% | "
+        f"H={cell.hidden} L={cell.layers} "
+        f"E={cell.total_experts} top-{cell.active_experts} | "
+        f"heads={derived['n_heads']}/"
+        f"{derived['n_kv_heads']} "
+        f"expert_hidden={derived['expert_hidden']} | "
+        f"total={measured['total_params']/1e9:.3f}B "
+        f"(paper {cell.total_params:.3f}B) "
+        f"active={measured['active_params']/1e9:.3f}B "
+        f"(paper {cell.active_params:.3f}B)"
+    )
+
+
+def _argv_has_flag(flag: str) -> bool:
+    for token in sys.argv[1:]:
+        if token == flag or token.startswith(flag + "="):
+            return True
+    return False
+
+
+def apply_paper_cli(args, parser=None) -> None:
+    """把 ``--paper-cell`` / ``--paper-protocol`` 落到 args 上。
+
+    - 预设覆盖模型结构参数；若命令行显式给了冲突值则报错，
+      避免「看起来按论文配置、实际被命令行改动」。
+    - ``--paper-protocol`` 只在用户未显式给出对应命令行参数时
+      套用 3.1 节的协议值，方便小规模冒烟测试但仍记录偏离。
+    """
+
+    def fail(message: str) -> None:
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+
+    preset_report: Optional[Dict[str, object]] = None
+    if getattr(args, "paper_cell", None):
+        try:
+            scale, sparsity = parse_paper_cell_label(
+                args.paper_cell
+            )
+        except ValueError as error:
+            fail(str(error))
+            return
+        arch = getattr(args, "paper_arch", None)
+        if arch is None:
+            arch = (
+                args.mode
+                if args.mode in PAPER_ARCHS
+                else "smelt"
+            )
+        if arch not in PAPER_ARCHS:
+            fail(
+                "--paper-arch 必须是 base 或 smelt"
+            )
+        if (
+            args.mode in PAPER_ARCHS
+            and args.mode != arch
+        ):
+            fail(
+                f"--mode {args.mode} 与 --paper-arch {arch} 冲突"
+            )
+        if args.mode not in PAPER_ARCHS and args.mode != "B":
+            fail(
+                "--paper-cell 只支持 base / smelt 两种论文架构"
+            )
+        try:
+            preset = paper_preset(scale, sparsity, arch)
+        except ValueError as error:
+            fail(str(error))
+            return
+        conflict_keys = {
+            "seq_len": "--seq-len",
+            "d_model": "--d-model",
+            "n_heads": "--n-heads",
+            "n_kv_heads": "--n-kv-heads",
+            "n_layers": "--n-layers",
+            "n_experts": "--n-experts",
+            "expert_hidden": "--expert-hidden",
+            "top_k": "--top-k",
+            "k1": "--k1",
+            "k2": "--k2",
+        }
+        conflicts = []
+        for key, flag in conflict_keys.items():
+            if not _argv_has_flag(flag):
+                continue
+            current = getattr(args, key, None)
+            expected = preset["config"][key]
+            if current != expected:
+                conflicts.append(
+                    f"{flag}={current!r}（预设要求 {expected!r}）"
+                )
+        if conflicts:
+            fail(
+                "--paper-cell 的结构参数由论文附录 A 决定，"
+                "不能同时覆盖：" + "; ".join(conflicts)
+            )
+        for key, value in preset["config"].items():
+            setattr(args, key, value)
+        args.mode = arch
+        args.paper_cell = f"{scale}:{sparsity}"
+        args.paper_arch = arch
+        # 只保留 JSON 可序列化的字段（PaperCell dataclass 不能
+        # 直接写进 config.json / 检查点元数据）。
+        preset_report = {
+            "paper": preset["paper"],
+            "arch": preset["arch"],
+            "scale": preset["scale"],
+            "sparsity": preset["sparsity"],
+            "config": dict(preset["config"]),
+            "derived": dict(preset["derived"]),
+            "measured": dict(preset["measured"]),
+            "targets": dict(preset["targets"]),
+        }
+        args.paper_preset = preset_report
+        print(f"[paper] {_preset_summary(preset)}")
+        if args.seq_len != int(PAPER_PROTOCOL["context_length"]):
+            print(
+                "[paper][warn] 上下文长度不是论文的 "
+                f"{PAPER_PROTOCOL['context_length']}；"
+                "paper_fidelity 会记为偏离"
+            )
+
+    if getattr(args, "paper_protocol", False):
+        protocol_defaults = {
+            "seq_len": int(PAPER_PROTOCOL["context_length"]),
+            "batch_size": int(
+                PAPER_PROTOCOL["global_batch_sequences"]
+            ),
+            "steps": int(PAPER_PROTOCOL["stable_steps"]),
+            "warmup_steps": 2000,
+            "lr_schedule": "wsd",
+            "eval_interval": 1000,
+            "save_at_steps": list(
+                PAPER_PROTOCOL["branch_steps"]
+            ),
+            "document_masks": True,
+        }
+        for key, value in protocol_defaults.items():
+            flag = "--" + key.replace("_", "-")
+            if _argv_has_flag(flag):
+                continue
+            setattr(args, key, value)
+        if getattr(args, "wsd_stable_steps", None) is None:
+            args.wsd_stable_steps = int(args.steps)
+        if not getattr(args, "group_separator", None):
+            fail(
+                "--paper-protocol 需要 --group-separator 标注文档"
+                "边界：论文 3.1 节在 4096 packed context 内使用"
+                "文档级 segment attention mask，没有边界就无法"
+                "忠实复现"
+            )
+        print(
+            "[paper][protocol] WSD + batch "
+            f"{args.batch_size} + stable {args.wsd_stable_steps} "
+            f"steps + ctx {args.seq_len} + document masks；"
+            "学习率/warmup/weight decay 论文未披露，沿用本仓库"
+            "默认值"
+        )
+
+    args.paper_preset_report = preset_report
 
 
 # ============================================================
@@ -1124,6 +2038,171 @@ class RMSNorm(nn.Module):
         return (y * self.weight).to(input_dtype)
 
 
+class SegmentAttentionMask:
+    """文档级 segment attention mask（论文 3.1 节）。
+
+    输入是每个 token 的文档编号 ``[batch, time]``；注意力只允许
+    同一文档内、且 key 位置不晚于 query 位置的 token 可见。
+
+    实现有两条路径：
+
+    - CUDA：``torch.nn.attention.flex_attention`` 的 BlockMask，
+      不物化 [batch, time, time] 的掩码矩阵，能支撑论文的
+      batch=256、context=4096 规模；
+    - CPU（或 flex_attention 不可用）：物化 bool 掩码，仅用于
+      小规模测试与评估；超过 1 GiB 时显式报错，而不是悄悄
+      退化成无掩码的因果注意力。
+
+    掩码在每次前向构造一次，随后共享给所有 Block（同一 batch
+    的所有层/分支使用同一份文档边界）。
+    """
+
+    # 物化 bool 掩码的内存上限（字节）。B*T*T 超过它时
+    # CPU 路径直接报错；论文规模请在 CUDA 上运行。
+    DENSE_LIMIT_BYTES = 1 << 30
+
+    def __init__(self, segment_ids: torch.Tensor):
+        if (
+            segment_ids.dim() != 2
+            or segment_ids.dtype
+            not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "segment_ids 必须是 [batch, time] 的整数张量"
+            )
+        self.segment_ids = segment_ids
+        self.batch, self.length = segment_ids.shape
+        self.dense: Optional[torch.Tensor] = None
+        self.block_mask = None
+        self.path = "dense"
+        if segment_ids.device.type == "cuda":
+            if self._build_flex():
+                return
+        self._build_dense()
+
+    def _build_flex(self) -> bool:
+        try:
+            from torch.nn.attention.flex_attention import (
+                create_block_mask,
+            )
+        except ImportError:
+            return False
+
+        segment = self.segment_ids
+
+        def mask_mod(batch, head, q_index, kv_index):
+            doc = segment[batch]
+            return (q_index >= kv_index) & (
+                doc[q_index] == doc[kv_index]
+            )
+
+        try:
+            self.block_mask = create_block_mask(
+                mask_mod,
+                B=int(self.batch),
+                H=None,
+                Q_LEN=int(self.length),
+                KV_LEN=int(self.length),
+                device=segment.device,
+            )
+        except Exception:
+            return False
+        self.path = "flex"
+        return True
+
+    def _build_dense(self) -> None:
+        needed = (
+            int(self.batch)
+            * int(self.length)
+            * int(self.length)
+        )
+        if needed > self.DENSE_LIMIT_BYTES:
+            raise RuntimeError(
+                "文档级 segment mask 需要物化 "
+                f"{self.batch}x{self.length}x{self.length} 的布尔"
+                "掩码（超过 1 GiB）；CPU 上无法运行该规模的"
+                "论文协议。请在 CUDA 上运行（走 flex_attention "
+                "BlockMask 的稀疏路径），或减小 --batch-size / "
+                "--seq-len"
+            )
+        segment = self.segment_ids
+        causal = torch.ones(
+            (self.length, self.length),
+            dtype=torch.bool,
+            device=segment.device,
+        ).tril()
+        same_doc = segment[:, None, :, None] == segment[
+            :, None, None, :
+        ]
+        # [batch, 1, time, time]：可直接广播到 SDPA 的
+        # (batch, heads, time, time)。
+        self.dense = same_doc & causal
+        self.path = "dense"
+
+    def attention(self, q, k, v):
+        if self.path == "flex":
+            from torch.nn.attention.flex_attention import (
+                flex_attention,
+            )
+            return flex_attention(
+                q, k, v, block_mask=self.block_mask
+            )
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=self.dense,
+            is_causal=False,
+        )
+
+
+def document_segment_ids(
+    input_ids: torch.Tensor,
+    separator: Sequence[int],
+) -> torch.Tensor:
+    """从 token 流中检测文档分隔符，返回每 token 的文档编号。
+
+    分隔符的起始字节处开启新文档（文档 0 从窗口起点开始）。
+    多字节分隔符按完整字节串匹配；窗口边界处被截断的分隔符
+    不计入（窗口外的文档边界本来就不影响窗口内可见性）。
+    """
+
+    batch, length = input_ids.shape
+    byte_values = [int(byte) for byte in separator]
+    if not byte_values or length <= 0:
+        return torch.zeros(
+            (batch, length),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+    span = length - len(byte_values) + 1
+    if span <= 0:
+        return torch.zeros(
+            (batch, length),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+    starts = torch.ones(
+        (batch, span),
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+    for offset, value in enumerate(byte_values):
+        starts &= (
+            input_ids[:, offset:offset + span] == value
+        )
+    boundary = torch.zeros(
+        (batch, length),
+        dtype=torch.long,
+        device=input_ids.device,
+    )
+    boundary[:, :span] = starts.to(torch.long)
+    # 窗口首个 token 即使匹配分隔符也属于本窗口的第一篇
+    # 文档（编号从 0 起），因此把第一个位置清零。
+    boundary[:, 0] = 0
+    return torch.cumsum(boundary, dim=1)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -1170,7 +2249,11 @@ class CausalSelfAttention(nn.Module):
             bias=False,
         )
 
-    def core(self, x: torch.Tensor) -> torch.Tensor:
+    def core(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional["SegmentAttentionMask"] = None,
+    ) -> torch.Tensor:
         """
         Attention 主体，返回输出投影之前的 [batch, length, dim]。
         调用方负责完成输出投影与残差相加。
@@ -1205,24 +2288,45 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # GQA：每个 KV 头被 kv_repeat 个连续 Q 头共享。
-        if self.kv_repeat > 1:
+        # GQA：整除时每个 KV 头被 kv_repeat 个连续 Q 头共享；
+        # 不整除时按 floor(i * n_kv / n_heads) 均匀映射，保证
+        # 任意 n_kv_heads 都能精确控制 KV cache（论文未披露
+        # head 几何，预算匹配需要这一自由度）。
+        if self.kv_repeat > 1 and self.n_heads % self.n_kv_heads == 0:
             k = k.repeat_interleave(self.kv_repeat, dim=1)
             v = v.repeat_interleave(self.kv_repeat, dim=1)
+        elif self.n_kv_heads != self.n_heads:
+            index = (
+                (torch.arange(self.n_heads) * self.n_kv_heads)
+                // self.n_heads
+            ).to(device=k.device)
+            k = k.index_select(1, index)
+            v = v.index_select(1, index)
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            is_causal=True,
-        )
+        if attn_mask is not None:
+            # 文档级 segment mask 已包含因果约束；走掩码路径时
+            # 不能再叠加 is_causal=True（否则两者不一致）。
+            y = attn_mask.attention(q, k, v)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=True,
+            )
 
         y = y.transpose(1, 2).contiguous()
         return y.view(batch, length, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(self.core(x), self.out.weight)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[SegmentAttentionMask] = None,
+    ) -> torch.Tensor:
+        return F.linear(
+            self.core(x, attn_mask), self.out.weight
+        )
 
 
 def _swiglu_backward(
@@ -2448,12 +3552,13 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         scale: Optional[float] = None,
+        attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> torch.Tensor:
         # scale 由 LanguageModel 按区域传入：循环区域内使用
         # loop_residual_scale（paper 口径为 residual_scale/r），
         # 区域外与历史行为一致使用 residual_scale。
         scale = self.residual_scale if scale is None else scale
-        core = self.attn.core(self.norm_attn(x))
+        core = self.attn.core(self.norm_attn(x), attn_mask)
 
         # dtype 一致（非 autocast，如 CPU/fp32）时以 addmm
         # 计算「投影 + 缩放 + 残差相加」；autocast 下 dtype
@@ -2516,8 +3621,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         top_k: int,
         scale: Optional[float] = None,
+        attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.attention_step(x, scale)
+        x = self.attention_step(x, scale, attn_mask)
         return self.moe_step(x, top_k, scale)
 
     def first_branch_step(
@@ -2525,6 +3631,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         k1: int,
         scale: Optional[float] = None,
+        attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2551,7 +3658,7 @@ class TransformerBlock(nn.Module):
                 scalar
         """
         scale = self.residual_scale if scale is None else scale
-        x = self.attention_step(x, scale)
+        x = self.attention_step(x, scale, attn_mask)
 
         expert_outputs, gates, indices, aux_loss = self.moe.unmerged(
             self.norm_moe(x),
@@ -2589,6 +3696,7 @@ class TransformerBlock(nn.Module):
         delayed: bool,
         scale: Optional[float] = None,
         second_round_width: Optional[int] = None,
+        attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         A/local_base/local_base_k2 的局部对照。
@@ -2603,7 +3711,7 @@ class TransformerBlock(nn.Module):
                      合并时机，不把第二轮宽度一起改掉。
         """
         scale = self.residual_scale if scale is None else scale
-        x = self.attention_step(x, scale)
+        x = self.attention_step(x, scale, attn_mask)
 
         if not delayed:
             # 等专家计算量对照：A 在 k1 个分支上各路由 k2 个
@@ -3120,6 +4228,7 @@ class LanguageModel(nn.Module):
         branches: torch.Tensor,
         top_k: int,
         scale: Optional[float] = None,
+        attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对每个 branch 独立执行完整 Transformer Block。
@@ -3144,6 +4253,7 @@ class LanguageModel(nn.Module):
             flat,
             top_k,
             scale,
+            attn_mask,
         )
 
         branches = flat.view(
@@ -3159,6 +4269,7 @@ class LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         cfg = self.cfg
 
@@ -3174,6 +4285,30 @@ class LanguageModel(nn.Module):
         x.add_(
             self.position_embedding_weight[:time]
         )
+
+        # 文档级 segment attention mask（论文 3.1 节）。显式传入
+        # segment_ids 时优先使用（测试/分析）；否则在启用
+        # cfg.document_masks 时从 token 流里的文档分隔符推导。
+        # B/B_early 把分支并入 batch 维，需要一份按 k1 复制的
+        # 掩码；其余模式的 Attention 在原始 batch 上执行。
+        if segment_ids is None and cfg.document_masks:
+            segment_ids = document_segment_ids(
+                input_ids,
+                cfg.document_separator or (),
+            )
+        attn_bias: Optional[SegmentAttentionMask] = None
+        branch_attn_bias: Optional[SegmentAttentionMask] = None
+        if segment_ids is not None:
+            attn_bias = SegmentAttentionMask(segment_ids)
+            if (
+                cfg.mode in ("B", "B_early")
+                and int(cfg.k1) > 1
+            ):
+                branch_attn_bias = SegmentAttentionMask(
+                    segment_ids.repeat_interleave(
+                        int(cfg.k1), 0
+                    )
+                )
 
         aux_losses: List[torch.Tensor] = []
 
@@ -3196,6 +4331,7 @@ class LanguageModel(nn.Module):
                 x,
                 cfg.top_k,
                 global_scale,
+                attn_bias,
             )
             aux_losses.append(aux)
 
@@ -3212,6 +4348,7 @@ class LanguageModel(nn.Module):
                     x,
                     cfg.top_k,
                     global_scale,
+                    attn_bias,
                 )
                 aux_losses.append(aux)
 
@@ -3225,6 +4362,7 @@ class LanguageModel(nn.Module):
                     x,
                     cfg.top_k,
                     global_scale,
+                    attn_bias,
                 )
                 aux_losses.append(aux)
 
@@ -3240,6 +4378,7 @@ class LanguageModel(nn.Module):
                         x,
                         cfg.top_k,
                         loop_scale,
+                        attn_bias,
                     )
                     aux_losses.append(aux)
 
@@ -3259,6 +4398,7 @@ class LanguageModel(nn.Module):
                 x,
                 cfg.k1,
                 loop_scale,
+                attn_bias,
             )
             aux_losses.append(aux)
 
@@ -3270,6 +4410,7 @@ class LanguageModel(nn.Module):
                     branches,
                     cfg.k1,
                     loop_scale,
+                    branch_attn_bias,
                 )
                 aux_losses.append(aux)
 
@@ -3308,6 +4449,7 @@ class LanguageModel(nn.Module):
                     branches,
                     cfg.k2,
                     loop_scale,
+                    branch_attn_bias,
                 )
                 aux_losses.append(aux)
 
@@ -3362,6 +4504,7 @@ class LanguageModel(nn.Module):
                     delayed,
                     loop_scale,
                     second_round_width,
+                    attn_bias,
                 )
                 aux_losses.extend((aux1, aux2))
 
@@ -3375,6 +4518,7 @@ class LanguageModel(nn.Module):
                 x,
                 cfg.top_k,
                 global_scale,
+                attn_bias,
             )
             aux_losses.append(aux)
 
@@ -19976,7 +21120,21 @@ def build_comparison_protocol(
         "optimizer_betas": [0.9, 0.999],
         "optimizer_eps": 1e-8,
         "lr": args.lr,
-        "lr_schedule": "linear_warmup_cosine_to_10pct",
+        "lr_schedule": (
+            "linear_warmup_cosine_to_10pct"
+            if str(getattr(args, "lr_schedule", "cosine"))
+            == "cosine"
+            else "wsd"
+        ),
+        "lr_schedule_name": str(
+            getattr(args, "lr_schedule", "cosine")
+        ),
+        "wsd_stable_steps": getattr(
+            args, "wsd_stable_steps", None
+        ),
+        "wsd_final_lr_ratio": getattr(
+            args, "wsd_final_lr_ratio", None
+        ),
         "warmup_steps": args.warmup_steps,
         "total_steps": args.steps,
         "weight_decay": args.weight_decay,
@@ -20190,6 +21348,17 @@ def experiment_protocol_from_payload(
             "linear_warmup_cosine_to_10pct"
             if has_training
             else None
+        ),
+        # 历史运行只有 cosine；缺记录时回填 cosine，避免与
+        # 新记录口径产生无意义的受控变量不一致。
+        "lr_schedule_name": (
+            "cosine" if has_training else None
+        ),
+        "wsd_stable_steps": run_args.get(
+            "wsd_stable_steps"
+        ),
+        "wsd_final_lr_ratio": run_args.get(
+            "wsd_final_lr_ratio"
         ),
         "lr": run_args.get("lr"),
         "warmup_steps": run_args.get("warmup_steps"),
@@ -35760,6 +36929,7 @@ def run_self_test():
             branches: torch.Tensor,
             top_k: int,
             scale=None,
+            attn_mask=None,
         ):
             self.route_widths.append(top_k)
             return super().run_independent_blocks(
@@ -35767,6 +36937,7 @@ def run_self_test():
                 branches,
                 top_k,
                 scale,
+                attn_mask,
             )
 
     probe = RouteWidthProbe(
@@ -41876,7 +43047,9 @@ def run_self_test():
         def __init__(self):
             self.calls = []
 
-        def attention_step(self, value, scale=None):
+        def attention_step(
+            self, value, scale=None, attn_mask=None
+        ):
             return value
 
         def moe_step(self, value, top_k, scale=None):
@@ -50079,34 +51252,111 @@ def build_lr_schedule(
     warmup_steps: int,
     total_steps: int,
     start_step: int = 0,
+    schedule: str = "cosine",
+    stable_steps: Optional[int] = None,
+    final_lr_ratio: float = 0.1,
 ):
+    """构造学习率调度。
+
+    schedule="cosine"（历史默认）：linear warmup 后余弦退火到
+    峰值 lr 的 10%，与引入 WSD 之前的运行逐位一致。
+
+    schedule="wsd"（论文 3.1 节 warmup-stable-decay）：
+    warmup 后保持恒定，``stable_steps`` 之后按余弦衰减到
+    ``final_lr_ratio``。``stable_steps=None`` 表示整段训练都
+    处于稳定期（不衰减）；分支实验把 ``stable_steps`` 设为
+    分支点，并用 ``--resume`` 从该检查点续跑。
+    """
+    if schedule not in ("cosine", "wsd"):
+        raise ValueError(
+            f"未知 lr schedule: {schedule!r}（cosine|wsd）"
+        )
     # last_epoch >= 0 时 LRScheduler 要求 param group 中存在
     # initial_lr；该键缺失时用当前的基准 lr 补齐。
     if start_step > 0:
         for group in optimizer.param_groups:
             group.setdefault("initial_lr", group["lr"])
 
-    def lr_lambda(step: int) -> float:
-        # step 从 0 开始计数。
-        if step < warmup_steps:
-            return (step + 1) / max(1, warmup_steps)
+    if schedule == "cosine":
+        def lr_lambda(step: int) -> float:
+            # step 从 0 开始计数。
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
 
-        progress = (step - warmup_steps) / max(
-            1,
-            total_steps - warmup_steps,
-        )
-        progress = min(1.0, progress)
+            progress = (step - warmup_steps) / max(
+                1,
+                total_steps - warmup_steps,
+            )
+            progress = min(1.0, progress)
 
-        # 余弦退火到原 lr 的 10%。
-        return 0.1 + 0.9 * (
-            0.5 * (1.0 + math.cos(math.pi * progress))
+            # 余弦退火到原 lr 的 10%。
+            return 0.1 + 0.9 * (
+                0.5 * (1.0 + math.cos(math.pi * progress))
+            )
+    else:
+        stable_end = int(
+            total_steps if stable_steps is None else stable_steps
         )
+        stable_end = max(
+            int(warmup_steps),
+            min(stable_end, int(total_steps)),
+        )
+        decay_steps = max(1, int(total_steps) - stable_end)
+        final_ratio = float(final_lr_ratio)
+        if not math.isfinite(final_ratio) or not (
+            0.0 <= final_ratio <= 1.0
+        ):
+            raise ValueError(
+                "WSD final_lr_ratio 必须落在 [0, 1]"
+            )
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            # 稳定期：恒定峰值 lr。
+            if step < stable_end:
+                return 1.0
+            progress = (
+                step - stable_end
+            ) / max(1, decay_steps)
+            progress = min(1.0, progress)
+            # 论文 3.1 节的分支是 cosine-decay。
+            cosine = 0.5 * (
+                1.0 + math.cos(math.pi * progress)
+            )
+            return final_ratio + (
+                1.0 - final_ratio
+            ) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda,
         # 断点恢复时直接同步到 start_step。
         last_epoch=start_step - 1,
+    )
+
+
+def build_lr_schedule_from_args(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    start_step: int = 0,
+):
+    """按命令行/检查点恢复后的参数构造调度。"""
+
+    return build_lr_schedule(
+        optimizer,
+        int(args.warmup_steps),
+        int(args.steps),
+        start_step=start_step,
+        schedule=str(
+            getattr(args, "lr_schedule", "cosine")
+        ),
+        stable_steps=getattr(
+            args, "wsd_stable_steps", None
+        ),
+        final_lr_ratio=float(
+            getattr(args, "wsd_final_lr_ratio", 0.1)
+        ),
     )
 
 
@@ -53156,6 +54406,102 @@ def main():
             "比例）"
         ),
     )
+    parser.add_argument(
+        "--paper-cell",
+        type=str,
+        default=None,
+        metavar="SCALE:SPARSITY",
+        help=(
+            "直接用论文 arXiv:2609.01343v1 附录 A 的网格单元"
+            "初始化模型结构，例如 200M:95（也接受 200M@95）。"
+            "H、L、专家数、top-8、循环布局、4096 上下文与"
+            "KV cache 匹配都由预设给出；显式冲突的 --d-model "
+            "等参数会被拒绝，避免「看起来按论文配置、实际被"
+            "改动」。与 --paper-arch 配合选择 base / smelt"
+        ),
+    )
+    parser.add_argument(
+        "--paper-arch",
+        type=str,
+        default=None,
+        choices=sorted(PAPER_ARCHS),
+        help=(
+            "论文网格的架构臂：base（未循环 MoE 基线）或 "
+            "smelt（middle 循环两次）。未指定时沿用 --mode"
+            "（若 --mode 为 base/smelt），否则默认 smelt"
+        ),
+    )
+    parser.add_argument(
+        "--paper-protocol",
+        action="store_true",
+        help=(
+            "套用论文 3.1 节训练协议：WSD 调度、全局 batch "
+            "256、稳定期 196075 步、4096 packed context 的"
+            "文档级 segment attention mask，并在六个分支点"
+            "（10k/20k/50k/100k/150k/196075）存档。需要 "
+            "--group-separator 标注文档边界。论文未披露的"
+            "学习率/warmup/weight decay 沿用命令行或仓库"
+            "默认值，并被 paper_fidelity 标为 undisclosed"
+        ),
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="cosine",
+        choices=("cosine", "wsd"),
+        help=(
+            "学习率调度：cosine（历史默认：linear warmup 后"
+            "余弦退火到 10%%）；wsd（论文 3.1 节的 "
+            "warmup-stable-decay：warmup 后恒定，"
+            "--wsd-stable-steps 之后余弦衰减到 "
+            "--wsd-final-lr-ratio）。WSD 分支实验用 --resume "
+            "从分支点检查点续跑，并把 --wsd-stable-steps 设为"
+            "分支点"
+        ),
+    )
+    parser.add_argument(
+        "--wsd-stable-steps",
+        type=int,
+        default=None,
+        help=(
+            "WSD 稳定期结束的绝对步数（从 0 开始计）；默认等于 "
+            "--steps（即整段训练都处于稳定期，不衰减）。分支"
+            "实验把它设为分支点"
+        ),
+    )
+    parser.add_argument(
+        "--wsd-final-lr-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "WSD 衰减终点相对峰值学习率的比例（默认 0.1，"
+            "与历史 cosine 调度的 10%% 终点一致；论文未披露"
+            "衰减终点，属于 undisclosed 量）"
+        ),
+    )
+    parser.add_argument(
+        "--save-at-steps",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="STEP",
+        help=(
+            "在这些绝对步数额外保存 step_<STEP>.pt 检查点，"
+            "供 WSD 的六个余弦衰减分支从同一条稳定期轨迹"
+            "分叉；--paper-protocol 默认使用论文的 "
+            "10k/20k/50k/100k/150k/196075"
+        ),
+    )
+    parser.add_argument(
+        "--document-masks",
+        action="store_true",
+        help=(
+            "在 4096 packed context 内使用文档级 segment "
+            "attention mask（论文 3.1 节）：需要 "
+            "--group-separator 给出文档边界；注意力只允许"
+            "同一文档内的 token 互相可见，跨文档的键被屏蔽"
+        ),
+    )
 
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -53611,6 +54957,33 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 论文复现预设必须在其它校验与 Config 构造之前落地：
+    # --paper-cell 决定模型结构，--paper-protocol 决定训练协议
+    # 与 WSD 调度参数。
+    apply_paper_cli(args, parser)
+    if (
+        args.wsd_stable_steps is not None
+        and args.wsd_stable_steps < 0
+    ):
+        parser.error("--wsd-stable-steps 不能为负")
+    if args.wsd_stable_steps is not None:
+        args.wsd_stable_steps = min(
+            int(args.wsd_stable_steps), int(args.steps)
+        )
+    if (
+        not math.isfinite(args.wsd_final_lr_ratio)
+        or not 0.0 <= args.wsd_final_lr_ratio <= 1.0
+    ):
+        parser.error(
+            "--wsd-final-lr-ratio 必须落在 [0, 1]"
+        )
+    if args.save_at_steps is not None:
+        args.save_at_steps = sorted({
+            int(step) for step in args.save_at_steps
+        })
+        if any(step <= 0 for step in args.save_at_steps):
+            parser.error("--save-at-steps 的步数必须为正整数")
 
     hashseed_error = pythonhashseed_error(
         args.require_pythonhashseed
@@ -54331,6 +55704,48 @@ def main():
         )
         if amp_change_error is not None:
             parser.error(amp_change_error)
+
+        # 学习率调度与 WSD 分支参数决定优化器轨迹；resume 必须
+        # 按存档恢复，否则续跑会静默切回 cosine 或改变稳定期
+        # 终点，把两条不同轨迹接在一起。
+        for schedule_field in (
+            "lr_schedule",
+            "wsd_stable_steps",
+            "wsd_final_lr_ratio",
+        ):
+            if schedule_field not in saved_args:
+                continue
+            # 显式命令行参数优先：WSD 分支实验会从稳定期
+            # 检查点 --resume 并显式给出新的 stable/final 值。
+            if _argv_has_flag(
+                "--" + schedule_field.replace("_", "-")
+            ):
+                continue
+            saved_value = saved_args.get(schedule_field)
+            current_value = getattr(
+                args, schedule_field, None
+            )
+            if saved_value != current_value:
+                print(
+                    f"resume restored {schedule_field} "
+                    f"{current_value!r} -> {saved_value!r} "
+                    "(学习率轨迹是采样/优化轨迹的一部分)"
+                )
+                setattr(args, schedule_field, saved_value)
+        # 文档级 segment mask 决定注意力可见性，是模型语义
+        # 的一部分，不能靠命令行静默切换。
+        if "document_masks" in saved_args:
+            saved_masks = bool(saved_args.get("document_masks"))
+            if saved_masks != bool(
+                getattr(args, "document_masks", False)
+            ):
+                print(
+                    "resume restored document_masks "
+                    f"{getattr(args, 'document_masks', False)} -> "
+                    f"{saved_masks} (注意力可见性是模型语义的一部分)"
+                )
+                args.document_masks = saved_masks
+
         saved_data_sha256 = saved_args.get("data_sha256")
         saved_data_val_fraction = saved_args.get(
             "data_val_fraction"
@@ -54421,6 +55836,19 @@ def main():
             residual_scale=args.residual_scale,
             residual_scaling=args.residual_scaling,
             init_scheme=args.init_scheme,
+            document_masks=bool(
+                getattr(args, "document_masks", False)
+            ),
+            document_separator=(
+                list(
+                    parse_group_separator(args.group_separator)
+                )
+                if (
+                    getattr(args, "document_masks", False)
+                    and args.group_separator is not None
+                )
+                else None
+            ),
         )
 
     if rng_payload is not None:
@@ -55019,7 +56447,62 @@ def main():
     # 成本，也无法覆盖分支 Attention。成本档案写入 config.json，
     # --budget-match 会把「按完整计算图核对预算」变成启动硬门。
     args.cost_profile = mode_cost_profile(cfg)
-    args.paper_fidelity = paper_fidelity_report(cfg)
+    # 论文复现审计：recipe（架构 + 3.1 节协议）与 budget 分开
+    # 记录。协议状态来自实际生效的命令行参数，不从默认值猜测。
+    protocol_state = {
+        "lr_schedule": str(
+            getattr(args, "lr_schedule", "cosine")
+        ),
+        "batch_size": int(args.batch_size),
+        "steps": int(args.steps),
+        "stable_steps": int(
+            args.steps
+            if getattr(args, "wsd_stable_steps", None) is None
+            else args.wsd_stable_steps
+        ),
+        "document_masks": bool(cfg.document_masks),
+        "save_at_steps": list(
+            getattr(args, "save_at_steps", None) or []
+        ),
+    }
+    args.paper_protocol_state = protocol_state
+    args.paper_fidelity = paper_fidelity_report(
+        cfg, protocol_state
+    )
+    fidelity = args.paper_fidelity
+    if fidelity.get("is_full_reproduction"):
+        print(
+            "[paper] 架构与 3.1 节协议均对齐论文披露口径"
+            f"（单元 {fidelity['cell']}）"
+        )
+    elif not fidelity.get("architecture_faithful"):
+        print(
+            "[paper][warn] 当前配置不是论文附录 A 的忠实"
+            "复现：" + ", ".join(fidelity["deviations"])
+        )
+    elif not fidelity.get("protocol_faithful"):
+        print(
+            "[paper][warn] 架构对齐论文，但训练协议仍有偏离："
+            + ", ".join(
+                name
+                for name in fidelity["deviations"]
+                if name.startswith("protocol_")
+            )
+        )
+    budget = fidelity.get("budget_audit")
+    if isinstance(budget, dict):
+        measured = budget["measured"]
+        print(
+            "[paper] 预算审计：FLOPs 比 "
+            f"{measured['flops_ratio_vs_base']:.3f}"
+            f"（论文 {budget['paper']['flops_ratio']}），"
+            "KV 比 "
+            f"{measured['kv_ratio_vs_base']:.3f}"
+            f"（论文 {budget['paper']['kv_ratio']}），"
+            "S="
+            f"{measured['compute_equivalent_sparsity']*100:.1f}%"
+            f"（论文 {budget['paper']['compute_equivalent_sparsity']*100:.1f}%）"
+        )
     budget_baseline = (
         args.budget_match
         if args.budget_match is not None
@@ -56125,10 +57608,9 @@ def main():
             args.torch_threads = saved_threads
             configure_cpu_threads(saved_threads)
 
-    scheduler = build_lr_schedule(
+    scheduler = build_lr_schedule_from_args(
         optimizer,
-        args.warmup_steps,
-        args.steps,
+        args,
         start_step=start_step,
     )
 
@@ -56883,7 +58365,14 @@ def main():
                 )
                 break
 
-        if (step + 1) % args.save_interval == 0:
+        save_at_steps = getattr(
+            args, "save_at_steps", None
+        ) or []
+        is_branch_point = (step + 1) in save_at_steps
+        if (
+            (step + 1) % args.save_interval == 0
+            or is_branch_point
+        ):
             # 存档不一定位于 eval 点上，先落盘保证顺序。
             flush_records()
             saved_checkpoint = save_checkpoint(
@@ -56900,6 +58389,30 @@ def main():
             )
             if saved_checkpoint:
                 last_saved_step = step + 1
+                if is_branch_point:
+                    # WSD 分支点：额外保存独立检查点，供六个
+                    # cosine-decay 分支各自 --resume 分叉，
+                    # 不覆盖 last.pt 的续跑语义。
+                    save_checkpoint(
+                        str(
+                            out_dir
+                            / f"step_{step + 1}.pt"
+                        ),
+                        model,
+                        optimizer,
+                        scaler,
+                        scheduler,
+                        step + 1,
+                        checkpoint_gen_state,
+                        args,
+                        numerical_state=(
+                            checkpoint_numerical_state()
+                        ),
+                    )
+                    print(
+                        f"[wsd] 分支点检查点 step_{step + 1}.pt "
+                        "已保存"
+                    )
             else:
                 # 参数/优化器状态已被污染：旧检查点保持不动，
                 # 继续训练只会重复跳过更新或扩散污染。

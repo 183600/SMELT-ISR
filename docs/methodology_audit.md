@@ -7,9 +7,12 @@
 > 循环区域 1/r 残差缩放、GQA/KV 估计、伪重复处理、种子功效下限、
 > 最小效应门槛检验、失败率报告、固定共同步数、块 bootstrap、
 > 数据切分口径声明、测试内容参与清洗的披露、测试集访问账本与
-> 工作流冻结开关。仍**未**完整实现论文的 4096 上下文/文档级
-> attention mask、WSD 调度、增量 KV 解码与来源外推切分；这些问题
-> 在文中标为「仍有限制」，不能靠措辞绕过。
+> 工作流冻结开关。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> context、文档级 segment attention mask、WSD 调度与
+> `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
+> 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
+> 预算偏差（FLOPs/active params/S）如实写入 `paper_fidelity.budget_audit`，
+> 不能靠措辞绕过。
 
 ## 1. 基线是否忠实复现 arXiv:2609.01343v1
 
@@ -32,12 +35,27 @@
   `paper_fidelity`；存在偏离时明确标记为 SMELT 风格架构。
 - `--budget-match MODE` 按完整计算图（Attention 执行次数 + MoE
   assignment + Router）核对每 token FLOPs，不匹配时拒绝启动。
-- 仍有限制：默认 top-2/8 专家、128 上下文是为了在单机 CPU/单卡
-  上可运行的**原型规模**；论文是 top-8、4096 上下文、100M–1.6B。
-  仓库没有 4096 packed context 的文档级 attention mask、WSD
-  调度、增量 KV 解码；这些必须在论文级复现中补上。
+- 默认仍是原型规模（top-2/8 专家、128 上下文），因为延迟合并实验
+  需要单机可运行；论文规模的运行必须显式使用 `--paper-cell`，否则
+  `paper_fidelity.architecture_faithful=false`。
+- 已补上：`--paper-cell` 的 32 格预设（附录 A 的 H/L/专家/top-8）、
+  4096 packed context 的文档级 segment attention mask、WSD 调度与
+  六个分支点；这些由 `paper_fidelity.protocol_checks` 逐项核对。
+- 仍有限制：增量 KV 解码与 DCLM/MMLU 官方评测管线未实现。
 
-复现论文口径的最小命令骨架（需要相应算力）：
+复现论文口径的最小命令（推荐预设；需要相应算力）：
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_base_100m_s85 \
+  --paper-cell 100M:85 --paper-arch base --paper-protocol \
+  --group-separator '\n\n' --hypothesis "论文 Baseline 100M S≈85%" --rq RQ1
+
+python experiment.py --data corpus.txt --out runs/paper_smelt_100m_s85 \
+  --paper-cell 100M:85 --paper-arch smelt --paper-protocol \
+  --group-separator '\n\n' --hypothesis "论文 SMELT 100M S≈85%" --rq RQ1
+```
+
+手工等价骨架（供核对推导量；不推荐，容易漏掉 KV/GQA/文档 mask）：
 
 ```bash
 python experiment.py --data corpus.txt --mode base --top-k 8 \

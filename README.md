@@ -7,7 +7,7 @@
 
 ## 📖 项目简介
 
-SMELT-ISR 是基于 [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers Loop Twice) 架构的路由改进实验项目。仓库同时提供论文的未循环 MoE 基线 `base`、SMELT 基线 `smelt`（middle 循环两次、循环区域残差按 1/r 缩放）以及延迟合并方案 A/B。**默认配置是小规模原型，不是论文 100M–1.6B/top-8/4096 上下文的复现**；`config.json` 的 `paper_fidelity` 会逐项列出偏离项。
+SMELT-ISR 是基于 [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers Loop Twice) 架构的路由改进实验项目。仓库同时提供论文的未循环 MoE 基线 `base`、SMELT 基线 `smelt`（middle 循环两次、循环区域残差按 1/r 缩放）以及延迟合并方案 A/B。**默认配置是小规模原型**；要复现论文附录 A 的网格单元，用 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`（见「论文口径与复现边界」），`config.json` 的 `paper_fidelity` 会逐项给出 `architecture_faithful` / `protocol_faithful` / `budget_audit`。
 
 原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
 1. **第一轮路由后不合并**：Top-$k_1$ 专家的输出保留为独立分支，不进行求和或拼接。
@@ -300,17 +300,49 @@ python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
 
 ### 论文口径与复现边界
 
-- `base` 是论文的未循环 MoE 基线；`smelt` 是循环两次的 SMELT。论文要求
-  top-8、GQA、4096 packed context、循环区域 1/r 残差缩放，并把
-  FLOPs / 总参数 / KV cache 三者共同匹配。本仓库默认是小规模原型；
-  `config.json` 的 `paper_fidelity` 会列出 `top_k_8`、`gqa`、
-  `context_4096` 等检查项，存在偏离时结论只能表述为「SMELT 风格架构」。
-- `--n-kv-heads` 控制 GQA；`--residual-scaling paper`（默认）实现循环
-  区域 1/r；`--budget-match smelt` 按完整计算图核对预算；
-  `measure_efficiency` 记录 `kv_cache_bytes_per_token`（容量估计，
-  增量 KV 解码尚未实现）。
-- 4096 上下文、文档级 attention mask、WSD 调度与增量解码仍是未实现项，
-  不能把当前结果直接等同于论文复现。
+本仓库现在提供论文 arXiv:2609.01343v1 的**显式复现入口**，默认的小规模
+实验（`B`/`A` 延迟合并）仍保持原型规模，两者不能混为一谈。
+
+**一条命令复现附录 A 的某个网格单元**（H、L、专家数、top-8、循环层位置、
+1/r 残差、4096 上下文、GQA/KV cache 匹配都由预设给出）：
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
+  --paper-cell 200M:95 --paper-arch smelt \
+  --paper-protocol --group-separator '\n\n' \
+  --hypothesis "论文 SMELT 200M S≈95% 单元的验证损失" --rq RQ1
+```
+
+- `--paper-cell SCALE:SPARSITY`：从附录 A 的 Baseline/SMELT 两表取
+  H、L、专家总数与 top-8；共 4 规模 × 4 稀疏度 × 2 架构 = 32 个单元。
+  显式冲突的 `--d-model` 等参数会被拒绝，避免「看起来按论文配置、
+  实际被命令行改动」。
+- 论文未披露的 head 维度、KV 头数与专家中间维由固定规则推导（head_dim
+  接近 64、GQA 匹配 KV cache、总非 embedding 参数对齐），推导值与
+  「实测 vs 论文目标」写入 `config.json` 的 `paper_fidelity.budget_audit`。
+- `--paper-protocol` 套用 3.1 节协议：WSD 调度（`--lr-schedule wsd`）、
+  全局 batch 256、稳定期 196 075 步、4096 packed context 的文档级
+  segment attention mask（`--document-masks`，由 `--group-separator`
+  标注文档边界），并在 10k/20k/50k/100k/150k/196075 六个分支点保存
+  `step_<N>.pt`。分支实验从分支点 `--resume`，显式给出
+  `--wsd-stable-steps <分支点> --steps <分支点+9537>` 即按 3.1 节的
+  10B-token cosine decay 续跑。
+- `paper_fidelity` 分成两层：`architecture_faithful`（附录 A 的结构 +
+  top-8/GQA/4096/1-r/循环位置）与 `protocol_faithful`（3.1 节协议），
+  两者都通过才是 `is_full_reproduction=true`。`budget_audit` 单独报告
+  FLOPs / 总参数 / KV cache / S 的实测值与论文目标的偏差——附录 A 的
+  参数化来自未公开 family，公开实现不能保证逐位数值相同，存在预算
+  偏差时不能声称数值复现，只能声称 recipe 复现。
+- 学习率、warmup、weight decay、AdamW betas、均衡损失系数、初始化与
+  预训练语料论文未披露；它们沿用本仓库默认值并列入 `paper_fidelity.undisclosed`。
+- 仍未实现：增量 KV 解码、DCLM Core / DCLM Completion / MMLU 官方
+  评测管线（需要外部基准与 22 个任务的数据）。这些不影响
+  `architecture_faithful` / `protocol_faithful` 的判定，但意味着
+  **验证损失之外的论文下游结论不能在本仓库内直接复现**。
+- 仓库同时保留 `--n-kv-heads`（任意 GQA 比例，非整除时按
+  floor(i·n_kv/n_heads) 均匀映射）、`--residual-scaling paper`（默认，
+  循环区域 1/r）、`--budget-match smelt`（完整计算图核对）与
+  `measure_efficiency` 的 `kv_cache_bytes_per_token`（容量估计）。
 
 ### 机制对照与确证流程
 

@@ -30,6 +30,44 @@ This structure explores whether delayed merging improves the expressiveness of e
 - **Complete training foundation**: resume from checkpoints, gradient clipping, load-balancing loss, LR scheduling, and detailed experiment metrics.
 - **Controlled comparisons and statistical reliability**: every run records a comparison protocol (optimizer, LR schedule, training steps, data augmentation, data fingerprint, early-stop/AMP/device numerics, ...); `--compare` verifies that everything except the declared experimental factors is identical and detects duplicate-seed pseudo-replication; `--seeds` runs multiple random seeds and reports Mean ± Std with significance tests; `--suite-ablation` runs the (1+N)×2 full-factorial ablation (covering schemes A and B by default) and checks coverage automatically.
 
+## 📐 Paper reproduction (arXiv:2609.01343v1)
+
+The repository ships an explicit reproduction path for the paper's 4×4×2 grid
+(4 scales × 4 compute-equivalent sparsity levels × `base`/`smelt`); the default
+small-scale `B`/`A` experiments are prototypes and are *not* the paper config.
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
+  --paper-cell 200M:95 --paper-arch smelt \
+  --paper-protocol --group-separator '\n\n' \
+  --hypothesis "paper SMELT 200M S~95% validation loss" --rq RQ1
+```
+
+- `--paper-cell SCALE:SPARSITY` takes H, L, total experts, top-8 and the loop
+  layout (layers `3–7`, `4–9`, `6–15`, `8–22` for L=10/12/20/30) from
+  Appendix A. Conflicting `--d-model` and friends are rejected.
+- Head geometry / KV heads / expert intermediate width are not disclosed by the
+  paper; they are derived by a fixed rule (head_dim≈64, GQA matched to the
+  reported KV-cache ratio, total non-embedding params matched within 1%). The
+  derived values and the measured-vs-paper budget deviations are written to
+  `paper_fidelity.budget_audit` in `config.json`.
+- `--paper-protocol` applies §3.1: WSD schedule (`--lr-schedule wsd`), global
+  batch 256, 196,075 stable steps, 4096-token packed contexts with
+  document-level segment attention masks (via `--group-separator`), and branch
+  checkpoints at 10k/20k/50k/100k/150k/196075. A decay branch resumes from
+  `step_<N>.pt` with `--wsd-stable-steps <N> --steps <N+9537>`.
+- `paper_fidelity` separates `architecture_faithful` (Appendix A structure +
+  top-8/GQA/4096/1-r/loop placement) from `protocol_faithful` (§3.1 protocol);
+  `is_full_reproduction` requires both. Budget numbers are reported honestly:
+  the paper's parameterisation comes from a proprietary family, so a public
+  implementation cannot claim bit-identical budgets.
+- Undisclosed in the paper: learning rate, warmup, weight decay, AdamW betas,
+  load-balance coefficient, initialisation and pretraining corpus. They stay at
+  this repository's defaults and are listed in `paper_fidelity.undisclosed`.
+- Not implemented: incremental KV decoding and the DCLM Core / DCLM Completion /
+  MMLU evaluation pipelines. Downstream claims beyond validation loss therefore
+  cannot be reproduced inside this repository.
+
 ## 🛠️ Requirements
 
 - Python 3.10+
