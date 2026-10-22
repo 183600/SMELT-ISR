@@ -20187,15 +20187,9 @@ def bad_case_comparison_report(
         for name in category_names:
             count = int(counts.get(name) or 0)
             category_counts[name] += count
-            share = shares.get(name)
-            if (
-                isinstance(share, (int, float))
-                and not isinstance(share, bool)
-                and math.isfinite(float(share))
-            ):
-                category_share_by_run[name].append(
-                    float(share)
-                )
+            share = _finite_float(shares.get(name))
+            if share is not None:
+                category_share_by_run[name].append(share)
 
         pairs = row.get("bad_case_top_confusions") or []
         seen_pairs = set()
@@ -41955,14 +41949,12 @@ def write_run_config(
                 # equivalence_margin 的 CLI 默认值非 None，不能
                 # 套用上面的「当前值为空才保留」规则：否则续跑
                 # 会把原运行的非默认预注册界覆盖成默认值。
-                previous_margin = previous_prereg.get(
-                    "equivalence_margin"
+                previous_margin = _finite_float(
+                    previous_prereg.get("equivalence_margin")
                 )
                 if (
-                    isinstance(previous_margin, (int, float))
-                    and not isinstance(previous_margin, bool)
-                    and math.isfinite(float(previous_margin))
-                    and float(previous_margin) > 0.0
+                    previous_margin is not None
+                    and previous_margin > 0.0
                     and current_prereg.get("equivalence_margin")
                     != previous_margin
                 ):
@@ -65267,15 +65259,13 @@ def main():
         # 会被默认 0.01 静默覆盖原来的非默认预注册界。这里按
         # 检查点恢复，保证 config.json 与对比期的预注册核对仍
         # 使用原运行事先声明的口径。
-        saved_equivalence_margin = saved_args.get(
-            "equivalence_margin"
+        saved_equivalence_margin = _finite_float(
+            saved_args.get("equivalence_margin")
         )
         if (
-            isinstance(saved_equivalence_margin, (int, float))
-            and not isinstance(saved_equivalence_margin, bool)
-            and math.isfinite(float(saved_equivalence_margin))
-            and float(saved_equivalence_margin) > 0.0
-            and float(saved_equivalence_margin)
+            saved_equivalence_margin is not None
+            and saved_equivalence_margin > 0.0
+            and saved_equivalence_margin
             != args.equivalence_margin
         ):
             print(
@@ -65284,9 +65274,7 @@ def main():
                 f"{saved_equivalence_margin} "
                 "(等价界是训练前预注册的一部分)"
             )
-            args.equivalence_margin = float(
-                saved_equivalence_margin
-            )
+            args.equivalence_margin = saved_equivalence_margin
 
         # 恢复后的 TF32 状态可能来自检查点，重新应用。
         configure_cuda_precision(args.allow_tf32)
@@ -67009,16 +66997,11 @@ def main():
     # resume 时从检查点继承此前峰值，取本段与历史的最大值，
     # 避免续跑把原运行的峰值洗掉。
     prior_training_peak_mb: Optional[float] = None
-    saved_peak = saved_numerical_state.get(
-        "training_peak_memory_mb"
+    saved_peak = _finite_float(
+        saved_numerical_state.get("training_peak_memory_mb")
     )
-    if (
-        isinstance(saved_peak, (int, float))
-        and not isinstance(saved_peak, bool)
-        and math.isfinite(float(saved_peak))
-        and float(saved_peak) >= 0.0
-    ):
-        prior_training_peak_mb = float(saved_peak)
+    if saved_peak is not None and saved_peak >= 0.0:
+        prior_training_peak_mb = saved_peak
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 

@@ -5407,6 +5407,39 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_bad_case_comparison_skips_out_of_range_shares(self):
+        huge = 10 ** 400
+        category = sorted(experiment._BAD_CASE_CATEGORIES)[0]
+        report = experiment.bad_case_comparison_report([
+            {
+                "bad_case_available": True,
+                "bad_case_tokens_evaluated": 10,
+                "bad_case_wrong_tokens": 2,
+                "bad_case_error_category_counts": {
+                    category: 2,
+                },
+                "bad_case_error_category_shares": {
+                    category: huge,
+                },
+            },
+            {
+                "bad_case_available": True,
+                "bad_case_tokens_evaluated": 10,
+                "bad_case_wrong_tokens": 2,
+                "bad_case_error_category_counts": {
+                    category: 2,
+                },
+                "bad_case_error_category_shares": {
+                    category: 0.2,
+                },
+            },
+        ])
+        self.assertEqual(report["n_runs_with_bad_cases"], 2)
+        self.assertEqual(
+            report["error_category_counts"][category], 4
+        )
+        self.assertNotIn(category, report["category_share_ranges"])
+
     def test_imbalance_advisory_tolerates_out_of_range_rates(self):
         huge = 10 ** 400
         report = experiment.imbalance_metric_advisory(
