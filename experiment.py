@@ -14018,7 +14018,19 @@ def _sparkline(values, width=48):
     width<=0 返回空串；width=1 时只保留最后一个点（最近一次
     观测），避免降采样的端点插值除以 width-1。
     """
-    values = [float(value) for value in values]
+    # 记录里的数值可能来自 JSON（含超出 float 范围的整数）或
+    # 已污染的曲线；无法得到有限浮点时返回空图，而不是让
+    # float()/int(nan) 在展示路径抛异常。
+    numeric: List[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return ""
+        if not math.isfinite(number):
+            return ""
+        numeric.append(number)
+    values = numeric
 
     if not values or width <= 0:
         return ""

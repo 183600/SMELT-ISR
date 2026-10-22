@@ -5407,6 +5407,17 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_sparkline_handles_out_of_range_and_nonfinite_values(self):
+        huge = 10 ** 400
+        self.assertEqual(experiment._sparkline([huge]), "")
+        self.assertEqual(
+            experiment._sparkline([1.0, float("nan")]), ""
+        )
+        self.assertEqual(
+            experiment._sparkline([1.0, float("inf")]), ""
+        )
+        self.assertEqual(len(experiment._sparkline([1, 2, 3])), 3)
+
     def test_bad_case_comparison_skips_out_of_range_shares(self):
         huge = 10 ** 400
         category = sorted(experiment._BAD_CASE_CATEGORIES)[0]
