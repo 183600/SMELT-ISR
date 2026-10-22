@@ -4186,6 +4186,55 @@ class ArtifactManifestTests(unittest.TestCase):
                 experiment._ARTIFACT_MANIFEST_MAX_ENTRIES = previous
             self.assertIn("上限", str(raised.exception))
 
+    def test_manifest_expected_sha_pin_detects_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            manifest_path = experiment.write_artifact_manifest(root)
+            pinned = experiment._sha256_file(manifest_path)
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "experiment.py",
+                    "--verify-manifest",
+                    str(root),
+                    "--expect-manifest-sha256",
+                    pinned,
+                ]
+                with contextlib.redirect_stdout(
+                    io.StringIO()
+                ) as out:
+                    experiment.main()
+                self.assertIn(
+                    '"manifest_sha256_matches_expected": true',
+                    out.getvalue(),
+                )
+
+                # 清单被整体替换但内部仍然自洽：只有外部记录的
+                # 指纹能发现替换，必须判失败。
+                sys.argv = [
+                    "experiment.py",
+                    "--verify-manifest",
+                    str(root),
+                    "--expect-manifest-sha256",
+                    "0" * 64,
+                ]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        experiment.main()
+                self.assertEqual(raised.exception.code, 1)
+            finally:
+                sys.argv = old_argv
+
+            error = experiment.manifest_mode_error(
+                argparse.Namespace(
+                    write_manifest=None,
+                    verify_manifest=None,
+                    verify_manifest_strict=False,
+                    expect_manifest_sha256="0" * 64,
+                )
+            )
+            self.assertIn("--verify-manifest", error)
+
     def test_manifest_mode_rejects_conflicting_entries(self):
         both = experiment.manifest_mode_error(
             argparse.Namespace(
@@ -4265,6 +4314,266 @@ class ArtifactManifestTests(unittest.TestCase):
                     "--verify-manifest",
                     str(root),
                 ]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        experiment.main()
+                self.assertEqual(raised.exception.code, 1)
+            finally:
+                sys.argv = old_argv
+
+
+class EnvironmentSnapshotTests(unittest.TestCase):
+    """环境身份：关键依赖/编译选项可核对，完整包清单可审计。"""
+
+    def test_snapshot_is_stable_and_contains_critical_packages(self):
+        first = experiment.build_environment_snapshot()
+        second = experiment.build_environment_snapshot()
+        self.assertEqual(first["schema"], "smelt-isr/environment/v1")
+        self.assertEqual(
+            first["environment_id"], second["environment_id"]
+        )
+        self.assertEqual(len(first["environment_id"]), 64)
+        names = {
+            item["name"]
+            for item in first["packages"]["all"]
+        }
+        self.assertIn("torch", names)
+        critical_names = {
+            item["name"]
+            for item in first["packages"]["critical"]
+        }
+        self.assertIn("torch", names)
+        self.assertEqual(
+            critical_names,
+            {
+                name
+                for name in names
+                if experiment._is_critical_distribution(name)
+            },
+        )
+        self.assertEqual(
+            first["packages"]["all"],
+            sorted(
+                first["packages"]["all"],
+                key=lambda item: item["name"],
+            ),
+        )
+
+    def test_per_run_hashseed_does_not_change_environment_identity(self):
+        snapshot = experiment.build_environment_snapshot()
+        altered = json.loads(json.dumps(snapshot))
+        altered["determinism"]["pythonhashseed_at_start"] = "12345"
+        # 套件子进程按种子固定不同的 PYTHONHASHSEED；它属于运行
+        # 参数而不是安装环境，不能让同一环境的多种子套件被
+        # --compare 误报为环境不同。
+        recalculated = experiment._canonical_json_sha256(
+            experiment._environment_identity_payload(altered)
+        )
+        self.assertEqual(
+            recalculated, snapshot["environment_id"]
+        )
+
+    def test_full_package_drift_does_not_change_critical_identity(self):
+        snapshot = experiment.build_environment_snapshot()
+        altered = json.loads(json.dumps(snapshot))
+        altered["packages"]["all"].append({
+            "name": "unrelated-tool",
+            "version": "1.0",
+        })
+        altered["packages"]["all_sha256"] = (
+            experiment._canonical_json_sha256(
+                altered["packages"]["all"]
+            )
+        )
+        # 非关键包不参与 environment_id：默认核对仍通过，
+        # 严格模式才把完整包清单漂移判为失败。
+        altered["environment_id"] = (
+            experiment._canonical_json_sha256(
+                experiment._environment_identity_payload(altered)
+            )
+        )
+        report = experiment.compare_environment_snapshots(
+            snapshot, altered
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertFalse(report["strict_ok"])
+        self.assertTrue(report["all_packages_match"] is False)
+        self.assertEqual(
+            [item["name"] for item in report[
+                "package_differences"
+            ]["added"]],
+            ["unrelated-tool"],
+        )
+
+    def test_critical_package_change_breaks_identity(self):
+        snapshot = experiment.build_environment_snapshot()
+        altered = json.loads(json.dumps(snapshot))
+        critical = altered["packages"]["critical"]
+        self.assertTrue(critical)
+        name = critical[0]["name"]
+        critical[0]["version"] = "0.0.0-drift"
+        altered["packages"]["all"] = [
+            (
+                {**item, "version": "0.0.0-drift"}
+                if item["name"] == name
+                else item
+            )
+            for item in altered["packages"]["all"]
+        ]
+        altered["packages"]["all_sha256"] = (
+            experiment._canonical_json_sha256(
+                altered["packages"]["all"]
+            )
+        )
+        altered["packages"]["critical_sha256"] = (
+            experiment._canonical_json_sha256(critical)
+        )
+        altered["environment_id"] = (
+            experiment._canonical_json_sha256(
+                experiment._environment_identity_payload(altered)
+            )
+        )
+        report = experiment.compare_environment_snapshots(
+            snapshot, altered
+        )
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            report["critical_package_differences"]
+        )
+        self.assertTrue(
+            any(
+                item["path"].startswith("packages")
+                for item in report["runtime_differences"]
+            ),
+            report["runtime_differences"],
+        )
+
+    def test_check_environment_reads_file_and_config_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            snapshot = experiment.build_environment_snapshot()
+            environment_path = root / "environment.json"
+            environment_path.write_text(
+                json.dumps(snapshot), encoding="utf-8"
+            )
+            report = experiment.check_environment_snapshot(
+                environment_path
+            )
+            self.assertTrue(report["ok"], report)
+            self.assertTrue(report["strict_ok"])
+
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({
+                    "environment": {
+                        "schema": snapshot["schema"],
+                        "environment_id": snapshot[
+                            "environment_id"
+                        ],
+                        "file": "environment.json",
+                        "file_sha256": experiment._sha256_file(
+                            environment_path
+                        ),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            report = experiment.check_environment_snapshot(
+                config_path
+            )
+            self.assertTrue(report["ok"], report)
+
+            # config 记录的摘要必须能发现 environment.json 被替换：
+            # 否则 --check-environment 会拿一份被篡改的“期望环境”
+            # 去比较，核对本身失去意义。
+            environment_path.write_text(
+                json.dumps({"schema": snapshot["schema"]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                experiment.check_environment_snapshot(config_path)
+
+    def test_write_environment_record_keeps_original_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = experiment.build_environment_snapshot()
+            current = json.loads(json.dumps(original))
+            current["environment_id"] = "1" * 64
+            record = experiment.write_run_environment_record(
+                root,
+                {"environment": current},
+                {"environment": original},
+            )
+            self.assertEqual(
+                record["environment_id"],
+                original["environment_id"],
+            )
+            self.assertTrue(
+                record["environment_changed_since_start"]
+            )
+            self.assertEqual(
+                record["resume_environment_id"], "1" * 64
+            )
+            on_disk = json.loads(
+                (root / "environment.json").read_text()
+            )
+            self.assertEqual(
+                on_disk["environment_id"],
+                original["environment_id"],
+            )
+            self.assertEqual(
+                record["file_sha256"],
+                experiment._sha256_file(
+                    root / "environment.json"
+                ),
+            )
+
+    def test_environment_mode_rejects_training_arguments(self):
+        strict_only = experiment.environment_mode_error(
+            argparse.Namespace(
+                check_environment=None,
+                check_environment_strict=True,
+            )
+        )
+        self.assertIn("--check-environment", strict_only)
+
+        conflict = experiment.environment_mode_error(
+            argparse.Namespace(
+                check_environment="run",
+                check_environment_strict=False,
+                data="corpus.txt",
+            )
+        )
+        self.assertIn("--data", conflict)
+
+        ok = experiment.environment_mode_error(
+            argparse.Namespace(
+                check_environment="run",
+                check_environment_strict=False,
+            )
+        )
+        self.assertIsNone(ok)
+
+    def test_environment_cli_checks_and_fails_on_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "environment.json"
+            snapshot = experiment.build_environment_snapshot()
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "experiment.py",
+                    "--check-environment",
+                    str(path),
+                ]
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    experiment.main()
+                self.assertIn("[env] OK", out.getvalue())
+
+                snapshot["environment_id"] = "0" * 64
+                path.write_text(
+                    json.dumps(snapshot), encoding="utf-8"
+                )
                 with contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaises(SystemExit) as raised:
                         experiment.main()

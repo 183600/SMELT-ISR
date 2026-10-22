@@ -1005,6 +1005,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   下判失败。校验拒绝绝对路径、`..` 与符号链接穿越；清单不含
   自身，避免哈希自指；生成与校验都会报告清单自身的 SHA-256，
   供外部归档记录锚定。清单是快照，续跑或补测后必须重新生成。
+- 环境身份不只看 Python/torch/NumPy 版本：每次运行写
+  `environment.json`（`smelt-isr/environment/v1`），记录关键
+  依赖精确版本、PyTorch 编译配置、CPU 指令集指纹、GPU
+  型号/算力、NVIDIA 驱动、TF32/确定性/线程开关，并给出
+  规范化 `environment_id`。`--check-environment RUN_DIR`
+  在重跑前核对（默认只要求关键环境一致；
+  `--check-environment-strict` 还要求完整包清单一致）。
+  `config.json` 顶层的 `environment` 是指向该文件的摘要
+  （含 SHA-256），完整快照在 `run_metadata.environment`；
+  `resume` 保留最初运行的环境，当前环境变化只额外记录，
+  不覆盖归档快照。
 
 ## 训练入口
 

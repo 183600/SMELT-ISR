@@ -751,6 +751,79 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
   偏小 25% 就会让所需种子数明显上升，冻结前应查看
   `power_sensitivity` 与 `binding_contrast`。
 
+## 31. 可复现性与工程规范：环境身份与重跑前核对（本轮补充）
+
+**判定：原实现记录了 Python/torch/NumPy 版本与部分设备字段，
+但「同一份代码 + 同一份数据」仍可能在另一个环境下得到不同
+数值：cuBLAS/cuDNN/MKL/Triton 版本、PyTorch 编译选项、CPU
+指令集、GPU 算力与驱动版本、TF32/线程/确定性开关都会改变
+浮点归约顺序。原归档清单也只把 Python/torch/NumPy 版本作为
+信息字段，无法在重跑前回答「现在这套环境是不是产出结果的那
+一套」。**
+
+**已修正：**
+
+- 新增 `build_environment_snapshot()`，生成
+  `smelt-isr/environment/v1` 快照：解释器实现/版本/构建、
+  libc、CPU 型号与指令集指纹、PyTorch 版本/编译配置/并行
+  信息、CUDA/cuDNN/MKLDNN、GPU 型号/算力/显存、NVIDIA
+  驱动版本、TF32/确定性/线程开关，以及全部已安装发行包的
+  规范名与精确版本。`packages.critical` 单独列出直接或间接
+  决定数值内核的子集。
+- 快照的 `environment_id` 只对关键字段（python/platform/
+  cpu/torch/device/driver/determinism + critical packages）做
+  规范化 SHA-256：可执行文件路径、主机名、采集时间、设备
+  UUID 与每次运行按种子设置的 PYTHONHASHSEED 等不进入身份，
+  避免同一套软件环境因虚拟环境路径或种子不同被误判。完整
+  包清单仍保存，供人工重建环境。
+- 每次运行把完整快照写入 `run_metadata.environment`，并单独
+  原子写 `environment.json`；`config.json` 顶层 `environment`
+  记录 `environment_id`、文件名与文件 SHA-256。`resume` 时
+  `environment.json` 保留最初运行的环境；若当前环境已变，
+  摘要写入 `resume_environment_id` 与
+  `environment_changed_since_start=true`，不静默覆盖。
+- 新增只读 `--check-environment RUN_DIR_OR_JSON`：从
+  `environment.json` 或 `config.json` 读取归档快照，与当前
+  环境比较；默认要求 `environment_id` 一致，
+  `--check-environment-strict` 还要求完整包清单逐项一致。
+  不一致时以非零状态码退出，并打印运行时字段与包版本差异；
+  入口拒绝与训练/对比/预注册参数混用。读取
+  `config.json` 摘要时会核对 `environment.json` 的 SHA-256，
+  防止用被替换的“期望环境”通过核对。
+- `environment_id` 加入 `--compare` 的可复现性硬核对键与
+  `metrics.jsonl` 首行身份字段：同一对比中的运行若产自不同
+  关键环境，报告明确列出，而不是只比较 Python/torch 两个
+  版本号。
+- `artifact_manifest.json` 的生成环境记录 `environment_id` 与
+  完整包清单指纹，`run` 摘要带出归档运行的
+  `environment_id` / `environment_file_sha256` /
+  `environment_changed_since_start`；`--verify-manifest` 另
+  报告清单生成环境与当前进程环境是否一致（信息字段，不参与
+  归档完整性判定，因为跨机器解压校验时环境不同是预期情况）。
+- 新增 `--expect-manifest-sha256 HEX`（配合
+  `--verify-manifest`）：把写入时打印、并记录到 DOI/归档元数据
+  的清单指纹传入校验；清单被整体替换时，内部文件仍可能全部
+  自洽，只有外部锚点能发现替换。该值参与最终 `ok` 判定，
+  格式不是 64 位十六进制时在只读入口直接拒绝。
+- 新增回归测试：快照跨进程稳定、完整包漂移不改变关键身份、
+  关键包变化破坏身份、`config.json` 摘要的文件哈希校验、
+  只读入口拒绝训练参数、CLI 一致/不一致的退出码。
+
+**仍有限制：**
+
+- `environment_id` 不覆盖 CPU 微码、BIOS、GPU 固件、内核
+  调度、集群负载或共享缓存；即使 id 相同，跨机器仍可能因
+  浮点归约顺序产生微小差异。它回答「是不是同一套数值环境」，
+  不保证逐位相同。
+- NVIDIA 驱动版本通过 `nvidia-smi` 读取；命令不可用或权限
+  受限时记为 `null`，此时不能把「无法读取」当成「驱动一致」。
+- 完整包清单包含与数值无关的包；默认核对只要求关键环境
+  一致，`--check-environment-strict` 才要求逐项一致。冻结
+  正式实验时建议同时保存 `environment.json` 与
+  `pip freeze`/容器镜像摘要，而不是只依赖 `environment_id`。
+- 快照是运行开始时的状态；训练中途升级依赖或替换驱动不会
+  被自动检测，必须在运行结束后重新生成并与归档比较。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /

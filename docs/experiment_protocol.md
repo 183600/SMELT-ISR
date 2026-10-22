@@ -317,7 +317,8 @@ python experiment.py --data corpus.txt --out runs/confirm \
 - `git archive` 的源码包 + commit SHA + `script_sha256`；
 - 全部运行的 `config.json`、`metrics.jsonl`、`best.pt`（如允许）、
   `comparison_analysis.json`、`routing*.json`、失败运行目录；
-- 预注册文件、最终报告、分析脚本、依赖版本与环境信息；
+- 预注册文件、最终报告、分析脚本、依赖版本与环境信息
+  （每个运行目录的 `environment.json`，见第 7 节）；
 - 测试集访问账本与归档校验和（SHA-256）。
 
 所有训练/评估进程结束后，为每个最终运行目录生成可机读清单：
@@ -325,11 +326,15 @@ python experiment.py --data corpus.txt --out runs/confirm \
 ```bash
 python experiment.py --write-manifest runs/final/A
 python experiment.py --verify-manifest runs/final/A --verify-manifest-strict
+# 可选：把 write 打印的清单指纹作为外部锚点，拒绝整体替换
+python experiment.py --verify-manifest runs/final/A \
+  --verify-manifest-strict --expect-manifest-sha256 <清单 SHA-256>
 ```
 
 `artifact_manifest.json` 逐文件记录相对路径、字节数、SHA-256
 与符号链接目标，并从 `config.json` 摘出 `script_sha256`、
-`git_commit`、数据/切分指纹、预注册文件指纹与
+`environment_id`、`environment_file_sha256`、`git_commit`、
+数据/切分指纹、预注册文件指纹与
 `comparison_protocol_sha256`。校验器拒绝绝对路径、`..` 与
 非规范相对路径；默认把清单外新增文件列为 `untracked`（可能
 是后续日志），`--verify-manifest-strict` 下才算失败。清单是
@@ -338,7 +343,64 @@ python experiment.py --verify-manifest runs/final/A --verify-manifest-strict
 才能证明传输过程没有改动内容。`--write-manifest` 会打印清单
 自身的 SHA-256，`--verify-manifest` 也会在报告中返回
 `manifest_sha256`；把该指纹记入外部归档记录/DOI 元数据，
-才能把「清单未被替换」也纳入审计链。
+并在复验时用 `--expect-manifest-sha256` 传入，才能把
+「清单未被替换」也纳入审计链：只校验清单内文件无法发现
+一份内容自洽、但整体被替换的清单。
 
 仓库内只保留代码与文档；结果放外部归档，避免仓库体积与
 「清理脚本删除审计记录」的冲突。
+
+## 7. 环境快照与重跑前核对
+
+只记录 Python/torch/NumPy 版本不足以复现浮点结果：cuBLAS/
+cuDNN/MKL/Triton 的版本、PyTorch 编译选项、CPU 指令集、GPU
+算力、驱动版本与线程/确定性开关都会改变归约顺序。每次运行
+现在额外写出 `environment.json`（`smelt-isr/environment/v1`）：
+
+- `python` / `platform` / `cpu` / `torch` / `device` / `driver` /
+  `determinism`：解释器构建、libc、CPU 指令集指纹、PyTorch
+  编译配置、设备型号/算力、NVIDIA 驱动版本、TF32/确定性/线程
+  开关；
+- `packages.all`：已安装发行包的规范名与精确版本；
+  `packages.critical`：其中直接或间接决定数值内核的子集
+  （torch / numpy / triton / nvidia-* / cuda-* / cudnn / nccl /
+  mkl / intel-* / openmp）；
+- `environment_id`：`python`、`platform`、`cpu`、`torch`、
+  `device`、`driver`、`determinism` 与 `packages.critical` 的
+  规范化 SHA-256。同一环境重复构造应得到同一 id；换关键依赖、
+  编译选项、设备或确定性开关会改变它。每次运行按种子设置的
+  `PYTHONHASHSEED` 不进入该指纹（它属于运行参数，套件各子
+  进程本就不同），但仍保留在完整快照中供逐运行核对。
+
+`config.json` 的 `run_metadata.environment` 保存完整快照，
+顶层 `environment` 只保存 `environment_id`、`environment.json`
+文件名与文件 SHA-256；两者由同一份快照生成，避免出现两个
+不一致的版本。`resume` 时 `environment.json` 保留**最初运行**
+的环境，当前环境若已变化，摘要额外记录
+`resume_environment_id` 与 `environment_changed_since_start=true`。
+
+重跑、续跑或换机器前先核对：
+
+```bash
+python experiment.py --check-environment runs/final/A
+python experiment.py --check-environment runs/final/A --check-environment-strict
+```
+
+第一个命令只要求 `environment_id` 一致（关键数值环境相同）；
+第二个还要求完整包清单逐项一致。命令以非零状态码退出表示
+不一致，并打印运行时字段与包版本差异；`--check-environment`
+也可以直接指向 `environment.json` 或 `config.json`。它是只读
+入口，不能与训练/对比/预注册参数同时使用。
+
+归档清单会把 `environment.json` 当作普通文件逐字节校验，并在
+`run` 摘要中带出 `environment_id`、`environment_file_sha256`
+与是否在续跑中换过环境；`--verify-manifest` 另报告清单生成
+环境与当前进程环境是否一致（信息字段，不参与归档完整性判定）。
+
+限制：`environment_id` 覆盖软件栈与设备/驱动，**不覆盖** CPU
+微码、BIOS、GPU 固件、集群负载或内核调度；即使 id 相同，
+跨机器仍可能因浮点归约顺序产生微小差异。`--check-environment`
+回答「是不是同一套数值环境」，不保证逐位相同；逐位复现仍应
+以 `--self-test`、`--sanity-repeats` 与同机同种子的双跑为准。
+完整包清单包含与数值无关的包，默认核对故意不因此失败；
+需要完全一致的 Python 环境时才用 `--check-environment-strict`。

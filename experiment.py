@@ -21279,6 +21279,9 @@ SINGLE_FACTOR_DESIGN_KEYS: Tuple[str, ...] = (
 # 未核对，不虚报一致。
 _REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
     "script_sha256",
+    # 完整环境身份（关键依赖 + 编译选项 + 设备 + 确定性开关）。
+    # 旧运行没有该字段时保持「未核对」，不虚报一致。
+    "environment_id",
     "python_version",
     "torch_version",
     "cuda_version",
@@ -39649,6 +39652,939 @@ def _cpu_model_name() -> Optional[str]:
     return platform.processor() or platform.machine() or None
 
 
+# ============================================================
+# Runtime environment snapshot / reproducibility check
+# ============================================================
+
+# environment.json：把「这次运行实际使用了哪套数值环境」变成
+# 可机读、可比较、可归档的记录。config.json 里只记 Python/torch/
+# NumPy 版本不足以复现浮点结果：cuBLAS/cuDNN/MKL/Triton 的版本、
+# PyTorch 编译选项、CPU 指令集与线程配置都会改变归约顺序。这里
+# 额外记录关键依赖的精确版本与运行时编译信息，并给出规范化
+# environment_id；--check-environment 可在重跑/续跑/换机器前核对。
+_ENVIRONMENT_SCHEMA = "smelt-isr/environment/v1"
+_ENVIRONMENT_FILENAME = "environment.json"
+_ENVIRONMENT_CONFIG_SCHEMA = "smelt-isr/run-config/v1"
+
+# 「关键依赖」：直接或间接决定数值内核的包。完整包清单也落盘，
+# 但 environment_id 只纳入这一子集，避免把 pip/setuptools 等与
+# 数值无关、且常随环境漂移的包算进严格身份。
+_ENVIRONMENT_CRITICAL_PREFIXES: Tuple[str, ...] = (
+    "torch",
+    "pytorch-",
+    "numpy",
+    "triton",
+    "nvidia-",
+    "cuda-",
+    "cudnn",
+    "nccl",
+    "mkl",
+    "intel-",
+    "openmp",
+)
+
+
+def _canonical_distribution_name(name: object) -> Optional[str]:
+    """PEP 503 规范化的发行包名；非法输入返回 None。"""
+    if not isinstance(name, str):
+        return None
+    value = re.sub(r"[-_.]+", "-", name.strip()).strip("-").lower()
+    return value or None
+
+
+def _is_critical_distribution(name: str) -> bool:
+    return any(
+        name == prefix.rstrip("-")
+        or name.startswith(prefix)
+        for prefix in _ENVIRONMENT_CRITICAL_PREFIXES
+    )
+
+
+def _installed_distributions() -> List[Dict[str, str]]:
+    """
+    返回已安装发行包的规范名与版本（按名字排序）。
+
+    环境记录不能因为某个包的元数据损坏而让训练失败：无法读取
+    的条目跳过，其余仍进入快照。同一规范名出现多份 dist-info
+    时取字典序最大的版本，保证结果稳定且不重复。
+    """
+    try:
+        from importlib import metadata
+    except ImportError:  # pragma: no cover - Python >= 3.8
+        return []
+
+    try:
+        distributions = list(metadata.distributions())
+    except Exception:
+        return []
+
+    versions: Dict[str, set] = {}
+    for dist in distributions:
+        try:
+            raw_name = (
+                dist.metadata.get("Name")
+                if dist.metadata is not None
+                else None
+            )
+            raw_version = dist.version
+        except Exception:
+            continue
+        name = _canonical_distribution_name(raw_name)
+        if name is None or raw_version is None:
+            continue
+        version = str(raw_version).strip()
+        if not version:
+            continue
+        versions.setdefault(name, set()).add(version)
+
+    return [
+        {
+            "name": name,
+            "version": sorted(versions[name])[-1],
+        }
+        for name in sorted(versions)
+    ]
+
+
+def _cpu_flags_digest() -> Dict[str, object]:
+    """记录 CPU 指令集指纹（影响 PyTorch 选用的内核）。"""
+    flags = set()
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("flags"):
+                    _, _, value = line.partition(":")
+                    flags.update(value.split())
+                    break
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    if not flags:
+        return {
+            "source": None,
+            "flags_sha256": None,
+            "flag_count": 0,
+        }
+    canonical = " ".join(sorted(flags))
+    return {
+        "source": "/proc/cpuinfo",
+        "flags_sha256": _sha256_text(canonical),
+        "flag_count": len(flags),
+    }
+
+
+def _torch_environment() -> Dict[str, object]:
+    """PyTorch 版本、编译选项与数值后端。"""
+    config_text = None
+    parallel_info = None
+    try:
+        config_text = str(torch.__config__.show())
+    except Exception:
+        pass
+    try:
+        parallel_info = str(torch.__config__.parallel_info())
+    except Exception:
+        pass
+    return {
+        "version": str(torch.__version__),
+        "git_version": getattr(torch.version, "git_version", None),
+        "cuda": getattr(torch.version, "cuda", None),
+        "cudnn": (
+            torch.backends.cudnn.version()
+            if torch.backends.cudnn.is_available()
+            else None
+        ),
+        "mkldnn": bool(torch.backends.mkldnn.is_available()),
+        "config_sha256": (
+            _sha256_text(config_text)
+            if config_text is not None
+            else None
+        ),
+        "parallel_info_sha256": (
+            _sha256_text(parallel_info)
+            if parallel_info is not None
+            else None
+        ),
+    }
+
+
+def _environment_device_info(
+    device: Optional[torch.device],
+) -> Dict[str, object]:
+    """设备类型/型号/算力；不记录 UUID 等会随会话变化的标识。"""
+    if device is None:
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    elif isinstance(device, str):
+        try:
+            device = torch.device(device)
+        except (RuntimeError, ValueError):
+            device = torch.device("cpu")
+
+    info: Dict[str, object] = {
+        "type": device.type,
+        "index": device.index,
+    }
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            properties = torch.cuda.get_device_properties(device)
+            info.update({
+                "name": torch.cuda.get_device_name(device),
+                "capability": (
+                    f"{properties.major}.{properties.minor}"
+                ),
+                "total_memory_mb": round(
+                    float(properties.total_memory) / (1024 ** 2),
+                    1,
+                ),
+                "multi_processor_count": getattr(
+                    properties, "multi_processor_count", None
+                ),
+            })
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    elif device.type == "mps":
+        info["name"] = "mps"
+    else:
+        info["name"] = _cpu_model_name()
+    return info
+
+
+@functools.lru_cache(maxsize=1)
+def _nvidia_driver_version() -> Optional[str]:
+    """
+    NVIDIA 驱动版本（若可用）。
+
+    CUDA runtime 版本相同而驱动不同，仍可能选择不同的内核实现。
+    这里只读取版本号，不依赖 pynvml；命令不可用时返回 None，
+    不把「无法读取」当成「没有差异」。
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    return None
+
+
+def _determinism_environment() -> Dict[str, object]:
+    """实际生效的确定性/线程开关。"""
+    return {
+        "deterministic_algorithms": (
+            torch.are_deterministic_algorithms_enabled()
+        ),
+        "deterministic_algorithms_warn_only": (
+            torch.is_deterministic_algorithms_warn_only_enabled()
+        ),
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cublas_workspace_config": os.environ.get(
+            "CUBLAS_WORKSPACE_CONFIG"
+        ),
+        "allow_tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "allow_tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "allow_fp16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul,
+            "allow_fp16_reduced_precision_reduction",
+            None,
+        ),
+        "allow_bf16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul,
+            "allow_bf16_reduced_precision_reduction",
+            None,
+        ),
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+        "pythonhashseed_at_start": _PYTHONHASHSEED_AT_START,
+    }
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return _sha256_text(
+        json.dumps(
+            _json_safe(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _environment_identity_payload(
+    snapshot: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    参与 environment_id 的字段：只保留决定数值结果的量。
+
+    可执行文件路径、主机名、采集时间、设备 UUID 等不进入身份，
+    否则同一套软件环境在同一台机器上换个虚拟环境路径就会被
+    误判为不可复现。
+    """
+    python = snapshot.get("python")
+    python = python if isinstance(python, dict) else {}
+    platform_info = snapshot.get("platform")
+    platform_info = (
+        platform_info if isinstance(platform_info, dict) else {}
+    )
+    cpu = snapshot.get("cpu")
+    cpu = cpu if isinstance(cpu, dict) else {}
+    torch_info = snapshot.get("torch")
+    torch_info = torch_info if isinstance(torch_info, dict) else {}
+    device = snapshot.get("device")
+    device = device if isinstance(device, dict) else {}
+    determinism = snapshot.get("determinism")
+    determinism = (
+        determinism if isinstance(determinism, dict) else {}
+    )
+    driver = snapshot.get("driver")
+    driver = driver if isinstance(driver, dict) else {}
+
+    packages = snapshot.get("packages")
+    critical: List[Dict[str, str]] = []
+    if isinstance(packages, dict):
+        raw_critical = packages.get("critical")
+        if isinstance(raw_critical, list):
+            critical = [
+                item
+                for item in raw_critical
+                if isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("version"), str)
+            ]
+
+    identity = {
+        "python": {
+            key: python.get(key)
+            for key in (
+                "implementation",
+                "version",
+                "compiler",
+                "build",
+            )
+        },
+        "platform": {
+            key: platform_info.get(key)
+            for key in (
+                "system",
+                "release",
+                "machine",
+                "libc",
+            )
+        },
+        "cpu": {
+            key: cpu.get(key)
+            for key in ("model", "flags_sha256")
+        },
+        "torch": {
+            key: torch_info.get(key)
+            for key in (
+                "version",
+                "git_version",
+                "cuda",
+                "cudnn",
+                "mkldnn",
+                "config_sha256",
+                "parallel_info_sha256",
+            )
+        },
+        "device": {
+            key: device.get(key)
+            for key in ("type", "name", "capability")
+        },
+        "driver": {
+            "nvidia": driver.get("nvidia"),
+        },
+        # PYTHONHASHSEED 是每次运行/每个种子显式设置的解释器
+        # 启动参数，不是安装环境的一部分：套件子进程会按种子
+        # 固定不同的值。若把它算进 environment_id，同一环境的
+        # 多种子套件会被误报为“环境不同”。完整快照仍保留它，
+        # 供逐运行核对随机化是否固定。
+        "determinism": {
+            key: value
+            for key, value in determinism.items()
+            if key != "pythonhashseed_at_start"
+        },
+        "packages": critical,
+    }
+    # 兼容只含少量字段的旧/手工快照：如果上面全是空值，退回
+    # 对整份快照（去掉时间与身份字段）做指纹，避免所有无效
+    # 快照共享同一个空对象哈希。
+    if not any(identity.values()):
+        return {
+            key: value
+            for key, value in snapshot.items()
+            if key not in ("captured_utc", "environment_id")
+        }
+    return identity
+
+
+def build_environment_snapshot(
+    device: Optional[torch.device] = None,
+) -> Dict[str, object]:
+    """
+    构造当前运行环境的规范化快照。
+
+    ``environment_id`` 是决定数值结果的关键依赖/编译选项/设备/
+    确定性开关的 SHA-256；完整包清单仍在 ``packages.all`` 中，
+    供人工审计与重建环境。快照本身不含时间以外的不确定值，
+    同一环境重复构造应得到同一 environment_id。
+    """
+    distributions = _installed_distributions()
+    critical = [
+        item
+        for item in distributions
+        if _is_critical_distribution(item["name"])
+    ]
+    cpu_model = _cpu_model_name()
+    cpu_flags = _cpu_flags_digest()
+    cpu = {
+        "model": cpu_model,
+        "count": os.cpu_count(),
+        "flags_sha256": cpu_flags["flags_sha256"],
+        "flag_count": cpu_flags["flag_count"],
+        "flags_source": cpu_flags["source"],
+    }
+    snapshot: Dict[str, object] = {
+        "schema": _ENVIRONMENT_SCHEMA,
+        "captured_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+            "compiler": platform.python_compiler(),
+            "build": list(platform.python_build()),
+            "executable": sys.executable,
+            "byteorder": sys.byteorder,
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "libc": list(platform.libc_ver()),
+        },
+        "cpu": cpu,
+        "torch": _torch_environment(),
+        "device": _environment_device_info(device),
+        "driver": {
+            "nvidia": _nvidia_driver_version(),
+        },
+        "determinism": _determinism_environment(),
+        "packages": {
+            "all": distributions,
+            "critical": critical,
+            "all_sha256": _canonical_json_sha256(distributions),
+            "critical_sha256": _canonical_json_sha256(critical),
+        },
+    }
+    snapshot["environment_id"] = _canonical_json_sha256(
+        _environment_identity_payload(snapshot)
+    )
+    return snapshot
+
+
+def _environment_package_map(
+    snapshot: Dict[str, object],
+) -> Dict[str, str]:
+    packages = snapshot.get("packages")
+    if isinstance(packages, dict):
+        raw = packages.get("all")
+    else:
+        raw = packages
+    if not isinstance(raw, list):
+        return {}
+    result: Dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = _canonical_distribution_name(item.get("name"))
+        version = item.get("version")
+        if name is not None and isinstance(version, str):
+            result[name] = version
+    return result
+
+
+def _nested_differences(
+    expected: object,
+    actual: object,
+    prefix: str = "",
+) -> List[Dict[str, object]]:
+    """递归列出两个简单 JSON 结构的差异（用于环境检查报告）。"""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        differences: List[Dict[str, object]] = []
+        for key in sorted(set(expected) | set(actual)):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            differences.extend(
+                _nested_differences(
+                    expected.get(key), actual.get(key), path
+                )
+            )
+        return differences
+    if expected != actual:
+        return [{
+            "path": prefix or "<root>",
+            "expected": expected,
+            "actual": actual,
+        }]
+    return []
+
+
+def compare_environment_snapshots(
+    expected: Dict[str, object],
+    actual: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """
+    比较归档环境与当前环境，返回可机读差异。
+
+    ``ok`` 只要求 environment_id 一致（决定数值结果的关键依赖/
+    编译选项/设备/确定性开关）；``strict_ok`` 还要求完整包清单
+    逐项一致。CLI 默认用 ``ok``，``--check-environment-strict``
+    用 ``strict_ok``。
+    """
+    actual = (
+        actual
+        if isinstance(actual, dict)
+        else build_environment_snapshot()
+    )
+    expected = expected if isinstance(expected, dict) else {}
+
+    expected_identity = _environment_identity_payload(expected)
+    actual_identity = _environment_identity_payload(actual)
+    expected_id = expected.get("environment_id")
+    if not isinstance(expected_id, str) or not expected_id:
+        expected_id = _canonical_json_sha256(expected_identity)
+    actual_id = actual.get("environment_id")
+    if not isinstance(actual_id, str) or not actual_id:
+        actual_id = _canonical_json_sha256(actual_identity)
+
+    expected_packages = _environment_package_map(expected)
+    actual_packages = _environment_package_map(actual)
+    added = [
+        {"name": name, "version": actual_packages[name]}
+        for name in sorted(set(actual_packages) - set(expected_packages))
+    ]
+    removed = [
+        {"name": name, "version": expected_packages[name]}
+        for name in sorted(set(expected_packages) - set(actual_packages))
+    ]
+    changed = [
+        {
+            "name": name,
+            "expected": expected_packages[name],
+            "actual": actual_packages[name],
+        }
+        for name in sorted(
+            set(expected_packages) & set(actual_packages)
+        )
+        if expected_packages[name] != actual_packages[name]
+    ]
+
+    critical_names = set()
+    for snapshot in (expected, actual):
+        packages = snapshot.get("packages")
+        if isinstance(packages, dict):
+            raw = packages.get("critical")
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        name = _canonical_distribution_name(
+                            item.get("name")
+                        )
+                        if name is not None:
+                            critical_names.add(name)
+    critical_differences = [
+        item
+        for item in added + removed + changed
+        if item["name"] in critical_names
+        or _is_critical_distribution(item["name"])
+    ]
+
+    runtime_differences = _nested_differences(
+        expected_identity, actual_identity
+    )
+    same_id = expected_id == actual_id
+    all_packages_match = not (added or removed or changed)
+    return {
+        "expected_environment_id": expected_id,
+        "actual_environment_id": actual_id,
+        "environment_id_matches": same_id,
+        "package_differences": {
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+        },
+        "critical_package_differences": critical_differences,
+        "runtime_differences": runtime_differences,
+        "all_packages_match": all_packages_match,
+        "ok": same_id,
+        "strict_ok": same_id and all_packages_match,
+    }
+
+
+def _environment_snapshot_from_config(
+    payload: Dict[str, object],
+    base_dir: Path,
+) -> Optional[Dict[str, object]]:
+    """从 config.json 的环境摘要/运行元数据中取快照。"""
+    environment = payload.get("environment")
+    if isinstance(environment, dict):
+        # 先看 file 摘要：config.json 顶层的 environment 是
+        # {schema, environment_id, file, file_sha256} 摘要，不是
+        # 完整快照；若先按 schema 判断，会把摘要自己当成快照，
+        # 从而跳过文件哈希校验。
+        file_name = environment.get("file")
+        if isinstance(file_name, str) and file_name:
+            candidate = base_dir / file_name
+            expected_sha = environment.get("file_sha256")
+            try:
+                raw = candidate.read_bytes()
+            except OSError:
+                raw = None
+            if raw is not None:
+                if (
+                    isinstance(expected_sha, str)
+                    and hashlib.sha256(raw).hexdigest()
+                    != expected_sha
+                ):
+                    raise ValueError(
+                        f"环境快照 {candidate} 的 SHA-256 与 "
+                        "config.json 记录不一致（文件被替换或截断）"
+                    )
+                try:
+                    loaded = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    loaded = None
+                if (
+                    isinstance(loaded, dict)
+                    and loaded.get("schema") == _ENVIRONMENT_SCHEMA
+                ):
+                    return loaded
+        elif environment.get("schema") == _ENVIRONMENT_SCHEMA:
+            return environment
+
+    for key in ("original_run_metadata", "run_metadata"):
+        metadata = payload.get(key)
+        if not isinstance(metadata, dict):
+            continue
+        snapshot = metadata.get("environment")
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("schema") == _ENVIRONMENT_SCHEMA
+        ):
+            return snapshot
+    return None
+
+
+def load_environment_snapshot(
+    path: Path,
+) -> Tuple[Dict[str, object], Path]:
+    """
+    读取 environment.json，或从运行目录的 config.json 提取快照。
+
+    返回 ``(snapshot, source_path)``。文件损坏、摘要不一致或找不到
+    快照时抛 ValueError，由 CLI 转成明确的错误信息。
+    """
+    path = Path(path)
+    if path.is_dir():
+        environment_path = path / _ENVIRONMENT_FILENAME
+        if environment_path.is_file():
+            path = environment_path
+        else:
+            config_path = path / "config.json"
+            if not config_path.is_file():
+                raise ValueError(
+                    f"{path} 内既没有 {_ENVIRONMENT_FILENAME}，"
+                    "也没有 config.json"
+                )
+            path = config_path
+
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"无法读取环境快照 {path}: {error}") from error
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"环境快照不是合法 JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("环境快照顶层必须是 JSON 对象")
+
+    if payload.get("schema") == _ENVIRONMENT_SCHEMA:
+        return payload, path
+
+    snapshot = _environment_snapshot_from_config(
+        payload, path.parent
+    )
+    if snapshot is None:
+        raise ValueError(
+            f"{path} 不是 {_ENVIRONMENT_SCHEMA} 快照，"
+            "且 config.json 中没有可提取的 environment 记录"
+        )
+    return snapshot, path.parent / _ENVIRONMENT_FILENAME
+
+
+def _snapshot_device(snapshot: Dict[str, object]) -> torch.device:
+    device = snapshot.get("device")
+    device_type = "cpu"
+    if isinstance(device, dict):
+        raw_type = device.get("type")
+        if raw_type in ("cuda", "mps", "cpu"):
+            device_type = str(raw_type)
+    try:
+        return torch.device(device_type)
+    except (RuntimeError, ValueError):
+        return torch.device("cpu")
+
+
+def check_environment_snapshot(
+    path: Path,
+    *,
+    strict: bool = False,
+) -> Dict[str, object]:
+    """
+    核对当前环境是否与归档快照一致。
+
+    这是重跑/续跑前的显式门：environment_id 不一致时，即使代码
+    与数据相同，浮点归约顺序也可能不同，不能把结果当作逐位复现。
+    """
+    expected, source = load_environment_snapshot(Path(path))
+    actual = build_environment_snapshot(_snapshot_device(expected))
+    report = compare_environment_snapshots(expected, actual)
+    report.update({
+        "source": str(source),
+        "strict": bool(strict),
+        "schema": expected.get("schema"),
+        "ok": (
+            report["strict_ok"] if strict else report["ok"]
+        ),
+    })
+    return report
+
+
+def print_environment_check(report: Dict[str, object]) -> None:
+    """打印环境核对摘要；完整差异由调用方决定是否落盘。"""
+    print(f"[env] source={report.get('source')}")
+    print(
+        "[env] expected environment_id="
+        f"{report.get('expected_environment_id')}"
+    )
+    print(
+        "[env] actual   environment_id="
+        f"{report.get('actual_environment_id')}"
+    )
+    runtime = report.get("runtime_differences") or []
+    if runtime:
+        print(f"[env] runtime differences ({len(runtime)}):")
+        for item in runtime[:12]:
+            print(
+                f"[env]   {item['path']}: "
+                f"{item['expected']!r} -> {item['actual']!r}"
+            )
+        if len(runtime) > 12:
+            print(f"[env]   ... {len(runtime) - 12} more")
+    packages = report.get("package_differences") or {}
+    added = packages.get("added") or []
+    removed = packages.get("removed") or []
+    changed = packages.get("changed") or []
+    if added or removed or changed:
+        print(
+            "[env] package differences: "
+            f"+{len(added)} -{len(removed)} ~{len(changed)}"
+        )
+        for item in changed[:8]:
+            print(
+                f"[env]   {item['name']}: "
+                f"{item['expected']} -> {item['actual']}"
+            )
+    if report.get("ok"):
+        if report.get("strict") and not report.get(
+            "all_packages_match", True
+        ):
+            print(
+                "[env] [warn] 关键环境一致，但完整包清单有差异"
+                "（严格模式判失败）"
+            )
+        else:
+            print("[env] OK: 当前环境与归档快照一致")
+    else:
+        print(
+            "[env] MISMATCH: 当前环境与归档快照不一致；"
+            "同一代码/数据下的数值结果不保证可复现。"
+            "请按 environment.json 的 packages 重建环境，"
+            "或在报告中明确声明环境差异。"
+        )
+
+
+def environment_mode_error(args) -> Optional[str]:
+    """校验 --check-environment 的模式与冲突参数。"""
+    check_path = getattr(args, "check_environment", None)
+    strict = bool(
+        getattr(args, "check_environment_strict", False)
+    )
+    if strict and check_path is None:
+        return (
+            "--check-environment-strict 必须与 "
+            "--check-environment 一起使用"
+        )
+    if check_path is None:
+        return None
+
+    conflicts = [
+        flag
+        for flag, active in (
+            (
+                "--write-manifest",
+                getattr(args, "write_manifest", None) is not None,
+            ),
+            (
+                "--verify-manifest",
+                getattr(args, "verify_manifest", None) is not None,
+            ),
+            (
+                "--expect-manifest-sha256",
+                getattr(
+                    args, "expect_manifest_sha256", None
+                )
+                is not None,
+            ),
+            (
+                "--compare",
+                getattr(args, "compare", None) is not None,
+            ),
+            (
+                "--compare-report",
+                getattr(args, "compare_report", None) is not None,
+            ),
+            (
+                "--final-test-comparison",
+                getattr(args, "final_test_comparison", None)
+                is not None,
+            ),
+            (
+                "--preregistration",
+                getattr(args, "preregistration", None) is not None,
+            ),
+            ("--data", getattr(args, "data", None) is not None),
+            ("--out", getattr(args, "out", None) is not None),
+            ("--seeds", getattr(args, "seeds", None) is not None),
+            (
+                "--resume",
+                getattr(args, "resume", None) is not None,
+            ),
+            (
+                "--evaluate-test",
+                bool(getattr(args, "evaluate_test", False)),
+            ),
+            (
+                "--plan-design",
+                bool(getattr(args, "plan_design", False)),
+            ),
+            (
+                "--suite-modes",
+                getattr(args, "suite_modes", None) is not None,
+            ),
+            (
+                "--suite-ablation",
+                bool(getattr(args, "suite_ablation", False)),
+            ),
+            (
+                "--suite-baseline-tuning",
+                bool(
+                    getattr(args, "suite_baseline_tuning", False)
+                ),
+            ),
+            (
+                "--statistical-baseline",
+                bool(getattr(args, "statistical_baseline", False)),
+            ),
+            (
+                "--sanity-only",
+                bool(getattr(args, "sanity_only", False)),
+            ),
+            (
+                "--paper-cell",
+                getattr(args, "paper_cell", None) is not None,
+            ),
+        )
+        if active
+    ]
+    if conflicts:
+        return (
+            "--check-environment 是只读环境核对入口，不能与"
+            "以下训练/分析参数同时使用: " + ", ".join(conflicts)
+        )
+    return None
+
+
+def write_run_environment_record(
+    out_dir: Path,
+    run_metadata: Dict[str, object],
+    original_metadata: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    """
+    把本次（或最初的）环境快照写为 environment.json。
+
+    resume 时优先归档最初运行的环境，而不是最后一次续跑的环境：
+    否则同一份运行目录的环境记录会随续跑漂移，无法回答「原始
+    结果是在哪套依赖下产生的」。当前环境若已变化，摘要里单独
+    记录，不覆盖原始快照。
+    """
+    current = run_metadata.get("environment")
+    current = current if isinstance(current, dict) else None
+    archived = None
+    if isinstance(original_metadata, dict):
+        candidate = original_metadata.get("environment")
+        if isinstance(candidate, dict):
+            archived = candidate
+    if archived is None:
+        archived = current
+    if archived is None:
+        return None
+
+    path = Path(out_dir) / _ENVIRONMENT_FILENAME
+    _atomic_write_json(path, archived)
+    record: Dict[str, object] = {
+        "schema": archived.get("schema", _ENVIRONMENT_SCHEMA),
+        "environment_id": archived.get("environment_id"),
+        "file": _ENVIRONMENT_FILENAME,
+        "file_sha256": _sha256_file(path),
+    }
+    current_id = (
+        current.get("environment_id")
+        if isinstance(current, dict)
+        else None
+    )
+    if (
+        isinstance(current_id, str)
+        and current_id
+        and current_id != record["environment_id"]
+    ):
+        record["resume_environment_id"] = current_id
+        record["environment_changed_since_start"] = True
+    return record
+
+
 def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     """
     收集本轮实验的代码版本与运行环境信息，写入 config.json，
@@ -39698,6 +40634,11 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         except (AssertionError, RuntimeError, ValueError):
             device_name = None
 
+    # 完整环境快照既进入 config.json 的 run_metadata，也单独写成
+    # environment.json（见 write_run_environment_record）。这里
+    # 只构造一次，避免同一份记录里出现两个可能不一致的版本。
+    environment = build_environment_snapshot(device)
+
     return {
         "timestamp_utc": datetime.datetime.now(
             datetime.timezone.utc
@@ -39743,6 +40684,24 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "git_dirty": git_dirty,
         "git_diff_sha256": git_diff_sha256,
         "script_sha256": _script_sha256(),
+        # 环境身份：决定数值结果的关键依赖/编译选项/设备/确定性
+        # 开关的规范化 SHA-256。同环境同代码的运行应一致；换
+        # CUDA/cuBLAS/MKL/Triton/CPU 指令集或线程配置会改变它。
+        "environment_id": environment["environment_id"],
+        "environment_schema": environment["schema"],
+        "python_implementation": environment["python"][
+            "implementation"
+        ],
+        "python_compiler": environment["python"]["compiler"],
+        "platform_machine": environment["platform"]["machine"],
+        "cpu_flags_sha256": environment["cpu"]["flags_sha256"],
+        "installed_distributions_sha256": environment["packages"][
+            "all_sha256"
+        ],
+        "installed_distributions_count": len(
+            environment["packages"]["all"]
+        ),
+        "environment": environment,
         # 进程启动时的实际值：None 说明本进程的 hash 随机化
         # 未被固定（set_seed 的 setdefault 只对之后的子进程
         # 生效），严格逐位复现应在启动命令行显式设置。
@@ -40029,6 +40988,16 @@ def _manifest_run_summary(
     preregistration = config.get("preregistration")
     if not isinstance(preregistration, dict):
         preregistration = {}
+    environment = config.get("environment")
+    environment = (
+        environment if isinstance(environment, dict) else {}
+    )
+    metadata_environment = metadata.get("environment")
+    metadata_environment = (
+        metadata_environment
+        if isinstance(metadata_environment, dict)
+        else {}
+    )
 
     return {
         "study_id": preregistration.get("study_id"),
@@ -40038,6 +41007,22 @@ def _manifest_run_summary(
         "script_sha256": metadata.get("script_sha256"),
         "git_commit": metadata.get("git_commit"),
         "git_dirty": metadata.get("git_dirty"),
+        # 环境身份与 environment.json 自身摘要：归档摘要不用
+        # 重新解析整份 config 就能核对「结果产自哪套环境」。
+        "environment_id": (
+            environment.get("environment_id")
+            or metadata_environment.get("environment_id")
+        ),
+        "environment_schema": (
+            environment.get("schema")
+            or metadata_environment.get("schema")
+        ),
+        "environment_file_sha256": environment.get(
+            "file_sha256"
+        ),
+        "environment_changed_since_start": environment.get(
+            "environment_changed_since_start"
+        ),
         "data_sha256": data.get("sha256"),
         "data_split_sha256": data.get("split_sha256"),
         "comparison_protocol_sha256": config.get(
@@ -40055,6 +41040,12 @@ def _manifest_run_summary(
 def _manifest_current_provenance() -> Dict[str, object]:
     """记录生成清单时的代码与解释器版本，供事后核对。"""
     status = _git_output("status", "--porcelain")
+    environment = build_environment_snapshot(
+        torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    )
+    environment_id = environment["environment_id"]
     return {
         "script_sha256": _script_sha256(),
         "git_commit": _git_output("rev-parse", "HEAD"),
@@ -40069,6 +41060,12 @@ def _manifest_current_provenance() -> Dict[str, object]:
             else None
         ),
         "platform": platform.platform(),
+        # 清单生成环境的完整身份；在另一台机器上校验归档时
+        # 不一致是预期情况，只作为信息字段，不影响完整性判定。
+        "environment_id": environment_id,
+        "installed_distributions_sha256": (
+            environment["packages"]["all_sha256"]
+        ),
         "cwd": os.getcwd(),
         # 逐参数 shell quote：含空格的路径（--data "my data.txt"）
         # 不能记录成无法复制重放的 "my data.txt"。
@@ -40331,6 +41328,11 @@ def verify_artifact_manifest(
             provenance.get("script_sha256")
             == _script_sha256()
         )
+        current_snapshot = build_environment_snapshot(
+            torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        )
         current_environment = {
             "python_version": platform.python_version(),
             "torch_version": torch.__version__,
@@ -40340,11 +41342,23 @@ def verify_artifact_manifest(
                 else None
             ),
             "platform": platform.platform(),
+            "environment_id": current_snapshot["environment_id"],
+            "installed_distributions_sha256": current_snapshot[
+                "packages"
+            ]["all_sha256"],
         }
-        result["environment_matches_current"] = {
+        matches = {
             key: provenance.get(key) == value
             for key, value in current_environment.items()
         }
+        # 旧清单没有 environment_id 时保持 None（未核对），不能
+        # 因为默认值/缺失就把「无法核对」报成「环境一致」。
+        if provenance.get("environment_id") is None:
+            matches["environment_id"] = None
+        result["environment_matches_current"] = matches
+        result["environment_id_matches_current"] = matches.get(
+            "environment_id"
+        )
 
     result["checked"] = len(seen)
     result["missing"] = missing
@@ -40384,6 +41398,22 @@ def manifest_mode_error(args) -> Optional[str]:
             "--verify-manifest-strict 必须与 "
             "--verify-manifest 一起使用"
         )
+    expected_manifest_sha = getattr(
+        args, "expect_manifest_sha256", None
+    )
+    if expected_manifest_sha is not None:
+        if verify_mode is None:
+            return (
+                "--expect-manifest-sha256 必须与 "
+                "--verify-manifest 一起使用"
+            )
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{64}", str(expected_manifest_sha)
+        ):
+            return (
+                "--expect-manifest-sha256 必须是 64 位"
+                "十六进制 SHA-256"
+            )
     if write_mode is None and verify_mode is None:
         return None
 
@@ -40560,6 +41590,7 @@ def write_run_config(
     )
 
     payload = {
+        "config_schema": _ENVIRONMENT_CONFIG_SCHEMA,
         "config": asdict(cfg),
         "args": vars(args),
         # 受控变量协议：--compare 用它核对「除声明因子外，
@@ -40917,6 +41948,18 @@ def write_run_config(
         )
     )
 
+    # 环境快照单独落一份 environment.json：它通常比 config.json
+    # 小得多，便于跨运行 diff、在重跑前用 --check-environment
+    # 核对，也能被 artifact_manifest 逐文件校验。resume 时保留
+    # 最初运行的环境，当前环境差异只写入摘要。
+    environment_record = write_run_environment_record(
+        out_dir,
+        run_metadata,
+        payload.get("original_run_metadata"),
+    )
+    if environment_record is not None:
+        payload["environment"] = environment_record
+
     # config.json 是实验追踪的唯一来源，写入中途失败不能留下
     # 半截文件：与 update_run_config 一样走临时文件 + 原子替换。
     previous_mode = 0o644
@@ -40945,6 +41988,10 @@ def write_run_config(
                 ensure_ascii=False,
                 indent=2,
             )
+            # 先 flush+fsync 再原子替换：机器崩溃/被抢占时，
+            # 不能让目录项指向一个尚未写入磁盘的 config.json。
+            handle.flush()
+            os.fsync(handle.fileno())
 
         os.replace(temp_path, config_path)
         temp_path = None
@@ -41015,6 +42062,8 @@ def update_run_config(out_dir: Path, key: str, value) -> None:
                 ensure_ascii=False,
                 indent=2,
             )
+            handle.flush()
+            os.fsync(handle.fileno())
 
         os.replace(temp_path, path)
         temp_path = None
@@ -41594,6 +42643,7 @@ def load_tracking_provenance(
         "original_script_sha256": None,
         "original_git_commit": None,
         "original_git_dirty": None,
+        "original_environment_id": None,
         "resume_count": 0,
         "comparison_protocol_sha256": None,
     }
@@ -41632,6 +42682,9 @@ def load_tracking_provenance(
         "original_script_sha256": original.get("script_sha256"),
         "original_git_commit": original.get("git_commit"),
         "original_git_dirty": original.get("git_dirty"),
+        "original_environment_id": original.get(
+            "environment_id"
+        ),
         "resume_count": resume_count,
         "comparison_protocol_sha256": protocol_sha,
     }
@@ -41662,6 +42715,7 @@ def tracking_header_fields(
             dataset, "effective_train_sha256", None
         ),
         "script_sha256": run_metadata.get("script_sha256"),
+        "environment_id": run_metadata.get("environment_id"),
         "git_commit": run_metadata.get("git_commit"),
         "git_dirty": run_metadata.get("git_dirty"),
         "pythonhashseed_at_start": run_metadata.get(
@@ -62109,6 +63163,42 @@ def main():
         ),
     )
     parser.add_argument(
+        "--check-environment",
+        type=str,
+        default=None,
+        metavar="RUN_DIR_OR_JSON",
+        help=(
+            "不训练：把当前环境与运行目录的 environment.json"
+            "（或 config.json 中的环境快照）逐项比较，"
+            "environment_id 不一致时以非零状态码退出。"
+            "用于重跑/续跑/换机器前确认关键依赖、编译选项、"
+            "设备与确定性开关相同；默认只要求关键环境一致，"
+            "--check-environment-strict 还要求完整包清单一致"
+        ),
+    )
+    parser.add_argument(
+        "--check-environment-strict",
+        action="store_true",
+        help=(
+            "与 --check-environment 配合：完整包清单（含与"
+            "数值无关的包）也必须逐项一致，任何新增/删除/"
+            "版本变化都判失败"
+        ),
+    )
+    parser.add_argument(
+        "--expect-manifest-sha256",
+        type=str,
+        default=None,
+        metavar="HEX",
+        help=(
+            "与 --verify-manifest 配合：要求清单自身的 SHA-256"
+            "等于外部归档记录中的值（64 位十六进制）。只校验"
+            "清单内文件不足以防清单被整体替换；把 --write-manifest"
+            "打印的指纹写入 DOI/归档记录后，用本参数才能验证"
+            "「被校验的清单就是被记录的那一份」"
+        ),
+    )
+    parser.add_argument(
         "--compare-factors",
         type=str,
         default=",".join(DEFAULT_COMPARISON_FACTORS),
@@ -62504,6 +63594,31 @@ def main():
             "它保存的是只读对比分析，不参与训练"
         )
 
+    # 环境核对同样必须在论文预设、预注册与数据加载之前分流：
+    # 它只读归档快照，不能因为用户同时给了 --data 就启动训练。
+    environment_error = environment_mode_error(args)
+    if environment_error is not None:
+        parser.error(environment_error)
+    if args.check_environment is not None:
+        try:
+            report = check_environment_snapshot(
+                Path(args.check_environment),
+                strict=bool(args.check_environment_strict),
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--check-environment 失败: {error}")
+        print_environment_check(report)
+        print(
+            json.dumps(
+                _json_safe(report),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if not report["ok"]:
+            raise SystemExit(1)
+        return
+
     # 归档清单模式同样是只读入口：必须在论文预设、预注册与
     # 数据加载之前分流，避免 --write-manifest 被当成一次训练。
     manifest_error = manifest_mode_error(args)
@@ -62528,6 +63643,24 @@ def main():
             Path(args.verify_manifest),
             strict=bool(args.verify_manifest_strict),
         )
+        expected_manifest_sha = args.expect_manifest_sha256
+        if expected_manifest_sha is not None:
+            expected_manifest_sha = expected_manifest_sha.lower()
+            actual_manifest_sha = report.get("manifest_sha256")
+            matches_expected = (
+                isinstance(actual_manifest_sha, str)
+                and actual_manifest_sha.lower()
+                == expected_manifest_sha
+            )
+            report["expected_manifest_sha256"] = (
+                expected_manifest_sha
+            )
+            report["manifest_sha256_matches_expected"] = (
+                matches_expected
+            )
+            # 清单被整体替换时，内部文件可以全部自洽；只有
+            # 外部记录的指纹能发现替换，因此它必须参与 ok。
+            report["ok"] = bool(report["ok"]) and matches_expected
         print(
             json.dumps(
                 _json_safe(report),
@@ -66619,6 +67752,7 @@ def main():
             dataset.effective_train_sha256
         ),
         "script_sha256": run_metadata.get("script_sha256"),
+        "environment_id": run_metadata.get("environment_id"),
         "git_commit": run_metadata.get("git_commit"),
         "git_dirty": run_metadata.get("git_dirty"),
         # 原始运行身份：resume 不把首次运行的时间/代码版本
@@ -66635,6 +67769,12 @@ def main():
                 "original_script_sha256"
             )
             or run_metadata.get("script_sha256")
+        ),
+        "original_environment_id": (
+            tracking_provenance.get(
+                "original_environment_id"
+            )
+            or run_metadata.get("environment_id")
         ),
         "original_git_commit": (
             tracking_provenance.get("original_git_commit")
@@ -67169,6 +68309,9 @@ def main():
                     "script_sha256": run_metadata.get(
                         "script_sha256"
                     ),
+                    "environment_id": run_metadata.get(
+                        "environment_id"
+                    ),
                     "git_commit": run_metadata.get("git_commit"),
                     "config_sha256": config_sha256,
                     "hypothesis": args.hypothesis,
@@ -67345,6 +68488,12 @@ def main():
                             "original_script_sha256"
                         )
                         or run_metadata.get("script_sha256")
+                    ),
+                    "original_environment_id": (
+                        tracking_provenance.get(
+                            "original_environment_id"
+                        )
+                        or run_metadata.get("environment_id")
                     ),
                     "original_git_commit": (
                         tracking_provenance.get(
