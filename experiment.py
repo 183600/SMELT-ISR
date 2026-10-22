@@ -15803,6 +15803,7 @@ def selection_bias_report(
         # 偏差也越大；不同运行数量不等时，选型偏差本身在组间
         # 不可比。
         "selection_opportunities": [],
+        "missing_selection_opportunity_runs": [],
         "opportunity_imbalance": None,
         "opportunity_advisory": None,
     }
@@ -15846,6 +15847,7 @@ def selection_bias_report(
     # 带来的乐观偏差越大。跨运行比较时若各运行的 T 不同，
     # 偏差幅度也不同，必须把 T 一并披露。
     opportunities = []
+    missing_opportunities: List[str] = []
     for entry in report["biased_runs"]:
         value = entry.get("n_eval_points")
         if (
@@ -15857,7 +15859,12 @@ def selection_bias_report(
                 "run": entry["run"],
                 "n_eval_points": int(value),
             })
+        else:
+            missing_opportunities.append(str(entry["run"]))
     report["selection_opportunities"] = opportunities
+    report["missing_selection_opportunity_runs"] = (
+        missing_opportunities
+    )
     if len(opportunities) >= 2:
         counts = [
             entry["n_eval_points"] for entry in opportunities
@@ -15891,6 +15898,20 @@ def selection_bias_report(
             "best_val 运行缺少验证点数量记录"
             "（curve_n_eval_points，旧运行）：无法核对各运行"
             "的选型机会是否相同"
+        )
+    if missing_opportunities and opportunities:
+        partial_note = (
+            "选型机会无法完整核对：以下 best_val 运行缺少"
+            "验证点数量记录（curve_n_eval_points，旧运行）: "
+            + ", ".join(missing_opportunities)
+        )
+        report["opportunity_advisory"] = (
+            (
+                str(report["opportunity_advisory"]) + "；"
+                if report["opportunity_advisory"]
+                else ""
+            )
+            + partial_note
         )
 
     metric_reports = (
@@ -35676,6 +35697,23 @@ def run_self_test():
         common_report,
     )
     assert balanced_opportunity["opportunity_imbalance"] is None
+    common_rows[1]["curve_n_eval_points"] = 5
+
+    common_rows[1].pop("curve_n_eval_points", None)
+    partial_opportunity = selection_bias_report(
+        common_rows,
+        "val_loss",
+        common_report,
+    )
+    assert len(
+        partial_opportunity["selection_opportunities"]
+    ) == 1
+    assert partial_opportunity[
+        "missing_selection_opportunity_runs"
+    ] == ["long"]
+    assert "无法完整核对" in str(
+        partial_opportunity["opportunity_advisory"]
+    )
     common_rows[1]["curve_n_eval_points"] = 5
 
     # 确定性基线不做 checkpoint 选型，不能进偏差比例的分母：
