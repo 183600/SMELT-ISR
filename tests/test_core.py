@@ -2737,6 +2737,83 @@ class ProcessTests(unittest.TestCase):
             report["splits"]["val"]["utf8_replacements"], 0
         )
 
+    def test_audit_reports_unseen_eval_label_coverage(self):
+        # train 只有 A，val 只有 B，test 只有 C：B/C 都是训练集
+        # 从未出现的字节类，评估 NLL 含不可约外推误差。
+        data = b"A" * 60 + b"B" * 20 + b"C" * 20
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "coverage.bin"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.2,
+                test_fraction=0.2,
+            )
+            report = experiment.audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+        coverage = report["label_coverage"]
+        self.assertEqual(
+            coverage["train"]["observed_byte_classes"], 1
+        )
+        for split, byte in (("val", ord("B")), ("test", ord("C"))):
+            self.assertEqual(
+                coverage[split]["unseen_label_classes"], 1
+            )
+            self.assertEqual(
+                coverage[split]["unseen_label_token_share"], 1.0
+            )
+            self.assertEqual(
+                report["splits"][split]["unseen_label_classes"],
+                1,
+            )
+        self.assertTrue(
+            any("从未出现" in warning for warning in report["warnings"])
+        )
+
+    def test_cleaning_records_deletion_bias(self):
+        # train 中夹入一段非法字节，只清洗 train；删除内容与保留
+        # 内容的字节/二元组分布完全不同，必须显式记录删除偏差。
+        data = (
+            b"A" * 25
+            + b"\xff" * 5
+            + b"A" * 30
+            + b"B" * 20
+            + b"C" * 20
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bias.bin"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.2,
+                test_fraction=0.2,
+                drop_train_corrupt_bytes=True,
+            )
+            report = experiment.audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+        bias = dataset.train_cleaning["deletion_bias"]
+        self.assertEqual(bias["dropped_bytes"], 5)
+        self.assertEqual(bias["kept_bytes"], 55)
+        self.assertEqual(bias["train_bytes"], 60)
+        self.assertEqual(bias["drop_fraction"], round(5 / 60, 6))
+        self.assertEqual(bias["byte_js"], 1.0)
+        self.assertEqual(bias["bigram_js"], 1.0)
+        self.assertEqual(
+            bias["dropped_top_bytes"][0][0], 255
+        )
+        self.assertTrue(
+            any(
+                "删除与保留内容的字节分布" in warning
+                for warning in report["warnings"]
+            )
+        )
+
     def test_include_test_in_cleaning_alias_is_effective(self):
         groups = [
             b"DUPAAAAA" if index == 0 else

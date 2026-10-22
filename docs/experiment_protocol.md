@@ -205,6 +205,12 @@ python experiment.py --data corpus.txt --out runs/confirm \
   核对结果（文件 SHA-256、study_id、冻结提交、补齐字段、
   实际数据指纹、运行模式/种子）写入 `config.json` 的
   `preregistration` 字段，供归档审计与人工复核。
+- 训练前同时检查数据审计的 `label_coverage`（评估集中训练集
+  从未出现的字节类/token 占比）与 `train_cleaning.deletion_bias`
+  （删除/保留内容的字节与二元组 JS、删除比例）；前者是不可约
+  外推误差，后者说明清洗是否选择性改变了训练分布。两者都随
+  `config.json` 归档，正式报告必须交代，不能把数据覆盖问题
+  写成模型能力差异。
 - 多种子套件结束后，父进程按每个子运行的
   `preregistration.file_sha256` 反查是否仍是同一份文件；
   中途编辑预注册会导致整批被拒绝汇总，而不是把不同协议的

@@ -6148,6 +6148,39 @@ class ByteDataset:
         self.test = tokens[n_val_end:]
         self.seq_len = seq_len
 
+        # 清洗的删除偏差随 train_cleaning 一起落盘：被删除与保留
+        # 内容若分布不同，清洗后的训练分布就是选择性改变的，
+        # 后续指标不能与未清洗运行直接比较。只在确有删除时计算，
+        # 避免没有清洗的运行承担额外扫描成本。
+        if (
+            self.train_cleaning is not None
+            and self.train_excluded_spans
+        ):
+            self.train_cleaning["deletion_bias"] = (
+                _deletion_bias_record(
+                    self._raw,
+                    n_train,
+                    self.train_excluded_spans,
+                )
+            )
+            if self.train_cleaning["deletion_bias"] is None:
+                # 删除区间非空但无法形成有效统计：显式记录，
+                # 不能静默省略字段让读者以为没有删除偏差。
+                self.train_cleaning["deletion_bias"] = {
+                    "schema": "smelt-isr/deletion-bias/v1",
+                    "dropped_bytes": sum(
+                        end - start
+                        for start, end in _merge_byte_intervals(
+                            self.train_excluded_spans
+                        )
+                    ),
+                    "kept_bytes": 0,
+                    "train_bytes": int(n_train),
+                    "byte_js": None,
+                    "bigram_js": None,
+                    "note": "没有可用于比较的保留内容",
+                }
+
         # 清洗后的有效训练集指纹：resume/对比不能只看整体数据
         # 指纹与清洗开关，必须确认剔除区间及保留内容完全一致。
         self.effective_train_sha256 = (
@@ -7203,6 +7236,18 @@ _AUDIT_CHUNK_GEAR_TABLE = tuple(
 )
 _AUDIT_CHUNK_UINT64_MASK = (1 << 64) - 1
 
+# 训练集清洗的删除偏差审计：被删除内容与保留内容的字节/二元组
+# 分布差异过大时，说明清洗不是随机删除，训练分布已被选择性改变。
+# 这不是「清洗有 bug」，而是必须在报告里披露的干预效应：清洗后的
+# 损失不能直接与未清洗运行比较，也不能把删除比例高当成数据更多。
+_AUDIT_DELETION_BIAS_WARN = 0.10
+_AUDIT_DELETION_DROP_WARN = 0.20
+
+# 评估集标签覆盖：训练集从未出现过的字节类在评估 token 中占比
+# 超过该阈值时告警。字节级 LM 无法通过上下文学习这些标签，
+# 它们构成不可约的外推误差，不能全部归因于模型能力。
+_AUDIT_UNSEEN_LABEL_WARN = 1e-4
+
 
 def _byte_bigram_counts(
     tokens: torch.Tensor,
@@ -7545,6 +7590,223 @@ def _subtract_byte_intervals(
         for start, stop in result
         if stop > start
     ]
+
+
+def _interval_byte_counts(
+    raw: memoryview,
+    intervals: List[Tuple[int, int]],
+    chunk_bytes: int = 1 << 20,
+) -> torch.Tensor:
+    """
+    统计若干连续区间内的字节频次（256 类，int64）。
+
+    从原始缓冲区按块读取，避免把整个 split 复制成 Python bytes。
+    与 ``_byte_bigram_counts`` 同一口径：只统计区间内部，不制造
+    跨越被删除内容的虚假计数。
+    """
+    counts = torch.zeros(256, dtype=torch.int64)
+
+    for span_start, span_end in intervals:
+        position = span_start
+        while position < span_end:
+            stop = min(position + chunk_bytes, span_end)
+            block = torch.frombuffer(
+                raw[position:stop],
+                dtype=torch.uint8,
+            )
+            if block.numel() > 0:
+                counts += torch.bincount(
+                    block,
+                    minlength=256,
+                )
+            position = stop
+
+    return counts
+
+
+def _interval_bigram_counts(
+    raw: memoryview,
+    intervals: List[Tuple[int, int]],
+    chunk_bytes: int = 1 << 20,
+) -> torch.Tensor:
+    """
+    统计若干连续区间内的相邻字节对频次（256*256 展平）。
+
+    分块时保留一个字节的重叠，确保块边界上的
+    (stop-1, stop) 转移不会被漏计；区间之间不连接，避免把
+    「删除内容之后紧接保留内容」误算成一个训练二元组。
+    """
+    vocab_size = 256
+    counts = torch.zeros(
+        vocab_size * vocab_size,
+        dtype=torch.int64,
+    )
+
+    for span_start, span_end in intervals:
+        if span_end - span_start < 2:
+            continue
+
+        position = span_start
+        while position < span_end - 1:
+            stop = min(position + chunk_bytes, span_end)
+            block = torch.frombuffer(
+                raw[position:stop],
+                dtype=torch.uint8,
+            )
+            left = block[:-1].to(torch.int64)
+            right = block[1:].to(torch.int64)
+            counts += torch.bincount(
+                left * vocab_size + right,
+                minlength=vocab_size * vocab_size,
+            )
+            if stop >= span_end:
+                break
+            # 下一块从上一块最后一个字节开始，保留边界转移。
+            position = stop - 1
+
+    return counts
+
+
+def _interval_length_summary(
+    intervals: List[Tuple[int, int]],
+) -> Dict[str, object]:
+    """返回区间长度（span 数、总字节、均值与分位数）。"""
+    lengths = sorted(
+        end - start
+        for start, end in intervals
+        if end > start
+    )
+    if not lengths:
+        return {
+            "spans": 0,
+            "bytes": 0,
+            "mean": None,
+            "median": None,
+            "p90": None,
+            "max": None,
+        }
+
+    def _quantile(fraction: float) -> int:
+        index = int(round(fraction * (len(lengths) - 1)))
+        return lengths[max(0, min(index, len(lengths) - 1))]
+
+    return {
+        "spans": len(lengths),
+        "bytes": sum(lengths),
+        "mean": round(sum(lengths) / len(lengths), 3),
+        "median": _quantile(0.5),
+        "p90": _quantile(0.9),
+        "max": lengths[-1],
+    }
+
+
+def _top_byte_summary(
+    counts: torch.Tensor,
+    top_k: int = 5,
+) -> List[List[object]]:
+    """把字节频次转成 [[byte, share], ...]（share 保留 6 位）。"""
+    total = int(counts.sum())
+    if total <= 0:
+        return []
+    k = min(top_k, int(counts.numel()))
+    values, indices = torch.topk(counts, k=k)
+    return [
+        [int(byte), round(float(value) / total, 6)]
+        for value, byte in zip(values.tolist(), indices.tolist())
+    ]
+
+
+def _deletion_bias_record(
+    raw: memoryview,
+    train_end: int,
+    excluded_spans: List[Tuple[int, int]],
+) -> Optional[Dict[str, object]]:
+    """
+    量化训练集清洗的「删除偏差」：被删除的 train 内容与保留内容
+    在字节分布、二元组分布与连续段长度上是否不同。
+
+    清洗不是随机缺失：去重会优先删除与 val/test 重复或更早出现
+    的群组，损坏字节清洗会优先删除含非法 UTF-8/NUL 的片段。
+    因此删除后的训练分布是**选择性**的，清洗前后的损失不可直接
+    比较，也不能把「删掉重复后指标变差/变好」全部归因于模型。
+    本记录只做诊断，不改变任何删除决策；返回 None 表示没有删除。
+    """
+    merged = _merge_byte_intervals(excluded_spans)
+    if not merged or train_end <= 0:
+        return None
+
+    kept_intervals = _subtract_byte_intervals(
+        0,
+        train_end,
+        merged,
+    )
+    dropped_bytes = sum(end - start for start, end in merged)
+    kept_bytes = sum(
+        end - start for start, end in kept_intervals
+    )
+
+    dropped_counts = _interval_byte_counts(raw, merged)
+    kept_counts = _interval_byte_counts(raw, kept_intervals)
+    dropped_total = int(dropped_counts.sum())
+    kept_total = int(kept_counts.sum())
+
+    byte_js: Optional[float] = None
+    if dropped_total > 0 and kept_total > 0:
+        byte_js = round(
+            _js_distance(
+                dropped_counts.to(torch.float64) / dropped_total,
+                kept_counts.to(torch.float64) / kept_total,
+            ),
+            6,
+        )
+
+    dropped_bigram = _interval_bigram_counts(raw, merged)
+    kept_bigram = _interval_bigram_counts(
+        raw,
+        kept_intervals,
+    )
+    bigram_js: Optional[float] = None
+    dropped_bigram_total = int(dropped_bigram.sum())
+    kept_bigram_total = int(kept_bigram.sum())
+    if dropped_bigram_total > 0 and kept_bigram_total > 0:
+        bigram_js = round(
+            _js_distance(
+                dropped_bigram.to(torch.float64)
+                / dropped_bigram_total,
+                kept_bigram.to(torch.float64)
+                / kept_bigram_total,
+            ),
+            6,
+        )
+
+    train_bytes = max(1, int(train_end))
+    return {
+        "schema": "smelt-isr/deletion-bias/v1",
+        "dropped_bytes": dropped_bytes,
+        "kept_bytes": kept_bytes,
+        "train_bytes": int(train_end),
+        "drop_fraction": round(dropped_bytes / train_bytes, 6),
+        "kept_fraction": round(kept_bytes / train_bytes, 6),
+        "excluded_span_lengths": _interval_length_summary(
+            merged
+        ),
+        "kept_span_lengths": _interval_length_summary(
+            kept_intervals
+        ),
+        "dropped_top_bytes": _top_byte_summary(dropped_counts),
+        "kept_top_bytes": _top_byte_summary(kept_counts),
+        "byte_js": byte_js,
+        "bigram_js": bigram_js,
+        "warn_byte_js": _AUDIT_DELETION_BIAS_WARN,
+        "warn_drop_fraction": _AUDIT_DELETION_DROP_WARN,
+        "interpretation": (
+            "删除由内容/群组规则触发，不是随机缺失；byte_js / "
+            "bigram_js 越大、drop_fraction 越高，清洗后的训练"
+            "分布与原始分布差异越大。比较清洗/未清洗运行的"
+            "指标前必须先核对本记录，不能把选择性删除当成同一"
+            "数据分布上的方法差异"
+        ),
+    }
 
 
 def _content_defined_chunk_scan(
@@ -9111,6 +9373,108 @@ def audit_data_splits(
                 "评估集规模/统计功效可能与预期不符"
             )
 
+    # 评估集标签覆盖：训练集从未出现过的字节类在评估 token 中
+    # 占比多少。字节级 LM 只能通过上下文降低已见标签的 NLL；
+    # 未见标签的最优预测只能退到平滑/先验，属于不可约的外推
+    # 误差。把它与分布偏移分开报告，避免把「模型没学会」和
+    # 「训练数据根本没有这个标签」混为一谈。
+    label_coverage: Dict[str, object] = {}
+    train_hist = histograms.get("train")
+    if train_hist is not None:
+        train_present = train_hist > 0
+        train_classes = int(train_present.sum())
+        label_coverage["train"] = {
+            "observed_byte_classes": train_classes,
+        }
+        for split in split_names:
+            if split == "train":
+                continue
+            split_hist = histograms[split]
+            unseen_mask = (split_hist > 0) & (~train_present)
+            unseen_classes = int(unseen_mask.sum())
+            unseen_share = float(
+                split_hist[unseen_mask].sum()
+            )
+            info = {
+                "observed_byte_classes": int(
+                    (split_hist > 0).sum()
+                ),
+                "train_observed_byte_classes": train_classes,
+                "unseen_label_classes": unseen_classes,
+                "unseen_label_token_share": round(
+                    unseen_share, 8
+                ),
+                "warn_token_share": (
+                    _AUDIT_UNSEEN_LABEL_WARN
+                ),
+            }
+            label_coverage[split] = info
+            split_info = splits_report.get(split)
+            if isinstance(split_info, dict):
+                split_info["unseen_label_classes"] = (
+                    unseen_classes
+                )
+                split_info["unseen_label_token_share"] = (
+                    info["unseen_label_token_share"]
+                )
+            if unseen_share > _AUDIT_UNSEEN_LABEL_WARN:
+                warnings.append(
+                    f"{split}: 评估集有 {unseen_classes} 个"
+                    "字节类在有效训练集中从未出现（占评估 "
+                    f"token {unseen_share:.4%}）；这些标签的"
+                    "NLL 无法通过训练降低，指标包含不可约的"
+                    "外推误差，不能与训练集覆盖相同的运行"
+                    "直接比较"
+                )
+
+    # 清洗的删除偏差：清洗按内容规则选择性删除，删除后的训练
+    # 分布可能与原始分布不同。这里不重复打印所有统计，只在
+    # 偏差达到告警阈值时提示；完整数值在
+    # data.train_cleaning.deletion_bias。
+    cleaning_record = dataset.train_cleaning
+    if isinstance(cleaning_record, dict):
+        bias = cleaning_record.get("deletion_bias")
+        if isinstance(bias, dict):
+            drop_fraction = bias.get("drop_fraction")
+            if (
+                isinstance(drop_fraction, (int, float))
+                and drop_fraction > _AUDIT_DELETION_DROP_WARN
+            ):
+                warnings.append(
+                    "train: 清洗删除了 "
+                    f"{float(drop_fraction):.1%} 的训练字节"
+                    f"（{bias.get('dropped_bytes')}B）；"
+                    "删除由重复/损坏/退化规则触发，不是随机"
+                    "缺失，清洗后的训练分布已被选择性改变。"
+                    "清洗/未清洗运行的指标不能直接比较"
+                )
+            byte_js = bias.get("byte_js")
+            if (
+                isinstance(byte_js, (int, float))
+                and byte_js > _AUDIT_DELETION_BIAS_WARN
+            ):
+                warnings.append(
+                    "train: 被删除与保留内容的字节分布"
+                    f"JS 距离 {float(byte_js):.4f} > "
+                    f"{_AUDIT_DELETION_BIAS_WARN:.2f}；"
+                    "清洗并非随机删除，训练分布发生了"
+                    "选择性变化，见 "
+                    "data.train_cleaning.deletion_bias"
+                )
+            bigram_js = bias.get("bigram_js")
+            if (
+                isinstance(bigram_js, (int, float))
+                and bigram_js
+                > _AUDIT_DELETION_BIAS_WARN
+            ):
+                warnings.append(
+                    "train: 被删除与保留内容的二元组分布"
+                    f"JS 距离 {float(bigram_js):.4f} > "
+                    f"{_AUDIT_DELETION_BIAS_WARN:.2f}；"
+                    "删除改变了上下文转移分布，不能把清洗后"
+                    "的改善/退化全部归因于方法"
+                )
+
     # 验证集标签噪声即使占比很低也必须显式提示：val 用于
     # checkpoint 选择、早停与超参/基线调参，少量损坏标签会
     # 系统性地改变选型结果，而不像 train 噪声那样只增加方差。
@@ -9483,6 +9847,7 @@ def audit_data_splits(
             for split, info in splits_report.items()
         },
         "dataset_split_fractions": dataset.split_fractions,
+        "label_coverage": label_coverage,
         "distribution_shift": distribution_shift,
         "distribution_shift_bigram": distribution_shift_bigram,
         "distribution_shift_conditional": (
@@ -9878,6 +10243,49 @@ def print_data_audit(report: Dict[str, object]) -> None:
             + (f"（{kinds}）" if kinds else "")
             + ": "
             + ", ".join(detail_parts)
+        )
+
+        bias = cleaning.get("deletion_bias")
+        if isinstance(bias, dict):
+            bias_parts = [
+                f"drop_fraction={bias.get('drop_fraction')}",
+                f"byte_js={bias.get('byte_js')}",
+                f"bigram_js={bias.get('bigram_js')}",
+            ]
+            print(
+                "[data]   清洗删除偏差: "
+                + ", ".join(bias_parts)
+                + (
+                    "（删除非随机，清洗前后分布不可直接比较）"
+                    if (
+                        isinstance(bias.get("drop_fraction"), (int, float))
+                        and float(bias["drop_fraction"])
+                        > _AUDIT_DELETION_DROP_WARN
+                    )
+                    or (
+                        isinstance(bias.get("byte_js"), (int, float))
+                        and float(bias["byte_js"])
+                        > _AUDIT_DELETION_BIAS_WARN
+                    )
+                    else ""
+                )
+            )
+
+    label_coverage = report.get("label_coverage") or {}
+    train_coverage = label_coverage.get("train")
+    if isinstance(train_coverage, dict):
+        print(
+            "[data]   训练集标签覆盖: "
+            f"{train_coverage.get('observed_byte_classes')}/256 "
+            "个字节类"
+        )
+    for split, info in label_coverage.items():
+        if split == "train" or not isinstance(info, dict):
+            continue
+        print(
+            f"[data]   {split} 标签覆盖: 未见 "
+            f"{info.get('unseen_label_classes')} 类，占评估 "
+            f"token {info.get('unseen_label_token_share'):.4%}"
         )
 
     if isinstance(groups, dict):
@@ -45715,6 +46123,12 @@ def run_self_test():
     # 统计基线/参考基线必须与神经网络窗口使用同一「有效
     # 训练字节」口径：被清洗的重复群组不能进入计数。
     assert dedup_dataset.effective_train_bytes == 28
+    dedup_bias = dedup_dataset.train_cleaning["deletion_bias"]
+    assert dedup_bias["dropped_bytes"] == 20
+    assert dedup_bias["kept_bytes"] == 28
+    assert dedup_bias["train_bytes"] == 48
+    assert dedup_bias["drop_fraction"] == round(20 / 48, 6)
+    assert dedup_bias["excluded_span_lengths"]["spans"] == 2
     assert dedup_dataset.effective_train_sha256 == (
         _effective_train_fingerprint(
             dedup_dataset._raw,

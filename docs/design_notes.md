@@ -91,7 +91,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   识别为不同数据协议。清洗后的有效训练集另有
   `data.effective_train_sha256`：它把剔除区间清单与保留字节一起
   哈希，resume 或跨运行对比时能发现「split 与清洗开关相同、实际
-  训练字节不同」的隐性变化。`data.split_isolation` 则独立记录
+  训练字节不同」的隐性变化。清洗确有删除时 `deletion_bias` 进一步
+  比较被删除与保留内容的字节/二元组分布（JS 距离）、删除比例与
+  连续段长度：清洗按内容规则选择性删除，偏差大时清洗前后的指标
+  不可直接比较。`label_coverage` 逐评估 split 报告训练集从未出现
+  的字节类数与 token 占比；这些标签的 NLL 是不可约外推误差，
+  不能算作模型能力差异。`data.split_isolation` 则独立记录
   `train < val < test` 的绝对字节边界、是否首尾相接覆盖全文以及
   任意重叠字节数，并进入受控变量协议：时序切分必须连续、零重叠、
   不随机打乱。
