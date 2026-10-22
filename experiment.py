@@ -71,6 +71,10 @@ class Config:
 
     d_model: int = 128
     n_heads: int = 4
+    # GQA / KV 头数：None 等价于 n_heads（标准 MHA）。SMELT 论文
+    # 使用 grouped-query attention 以匹配 KV cache；n_kv_heads <
+    # n_heads 时每个 KV 头被 n_heads // n_kv_heads 个 Q 头共享。
+    n_kv_heads: Optional[int] = None
     n_layers: int = 8
 
     n_experts: int = 8
@@ -97,6 +101,14 @@ class Config:
     balance_coef: float = 0.01
     residual_scale: float = 1.0
 
+    # 残差缩放口径：
+    #   paper  —— 循环区域内的子层残差更新额外除以循环次数 r
+    #             （SMELT 论文 3.1 节；本基座 r=2，即 1/2），
+    #             循环区域外的子层仍只用 residual_scale；
+    #   global —— 历史行为：residual_scale 全局作用于所有子层。
+    # 旧运行 / global 口径在 comparison_protocol 中可区分。
+    residual_scaling: str = "paper"
+
     # 初始化方案。module_order 是历史行为：按模块构造顺序消耗
     # 全局 RNG，不同 mode 的模块数量/构造顺序不同，同一种子下
     # 共享层会得到不同初始权重。name_hash 按参数名与运行种子
@@ -106,9 +118,53 @@ class Config:
 
     # LanguageModel 可以构建的模式；ngram 仅供统计基线运行写
     # config.json 使用。
-    MODEL_MODES = {"smelt", "local_base", "A", "B", "dense"}
+    #   base           —— 论文的未循环 MoE 基线（middle 只执行一次）；
+    #   smelt          —— 论文方法（middle 循环两次，循环区域残差 1/r）；
+    #   local_base     —— 立即合并 + 第二轮宽度 min(E,k1*k2) 的等专家
+    #                     计算量对照（性能对照）；
+    #   local_base_k2  —— 立即合并 + 第二轮宽度 k2 的机制对照
+    #                     （只改变合并时机，不改变第二轮宽度）；
+    #   A              —— 局部延迟合并；
+    #   B              —— 全局延迟合并；
+    #   B_early        —— B 的等计算量机制对照：分支数与 Attention/MoE
+    #                     执行次数不变，只在第一轮结束后提前合并并
+    #                     重新展开为 k1 个分支（只改变合并位置）；
+    #   dense          —— 无 MoE、无循环的纯稠密 Transformer 基线。
+    MODEL_MODES = {
+        "base",
+        "smelt",
+        "local_base",
+        "local_base_k2",
+        "A",
+        "B",
+        "B_early",
+        "dense",
+    }
     ALL_MODES = MODEL_MODES | {"ngram"}
     INIT_SCHEMES = {"module_order", "name_hash"}
+    RESIDUAL_SCALINGS = {"paper", "global"}
+
+    @property
+    def effective_n_kv_heads(self) -> int:
+        return self.n_heads if self.n_kv_heads is None else self.n_kv_heads
+
+    @property
+    def loop_count(self) -> int:
+        """中间区域每层在完整前向中执行的次数。"""
+        return 1 if self.mode in {"base", "dense"} else 2
+
+    @property
+    def loop_residual_scale(self) -> float:
+        """循环区域内子层残差更新的系数。
+
+        paper 口径按 SMELT 论文 3.1 节对循环区域内的每个子层
+        残差更新除以循环次数 r；global 口径保留历史行为，即
+        与循环区域外使用同一个 residual_scale。
+        """
+        if self.residual_scaling == "paper":
+            return self.residual_scale / float(self.loop_count)
+        return self.residual_scale
+
 
     @property
     def effective_dense_fnn_hidden(self) -> int:
@@ -130,8 +186,17 @@ class Config:
             raise ValueError("expert_hidden 必须为正整数")
         if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
             raise ValueError("d_model 必须能被正的 n_heads 整除")
-        if self.n_layers < 4 or self.n_layers % 4 != 0:
-            raise ValueError("n_layers 必须是大于等于 4 的 4 的倍数")
+        if self.effective_n_kv_heads <= 0:
+            raise ValueError("n_kv_heads 必须为正整数")
+        if self.n_heads % self.effective_n_kv_heads != 0:
+            raise ValueError(
+                "n_heads 必须能被 n_kv_heads 整除（GQA 分组）"
+            )
+        if self.n_layers < 4:
+            raise ValueError("n_layers 必须大于等于 4")
+        # 中间区域由 middle_start=n//4、middle_end=3n//4 定义，
+        # 对 L=10/12/20/30 等论文深度都能取到约 50% 的循环跨度；
+        # 不再强制 L 为 4 的倍数（论文的 L=10/20/30 就不是）。
         if not 1 <= self.top_k <= self.n_experts:
             raise ValueError("top_k 必须满足 1 <= top_k <= n_experts")
         if not 1 <= self.k1 <= self.n_experts:
@@ -142,6 +207,11 @@ class Config:
             raise ValueError("balance_coef 必须是有限非负数")
         if not math.isfinite(self.residual_scale) or self.residual_scale < 0.0:
             raise ValueError("residual_scale 必须是有限非负数")
+        if self.residual_scaling not in self.RESIDUAL_SCALINGS:
+            raise ValueError(
+                "residual_scaling 必须是 "
+                + " / ".join(sorted(self.RESIDUAL_SCALINGS))
+            )
         if self.mode == "dense":
             hidden = self.effective_dense_fnn_hidden
             if hidden <= 0:
@@ -169,6 +239,357 @@ class Config:
     @property
     def middle_end(self) -> int:
         return 3 * self.n_layers // 4
+
+
+# ============================================================
+# Cost model / budget matching
+# ============================================================
+
+def mode_cost_profile(cfg: Config) -> Dict[str, object]:
+    """
+    按完整计算图给出每 token 的执行次数与解析 FLOPs。
+
+    只数路由宽度会漏掉第一阶段成本：A 的每 token 专家
+    执行次数是 ``k1 + k1*k2``，而不是 ``k1*k2``；B 还要计入
+    分支创建位置、第一轮其余层按分支执行的 Attention/MoE，
+    以及分支化 Attention 的开销。该函数把四类成本分开：
+
+    - ``attention_executions``：每 token 经过 Attention 子层的
+      次数（B 的分支 Attention 按 k1 倍计）；
+    - ``moe_passes``：每 token 经过 Router/MoE 子层的次数；
+    - ``expert_assignments``：每 token 的专家执行次数（k 个
+      专家算 k 次）；
+    - ``router_calls``：每 token 的路由打分次数。
+
+    ``analytic_flops_per_token`` 是统一口径的解析下界
+    （矩阵乘 2·m·n·k，Attention 矩阵 4·T·D），用于跨模式
+    预算匹配；实测 FLOPs 仍以 FlopCounter 为准。两者不会
+    假装相等：报告同时给出 ``measurement`` 与实际测量的
+    比例（见 ``measure_efficiency``）。
+    """
+    layers = int(cfg.n_layers)
+    middle = int(cfg.middle_end - cfg.middle_start)
+    pre = int(cfg.middle_start)
+    post = int(layers - cfg.middle_end)
+    dim = int(cfg.d_model)
+    head_dim = dim // int(cfg.n_heads)
+    kv_dim = int(cfg.effective_n_kv_heads) * head_dim
+    top_k = int(cfg.top_k)
+    k1 = int(cfg.k1)
+    k2 = int(cfg.k2)
+    experts = int(cfg.n_experts)
+    expert_hidden = int(cfg.expert_hidden)
+    seq_len = int(cfg.seq_len)
+
+    mode = cfg.mode
+    branch_factor = 1
+    if mode == "dense":
+        attention_executions = layers
+        moe_passes = 0
+        expert_assignments = 0
+        router_calls = 0
+    elif mode == "base":
+        attention_executions = layers
+        moe_passes = layers
+        expert_assignments = top_k * layers
+        router_calls = layers
+    elif mode == "smelt":
+        attention_executions = pre + 2 * middle + post
+        moe_passes = pre + 2 * middle + post
+        expert_assignments = top_k * (pre + 2 * middle + post)
+        router_calls = moe_passes
+    elif mode == "B":
+        branch_factor = k1
+        branch_exec = 1 + (middle - 1) * k1 + middle * k1
+        attention_executions = pre + branch_exec + post
+        moe_passes = pre + branch_exec + post
+        # 第一轮 m 个 Block 每 token 都路由 k1 个专家；第二轮
+        # m 个 Block 的每个分支各路由 k2 个专家。
+        expert_assignments = (
+            top_k * (pre + post) + middle * k1 + middle * k1 * k2
+        )
+        router_calls = moe_passes
+    elif mode == "B_early":
+        # 与 B 完全相同的分支数、Attention/MoE 执行次数；只有
+        # 跨分支合并位置提前到第一轮结束。
+        branch_factor = k1
+        branch_exec = 1 + (middle - 1) * k1 + middle * k1
+        attention_executions = pre + branch_exec + post
+        moe_passes = pre + branch_exec + post
+        expert_assignments = (
+            top_k * (pre + post) + middle * k1 + middle * k1 * k2
+        )
+        router_calls = moe_passes
+    else:
+        # A / local_base / local_base_k2：Attention 由所有分支
+        # 共享（每层一次），MoE 两阶段。
+        attention_executions = layers
+        moe_passes = layers + middle
+        router_calls = moe_passes
+        if mode == "A":
+            expert_assignments = (
+                top_k * (pre + post) + middle * (k1 + k1 * k2)
+            )
+        elif mode == "local_base_k2":
+            expert_assignments = (
+                top_k * (pre + post) + middle * (k1 + k2)
+            )
+        else:
+            expert_assignments = (
+                top_k * (pre + post)
+                + middle * (k1 + min(experts, k1 * k2))
+            )
+
+    # 每 token 经过一次 Attention 子层的解析 FLOPs。
+    # Q/K/V/out 投影：Q 为 D×D，K/V 为 D×kv_dim，out 为 D×D；
+    # 乘加计 2 次。Attention 矩阵（因果）按 4·T·D 计，与
+    # _count_forward_flops 的估计口径一致。
+    attention_flops = (
+        2 * dim * dim
+        + 2 * 2 * dim * kv_dim
+        + 2 * dim * dim
+        + 4 * seq_len * dim
+    )
+    # 每个 MoE/Router pass 的路由打分。
+    router_flops = 2 * dim * experts
+    # 每个专家 assignment：gate_up 为 D×(2·H)，down 为 H×D。
+    expert_flops = 2 * dim * (2 * expert_hidden) + 2 * expert_hidden * dim
+    analytic_flops = (
+        attention_executions * attention_flops
+        + router_calls * router_flops
+        + expert_assignments * expert_flops
+    )
+    # KV cache 每 token 字节数（fp16 存储 K 和 V）：只按物理层
+    # 计一次；B/B_early 的每个分支各自持有一份 KV，因此乘
+    # 分支数。若实现为每次循环访问都缓存一份，需再乘
+    # loop_count，这里显式记录两种口径。
+    kv_bytes_physical = (
+        2 * layers * 2 * kv_dim * 2 * branch_factor
+    )
+    return {
+        "mode": mode,
+        "n_layers": layers,
+        "middle_layers": middle,
+        "loop_count": int(cfg.loop_count),
+        "branch_factor": int(branch_factor),
+        "attention_executions_per_token": int(attention_executions),
+        "moe_passes_per_token": int(moe_passes),
+        "router_calls_per_token": int(router_calls),
+        "expert_assignments_per_token": int(expert_assignments),
+        "analytic_flops_per_token": int(analytic_flops),
+        "analytic_flops_breakdown": {
+            "attention": int(attention_executions * attention_flops),
+            "router": int(router_calls * router_flops),
+            "experts": int(expert_assignments * expert_flops),
+        },
+        "analytic_formula": {
+            "expert_assignments": {
+                "smelt": "top_k * (pre + 2*middle + post)",
+                "A": "top_k*(pre+post) + middle*(k1 + k1*k2)",
+                "local_base": (
+                    "top_k*(pre+post) + middle*(k1 + "
+                    "min(n_experts, k1*k2))"
+                ),
+                "local_base_k2": (
+                    "top_k*(pre+post) + middle*(k1 + k2)"
+                ),
+                "B": (
+                    "top_k*(pre+post) + middle*k1 + "
+                    "middle*k1*k2"
+                ),
+                "B_early": (
+                    "top_k*(pre+post) + middle*k1 + "
+                    "middle*k1*k2 (与 B 相同)"
+                ),
+                "base": "top_k * n_layers",
+                "dense": "0（无 MoE）",
+            }.get(mode, "n/a"),
+            "attention_executions": {
+                "smelt": "pre + 2*middle + post",
+                "A": "n_layers (Attention 跨分支共享)",
+                "B": (
+                    "pre + [1 + (middle-1)*k1 + middle*k1] + post"
+                ),
+                "base": "n_layers",
+                "dense": "n_layers",
+            }.get(
+                mode,
+                "n_layers (Attention 跨分支共享)",
+            ),
+            "note": (
+                "只匹配 k1*k2≈2*top_k 会漏掉第一阶段成本；"
+                "请用 --budget-match 对完整计算图核对"
+            ),
+        },
+        "kv_cache_bytes_per_token": int(kv_bytes_physical),
+        "kv_cache_bytes_per_token_per_visit": int(
+            kv_bytes_physical * int(cfg.loop_count)
+        ),
+        "kv_cache_note": (
+            "按物理层各缓存一份 K/V（B 按分支数乘 k1）的 fp16 "
+            "估计；per_visit 口径为每次循环访问都单独缓存。"
+            "增量解码尚未实现，这里只是容量下界/口径说明"
+        ),
+    }
+
+
+def _budget_flops_ratio(
+    cfg: Config,
+    baseline_mode: str,
+    k1: Optional[int] = None,
+    k2: Optional[int] = None,
+) -> float:
+    """候选配置相对同维度参考模式的解析 FLOPs 比例。"""
+    candidate = replace(
+        cfg,
+        mode=cfg.mode,
+        k1=cfg.k1 if k1 is None else int(k1),
+        k2=cfg.k2 if k2 is None else int(k2),
+    )
+    baseline = replace(cfg, mode=baseline_mode)
+    baseline_flops = int(
+        mode_cost_profile(baseline)["analytic_flops_per_token"]
+    )
+    candidate_flops = int(
+        mode_cost_profile(candidate)["analytic_flops_per_token"]
+    )
+    if baseline_flops <= 0:
+        return float("inf")
+    return candidate_flops / baseline_flops
+
+
+def budget_match_report(
+    cfg: Config,
+    baseline_mode: str,
+    tolerance: float,
+) -> Dict[str, object]:
+    """
+    按完整计算图核对候选模式与参考模式的每 token FLOPs。
+
+    返回比例、允许误差、是否匹配，并为 A/local_base*/
+    local_base_k2 搜索最接近预算的整数 k2（固定其它结构）；
+    为 B/B_early 搜索 (k1, k2) 网格中的最接近组合。搜索只是
+    建议，不会静默改配置。
+    """
+    profile = mode_cost_profile(cfg)
+    baseline_profile = mode_cost_profile(
+        replace(cfg, mode=baseline_mode)
+    )
+    ratio = (
+        float(profile["analytic_flops_per_token"])
+        / float(baseline_profile["analytic_flops_per_token"])
+        if int(baseline_profile["analytic_flops_per_token"]) > 0
+        else float("inf")
+    )
+    report: Dict[str, object] = {
+        "baseline_mode": baseline_mode,
+        "candidate_mode": cfg.mode,
+        "candidate_flops_per_token": profile[
+            "analytic_flops_per_token"
+        ],
+        "baseline_flops_per_token": baseline_profile[
+            "analytic_flops_per_token"
+        ],
+        "flops_ratio": ratio,
+        "tolerance": tolerance,
+        "matched": abs(ratio - 1.0) <= tolerance,
+        "matched_costs": {
+            "candidate": profile,
+            "baseline": baseline_profile,
+        },
+        "search": None,
+    }
+
+    if cfg.mode in {
+        "A",
+        "local_base",
+        "local_base_k2",
+    }:
+        best = None
+        for candidate_k2 in range(1, cfg.n_experts + 1):
+            candidate_ratio = _budget_flops_ratio(
+                cfg,
+                baseline_mode,
+                k2=candidate_k2,
+            )
+            score = abs(candidate_ratio - 1.0)
+            if best is None or score < best[0]:
+                best = (score, candidate_k2, candidate_ratio)
+        if best is not None:
+            report["search"] = {
+                "kind": "k2",
+                "recommended_k2": int(best[1]),
+                "flops_ratio_at_recommendation": best[2],
+                "grid": "1..n_experts",
+            }
+    elif cfg.mode in {"B", "B_early"}:
+        best = None
+        for candidate_k1 in range(1, cfg.n_experts + 1):
+            for candidate_k2 in range(1, cfg.n_experts + 1):
+                candidate_ratio = _budget_flops_ratio(
+                    cfg,
+                    baseline_mode,
+                    k1=candidate_k1,
+                    k2=candidate_k2,
+                )
+                score = abs(candidate_ratio - 1.0)
+                if best is None or score < best[0]:
+                    best = (
+                        score,
+                        candidate_k1,
+                        candidate_k2,
+                        candidate_ratio,
+                    )
+        if best is not None:
+            report["search"] = {
+                "kind": "k1_k2",
+                "recommended_k1": int(best[1]),
+                "recommended_k2": int(best[2]),
+                "flops_ratio_at_recommendation": best[3],
+                "grid": "1..n_experts x 1..n_experts",
+            }
+    return report
+
+
+def paper_fidelity_report(cfg: Config) -> Dict[str, object]:
+    """
+    对照 arXiv:2609.01343v1 的关键配置，列出复现状态。
+
+    论文的关键配置：middle 50% 循环两次；循环区域内每个子层
+    残差按 1/r 缩放；每层 top-8 路由；GQA；FLOPs / 总参数 /
+    KV cache 三者匹配；4096 token 上下文与文档级 attention
+    mask。本基座是可运行的小规模复现，默认的 128 上下文 /
+    8 专家 / top-2 不是论文规模；报告把「已实现」与「偏离」
+    分开记录，避免把 SMELT 风格简化模型说成论文复现。
+    """
+    checks = {
+        "loop_middle_half": (
+            cfg.middle_end - cfg.middle_start == cfg.n_layers // 2
+        ),
+        "loop_twice": cfg.loop_count == 2,
+        "loop_residual_scaling_1_over_r": (
+            cfg.residual_scaling == "paper"
+        ),
+        "top_k_8": cfg.top_k == 8,
+        "gqa": cfg.effective_n_kv_heads < cfg.n_heads,
+        "context_4096": cfg.seq_len == 4096,
+    }
+    deviations = [name for name, ok in checks.items() if not ok]
+    return {
+        "paper": "arXiv:2609.01343v1",
+        "checks": checks,
+        "deviations": deviations,
+        "is_full_reproduction": not deviations,
+        "interpretation": (
+            "没有偏离项才可称为论文配置的复现；存在偏离项时，"
+            "结论只能表述为「SMELT 风格架构」的结果，不能直接"
+            "声称复现或超过论文 SMELT"
+        ),
+        "scale_note": (
+            "论文标度 100M–1.6B、4096 上下文、top-8 + GQA；"
+            "本仓库默认是小规模原型，规模外推需要另行验证"
+        ),
+    }
 
 
 # ============================================================
@@ -613,13 +1034,41 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
 
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.effective_n_kv_heads
+        self.kv_repeat = self.n_heads // self.n_kv_heads
         self.head_dim = cfg.d_model // cfg.n_heads
+        self.kv_dim = self.n_kv_heads * self.head_dim
 
-        self.qkv = nn.Linear(
-            cfg.d_model,
-            3 * cfg.d_model,
-            bias=False,
-        )
+        # n_kv_heads == n_heads 时保留融合 qkv 参数（历史检查点
+        # 兼容，且 MHA 时更省一次 GEMM）；GQA 时 K/V 的投影宽度
+        # 小于 Q，必须分开投影。
+        if self.n_kv_heads == self.n_heads:
+            self.qkv = nn.Linear(
+                cfg.d_model,
+                3 * cfg.d_model,
+                bias=False,
+            )
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
+        else:
+            self.qkv = None
+            self.q_proj = nn.Linear(
+                cfg.d_model,
+                cfg.d_model,
+                bias=False,
+            )
+            self.k_proj = nn.Linear(
+                cfg.d_model,
+                self.kv_dim,
+                bias=False,
+            )
+            self.v_proj = nn.Linear(
+                cfg.d_model,
+                self.kv_dim,
+                bias=False,
+            )
+
         self.out = nn.Linear(
             cfg.d_model,
             cfg.d_model,
@@ -633,13 +1082,38 @@ class CausalSelfAttention(nn.Module):
         """
         batch, length, dim = x.shape
 
-        q, k, v = F.linear(x, self.qkv.weight).view(
-            batch, length, 3, self.n_heads, self.head_dim
-        ).unbind(2)
+        if self.qkv is not None:
+            q, k, v = F.linear(x, self.qkv.weight).view(
+                batch, length, 3, self.n_heads, self.head_dim
+            ).unbind(2)
+        else:
+            q = self.q_proj(x).view(
+                batch,
+                length,
+                self.n_heads,
+                self.head_dim,
+            )
+            k = self.k_proj(x).view(
+                batch,
+                length,
+                self.n_kv_heads,
+                self.head_dim,
+            )
+            v = self.v_proj(x).view(
+                batch,
+                length,
+                self.n_kv_heads,
+                self.head_dim,
+            )
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # GQA：每个 KV 头被 kv_repeat 个连续 Q 头共享。
+        if self.kv_repeat > 1:
+            k = k.repeat_interleave(self.kv_repeat, dim=1)
+            v = v.repeat_interleave(self.kv_repeat, dim=1)
 
         y = F.scaled_dot_product_attention(
             q,
@@ -1052,6 +1526,15 @@ class SparseMoE(nn.Module):
         # analyze_routing 的诊断前向中挂载。
         self._routing_probe = None
 
+        # 路由干预（RQ4 功能验证）：默认 None。
+        #   _routing_override(indices, weights, logits) 返回改写的
+        #       (indices, weights)，用于「路由打乱」等反事实；
+        #   _expert_drop_index 把指定专家的输出置零，用于
+        #       「专家屏蔽」的因果重要性测量。
+        # 只在显式启用的评估路径中挂载，训练路径不受影响。
+        self._routing_override = None
+        self._expert_drop_index: Optional[int] = None
+
         # 推理路径的零填充缓冲：grad 关闭时按
         # (device, dtype, rows, dim) 取用；训练（grad 开启）时
         # 填充缓冲会经 bmm 进入计算图，必须每次新建。
@@ -1250,12 +1733,30 @@ class SparseMoE(nn.Module):
         )
 
         # top-k 内部的 softmax 等价于完整 softmax 概率的
-        # 重新归一化，直接对 top-k logits 求 softmax；
-        # top_k == 1 时权重为单元素 softmax，恒为 1.0。
+        # 重新归一化，直接对 top-k logits 求 softmax。
+        #
+        # top_k == 1 时不能把权重设成常数 1：离散 argmax 的选择
+        # 本身不可导，常数权重会让 router 完全收不到语言建模损失
+        # 的梯度（只有负载均衡损失还能训练它；balance_coef=0 的
+        # 消融臂里 router 就永远停在上一步/初始化）。这里改用
+        # Switch Transformer 的口径：取完整 softmax 中选中专家的
+        # 概率作为门控权重，概率对 router logits 可导，梯度可以
+        # 通过门控缩放回流。
         if top_k == 1:
-            top_weights = torch.ones_like(top_values)
+            full_probs = router_logits.softmax(dim=-1)
+            top_weights = full_probs.gather(-1, top_indices)
         else:
             top_weights = top_values.softmax(dim=-1)
+
+        # 路由干预（只用于反事实评估）：在统计 counts / 计算
+        # aux loss 之前改写选择，保证后续 dispatch 与负载统计
+        # 都使用干预后的 assignment。
+        if self._routing_override is not None:
+            top_indices, top_weights = self._routing_override(
+                top_indices,
+                top_weights,
+                router_logits,
+            )
 
         # Top-k 版本的 Switch 风格负载均衡损失。
         # f_i 是「被分配给专家 i 的 token 比例」，以 token
@@ -1698,6 +2199,19 @@ class SparseMoE(nn.Module):
             top_k,
         )
 
+        # 专家屏蔽干预：把指定专家的输出置零（路由与门控保持
+        # 不变），用于测量「该专家对当前 token 的因果贡献」。
+        # 不做均值替换，以免引入额外的分布外输入；屏蔽后的
+        # 损失上升幅度是专家功能重要性的直接证据。
+        if self._expert_drop_index is not None:
+            drop = int(self._expert_drop_index)
+            mask = (top_indices == drop).to(
+                expert_outputs.dtype
+            )
+            expert_outputs = expert_outputs * (
+                1.0 - mask.unsqueeze(-1)
+            )
+
         return (
             expert_outputs,
             top_weights,
@@ -1725,10 +2239,13 @@ class SparseMoE(nn.Module):
         top_k = expert_outputs.size(-2)
         dim = expert_outputs.size(-1)
 
-        # top_k == 1 时门控权重恒为 1.0（单元素 softmax），
-        # 加权和退化为恒等；有残差时完成「缩放 + 残差相加」。
+        # top_k == 1 时门控权重是选中专家的完整 softmax 概率
+        # （Switch 风格，见 route 注释），不能当成恒等 1.0；
+        # 加权和退化为逐行乘概率后再加残差。
         if top_k == 1:
             output = expert_outputs.reshape(-1, dim)
+            weights = top_weights.reshape(-1, 1).to(output.dtype)
+            output = output * weights
 
             if residual is not None:
                 flat_residual = residual.reshape(-1, dim)
@@ -1835,7 +2352,12 @@ class TransformerBlock(nn.Module):
     def attention_step(
         self,
         x: torch.Tensor,
+        scale: Optional[float] = None,
     ) -> torch.Tensor:
+        # scale 由 LanguageModel 按区域传入：循环区域内使用
+        # loop_residual_scale（paper 口径为 residual_scale/r），
+        # 区域外与历史行为一致使用 residual_scale。
+        scale = self.residual_scale if scale is None else scale
         core = self.attn.core(self.norm_attn(x))
 
         # dtype 一致（非 autocast，如 CPU/fp32）时以 addmm
@@ -1848,21 +2370,23 @@ class TransformerBlock(nn.Module):
                 core.reshape(-1, dim),
                 self.attn.out.weight.t(),
                 beta=1.0,
-                alpha=self.residual_scale,
+                alpha=scale,
             ).view(batch, length, dim)
 
         # add(alpha=) 完成「缩放 + 相加」。
         return torch.add(
             x,
             F.linear(core, self.attn.out.weight),
-            alpha=self.residual_scale,
+            alpha=scale,
         )
 
     def moe_step(
         self,
         x: torch.Tensor,
         top_k: int,
+        scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scale = self.residual_scale if scale is None else scale
         # dense 基线：无路由，无辅助损失；top_k 参数被忽略，
         # 保持与 MoE 模式一致的调用签名。
         if self.is_dense:
@@ -1871,7 +2395,7 @@ class TransformerBlock(nn.Module):
                 torch.add(
                     x,
                     y,
-                    alpha=self.residual_scale,
+                    alpha=scale,
                 ),
                 x.new_zeros(()),
             )
@@ -1888,7 +2412,7 @@ class TransformerBlock(nn.Module):
             top_weights,
             x.shape,
             residual=x,
-            residual_scale=self.residual_scale,
+            residual_scale=scale,
         )
         return x, aux_loss
 
@@ -1896,14 +2420,16 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         top_k: int,
+        scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self.attention_step(x)
-        return self.moe_step(x, top_k)
+        x = self.attention_step(x, scale)
+        return self.moe_step(x, top_k, scale)
 
     def first_branch_step(
         self,
         x: torch.Tensor,
         k1: int,
+        scale: Optional[float] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1929,7 +2455,8 @@ class TransformerBlock(nn.Module):
             aux_loss:
                 scalar
         """
-        x = self.attention_step(x)
+        scale = self.residual_scale if scale is None else scale
+        x = self.attention_step(x, scale)
 
         expert_outputs, gates, indices, aux_loss = self.moe.unmerged(
             self.norm_moe(x),
@@ -1939,13 +2466,17 @@ class TransformerBlock(nn.Module):
         # expert_outputs:
         # [batch, time, k1, dim]
         #
-        # 每个分支都保留完整残差：x + residual_scale * expert。
-        # dtype 不一致（autocast 残差流精度更高）时靠类型
-        # 提升合并。
+        # 每个分支保留完整残差：x + scale * (gate * expert)。
+        # gate 不能省：top_k=1 时它是选中专家的完整 softmax
+        # 概率（Switch 风格），省掉会让分支残差与已合并路径
+        # 不一致；top_k>1 时 gate 是 top-k 归一化权重。
+        gated_experts = expert_outputs * gates.to(
+            expert_outputs.dtype
+        ).unsqueeze(-1)
         branches = torch.add(
             x.unsqueeze(1),
-            expert_outputs.permute(0, 2, 1, 3),
-            alpha=self.residual_scale,
+            gated_experts.permute(0, 2, 1, 3),
+            alpha=scale,
         )
 
         return (
@@ -1961,42 +2492,45 @@ class TransformerBlock(nn.Module):
         k1: int,
         k2: int,
         delayed: bool,
+        scale: Optional[float] = None,
+        second_round_width: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        A/local_base 的局部对照。
+        A/local_base/local_base_k2 的局部对照。
 
         返回值固定为张量三元组 (x, aux1, aux2)，与
         _BlockCheckpoint 的「输出是张量元组」约定一致。
 
-        local_base:
-            第一轮 MoE 后立即合并。第二轮宽度
-            min(n_experts, k1*k2) 只用于对齐 A 的计算量；
-            返回的 aux2 已按 k2/matched_k2 折算回单分支
-            宽度，避免均衡强度随实现细节变化。
-
-        A:
-            第一轮专家输出先保留为分支；
-            第二轮每个分支独立路由；
-            第二轮结束后再合并。
+        second_round_width:
+            None  —— local_base 的等专家计算量口径：第二轮
+                     宽度取 min(n_experts, k1*k2)；
+            显式值 —— 机制对照 local_base_k2 取 k2，只改变
+                     合并时机，不把第二轮宽度一起改掉。
         """
-        x = self.attention_step(x)
+        scale = self.residual_scale if scale is None else scale
+        x = self.attention_step(x, scale)
 
         if not delayed:
-            # 立即合并对照与 A 的第二轮计算量对齐：A 在 k1 个
-            # 分支上各路由 k2 个专家，单分支的第二轮相应取
-            # min(n_experts, k1 * k2) 个专家。
-            matched_k2 = min(
-                self.moe.n_experts,
-                k1 * k2,
+            # 等专家计算量对照：A 在 k1 个分支上各路由 k2 个
+            # 专家，单分支的第二轮相应取 min(E, k1*k2) 个专家。
+            # 机制对照则固定第二轮为 k2（见 second_round_width）。
+            matched_k2 = (
+                min(self.moe.n_experts, k1 * k2)
+                if second_round_width is None
+                else int(second_round_width)
             )
-            x, aux1 = self.moe_step(x, k1)
-            x, aux2 = self.moe_step(x, matched_k2)
+            x, aux1 = self.moe_step(x, k1, scale)
+            x, aux2 = self.moe_step(x, matched_k2, scale)
             # 第二轮宽度是计算量对齐的产物；aux loss 约随
             # 路由宽度线性增长（见 SparseMoE.route 注释）。
             # 把 local_base 的 aux2 折算回 A/B 的单分支宽度
             # k2，保证全因子消融中 balance_coef 代表同一均衡
             # 强度，而不是让「立即合并」臂意外多受均衡压力。
-            if matched_k2 != k2:
+            # local_base_k2 的第二轮本来就是 k2，无需折算。
+            if (
+                second_round_width is None
+                and matched_k2 != k2
+            ):
                 aux2 = aux2 * (
                     float(k2) / float(matched_k2)
                 )
@@ -2007,13 +2541,19 @@ class TransformerBlock(nn.Module):
             k1,
         )
 
+        # 未合并分支的专家输出必须先乘第一轮门控（top_k=1
+        # 时是选中概率，不是 1），再加完整残差。
+        expert_outputs = expert_outputs * gates.to(
+            expert_outputs.dtype
+        ).unsqueeze(-1)
+
         # 残差并入 expert_outputs：dtype 一致时原地完成
-        # x + residual_scale * expert；dtype 不匹配时用
+        # x + scale * (gate*expert)；dtype 不匹配时用
         # add(alpha=) 合并。
         if expert_outputs.dtype == x.dtype:
-            if self.residual_scale != 1.0:
+            if scale != 1.0:
                 expert_outputs.mul_(
-                    self.residual_scale,
+                    scale,
                 )
             expert_outputs.add_(
                 x.unsqueeze(-2),
@@ -2023,7 +2563,7 @@ class TransformerBlock(nn.Module):
             branches = torch.add(
                 x.unsqueeze(-2),
                 expert_outputs,
-                alpha=self.residual_scale,
+                alpha=scale,
             )
 
         # branches:
@@ -2041,13 +2581,13 @@ class TransformerBlock(nn.Module):
             gates2,
             branches.shape,
             residual=branches,
-            residual_scale=self.residual_scale,
+            residual_scale=scale,
         )
 
         # 第一轮门控权重在第二轮结束后使用。
         if branches.size(-2) == 1:
-            # k1 == 1 时单元素 softmax 权重恒为 1.0，
-            # 加权和退化为恒等。
+            # k1 == 1 时分支已包含完整残差，第一轮专家输出
+            # 已按 p1 缩放；不能再乘一次 p1（会缩放残差）。
             x = branches.squeeze(-2)
         else:
             # 跨分支的门控加权和：逐分支 mul + addcmul 累加，
@@ -2484,6 +3024,7 @@ class LanguageModel(nn.Module):
         block: TransformerBlock,
         branches: torch.Tensor,
         top_k: int,
+        scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对每个 branch 独立执行完整 Transformer Block。
@@ -2507,6 +3048,7 @@ class LanguageModel(nn.Module):
         flat, aux_loss = block(
             flat,
             top_k,
+            scale,
         )
 
         branches = flat.view(
@@ -2547,12 +3089,18 @@ class LanguageModel(nn.Module):
         # 分支统一执行；跳过前后区域循环，避免边界 Block 重复执行。
         pre_end = 0 if cfg.mode == "dense" else self.middle_start
 
+        # 残差缩放：循环区域外的子层用 residual_scale；循环
+        # 区域内的子层在 paper 口径下额外除以循环次数 r。
+        global_scale = cfg.residual_scale
+        loop_scale = cfg.loop_residual_scale
+
         # 中间区域之前的层。
         for index in range(pre_end):
             x, aux = call(
                 blocks[index],
                 x,
                 cfg.top_k,
+                global_scale,
             )
             aux_losses.append(aux)
 
@@ -2568,11 +3116,26 @@ class LanguageModel(nn.Module):
                     blocks[index],
                     x,
                     cfg.top_k,
+                    global_scale,
                 )
                 aux_losses.append(aux)
 
         # ----------------------------------------------------
-        # Original SMELT
+        # 论文的未循环 MoE 基线：middle 只执行一次。
+        # ----------------------------------------------------
+        elif cfg.mode == "base":
+            for block in middle:
+                x, aux = call(
+                    block,
+                    x,
+                    cfg.top_k,
+                    global_scale,
+                )
+                aux_losses.append(aux)
+
+        # ----------------------------------------------------
+        # Original SMELT：middle 循环两次，循环区域内每个子层
+        # 的残差更新按 1/r 缩放（paper 口径）。
         # ----------------------------------------------------
         elif cfg.mode == "smelt":
             for _ in range(2):
@@ -2581,13 +3144,14 @@ class LanguageModel(nn.Module):
                         block,
                         x,
                         cfg.top_k,
+                        loop_scale,
                     )
                     aux_losses.append(aux)
 
         # ----------------------------------------------------
-        # Scheme B
+        # Scheme B / B 的等计算量机制对照 B_early
         # ----------------------------------------------------
-        elif cfg.mode == "B":
+        elif cfg.mode in ("B", "B_early"):
             if len(middle) == 0:
                 raise RuntimeError(
                     "中间层不能为空"
@@ -2599,6 +3163,7 @@ class LanguageModel(nn.Module):
                 middle[0].first_branch_step,
                 x,
                 cfg.k1,
+                loop_scale,
             )
             aux_losses.append(aux)
 
@@ -2609,8 +3174,36 @@ class LanguageModel(nn.Module):
                     block,
                     branches,
                     cfg.k1,
+                    loop_scale,
                 )
                 aux_losses.append(aux)
+
+            # B_early：分支数与后续 Attention/MoE 执行次数保持
+            # 与 B 一致，只在第一轮结束后提前合并，再把合并状态
+            # 复制回 k1 个分支继续第二轮。这样合并位置是唯一
+            # 改变的因素；第二轮各分支状态相同是提前合并的
+            # 直接后果，而不是额外减少了计算量。
+            if cfg.mode == "B_early":
+                if branches.size(1) == 1:
+                    merged = branches.squeeze(1)
+                else:
+                    branch_weights = gates.to(
+                        branches.dtype
+                    ).unsqueeze(-1).unbind(-2)
+                    merged = branches[:, 0].mul(
+                        branch_weights[0]
+                    )
+                    for index in range(1, len(branch_weights)):
+                        merged.addcmul_(
+                            branches[:, index],
+                            branch_weights[index],
+                        )
+                branches = merged.unsqueeze(1).expand(
+                    -1,
+                    cfg.k1,
+                    -1,
+                    -1,
+                ).contiguous()
 
             # 第二轮完整执行整个中间区域。
             for block in middle:
@@ -2619,6 +3212,7 @@ class LanguageModel(nn.Module):
                     block,
                     branches,
                     cfg.k2,
+                    loop_scale,
                 )
                 aux_losses.append(aux)
 
@@ -2631,8 +3225,10 @@ class LanguageModel(nn.Module):
             # [batch, k1, time, dim]
             #
             if branches.size(1) == 1:
-                # k1 == 1 时 gate 来自单元素 softmax，恒为 1.0，
-                # 分支维收缩退化为恒等，直接去掉分支维。
+                # k1 == 1 时分支已包含完整残差，且第一轮专家
+                # 输出已按选中概率 p1 缩放（Switch 风格）；
+                # 不能再把整条分支乘一次 p1，否则残差也会被
+                # 缩放。单个分支求和等价于恒等。
                 x = branches.squeeze(1)
             else:
                 # 归一化后的 top-k gate 在每个 token 上和为 1。
@@ -2652,10 +3248,15 @@ class LanguageModel(nn.Module):
                     )
 
         # ----------------------------------------------------
-        # Local base / Scheme A
+        # Local base / Scheme A / local_base_k2
         # ----------------------------------------------------
         else:
             delayed = cfg.mode == "A"
+            # local_base_k2 是「只改变合并时机」的机制对照：
+            # 第二轮固定 k2，不跟随 A 的 k1*k2 专家计算量。
+            second_round_width = (
+                cfg.k2 if cfg.mode == "local_base_k2" else None
+            )
 
             for block in middle:
                 x, aux1, aux2 = call(
@@ -2664,6 +3265,8 @@ class LanguageModel(nn.Module):
                     cfg.k1,
                     cfg.k2,
                     delayed,
+                    loop_scale,
+                    second_round_width,
                 )
                 aux_losses.extend((aux1, aux2))
 
@@ -2676,6 +3279,7 @@ class LanguageModel(nn.Module):
                 blocks[index],
                 x,
                 cfg.top_k,
+                global_scale,
             )
             aux_losses.append(aux)
 
@@ -3271,7 +3875,152 @@ def _split_isolation_record(
         "contiguous": contiguous,
         "covers_all_bytes": covers_all,
         "overlap_bytes": overlap_bytes,
-        "policy": "chronological_contiguous_no_shuffle",
+        "policy": "prefix_contiguous_no_shuffle",
+    }
+
+
+def audit_entity_manifest(
+    buf: bytes,
+    group_separator: Optional[bytes],
+    split_bounds: Dict[str, Tuple[int, int]],
+    manifest_path: str,
+) -> Dict[str, object]:
+    """用显式实体 ID 检查同一实体是否跨越 split。
+
+    ``--group-separator`` 只保证「分隔符之间的连续片段」不被
+    切开，不能识别同一用户/作者/文档版本在不相邻片段中的
+    重复出现。实体清单按群组序号（0 基）给出 entity_id
+    （JSON 数组或 {"groups": [...]}）；审计把同一 entity 的
+    全部群组映射到 split，任何实体同时出现在两个 split 即
+    报告为泄露级问题。
+
+    没有群组分隔符时无法建立群组序号，直接返回 skipped。
+    """
+    if group_separator is None:
+        return {
+            "available": False,
+            "reason": "需要 --group-separator 才能建立群组序号",
+        }
+    with open(manifest_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        values = payload.get("groups") or payload.get("entity_ids")
+    else:
+        values = payload
+    if not isinstance(values, list) or not values:
+        raise ValueError(
+            "实体清单必须是非空 JSON 数组（按群组序号给 entity_id）"
+        )
+    spans = list(_iter_group_spans(buf, group_separator, 0))
+    if len(values) != len(spans):
+        raise ValueError(
+            "实体清单条目数（"
+            f"{len(values)}）与群组数（{len(spans)}）不一致"
+        )
+    split_of = {}
+    ordered = sorted(
+        split_bounds.items(), key=lambda item: item[1][0]
+    )
+    for index, (start, _end) in enumerate(spans):
+        split_name = None
+        for name, (begin, finish) in ordered:
+            if begin <= start < finish:
+                split_name = name
+                break
+        split_of[index] = split_name
+    entities: Dict[str, set] = {}
+    for index, entity in enumerate(values):
+        entity_id = str(entity)
+        entities.setdefault(entity_id, set()).add(
+            split_of.get(index)
+        )
+    crossing = {
+        entity: sorted(
+            str(split) for split in splits if split is not None
+        )
+        for entity, splits in entities.items()
+        if len([split for split in splits if split is not None]) > 1
+    }
+    return {
+        "available": True,
+        "manifest": manifest_path,
+        "groups": len(spans),
+        "entities": len(entities),
+        "cross_split_entities": len(crossing),
+        "examples": list(crossing.items())[:20],
+        "note": (
+            "实体 ID 来自外部清单；分隔符本身不提供实体隔离。"
+            "跨 split 实体是泄露级问题，应重新切分或剔除，"
+            "而不是声称「群组不跨界」已足够"
+        ),
+    }
+
+
+def read_time_order_manifest(
+    path: str,
+) -> Dict[str, object]:
+    """读取并校验时间顺序清单（每行一个时间戳）。
+
+    支持 JSONL（``{"timestamp": "..."}``）或纯文本
+    （每行一个 ISO-8601 时间戳）。用于 --split-policy
+    chronological：只有清单按文件顺序单调不减时，前缀切分
+    才可以称为「按时间切分」；否则拒绝启动。
+    """
+    records: List[str] = []
+    with open(path, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                value = payload.get("timestamp")
+            elif isinstance(payload, str):
+                value = payload
+            else:
+                value = None
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"时间清单第 {line_number} 行缺少 timestamp"
+                )
+            try:
+                datetime.datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"时间清单第 {line_number} 行不是 ISO-8601: "
+                    f"{value!r}（{error}）"
+                )
+            records.append(value)
+    if not records:
+        raise ValueError("时间清单为空")
+    parsed = [
+        datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+        for value in records
+    ]
+    violations = [
+        index
+        for index in range(1, len(parsed))
+        if parsed[index] < parsed[index - 1]
+    ]
+    return {
+        "path": path,
+        "records": len(records),
+        "min_timestamp": records[0],
+        "max_timestamp": records[-1],
+        "monotonic_non_decreasing": not violations,
+        "order_violations": violations[:20],
+        "order_violation_count": len(violations),
+        "note": (
+            "清单按语料文件顺序逐条给出时间戳；只有单调不减时"
+            "前缀切分才是时间切分。文件顺序本身不构成时间证据"
+        ),
     }
 
 
@@ -3319,7 +4068,13 @@ class ByteDataset:
         drop_train_degenerate_groups: bool = False,
         drop_train_degenerate_runs: bool = False,
         clean_train_against_test: bool = False,
+        include_test_in_cleaning: bool = False,
     ):
+        # 两个入口名都保留：远程分支的 clean_train_against_test
+        # 与本次修正的 include_test_in_cleaning 语义相同。
+        include_test_in_cleaning = bool(
+            include_test_in_cleaning or clean_train_against_test
+        )
         data_path = Path(filename)
 
         if not 0.0 < val_fraction < 1.0:
@@ -3554,6 +4309,27 @@ class ByteDataset:
             for split, (begin, end) in self.split_bounds.items()
         }
 
+        # 训练集清洗的评估内容访问口径：默认只用 val 决定
+        # 删除哪些训练群组。test 内容参与删除决策会让「测试集
+        # 全程尘封」不再成立（即使 test 字节本身不被修改）：
+        # 数据集构建已经根据 test 内容筛掉了特定训练样本。
+        # 只有显式 --allow-eval-content-for-cleaning 才把 test
+        # 纳入清洗参照，并把访问事实写入 data_audit。
+        self.eval_content_access = {
+            "splits": (
+                ["val", "test"]
+                if include_test_in_cleaning
+                else ["val"]
+            ),
+            "purpose": "train_cleaning_reference",
+            "test_content_used": bool(include_test_in_cleaning),
+            "note": (
+                "默认只用 val 决定训练集删除；test 内容不参与"
+                "数据集构建。启用 --allow-eval-content-for-cleaning "
+                "后 test 内容会参与删除决策，必须披露且不能"
+                "同时声称 test 全程未被读取"
+            ),
+        }
         dedup_excluded: List[Tuple[int, int]] = []
         dedup_stats: Optional[Dict[str, object]] = None
 
@@ -7942,6 +8718,43 @@ def _ar1_adjusted_mean_test(
     return result
 
 
+def _bootstrap_window_indices(
+    n_windows: int,
+    replicates: int,
+    generator: torch.Generator,
+    block_size: int = 1,
+) -> torch.Tensor:
+    """窗口重采样下标：i.i.d. 或循环移动块。
+
+    block_size>1 时先抽取 n_blocks=ceil(n/block_size) 个块起点，
+    再拼接连续窗口（循环取模），最后截断到 n。它把相邻窗口
+    成块重采样，部分吸收局部自相关；按文档/来源做 cluster
+    bootstrap 仍然更合适，这里只是窗口级近似。
+    """
+    n = int(n_windows)
+    reps = int(replicates)
+    if block_size <= 1:
+        return torch.randint(
+            low=0,
+            high=n,
+            size=(reps, n),
+            generator=generator,
+        )
+    block = max(1, int(block_size))
+    n_blocks = int(math.ceil(n / block))
+    starts = torch.randint(
+        low=0,
+        high=n,
+        size=(reps, n_blocks),
+        generator=generator,
+    )
+    offsets = torch.arange(block)
+    indices = (
+        starts.unsqueeze(-1) + offsets
+    ) % n
+    return indices.reshape(reps, -1)[:, :n]
+
+
 def _bootstrap_eval_intervals(
     window_loss_sums: torch.Tensor,
     window_tokens: torch.Tensor,
@@ -7952,6 +8765,7 @@ def _bootstrap_eval_intervals(
     seed: int,
     ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
     window_class_loss_sums: Optional[torch.Tensor] = None,
+    block_size: int = 1,
 ) -> Dict[str, object]:
     """
     对固定评估窗口做有放回 bootstrap，给出评估集层面的
@@ -7993,11 +8807,11 @@ def _bootstrap_eval_intervals(
         return {}
 
     generator = torch.Generator().manual_seed(int(seed))
-    indices = torch.randint(
-        low=0,
-        high=n_windows,
-        size=(int(replicates), n_windows),
-        generator=generator,
+    indices = _bootstrap_window_indices(
+        n_windows,
+        int(replicates),
+        generator,
+        block_size=block_size,
     )
 
     loss_sums = window_loss_sums.to(torch.float64)
@@ -8180,6 +8994,15 @@ def _bootstrap_eval_intervals(
         result[f"{name}_ci95_low"] = low
         result[f"{name}_ci95_high"] = high
 
+    result["bootstrap_unit"] = (
+        "moving_block" if int(block_size) > 1 else "window_iid"
+    )
+    result["bootstrap_block_size"] = int(max(1, block_size))
+    result["bootstrap_note"] = (
+        "窗口级重采样只近似评估不确定性；连续/重叠窗口应按"
+        "文档/来源做 cluster bootstrap，块 bootstrap 仅部分"
+        "吸收局部自相关"
+    )
     return result
 
 
@@ -8197,9 +9020,13 @@ def macro_auc_metrics(
     min_support 的类，返回值同时记录纳入类数，保证
     「macro」的口径（对哪些类求平均）可追溯。
 
-    极度不平衡时优先报告 PR-AUC：负样本基数巨大时
-    ROC-AUC 的 FPR 分母被拉大，同样的假阳性绝对数量下
-    分数增长缓慢，容易给出过于乐观的结论。
+    ROC-AUC 的 TPR/FPR 都以真实类别为条件，其期望不随
+    prevalence 变化；负样本更多只会让 FPR 估计更精确，不会
+    把 AUC 本身抬高。真正的问题是：正类极稀有且分数区分度
+    一般时，高 ROC-AUC 仍可能对应很低的 precision/recall，
+    PR-AUC 的随机水平又等于 prevalence——因此排序指标要
+    报告 PR-AUC 相对随机水平的 lift 与 precision@k，而不是
+    把绝对 PR-AUC 当归一化准确率。
 
     同时返回 ``pr_auc_macro_chance``：macro PR-AUC 的随机
     水平（各纳入类 prevalence 的均值），以及
@@ -8456,6 +9283,7 @@ def evaluate(
     bad_case_collector: Optional["_BadCaseCollector"] = None,
     bootstrap_replicates: int = 0,
     window_sink: Optional[List[Dict[str, float]]] = None,
+    bootstrap_block: int = 1,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -8912,6 +9740,7 @@ def evaluate(
             window_class_loss_sums=torch.stack(
                 window_class_loss_sums
             ),
+            block_size=int(bootstrap_block),
         )
         for key, value in bootstrap_metrics.items():
             metrics[f"{split}_{key}"] = value
@@ -11205,6 +12034,23 @@ def run_statistical_baseline(
                     "drop_train_degenerate_runs",
                     False,
                 )
+            ),
+            "eval_content_access": (
+                getattr(dataset, "eval_content_access", None)
+                if dataset is not None
+                else None
+            ),
+            "cleaning_domain_justification": getattr(
+                args, "cleaning_domain_justification", None
+            ),
+            "split_policy": getattr(
+                args, "split_policy", "contiguous"
+            ),
+            "time_order_evidence": getattr(
+                args, "time_order_evidence", None
+            ),
+            "entity_audit": getattr(
+                args, "data_entity_audit", None
             ),
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
@@ -13853,6 +14699,20 @@ def _routing_set_metrics_bool(
     - first_recall：|A∩B| / |A|，第一轮专家在第二轮复现的比例；
     - second_unique_reuse：|A∩B| / |B|，第二轮独特专家来自
       第一轮的比例。
+
+    Jaccard 不能直接跨 $k_1/k_2$、专家数与负载集中度比较：
+    均匀随机选择时两个 k 元集合的期望交集是 k1*k2/E。因此
+    同时给出两个机会水平（chance level）：
+
+    - ``jaccard_chance_uniform``：每个 token 按 |A|、|B| 与
+      E 计算期望交集的均匀随机基线；
+    - ``jaccard_chance_marginal``：第二轮的专家边际负载保持
+      不变（P(e∈B)=第二轮负载份额），只随机化组合；这对应
+      「保持负载分布、打乱路由」的置换基线。
+
+    ``*_lift`` 为观测 Jaccard 相对机会水平的倍数，``*_adjusted``
+    为 (obs − chance)/(1 − chance)。低重合本身不证明路由更
+    有效，必须结合干预实验（见 analyze_routing_interventions）。
     """
     if a_bool.numel() == 0 or b_bool.numel() == 0:
         return None
@@ -13863,12 +14723,50 @@ def _routing_set_metrics_bool(
     union = (a_bool | b_bool).sum(dim=-1).float()
     r1_size = a_bool.sum(dim=-1).float()
     r2_size = b_bool.sum(dim=-1).float()
+    n_experts = int(a_bool.size(-1))
+
+    jaccard = intersection / union.clamp_min(1e-12)
+    jaccard_mean = float(jaccard.mean())
+
+    # 均匀随机基线：E|A∩B| = |A|·|B|/E。
+    expected_uniform = (
+        r1_size * r2_size / max(1, n_experts)
+    )
+    union_uniform = (
+        r1_size + r2_size - expected_uniform
+    ).clamp_min(1e-12)
+    chance_uniform = float(
+        (expected_uniform / union_uniform).mean()
+    )
+
+    # 边际负载保持基线：P(e∈B) 取第二轮的经验负载份额，
+    # 对每个 token 的 A 集合求和得到期望交集。该口径保留
+    # 「某些专家本来就更常被选中」带来的重合，避免把负载
+    # 集中误读成路由机制。
+    b_load = b_bool.float().mean(dim=0)
+    expected_marginal = (
+        a_bool.float() * b_load.unsqueeze(0)
+    ).sum(dim=-1)
+    union_marginal = (
+        r1_size + r2_size - expected_marginal
+    ).clamp_min(1e-12)
+    chance_marginal = float(
+        (expected_marginal / union_marginal).mean()
+    )
+
+    def _adjusted(chance: float) -> Optional[float]:
+        if chance >= 1.0:
+            return None
+        return (jaccard_mean - chance) / (1.0 - chance)
+
+    def _lift(chance: float) -> Optional[float]:
+        if chance <= 0.0:
+            return None
+        return jaccard_mean / chance
 
     return {
         "units": int(a_bool.size(0)),
-        "second_round_jaccard_mean": float(
-            (intersection / union.clamp_min(1e-12)).mean()
-        ),
+        "second_round_jaccard_mean": jaccard_mean,
         "second_round_exact_match_share": float(
             (intersection == union).float().mean()
         ),
@@ -13877,6 +14775,21 @@ def _routing_set_metrics_bool(
         ),
         "second_round_unique_reuse_mean": float(
             (intersection / r2_size.clamp_min(1e-12)).mean()
+        ),
+        "expected_intersection_uniform": float(
+            expected_uniform.mean()
+        ),
+        "jaccard_chance_uniform": chance_uniform,
+        "jaccard_chance_marginal": chance_marginal,
+        "jaccard_lift_over_uniform": _lift(chance_uniform),
+        "jaccard_lift_over_marginal": _lift(chance_marginal),
+        "jaccard_adjusted_uniform": _adjusted(chance_uniform),
+        "jaccard_adjusted_marginal": _adjusted(chance_marginal),
+        "chance_note": (
+            "uniform = 均匀随机集合（E|A∩B|=k1*k2/E）；"
+            "marginal = 保持第二轮专家负载份额、随机化组合。"
+            "低 Jaccard 必须先减去机会水平才可与其它 k1/k2 "
+            "或负载分布比较"
         ),
     }
 
@@ -14079,7 +14992,7 @@ class RoutingProbe:
             if cfg.mode == "A" and len(shape) == 4:
                 branch_dim = 2
             elif (
-                cfg.mode == "B"
+                cfg.mode in ("B", "B_early")
                 and is_middle
                 and cfg.k1 >= 2
                 and len(shape) == 3
@@ -14148,8 +15061,12 @@ class RoutingProbe:
                 accumulator[name] = (
                     int(accumulator.get(name, 0)) + int(value)
                 )
-            else:
+            elif isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            ):
                 accumulator.setdefault(name, []).append(float(value))
+            # 非数值字段（如 chance_note 说明文字）不参与均值
+            # 聚合，直接忽略而不是 float() 崩溃。
 
     @staticmethod
     def _finalize(
@@ -14283,7 +15200,7 @@ class RoutingProbe:
             "branch_self_reuse_share": None,
         }
 
-        if cfg.mode in ("smelt", "local_base"):
+        if cfg.mode in ("base", "smelt", "local_base", "local_base_k2"):
             metrics = _routing_set_metrics(a, b, n_experts)
             result["branch_level"] = metrics
             result["token_level"] = (
@@ -14324,7 +15241,7 @@ class RoutingProbe:
             result["branch_self_reuse_share"] = float(own.mean())
             return result
 
-        if cfg.mode == "B" and block == cfg.middle_start:
+        if cfg.mode in ("B", "B_early") and block == cfg.middle_start:
             # 分支创建：[B, T, k1]（第 j 个分支的专家）；第二轮
             # 经 run_independent_blocks 把分支维并入批维后为
             # [B*k1*T, k2]，行序为 (batch, branch, time)。
@@ -14378,7 +15295,7 @@ class RoutingProbe:
             result["branch_self_reuse_share"] = float(own.mean())
             return result
 
-        if cfg.mode == "B":
+        if cfg.mode in ("B", "B_early"):
             # 第一轮其余 Block 与第二轮：x 为 [B*k1, T, D]，
             # 行序为 (batch, branch)；两轮逐分支对齐。
             time_steps = int(shape_first[1])
@@ -14497,12 +15414,24 @@ class RoutingProbe:
                 "round = 同一 Block 内 route() 的调用序号："
                 "1=第一轮，2=第二轮"
             ),
+            "branch_semantics": (
+                "B 的分支是「按第一轮路由排名（slot）组成的序列"
+                "分支」：同一 slot 在不同位置可以对应不同专家。"
+                "分支间的前向状态彼此隔离（各自做 Attention），"
+                "但全部专家/router/embedding 参数共享，梯度通过"
+                "共享参数耦合；它们不是参数独立的专家轨迹，也"
+                "不保证统计独立。'独立'只在「前向状态不混合」"
+                "这一意义上成立"
+            ),
             "notes": [
                 "诊断只使用验证集固定窗口，测试集不参与。",
                 "路由诊断不参与模型选择、早停或指标优化。",
                 "重合度在同一 token、同一 Block 的两轮路由之间"
                 "比较；A/B 的分支结构另有逐分支与 token 级"
                 "（跨分支并集）口径。",
+                "Jaccard 必须与 jaccard_chance_uniform / "
+                "jaccard_chance_marginal 及 lift 一起读；低重合"
+                "本身不证明路由更有效，需要干预实验验证。",
             ],
         }
 
@@ -14633,6 +15562,13 @@ class RoutingProbe:
                 "second_round_slot_reuse_mean",
                 "first_round_recall_mean",
                 "second_round_unique_reuse_mean",
+                "expected_intersection_uniform",
+                "jaccard_chance_uniform",
+                "jaccard_chance_marginal",
+                "jaccard_lift_over_uniform",
+                "jaccard_lift_over_marginal",
+                "jaccard_adjusted_uniform",
+                "jaccard_adjusted_marginal",
             ):
                 value = branch_metrics.get(name)
                 if isinstance(value, (int, float)):
@@ -14700,10 +15636,14 @@ class RoutingProbe:
             "rq3_expert_overlap": {
                 "definition": (
                     "第二轮相对第一轮的专家集合重合：jaccard = "
-                    "|A∩B|/|A∪B|；slot_reuse = 第二轮每个 "
-                    "assignment 的专家落在第一轮集合中的比例；"
-                    "branch 级 = 同一分支两轮对齐，token 级 = "
-                    "第二轮跨分支并集对第一轮集合"
+                    "|A∩B|/|A∪B|；chance_uniform = 均匀随机集合"
+                    "的期望 Jaccard（E|A∩B|=k1*k2/E）；"
+                    "chance_marginal = 保持第二轮专家边际负载、"
+                    "随机化组合的期望 Jaccard；lift = 观测/chance；"
+                    "adjusted = (obs−chance)/(1−chance)。"
+                    "slot_reuse = 第二轮每个 assignment 的专家落在"
+                    "第一轮集合中的比例；branch 级 = 同一分支两轮"
+                    "对齐，token 级 = 第二轮跨分支并集对第一轮集合"
                 ),
                 "summary": rq3_summary,
             },
@@ -14850,6 +15790,17 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
                 "[routing] 分支自身专家在第二轮复现比例（A/B）: "
                 f"{float(rq3['branch_self_reuse_share']):.4f}"
             )
+        # 机会水平校正：不同 k1/k2 与负载分布下 Jaccard 的
+        # 零点不同，必须并列展示。
+        print(
+            "[routing] RQ3 机会水平："
+            f"uniform={_show('jaccard_chance_uniform')} "
+            f"marginal={_show('jaccard_chance_marginal')} "
+            f"lift_uniform={_show('jaccard_lift_over_uniform')} "
+            f"lift_marginal={_show('jaccard_lift_over_marginal')} "
+            f"adjusted_marginal="
+            f"{_show('jaccard_adjusted_marginal')}"
+        )
 
     divergence = (report.get("branch_divergence") or {}).get(
         "summary"
@@ -14860,6 +15811,292 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
             f"{float(divergence['branch_cosine_mean']):.4f}"
             f"（blocks_with_branches="
             f"{divergence.get('blocks_with_branches')}）"
+        )
+
+
+def _intervention_eval(
+    model: nn.Module,
+    dataset: ByteDataset,
+    batch_size: int,
+    batches: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+) -> Dict[str, float]:
+    """在固定验证窗口上做一次前向，返回损失与 token 准确率。"""
+    core = _unwrap_model(model)
+    was_training = core.training
+    core.eval()
+    use_amp = amp_dtype is not None and device.type == "cuda"
+    total_loss = 0.0
+    total_tokens = 0
+    correct = 0
+    try:
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
+            with torch.no_grad():
+                for batch_index in range(batches):
+                    x, y = dataset.fixed_eval_batch(
+                        "val",
+                        batch_index,
+                        batches,
+                        batch_size,
+                        device,
+                    )
+                    if x.size(0) == 0:
+                        break
+                    logits = core(x)["logits"].float()
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        y.reshape(-1),
+                        reduction="sum",
+                    )
+                    total_loss += float(loss)
+                    total_tokens += int(y.numel())
+                    correct += int(
+                        (logits.argmax(dim=-1) == y).sum()
+                    )
+    finally:
+        core.train(was_training)
+    if total_tokens <= 0:
+        return {
+            "loss": float("nan"),
+            "token_accuracy": float("nan"),
+            "tokens": 0,
+        }
+    return {
+        "loss": total_loss / total_tokens,
+        "token_accuracy": correct / total_tokens,
+        "tokens": total_tokens,
+    }
+
+
+def analyze_routing_interventions(
+    model: nn.Module,
+    dataset: ByteDataset,
+    batch_size: int,
+    batches: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype] = None,
+    seed: int = 0,
+) -> Dict[str, object]:
+    """
+    RQ4 的干预验证：负载均匀/熵高本身不能证明专家专门化。
+
+    三类反事实只用验证集固定窗口，不参与选型：
+
+    1. ``routing_shuffle``：把每个 token 的顶层路由替换为均匀
+       随机专家（保留 k 个 assignment，权重均匀）。若专家存在
+       可区分的功能，随机化路由应显著抬高损失；
+    2. ``expert_drop``：逐个把某专家的输出置零（路由/门控保持
+       不变），记录损失上升。若专家专门化，不同专家的 drop
+       损失上升应有明显差异，而不是所有专家都差不多；
+    3. ``baseline``：同一批窗口、同一模型的原损失。
+
+    报告给出损失差、准确率差、专家重要性分布与「最重/最轻
+    专家」的比值，并把路由分布诊断降级为「利用率描述」。
+    代价是 E+2 次验证前向，默认不启用（``--routing-interventions``）。
+    """
+    core = _unwrap_model(model)
+    cfg = core.cfg
+    moe_modules = [
+        block.moe
+        for block in core.blocks
+        if isinstance(getattr(block, "moe", None), SparseMoE)
+    ]
+    report: Dict[str, object] = {
+        "mode": cfg.mode,
+        "split": "val",
+        "batches_requested": batches,
+        "batch_size": batch_size,
+        "n_experts": cfg.n_experts,
+        "baseline": _intervention_eval(
+            core,
+            dataset,
+            batch_size,
+            batches,
+            device,
+            amp_dtype,
+        ),
+        "interventions": {
+            "routing_shuffle": {},
+            "expert_drop": {},
+        },
+        "notes": [
+            "只使用验证集固定窗口；测试集不参与。",
+            "routing_shuffle 保持 assignment 数与均匀权重，仅把"
+            "专家身份随机化；expert_drop 保持路由与门控，仅把"
+            "被屏蔽专家的输出置零。",
+            "这是功能干预证据；负载熵/死专家数只是利用率描述，"
+            "均匀随机路由也能得到高熵，不能单独证明专门化。",
+            "代价：E+2 次验证前向，大 E 时开销明显。",
+        ],
+    }
+
+    baseline_loss = float(report["baseline"]["loss"])
+    baseline_acc = float(report["baseline"]["token_accuracy"])
+
+    # 路由打乱：每个 MoE 用独立、固定的随机流；保留原 k。
+    shuffle_generators: Dict[int, torch.Generator] = {}
+
+    def _make_override(module: SparseMoE):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            (int(seed) * 1_000_003 + id(module)) & 0x7FFFFFFF
+        )
+        shuffle_generators[id(module)] = generator
+
+        def _override(indices, weights, logits):
+            generator.manual_seed(
+                (int(seed) * 1_000_003 + id(module)) & 0x7FFFFFFF
+            )
+            new_indices = torch.randint(
+                0,
+                int(module.n_experts),
+                indices.shape,
+                generator=generator,
+                device="cpu",
+            ).to(indices.device)
+            new_weights = torch.full_like(
+                weights,
+                1.0 / max(1, indices.size(-1)),
+            )
+            return new_indices, new_weights
+
+        return _override
+
+    overrides = {}
+    for module in moe_modules:
+        overrides[id(module)] = _make_override(module)
+        module._routing_override = overrides[id(module)]
+    try:
+        shuffled = _intervention_eval(
+            core,
+            dataset,
+            batch_size,
+            batches,
+            device,
+            amp_dtype,
+        )
+    finally:
+        for module in moe_modules:
+            module._routing_override = None
+    report["interventions"]["routing_shuffle"] = {
+        **shuffled,
+        "loss_delta": float(shuffled["loss"]) - baseline_loss,
+        "loss_ratio": (
+            float(shuffled["loss"]) / baseline_loss
+            if baseline_loss > 0
+            else None
+        ),
+        "accuracy_delta": float(shuffled["token_accuracy"]) - baseline_acc,
+    }
+
+    # 专家屏蔽：逐个专家置零。E 较大时也只在 val 固定窗口上
+    # 做一次前向/专家，成本可控但会明显变慢。
+    drop_rows: Dict[str, object] = {}
+    drop_deltas: List[float] = []
+    for expert_index in range(cfg.n_experts):
+        for module in moe_modules:
+            module._expert_drop_index = expert_index
+        try:
+            dropped = _intervention_eval(
+                core,
+                dataset,
+                batch_size,
+                batches,
+                device,
+                amp_dtype,
+            )
+        finally:
+            for module in moe_modules:
+                module._expert_drop_index = None
+        delta = float(dropped["loss"]) - baseline_loss
+        drop_deltas.append(delta)
+        drop_rows[str(expert_index)] = {
+            **dropped,
+            "loss_delta": delta,
+        }
+    finite_deltas = [
+        value for value in drop_deltas if math.isfinite(value)
+    ]
+    if finite_deltas:
+        mean_delta = sum(finite_deltas) / len(finite_deltas)
+        variance = sum(
+            (value - mean_delta) ** 2 for value in finite_deltas
+        ) / len(finite_deltas)
+        max_index = max(
+            range(len(drop_deltas)),
+            key=lambda index: drop_deltas[index],
+        )
+        min_index = min(
+            range(len(drop_deltas)),
+            key=lambda index: drop_deltas[index],
+        )
+        max_delta = drop_deltas[max_index]
+        min_delta = drop_deltas[min_index]
+        report["interventions"]["expert_drop"] = {
+            "per_expert": drop_rows,
+            "mean_loss_delta": mean_delta,
+            "std_loss_delta": math.sqrt(variance),
+            "max_loss_delta": max_delta,
+            "max_expert": max_index,
+            "min_loss_delta": min_delta,
+            "min_expert": min_index,
+            "max_over_min_abs_ratio": (
+                abs(max_delta) / abs(min_delta)
+                if abs(min_delta) > 1e-12
+                else None
+            ),
+            "importance_cv": (
+                math.sqrt(variance) / abs(mean_delta)
+                if abs(mean_delta) > 1e-12
+                else None
+            ),
+        }
+    else:
+        report["interventions"]["expert_drop"] = {
+            "per_expert": drop_rows,
+            "error": "所有专家屏蔽后的损失都不是有限值",
+        }
+    return report
+
+
+def print_routing_interventions(report: Dict[str, object]) -> None:
+    """打印 RQ4 干预实验摘要。"""
+    baseline = report.get("baseline") or {}
+    if not baseline or "loss" not in baseline:
+        return
+    print(
+        "[routing-intervention] mode="
+        f"{report.get('mode')} baseline_loss="
+        f"{float(baseline['loss']):.6f}"
+    )
+    shuffle = (report.get("interventions") or {}).get(
+        "routing_shuffle"
+    ) or {}
+    if shuffle.get("loss_delta") is not None:
+        print(
+            "[routing-intervention] 路由打乱："
+            f"Δloss={float(shuffle['loss_delta']):+.6f} "
+            f"ratio={shuffle.get('loss_ratio')} "
+            f"Δacc={float(shuffle['accuracy_delta']):+.4f}"
+        )
+    drop = (report.get("interventions") or {}).get(
+        "expert_drop"
+    ) or {}
+    if drop.get("max_expert") is not None:
+        print(
+            "[routing-intervention] 专家屏蔽："
+            f"max_expert={drop.get('max_expert')} "
+            f"Δloss={float(drop.get('max_loss_delta')):+.6f}；"
+            f"min_expert={drop.get('min_expert')} "
+            f"Δloss={float(drop.get('min_loss_delta')):+.6f}；"
+            f"mean={float(drop.get('mean_loss_delta')):+.6f}"
+            f"±{float(drop.get('std_loss_delta')):.6f} "
+            f"CV={drop.get('importance_cv')}"
         )
 
 
@@ -15449,14 +16686,18 @@ def _count_forward_flops(
 
         def _wrapped_attention_step(
             inputs: torch.Tensor,
+            *args,
             _original=original_attention_step,
+            **kwargs,
         ) -> torch.Tensor:
             if inputs.dim() == 3:
                 # numel = B·T·D，乘 4·T 即 4·B·T²·D。
                 attention_flops[0] += (
                     4 * int(inputs.size(-2)) * int(inputs.numel())
                 )
-            return _original(inputs)
+            # scale 等区域参数必须原样透传，否则测量前向会走
+            # 默认全局残差口径、与被测模型的实际计算图不一致。
+            return _original(inputs, *args, **kwargs)
 
         module.attention_step = _wrapped_attention_step
         wrapped_modules.append(module)
@@ -15793,6 +17034,25 @@ def measure_efficiency(
         "batch_size": int(batch_size),
         "seq_len": int(x.size(1)),
         "tokens_per_forward": tokens,
+        # 完整计算图口径与 KV cache 估计：论文要求 FLOPs、总参数
+        # 与 KV cache 三者共同匹配；这里把解析成本与容量一起
+        # 落盘，供 --compare / --budget-match 复核。
+        "cost_profile": mode_cost_profile(cfg),
+        "kv_cache_bytes_per_token": mode_cost_profile(cfg)[
+            "kv_cache_bytes_per_token"
+        ],
+        "measured_flops_per_token": (
+            round(
+                float(flops["total_flops_per_forward"])
+                / max(1, tokens),
+                3,
+            )
+            if flops["total_flops_per_forward"] is not None
+            else None
+        ),
+        "analytic_flops_per_token": mode_cost_profile(cfg)[
+            "analytic_flops_per_token"
+        ],
         "measurement": {
             "device": str(device),
             "amp_dtype": (
@@ -15873,7 +17133,7 @@ _COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
 # 方法差异；周期验证点是「当时模型」的即时指标，不经过
 # checkpoint 选择。与等计算量 loss 一样，它是分析期派生指标。
 #
-# 只给 loss 提供无偏口径是不够的：类别不平衡时项目建议用
+# 只给 loss 提供选型无关口径是不够的：类别不平衡时项目建议用
 # macro F1 / PR-AUC 判定，假设也可能预注册 accuracy、precision
 # 或 recall；这些指标同样会被 checkpoint 选择抬高。因此凡是
 # 周期验证实际计算的 val 指标，都生成一份共同步数派生指标。
@@ -15899,7 +17159,7 @@ _COMMON_STEP_CORE_BASE_METRICS: Tuple[str, ...] = (
 # 显式选为选型指标或传 --periodic-auc 时，周期验证也会写出这些
 # 键。它们同样需要避开 checkpoint 选型偏差的共同步数口径——
 # 极度不平衡时项目建议以 PR-AUC 判定，若只有 final 版本，
-# 判定指标恰恰是最容易被选型抬高、又没有无偏复核的那个。
+# 判定指标恰恰是最容易被选型抬高、又没有选型无关复核的那个。
 _COMMON_STEP_OPTIONAL_BASE_METRICS: Tuple[str, ...] = (
     "val_pr_auc_macro",
     "val_pr_auc_macro_lift",
@@ -16244,6 +17504,7 @@ def annotate_compute_matched_metrics(
 
 def annotate_common_step_metrics(
     rows: List[Dict[str, object]],
+    target_step: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     为每个运行计算「共同训练步数」处的即时验证指标，并写回
@@ -16254,7 +17515,7 @@ def annotate_common_step_metrics(
     跨运行比较时，每个方法各自的「最优值」都会吸收一部分种子
     噪声（winner's curse）；噪声大的方法被高估得更多，显著性
     检验因此有偏。周期验证曲线记录的是各评估步当时的即时模型
-    指标，不经过 checkpoint 选择，适合做方法对比的无偏口径。
+    指标，不经过 checkpoint 选择，适合做方法对比的选型无关口径。
 
     协议：
     - 只使用周期验证记录（数值 step + 有限指标值），排除
@@ -16287,7 +17548,11 @@ def annotate_common_step_metrics(
         "advisories": [],
         "selection_bias_note": (
             "这些指标取自周期验证曲线，不经过验证集 checkpoint "
-            "选择；与 final 的 val 指标不同，不受选型偏差影响"
+            "选择，因此避开了 best-checkpoint 的 winner's curse；"
+            "但若共同步数由观察到的端点决定（默认 min-of-last），"
+            "它仍是数据依赖的选择，不能称为无偏。预先固定 "
+            "--common-step 后才是 selection-independent（在共同"
+            "支持范围内）"
         ),
         "ok": False,
     }
@@ -16329,17 +17594,40 @@ def annotate_common_step_metrics(
     if not loss_curves:
         report["advisories"].append(
             "没有任何运行具备周期验证曲线：无法计算共同步数"
-            "处的无偏验证指标；请用未跳过周期验证的新版运行重跑"
+            "处的选型无关验证指标；请用未跳过周期验证的新版运行重跑"
         )
         return report
 
-    target_step = min(
-        points[-1][0] for points in loss_curves.values()
-    )
+    if target_step is None:
+        target_step = min(
+            points[-1][0] for points in loss_curves.values()
+        )
+        target_step_rule = "min_last_validation_step"
+        target_step_data_dependent = True
+    else:
+        target_step = float(target_step)
+        target_step_rule = "preregistered_fixed_step"
+        target_step_data_dependent = False
     report["target_step"] = target_step
+    report["target_step_rule"] = target_step_rule
+    report["target_step_data_dependent"] = (
+        target_step_data_dependent
+    )
     report["target_note"] = (
-        "共同步数 = 可比运行最后一个周期验证步的最小值；"
-        "取各运行在该步的即时验证指标（不做外推）"
+        "共同步数 = "
+        + (
+            "训练前显式指定的固定步（--common-step）"
+            if not target_step_data_dependent
+            else "可比运行最后一个周期验证步的最小值"
+        )
+        + "；取各运行在该步的即时验证指标（不做外推）。"
+        + (
+            ""
+            if not target_step_data_dependent
+            else "该步由观察到的端点决定：早停/不等步数时与"
+            "结果相关，不是选型无关口径；正式对比应预先固定 "
+            "--common-step"
+        )
     )
 
     metric_reports: Dict[str, Dict[str, object]] = {}
@@ -16449,7 +17737,7 @@ def annotate_common_step_metrics(
     else:
         report["advisories"].append(
             "没有运行能在共同步数点提供验证 loss：无法做"
-            "无偏的即时验证对比"
+            "选型无关的即时验证对比"
         )
 
     if report["excluded_runs"]:
@@ -16487,7 +17775,7 @@ def selection_bias_report(
     而 ``best.pt`` 正是按同一验证集指标（默认 val_loss）选出的。
     同一批数据既用于选型又用于判定时，点估计和显著性检验都会
     带乐观偏差，且偏差大小随各运行的种子噪声变化。报告必须
-    点名这一风险，并给出可执行的无偏口径（共同步数指标）。
+    点名这一风险，并给出可执行的选型无关口径（共同步数指标）。
 
     只把明确记录为 ``selected_model=best_val`` 的运行计入
     ``biased_runs``；旧运行缺选型记录时列入 unknown，不虚报。
@@ -16650,7 +17938,7 @@ def selection_bias_report(
         if report["unbiased_metric"]:
             detail += (
                 "；同一验证集既选型又判定，存在乐观偏差。"
-                f"无偏复核请用 --compare-metric "
+                f"选型无关复核请用 --compare-metric "
                 f"{report['unbiased_metric']}（覆盖 "
                 f"{report['unbiased_runs']} 个运行）"
             )
@@ -16772,6 +18060,99 @@ def numerical_failure_report(
             )
         report["advisory"] = message
     return report
+
+
+def failure_rate_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    按实验臂报告数值失败率与成功条件性能（防止幸存者偏差）。
+
+    只比较成功运行会系统性掩盖「某个方法更容易数值失败」的
+    稳定性成本。这里把「计划运行」（实际启动的运行目录数）
+    作为分母，分别给出失败数、失败率、未知数，并在臂间失败
+    率差超过阈值时点名 ``differential_failure``。失败运行仍
+    不进入均值/检验（否则故障会被当成效应），但必须与失败率
+    一起报告；成功条件下的指标已经由聚合表给出。
+
+    重试规则：本仓库不自动重试。用同一个 seed 重跑成功路径会
+    产生伪重复（独立种子数不增加）；失败后应换新 seed 或修复
+    数值问题后整批重跑，并在报告中保留失败目录。
+    """
+    groups: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        mode = str(row.get("mode") or "unknown")
+        arm = groups.setdefault(
+            mode,
+            {
+                "mode": mode,
+                "planned_runs": 0,
+                "observed_runs": 0,
+                "failed_runs": 0,
+                "unknown_runs": 0,
+                "failed_run_names": [],
+                "success_runs": 0,
+            },
+        )
+        arm["planned_runs"] = int(arm["planned_runs"]) + 1
+        status = row.get("numerical_status")
+        if status == "failed":
+            arm["failed_runs"] = int(arm["failed_runs"]) + 1
+            arm["failed_run_names"].append(str(row.get("run")))
+        elif status == "unknown":
+            arm["unknown_runs"] = int(arm["unknown_runs"]) + 1
+        else:
+            arm["success_runs"] = int(arm["success_runs"]) + 1
+        arm["observed_runs"] = int(arm["planned_runs"]) - int(
+            arm["failed_runs"]
+        )
+
+    arms = list(groups.values())
+    for arm in arms:
+        planned = int(arm["planned_runs"])
+        failed = int(arm["failed_runs"])
+        arm["failure_rate"] = (
+            failed / planned if planned > 0 else None
+        )
+
+    rates = [
+        (str(arm["mode"]), float(arm["failure_rate"]))
+        for arm in arms
+        if arm["failure_rate"] is not None
+    ]
+    differential = None
+    if len(rates) >= 2:
+        worst = max(rates, key=lambda item: item[1])
+        best = min(rates, key=lambda item: item[1])
+        if worst[1] - best[1] > 0.10:
+            differential = {
+                "worst_mode": worst[0],
+                "worst_rate": worst[1],
+                "best_mode": best[0],
+                "best_rate": best[1],
+                "gap": worst[1] - best[1],
+                "note": (
+                    "各臂失败率差异超过 10 个百分点：只比较成功"
+                    "运行会掩盖失败率更高的方法的稳定性成本；"
+                    "该方法的性能结论必须以「失败率 + 成功条件"
+                    "指标」成对报告"
+                ),
+            }
+
+    return {
+        "arms": arms,
+        "differential_failure": differential,
+        "retry_policy": (
+            "不自动重试；同一 seed 重跑成功路径属于伪重复，"
+            "不增加独立种子数。失败后换新 seed 或修复数值问题"
+            "后整批重跑，并保留失败目录"
+        ),
+        "note": (
+            "planned_runs 为实际启动的运行目录数；失败运行不"
+            "进入均值/检验，但失败率必须与成功条件指标一起"
+            "报告"
+        ),
+    }
 
 
 # 曲线诊断中可跨运行比较的数值字段（来自 metrics.jsonl 的
@@ -17201,6 +18582,10 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["hypothesis_baseline"] = preregistration.get(
             "baseline"
         )
+
+        # 实验规模守卫（tokens_seen / tokens per param / epochs）：
+        # 原型级结果不能外推为规模结论。
+        row["scale_guard"] = config_payload.get("scale_guard")
 
         # 参考基线（uniform / unigram 在 val 上的同口径指标）：
         # 对比分析用它核对「所声明的基线是否真的强于无上下文
@@ -17833,7 +19218,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 的误差线，跨运行比较误差线时口径不再一致。
     "eval_bootstrap",
     # 周期验证是否计算 PR-AUC / lift / ROC-AUC：显式
-    # --periodic-auc 与 AUC 选型都会生成共同步数无偏 AUC 指标；
+    # --periodic-auc 与 AUC 选型都会生成共同步数选型无关 AUC 指标；
     # 一个跑有一个没跑时，敏感性分析的可比口径不同。
     "periodic_auc",
     "data_sha256",
@@ -17959,7 +19344,7 @@ DEFAULT_COMPARISON_FACTORS = (
 # 验证曲线，但按共同训练步数对齐，用来避开 final 指标的
 # checkpoint 选型偏差（见 annotate_common_step_metrics）。它们
 # 与对应周期指标同单位、同方向，可直接作为 --compare-metric
-# 或预注册主指标做显著性检验；不能只给 loss 提供无偏口径，
+# 或预注册主指标做显著性检验；不能只给 loss 提供选型无关口径，
 # 否则以 macro F1 / accuracy 判定时仍会落入 winner's curse。
 COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
@@ -18094,7 +19479,7 @@ def _periodic_auc_enabled(
 # 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
 # 才计算的 AUC），但不含路由诊断与共同步数派生指标——调参
 # 必须用训练时真实产生、可直接优化/选择的最终 val 指标；
-# 派生指标只用于分析期无偏复核，不能反过来充当调参目标。
+# 派生指标只用于分析期选型无关复核，不能反过来充当调参目标。
 _BASELINE_TUNING_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
@@ -18126,15 +19511,18 @@ _NGRAM_PER_WINDOW_CLASSIFICATION_METRICS = frozenset({
     "recall_weighted",
 })
 
-# 因子的自然排序（立即合并对照在前，延迟合并在后），
+# 因子的自然排序（未循环基线 → 立即合并对照 → 延迟合并），
 # 用于让「基线→改进」的差值符号可解释。
 _FACTOR_VALUE_ORDER = {
-    "smelt": 0,
-    "local_base": 1,
-    "A": 2,
-    "B": 3,
-    "dense": 4,
-    "ngram": 5,
+    "base": 0,
+    "smelt": 1,
+    "local_base": 2,
+    "local_base_k2": 3,
+    "A": 4,
+    "B": 5,
+    "B_early": 6,
+    "dense": 7,
+    "ngram": 8,
 }
 
 # 显著性与统计功效的判定阈值。
@@ -18146,6 +19534,32 @@ _FACTOR_VALUE_ORDER = {
 _SIGNIFICANCE_LEVEL = 0.05
 _MIN_SEEDS_FOR_STATS = 3
 _RECOMMENDED_SEEDS = 3
+# 精确配对符号翻转检验的最小可达双侧 p 是 2/2^n：n=3/4/5 时
+# 分别为 0.25/0.125/0.0625，均大于 0.05。若把「配对 t 与符号
+# 翻转同时显著」作为稳健结论的必要条件，n≤5 的设计在数学上
+# 不可能满足；至少需要 n=6（2/64=0.03125），家族校正后还要
+# 更多。规划种子时必须把这一点与预注册最小效应/主检验一起
+# 考虑，而不是先跑 3~5 个种子再解释为什么「不稳健」。
+_MIN_SEEDS_FOR_ROBUST_SIGN_FLIP = 6
+
+
+def _sign_flip_required_seeds(
+    alpha: float = _SIGNIFICANCE_LEVEL,
+    family_size: int = 1,
+) -> int:
+    """精确符号翻转在给定家族校正下所需的最小种子数。
+
+    Holm 首步阈值为 alpha/m；要求 2/2^n <= alpha/m，即
+    n >= ceil(log2(2m/alpha))。家族规模 m=1、alpha=0.05 时为 6。
+    """
+    if alpha <= 0.0:
+        return _MIN_SEEDS_FOR_ROBUST_SIGN_FLIP
+    m = max(1, int(family_size))
+    required = math.ceil(
+        math.log2(2.0 * m / float(alpha))
+    )
+    return max(_MIN_SEEDS_FOR_STATS, int(required))
+
 
 # 功效分析的目标功效与实际意义等价界。
 #
@@ -18179,6 +19593,43 @@ _HYPOTHESIS_MIN_EFFECT_ABS_FLOOR = 1.0e-12
 _T_POWER_TAIL = 12.0
 _T_POWER_MIN_INTERVALS = 800
 _T_POWER_MAX_INTERVALS = 4000
+
+
+def _build_seed_plan(
+    seeds: List[int],
+    allow_underpowered: bool,
+    planned_comparisons: int = 1,
+) -> Dict[str, object]:
+    """种子计划：同时记录 t 检验与精确符号翻转的功效下限。
+
+    ``min_seeds_for_significance`` 是配对/ Welch t 检验的最低
+    种子数（3）；``min_seeds_for_robust_sign_flip`` 是精确符号
+    翻转在给定家族规模下能达到 alpha 的最小 n（n=6，家族校正
+    后更大）。n<6 时 ``significant_robust`` 在数学上不可能为
+    True，报告必须区分「效应不稳健」与「设计无法判定稳健性」。
+    """
+    n = len(seeds)
+    required_robust = _sign_flip_required_seeds(
+        _SIGNIFICANCE_LEVEL, planned_comparisons
+    )
+    return {
+        "seeds": [int(seed) for seed in seeds],
+        "n_seeds": n,
+        "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
+        "min_seeds_for_robust_sign_flip": required_robust,
+        "planned_comparisons": int(planned_comparisons),
+        "robust_claim_possible": n >= required_robust,
+        "robust_claim_note": (
+            "精确符号翻转双侧最小 p=2/2^n；n=3/4/5 时为 "
+            "0.25/0.125/0.0625，均不能达到 0.05。"
+            "significant_robust（配对 t 与符号翻转同时显著）"
+            "至少需要 n=6，家族校正后按 "
+            "ceil(log2(2m/alpha)) 增加"
+        ),
+        "underpowered_override": bool(
+            allow_underpowered and n < _MIN_SEEDS_FOR_STATS
+        ),
+    }
 
 
 def _independent_seed_count(
@@ -18403,6 +19854,7 @@ def build_comparison_protocol(
         "seq_len": cfg.seq_len,
         "d_model": cfg.d_model,
         "n_heads": cfg.n_heads,
+        "n_kv_heads": cfg.effective_n_kv_heads,
         "n_layers": cfg.n_layers,
         "n_experts": cfg.n_experts,
         "expert_hidden": cfg.expert_hidden,
@@ -18419,8 +19871,16 @@ def build_comparison_protocol(
         ),
         "dense_fnn_hidden": cfg.dense_fnn_hidden,
         "residual_scale": cfg.residual_scale,
+        # 循环区域残差缩放口径决定循环内子层的有效残差强度：
+        # paper（1/r）与 global 是两种不同架构，不能跨口径比较。
+        "residual_scaling": cfg.residual_scaling,
+        "loop_residual_scale": cfg.loop_residual_scale,
+        "loop_count": cfg.loop_count,
         "val_fraction": getattr(args, "val_fraction", None),
         "test_fraction": getattr(args, "test_fraction", None),
+        "split_policy": getattr(
+            args, "split_policy", "contiguous"
+        ),
         # 群组分隔符决定切分位置（同一文件 + 不同分隔符 =
         # 不同的数据划分），必须作为受控变量核对。
         "group_separator": getattr(args, "group_separator", None),
@@ -18451,6 +19911,14 @@ def build_comparison_protocol(
         ),
         "drop_train_degenerate_runs": bool(
             getattr(args, "drop_train_degenerate_runs", False)
+        ),
+        "allow_eval_content_for_cleaning": bool(
+            getattr(
+                args, "allow_eval_content_for_cleaning", False
+            )
+        ),
+        "allow_entity_overlap": bool(
+            getattr(args, "allow_entity_overlap", False)
         ),
         "allow_data_leakage": bool(
             getattr(args, "allow_data_leakage", False)
@@ -18620,6 +20088,12 @@ def experiment_protocol_from_payload(
         "seq_len": cfg.get("seq_len"),
         "d_model": cfg.get("d_model"),
         "n_heads": cfg.get("n_heads"),
+        # 旧运行都是 MHA（没有 n_kv_heads 字段）：按 n_heads
+        # 回填，避免把旧 MHA 运行误报成缺记录。
+        "n_kv_heads": _pick(
+            cfg.get("n_kv_heads"),
+            cfg.get("n_heads"),
+        ),
         "n_layers": cfg.get("n_layers"),
         "n_experts": cfg.get("n_experts"),
         "expert_hidden": cfg.get("expert_hidden"),
@@ -18641,9 +20115,34 @@ def experiment_protocol_from_payload(
         ),
         "dense_fnn_hidden": cfg.get("dense_fnn_hidden"),
         "residual_scale": cfg.get("residual_scale"),
+        # 旧运行只有 global 口径（residual_scale 全局生效）。
+        "residual_scaling": (
+            cfg.get("residual_scaling")
+            if cfg.get("residual_scaling") is not None
+            else ("global" if has_training else None)
+        ),
+        "loop_residual_scale": _pick(
+            cfg.get("loop_residual_scale"),
+            cfg.get("residual_scale") if has_training else None,
+        ),
+        "loop_count": _pick(
+            cfg.get("loop_count"),
+            (
+                1
+                if cfg.get("mode") in {"base", "dense"}
+                else 2
+            )
+            if has_training and cfg.get("mode") is not None
+            else None,
+        ),
         "val_fraction": _pick(
             data.get("val_fraction"),
             run_args.get("val_fraction"),
+        ),
+        "split_policy": _pick(
+            data.get("split_policy"),
+            run_args.get("split_policy"),
+            "contiguous" if has_training else None,
         ),
         "test_fraction": _pick(
             data.get("test_fraction"),
@@ -20064,8 +21563,9 @@ def _cell_window_paired_analysis(
         notes.append(
             "同一实验单元内出现重复随机种子（"
             + ", ".join(str(seed) for seed in duplicate_seeds)
-            + "）：这些种子的运行归属不唯一，已从窗口级配对中"
-            "剔除；种子级检验同样禁用配对"
+            + "）：窗口级配对只使用归属唯一的种子；种子级"
+            "检验先把同一 seed 折叠为一个观测，再做配对，"
+            "复制运行不增加 n"
         )
     notes.append(
         "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
@@ -21080,6 +22580,16 @@ def _collapse_seed_samples(
                 [float(sample["value"]) for sample in group]
             ),
             "n_runs": len(group),
+            # 同一 seed 的复制运行若给出不同值，说明它们并非
+            # 逐位相同的确定性复制；均值折叠可以避免虚增 n，
+            # 但必须把这份差异显式记录，不能悄悄抹平。
+            "within_seed_sd": (
+                _sample_std(
+                    [float(sample["value"]) for sample in group]
+                )
+                if len(group) > 1
+                else None
+            ),
         })
     collapsed.extend(unseeded)
     return collapsed
@@ -21373,12 +22883,14 @@ def _contrast_test(
     对比两个实验单元的指标样本：种子集合完全相同时用配对
     t 检验（同种子 = 配对重复），否则用 Welch t 检验。
 
-    同一单元里出现重复随机种子（伪重复）时不能做配对检验：
-    字典会静默丢掉重复样本，把「复制的同一个运行」当成独立
-    重复。检测到伪重复时退回 Welch，并且把同一 seed 的多个
-    样本折叠为一个独立观测，避免复制运行虚增 Welch 的样本数
-    与自由度、把不显著差异做成显著性。结果里记录
-    ``duplicate_seeds``，展示层据此提示。
+    同一单元里出现重复随机种子（伪重复）时，推断单位仍是
+    「独立随机种子」而不是「运行目录」：先把同一 seed 的多个
+    样本折叠为单个观测（取均值），再在折叠后的种子上做配对
+    检验。折叠后每个 seed 只贡献一个观测，配对比较不会虚增 n
+    或自由度；复制运行若给出不同数值，其组内标准差记录在
+    ``pseudo_replication`` 里并提示，而不是悄悄平均掉。
+    直接退回 Welch 并保留每个复制运行作为样本才是错误做法：
+    伪重复的运行不是独立重复，换检验不会恢复独立性。
     """
     seeds_a = [
         sample["seed"]
@@ -21399,6 +22911,23 @@ def _contrast_test(
     # 检验的 n / df / 均值都不再把复制运行当独立重复。
     samples_a = _collapse_seed_samples(samples_a)
     samples_b = _collapse_seed_samples(samples_b)
+    pseudo_replication = {
+        "detected": bool(duplicate_seeds),
+        "collapsed": True,
+        "unit": "independent_seed",
+        "within_seed_sd_max": max(
+            [
+                float(sample["within_seed_sd"])
+                for sample in samples_a + samples_b
+                if sample.get("within_seed_sd") is not None
+            ],
+            default=None,
+        ),
+        "note": (
+            "同一 seed 的多个运行先折叠为一个观测；折叠后"
+            "按种子配对，复制运行不增加 n"
+        ),
+    }
 
     by_seed_a = {
         sample["seed"]: float(sample["value"])
@@ -21415,10 +22944,10 @@ def _contrast_test(
 
     # 配对要求两侧样本**全部**带种子且种子集合相同：只比较
     # 「有种子的样本」会让无种子样本被静默排除出检验，却仍计入
-    # 均值/Δ/样本数，检验结果与展示的效应量脱节。
+    # 均值/Δ/样本数，检验结果与展示的效应量脱节。重复 seed 已在
+    # 上面折叠，因此不再排除配对。
     paired = (
-        not duplicate_seeds
-        and len(common_seeds) >= _MIN_SEEDS_FOR_STATS
+        len(common_seeds) >= _MIN_SEEDS_FOR_STATS
         and len(by_seed_a) == len(samples_a)
         and len(by_seed_b) == len(samples_b)
         and len(common_seeds) == len(by_seed_a)
@@ -21432,11 +22961,16 @@ def _contrast_test(
         ]
         result = _paired_t_test(differences)
         result["n_pairs"] = len(common_seeds)
+        result["n_baseline"] = len(by_seed_a)
+        result["n_variant"] = len(by_seed_b)
+        result["pseudo_replication"] = pseudo_replication
+        result["duplicate_seeds"] = bool(duplicate_seeds)
         result.update(
             _leave_one_out_effect_stability(differences)
         )
         # 小样本的配对 t 检验依赖差值正态性；符号翻转检验
-        # 提供无分布假设的稳健性对照，二者结论不一致时展示层
+        # 提供「差值分布关于 0 对称」假设下的稳健性对照，二者
+        # 结论不一致时展示层
         # 必须提示，不能只挑支持结论的那个。
         randomization = _paired_sign_flip_test(differences)
         if randomization.get("p_value") is not None:
@@ -21465,27 +22999,29 @@ def _contrast_test(
                 )
                 is not False
             )
+            result["randomization_null_assumption"] = (
+                "symmetric_paired_differences_about_zero"
+            )
+            result["significant_robust_status"] = (
+                "not_evaluable_n_le_5"
+                if not result["significant_robust_possible"]
+                else "evaluable"
+            )
         return result
 
     values_a = [float(sample["value"]) for sample in samples_a]
     values_b = [float(sample["value"]) for sample in samples_b]
     result = _welch_t_test(values_a, values_b)
     result["n_pairs"] = 0
-    if duplicate_seeds:
-        result["duplicate_seeds"] = True
+    result["pseudo_replication"] = pseudo_replication
 
     # 种子集合部分重叠时，主检验退回 Welch 会丢掉共同种子的
     # 配对信息（共同种子上的难度是共享的）。这里补一个仅用
     # 共同种子的完整案例配对敏感性分析：它是稳健性参考，
     # 不能替代主检验——缺失机制与结果相关时，共同子集不是
-    # 随机样本。
-    if duplicate_seeds:
-        result["partial_pairing"] = {
-            "available": False,
-            "reason": "duplicate_seeds",
-            "common_seeds": common_seeds,
-        }
-    elif len(common_seeds) >= _MIN_SEEDS_FOR_STATS:
+    # 随机样本。重复 seed 已在上面折叠成独立种子，不再阻止
+    # 共同种子配对。
+    if len(common_seeds) >= _MIN_SEEDS_FOR_STATS:
         differences = [
             by_seed_b[seed] - by_seed_a[seed]
             for seed in common_seeds
@@ -21849,6 +23385,9 @@ def _apply_multiple_comparison_correction(
         randomization_holm,
         randomization_bh,
     ):
+        contrast["randomization_null_assumption"] = (
+            "symmetric_paired_differences_about_zero"
+        )
         contrast["randomization_p_value_holm"] = holm_p
         contrast["randomization_p_value_bh"] = bh_p
         if "randomization_significant_raw" not in contrast:
@@ -23220,7 +24759,7 @@ def ablation_component_verdicts(
         if flipped and component["status"] == "supported":
             component["status"] = "inconclusive"
             component["reasons"].append(
-                "final 选型口径支持，但共同步数无偏口径下"
+                "final 选型口径支持，但共同步数选型无关口径下"
                 "至少一个效应不再支持：结论对 checkpoint "
                 "选择敏感"
             )
@@ -23525,7 +25064,7 @@ def factorial_common_step_sensitivity(
     equivalence_margin: Optional[float] = None,
 ) -> Dict[str, object]:
     """
-    在共同步数无偏口径上重估全因子效应，检查主结论是否翻转。
+    在共同步数选型无关口径上重估全因子效应，检查主结论是否翻转。
 
     判定指标若是验证集选中的 ``final`` 指标，主效应/交互的
     显著性可能来自 winner's curse；共同步数派生指标只取各运行
@@ -23686,7 +25225,7 @@ def factorial_common_step_sensitivity(
     )
     if report["support_flips"]:
         report["advisory"] = (
-            "final 选型口径支持组件的效应在共同步数无偏口径下"
+            "final 选型口径支持组件的效应在共同步数选型无关口径下"
             "不再支持：主结论依赖 checkpoint 选型，"
             "不能宣称组件有用"
         )
@@ -23702,7 +25241,7 @@ def factorial_common_step_sensitivity(
         )
     else:
         report["advisory"] = (
-            "共同步数无偏口径与 final 口径的效应 claim 一致"
+            "共同步数选型无关口径与 final 口径的效应 claim 一致"
         )
     return report
 
@@ -23876,7 +25415,7 @@ def _contrast_display(
                 or contrast.get("significant")
                 != contrast.get("randomization_significant")
             ):
-                p_text += f" [无分布假设: {randomization_text}]"
+                p_text += f" [符号翻转/对称性假设: {randomization_text}]"
 
     star = "*" if contrast.get("significant") else ""
 
@@ -23982,7 +25521,7 @@ def _contrast_display(
         != contrast.get("randomization_significant")
     ):
         caveat += (
-            "（配对 t 与无分布假设的符号翻转检验经 Holm "
+            "（配对 t 与「差值对称」假设下的符号翻转检验经 Holm "
             "校正后结论不一致：显著性依赖正态性假设或检验"
             "功效，不能作为稳健结论）"
         )
@@ -26925,12 +28464,17 @@ def hypothesis_preregistration_error(
     ):
         return None
 
-    if args.compare is not None or args.sanity_only:
+    if (
+        args.compare is not None
+        or getattr(args, "final_test_comparison", None) is not None
+        or args.sanity_only
+    ):
         return (
             "--primary-metric / --hypothesis-direction / "
             "--hypothesis-min-effect / --hypothesis-baseline "
-            "只适用于训练入口：--compare 只读分析与 "
-            "--sanity-only 结构自检不训练神经模型"
+            "只适用于训练入口：--compare / "
+            "--final-test-comparison 只读分析与 --sanity-only "
+            "结构自检不训练神经模型"
         )
 
     if args.statistical_baseline:
@@ -27368,6 +28912,7 @@ def hypothesis_alignment(
     below_min_effect: List[str] = []
     min_effect_undefined: List[str] = []
     inconclusive_underpowered: List[str] = []
+    min_effect_unverified: List[str] = []
 
     for contrast in contrasts:
         if contrast.get("confounded") or contrast.get(
@@ -27466,6 +29011,85 @@ def hypothesis_alignment(
         entry["min_effect_abs"] = threshold_abs
         entry["baseline_mean"] = baseline_mean
 
+        # 最小有意义效应不能只靠「点估计超过门槛 + 相对 0
+        # 显著」来主张：显著只拒绝「效应为 0」，不拒绝「效应
+        # 小于等于门槛」。这里做方向调整后的门槛检验
+        # H0: 改善量 <= threshold_abs，并要求其单侧 p 值显著；
+        # 有区间时同时要求方向调整后的 95% 置信下界超过门槛。
+        directional_delta = (
+            -delta if direction == "decrease" else delta
+        )
+        ci_low = contrast.get("ci95_low")
+        ci_high = contrast.get("ci95_high")
+        directional_ci_low = None
+        if (
+            isinstance(ci_low, (int, float))
+            and not isinstance(ci_low, bool)
+            and isinstance(ci_high, (int, float))
+            and not isinstance(ci_high, bool)
+        ):
+            directional_ci_low = (
+                -float(ci_high)
+                if direction == "decrease"
+                else float(ci_low)
+            )
+        entry["directional_effect"] = directional_delta
+        entry["directional_ci95_low"] = directional_ci_low
+        min_effect_p_value = None
+        min_effect_verified = False
+        if threshold_abs is not None:
+            se = contrast.get("se")
+            df = contrast.get("df")
+            alpha_family = contrast.get(
+                "alpha_bonferroni", _SIGNIFICANCE_LEVEL
+            )
+            if (
+                isinstance(se, (int, float))
+                and not isinstance(se, bool)
+                and float(se) > 0.0
+                and isinstance(df, (int, float))
+                and not isinstance(df, bool)
+            ):
+                t_stat = (
+                    directional_delta - threshold_abs
+                ) / float(se)
+                p_value_margin = _t_cdf(
+                    t_stat, float(df)
+                )
+                if p_value_margin is not None:
+                    min_effect_p_value = (
+                        1.0 - float(p_value_margin)
+                    )
+                    min_effect_verified = bool(
+                        min_effect_p_value
+                        <= float(alpha_family)
+                    )
+            if (
+                not min_effect_verified
+                and directional_ci_low is not None
+            ):
+                min_effect_verified = bool(
+                    directional_ci_low > threshold_abs
+                )
+            entry["min_effect_p_value"] = min_effect_p_value
+            entry["min_effect_test"] = {
+                "h0": "directional_effect <= min_effect_abs",
+                "alpha": float(
+                    contrast.get(
+                        "alpha_bonferroni",
+                        _SIGNIFICANCE_LEVEL,
+                    )
+                ),
+                "p_value": min_effect_p_value,
+                "ci95_low_directional": directional_ci_low,
+                "verified": min_effect_verified,
+                "criterion": (
+                    "单侧门槛检验显著，或方向调整后的 95% "
+                    "置信下界超过门槛；仅点估计超门槛不算"
+                ),
+            }
+        entry["min_effect_verified"] = min_effect_verified
+
         conflict = direction == "decrease" and delta > 0.0 or (
             direction == "increase" and delta < 0.0
         )
@@ -27486,8 +29110,23 @@ def hypothesis_alignment(
             and abs(delta) < threshold_abs
         ):
             status = "below_declared_min_effect"
-        elif entry["significant"]:
+        elif entry["significant"] and threshold_abs is None:
             status = "supported"
+        elif entry["significant"] and min_effect_verified:
+            status = "supported"
+        elif entry["significant"]:
+            # 点估计达到门槛且显著，但门槛本身没被统计检验
+            # 支持：可能是真效应，也可能是噪声刚好把点估计
+            # 推过门槛，不能声称「达到最小有意义改善」。
+            status = (
+                "min_effect_unverifiable"
+                if entry.get("min_effect_test", {}).get(
+                    "p_value"
+                )
+                is None
+                and directional_ci_low is None
+                else "min_effect_not_verified"
+            )
         else:
             status = "not_significant"
             # 功效核对：主指标预注册了最小效应时，「不显著」
@@ -27570,6 +29209,19 @@ def hypothesis_alignment(
                 )
                 + "）"
             )
+        elif status in {
+            "min_effect_not_verified",
+            "min_effect_unverifiable",
+        }:
+            test_info = entry.get("min_effect_test") or {}
+            min_effect_unverified.append(
+                f"{label}（点估计 Δ={delta:+.4f} 达到门槛，但"
+                "门槛本身未被统计检验支持："
+                f"p={test_info.get('p_value')}，"
+                f"方向调整 CI 下界="
+                f"{test_info.get('ci95_low_directional')}；"
+                "不能声称达到最小有意义改善）"
+            )
         elif status == "below_declared_min_effect":
             below_min_effect.append(
                 f"{label}（Δ={delta:+.4f}，低于预注册最小效应 "
@@ -27634,6 +29286,15 @@ def hypothesis_alignment(
             "结果，不能解读为「无效应」，也不能解读为「等价」；"
             "需要增加随机种子或降低种子间方差才能判定："
             + "; ".join(inconclusive_underpowered)
+        )
+    if min_effect_unverified:
+        advisories.append(
+            "以下对比的点估计超过预注册最小效应且相对 0 显著，"
+            "但「真实效应达到门槛」本身未被检验支持（门槛"
+            "单侧检验不显著，或方向调整后的置信下界未超过"
+            "门槛）：不能标记为 supported，需要更多种子/更长"
+            "训练或重新声明一个与效应量相称的门槛："
+            + "; ".join(min_effect_unverified)
         )
 
     # 预注册主指标的口径族：频率加权的似然（val_loss / val_ppl /
@@ -27795,18 +29456,22 @@ def imbalance_metric_advisory(
             f"最高频类占比达 {max_majority:.2%}"
             f"（{most_imbalanced_run}，val_majority_accuracy，"
             "约 1:1000 以上的极度不平衡）：accuracy 与 micro "
-            "口径完全失效；排序判定只能看 PR-AUC——这里 "
-            "ROC-AUC 的随机水平仍是 0.5，会因负样本基数巨大、"
-            "FPR 增长缓慢而给出过于乐观的分数"
+            "口径已被常数预测主导。字节语言模型的主指标仍应是 "
+            "NLL / bits-per-byte（预注册口径），并辅以类平衡 "
+            "val_macro_nll；PR-AUC 只作为诊断，必须报告相对"
+            "随机水平（≈平均 prevalence）的 lift，而不是把"
+            "PR-AUC 绝对值当归一化准确率"
             f"{chance_text}；PR-AUC 必须显著高于该随机水平"
         )
     elif max_majority >= _IMBALANCE_DOMINANT_MAJORITY:
         report["advisories"].append(
             f"最高频类占比达 {max_majority:.1%}"
             f"（{most_imbalanced_run}，val_majority_accuracy）："
-            "accuracy 与 micro 口径已被常数预测主导，必须看 "
-            "macro F1 与 PR-AUC；此时 ROC-AUC 会因负样本基数大"
-            "而过于乐观"
+            "accuracy 与 micro 口径已被常数预测主导；主指标应"
+            "保持 NLL / bits-per-byte，辅以 macro NLL 与 macro "
+            "F1 诊断。ROC-AUC 对 prevalence 不敏感，但高 AUC "
+            "不保证低 prevalence 下有可用的 precision/recall；"
+            "PR-AUC 需按 lift 解读"
         )
     elif max_majority >= _IMBALANCE_WEAK_MAJORITY:
         report["advisories"].append(
@@ -27821,8 +29486,10 @@ def imbalance_metric_advisory(
         and max_majority >= _IMBALANCE_WEAK_MAJORITY
     ):
         report["advisories"].append(
-            f"当前主指标 {metric} 受多数类主导："
-            "建议改用 macro F1 或 PR-AUC 作为判定口径"
+            f"当前主指标 {metric} 受多数类主导：若研究问题是"
+            "语言建模似然，应保留 NLL / bits-per-byte 为主指标，"
+            "把 accuracy / macro F1 / PR-AUC 作为辅助诊断；"
+            "只有任务本身是分类决策时才应预注册分类指标"
         )
 
     # 似然口径同样是频率加权的：val_loss / val_ppl / bpb 按
@@ -27889,16 +29556,17 @@ def imbalance_metric_advisory(
     ):
         extreme = max_majority >= _IMBALANCE_EXTREME_MAJORITY
         report["advisories"].append(
-            "类别不平衡下 ROC-AUC 偏乐观（FPR 分母被负样本"
-            "基数拉大"
+            "类别不平衡下 ROC-AUC 本身不因负样本多而升高"
+            "（TPR/FPR 均以真实类别为条件），但高 ROC-AUC 仍"
+            "可能对应低 precision/recall"
             + (
                 "，随机水平 0.5 与 PR-AUC 随机水平相差"
                 f"约 {max_majority:.0%} 量级的比例"
                 if extreme
                 else ""
             )
-            + "），优先看 PR-AUC"
-            "（--compare-metric val_pr_auc_macro）"
+            + "；排序诊断请同时报告 PR-AUC 相对随机水平的 "
+            "lift（--compare-metric val_pr_auc_macro_lift）"
         )
 
     return report
@@ -28904,6 +30572,7 @@ def print_comparison_analysis(
     ablation_modes: Optional[List[str]] = None,
     equivalence_margin: Optional[float] = _DEFAULT_EQUIVALENCE_MARGIN,
     allow_partial_ablation: bool = False,
+    common_step: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     打印完整的对比分析：受控变量检查、按种子聚合的
@@ -28960,8 +30629,14 @@ def print_comparison_analysis(
     # 入口统一注入行级字段，后续聚合/检验/基线检查一并使用。
     compute_matched = annotate_compute_matched_metrics(rows)
     # final 的 val 指标来自验证集选中的 checkpoint；共同步数处
-    # 的即时验证 loss 不经过选型，提供无偏对照。
-    common_step = annotate_common_step_metrics(rows)
+    # 的即时验证 loss 不经过选型，提供选型无关的对照。
+    # 注意：若共同步数取「各运行最后验证步的最小值」，该步本身
+    # 是观察到的端点（早停/不等步数时与结果相关），因此不是
+    # 无偏估计；应优先用训练前固定的 --common-step。
+    common_step = annotate_common_step_metrics(
+        rows,
+        target_step=common_step,
+    )
     selection_bias = selection_bias_report(
         rows,
         metric,
@@ -29064,7 +30739,7 @@ def print_comparison_analysis(
             matched_coverage,
         )
     # 选型偏差敏感性：final 指标来自 best_val，可能把种子噪声
-    # 吸收成「组件有用」。在共同步数无偏口径上重估同一全因子，
+    # 吸收成「组件有用」。在共同步数选型无关口径上重估同一全因子，
     # 支持翻转为不支持时必须降级组件判定。
     common_step_sensitivity = factorial_common_step_sensitivity(
         aggregates,
@@ -29225,6 +30900,23 @@ def print_comparison_analysis(
 
     provenance = check_run_provenance(rows)
     numerical_failures = numerical_failure_report(rows)
+    failure_rates = failure_rate_report(rows)
+    scale_tiers = {}
+    for row in rows:
+        guard = row.get("scale_guard")
+        if not isinstance(guard, dict):
+            continue
+        tier = str(guard.get("scale_tier"))
+        scale_tiers.setdefault(tier, []).append(str(row.get("run")))
+    scale_guard_report = {
+        "tiers": {tier: len(names) for tier, names in scale_tiers.items()},
+        "prototype_runs": scale_tiers.get("prototype", []),
+        "note": (
+            "prototype 级（<20 token/param、<1 epoch、seq_len<512 "
+            "或专家数≤8）只支持原型可行性；不能据此声称大规模 "
+            "MoE/长上下文/推理任务的普遍结论"
+        ),
+    }
 
     print()
     print(
@@ -29312,6 +31004,40 @@ def print_comparison_analysis(
         )
     else:
         print("  OK：所有运行都记录了数值完整性且未发现失败")
+
+    print()
+    print(
+        "[failure] 失败率与成功条件性能：只比较成功运行会掩盖"
+        "稳定性成本，失败率必须与成功条件指标一起报告"
+    )
+    for arm in failure_rates["arms"]:
+        rate = arm.get("failure_rate")
+        rate_text = (
+            "n/a"
+            if rate is None
+            else f"{float(rate):.1%}"
+        )
+        print(
+            f"  {arm['mode']}: planned={arm['planned_runs']} "
+            f"failed={arm['failed_runs']} "
+            f"unknown={arm['unknown_runs']} "
+            f"success={arm['success_runs']} failure_rate={rate_text}"
+        )
+    if failure_rates["differential_failure"]:
+        print(
+            "  [warn] "
+            + str(
+                failure_rates["differential_failure"]["note"]
+            )
+        )
+    print("  [note] " + str(failure_rates["retry_policy"]))
+    if scale_guard_report["prototype_runs"]:
+        print(
+            "  [scale] [warn] 以下运行是原型级规模，结论不能"
+            "外推到大规模/长上下文：" + ", ".join(
+                scale_guard_report["prototype_runs"][:10]
+            )
+        )
 
     print()
     print(
@@ -29540,8 +31266,8 @@ def print_comparison_analysis(
             )
             print(
                 "  [warn] 伪重复：以下实验单元含重复随机种子"
-                "（复制的同一运行不是独立重复实验，"
-                "种子间方差被低估、配对检验不可用）: "
+                "（复制的同一运行不是独立重复实验；已按独立"
+                "种子折叠为一个观测，复制运行不增加 n）: "
                 + details
             )
 
@@ -29768,7 +31494,7 @@ def print_comparison_analysis(
     print()
     print(
         "[common-step] 共同训练步数处的即时验证指标"
-        "（不经过验证集 checkpoint 选择，用于无偏复核）"
+        "（不经过验证集 checkpoint 选择，用于选型无关复核）"
     )
     if not common_step["runs"]:
         print("  无可用的共同步数对比")
@@ -30935,6 +32661,8 @@ def print_comparison_analysis(
         "controlled": controlled,
         "provenance": provenance,
         "numerical_failures": numerical_failures,
+        "failure_rates": failure_rates,
+        "scale_guard": scale_guard_report,
         "hypothesis_registry": hypotheses,
         "hypothesis_alignment": alignment,
         "aggregates": aggregates,
@@ -31890,6 +33618,62 @@ def training_batch_fingerprint(
     }
 
 
+def build_scale_guard(
+    cfg: Config,
+    args: argparse.Namespace,
+    n_params: int,
+    dataset: Optional[ByteDataset] = None,
+) -> Dict[str, object]:
+    """记录实验规模与原型级结论守卫。
+
+    默认 32×128×2000 ≈ 8.19M 训练字节位置、约 6.9M 参数，
+    只有约 1.2 token/param；这主要支持「原型可行性」，不足以
+    外推到大规模 MoE、长上下文或推理任务。报告把规模写成
+    tokens_seen / tokens_per_param / epochs，并在达到原型级
+    阈值时给出 [scale] 警告，避免把玩具规模的结果说成普遍结论。
+    """
+    tokens_seen = (
+        int(getattr(args, "steps", 0))
+        * int(getattr(args, "batch_size", 0))
+        * int(cfg.seq_len)
+    )
+    tokens_per_param = (
+        tokens_seen / float(n_params)
+        if n_params > 0
+        else None
+    )
+    train_bytes = None
+    epochs = None
+    if dataset is not None:
+        train_bytes = int(dataset.effective_train_bytes)
+        if train_bytes > 0:
+            epochs = tokens_seen / float(train_bytes)
+    prototype = bool(
+        (tokens_per_param is not None and tokens_per_param < 20.0)
+        or (epochs is not None and epochs < 1.0)
+        or cfg.seq_len < 512
+        or cfg.n_experts <= 8
+    )
+    return {
+        "tokens_seen": tokens_seen,
+        "n_params": int(n_params),
+        "tokens_per_param": tokens_per_param,
+        "train_bytes": train_bytes,
+        "epochs_over_train": epochs,
+        "seq_len": int(cfg.seq_len),
+        "n_experts": int(cfg.n_experts),
+        "top_k": int(cfg.top_k),
+        "scale_tier": "prototype" if prototype else "research",
+        "note": (
+            "tokens_seen=steps×batch_size×seq_len；prototype 级"
+            "（<20 token/param、<1 epoch、seq_len<512 或专家数"
+            "≤8）的结果只能支持原型可行性，不能外推到大规模 "
+            "MoE、长上下文或推理任务。训练收敛应分别按 token、"
+            "FLOPs 与墙钟时间报告"
+        ),
+    }
+
+
 def write_run_config(
     out_dir: Path,
     cfg: Config,
@@ -31918,6 +33702,17 @@ def write_run_config(
         # 优化器 / 学习率 / 训练轮数 / 数据增强等设置是否一致」。
         "comparison_protocol": build_comparison_protocol(cfg, args),
         "n_params": n_params,
+        "paper_fidelity": getattr(args, "paper_fidelity", None),
+        "cost_profile": getattr(args, "cost_profile", None),
+        "budget_match": getattr(
+            args, "budget_match_report", None
+        ),
+        "scale_guard": build_scale_guard(
+            cfg,
+            args,
+            n_params,
+            dataset,
+        ),
         "initialization": init_fingerprints,
         "training_trace": (
             training_batch_fingerprint(
@@ -32026,6 +33821,23 @@ def write_run_config(
                     "drop_train_degenerate_runs",
                     False,
                 )
+            ),
+            "eval_content_access": (
+                getattr(dataset, "eval_content_access", None)
+                if dataset is not None
+                else None
+            ),
+            "cleaning_domain_justification": getattr(
+                args, "cleaning_domain_justification", None
+            ),
+            "split_policy": getattr(
+                args, "split_policy", "contiguous"
+            ),
+            "time_order_evidence": getattr(
+                args, "time_order_evidence", None
+            ),
+            "entity_audit": getattr(
+                args, "data_entity_audit", None
             ),
             "allow_data_leakage": bool(
                 getattr(args, "allow_data_leakage", False)
@@ -32524,6 +34336,200 @@ def test_record_exists(path: Path) -> bool:
         return True
 
     return False
+
+
+def _read_test_records(run_dir: Path) -> Dict[str, object]:
+    """读取单个运行的 test 汇总记录（最后一次 test 行）。"""
+    path = Path(run_dir) / "metrics.jsonl"
+    record: Optional[Dict[str, object]] = None
+    if not path.exists():
+        return {"run": str(run_dir), "available": False}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and item.get("step") == "test":
+                    record = item
+    except (OSError, UnicodeDecodeError):
+        return {"run": str(run_dir), "available": False}
+    if record is None:
+        return {"run": str(run_dir), "available": False}
+    return {"run": str(run_dir), "available": True, **record}
+
+
+def read_test_access_ledger(path: Path) -> List[Dict[str, object]]:
+    """读取测试集访问账本（JSONL，只追加）。"""
+    path = Path(path)
+    if not path.exists():
+        return []
+    entries: List[Dict[str, object]] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                entries.append(item)
+    return entries
+
+
+def append_test_access_ledger(
+    path: Path,
+    record: Dict[str, object],
+) -> None:
+    """原子追加一条测试集访问记录（flush+fsync）。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_json_safe(record), ensure_ascii=False)
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _test_access_key(
+    data_sha256: object,
+    split_sha256: object,
+    test_fraction: object,
+) -> Dict[str, object]:
+    return {
+        "data_sha256": data_sha256,
+        "test_split_sha256": (
+            (split_sha256 or {}).get("test")
+            if isinstance(split_sha256, dict)
+            else None
+        ),
+        "test_fraction": test_fraction,
+    }
+
+
+def check_test_access_ledger(
+    ledger_path: Path,
+    key: Dict[str, object],
+    out_dir: Path,
+) -> Dict[str, object]:
+    """检查同一测试集是否已被其它候选/目录解封过。
+
+    路径级封条只能防止同一目录重复解封；新建目录、换种子或
+    改代码仍可再次访问同一测试集。账本按
+    ``(data_sha256, test_split_sha256, test_fraction)`` 识别
+    「同一测试集」，列出全部历史访问，供研究级流程核对候选
+    冻结与预注册比较是否完整。
+    """
+    entries = read_test_access_ledger(ledger_path)
+    matching = [
+        entry
+        for entry in entries
+        if all(entry.get(field) == value for field, value in key.items())
+    ]
+    other_candidates = [
+        entry
+        for entry in matching
+        if str(entry.get("out_dir")) != str(Path(out_dir))
+    ]
+    return {
+        "ledger": str(ledger_path),
+        "matching_accesses": len(matching),
+        "other_candidates": other_candidates,
+        "repeat_access": bool(other_candidates),
+        "note": (
+            "同一测试集被多个目录/候选访问时，测试集已不再"
+            "只服务于一次最终确认；最终报告必须列出全部访问"
+            "与预注册比较，不能只展示最好的候选"
+        ),
+    }
+
+
+def print_final_test_comparison(
+    run_dirs: List[str],
+    ledger_path: Optional[str] = None,
+) -> Dict[str, object]:
+    """只读汇总冻结候选的 test 记录（研究级最终确认）。
+
+    不做任何评估、不写运行目录；只读取各候选的 test 汇总与
+    可选访问账本，打印所有候选（包括失败/无 test 记录的候选），
+    避免「只报告跑通的那个」。多重比较与显著性需要后续按
+    预注册主指标单独分析，这里先保证**所有**候选可见。
+    """
+    rows: List[Dict[str, object]] = []
+    print("[final-test] 只读汇总冻结候选的测试集记录（不重新评估）")
+    for run_dir in run_dirs:
+        path = Path(run_dir)
+        config: Dict[str, object] = {}
+        try:
+            config = json.loads(
+                (path / "config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+        record = _read_test_records(path)
+        cfg = config.get("config") or {}
+        row = {
+            "run": str(path),
+            "mode": cfg.get("mode"),
+            "seed": (config.get("args") or {}).get("seed"),
+            "test_available": bool(record.get("available")),
+            "test_loss": record.get("test_loss"),
+            "test_ppl": record.get("test_ppl"),
+            "test_bits_per_byte": record.get("test_bits_per_byte"),
+            "test_token_accuracy": record.get(
+                "test_token_accuracy"
+            ),
+            "selected_model": record.get("model_selection"),
+            "selected_step": record.get("selected_step"),
+        }
+        rows.append(row)
+        print(
+            f"  {path}: mode={row['mode']} seed={row['seed']} "
+            f"test_loss={row['test_loss']} "
+            f"bpb={row['test_bits_per_byte']} "
+            f"available={row['test_available']}"
+        )
+    missing = [
+        row["run"] for row in rows if not row["test_available"]
+    ]
+    if missing:
+        print(
+            "  [warn] 以下候选没有 test 记录（可能未解封或评估失败），"
+            "不能静默从最终比较中消失: " + ", ".join(missing)
+        )
+    ledger_info = None
+    if ledger_path:
+        entries = read_test_access_ledger(Path(ledger_path))
+        counts: Dict[str, int] = {}
+        for entry in entries:
+            counts[str(entry.get("out_dir"))] = (
+                counts.get(str(entry.get("out_dir")), 0) + 1
+            )
+        ledger_info = {
+            "ledger": ledger_path,
+            "accesses": len(entries),
+            "per_candidate": counts,
+        }
+        repeated = [
+            name for name, count in counts.items() if count > 1
+        ]
+        if repeated:
+            print(
+                "  [warn] 以下候选被账本记录为重复解封测试集: "
+                + ", ".join(repeated)
+            )
+    return {
+        "candidates": rows,
+        "missing_test_records": missing,
+        "ledger": ledger_info,
+        "protocol_note": (
+            "最终确认必须先冻结候选（代码/配置/数据指纹），"
+            "一次性解封测试集，并报告全部预注册比较；本命令"
+            "只读汇总，不做选择或重复评估"
+        ),
+    }
 
 
 def load_previous_sanity_result(
@@ -33165,10 +35171,12 @@ def run_self_test():
 
             def probe_attention_step(
                 inputs: torch.Tensor,
+                *args,
                 _original=original_step,
+                **kwargs,
             ) -> torch.Tensor:
                 calls[0] += 1
-                return _original(inputs)
+                return _original(inputs, *args, **kwargs)
 
             block.attention_step = probe_attention_step
 
@@ -33233,12 +35241,14 @@ def run_self_test():
             block: TransformerBlock,
             branches: torch.Tensor,
             top_k: int,
+            scale=None,
         ):
             self.route_widths.append(top_k)
             return super().run_independent_blocks(
                 block,
                 branches,
                 top_k,
+                scale,
             )
 
     probe = RouteWidthProbe(
@@ -38879,7 +40889,7 @@ def run_self_test():
     ] != by_run["long"]["val_loss"]
 
     # final 的 val_loss 来自 best_val checkpoint：报告必须点名
-    # 选型偏差，并指向共同步数无偏口径；共同步数指标本身不
+    # 选型偏差，并指向共同步数选型无关口径；共同步数指标本身不
     # 参与该警告。
     bias_report = selection_bias_report(
         common_rows,
@@ -38987,7 +40997,7 @@ def run_self_test():
         common_report,
     )["applicable"]
 
-    # 类别指标同样需要无偏口径：以 macro F1 判定时不能只有
+    # 类别指标同样需要选型无关口径：以 macro F1 判定时不能只有
     # loss 的共同步数版本。两个运行的 macro F1 在共同步数处
     # 精确/插值取值，且选型偏差报告必须指向对应派生指标。
     assert "val_macro_f1_at_common_step" in COMPARISON_METRIC_KEYS
@@ -39086,7 +41096,7 @@ def run_self_test():
             not in metric_common["metric_reports"]
         )
 
-    # 排序指标（PR-AUC / lift / ROC-AUC）同样需要共同步数无偏
+    # 排序指标（PR-AUC / lift / ROC-AUC）同样需要共同步数选型无关
     # 口径：极度不平衡时项目建议以 PR-AUC 判定，若只有 final
     # 版本，判定指标恰好是会被 checkpoint 选型抬高的那个。
     for base in (
@@ -39306,7 +41316,7 @@ def run_self_test():
         - (_two_sided_t_p_value(-2.0, 7.0) or 0.0)
     ) < 1e-12
 
-    # ---- 对比分析：无分布假设的配对符号翻转检验 ----
+    # ---- 对比分析：对称性假设下的配对符号翻转检验 ----
     # n=3、差值全为正时，8 种符号组合里只有全正/全负两种
     # 与观测均值同向或更强，精确双侧 p=2/8=0.25。
     sign_flip = _paired_sign_flip_test([1.0, 2.0, 3.0])
@@ -39359,7 +41369,7 @@ def run_self_test():
         float(unstable_loo["leave_one_out_effect_min"]) + 1.0
     ) < 1e-12
 
-    # 配对对比必须携带无分布假设检验与 leave-one-out 字段。
+    # 配对对比必须携带符号翻转（对称性假设）与 leave-one-out 字段。
     paired_contrast = _contrast_test(
         [
             {"seed": 1, "value": 3.0},
@@ -40934,9 +42944,9 @@ def run_self_test():
         assert "12 个种子" in inconclusive_display
 
         # 伪重复：同一单元里同一个种子被复制成多个运行（目录
-        # 复制的常见事故）不是独立重复实验。必须点名重复种子、
-        # 禁止配对检验（按种子配对会静默丢样本）、退回 Welch，
-        # 且展示层给出警告。
+        # 复制的常见事故）不是独立重复实验。必须先折叠为每个
+        # 独立种子一个观测，再按种子配对；复制运行不增加 n，
+        # 换 Welch 也不会恢复独立性。展示层必须点名重复种子。
         duplicate_path = _write_analysis_run(
             "A_seed42_duplicate",
             "A",
@@ -40972,8 +42982,12 @@ def run_self_test():
             "val_loss",
         )[0]
         assert duplicate_contrast["duplicate_seeds"]
-        assert duplicate_contrast["test"] == "welch_t"
-        assert duplicate_contrast["n_pairs"] == 0
+        # 伪重复先折叠为独立种子观测，再做配对检验：复制运行
+        # 不增加 n/df，也不能靠换 Welch 恢复独立性。
+        assert duplicate_contrast["test"] == "paired_t"
+        assert duplicate_contrast["n_pairs"] == 3
+        assert duplicate_contrast["pseudo_replication"]["detected"]
+        assert duplicate_contrast["pseudo_replication"]["collapsed"]
         # 伪重复折叠为独立种子观测：检验与展示的样本数都不能
         # 把复制运行算成独立重复（A 单元 4 个运行、3 个种子）。
         assert duplicate_contrast["n_baseline"] == 3
@@ -42377,7 +44391,7 @@ def run_self_test():
 
         # 共同步数敏感性：final 口径显示 A 恒定改善，但周期
         # 曲线在共同步数点的 A 效应均值恰好为 0。选型口径的
-        # 支持必须在无偏口径下降级，不能继续宣称组件有用。
+        # 支持必须在选型无关口径下降级，不能继续宣称组件有用。
         sensitivity_paths = []
         for seed, offset, common_delta in (
             (1, 0.0, 0.02),
@@ -47394,6 +49408,7 @@ def hypothesis_check_error(
     """
     if (
         args.compare is None
+        and getattr(args, "final_test_comparison", None) is None
         and not args.sanity_only
         and not args.statistical_baseline
         and args.resume is None
@@ -48000,12 +50015,10 @@ def analyze_baseline_tuning(
         # 种子计划随报告落盘：调参的统计功效（独立种子数、
         # 是否用了低功效豁免）是「基线已充分调参」的一部分，
         # 下游来源核对与基线合理性检查都必须能看到。
-        "seed_plan": {
-            "seeds": [int(seed) for seed in seeds],
-            "n_seeds": len(seeds),
-            "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
-            "underpowered_override": False,
-        },
+        "seed_plan": _build_seed_plan(
+            seeds,
+            False,
+        ),
         # 候选的种子集合必须一致：不同候选跑不同种子时，
         # 均值差异可能是种子难度差异而不是学习率差异；
         # 同一候选内重复种子则是伪重复，会低估方差。
@@ -48163,6 +50176,17 @@ def analyze_baseline_tuning(
             "metric_std": _sample_std(values),
             "runs": [str(row.get("run")) for row in lr_rows],
             "seeds": unique_seeds,
+            # 按种子对齐的指标值：调参并列判定必须利用配对
+            # 差值（std 不是均值差的标准误，且忽略配对）。
+            "seed_metric": {
+                int(row["seed"]): float(row[metric])
+                for row in lr_rows
+                if isinstance(row.get("seed"), int)
+                and not isinstance(row.get("seed"), bool)
+                and isinstance(row.get(metric), (int, float))
+                and not isinstance(row.get(metric), bool)
+                and math.isfinite(float(row[metric]))
+            },
         }
         if len(values) < len(lr_rows):
             report["issues"].append(
@@ -48265,11 +50289,60 @@ def analyze_baseline_tuning(
             if higher_is_better
             else mean - best_mean
         )
-        noise = max(
-            best_std,
-            float(candidate["metric_std"] or 0.0),
+        # 并列判定优先用**同种子配对差值**的 t 检验：std 是
+        # 种子间离散度，不是均值差的标准误，且忽略配对。
+        # 配对不显著时只能说明当前种子数无法区分，这是预先
+        # 声明的简化选型规则（不是等价性证明）；没有可比配对
+        # 时才退回旧的 std 启发式，并在报告中标明规则。
+        best_seed_metric = best.get("seed_metric") or {}
+        cand_seed_metric = candidate.get("seed_metric") or {}
+        common_train_seeds = sorted(
+            set(best_seed_metric) & set(cand_seed_metric)
         )
-        is_tied = gap <= 0.0 or (noise > 0.0 and gap < noise)
+        paired_rule = None
+        is_tied = gap <= 0.0
+        if (
+            not is_tied
+            and len(common_train_seeds) >= _MIN_SEEDS_FOR_STATS
+        ):
+            # 方向统一成「候选相对最优的改善量」，越大越好。
+            diffs = [
+                (
+                    cand_seed_metric[seed]
+                    - best_seed_metric[seed]
+                    if higher_is_better
+                    else best_seed_metric[seed]
+                    - cand_seed_metric[seed]
+                )
+                for seed in common_train_seeds
+            ]
+            paired_test = _paired_t_test(diffs)
+            paired_rule = {
+                "test": "paired_t_on_seed_differences",
+                "n_pairs": len(common_train_seeds),
+                "effect": paired_test.get("effect"),
+                "se": paired_test.get("se"),
+                "df": paired_test.get("df"),
+                "p_value": paired_test.get("p_value"),
+                "alpha": _SIGNIFICANCE_LEVEL,
+                "basis": (
+                    "不显著只能说明当前种子数无法区分候选，"
+                    "不是等价性证明；这是预声明的选型简化规则"
+                ),
+            }
+            # 配对差值不显著 → 无法区分 → 进入保守并列集合。
+            is_tied = bool(
+                paired_test.get("p_value") is not None
+                and float(paired_test["p_value"])
+                > _SIGNIFICANCE_LEVEL
+            )
+        if paired_rule is None and not is_tied:
+            noise = max(
+                best_std,
+                float(candidate["metric_std"] or 0.0),
+            )
+            is_tied = noise > 0.0 and gap < noise
+        candidate["paired_tie_test"] = paired_rule
         if is_tied:
             tied.append(candidate)
             if candidate is not best:
@@ -48295,12 +50368,26 @@ def analyze_baseline_tuning(
         if conservative_tie_break
         else "best_mean"
     )
+    report["selection_rule"] = {
+        "tie_break": "smallest_lr",
+        "tie_test": (
+            "paired_t_on_seed_differences"
+            if any(c.get("paired_tie_test") for c in usable)
+            else "max_std_heuristic_fallback"
+        ),
+        "alpha": _SIGNIFICANCE_LEVEL,
+        "note": (
+            "并列 = 候选与最优均值的同种子配对差值不显著"
+            "（或无法配对时差距小于较大 std 的旧启发式）；"
+            "不显著不是等价性证明，winner 仍需独立种子确认"
+        ),
+    }
 
     if indistinguishable:
         report["issues"].append(
-            "以下学习率候选与最优均值候选的差距小于种子波动"
-            "（无法在统计上区分，已按 selection_rule 从并列"
-            "集合中取更小 lr 作为保守 winner）: "
+            "以下学习率候选与最优均值候选无法在统计上区分"
+            "（同种子配对 t 检验不显著；已按 selection_rule "
+            "从并列集合中取更小 lr 作为保守 winner）: "
             + ", ".join(
                 format(lr, "g") for lr in indistinguishable
             )
@@ -49008,12 +51095,10 @@ def analyze_baseline_tuning_axes(
             if isinstance(lr_axis, dict)
             else []
         ),
-        "seed_plan": {
-            "seeds": [int(seed) for seed in seeds],
-            "n_seeds": len(seeds),
-            "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
-            "underpowered_override": False,
-        },
+        "seed_plan": _build_seed_plan(
+            seeds,
+            False,
+        ),
         "seed_alignment": (
             lr_axis.get("seed_alignment")
             if isinstance(lr_axis, dict)
@@ -49746,15 +51831,10 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             seeds,
         )
     report["metric_source"] = metric_source
-    report["seed_plan"] = {
-        "seeds": [int(seed) for seed in seeds],
-        "n_seeds": len(seeds),
-        "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
-        "underpowered_override": bool(
-            args.allow_underpowered
-            and len(seeds) < _MIN_SEEDS_FOR_STATS
-        ),
-    }
+    report["seed_plan"] = _build_seed_plan(
+        seeds,
+        args.allow_underpowered,
+    )
     if len(seeds) < _MIN_SEEDS_FOR_STATS:
         report["issues"].append(
             f"每个候选只有 {len(seeds)} 个种子"
@@ -49849,18 +51929,14 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         allow_partial_ablation=bool(
             args.allow_partial_ablation
         ),
+        common_step=args.common_step,
     )
     # 种子计划随报告落盘：事后能核对本轮结论是在几个种子上
     # 得出的、是否使用了低统计功效豁免。
-    analysis["seed_plan"] = {
-        "seeds": [int(seed) for seed in args.seeds],
-        "n_seeds": len(args.seeds),
-        "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
-        "underpowered_override": bool(
-            args.allow_underpowered
-            and len(args.seeds) < _MIN_SEEDS_FOR_STATS
-        ),
-    }
+    analysis["seed_plan"] = _build_seed_plan(
+        args.seeds,
+        args.allow_underpowered,
+    )
     write_comparison_report(out_root, analysis)
 
 
@@ -49881,10 +51957,13 @@ def main():
         "--mode",
         type=str,
         default="B",
-        choices=["smelt", "local_base", "A", "B", "dense"],
+        choices=sorted(Config.MODEL_MODES),
         help=(
-            "模型模式；dense 为无 MoE、无循环的纯稠密"
-            " Transformer 基线（先跑简单基线，再谈复杂模型）"
+            "模型模式；base 为论文的未循环 MoE 基线、smelt 为"
+            "循环两次的 SMELT、local_base_k2 为只改变合并时机"
+            "的机制对照、B_early 为 B 的等计算量合并位置对照；"
+            "dense 为无 MoE、无循环的纯稠密 Transformer 基线"
+            "（先跑简单基线，再谈复杂模型）"
         ),
     )
     parser.add_argument(
@@ -50090,11 +52169,95 @@ def main():
         ),
     )
     parser.add_argument(
+        "--entity-manifest",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "显式实体清单（JSON 数组，按群组序号给 entity_id）："
+            "审计同一用户/作者/文档是否跨 split。--group-separator "
+            "只保证连续片段完整，不能识别非相邻片段的同一实体"
+        ),
+    )
+    parser.add_argument(
+        "--allow-entity-overlap",
+        action="store_true",
+        help=(
+            "显式允许实体跨 split（默认拒绝训练/拒绝解封）："
+            "跨 split 实体是群组级泄露，豁免会写入配置"
+        ),
+    )
+    parser.add_argument(
+        "--split-policy",
+        type=str,
+        default="contiguous",
+        choices=("contiguous", "chronological"),
+        help=(
+            "切分口径：contiguous（默认）只是按文件顺序做连续"
+            "前缀切分，除非语料确实按时间排序，否则不构成时间"
+            "切分；chronological 需要 --time-order-manifest "
+            "证明文件顺序与时间戳单调一致。文档/来源分层或"
+            "来源外推切分仍需显式群组/来源清单"
+        ),
+    )
+    parser.add_argument(
+        "--time-order-manifest",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "时间顺序清单（JSONL 或每行一个 ISO-8601 时间戳，"
+            "按语料文件顺序）。仅 --split-policy chronological "
+            "时必填；时间戳非单调时拒绝启动"
+        ),
+    )
+    parser.add_argument(
         "--evaluate-test",
         action="store_true",
         help=(
             "训练结束后在测试集上做唯一一次最终评估；"
             "不设置时测试集完全不被访问"
+        ),
+    )
+    parser.add_argument(
+        "--test-ledger",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "研究级测试集访问账本（JSONL，只追加）。建议放在"
+            "所有候选共享的目录：每次 --evaluate-test 记录"
+            "数据/测试 split 指纹、候选目录、代码指纹与时间；"
+            "同一测试集被多个候选访问时显式披露。默认写入"
+            "输出目录内，只防同目录重复"
+        ),
+    )
+    parser.add_argument(
+        "--allow-repeat-test-access",
+        action="store_true",
+        help=(
+            "允许同一测试集被其它候选/目录再次解封（默认拒绝）。"
+            "启用后最终报告必须列出全部访问；该豁免写入账本"
+        ),
+    )
+    parser.add_argument(
+        "--study-id",
+        type=str,
+        default=None,
+        help=(
+            "研究/确认阶段标识，写入 test 记录与访问账本，"
+            "用于把多次运行归到同一个预注册比较"
+        ),
+    )
+    parser.add_argument(
+        "--final-test-comparison",
+        nargs="+",
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "只读汇总冻结候选的 test 记录（不重新评估、不选择）："
+            "列出全部候选、缺失 test 的候选与访问账本重复次数。"
+            "最终确认应先冻结候选再一次性解封测试集"
         ),
     )
     parser.add_argument(
@@ -50194,6 +52357,29 @@ def main():
         ),
     )
     parser.add_argument(
+        "--domain-justification",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help=(
+            "启用任一训练集清洗开关时必填：说明这些字节在本"
+            "任务中确实是损坏/噪声（而不是合法字节、结构分隔"
+            "或低频但有效的标签），并记录清洗规则的选择依据。"
+            "非法 UTF-8/NUL/重复字节本身不等于标签错误"
+        ),
+    )
+    parser.add_argument(
+        "--allow-eval-content-for-cleaning",
+        action="store_true",
+        help=(
+            "允许用 val 与 test 内容共同决定训练集删除哪些"
+            "群组/共享块（默认只用 val）。启用测试内容参与"
+            "数据集构建后，不能再声称「测试集全程未被读取」；"
+            "该事实与 test 内容访问范围写入 data_audit 与"
+            "config.json，且清洗规则必须在训练前冻结"
+        ),
+    )
+    parser.add_argument(
         "--strict-data-audit",
         action="store_true",
         help=(
@@ -50260,6 +52446,16 @@ def main():
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument(
+        "--n-kv-heads",
+        type=int,
+        default=None,
+        help=(
+            "GQA 的 KV 头数（必须整除 n_heads）；默认等于 "
+            "n_heads（标准 MHA）。SMELT 论文用 GQA 匹配 KV "
+            "cache，复现论文口径时可设 n_heads/4"
+        ),
+    )
     parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument("--n-experts", type=int, default=8)
     parser.add_argument("--expert-hidden", type=int, default=256)
@@ -50268,6 +52464,44 @@ def main():
     parser.add_argument("--k2", type=int, default=2)
     parser.add_argument("--balance-coef", type=float, default=0.01)
     parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--residual-scaling",
+        type=str,
+        default="paper",
+        choices=sorted(Config.RESIDUAL_SCALINGS),
+        help=(
+            "残差缩放口径：paper（默认）在循环区域内把子层"
+            "残差更新除以循环次数 r（SMELT 论文 3.1 节，r=2 "
+            "即 1/2）；global 为历史行为（residual_scale 全局"
+            "统一作用于循环区域内外）。跨模式对比必须一致，"
+            "且该口径进入 comparison_protocol"
+        ),
+    )
+    parser.add_argument(
+        "--budget-match",
+        type=str,
+        default=None,
+        metavar="MODE",
+        help=(
+            "按完整计算图（Attention 执行次数 + MoE 专家"
+            "assignment + 路由）核对与参考模式的每 token FLOPs "
+            "是否匹配，不匹配时拒绝启动并给出建议 k2。例如 "
+            "--mode A --budget-match smelt。注意仅令 "
+            "k1*k2≈2*top_k 会漏掉第一阶段成本，不是充分的"
+            "预算匹配"
+        ),
+    )
+    parser.add_argument(
+        "--budget-tolerance",
+        type=float,
+        default=0.10,
+        help=(
+            "--budget-match 的允许相对误差（默认 0.10 = 10%%；"
+            "论文的预算匹配残差在 FLOPs 上 <4%%，本原型按整数"
+            "k2 只能取离散值，默认放宽到 10%% 但仍会报告实测"
+            "比例）"
+        ),
+    )
 
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -50350,6 +52584,26 @@ def main():
         ),
     )
     parser.add_argument(
+        "--routing-interventions",
+        action="store_true",
+        help=(
+            "在验证集固定窗口上追加 RQ4 的功能干预实验："
+            "路由打乱（随机专家）与逐专家屏蔽（输出置零），"
+            "比较损失上升。负载均匀/熵高本身不能证明专家"
+            "专门化；该选项额外做 E+2 次验证前向，默认关闭"
+        ),
+    )
+    parser.add_argument(
+        "--routing-intervention-batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "干预实验使用的验证窗口批数；默认 min(eval_batches, 5)，"
+            "设为 0 表示与 --eval-batches 相同"
+        ),
+    )
+    parser.add_argument(
         "--compare",
         nargs="+",
         default=None,
@@ -50399,6 +52653,31 @@ def main():
             "指标不参与跨运行对比与选择，只在单个运行的"
             "最终评估中出现）；可选: "
             + ", ".join(COMPARISON_METRIC_KEYS)
+        ),
+    )
+    parser.add_argument(
+        "--common-step",
+        type=float,
+        default=None,
+        metavar="STEP",
+        help=(
+            "预注册的共同训练步数，用于 <metric>_at_common_step "
+            "派生指标。默认取各运行最后一个周期验证步的最小值，"
+            "该步由观察到的端点决定（早停/不等步数时与结果相关），"
+            "不是选型无关口径；正式对比应在训练前固定该步"
+        ),
+    )
+    parser.add_argument(
+        "--eval-bootstrap-block",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "评估窗口 bootstrap 的重采样单位：1=逐窗口 i.i.d."
+            "（默认，可能低估序列相关的不确定性）；N>1 时使用"
+            "长度为 N 的循环移动块 bootstrap（连续窗口成块重采样，"
+            "部分吸收局部自相关）。按文档/来源做 cluster bootstrap "
+            "仍是更合适的选择；本选项只缓解窗口级近似"
         ),
     )
     parser.add_argument(
@@ -50707,6 +52986,15 @@ def main():
         parser.error("--eval-batches 必须为正整数")
     if args.eval_bootstrap < 0:
         parser.error("--eval-bootstrap 不能为负")
+    if args.eval_bootstrap_block <= 0:
+        parser.error("--eval-bootstrap-block 必须为正整数")
+    if (
+        args.routing_intervention_batches is not None
+        and args.routing_intervention_batches < 0
+    ):
+        parser.error(
+            "--routing-intervention-batches 不能为负"
+        )
     if args.save_interval <= 0:
         parser.error("--save-interval 必须为正整数")
     if args.warmup_steps < 0:
@@ -51112,6 +53400,32 @@ def main():
     if preregistration_error is not None:
         parser.error(preregistration_error)
 
+    # 研究级最终确认：只读汇总冻结候选的 test 记录，不重新
+    # 评估、不挑选候选。必须先于 --compare/训练处理。
+    if args.final_test_comparison is not None:
+        invalid = [
+            path
+            for path in args.final_test_comparison
+            if not Path(path).is_dir()
+        ]
+        if invalid:
+            parser.error(
+                "--final-test-comparison 的运行目录不存在: "
+                + ", ".join(invalid)
+            )
+        report = print_final_test_comparison(
+            list(args.final_test_comparison),
+            args.test_ledger,
+        )
+        print(
+            json.dumps(
+                _json_safe(report),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
     # --compare 模式只读运行目录，不需要 --data / --out。
     if args.compare is not None:
         # 路径写错时 compare_runs 仍会为不存在的目录生成整行 "-"
@@ -51137,6 +53451,7 @@ def main():
             baseline_mode=args.compare_baseline,
             metric=args.compare_metric,
             equivalence_margin=args.equivalence_margin,
+            common_step=args.common_step,
         )
         return
 
@@ -51382,6 +53697,22 @@ def main():
                     ensure_ascii=False,
                 )
             )
+        # 旧检查点没有 residual_scaling / n_kv_heads 字段：当时
+        # 的行为是全局 residual_scale、MHA。必须按旧语义回填，
+        # 否则 resume 会静默切换成 paper 1/r 或 GQA，把两次不同
+        # 架构的训练轨迹接在一起。
+        if "residual_scaling" not in saved_config:
+            saved_config = dict(saved_config)
+            saved_config["residual_scaling"] = "global"
+            print(
+                "[repro] [warn] 旧检查点缺少 residual_scaling："
+                "按历史 global 口径恢复（循环区域不额外除以 r）"
+            )
+        if "n_kv_heads" not in saved_config:
+            saved_config = dict(saved_config)
+            saved_config["n_kv_heads"] = saved_config.get(
+                "n_heads"
+            )
         cfg = Config(**{
             key: value
             for key, value in saved_config.items()
@@ -51411,6 +53742,7 @@ def main():
             seq_len=args.seq_len,
             d_model=args.d_model,
             n_heads=args.n_heads,
+            n_kv_heads=args.n_kv_heads,
             n_layers=args.n_layers,
             n_experts=args.n_experts,
             expert_hidden=args.expert_hidden,
@@ -51421,6 +53753,7 @@ def main():
             dense_fnn_hidden=dense_fnn_hidden,
             balance_coef=args.balance_coef,
             residual_scale=args.residual_scale,
+            residual_scaling=args.residual_scaling,
             init_scheme=args.init_scheme,
         )
 
@@ -51431,6 +53764,7 @@ def main():
             "seq_len",
             "d_model",
             "n_heads",
+            "n_kv_heads",
             "n_layers",
             "n_experts",
             "expert_hidden",
@@ -51441,6 +53775,7 @@ def main():
             "dense_fnn_hidden",
             "balance_coef",
             "residual_scale",
+            "residual_scaling",
             "init_scheme",
         }
         ignored = {}
@@ -51935,9 +54270,146 @@ def main():
             "--drop-train-degenerate-groups 以保持群组完整"
         )
 
+    cleaning_flags = (
+        ("--drop-train-corrupt-groups", args.drop_train_corrupt_groups),
+        ("--drop-train-corrupt-bytes", args.drop_train_corrupt_bytes),
+        (
+            "--drop-train-degenerate-groups",
+            args.drop_train_degenerate_groups,
+        ),
+        (
+            "--drop-train-degenerate-runs",
+            args.drop_train_degenerate_runs,
+        ),
+    )
+    enabled_cleaning = [
+        name for name, enabled in cleaning_flags if enabled
+    ]
+    if enabled_cleaning and not (
+        args.domain_justification
+        and str(args.domain_justification).strip()
+    ):
+        parser.error(
+            "启用训练集清洗（" + ", ".join(enabled_cleaning)
+            + "）需要 --domain-justification：非法 UTF-8、NUL、"
+            "重复字节或退化段可能是合法字节/结构（二进制记录、"
+            "表格边框、填充），也可能是任务允许的标签；没有"
+            "领域依据的删除会选择性改变监督分布。请先确认这是"
+            "格式损坏并记录依据，或只用审计/严格门而不删除"
+        )
+    args.cleaning_domain_justification = (
+        str(args.domain_justification).strip()
+        if args.domain_justification
+        else None
+    )
+
+    # 切分口径证据：文件顺序不等于时间顺序。只有显式声明
+    # chronological 并提供单调时间清单时，才允许把前缀切分
+    # 称为时间切分；否则报告记录 contiguous（非时间）口径。
+    args.time_order_evidence = None
+    if args.split_policy == "chronological":
+        if not args.time_order_manifest:
+            parser.error(
+                "--split-policy chronological 需要 "
+                "--time-order-manifest：仅凭文件顺序不能证明"
+                "时间顺序"
+            )
+        try:
+            time_evidence = read_time_order_manifest(
+                args.time_order_manifest
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--time-order-manifest 无效: {error}")
+        if not time_evidence["monotonic_non_decreasing"]:
+            parser.error(
+                "--time-order-manifest 的时间戳不是单调不减："
+                "语料文件顺序与时间顺序不一致，不能按时间前缀"
+                "切分（违规行: "
+                + ", ".join(
+                    str(item)
+                    for item in time_evidence["order_violations"]
+                )
+                + "）"
+            )
+        args.time_order_evidence = time_evidence
+    elif args.time_order_manifest is not None:
+        print(
+            "[data] [note] 已提供 --time-order-manifest，但 "
+            "--split-policy=contiguous：清单只作为证据记录，"
+            "本次结论仍不声称时间切分"
+        )
+        try:
+            args.time_order_evidence = read_time_order_manifest(
+                args.time_order_manifest
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--time-order-manifest 无效: {error}")
+
     # 数据管线先于模型准备：sanity check 需要在创建全量模型之前
     # 先用同一数据管线验证模型代码能够过拟合小批量，同时拿到
     # 数据版本指纹写入实验追踪信息。
+
+    # 完整计算图成本口径：只匹配 k1*k2≈2*top_k 会漏掉第一阶段
+    # 成本，也无法覆盖分支 Attention。成本档案写入 config.json，
+    # --budget-match 会把「按完整计算图核对预算」变成启动硬门。
+    args.cost_profile = mode_cost_profile(cfg)
+    args.paper_fidelity = paper_fidelity_report(cfg)
+    budget_baseline = (
+        args.budget_match
+        if args.budget_match is not None
+        else ("base" if cfg.mode != "base" else "smelt")
+    )
+    if budget_baseline not in Config.MODEL_MODES:
+        parser.error(
+            "--budget-match 必须是模型模式之一: "
+            + ", ".join(sorted(Config.MODEL_MODES))
+        )
+    if (
+        not math.isfinite(args.budget_tolerance)
+        or args.budget_tolerance <= 0.0
+    ):
+        parser.error("--budget-tolerance 必须是有限正数")
+    budget_report = budget_match_report(
+        cfg,
+        budget_baseline,
+        args.budget_tolerance,
+    )
+    args.budget_match_report = budget_report
+    print(
+        "[budget] 解析口径：每 token FLOPs "
+        f"{budget_report['candidate_flops_per_token']:,} vs "
+        f"{budget_report['baseline_flops_per_token']:,} "
+        f"({budget_baseline})，比例 "
+        f"{budget_report['flops_ratio']:.3f}"
+    )
+    if args.budget_match is not None:
+        search = budget_report.get("search")
+        if not budget_report["matched"]:
+            hint = ""
+            if isinstance(search, dict):
+                if search.get("kind") == "k2":
+                    hint = (
+                        "；按完整计算图最接近预算的 k2="
+                        f"{search['recommended_k2']}（比例 "
+                        f"{search['flops_ratio_at_recommendation']:.3f}）"
+                    )
+                elif search.get("kind") == "k1_k2":
+                    hint = (
+                        "；按完整计算图最接近预算的 "
+                        f"k1={search['recommended_k1']}, "
+                        f"k2={search['recommended_k2']}（比例 "
+                        f"{search['flops_ratio_at_recommendation']:.3f}）"
+                    )
+            parser.error(
+                "--budget-match 未通过：候选模式与 "
+                f"{budget_baseline} 的解析 FLOPs 比例为 "
+                f"{budget_report['flops_ratio']:.3f}，超出 "
+                f"±{args.budget_tolerance:.0%} 的允许误差"
+                + hint
+                + "。仅令 k1*k2≈2*top_k 会漏掉第一阶段成本，"
+                "不是充分的预算匹配；请调整 k1/k2/宽度后重跑"
+            )
+
     try:
         dataset = ByteDataset(
             args.data,
@@ -51964,8 +54436,24 @@ def main():
             drop_train_degenerate_runs=(
                 args.drop_train_degenerate_runs
             ),
-            clean_train_against_test=(
-                args.clean_train_against_test
+            clean_train_against_test=bool(
+                getattr(
+                    args,
+                    "clean_train_against_test",
+                    False,
+                )
+                or getattr(
+                    args,
+                    "allow_eval_content_for_cleaning",
+                    False,
+                )
+            ),
+            include_test_in_cleaning=bool(
+                getattr(
+                    args,
+                    "allow_eval_content_for_cleaning",
+                    False,
+                )
             ),
         )
     except (OSError, ValueError) as error:
@@ -51991,6 +54479,40 @@ def main():
     args.data_split_isolation = dict(
         dataset.split_isolation
     )
+
+    args.data_entity_audit = None
+    if args.entity_manifest is not None:
+        try:
+            entity_audit = audit_entity_manifest(
+                bytes(dataset._raw),
+                group_separator_bytes,
+                dataset.split_bounds,
+                args.entity_manifest,
+            )
+        except (OSError, ValueError) as error:
+            parser.error(f"--entity-manifest 无效: {error}")
+        args.data_entity_audit = entity_audit
+        if entity_audit.get("cross_split_entities"):
+            message = (
+                "实体清单显示 "
+                f"{entity_audit['cross_split_entities']} 个实体"
+                "同时出现在多个 split：分隔符只保证连续片段"
+                "完整，不保证实体隔离；同一用户/作者/文档版本"
+                "的非相邻片段仍会泄露"
+            )
+            if args.allow_entity_overlap:
+                print("[data] [warn] " + message)
+            else:
+                parser.error(
+                    message
+                    + "。请重新切分/剔除跨界实体，或显式加 "
+                    "--allow-entity-overlap（会写入配置）"
+                )
+        else:
+            print(
+                "[data] 实体审计通过："
+                f"{entity_audit.get('entities')} 个实体均未跨 split"
+            )
 
     data_change_error = resume_data_change_error(
         saved_data_sha256,
@@ -52963,6 +55485,26 @@ def main():
     )
     print(f"mode={cfg.mode} params={n_params:,}")
     print(f"device={device} start_step={start_step}")
+    scale_guard = build_scale_guard(
+        cfg,
+        args,
+        int(n_params),
+        dataset,
+    )
+    args.scale_guard = scale_guard
+    print(
+        "[scale] tokens_seen="
+        f"{scale_guard['tokens_seen']:,} "
+        f"tokens/param={scale_guard['tokens_per_param']:.2f} "
+        f"epochs={scale_guard['epochs_over_train']} "
+        f"tier={scale_guard['scale_tier']}"
+    )
+    if scale_guard["scale_tier"] == "prototype":
+        print(
+            "[scale] [warn] 原型级规模：结果只支持可行性/机制"
+            "验证，不能外推到大规模 MoE、长上下文或推理任务；"
+            "需要多来源、多上下文长度与多模型规模的复核"
+        )
 
     # 恢复训练默认跳过 sanity check；保留原运行的结果，
     # 避免重写 config.json 时丢失该追踪信息。
@@ -53490,7 +56032,7 @@ def main():
                 # eval_metrics 缺键，checkpoint 永远不会被
                 # 选型更新，最终回退到最后一步参数。
                 # --periodic-auc 让不按 AUC 选型的运行也能
-                # 记录周期排序指标，供共同步数无偏复核。
+                # 记录周期排序指标，供共同步数选型无关复核。
                 compute_auc=_periodic_auc_enabled(
                     getattr(args, "periodic_auc", False),
                     args.selection_metric,
@@ -53780,6 +56322,9 @@ def main():
             args, "eval_bootstrap", 0
         ),
         window_sink=val_window_records,
+        bootstrap_block=getattr(
+            args, "eval_bootstrap_block", 1
+        ),
     )
 
     if val_window_records:
@@ -54152,6 +56697,67 @@ def main():
         )
         metrics_file.flush()
 
+        # RQ4 功能干预：负载利用率不能证明专家专门化，必须做
+        # 路由打乱/专家屏蔽等反事实。默认关闭以控制验证开销。
+        if args.routing_interventions:
+            routing_probe.detach()
+            intervention_batches = (
+                args.eval_batches
+                if args.routing_intervention_batches == 0
+                else (
+                    args.routing_intervention_batches
+                    if args.routing_intervention_batches
+                    is not None
+                    else min(5, args.eval_batches)
+                )
+            )
+            if intervention_batches <= 0:
+                print(
+                    "[routing-intervention] batches<=0，跳过。"
+                )
+            else:
+                intervention_report = (
+                    analyze_routing_interventions(
+                        model,
+                        dataset,
+                        args.batch_size,
+                        intervention_batches,
+                        device,
+                        amp_dtype,
+                        seed=int(args.seed),
+                    )
+                )
+                print_routing_interventions(
+                    intervention_report
+                )
+                update_run_config(
+                    out_dir,
+                    "routing_interventions",
+                    intervention_report,
+                )
+                with open(
+                    out_dir / "routing_interventions.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(
+                        _json_safe(intervention_report),
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                metrics_file.write(
+                    json.dumps(
+                        _json_safe({
+                            "step": "routing_interventions",
+                            **intervention_report,
+                        }),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                metrics_file.flush()
+
     # 最终评估口径：上面的 final 记录始终是验证集口径。
     # 测试集默认全程尘封，只有显式 --evaluate-test 时才在训练
     # 完全结束后解封，且同一次运行只允许评估一次；重复传入也
@@ -54283,6 +56889,94 @@ def main():
                         "输入/标签错位或窗口越界，再评估测试集。"
                     )
 
+                # 研究级访问账本：路径级封条挡不住「新建目录/
+                # 换种子/改代码后再次访问同一测试集」。账本按
+                # 数据+test split 指纹识别同一测试集，默认拒绝
+                # 第二个候选重复解封；豁免必须显式声明并留痕。
+                ledger_path = (
+                    Path(args.test_ledger)
+                    if args.test_ledger
+                    else out_dir / "test_access_ledger.jsonl"
+                )
+                if args.test_ledger is None:
+                    print(
+                        "[test] [warn] 未指定 --test-ledger：访问"
+                        "账本只写在本次输出目录，无法阻止其它目录"
+                        "重复解封同一测试集"
+                    )
+                access_key = _test_access_key(
+                    dataset.data_sha256,
+                    dataset.split_sha256,
+                    dataset.test_fraction,
+                )
+                access_check = check_test_access_ledger(
+                    ledger_path,
+                    access_key,
+                    out_dir,
+                )
+                if (
+                    access_check["repeat_access"]
+                    and not args.allow_repeat_test_access
+                ):
+                    raise SystemExit(
+                        "[test] 拒绝解封：访问账本显示同一测试集"
+                        "已被其它候选解封（"
+                        + ", ".join(
+                            str(item.get("out_dir"))
+                            for item in access_check[
+                                "other_candidates"
+                            ][:5]
+                        )
+                        + "）。最终确认应冻结候选后统一解封；"
+                        "如确需重复访问，显式加 "
+                        "--allow-repeat-test-access，最终报告"
+                        "必须列出全部访问"
+                    )
+                config_sha256 = None
+                try:
+                    config_sha256 = hashlib.sha256(
+                        (out_dir / "config.json").read_bytes()
+                    ).hexdigest()
+                except OSError:
+                    pass
+                access_record = {
+                    **access_key,
+                    "out_dir": str(out_dir),
+                    "study_id": args.study_id,
+                    "seed": args.seed,
+                    "script_sha256": run_metadata.get(
+                        "script_sha256"
+                    ),
+                    "git_commit": run_metadata.get("git_commit"),
+                    "config_sha256": config_sha256,
+                    "hypothesis": args.hypothesis,
+                    "primary_metric": args.primary_metric,
+                    "selected_step": (
+                        best_selection_step
+                        if selection_policy == "best_val"
+                        else end_step
+                    ),
+                    "model_selection": selection_policy,
+                    "allow_repeat_access": bool(
+                        args.allow_repeat_test_access
+                    ),
+                    "accessed_utc": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                    "note": (
+                        "测试集访问账本；同一 data/split 指纹的"
+                        "全部访问都应进入最终报告"
+                    ),
+                }
+                append_test_access_ledger(
+                    ledger_path, access_record
+                )
+                print(
+                    "[test] 访问账本已记录: "
+                    f"{ledger_path}（历史访问 "
+                    f"{access_check['matching_accesses'] + 1} 次）"
+                )
+
                 # 解封不可回滚：正式评估前先把 test_started 标记
                 # 落盘并 flush。评估中途崩溃时，标记会让同目录的
                 # 后续运行（含 --resume）拒绝再次解封，而不是因为
@@ -54339,6 +57033,9 @@ def main():
                     bad_case_collector=test_bad_case_collector,
                     bootstrap_replicates=getattr(
                         args, "eval_bootstrap", 0
+                    ),
+                    bootstrap_block=getattr(
+                        args, "eval_bootstrap_block", 1
                     ),
                 )
 
@@ -54409,6 +57106,17 @@ def main():
                         "script_sha256"
                     ),
                     "git_commit": run_metadata.get("git_commit"),
+                    "study_id": args.study_id,
+                    "test_ledger": str(ledger_path),
+                    "test_access": access_record,
+                    "model_selection": selection_policy,
+                    "selected_step": (
+                        best_selection_step
+                        if selection_policy == "best_val"
+                        else end_step
+                    ),
+                    "hypothesis": args.hypothesis,
+                    "primary_metric": args.primary_metric,
                     "run_completed_utc": datetime.datetime.now(
                         datetime.timezone.utc
                     ).isoformat(),

@@ -27,6 +27,9 @@ env:
   TERM: dumb
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: '1'
+  # 冻结开关：确认性实验期间设为 true（或创建 .github/EXPERIMENT_FREEZE），
+  # 工作流只保留续跑/清理，不再让 agent 修改代码或提交实验结果。
+  EXPERIMENT_FREEZE: ${{ vars.EXPERIMENT_FREEZE }}
 
 jobs:
   run-opencode:
@@ -45,7 +48,7 @@ jobs:
       # 本 run 无论以何种方式结束（成功 / 失败 / 超时被取消 / runner 宕机），
       # 队列里的后继 run 都会在几秒内自动开始；不依赖任何收尾步骤是否被执行。
       - name: Queue next run (immediate hand-off)
-        if: always()
+        if: always() && vars.EXPERIMENT_FREEZE != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -99,6 +102,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Check experiment freeze switch
+        id: freeze
+        run: |
+          set +e
+          FROZEN="false"
+          if [ "${EXPERIMENT_FREEZE}" = "true" ] || [ "${EXPERIMENT_FREEZE}" = "1" ]; then
+            FROZEN="true"
+          fi
+          if [ -f .github/EXPERIMENT_FREEZE ] || [ -f EXPERIMENT_FREEZE ]; then
+            FROZEN="true"
+          fi
+          echo "frozen=${FROZEN}" >> "$GITHUB_OUTPUT"
+          if [ "$FROZEN" = "true" ]; then
+            echo "[freeze] 实验冻结中：跳过 agent 阶段，不修改代码/不产生新提交。"
+            echo "[freeze] 冻结提交：$(git rev-parse HEAD)"
+          fi
 
       - name: Free up disk space (keep miniconda)
         run: |
@@ -207,6 +227,7 @@ jobs:
           git config core.quotepath false
 
       - name: Run opencode for ~3 hours (phases per iteration)
+        if: steps.freeze.outputs.frozen != 'true'
         timeout-minutes: 180
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -233,7 +254,7 @@ jobs:
           PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法：检查随机种子是否全部固定——Python、NumPy、PyTorch/TensorFlow 以及 CUDA、dataloader 的种子都要固定（即使固定了种子，跨硬件架构也难完全复现，但至少要保证同一台机器上结果相对稳定）；补充过拟合小批量数据的 sanity check——训练大模型前先抽取一个小批次（一个 batch 或几十到几百条数据），关闭正则化和数据增强，观察训练损失能否迅速趋近于 0、分类任务准确率能否接近 100%；如果连小数据都无法过拟合，说明存在梯度没有反向传播、损失计算错误等严重 bug，不要盲目开始全量训练（注意这是必要不充分的检查，通过也不代表代码完全正确，数据增强、特征对齐、标签映射等 bug 仍可能漏网，还需配合中间结果检查）；改进实验追踪——不要手动记录实验，确保每轮实验都记录代码版本、超参数、随机种子、数据版本、训练曲线和最终结果，做到可复现、可追溯。发现以上问题就实际修改代码来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法：检查对比实验是否严格控制变量——对比 A 方法与 B 方法时，除待验证的模块外，优化器、学习率策略、训练轮数、数据增强等设置必须完全一致；许多所谓的性能提升其实只是换了优化器或调了学习率，而不是方法本身更好。检查消融实验是否完整——如果项目提出了多个创新点（如模块 A、模块 B、损失 C），必须证明它们各自都有用：要么做全因子消融（无、A、B、C、AB、AC、BC、ABC 共八种组合，覆盖最完整），要么用去一法（Full、Full-A、Full-B、Full-C，更省算力）；只报告部分组合（如漏掉 C 单独的效果）无法支撑各自都有用的结论。检查统计可靠性——关键实验至少用 3~5 个不同随机种子运行、汇报 Mean ± Std；如果提升只有 0.2% 而方差有 0.5%，这种提升在统计上没有意义。发现以上问题就实际修改实验代码来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法：检查是否真正监控了训练曲线而不只看最终数值——训练损失降而验证损失升说明过拟合（需要加正则化、增大数据量或早停），两者都不降说明欠拟合、学习率不当或数据管道本身有问题；损失出现 NaN 时要有系统的排查路径：先查数据中是否含 NaN/Inf，再查代码里的 log(0) 和除零、softmax 数值溢出，然后查 fp16 混合精度下溢出，最后查梯度爆炸或学习率过大。补充坏案例分析——把预测错误的样本打印出来，分析错误原因（标注本身有错？样本特征极其模糊？还是模型的盲区？），这一步往往是提出新改进思路的最重要来源。正视效率与精度的权衡——评价改进不能只看指标涨点，还要关注参数量、计算量、推理延迟和显存/内存占用；提升 0.5% 的精度却让计算时间增加 10 倍通常不可行，微小且不显著的涨点说服力同样有限。发现以上问题就实际修改代码与实验脚本来改进。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_CLEAN='不要修改算力申请.md，确保远程仓库里没有实验结果文件、REPORTxx.md 以及 autodl_budgetxx.json；确保 docs 目录只保留 design_notes.md；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释）。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
+          PROMPT_CLEAN='不要修改算力申请.md；不要删除实验结果、审计记录、性能/预算/修复记录或 docs 下的分析文档——这些是审计链的一部分，必须保留或归档到外部不可变存储。只清理临时文件（*.tmp、opencode 临时配置、agent 自己生成的临时清单），不要用删除来“清理”历史记录。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
           PROMPT_APPLY='确保算力申请.md没有错误。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
 
           # 每阶段单次调用的最大时长（秒）
@@ -655,8 +676,8 @@ jobs:
           # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main。
           maybe_run_tests() {
             local iter="$1"
-            # 实测本仓库的测试门只是 `python3 -m py_compile`（全量语法检查），几秒内完成，
-            # 成本可忽略：每次提交后都跑，不再按 20% 抽样（原先 80% 的提交从未被验证过）。
+            # 测试门 = 全量语法检查 + tests/ 下的快速回归（几十秒），
+            # 每次提交后都跑，不再按比例抽样。
             echo "[test-gate] iter #$iter 执行全量测试"
             local TG_REMAIN=$(( DEADLINE - $(date +%s) ))
             if [ "$TG_REMAIN" -lt 1200 ]; then
@@ -667,8 +688,14 @@ jobs:
             set +e
             TG_FILES="$(git ls-files '*.py' 2>/dev/null)"
             [ -z "$TG_FILES" ] && exit 42
-            python3 -m py_compile $TG_FILES
-            exit $?
+            python3 -m py_compile $TG_FILES || exit $?
+            # 语法检查之外补一组快速回归（top-1 路由梯度、GQA、
+            # B_early 等计算量、伪重复折叠、测试集账本等）。
+            if [ -d tests ]; then
+              python3 -m unittest discover -s tests -v
+              exit $?
+            fi
+            exit 0
           TGEOF
             local TG_LOG=/tmp/test_gate.log
             echo "=========== TEST GATE (iter #$iter) ==========="
@@ -792,14 +819,11 @@ jobs:
         if: always()
         run: |
           set +e
+          # 只清理临时文件；实验结果/审计/分析记录必须保留或
+          # 由独立的 artifact 步骤归档，不能在这里删除。
           rm -f .opencode_issues.md
           rm -f opencode.json opencode.jsonc .opencode.json 2>/dev/null
-          find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
-          find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
-          if [ -d docs ]; then
-            find docs -mindepth 1 -maxdepth 1 ! -name 'design_notes.md' -exec rm -rf {} +
-            [ -f docs/design_notes.md ] || : > docs/design_notes.md
-          fi
+          find . -maxdepth 2 -type f \( -name '*.tmp' -o -name '*.bak' \) -not -path './.git/*' -delete
 
       - name: Final commit and push
         if: always()
@@ -826,6 +850,21 @@ jobs:
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
           git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
 
+      - name: Archive run artifacts (audit trail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smelt-isr-run-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 90
+          path: |
+            runs/**
+            **/config.json
+            **/metrics.jsonl
+            **/comparison_analysis.json
+            **/routing*.json
+            /tmp/oc_out.log
+
       - name: Push to Gitee
         if: always()
         env:
@@ -849,7 +888,7 @@ jobs:
   # 万一这个 job 连启动都没机会（整个 run 被强杀），*/15 心跳会兜底。
   next-run:
     needs: [run-opencode]
-    if: always()
+    if: always() && vars.EXPERIMENT_FREEZE != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

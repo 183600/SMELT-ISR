@@ -1,5 +1,11 @@
 # SMELT-ISR 设计说明
 
+> 逐项方法学审计与修正记录见
+> [methodology_audit.md](methodology_audit.md)；冻结/预注册/统一解封
+> 测试集的流程见 [experiment_protocol.md](experiment_protocol.md)。
+> 本文件描述当前实现；论文级复现的偏离项以 `config.json` 的
+> `paper_fidelity` 为准。
+
 ## 概述
 
 SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础上，
@@ -7,16 +13,21 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 
 ## 运行模式
 
-- `smelt`：原始 SMELT 基线。中间区域循环两次，每轮独立路由。
+- `base`：论文的未循环 MoE 基线。中间区域只执行一次。
+- `smelt`：原始 SMELT。中间区域循环两次，每轮独立路由；
+  `residual_scaling=paper`（默认）时循环区域子层残差按 1/r 缩放。
 - `A`：局部延迟合并。中间层每个 Block 的第一轮 MoE 保留 `k1` 个分支，
   第二轮每个分支独立路由 `k2` 个专家，同一 Block 内两轮结束后再合并。
 - `B`：全局延迟合并。第一轮在中间区域第一个 Block 处创建 `k1` 个分支，
   第一轮其余 Block 与第二轮都在整个中间区域上按分支独立执行，
   最后跨第一轮分支合并。
-- `local_base`：立即合并对照。第一轮 MoE 后立即合并，再执行第二轮 MoE；
-  第二轮专家宽度取 `min(n_experts, k1 * k2)`，与 A 的第二轮计算量
-  （`k1` 个分支各路由 `k2` 个专家）对齐，`k1 * k2 > n_experts` 时受
-  专家总数上限截断，两者不再严格等量。
+- `local_base_k2`：**只改变合并时机**的机制对照。第一轮 MoE 后立即
+  合并，第二轮宽度仍为 `k2`，与 A 的单分支第二轮一致。
+- `local_base`：**等专家计算量**性能对照。立即合并，第二轮宽度取
+  `min(n_experts, k1*k2)`；`k1*k2 > n_experts` 时受专家上限截断。
+- `B_early`：B 的**等计算量合并位置对照**。分支数、Attention/MoE
+  执行次数与 B 完全相同，只在第一轮结束后提前跨分支合并，再复制回
+  `k1` 个分支继续第二轮。它回答「合并位置」而不是「多算/多轨迹」。
 
 ## 关键配置
 
@@ -33,12 +44,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   用于区分未折算的旧运行。对比分析另有
   `balance_strength_report` 核对 `balance_coef × 有效路由宽度`，
   宽度不同而强度未抵消时以 `[balance-scale]` 警告。
-- `residual_scale`：残差缩放系数，全局作用于所有区域、所有子层的残差
-  更新（Attention 与 MoE 一致，循环区域内/外一致），默认 1.0。SMELT
-  论文对循环区域内的子层残差更新按循环次数 $r$ 缩放 $1/r$（循环两次
-  即 1/2），以抑制共享权重的反复访问推高残差流；本基座未实现按区域
-  区分的 $1/r$ 缩放。跨模式实验应保持该系数一致；把全局系数设为 0.5
-  并不等价于论文「仅循环区域 1/r」的口径。
+- `residual_scale` / `residual_scaling`：`residual_scale` 是全局
+  残差系数（默认 1.0）。`residual_scaling=paper`（默认）在循环区域
+  内把每个子层残差更新再除以循环次数 $r$（r=2 → 1/2），循环区域外
+  只用 `residual_scale`；`global` 保留历史行为（内外统一）。该口径
+  进入 `comparison_protocol`，跨模式对比必须一致。`paper_fidelity`
+  会核对 1/r、top-8、GQA、4096 上下文等论文配置，偏离时明确标记为
+  SMELT 风格简化模型。
 
 ## 数据协议（防止数据泄露）
 
@@ -94,13 +106,14 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   val 或更早 train 群组内容完全相同的群组，val/test 字节与切分
   位置不变；被剔除内容不进入神经窗口、unigram / n-gram 计数或分布
   审计，`data_audit` 的 `effective_bytes` / `effective_windows` 与
-  `config.data.split_fractions` 记录清洗后的真实训练口径。训练期只用
-  切分边界核对 test 占比（不读 test 内容）；解封前独立探针再核对
-  test 固定窗口的输入/标签逐位对齐。默认不使用 test 内容决定剔除
-  哪些训练群组；train/test 重复留到解封时由泄露门拦截。只有显式
-  `--clean-train-against-test` 才恢复「用 test 清洗 train」的旧行为，
-  并把 `test_used_for_cleaning` / `cleaning_eval_splits` 写入
-  `train_cleaning` 与受控协议（该运行不再被视为完全尘封测试集）。
+  `config.data.split_fractions` 记录清洗后的真实训练口径。默认不使用
+  test 内容决定剔除哪些训练群组；train/test 重复留到解封时由泄露门
+  拦截。只有显式 `--clean-train-against-test`（或同义的
+  `--allow-eval-content-for-cleaning`）才恢复「用 test 清洗 train」
+  的旧行为，并把 `test_used_for_cleaning` / `cleaning_eval_splits` /
+  `eval_content_access` 写入 `train_cleaning`、`config.data` 与受控
+  协议（该运行不再被视为完全尘封测试集）。解封前独立探针再核对
+  test 固定窗口的输入/标签逐位对齐。
 - **跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
   群组分隔符）用与审计相同的内容定义分块指纹，把与 val（默认；
   显式 `--clean-train-against-test` 时含 test）共享连续字节块的整个
@@ -129,7 +142,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   窗口、越界 token、超阈值 UTF-8/NUL 损坏）从警告升级为致命错误：
   训练前审计不过则拒绝开始训练；解封测试集时 test 审计不过则拒绝
   解封且不写 test 记录。默认只警告，便于先诊断再清洗。
-- **测试集标签完整性硬门**：test 不参与任何清洗，因此带标签噪声的
+- **测试集标签完整性硬门**：test 字节不参与任何清洗（默认 test
+  内容也不参与训练集删除决策），因此带标签噪声的
   test 上得出的最终指标不可信。解封时（神经与统计基线两条路径）
   只要 test 存在越界 token、非法 UTF-8 或 NUL 就默认拒绝解封；
   只有显式传入 `--allow-corrupt-test-labels` 才会放行，且豁免写入
@@ -230,7 +244,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - `_paired_sign_flip_test`、`_leave_one_out_effect_stability`：
   配对符号翻转（randomization）检验与 leave-one-out 稳健性。
   n≤12 精确枚举全部 2^n 符号组合，n>12 用固定种子 Monte
-  Carlo；不依赖差值正态性，适合 3~5 个种子的实验。结果同时
+  Carlo；不要求正态性，但要求差值分布关于 0 对称（或随机化
+  可交换），适合 3~5 个种子时作为 t 检验的稳健性参考；要主张
+  「双检验同时显著」至少需要 6 个种子。结果同时
   记录最小可达 p 值，样本量不足以在 0.05 水平显著时明确
   提示「不显著 ≠ 无效应」。leave-one-out 逐一去掉一个种子
   重算效应，方向翻转或归零时提示结论可能由单个种子驱动。
@@ -395,22 +411,27 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   校正值随报告给出供探索性解读；未校正判定保留在
   `significant_raw` 字段，可追溯校正前后是否翻转（6 个两两
   对比不校正时家族错误率约 26%）。种子数少于 3 的实验单元
-  会被标记为统计可靠性不足；关键结论应基于预设对比且种子数
-  3~5。**差分缺失**：缺判定指标的运行被完整案例分析排除，若
+  会被标记为统计可靠性不足；关键结论应基于预设对比；3~5 个种子只能支持 t 检验，
+  「配对 t + 符号翻转同时显著」的稳健主张至少需要 6 个种子。**差分缺失**：缺判定指标的运行被完整案例分析排除，若
   两臂被排除的运行数不同，对比就不再来自同一批运行
   （`differential_missingness` 字段与展示层警告），此时差异
   可能来自缺测机制而非方法本身。数值失败运行（NaN/Inf、参数或
   优化器状态污染、`curve_status=diverged` 或有限发散
   `diverging`）不进入均值、检验与消融覆盖，并单独列出。
-  **配对无分布假设检验**：同一批种子上的配对差值还做
+  **对称性假设下的符号翻转检验**：同一批种子上的配对差值还做
   符号翻转（randomization）检验，n≤12 精确枚举、n>12 固定
-  种子 Monte Carlo；它对差值正态性不作要求，与配对 t 检验
-  互为稳健性对照。两套检验经同一 Holm 家族校正后结论不一致
+  种子 Monte Carlo；它不要求正态性，但要求配对差值分布关于 0
+  对称（或随机化支持的可交换性）。同一个 seed 编号只保证配对，
+  不保证方法标签可交换；结果记录
+  `randomization_null_assumption="symmetric_paired_differences_about_zero"`。两套检验经同一 Holm 家族校正后结论不一致
   时展示层明确提示「显著性依赖正态性假设或检验功效，不能
   作为稳健结论」；`significant_robust` 要求两者同时显著。
-  精确检验同时记录最小可达双侧 p 值（2/2^n），n<5 时该值
-  本身大于 0.05，展示层提示该设计在数学上无法达到显著，
-  不能把「不显著」解读为「无效应」。**leave-one-out 稳健性**：
+  精确检验同时记录最小可达双侧 p 值（2/2^n）：n=3/4/5 时
+  分别为 0.25/0.125/0.0625，**n≤5 时该值本身大于 0.05**，
+  「配对 t 与符号翻转同时显著」在数学上不可能成立；至少
+  n=6，家族校正后按 ceil(log2(2m/α)) 增加。`seed_plan` 记录
+  `min_seeds_for_robust_sign_flip` 与 `robust_claim_possible`，
+  不能把「设计无法判定」说成「效应不稳健」。**leave-one-out 稳健性**：
   逐一去掉一个种子重算效应，若方向翻转或归零，提示结论可能
   由单个种子驱动；这是描述性检查，不替代显著性检验。
   **不显著 ≠ 等价（功效与等价性口径）**：显著性检验
@@ -459,11 +480,11 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   积分对 chi 分布做自适应 Simpson 数值积分（按 df 缓存），
   δ=0 时功效恰为 alpha，大 df 退化为正态近似，自测覆盖这些
   解析回归点。**伪重复检测**：同一实验单元里同一随机种子出现多次
-  （复制运行目录、重复登记同一运行）会被按种子配对时的字典
-  静默合并、虚增样本数并低估种子间方差；聚合层显式记录
-  `duplicate_seeds`，展示层点名重复种子，检验层禁用配对检验
-  并退回 Welch（每个运行各算一个样本），`comparison_analysis.json`
-  的 `duplicate_seed_cells` 列出全部伪重复单元。关键套件
+  （复制运行目录、重复登记同一运行）不是独立重复。实现先把同一
+  seed 的多个运行折叠成**一个独立观测**（组内差异记录在
+  `pseudo_replication.within_seed_sd_max`），再按种子配对；复制
+  运行不增加 n/df。换 Welch 并把每个运行当样本不能恢复独立性。
+  `duplicate_seed_cells` 列出全部伪重复单元。关键套件
   （`--suite-modes`/`--suite-ablation`/`--suite-baseline-tuning`）
   在少于 3 个不同随机种子时直接拒绝运行，冒烟/调试需显式
   加 `--allow-underpowered`；豁免与种子计划（`seed_plan`）
@@ -498,13 +519,15 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `*_auc_coverage_fraction` 与 `*_auc_sampling`
   （`full`/`uniform_stride`）随指标落盘，读者能直接判断
   AUC 覆盖了多大比例的评估位置。
-  **选型偏差的无偏口径**：final 的 val 指标来自验证集选中的
-  checkpoint，同一批数据既选型又判定会产生 winner's curse。
+  **选型无关口径（不是无条件无偏）**：final 的 val 指标来自验证集
+  选中的 checkpoint，同一批数据既选型又判定会产生 winner's curse。
   `--compare` 对所有周期验证实际计算的指标（loss / ppl / bpb /
   accuracy / micro、macro、weighted F1 / precision / recall）
-  生成 `<metric>_at_common_step` 派生指标：在各运行最后一个
-  周期验证步的最小值处精确取值或线性插值，不经过选型，可作为
-  `--compare-metric` 做聚合、显著性检验与因子效应。PR-AUC /
+  生成 `<metric>_at_common_step` 派生指标。默认在「各运行最后
+  周期验证步的最小值」处取值/插值：该步由观察到的端点决定，
+  早停或不等步数时与结果相关，因此只解决了 checkpoint 选型偏差，
+  不是无偏。正式对比应预先用 `--common-step STEP` 固定步数；
+  报告记录 `target_step_rule` 与 `target_step_data_dependent`。PR-AUC /
   lift / ROC-AUC 默认只在最终评估计算；把它们选为
   `--selection-metric` 或显式传 `--periodic-auc` 后，周期验证
   也按相同固定窗口与排序口径记录，因而同样有
@@ -570,9 +593,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `--baseline-tuning-mode` 选模式）：候选之间只允许学习率
   不同（steps/batch/数据/结构/调度等全部继承同一条命令行），
   保证调参与「训练更久或换了协议」不混杂；按 val 指标
-  Mean ± Std 选择 winner——先取最优均值候选，再把与最优均值
-  差距小于种子波动（两侧 std 的较大者）的候选视为无法区分，
-  从并列集合中取更小 lr 的保守解，并列集合与选择方式
+  Mean ± Std 选择 winner——先取最优均值候选，再用**同种子
+  配对差值 t 检验**判断候选是否可区分（不显著 → 保守并列；
+  这不是等价性证明），从并列集合中取更小 lr 的保守解，并列集合与选择方式
   （`winner_selection`/`tied_lrs`）如实写入报告；winner 落在
   网格边界时提示扩展候选后重跑。报告写入
   `<out>/baseline_tuning.json`。后续基线训练用
@@ -845,7 +868,8 @@ A B）、`--allow-underpowered`（显式允许套件在 <3 个种子下
 `--suite-baseline-tuning`（配合 `--seeds` 做简单基线
 的学习率网格调参，`--baseline-tuning-lrs` 给候选、
 `--baseline-tuning-mode` 选模式）。关键套件至少需要 3 个
-不同随机种子，否则直接报错要求改用 3~5 个种子或显式豁免。
+不同随机种子，否则直接报错；3~5 个只能支持 t 检验，稳健双检验
+至少需要 6 个种子，否则用显式豁免并标记 `robust_claim_possible=false`。
 套件逐进程调用自身，结束后自动输出完整对比分析并写入
 `<out>/comparison_analysis.json`（调参套件写
 `<out>/baseline_tuning.json`）。基线训练可用
