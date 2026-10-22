@@ -361,6 +361,30 @@ class RoutingInterventionReproducibilityTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_set_seed_updates_child_hashseed_on_reseed(self):
+        if experiment._PYTHONHASHSEED_AT_START is not None:
+            self.skipTest("PYTHONHASHSEED was fixed before import")
+        import os
+
+        saved_env = os.environ.get("PYTHONHASHSEED")
+        saved_rng = experiment._capture_rng_state()
+        try:
+            os.environ.pop("PYTHONHASHSEED", None)
+            experiment.set_seed(101)
+            self.assertEqual(
+                os.environ.get("PYTHONHASHSEED"), "101"
+            )
+            experiment.set_seed(102)
+            self.assertEqual(
+                os.environ.get("PYTHONHASHSEED"), "102"
+            )
+        finally:
+            experiment._restore_rng_state(saved_rng)
+            if saved_env is None:
+                os.environ.pop("PYTHONHASHSEED", None)
+            else:
+                os.environ["PYTHONHASHSEED"] = saved_env
+
     def test_split_policy_default_is_contiguous(self):
         cfg = _tiny_config()
         self.assertEqual(

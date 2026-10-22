@@ -829,7 +829,15 @@ def set_seed(
     # PYTHONHASHSEED 只对之后启动的子进程（如 torch.compile 的
     # 编译进程）生效；当前解释器的哈希种子在启动时已经确定，
     # 需要严格复现时应在命令行显式设置该环境变量。
-    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    #
+    # 若启动时未显式设置，本函数就是该变量的所有者：之后再次
+    # set_seed 必须把值更新为当前 seed，否则先 set_seed(42) 再
+    # set_seed(7) 时子进程仍继承 42，和当前随机流不一致。用户
+    # 启动时显式设置的值则不能被静默覆盖（尊重外部固定口径）。
+    if _PYTHONHASHSEED_AT_START is None:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+    else:
+        os.environ.setdefault("PYTHONHASHSEED", str(seed))
 
     global _PYTHONHASHSEED_WARNED
     if (
@@ -49436,6 +49444,25 @@ def run_self_test():
         os.environ.pop("PYTHONHASHSEED", None)
         if saved_hashseed is not None:
             os.environ["PYTHONHASHSEED"] = saved_hashseed
+
+    # set_seed 在启动时未显式设置 PYTHONHASHSEED 的情况下是该
+    # 环境变量的所有者：重复播种必须把子进程可见的值更新为
+    # 当前 seed，否则第二次 set_seed 之后的子进程仍继承旧值。
+    if _PYTHONHASHSEED_AT_START is None:
+        saved_rng = _capture_rng_state()
+        saved_env_hashseed = os.environ.get("PYTHONHASHSEED")
+        try:
+            os.environ.pop("PYTHONHASHSEED", None)
+            set_seed(101)
+            assert os.environ.get("PYTHONHASHSEED") == "101"
+            set_seed(102)
+            assert os.environ.get("PYTHONHASHSEED") == "102"
+        finally:
+            _restore_rng_state(saved_rng)
+            if saved_env_hashseed is None:
+                os.environ.pop("PYTHONHASHSEED", None)
+            else:
+                os.environ["PYTHONHASHSEED"] = saved_env_hashseed
 
     print("self-test passed")
 
