@@ -15814,6 +15814,27 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         )
 
 
+def _routing_shuffle_seed(
+    seed: int,
+    module_index: int,
+) -> int:
+    """
+    路由打乱干预的稳定子种子。
+
+    只用 (运行 seed, MoE 在模型中的固定序号) 派生，绝不使用
+    ``id(module)`` 或对象地址：后者随进程、内存分配和模型
+    构造顺序变化，会让同一 ``--seed`` 的 RQ4 干预在不同运行
+    中消费不同的随机路由，功能证据不可复现。
+    """
+    material = (
+        f"routing_shuffle_v1|{int(seed)}|{int(module_index)}"
+    ).encode("utf-8")
+    return int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(),
+        "big",
+    )
+
+
 def _intervention_eval(
     model: nn.Module,
     dataset: ByteDataset,
@@ -15939,18 +15960,15 @@ def analyze_routing_interventions(
     baseline_acc = float(report["baseline"]["token_accuracy"])
 
     # 路由打乱：每个 MoE 用独立、固定的随机流；保留原 k。
-    shuffle_generators: Dict[int, torch.Generator] = {}
-
-    def _make_override(module: SparseMoE):
+    # 种子必须由「运行 seed + 模型内 MoE 序号」派生，不能用
+    # id(module)：对象地址随进程/分配顺序变化，同一 --seed 的
+    # 干预实验会跨进程得到不同路由，RQ4 的功能证据不可复现。
+    def _make_override(module: SparseMoE, module_index: int):
         generator = torch.Generator(device="cpu")
-        generator.manual_seed(
-            (int(seed) * 1_000_003 + id(module)) & 0x7FFFFFFF
-        )
-        shuffle_generators[id(module)] = generator
 
         def _override(indices, weights, logits):
             generator.manual_seed(
-                (int(seed) * 1_000_003 + id(module)) & 0x7FFFFFFF
+                _routing_shuffle_seed(seed, module_index)
             )
             new_indices = torch.randint(
                 0,
@@ -15968,8 +15986,11 @@ def analyze_routing_interventions(
         return _override
 
     overrides = {}
-    for module in moe_modules:
-        overrides[id(module)] = _make_override(module)
+    for module_index, module in enumerate(moe_modules):
+        overrides[id(module)] = _make_override(
+            module,
+            module_index,
+        )
         module._routing_override = overrides[id(module)]
     try:
         shuffled = _intervention_eval(
@@ -35374,6 +35395,19 @@ def run_self_test():
         "second_round_slot_reuse_mean",
     ):
         assert abs(identical_metrics[name] - 1.0) < 1e-6
+
+    # 路由打乱的随机流只能由 (seed, MoE 固定序号) 决定：
+    # 用 id(module) 会在不同进程/分配顺序下产生不同路由，
+    # 同 --seed 的 RQ4 干预结论不可复现。
+    assert _routing_shuffle_seed(7, 0) == (
+        _routing_shuffle_seed(7, 0)
+    )
+    assert _routing_shuffle_seed(7, 0) != (
+        _routing_shuffle_seed(7, 1)
+    )
+    assert _routing_shuffle_seed(7, 0) != (
+        _routing_shuffle_seed(8, 0)
+    )
 
     # 端到端诊断：B/A/smelt 在固定 val 窗口上的报告结构、
     # 轮次归属与分支口径；dense 无路由必须显式跳过。

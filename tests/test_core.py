@@ -262,6 +262,104 @@ class RoutingTests(unittest.TestCase):
         )
 
 
+class RoutingInterventionReproducibilityTests(unittest.TestCase):
+    def test_routing_shuffle_seed_uses_stable_module_index(self):
+        first = experiment._routing_shuffle_seed(7, 0)
+        self.assertEqual(
+            first, experiment._routing_shuffle_seed(7, 0)
+        )
+        self.assertEqual(
+            experiment._routing_shuffle_seed(7, 1),
+            experiment._routing_shuffle_seed(7, 1),
+        )
+        self.assertNotEqual(
+            first, experiment._routing_shuffle_seed(8, 0)
+        )
+        self.assertNotEqual(
+            first, experiment._routing_shuffle_seed(7, 1)
+        )
+
+    def test_routing_shuffle_reproducible_across_fresh_models(self):
+        class _FixedEvalDataset:
+            def __init__(self, seq_len):
+                self.seq_len = seq_len
+
+            def fixed_eval_batch(
+                self,
+                split,
+                batch_index,
+                batches,
+                batch_size,
+                device,
+            ):
+                generator = torch.Generator().manual_seed(0)
+                x = torch.randint(
+                    0,
+                    256,
+                    (batch_size, self.seq_len),
+                    generator=generator,
+                )
+                y = torch.randint(
+                    0,
+                    256,
+                    (batch_size, self.seq_len),
+                    generator=generator,
+                )
+                return x, y
+
+        cfg = _tiny_config(mode="A", seq_len=8, n_layers=4)
+        experiment.set_seed(123)
+        first_model = experiment.LanguageModel(cfg)
+        experiment.set_seed(123)
+        second_model = experiment.LanguageModel(cfg)
+        dataset = _FixedEvalDataset(cfg.seq_len)
+
+        first = experiment.analyze_routing_interventions(
+            first_model,
+            dataset,
+            batch_size=2,
+            batches=1,
+            device=torch.device("cpu"),
+            amp_dtype=None,
+            seed=7,
+        )
+        second = experiment.analyze_routing_interventions(
+            second_model,
+            dataset,
+            batch_size=2,
+            batches=1,
+            device=torch.device("cpu"),
+            amp_dtype=None,
+            seed=7,
+        )
+        self.assertEqual(
+            first["interventions"]["routing_shuffle"]["loss"],
+            second["interventions"]["routing_shuffle"]["loss"],
+        )
+        self.assertEqual(
+            first["interventions"]["routing_shuffle"][
+                "token_accuracy"
+            ],
+            second["interventions"]["routing_shuffle"][
+                "token_accuracy"
+            ],
+        )
+
+        other_seed = experiment.analyze_routing_interventions(
+            first_model,
+            dataset,
+            batch_size=2,
+            batches=1,
+            device=torch.device("cpu"),
+            amp_dtype=None,
+            seed=8,
+        )
+        self.assertNotEqual(
+            first["interventions"]["routing_shuffle"]["loss"],
+            other_seed["interventions"]["routing_shuffle"]["loss"],
+        )
+
+
 class ProcessTests(unittest.TestCase):
     def test_split_policy_default_is_contiguous(self):
         cfg = _tiny_config()
