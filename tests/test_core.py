@@ -192,6 +192,29 @@ class CostModelTests(unittest.TestCase):
         ):
             self.assertEqual(b[key], early[key], key)
 
+    def test_kv_cache_bytes_counts_k_and_v_once(self):
+        # d_model=32, n_heads=4, n_kv_heads=2 -> head_dim=8,
+        # kv_dim=16；4 层 fp16 的 K+V = 4*16*2*2 = 256 bytes。
+        cfg = _tiny_config(mode="smelt")
+        profile = experiment.mode_cost_profile(cfg)
+        expected = 4 * 16 * 2 * 2
+        self.assertEqual(
+            profile["kv_cache_bytes_per_token"], expected
+        )
+        self.assertEqual(
+            profile["kv_cache_bytes_per_token_per_visit"],
+            expected * cfg.loop_count,
+        )
+
+        # B 有 k1=2 个独立分支，各自缓存一份 KV。
+        branch_profile = experiment.mode_cost_profile(
+            _tiny_config(mode="B")
+        )
+        self.assertEqual(
+            branch_profile["kv_cache_bytes_per_token"],
+            expected * 2,
+        )
+
     def test_budget_search_reports_recommendation(self):
         cfg = _tiny_config(mode="A")
         report = experiment.budget_match_report(

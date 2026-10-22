@@ -406,12 +406,13 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
         + router_calls * router_flops
         + expert_assignments * expert_flops
     )
-    # KV cache 每 token 字节数（fp16 存储 K 和 V）：只按物理层
-    # 计一次；B/B_early 的每个分支各自持有一份 KV，因此乘
-    # 分支数。若实现为每次循环访问都缓存一份，需再乘
-    # loop_count，这里显式记录两种口径。
+    # KV cache 每 token 字节数（fp16 存储 K 和 V）：每个物理层
+    # 为 K、V 各存一个 kv_dim 向量，fp16 每元素 2 字节；B/B_early
+    # 的每个分支各自持有一份 KV，因此乘分支数。若实现为每次
+    # 循环访问都缓存一份，需再乘 loop_count，这里显式记录两种口径。
+    kv_bytes_per_layer = 2 * 2 * kv_dim  # K+V × fp16 bytes
     kv_bytes_physical = (
-        2 * layers * 2 * kv_dim * 2 * branch_factor
+        layers * kv_bytes_per_layer * branch_factor
     )
     return {
         "mode": mode,
