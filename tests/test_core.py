@@ -754,6 +754,31 @@ class ProcessTests(unittest.TestCase):
         for key in keys:
             self.assertIn(key, report["unchecked_keys"])
 
+    def test_ngram_bootstrap_honours_block_size(self):
+        data = torch.tensor(
+            [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],
+            dtype=torch.uint8,
+        )
+        model = experiment.NgramBaseline(data, max_order=2)
+        windows = torch.stack(
+            [data[index:index + 5] for index in range(6)]
+        )
+        metrics = experiment._ngram_extended_metrics(
+            model,
+            [windows],
+            alpha=1.0,
+            order=2,
+            split="val",
+            include_auc=False,
+            bootstrap_replicates=20,
+            bootstrap_seed=7,
+            bootstrap_block=3,
+        )
+        self.assertEqual(
+            metrics["val_bootstrap_unit"], "moving_block"
+        )
+        self.assertEqual(metrics["val_bootstrap_block_size"], 3)
+
     def test_cross_family_explicit_null_is_compared(self):
         recorded = ["group_separator"]
         rows = [

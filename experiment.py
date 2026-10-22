@@ -11917,6 +11917,7 @@ def _ngram_extended_metrics(
     include_auc: bool = True,
     bootstrap_replicates: int = 0,
     bootstrap_seed: Optional[int] = None,
+    bootstrap_block: int = 1,
     window_sink: Optional[List[Dict[str, object]]] = None,
     window_classification: bool = False,
 ) -> Dict[str, object]:
@@ -12237,6 +12238,7 @@ def _ngram_extended_metrics(
             window_class_loss_sums=torch.stack(
                 window_class_loss_sums
             ),
+            block_size=int(bootstrap_block),
         )
         for key, value in bootstrap_metrics.items():
             metrics[f"{split}_{key}"] = value
@@ -13054,6 +13056,9 @@ def run_statistical_baseline(
     bootstrap_replicates = int(
         getattr(args, "eval_bootstrap", 0)
     )
+    bootstrap_block = int(
+        getattr(args, "eval_bootstrap_block", 1)
+    )
     val_window_records: List[Dict[str, float]] = []
     final_metrics = _ngram_extended_metrics(
         model,
@@ -13069,6 +13074,7 @@ def run_statistical_baseline(
             args.batch_size,
             dataset.seq_len,
         ),
+        bootstrap_block=bootstrap_block,
         window_sink=val_window_records,
     )
 
@@ -13288,6 +13294,7 @@ def run_statistical_baseline(
                     args.batch_size,
                     dataset.seq_len,
                 ),
+                bootstrap_block=bootstrap_block,
             )
 
             _write({
@@ -13423,6 +13430,8 @@ def run_statistical_baseline(
             ),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
+            "eval_bootstrap": args.eval_bootstrap,
+            "eval_bootstrap_block": args.eval_bootstrap_block,
             "data_sha256": dataset.data_sha256,
             # 与神经运行相同：逐 split 内容指纹用于核对
             # ngram 与神经运行是否真的看到同一组 train/val/test
@@ -20625,6 +20634,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 精度：不同运行用不同的 --eval-bootstrap 会得到不同宽度
     # 的误差线，跨运行比较误差线时口径不再一致。
     "eval_bootstrap",
+    # 重采样单位（i.i.d. 窗口 vs 移动块）会改变区间宽度与
+    # 自相关处理；同一 bootstrap 次数但 block 不同不是同一
+    # 评估口径。
+    "eval_bootstrap_block",
     # 周期验证是否计算 PR-AUC / lift / ROC-AUC：显式
     # --periodic-auc 与 AUC 选型都会生成共同步数选型无关 AUC 指标；
     # 一个跑有一个没跑时，敏感性分析的可比口径不同。
@@ -20674,6 +20687,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 口径报告区间；重采样次数不同会让跨 family 的误差线
     # 无法直接比较。
     "eval_bootstrap",
+    "eval_bootstrap_block",
     "data_augmentation",
 )
 
@@ -21366,6 +21380,10 @@ def build_comparison_protocol(
         "eval_bootstrap": getattr(
             args, "eval_bootstrap", None
         ),
+        # 重采样单位同样是评估协议的一部分。
+        "eval_bootstrap_block": getattr(
+            args, "eval_bootstrap_block", 1
+        ),
         # 周期验证是否计算排序指标决定无偏共同步数 AUC 指标
         # 是否存在。AUC 选型会自动启用，因此记录生效值而非
         # 原始 flag，避免等价配置被误报为协议差异。
@@ -21652,6 +21670,11 @@ def experiment_protocol_from_payload(
         # 旧运行未记录时保持 None（检查器标为缺记录），
         # 不能默认成当前 CLI 的 500。
         "eval_bootstrap": run_args.get("eval_bootstrap"),
+        # 旧运行没有记录重采样单位；保持 None 由检查器标为
+        # 未核对，不能默认成当前 CLI 的 1 而掩盖块 bootstrap 差异。
+        "eval_bootstrap_block": run_args.get(
+            "eval_bootstrap_block"
+        ),
         # 旧神经运行没有该字段时，历史行为等价于 False；
         # 但若当时已按 AUC 选型，周期验证实际会计算排序指标，
         # 回退为生效值。ngram 没有周期验证，保持 None。
