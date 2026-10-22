@@ -23087,6 +23087,102 @@ def _baseline_tuning_seed_count(
     return None
 
 
+def _baseline_tuning_seed_values(
+    record: Dict[str, object],
+) -> List[int]:
+    """
+    读取调参报告/来源记录里的调参种子列表。
+
+    新版报告在 ``seed_plan.seeds`` 保存完整种子集合，旧版在
+    顶层 ``seeds``；两者都缺失时返回空列表，表示无法核对
+    调参种子与最终评估种子是否重合。只接受整数（排除 bool），
+    不做字符串猜测。
+    """
+    candidates: List[object] = []
+    seed_plan = record.get("seed_plan")
+    if isinstance(seed_plan, dict):
+        candidates = seed_plan.get("seeds") or []
+    if not candidates:
+        candidates = record.get("seeds") or []
+    if not isinstance(candidates, list):
+        return []
+    values: List[int] = []
+    for seed in candidates:
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            values.append(int(seed))
+    return values
+
+
+def tuning_seed_overlap_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    核对「调参时用于选 winner 的种子」与「最终评估种子」是否
+    重合。
+
+    同一批随机种子先被用来选择学习率/其他超参数，又用来评估
+    最终基线或挑战臂，会把 winner's curse 带进对比：被选中的
+    配置在这批种子上本来就更占优，后续评估不再独立。调参仍可
+    证明「配置被调过」，但该运行的指标不能当作独立验证。
+
+    返回结构化报告；没有调参记录时 ``ok=None``（不虚报通过）。
+    """
+    entries: List[Dict[str, object]] = []
+    advisories: List[str] = []
+    with_tuning = 0
+    overlapping = 0
+    for row in rows:
+        record = row.get("baseline_tuning")
+        if not isinstance(record, dict):
+            continue
+        tuning_seeds = _baseline_tuning_seed_values(record)
+        if not tuning_seeds:
+            continue
+        with_tuning += 1
+        evaluation_seed = row.get("seed")
+        if not isinstance(evaluation_seed, int) or isinstance(
+            evaluation_seed, bool
+        ):
+            continue
+        overlap = sorted(set(tuning_seeds) & {int(evaluation_seed)})
+        if not overlap:
+            continue
+        overlapping += 1
+        entry = {
+            "run": str(row.get("run")),
+            "mode": row.get("mode"),
+            "evaluation_seed": int(evaluation_seed),
+            "tuning_seeds": tuning_seeds,
+            "overlap": overlap,
+        }
+        entries.append(entry)
+        advisories.append(
+            f"{entry['run']} 的最终评估种子 "
+            f"{entry['evaluation_seed']} 也参与了调参 winner 的"
+            f"选择（调参种子 {tuning_seeds}）：同一批种子既选"
+            "超参数又评估最终结果，winner's curse 会让该运行"
+            "指标偏乐观，不能当作独立验证；请把调参种子与"
+            "评估种子分开（如调参用 7/8/9，最终基线用 "
+            "42/43/44）"
+        )
+
+    report: Dict[str, object] = {
+        "n_runs_with_tuning": with_tuning,
+        "n_overlapping_runs": overlapping,
+        "overlap_share": (
+            overlapping / with_tuning if with_tuning else None
+        ),
+        "entries": entries,
+        "advisories": advisories,
+        "ok": (
+            None
+            if with_tuning == 0
+            else (False if overlapping else True)
+        ),
+    }
+    return report
+
+
 def _baseline_tuning_axis_error(
     record: Dict[str, object],
 ) -> Optional[str]:
@@ -26333,6 +26429,7 @@ def print_comparison_analysis(
         metric,
     )
     adequacy = baseline_adequacy(rows, baseline_mode, metric)
+    tuning_seed_overlap = tuning_seed_overlap_report(rows)
     imbalance = imbalance_metric_advisory(rows, metric)
     # 选型口径一致性：checkpoint 按 val_loss 选、结论却按
     # macro F1 判定时，最终模型不是假设要检验的那个模型。
@@ -27522,6 +27619,26 @@ def print_comparison_analysis(
                     f"{format(float(item['baseline_tuned_lr']), 'g')}）"
                 )
 
+    print()
+    print(
+        "[tuning-seeds] 调参种子与最终评估种子独立性核对"
+        "（同一批种子既选 winner 又评估会把 winner's curse "
+        "带进对比）"
+    )
+    if tuning_seed_overlap["ok"] is True:
+        print(
+            "  OK：所有带调参来源的运行，其调参种子与最终"
+            "评估种子均不相交"
+        )
+    elif tuning_seed_overlap["ok"] is None:
+        print(
+            "  [note] 没有可核对的调参种子记录（无调参来源或"
+            "旧版报告缺种子列表）：无法排除种子复用"
+        )
+    else:
+        for message in tuning_seed_overlap["advisories"]:
+            print(f"  [warn] {message}")
+
     expected_cells = coverage.get("expected_cells") or []
     # 表头形状按声明的消融方案数动态给出：默认 A/B 时为 3×2，
     # 只有两个方案时才恰好是 2×2，不能硬编码。
@@ -27913,6 +28030,7 @@ def print_comparison_analysis(
         "reference_contrasts": reference,
         "baseline_preregistration": baseline_preregistration,
         "baseline_adequacy": adequacy,
+        "tuning_seed_overlap": tuning_seed_overlap,
         "selection_metric_mismatch": selection_metric_mismatch,
         "imbalance_advisory": imbalance,
         "ablation_coverage": coverage,
@@ -38888,6 +39006,32 @@ def run_self_test():
         assert adequacy_ok["ok"] is True, adequacy_ok
         assert not adequacy_ok["straw_man"]
 
+        # 调参种子与最终评估种子重合：smelt_seed1 用种子 1，
+        # 而调参 winner 正是在 [1,2,3] 上选出的，必须被点名；
+        # 换成不相交种子则通过。没有调参记录时不能虚报通过。
+        overlap_report = tuning_seed_overlap_report(hyp_rows)
+        assert overlap_report["ok"] is False
+        assert overlap_report["n_overlapping_runs"] == 1
+        assert overlap_report["entries"][0]["overlap"] == [1]
+        assert any(
+            "winner's curse" in message
+            for message in overlap_report["advisories"]
+        )
+        disjoint_report = tuning_seed_overlap_report([
+            {
+                "run": "smelt_seed42",
+                "mode": "smelt",
+                "seed": 42,
+                "baseline_tuning": good_tuning,
+            }
+        ])
+        assert disjoint_report["ok"] is True
+        assert disjoint_report["n_overlapping_runs"] == 0
+        no_tuning_report = tuning_seed_overlap_report([
+            {"run": "smelt_seed42", "mode": "smelt", "seed": 42}
+        ])
+        assert no_tuning_report["ok"] is None
+
         # 基线没有优于 unigram 参考（稻草人）：必须被标记，
         # 且 ok=False。5.20 > 5.0（越低越好）。
         weak_path = _write_analysis_run(
@@ -47327,6 +47471,16 @@ def main():
             f"{format(float(baseline_tuning_record['winner_lr']), 'g')}, "
             f"metric={baseline_tuning_record['metric']}"
         )
+        seed_overlap = tuning_seed_overlap_report([{
+            "run": str(out_dir),
+            "mode": cfg.mode,
+            "seed": args.seed,
+            "baseline_tuning": baseline_tuning_record,
+        }])
+        for advisory in seed_overlap["advisories"]:
+            print(
+                "[baseline-tuning] [warn] " + str(advisory)
+            )
 
     # 数据审计在训练之前完成：重复内容、分布偏移与 token 值域
     # 问题会被记录并在发现风险时给出警告。test 此时保持尘封，
