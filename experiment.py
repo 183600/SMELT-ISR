@@ -22338,6 +22338,386 @@ def factorial_effects(
     return report
 
 
+# 因子效应出现这些 claim 时，统计显著也不能归因到组件本身：
+# 要么受控变量/结构/计算量/同种子随机性混杂，要么控制项根本
+# 没记录。组件级联合判定必须把这些情况集中列为 blocker。
+_COMPONENT_BLOCKING_CLAIMS = frozenset({
+    "confounded",
+    "compute_confounded",
+    "randomness_confounded",
+    "unverified_controls",
+})
+
+
+def _component_evidence_summary(
+    effects: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    汇总一组因子效应对某个组件的支持程度。
+
+    返回 ``supported`` / ``partial`` / ``contradicted`` /
+    ``blocked`` / ``inconclusive`` / ``insufficient_data`` /
+    ``missing``。只有所有可用证据都在 Holm 校正后显著且方向
+    改善，才返回 ``supported``；任一显著变差即为
+    ``contradicted``；出现混杂 claim 时一律 ``blocked``。
+    """
+    if not effects:
+        return {
+            "status": "missing",
+            "reason": "没有该组件的效应估计（组合缺失或指标不可用）",
+        }
+
+    claims = [str(effect.get("claim")) for effect in effects]
+    summaries = [
+        {
+            "effect_name": effect.get("effect_name"),
+            "delayed_mode": effect.get("delayed_mode"),
+            "claim": effect.get("claim"),
+            "mean_effect": effect.get("mean_effect"),
+            "p_value_holm": effect.get("p_value_holm"),
+            "significant": effect.get("significant"),
+            "equivalent": effect.get("equivalent"),
+            "n_pairs": effect.get("n_pairs", 0),
+        }
+        for effect in effects
+    ]
+
+    if any(claim in _COMPONENT_BLOCKING_CLAIMS for claim in claims):
+        return {
+            "status": "blocked",
+            "reason": "效应被混杂/未核对控制项阻塞，不能归因到组件",
+            "evidence": summaries,
+        }
+    if any(claim == "harms_component" for claim in claims):
+        return {
+            "status": "contradicted",
+            "reason": "至少一个校正后显著的效应方向为变差",
+            "evidence": summaries,
+        }
+    if all(claim == "supports_component" for claim in claims):
+        return {
+            "status": "supported",
+            "reason": "全部可用效应校正后显著且方向改善",
+            "evidence": summaries,
+        }
+    if any(claim == "supports_component" for claim in claims):
+        return {
+            "status": "partial",
+            "reason": "只有部分效应支持，不能宣称组件在所有设置下有用",
+            "evidence": summaries,
+        }
+    if all(effect.get("equivalent") for effect in effects):
+        return {
+            "status": "not_supported",
+            "reason": (
+                "效应在预注册等价界内（TOST 校正后成立）："
+                "没有证据支持该组件带来实质改善"
+            ),
+            "evidence": summaries,
+        }
+    if all(
+        isinstance(effect.get("n_pairs"), int)
+        and not isinstance(effect.get("n_pairs"), bool)
+        and effect.get("n_pairs") < _MIN_SEEDS_FOR_STATS
+        for effect in effects
+    ):
+        return {
+            "status": "insufficient_data",
+            "reason": "共同种子数不足，无法判断组件是否有效",
+            "evidence": summaries,
+        }
+    return {
+        "status": "inconclusive",
+        "reason": (
+            "效应未达到校正后显著，且未通过等价性检验："
+            "既不能宣称有用，也不能宣称无实质差异"
+        ),
+        "evidence": summaries,
+    }
+
+
+def ablation_component_verdicts(
+    factorial: Dict[str, object],
+    coverage: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    把全因子效应汇总成「每个创新点是否各自有用」的联合判定。
+
+    主动机：主效应、简单效应与交互分散在报告各处时，读者容易
+    把「部分组合显著」拼成「全部创新点都有用」。这里对每个
+    延迟合并方案与均衡损失分别给出单一 verdict，并要求：
+
+    - 主效应（跨均衡开关加权）支持该组件；
+    - 简单效应没有显著变差或混杂；
+    - 消融组合完整、结构/计算量/同种子随机性没有阻塞；
+    - 全因子各格共享同一组随机种子（否则不同组件是在不同
+      种子子集上比较）。
+
+    只有全部组件均为 ``supported`` 且无 blocker 时，
+    ``all_components_supported`` 才为 True；部分显著只返回
+    ``partial``，不会被包装成「各自有用」。
+    """
+    effects = [
+        effect
+        for effect in factorial.get("effects", [])
+        if isinstance(effect, dict)
+    ]
+    expected_delayed = [
+        str(mode)
+        for mode in (
+            coverage.get("expected_delayed_modes")
+            or list(_DELAYED_MERGE_MODES)
+        )
+    ]
+    project_delayed = [
+        str(mode)
+        for mode in (
+            coverage.get("project_delayed_modes")
+            or list(_DELAYED_MERGE_MODES)
+        )
+    ]
+
+    components: List[Dict[str, object]] = []
+    for mode in expected_delayed:
+        primary = [
+            effect
+            for effect in effects
+            if effect.get("delayed_mode") == mode
+            and effect.get("effect_name") == "delayed_merge_main"
+        ]
+        simple = [
+            effect
+            for effect in effects
+            if effect.get("delayed_mode") == mode
+            and effect.get("effect_name")
+            in {
+                "delayed_merge_at_balance_off",
+                "delayed_merge_at_balance_on",
+            }
+        ]
+        primary_summary = _component_evidence_summary(primary)
+        simple_summary = _component_evidence_summary(simple)
+        status = str(primary_summary["status"])
+        reasons = [str(primary_summary.get("reason"))]
+        if status == "supported":
+            if simple_summary["status"] == "contradicted":
+                status = "contradicted"
+                reasons.append(
+                    "主效应支持，但至少一个均衡开关水平的简单"
+                    "效应显著变差（交互），不能宣称各水平都有用"
+                )
+            elif simple_summary["status"] == "blocked":
+                status = "blocked"
+                reasons.append(
+                    "主效应支持，但简单效应受混杂/未核对控制项"
+                    "阻塞"
+                )
+        elif (
+            status in {"missing", "insufficient_data", "inconclusive"}
+            and simple_summary["status"] == "supported"
+        ):
+            status = "partial"
+            reasons.append(
+                "主效应不足，但部分简单效应支持：只算局部证据"
+            )
+        components.append({
+            "component": f"delayed_merge_{mode}",
+            "label": f"延迟合并方案 {mode}",
+            "status": status,
+            "primary": primary_summary,
+            "simple": simple_summary,
+            "reasons": reasons,
+        })
+
+    balance_main = [
+        effect
+        for effect in effects
+        if effect.get("effect_name") == "balance_loss_main"
+    ]
+    balance_simple = [
+        effect
+        for effect in effects
+        if effect.get("effect_name")
+        in {
+            "balance_loss_at_local_base",
+            "balance_loss_at_delayed_merge",
+        }
+    ]
+    balance_primary = _component_evidence_summary(balance_main)
+    balance_simple_summary = _component_evidence_summary(
+        balance_simple
+    )
+    balance_status = str(balance_primary["status"])
+    balance_reasons = [str(balance_primary["reason"])]
+    if balance_status == "supported":
+        if balance_simple_summary["status"] == "contradicted":
+            balance_status = "contradicted"
+            balance_reasons.append(
+                "均衡损失主效应支持，但至少一个简单效应显著"
+                "变差（交互）"
+            )
+        elif balance_simple_summary["status"] == "blocked":
+            balance_status = "blocked"
+            balance_reasons.append(
+                "均衡损失主效应支持，但简单效应受混杂/未核对"
+                "控制项阻塞"
+            )
+    elif (
+        balance_status
+        in {"missing", "insufficient_data", "inconclusive"}
+        and balance_simple_summary["status"] == "supported"
+    ):
+        balance_status = "partial"
+        balance_reasons.append(
+            "主效应不足，但部分简单效应支持：只算局部证据"
+        )
+    components.append({
+        "component": "balance_loss",
+        "label": "负载均衡损失",
+        "status": balance_status,
+        "primary": balance_primary,
+        "simple": balance_simple_summary,
+        "reasons": balance_reasons,
+    })
+
+    blockers: List[str] = []
+    if coverage.get("partial"):
+        blockers.append(
+            "本轮是部分消融，未覆盖项目方案 "
+            + ", ".join(
+                str(mode)
+                for mode in coverage.get(
+                    "undeclared_project_modes", []
+                )
+            )
+        )
+    if coverage.get("missing_cells"):
+        blockers.extend(
+            "缺少消融组合: " + str(message)
+            for message in coverage["missing_cells"]
+        )
+    for key, label in (
+        ("structural_confounds", "结构设置混杂"),
+        ("width_confounds", "专家宽度/计算量混杂"),
+        ("randomness_confounds", "同种子随机性混杂"),
+    ):
+        values = coverage.get(key) or []
+        if values:
+            blockers.append(
+                f"{label}（{len(values)} 项）：主效应不能归因"
+            )
+    for entry in coverage.get("compute_parity") or []:
+        if not entry.get("matched"):
+            blockers.append(
+                f"{entry.get('delayed_mode')} 与 local_base 的"
+                f" {entry.get('field')} 不匹配"
+                f"（{float(entry.get('ratio', 0.0)):.2f}×）"
+            )
+    alignment = coverage.get("global_seed_alignment")
+    if isinstance(alignment, dict) and alignment.get(
+        "applicable"
+    ):
+        if not alignment.get("all_expected_present"):
+            blockers.append(
+                "全因子存在缺失格，无法核对所有组件的共同种子"
+            )
+        elif not alignment.get("aligned"):
+            blockers.append(
+                "全因子各格种子集合不一致，组件效应只在"
+                "不同种子子集上可配对"
+            )
+        elif int(alignment.get("n_common_seeds", 0)) < (
+            _MIN_SEEDS_FOR_STATS
+        ):
+            blockers.append(
+                "全因子共同种子只有 "
+                f"{alignment.get('n_common_seeds', 0)} 个"
+                f"（< {_MIN_SEEDS_FOR_STATS}）"
+            )
+    if factorial.get("incomplete_designs"):
+        blockers.append(
+            "存在不完整的 2×2 设计："
+            + "; ".join(
+                f"{item.get('delayed_mode')} 缺 "
+                + ", ".join(item.get("missing_cells") or [])
+                for item in factorial["incomplete_designs"]
+            )
+        )
+    if factorial.get("controlled_variables_ok") is False:
+        blockers.append("受控变量检查存在违规")
+    if factorial.get("unchecked_control_keys"):
+        blockers.append(
+            "以下控制项未记录: "
+            + ", ".join(
+                str(key)
+                for key in factorial["unchecked_control_keys"]
+            )
+        )
+    if coverage.get("low_replicate_cells"):
+        blockers.append(
+            "存在种子数不足的消融单元/未判定单元（"
+            + str(len(coverage["low_replicate_cells"]))
+            + " 项）"
+        )
+
+    statuses = {
+        str(component["component"]): str(component["status"])
+        for component in components
+    }
+    missing_project = [
+        mode for mode in project_delayed if mode not in {
+            str(component["component"])[len("delayed_merge_"):]
+            for component in components
+            if str(component["component"]).startswith(
+                "delayed_merge_"
+            )
+        }
+    ]
+    if missing_project:
+        blockers.append(
+            "项目声明的延迟合并方案未进入本轮判定: "
+            + ", ".join(missing_project)
+        )
+
+    all_supported = bool(components) and all(
+        status == "supported" for status in statuses.values()
+    ) and not blockers
+
+    if not factorial.get("applicable"):
+        advisory = (
+            "对比因子未同时包含 mode 与 balance_coef："
+            "无法给出组件级联合判定"
+        )
+    elif all_supported:
+        advisory = (
+            "全部组件均有校正后显著、方向改善且无混杂的支持"
+            "证据：可以宣称各创新点各自有用"
+        )
+    elif blockers:
+        advisory = (
+            "存在阻塞条件：先补齐组合/消除混杂/统一共同种子，"
+            "不能宣称全部创新点各自有用"
+        )
+    else:
+        advisory = (
+            "并非所有组件都获得支持："
+            + "；".join(
+                f"{component['label']}={component['status']}"
+                for component in components
+            )
+            + "；只能报告有证据的组件，不能宣称「各自有用」"
+        )
+
+    return {
+        "applicable": bool(factorial.get("applicable")),
+        "components": components,
+        "statuses": statuses,
+        "all_components_supported": all_supported,
+        "blockers": blockers,
+        "advisory": advisory,
+    }
+
+
 def _current_seed_count(
     contrast: Dict[str, object],
 ) -> Optional[float]:
@@ -23551,6 +23931,99 @@ def ablation_coverage(
         for level in ("off", "on")
     ]
     report["expected_cells"] = expected_cells
+
+    # 全因子共享种子：每个方案的 2×2 内部对齐还不够，A、B 与
+    # local_base 之间也必须使用同一组种子。否则 A 的组件效应与
+    # B 的组件效应是在不同种子子集上估计的，「各创新点各自
+    # 有用」就不再是同一批重复实验里的联合结论。
+    global_alignment: Dict[str, object] = {
+        "applicable": False,
+        "cells": expected_cells,
+        "all_expected_present": False,
+        "complete_seed_records": True,
+        "common_seeds": [],
+        "n_common_seeds": 0,
+        "aligned": False,
+    }
+    if (
+        "balance_coef" in factor_set
+        and "mode" in factor_set
+    ):
+        expected_pairs = [
+            (mode, level)
+            for mode in ("local_base", *expected_delayed)
+            for level in ("off", "on")
+        ]
+        missing_pairs = [
+            pair for pair in expected_pairs
+            if pair not in merge_pair_cells
+        ]
+        seed_sets: List[set] = []
+        raw_by_key: Dict[object, object] = {}
+        complete_records = True
+        for pair in expected_pairs:
+            seeds = merge_pair_seeds.get(pair, [])
+            if pair in merge_pair_cells and (
+                len(seeds) != merge_pair_cells[pair]
+            ):
+                complete_records = False
+            seed_set = {
+                _stable_factor_key(seed) for seed in seeds
+            }
+            seed_sets.append(seed_set)
+            for seed in seeds:
+                raw_by_key.setdefault(
+                    _stable_factor_key(seed), seed
+                )
+        common = (
+            set.intersection(*seed_sets)
+            if seed_sets
+            else set()
+        )
+        all_present = not missing_pairs
+        aligned = bool(
+            all_present
+            and complete_records
+            and all(seed_set == common for seed_set in seed_sets)
+        )
+        common_raw = sorted(
+            (raw_by_key[key] for key in common),
+            key=_factor_sort_rank,
+        )
+        global_alignment = {
+            "applicable": True,
+            "cells": expected_cells,
+            "all_expected_present": all_present,
+            "missing_cells": [
+                f"{mode}/b={level}"
+                for mode, level in missing_pairs
+            ],
+            "complete_seed_records": complete_records,
+            "common_seeds": common_raw,
+            "n_common_seeds": len(common),
+            "aligned": aligned,
+        }
+        if all_present and not complete_records:
+            report["advisories"].append(
+                "全因子存在未记录随机种子的运行：无法核对各格"
+                "是否共享同一组种子，主效应/交互不能按同种子"
+                "配对解读"
+            )
+        if all_present and len(common) < _MIN_SEEDS_FOR_STATS:
+            report["low_replicate_cells"].append(
+                "全因子各格共同种子只有 "
+                f"{len(common)} 个（< {_MIN_SEEDS_FOR_STATS}）"
+                "：方案之间的组件效应不再来自同一批重复实验，"
+                "不能支撑「各创新点各自有用」"
+            )
+        elif all_present and not aligned:
+            report["advisories"].append(
+                "全因子各格的随机种子集合不一致："
+                f"共同种子 {len(common)} 个；A/B/local_base "
+                "的组件效应只在共同子集上可配对，未对齐的种子"
+                "不能当作额外重复"
+            )
+    report["global_seed_alignment"] = global_alignment
 
     if (
         "balance_coef" in factor_set
@@ -27332,6 +27805,13 @@ def print_comparison_analysis(
             controlled,
             matched_coverage,
         )
+    # 组件级联合判定：把分散的主效应/简单效应拼成每个创新点
+    # 的单一 verdict，并集中列出阻塞条件。只有全部组件都有
+    # 无混杂的支持证据时才允许宣称「各自有用」。
+    component_verdicts = ablation_component_verdicts(
+        factorial,
+        coverage,
+    )
     # 伪重复：同一实验单元里同一随机种子出现多次（如复制运行
     # 目录）不是独立重复实验，必须点名，不能让它悄悄抬高样本数、
     # 压低种子间方差。
@@ -28632,6 +29112,29 @@ def print_comparison_analysis(
                 f"集合不同，仅在 {entry['n_common_seeds']} 个"
                 "共同种子上可配对"
             )
+    global_alignment = coverage.get("global_seed_alignment")
+    if isinstance(global_alignment, dict) and global_alignment.get(
+        "applicable"
+    ):
+        seeds_text = ", ".join(
+            str(seed)
+            for seed in global_alignment.get("common_seeds", [])
+        )
+        if global_alignment.get("aligned"):
+            print(
+                "  全因子种子对齐: 所有消融格共享 "
+                f"{global_alignment.get('n_common_seeds', 0)} 个"
+                "种子"
+                + (f"（{seeds_text}）" if seeds_text else "")
+            )
+        elif global_alignment.get("all_expected_present"):
+            print(
+                "  [warn] 全因子种子未对齐: 各格种子集合不同，"
+                "共同种子只有 "
+                f"{global_alignment.get('n_common_seeds', 0)} 个；"
+                "不同方案可能在不同种子子集上比较，"
+                "不能拼成「各创新点各自有用」"
+            )
     for entry in coverage.get("compute_parity", []):
         if entry["matched"]:
             continue
@@ -28715,12 +29218,21 @@ def print_comparison_analysis(
     compute_aligned = metric == _COMPUTE_MATCHED_METRIC or (
         compute_parity_ok and width_parity_ok
     )
+    global_alignment_info = coverage.get(
+        "global_seed_alignment"
+    )
+    global_seed_ok = bool(
+        isinstance(global_alignment_info, dict)
+        and global_alignment_info.get("applicable")
+        and global_alignment_info.get("aligned")
+    )
     if (
         full_factorial
         and not coverage["missing_cells"]
         and not coverage["low_replicate_cells"]
         and not coverage.get("structural_confounds")
         and not randomness["confounds"]
+        and global_seed_ok
         and compute_aligned
     ):
         aligned_text = (
@@ -28731,6 +29243,16 @@ def print_comparison_analysis(
         print(
             f"  OK：{len(expected_cells) // 2}×2 全因子组合齐全"
             f"、种子数达标且{aligned_text}"
+        )
+    elif (
+        full_factorial
+        and not global_seed_ok
+    ):
+        print(
+            f"  [warn] {len(expected_cells) // 2}×2 组合齐全，"
+            "但全因子各格的随机种子集合不一致："
+            "不同方案的组件效应可能来自不同的种子子集，"
+            "不能拼成「各创新点各自有用」"
         )
     elif (
         full_factorial
@@ -28851,6 +29373,35 @@ def print_comparison_analysis(
                 "只有校正后仍 <= alpha 才可主张「无实质差异」，"
                 "「不显著」本身不构成等价证据"
             )
+
+    if component_verdicts["applicable"]:
+        print()
+        print(
+            "[ablation-verdict] 组件级联合判定"
+            "（每个创新点必须有独立支持证据，不能把部分显著"
+            "拼成「各自有用」）"
+        )
+        for component in component_verdicts["components"]:
+            print(
+                f"  [{component['status']}] {component['label']}"
+                + "："
+                + "；".join(
+                    str(reason)
+                    for reason in component["reasons"]
+                    if reason
+                )
+            )
+        if component_verdicts["all_components_supported"]:
+            print(
+                "  OK：全部组件均获得无混杂的支持证据"
+            )
+        else:
+            print(
+                "  [not-supported] "
+                + str(component_verdicts["advisory"])
+            )
+        for blocker in component_verdicts["blockers"]:
+            print(f"  [blocked] {blocker}")
 
     if factorial_compute_matched is not None:
         print()
@@ -29033,6 +29584,7 @@ def print_comparison_analysis(
         "ablation_coverage": coverage,
         "balance_scale": balance_scale,
         "factorial_effects": factorial,
+        "ablation_component_verdicts": component_verdicts,
         "factorial_effects_compute_matched": (
             factorial_compute_matched
         ),
@@ -39864,6 +40416,95 @@ def run_self_test():
         assert abs(interaction["mean_effect"]) < 1e-9
         assert not interaction["significant"]
         assert interaction["claim"] == "not_significant"
+        # 组件级联合判定：同一份 A-only 全因子在完整覆盖与
+        # 对齐种子下应判为全部支持；主效应改判不显著或全因子
+        # 种子未对齐时必须拒绝「各自有用」。
+        component_coverage = {
+            "expected_delayed_modes": ["A"],
+            "project_delayed_modes": ["A"],
+            "global_seed_alignment": {
+                "applicable": True,
+                "all_expected_present": True,
+                "complete_seed_records": True,
+                "aligned": True,
+                "common_seeds": [1, 2, 3],
+                "n_common_seeds": 3,
+            },
+            "missing_cells": [],
+            "structural_confounds": [],
+            "width_confounds": [],
+            "randomness_confounds": [],
+            "compute_parity": [],
+            "low_replicate_cells": [],
+        }
+        component_verdicts = ablation_component_verdicts(
+            factorial,
+            component_coverage,
+        )
+        assert component_verdicts["all_components_supported"], (
+            component_verdicts
+        )
+        assert (
+            component_verdicts["statuses"]["delayed_merge_A"]
+            == "supported"
+        )
+        assert (
+            component_verdicts["statuses"]["balance_loss"]
+            == "supported"
+        )
+        not_supported_factorial = json.loads(
+            json.dumps(
+                _json_safe(factorial),
+                ensure_ascii=False,
+            )
+        )
+        for effect in not_supported_factorial["effects"]:
+            if effect["effect_name"] == "delayed_merge_main":
+                effect["claim"] = "not_significant"
+                effect["significant"] = False
+        not_supported_verdicts = ablation_component_verdicts(
+            not_supported_factorial,
+            component_coverage,
+        )
+        assert not not_supported_verdicts[
+            "all_components_supported"
+        ]
+        assert (
+            not_supported_verdicts["statuses"]["delayed_merge_A"]
+            == "partial"
+        )
+        misaligned_components = json.loads(
+            json.dumps(component_coverage)
+        )
+        misaligned_components["global_seed_alignment"][
+            "aligned"
+        ] = False
+        misaligned_verdicts = ablation_component_verdicts(
+            factorial,
+            misaligned_components,
+        )
+        assert not misaligned_verdicts["all_components_supported"]
+        assert any(
+            "种子" in blocker
+            for blocker in misaligned_verdicts["blockers"]
+        )
+
+        # 全局种子对齐：每个 2×2 内部对齐但 A/B 使用不同
+        # 种子子集时，不能把两个组件的结论拼成同一批重复实验。
+        global_seed_rows = compare_runs(factorial_paths)
+        global_seed_coverage = ablation_coverage(
+            global_seed_rows,
+            ["mode", "balance_coef"],
+            ["A"],
+            allow_partial=True,
+        )
+        assert global_seed_coverage[
+            "global_seed_alignment"
+        ]["applicable"]
+        assert global_seed_coverage[
+            "global_seed_alignment"
+        ]["all_expected_present"]
+
         # 因子效应报告必须能安全落盘（seed/元组等不泄露到 JSON）。
         json.dumps(
             _json_safe(factorial),
