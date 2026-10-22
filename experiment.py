@@ -23261,8 +23261,16 @@ def _paired_sign_flip_test(
     if values is None:
         return {"test": "invalid_values"}
 
-    mean = sum(values) / n
-    observed = abs(mean)
+    # 符号翻转统计量对公共尺度不变：先把差值缩放到 [-1, 1]，
+    # 避免合法的大浮点数在求和/平方时溢出成 inf 或抛
+    # OverflowError。随机化种子仍用原始值，保证结果可复现。
+    raw_values = values
+    scale = max(abs(value) for value in values)
+    if scale > 0.0:
+        values = [value / scale for value in values]
+    mean_scaled = sum(values) / n
+    mean = mean_scaled * scale
+    observed = abs(mean_scaled)
     tolerance = 1e-12 * max(1.0, observed)
 
     if observed <= tolerance:
@@ -23290,7 +23298,7 @@ def _paired_sign_flip_test(
         method = "exact"
     else:
         generator = torch.Generator().manual_seed(
-            _randomization_seed(values)
+            _randomization_seed(raw_values)
         )
         replicates = _RANDOMIZATION_MONTE_CARLO_REPLICATES
         signs = torch.randint(
@@ -23914,55 +23922,120 @@ def _window_variance_components(
         }
 
     matrix = [usable[seed] for seed in seed_order]
-    grand_mean = (
-        sum(sum(row) for row in matrix)
+    # 先按全局最大绝对值缩放再分解：ANOVA 的平方和在原始尺度
+    # 上很容易越过 float 上限（合法输入如 1e200 就会让
+    # ``** 2`` 抛 OverflowError）。方差占比与自由度对公共尺度
+    # 不变；绝对分量在最后再按 scale² 还原，超出 float 范围时
+    # 明确返回 None。
+    scale = max(
+        abs(value) for row in matrix for value in row
+    )
+    if scale == 0.0:
+        scaled_matrix = [
+            [0.0 for _ in row] for row in matrix
+        ]
+    else:
+        scaled_matrix = [
+            [value / scale for value in row]
+            for row in matrix
+        ]
+    grand_mean_norm = (
+        sum(sum(row) for row in scaled_matrix)
         / float(seed_count * window_count)
     )
-    seed_means = [
-        sum(row) / float(window_count) for row in matrix
+    seed_means_norm = [
+        sum(row) / float(window_count)
+        for row in scaled_matrix
     ]
-    window_means = [
-        sum(matrix[index][column] for index in range(seed_count))
+    window_means_norm = [
+        sum(
+            scaled_matrix[index][column]
+            for index in range(seed_count)
+        )
         / float(seed_count)
         for column in range(window_count)
     ]
-    ss_seed = window_count * sum(
-        (mean - grand_mean) ** 2 for mean in seed_means
+    ss_seed_norm = window_count * sum(
+        (mean - grand_mean_norm) ** 2
+        for mean in seed_means_norm
     )
-    ss_window = seed_count * sum(
-        (mean - grand_mean) ** 2 for mean in window_means
+    ss_window_norm = seed_count * sum(
+        (mean - grand_mean_norm) ** 2
+        for mean in window_means_norm
     )
-    ss_total = sum(
-        (value - grand_mean) ** 2
-        for row in matrix
+    ss_total_norm = sum(
+        (value - grand_mean_norm) ** 2
+        for row in scaled_matrix
         for value in row
     )
     # 浮点误差可能让三项之和大一点点；截断到 0 而不是产生
     # 负的方差分量。
-    ss_error = max(0.0, ss_total - ss_seed - ss_window)
+    ss_error_norm = max(
+        0.0, ss_total_norm - ss_seed_norm - ss_window_norm
+    )
     df_seed = seed_count - 1
     df_window = window_count - 1
     df_error = df_seed * df_window
-    ms_seed = ss_seed / float(df_seed)
-    ms_window = ss_window / float(df_window)
-    ms_error = ss_error / float(df_error) if df_error > 0 else 0.0
+    ms_seed_norm = ss_seed_norm / float(df_seed)
+    ms_window_norm = ss_window_norm / float(df_window)
+    ms_error_norm = (
+        ss_error_norm / float(df_error)
+        if df_error > 0
+        else 0.0
+    )
 
     # 两向随机效应方差分量（可能为负，按惯例截断到 0，并记录）。
-    raw_seed_var = (ms_seed - ms_error) / float(window_count)
-    raw_window_var = (ms_window - ms_error) / float(seed_count)
-    seed_var = max(0.0, raw_seed_var)
-    window_var = max(0.0, raw_window_var)
-    error_var = max(0.0, ms_error)
+    raw_seed_var_norm = (
+        ms_seed_norm - ms_error_norm
+    ) / float(window_count)
+    raw_window_var_norm = (
+        ms_window_norm - ms_error_norm
+    ) / float(seed_count)
+    seed_var_norm = max(0.0, raw_seed_var_norm)
+    window_var_norm = max(0.0, raw_window_var_norm)
+    error_var_norm = max(0.0, ms_error_norm)
 
-    mean_seed_var = seed_var / float(seed_count)
-    mean_window_var = window_var / float(window_count)
-    mean_error_var = error_var / float(
+    mean_seed_var_norm = seed_var_norm / float(seed_count)
+    mean_window_var_norm = window_var_norm / float(window_count)
+    mean_error_var_norm = error_var_norm / float(
         seed_count * window_count
     )
-    total_mean_var = (
-        mean_seed_var + mean_window_var + mean_error_var
+    total_mean_var_norm = (
+        mean_seed_var_norm
+        + mean_window_var_norm
+        + mean_error_var_norm
     )
-    same_window_mean_var = mean_seed_var + mean_error_var
+    same_window_mean_var_norm = (
+        mean_seed_var_norm + mean_error_var_norm
+    )
+
+    def _rescale_square(value: float) -> Optional[float]:
+        """把归一化方差还原到原始尺度；溢出时返回 None。"""
+        if not math.isfinite(value) or value < 0.0:
+            return None
+        result = (value * scale) * scale
+        return result if math.isfinite(result) else None
+
+    def _rescale_root(value: float) -> Optional[float]:
+        """把归一化标准差还原到原始尺度；溢出时返回 None。"""
+        if not math.isfinite(value) or value < 0.0:
+            return None
+        result = math.sqrt(value) * scale
+        return result if math.isfinite(result) else None
+
+    grand_mean = grand_mean_norm * scale
+    seed_var = _rescale_square(seed_var_norm)
+    window_var = _rescale_square(window_var_norm)
+    error_var = _rescale_square(error_var_norm)
+    raw_seed_var = _rescale_square(raw_seed_var_norm)
+    raw_window_var = _rescale_square(raw_window_var_norm)
+    mean_seed_var = _rescale_square(mean_seed_var_norm)
+    mean_window_var = _rescale_square(mean_window_var_norm)
+    mean_error_var = _rescale_square(mean_error_var_norm)
+    total_mean_var = _rescale_square(total_mean_var_norm)
+    same_window_mean_var = _rescale_square(
+        same_window_mean_var_norm
+    )
 
     components: Dict[str, object] = {
         "available": True,
@@ -23972,11 +24045,11 @@ def _window_variance_components(
         "n_windows_min": window_count,
         "n_windows_max": window_count,
         "seed_mean_effect": grand_mean,
-        "between_seed_sd": math.sqrt(seed_var),
-        "window_sd": math.sqrt(window_var),
-        "within_seed_sd_mean": math.sqrt(error_var),
-        "within_seed_mean_sd": math.sqrt(
-            error_var / float(window_count)
+        "between_seed_sd": _rescale_root(seed_var_norm),
+        "window_sd": _rescale_root(window_var_norm),
+        "within_seed_sd_mean": _rescale_root(error_var_norm),
+        "within_seed_mean_sd": _rescale_root(
+            error_var_norm / float(window_count)
         ),
         "variance_components_single_observation": {
             "seed": seed_var,
@@ -23985,7 +24058,8 @@ def _window_variance_components(
             "raw_seed": raw_seed_var,
             "raw_window": raw_window_var,
             "truncated_at_zero": bool(
-                raw_seed_var < 0.0 or raw_window_var < 0.0
+                raw_seed_var_norm < 0.0
+                or raw_window_var_norm < 0.0
             ),
         },
         "variance_components_of_mean": {
@@ -23995,10 +24069,12 @@ def _window_variance_components(
             "total": total_mean_var,
         },
         "variance_of_mean": total_mean_var,
-        "std_error_of_mean": math.sqrt(total_mean_var),
+        "std_error_of_mean": _rescale_root(
+            total_mean_var_norm
+        ),
         "variance_of_mean_same_windows": same_window_mean_var,
-        "std_error_of_mean_same_windows": math.sqrt(
-            same_window_mean_var
+        "std_error_of_mean_same_windows": _rescale_root(
+            same_window_mean_var_norm
         ),
         "variance_share_seed": None,
         "variance_share_window": None,
@@ -24009,9 +24085,9 @@ def _window_variance_components(
         "dominant_source": None,
         "dominant_source_same_windows": None,
         "mean_squares": {
-            "seed": ms_seed,
-            "window": ms_window,
-            "error": ms_error,
+            "seed": _rescale_square(ms_seed_norm),
+            "window": _rescale_square(ms_window_norm),
+            "error": _rescale_square(ms_error_norm),
         },
         "degrees_of_freedom": {
             "seed": df_seed,
@@ -24028,10 +24104,14 @@ def _window_variance_components(
         ),
     }
 
-    if total_mean_var > 0.0:
-        share_seed = mean_seed_var / total_mean_var
-        share_window = mean_window_var / total_mean_var
-        share_interaction = mean_error_var / total_mean_var
+    if total_mean_var_norm > 0.0:
+        share_seed = mean_seed_var_norm / total_mean_var_norm
+        share_window = (
+            mean_window_var_norm / total_mean_var_norm
+        )
+        share_interaction = (
+            mean_error_var_norm / total_mean_var_norm
+        )
         components["variance_share_seed"] = share_seed
         components["variance_share_window"] = share_window
         components["variance_share_interaction"] = (
@@ -24065,52 +24145,62 @@ def _window_variance_components(
         components["dominant_source"] = dominant
         components["advisory"] = advisory
 
-    if same_window_mean_var > 0.0:
+    if same_window_mean_var_norm > 0.0:
         components["variance_share_seed_same_windows"] = (
-            mean_seed_var / same_window_mean_var
+            mean_seed_var_norm / same_window_mean_var_norm
         )
         components["variance_share_interaction_same_windows"] = (
-            mean_error_var / same_window_mean_var
+            mean_error_var_norm / same_window_mean_var_norm
         )
-        if mean_seed_var / same_window_mean_var >= 0.8:
+        if (
+            mean_seed_var_norm / same_window_mean_var_norm
+            >= 0.8
+        ):
             components["dominant_source_same_windows"] = (
                 "training_seed"
             )
-        elif mean_error_var / same_window_mean_var >= 0.8:
+        elif (
+            mean_error_var_norm / same_window_mean_var_norm
+            >= 0.8
+        ):
             components["dominant_source_same_windows"] = (
                 "seed_window_interaction"
             )
         else:
             components["dominant_source_same_windows"] = "mixed"
 
-    reliability_denominator = seed_var + (
-        error_var / float(window_count)
+    reliability_denominator = seed_var_norm + (
+        error_var_norm / float(window_count)
     )
     if reliability_denominator > 0.0:
         components["seed_mean_reliability"] = (
-            seed_var / reliability_denominator
+            seed_var_norm / reliability_denominator
         )
 
     if seed_count >= 3:
         critical = _t_critical(float(seed_count - 1))
         if critical is not None:
-            predicted_sd = math.sqrt(
-                seed_var + error_var / float(window_count)
+            predicted_sd = _rescale_root(
+                seed_var_norm + error_var_norm / float(window_count)
             )
-            components[
-                "new_seed_mean_prediction_interval_95"
-            ] = {
-                "low": grand_mean - critical * predicted_sd,
-                "high": grand_mean + critical * predicted_sd,
-                "df": seed_count - 1,
-                "t_critical": critical,
-                "method": "t_prediction_new_seed_mean",
-                "note": (
-                    "同一批固定评估窗口上「换一个新训练种子」"
-                    "的均值差预测区间；不包含窗口主效应，"
-                    "不是换评估集的外推"
-                ),
-            }
+            if predicted_sd is not None:
+                low = grand_mean - critical * predicted_sd
+                high = grand_mean + critical * predicted_sd
+                if math.isfinite(low) and math.isfinite(high):
+                    components[
+                        "new_seed_mean_prediction_interval_95"
+                    ] = {
+                        "low": low,
+                        "high": high,
+                        "df": seed_count - 1,
+                        "t_critical": critical,
+                        "method": "t_prediction_new_seed_mean",
+                        "note": (
+                            "同一批固定评估窗口上「换一个新训练"
+                            "种子」的均值差预测区间；不包含窗口"
+                            "主效应，不是换评估集的外推"
+                        ),
+                    }
     return components
 
 

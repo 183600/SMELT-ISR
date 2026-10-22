@@ -4850,6 +4850,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )["test"],
             "invalid_values",
         )
+        # 符号翻转统计量对尺度不变：同一组大到 1e308 的差值
+        # 不能因求和溢出而被误判成退化的 p=1。
+        sign = experiment._paired_sign_flip_test(
+            [huge, huge, huge]
+        )
+        self.assertEqual(sign["method"], "exact")
+        self.assertEqual(sign["p_value"], 0.25)
+        # 两向方差分解同样必须先在归一化尺度上计算，不能对
+        # 1e200 的离差直接平方。
+        components = experiment._window_variance_components(
+            {1: [1e200, 0.0], 2: [1e200, 0.0]}
+        )
+        self.assertTrue(components["available"])
+        self.assertEqual(
+            components["between_seed_sd"], 0.0
+        )
+        self.assertIsNotNone(components["std_error_of_mean"])
 
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [
