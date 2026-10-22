@@ -1460,6 +1460,20 @@ class PreregistrationTests(unittest.TestCase):
         )
         self.assertIn("SHA-256", error)
 
+    def test_apply_rejects_unverifiable_frozen_script(self):
+        payload = self._payload()
+        payload["frozen_script_sha256"] = "d" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256=None,
+        )
+        self.assertIn("无法读取", error)
+        self.assertIn("SHA-256", error)
+
     def test_apply_allows_frozen_commit_ancestor(self):
         args = self._args()
         _, error = experiment.preregistration_apply(

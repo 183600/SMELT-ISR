@@ -30835,7 +30835,13 @@ def preregistration_apply(
             "改动后重跑，而不是把脏工作区当作冻结版本"
         )
     expected_script = payload.get("frozen_script_sha256")
-    if expected_script is not None and current_script_sha256 is not None:
+    if expected_script is not None:
+        if current_script_sha256 is None:
+            return applied, (
+                "预注册声明了 frozen_script_sha256，但无法读取"
+                "当前 experiment.py 的 SHA-256：不能把未核对的"
+                "脚本当作冻结版本"
+            )
         if str(expected_script) != current_script_sha256:
             return applied, (
                 "当前 experiment.py 的 SHA-256 与预注册 "
