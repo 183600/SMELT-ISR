@@ -268,25 +268,58 @@ class CostModelTests(unittest.TestCase):
 
     def test_kv_cache_bytes_counts_k_and_v_once(self):
         # d_model=32, n_heads=4, n_kv_heads=2 -> head_dim=8,
-        # kv_dim=16；4 层 fp16 的 K+V = 4*16*2*2 = 256 bytes。
+        # kv_dim=16；每层 fp16 的 K+V = 16*2*2 = 64 bytes。
+        bytes_per_layer = 16 * 2 * 2
         cfg = _tiny_config(mode="smelt")
         profile = experiment.mode_cost_profile(cfg)
-        expected = 4 * 16 * 2 * 2
+        # 物理层仍只有 4 份；middle=2 层访问两次，pre/post 各
+        # 一次 -> 共 1+2*2+1=6 次 Attention，而不是 4*2。
         self.assertEqual(
-            profile["kv_cache_bytes_per_token"], expected
+            profile["kv_cache_bytes_per_token"],
+            4 * bytes_per_layer,
         )
         self.assertEqual(
             profile["kv_cache_bytes_per_token_per_visit"],
-            expected * cfg.loop_count,
+            6 * bytes_per_layer,
+        )
+        self.assertEqual(
+            profile["kv_cache_bytes_per_token_per_visit"],
+            profile["attention_executions_per_token"]
+            * bytes_per_layer,
         )
 
-        # B 有 k1=2 个独立分支，各自缓存一份 KV。
+        # B 有 k1=2 个独立分支：分支只出现在 middle，pre/post
+        # 仍各一份。middle=2 -> 物理容量 (1+1+2*2)=6 份。
         branch_profile = experiment.mode_cost_profile(
             _tiny_config(mode="B")
         )
         self.assertEqual(
             branch_profile["kv_cache_bytes_per_token"],
-            expected * 2,
+            6 * bytes_per_layer,
+        )
+        # 访问次数：pre 1 + [首块 1 + 剩余 1 块×2 分支 +
+        # 第二轮 2 块×2 分支] + post 1 = 9。
+        self.assertEqual(
+            branch_profile["kv_cache_bytes_per_token_per_visit"],
+            9 * bytes_per_layer,
+        )
+        self.assertEqual(
+            branch_profile[
+                "kv_cache_bytes_per_token_per_visit"
+            ],
+            branch_profile["attention_executions_per_token"]
+            * bytes_per_layer,
+        )
+        early = experiment.mode_cost_profile(
+            _tiny_config(mode="B_early")
+        )
+        self.assertEqual(
+            early["kv_cache_bytes_per_token"],
+            branch_profile["kv_cache_bytes_per_token"],
+        )
+        self.assertEqual(
+            early["kv_cache_bytes_per_token_per_visit"],
+            branch_profile["kv_cache_bytes_per_token_per_visit"],
         )
 
     def test_dense_profile_counts_dense_ffn_flops(self):

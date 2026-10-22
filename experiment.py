@@ -429,12 +429,30 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
         + dense_ffn_flops
     )
     # KV cache 每 token 字节数（fp16 存储 K 和 V）：每个物理层
-    # 为 K、V 各存一个 kv_dim 向量，fp16 每元素 2 字节；B/B_early
-    # 的每个分支各自持有一份 KV，因此乘分支数。若实现为每次
-    # 循环访问都缓存一份，需再乘 loop_count，这里显式记录两种口径。
+    # 为 K、V 各存一个 kv_dim 向量，fp16 每元素 2 字节。
+    #
+    # 分支只存在于 middle 区域（B/B_early 的第一轮第一个 Block
+    # 在 Attention 之后才创建分支，其余 middle Block 与第二轮按
+    # 分支执行）；pre/post 始终只有一份 KV。因此物理容量按
+    # ``pre + post + middle * branch_factor`` 计，不能把分支数
+    # 乘到全部层上。
+    #
+    # per-visit 口径是「每个 token 实际执行多少次 Attention」，
+    # 即 attention_executions：smelt 只有 middle 访问两次，
+    # pre/post 各一次；B/B_early 的分支 Attention 也逐次计入。
+    # 直接拿物理层数乘 loop_count 会把 pre/post 也算成两次访问，
+    # 高估容量。
     kv_bytes_per_layer = 2 * 2 * kv_dim  # K+V × fp16 bytes
-    kv_bytes_physical = (
-        layers * kv_bytes_per_layer * branch_factor
+    kv_cache_layers = (
+        pre + post + middle * branch_factor
+        if mode in ("B", "B_early")
+        else layers
+    )
+    kv_bytes_physical = int(
+        kv_cache_layers * kv_bytes_per_layer
+    )
+    kv_bytes_per_visit = int(
+        attention_executions * kv_bytes_per_layer
     )
     return {
         "mode": mode,
@@ -502,14 +520,17 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
                 "请用 --budget-match 对完整计算图核对"
             ),
         },
-        "kv_cache_bytes_per_token": int(kv_bytes_physical),
-        "kv_cache_bytes_per_token_per_visit": int(
-            kv_bytes_physical * int(cfg.loop_count)
+        "kv_cache_bytes_per_token": kv_bytes_physical,
+        "kv_cache_bytes_per_token_per_visit": (
+            kv_bytes_per_visit
         ),
+        "kv_cache_physical_layers": int(kv_cache_layers),
         "kv_cache_note": (
-            "按物理层各缓存一份 K/V（B 按分支数乘 k1）的 fp16 "
-            "估计；per_visit 口径为每次循环访问都单独缓存。"
-            "增量解码尚未实现，这里只是容量下界/口径说明"
+            "按物理层各缓存一份 K/V 的 fp16 估计；B/B_early "
+            "只在 middle 区域按分支数乘 k1，pre/post 保持一份。"
+            "per_visit 口径为每个 token 实际执行的 Attention "
+            "次数（含循环与分支），不是物理层数乘循环次数。"
+            "增量解码尚未实现，这里只是容量估计/口径说明"
         ),
     }
 
