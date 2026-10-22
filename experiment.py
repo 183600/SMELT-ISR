@@ -27071,15 +27071,25 @@ def aggregate_runs(
                             * field_std
                             / math.sqrt(len(values))
                         )
-                        cost_entry["ci95_low"] = field_mean - cost_half
-                        cost_entry["ci95_high"] = field_mean + cost_half
-                        cost_entry["ci95"] = {
-                            "low": field_mean - cost_half,
-                            "high": field_mean + cost_half,
-                            "t_critical": cost_critical,
-                            "df": len(values) - 1,
-                            "method": "t_interval",
-                        }
+                        cost_low = field_mean - cost_half
+                        cost_high = field_mean + cost_half
+                        # 合法但极大的有限均值/标准差在乘 t 临界值
+                        # 或相加时仍可能越过 float 上限。区间无法
+                        # 用有限数表示时省略，而不是把 ±inf 写进
+                        # JSON（非标准 JSON，读取端会被迫崩溃或
+                        # 把无穷宽区间当成真实数值）。
+                        if math.isfinite(cost_low) and math.isfinite(
+                            cost_high
+                        ):
+                            cost_entry["ci95_low"] = cost_low
+                            cost_entry["ci95_high"] = cost_high
+                            cost_entry["ci95"] = {
+                                "low": cost_low,
+                                "high": cost_high,
+                                "t_critical": cost_critical,
+                                "df": len(values) - 1,
+                                "method": "t_interval",
+                            }
                 aggregate["costs"][field] = cost_entry
 
         for metric in metric_keys:
@@ -27122,15 +27132,22 @@ def aggregate_runs(
                     half_width = (
                         critical * std / math.sqrt(len(values))
                     )
-                    ci = {
-                        "low": mean - half_width,
-                        "high": mean + half_width,
-                        "t_critical": critical,
-                        "df": len(values) - 1,
-                        "method": "t_interval",
-                    }
-                    aggregate[f"{metric}_ci95_low"] = ci["low"]
-                    aggregate[f"{metric}_ci95_high"] = ci["high"]
+                    low = mean - half_width
+                    high = mean + half_width
+                    # 与成本 CI 同理：std/均值合法但极大时，t 区间
+                    # 的端点可能越过 float 上限。不能把 ±inf 写进
+                    # aggregate（它会被原样落盘到 JSON 报告）；无法
+                    # 表示时按「区间不可用」处理，保留点估计。
+                    if math.isfinite(low) and math.isfinite(high):
+                        ci = {
+                            "low": low,
+                            "high": high,
+                            "t_critical": critical,
+                            "df": len(values) - 1,
+                            "method": "t_interval",
+                        }
+                        aggregate[f"{metric}_ci95_low"] = low
+                        aggregate[f"{metric}_ci95_high"] = high
             aggregate.setdefault("ci95", {})[metric] = ci
 
             # 没有样本的指标从 JSON 报告中省略，避免大量 null。

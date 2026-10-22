@@ -6473,6 +6473,34 @@ class EdgeCaseRegressionTests(unittest.TestCase):
 
 
 class NumericalScaleTests(unittest.TestCase):
+    def test_aggregate_interval_omits_unrepresentable_bounds(self):
+        # 合法但极大的有限均值/标准差会让 t 区间端点越过 float
+        # 上限；报告必须省略该区间，而不是写入 JSON 无法表示的
+        # ±inf。
+        rows = [
+            {
+                "run": "r1",
+                "mode": "A",
+                "seed": 1,
+                "val_loss": 1.0e308,
+                "n_params": 1.0e308,
+            },
+            {
+                "run": "r2",
+                "mode": "A",
+                "seed": 2,
+                "val_loss": 1.0,
+                "n_params": 1.0,
+            },
+        ]
+        aggregate = experiment.aggregate_runs(rows, ["mode"])[0]
+        self.assertNotIn("val_loss_ci95_low", aggregate)
+        self.assertNotIn("val_loss_ci95_high", aggregate)
+        self.assertIsNone(aggregate["ci95"]["val_loss"])
+        self.assertNotIn("ci95_low", aggregate["costs"]["n_params"])
+        self.assertNotIn("ci95_high", aggregate["costs"]["n_params"])
+        json.dumps(aggregate, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
