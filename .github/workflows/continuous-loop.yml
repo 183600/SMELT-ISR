@@ -264,6 +264,7 @@ jobs:
           PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          # SINGLE 与 SCI_1~6 一起进入随机池：命中时本轮 sci 做单因素实验检查。
           PROMPT_SINGLE='确保需要是单因素实验的实验都是单因素实验。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
           PROMPT_CLEAN='不要修改算力申请.md；不要删除实验结果、审计记录、性能/预算/修复记录或 docs 下的分析文档——这些是审计链的一部分，必须保留或归档到外部不可变存储。只清理临时文件（*.tmp、opencode 临时配置、agent 自己生成的临时清单），不要用删除来“清理”历史记录。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”。'
           PROMPT_APPLY='确保算力申请.md没有错误。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
@@ -272,7 +273,6 @@ jobs:
           PERF_TIMEOUT=$((3*3600))     # 3h
           BUG_TIMEOUT=$((3*3600))      # 3h
           SCI_TIMEOUT=$((3*3600))      # 3h
-          SINGLE_TIMEOUT=$((3600))     # 1h（并入 sci 的单因素实验检查）
           CLEAN_TIMEOUT=$((3*3600))    # 3h
           APPLY_TIMEOUT=$((3*3600))    # 3h
 
@@ -810,15 +810,15 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（含单因素检查）-> apply（clean 的清理工作交给收尾的 shell 步骤）-----
+            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（7 选 1，含单因素）-> apply（clean 的清理工作交给收尾的 shell 步骤）-----
             # for phase in perf bug sci clean apply; do
             for phase in bug sci apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
                 sci)
-                  # 科研方法改进：从 PROMPT_SCI_1~6 中随机选一个提示词
-                  SCI_ROLL=$(( (RANDOM % 6) + 1 ))
+                  # 科研方法改进：从 PROMPT_SCI_1~6 + PROMPT_SINGLE 中随机选一个提示词（7 选 1）
+                  SCI_ROLL=$(( (RANDOM % 7) + 1 ))
                   case "$SCI_ROLL" in
                     1) P="$PROMPT_SCI_1"; SCI_LABEL='通用（不指定方面）' ;;
                     2) P="$PROMPT_SCI_2"; SCI_LABEL='实验设计与准备' ;;
@@ -826,6 +826,7 @@ jobs:
                     4) P="$PROMPT_SCI_4"; SCI_LABEL='可复现性与工程规范' ;;
                     5) P="$PROMPT_SCI_5"; SCI_LABEL='对比实验与消融' ;;
                     6) P="$PROMPT_SCI_6"; SCI_LABEL='结果分析' ;;
+                    7) P="$PROMPT_SINGLE"; SCI_LABEL='单因素实验' ;;
                   esac
                   T="$SCI_TIMEOUT"
                   echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
@@ -847,13 +848,6 @@ jobs:
                 perf|bug) P="$(fast_prompt "$phase" "$P")" ;;
               esac
               run_phase "$phase" "$P" "$T"
-
-              # 单因素实验检查并入 sci：同一次 sci 阶段内追加一次调用
-              if [ "$phase" = "sci" ]; then
-                echo ">>> iteration #$i | phase=sci-single | budget=${SINGLE_TIMEOUT}s（并入 sci）"
-                run_phase "sci-single" "$PROMPT_SINGLE" "$SINGLE_TIMEOUT"
-              fi
-
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
