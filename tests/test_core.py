@@ -6684,6 +6684,37 @@ class NumericalScaleTests(unittest.TestCase):
             )
         json.dumps(report, allow_nan=False)
 
+    def test_ablation_parity_ratio_overflow_is_not_written(self):
+        rows = [
+            {
+                "run": "base",
+                "mode": "local_base",
+                "balance_coef": 0.0,
+                "seed": 1,
+                "flops_per_forward": 1.0e-308,
+                "n_params": 1.0,
+            },
+            {
+                "run": "A",
+                "mode": "A",
+                "balance_coef": 0.0,
+                "seed": 1,
+                "flops_per_forward": 1.0e150,
+                "n_params": 1.0,
+            },
+        ]
+        report = experiment.ablation_coverage(
+            rows, ["mode", "balance_coef"]
+        )
+        entry = next(
+            item
+            for item in report["compute_parity"]
+            if item["delayed_mode"] == "A"
+        )
+        self.assertIsNone(entry["ratio"])
+        self.assertFalse(entry["matched"])
+        json.dumps(report, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],

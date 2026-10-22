@@ -31732,6 +31732,23 @@ def ablation_coverage(
         ):
             continue
         ratio = variant_cost / baseline_cost
+        if not math.isfinite(ratio):
+            # 两个有限成本仍可能相除溢出（如 1e150 / 1e-308）。
+            # 不写 inf，也不把它伪装成某个有限的「未匹配倍率」。
+            report["compute_parity"].append({
+                "delayed_mode": mode,
+                "field": field,
+                "baseline_value": baseline_cost,
+                "variant_value": variant_cost,
+                "ratio": None,
+                "matched": False,
+            })
+            report["advisories"].append(
+                f"{mode} 的 {field} 相对 local_base 的倍率超出"
+                "可表示的 float 范围：差异极端，不能归因于延迟"
+                "合并；请核对成本记录/单位是否损坏"
+            )
+            continue
         matched = ratio < _COST_RATIO_MATERIAL
         report["compute_parity"].append({
             "delayed_mode": mode,
@@ -31771,6 +31788,21 @@ def ablation_coverage(
         ):
             continue
         parameter_ratio = variant_params / baseline_params
+        if not math.isfinite(parameter_ratio):
+            report["capacity_parity"].append({
+                "delayed_mode": mode,
+                "field": "n_params",
+                "baseline_value": baseline_params,
+                "variant_value": variant_params,
+                "ratio": None,
+                "matched": False,
+            })
+            report["advisories"].append(
+                f"{mode} 的 n_params 相对 local_base 的倍率"
+                "超出可表示的 float 范围：不能归因于延迟合并，"
+                "请核对参数记录/单位是否损坏"
+            )
+            continue
         parameter_matched = (
             parameter_ratio < _COST_RATIO_MATERIAL
         )
