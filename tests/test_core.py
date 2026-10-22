@@ -6331,6 +6331,40 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(constant["high"], 1.0e308)
         self.assertIsNone(constant["lag1_autocorrelation"])
 
+    def test_hierarchical_window_bootstrap_is_scale_stable(self):
+        small = {
+            1: [1.0, 2.0, 3.0],
+            2: [2.0, 3.0, 4.0],
+        }
+        large = {
+            seed: [value * 1.0e300 for value in values]
+            for seed, values in small.items()
+        }
+        small_ci = experiment._hierarchical_window_bootstrap_ci(small)
+        large_ci = experiment._hierarchical_window_bootstrap_ci(large)
+        self.assertTrue(small_ci["available"])
+        self.assertTrue(large_ci["available"])
+        self.assertTrue(math.isfinite(large_ci["low"]))
+        self.assertTrue(math.isfinite(large_ci["high"]))
+        scale = 1.0e300
+        self.assertAlmostEqual(
+            large_ci["low"] / scale,
+            small_ci["low"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_ci["high"] / scale,
+            small_ci["high"],
+            places=12,
+        )
+
+        constant = experiment._hierarchical_window_bootstrap_ci({
+            1: [1.0e308, 1.0e308],
+            2: [1.0e308, 1.0e308],
+        })
+        self.assertEqual(constant["low"], 1.0e308)
+        self.assertEqual(constant["high"], 1.0e308)
+
 
 if __name__ == "__main__":
     unittest.main()

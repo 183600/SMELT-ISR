@@ -24355,6 +24355,19 @@ def _hierarchical_window_bootstrap_ci(
         for seed in seed_order
         for value in usable[seed]
     ]
+    # 与单层窗口 bootstrap 相同：合法的大差值在重采样求均值时
+    # 会把总和溢出成 inf，区间随之变成 NaN。两层 bootstrap 的
+    # 均值同样对公共尺度等变，按所有种子/窗口的最大绝对值统一
+    # 归一化，最后再还原；随机种子仍由原始值派生。
+    scale = max(abs(value) for value in flatten)
+    if scale > 1.0e150:
+        scaled_usable = {
+            seed: [value / scale for value in usable[seed]]
+            for seed in seed_order
+        }
+    else:
+        scale = 1.0
+        scaled_usable = usable
     generator = torch.Generator().manual_seed(
         _randomization_seed(flatten)
     )
@@ -24378,7 +24391,7 @@ def _hierarchical_window_bootstrap_ci(
     )
     for column, seed in enumerate(seed_order):
         values = torch.tensor(
-            usable[seed], dtype=torch.float64
+            scaled_usable[seed], dtype=torch.float64
         )
         resampled_means[:, column] = values[
             window_indices
@@ -24386,8 +24399,8 @@ def _hierarchical_window_bootstrap_ci(
     draws = torch.gather(
         resampled_means, 1, seed_indices
     ).mean(dim=1)
-    low = float(torch.quantile(draws, 0.025).item())
-    high = float(torch.quantile(draws, 0.975).item())
+    low = float(torch.quantile(draws, 0.025).item()) * scale
+    high = float(torch.quantile(draws, 0.975).item()) * scale
     return {
         "available": True,
         "low": low,
