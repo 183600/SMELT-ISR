@@ -22704,14 +22704,32 @@ def ablation_component_verdicts(
                 f" {entry.get('field')} 不匹配"
                 + ratio_text
             )
-    if (
-        factorial.get("metric") != _COMPUTE_MATCHED_METRIC
-        and not parity_entries
-    ):
-        blockers.append(
-            "所有运行都缺 FLOPs/参数量记录：计算量对齐"
-            "未核对，不能把差异归因到组件"
-        )
+    if factorial.get("metric") != _COMPUTE_MATCHED_METRIC:
+        if not parity_entries:
+            blockers.append(
+                "所有运行都缺 FLOPs/参数量记录：计算量对齐"
+                "未核对，不能把差异归因到组件"
+            )
+        else:
+            parity_modes = {
+                str(entry.get("delayed_mode"))
+                for entry in parity_entries
+            }
+            # 一个方案有记录不代表其他方案也有：只核对 A 的
+            # FLOPs 时，B vs local_base 仍可能是未核对的额外
+            # 计算，不能因为 parity_entries 非空就放行。
+            missing_parity_modes = [
+                mode
+                for mode in expected_delayed
+                if mode not in parity_modes
+            ]
+            if missing_parity_modes:
+                blockers.append(
+                    "以下延迟合并方案缺 FLOPs/参数量记录："
+                    + ", ".join(missing_parity_modes)
+                    + "：计算量对齐未核对，不能把差异归因"
+                    "到组件"
+                )
     alignment = coverage.get("global_seed_alignment")
     if isinstance(alignment, dict) and alignment.get(
         "applicable"
@@ -40977,6 +40995,29 @@ def run_self_test():
             "计算量对齐未核对" in blocker
             for blocker in no_compute_verdicts["blockers"]
         )
+
+        # 只有部分方案有 FLOPs/参数量记录时，其余方案的计算量
+        # 对齐仍未核对；不能因为 parity_entries 非空就放行。
+        partial_compute_coverage = json.loads(
+            json.dumps(component_coverage)
+        )
+        partial_compute_coverage["compute_parity"][0][
+            "delayed_mode"
+        ] = "B"
+        partial_compute_verdicts = (
+            ablation_component_verdicts(
+                factorial,
+                partial_compute_coverage,
+            )
+        )
+        assert not partial_compute_verdicts[
+            "all_components_supported"
+        ]
+        assert any(
+            "A" in blocker
+            and "计算量对齐未核对" in blocker
+            for blocker in partial_compute_verdicts["blockers"]
+        ), partial_compute_verdicts["blockers"]
 
         # 同一消融上下文折叠多个正 balance_coef 会混入均衡
         # 强度差异；即使其余效应都支持，也不能宣称各组件
