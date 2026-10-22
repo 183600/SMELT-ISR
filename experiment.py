@@ -22895,6 +22895,7 @@ def factorial_effects(
 _COMPONENT_BLOCKING_CLAIMS = frozenset({
     "confounded",
     "compute_confounded",
+    "capacity_confounded",
     "randomness_confounded",
     "attrition_confounded",
     "unverified_controls",
@@ -23182,6 +23183,20 @@ def ablation_component_verdicts(
         if values:
             blockers.append(
                 f"{label}（{len(values)} 项）：主效应不能归因"
+            )
+    capacity_entries = coverage.get("capacity_parity") or []
+    for entry in capacity_entries:
+        if not entry.get("matched"):
+            ratio = entry.get("ratio")
+            ratio_text = (
+                f"（{float(ratio):.2f}×）"
+                if isinstance(ratio, (int, float))
+                and not isinstance(ratio, bool)
+                else ""
+            )
+            blockers.append(
+                f"{entry.get('delayed_mode')} 与 local_base 的"
+                f"参数量不匹配" + ratio_text
             )
     parity_entries = coverage.get("compute_parity") or []
     for entry in parity_entries:
@@ -24422,6 +24437,7 @@ def ablation_coverage(
         "width_confounds": [],
         "seed_alignment": [],
         "compute_parity": [],
+        "capacity_parity": [],
         "numerical_attrition": [],
         "attrition_confounds": [],
         "advisories": [],
@@ -24736,6 +24752,45 @@ def ablation_coverage(
                 "归因于延迟合并；请用 "
                 "--compare-metric val_loss_at_matched_flops "
                 "在等训练计算量点复核，或报告等计算对照"
+            )
+
+    # FLOPs 对齐不等于容量对齐：A/B 与 local_base 若参数量
+    # 相差很多，多出的容量本身就能改善 loss，等 FLOPs 指标也
+    # 无法排除。这里单独核对 n_params 倍率。
+    for mode in coverage_modes:
+        if (
+            "local_base" not in modes_present
+            or mode not in modes_present
+        ):
+            continue
+        baseline_params = _rows_cost_mean(
+            "local_base", "n_params"
+        )
+        variant_params = _rows_cost_mean(mode, "n_params")
+        if (
+            baseline_params is None
+            or variant_params is None
+            or baseline_params <= 0.0
+        ):
+            continue
+        parameter_ratio = variant_params / baseline_params
+        parameter_matched = (
+            parameter_ratio < _COST_RATIO_MATERIAL
+        )
+        report["capacity_parity"].append({
+            "delayed_mode": mode,
+            "field": "n_params",
+            "baseline_value": baseline_params,
+            "variant_value": variant_params,
+            "ratio": parameter_ratio,
+            "matched": parameter_matched,
+        })
+        if not parameter_matched:
+            report["advisories"].append(
+                f"{mode} 的 n_params 是 local_base 的 "
+                f"{parameter_ratio:.2f} 倍：等 FLOPs 也不等于"
+                "等容量，主效应混入参数容量差异，不能归因"
+                "到延迟合并"
             )
 
     # A 的第二轮宽度是 k1 个分支各路由 k2 个专家，而
@@ -28059,6 +28114,11 @@ def annotate_factorial_confounds(
         entry.get("delayed_mode")
         for entry in coverage.get("width_confounds", [])
     )
+    compute_confounds.update(
+        entry.get("delayed_mode")
+        for entry in coverage.get("capacity_parity", [])
+        if not entry.get("matched")
+    )
     compute_confounds.discard(None)
     if compute_confounds:
         for effect in factorial.get("effects", []):
@@ -28073,6 +28133,29 @@ def annotate_factorial_confounds(
         factorial.setdefault("advisories", []).append(
             "部分方案与 local_base 的计算量不匹配：这些方案的"
             "主效应混入计算量，须在等训练计算量指标上复核"
+        )
+
+    capacity_confounds = {
+        entry.get("delayed_mode")
+        for entry in coverage.get("capacity_parity", [])
+        if not entry.get("matched")
+    }
+    capacity_confounds.discard(None)
+    if capacity_confounds:
+        for effect in factorial.get("effects", []):
+            if effect.get("delayed_mode") not in capacity_confounds:
+                continue
+            effect["capacity_confounded"] = True
+            if effect.get("claim") in positive_claims | {
+                "confounded",
+                "unverified_controls",
+                "compute_confounded",
+            }:
+                effect["claim"] = "capacity_confounded"
+        factorial.setdefault("advisories", []).append(
+            "部分方案与 local_base 的参数量不匹配：即使 FLOPs "
+            "对齐，多出的参数容量也可能带来收益，主效应不能"
+            "归因到延迟合并本身"
         )
 
 
@@ -28361,6 +28444,8 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append("消融结构设置混杂")
     if effect.get("compute_confounded"):
         qualifiers.append("计算量未对齐")
+    if effect.get("capacity_confounded"):
+        qualifiers.append("模型参数量未对齐")
     if effect.get("randomness_confounded"):
         qualifiers.append(
             "同种子初始化/训练数据不一致"
@@ -28400,6 +28485,9 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
             ),
             "compute_confounded": (
                 "显著但计算量不匹配，需等计算量复核"
+            ),
+            "capacity_confounded": (
+                "显著但参数量/容量不匹配，不能归因"
             ),
             "randomness_confounded": (
                 "显著但同种子随机性未对齐，不能归因"
@@ -30247,6 +30335,17 @@ def print_comparison_analysis(
             "--compare-metric val_loss_at_matched_flops "
             "在等训练计算量点复核"
         )
+    for entry in coverage.get("capacity_parity", []):
+        if entry["matched"]:
+            continue
+        print(
+            "  [confounded] 参数量不匹配: "
+            f"{entry['delayed_mode']} 的 n_params 是 "
+            "local_base 的 "
+            f"{float(entry['ratio']):.2f} 倍，"
+            "即使 FLOPs 对齐，多出的容量也可能带来收益，"
+            "主效应不能归因到延迟合并"
+        )
     if coverage["low_replicate_cells"]:
         for message in coverage["low_replicate_cells"]:
             print(f"  [warn] {message}")
@@ -30315,8 +30414,15 @@ def print_comparison_analysis(
         entry.get("matched") for entry in parity_entries
     )
     width_parity_ok = not coverage.get("width_confounds")
+    capacity_entries = coverage.get("capacity_parity") or []
+    capacity_parity_ok = all(
+        entry.get("matched") for entry in capacity_entries
+    )
+    capacity_parity_checked = bool(capacity_entries)
     compute_aligned = metric == _COMPUTE_MATCHED_METRIC or (
-        compute_parity_ok and width_parity_ok
+        compute_parity_ok
+        and width_parity_ok
+        and (capacity_parity_ok or not capacity_parity_checked)
     )
     global_alignment_info = coverage.get(
         "global_seed_alignment"
@@ -42538,6 +42644,81 @@ def run_self_test():
         assert any(
             "计算量" in message
             for message in parity_coverage["advisories"]
+        )
+
+        # 等 FLOPs 不等于等容量：B 的参数量是 local_base 的
+        # 3 倍时，即使 FLOPs 完全一致，也必须单独点名容量
+        # 混杂，不能把收益归因到延迟合并。
+        capacity_paths = [
+            _write_analysis_run(
+                "fact_B_on_capacity",
+                "B",
+                1,
+                3e-4,
+                100,
+                0.01,
+                2.80,
+                flops=1000,
+                n_params=3000,
+            ),
+            _write_analysis_run(
+                "fact_local_on_capacity",
+                "local_base",
+                1,
+                3e-4,
+                100,
+                0.01,
+                3.00,
+                flops=1000,
+                n_params=1000,
+            ),
+        ]
+        capacity_coverage = ablation_coverage(
+            compare_runs(capacity_paths),
+            factors,
+        )
+        capacity_entries = [
+            entry
+            for entry in capacity_coverage["capacity_parity"]
+            if entry["delayed_mode"] == "B"
+        ]
+        assert capacity_entries, capacity_coverage
+        assert not capacity_entries[0]["matched"]
+        assert abs(capacity_entries[0]["ratio"] - 3.0) < 1e-9
+        assert any(
+            "n_params" in message
+            for message in capacity_coverage["advisories"]
+        )
+        capacity_factorial = {
+            "effects": [
+                {
+                    "delayed_mode": "B",
+                    "claim": "supports_component",
+                },
+                {
+                    "delayed_mode": "A",
+                    "claim": "supports_component",
+                },
+            ],
+            "advisories": [],
+        }
+        annotate_factorial_confounds(
+            capacity_factorial,
+            {"ok": True},
+            capacity_coverage,
+        )
+        assert (
+            capacity_factorial["effects"][0]["claim"]
+            == "capacity_confounded"
+        )
+        assert (
+            capacity_factorial["effects"][0][
+                "capacity_confounded"
+            ]
+        )
+        assert (
+            capacity_factorial["effects"][1]["claim"]
+            == "supports_component"
         )
 
         # 种子未对齐：A 的 2×2 各格种子集合不同（有的多一个
