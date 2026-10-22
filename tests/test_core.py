@@ -1700,6 +1700,192 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertIsInstance(error, str)
 
 
+    def test_counterbalanced_order_balances_positions(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3, 4, 5, 6],
+            modes=["A", "B", "C"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "counterbalanced", 11
+        )
+        repeated = experiment.order_sweep_plan(
+            plan, "counterbalanced", 11
+        )
+        self.assertEqual(
+            [item["label"] for item in ordered],
+            [item["label"] for item in repeated],
+        )
+        report = experiment.run_order_balance_report(ordered)
+        self.assertTrue(report["available"])
+        self.assertTrue(report["complete_blocks"])
+        self.assertTrue(report["balanced"])
+        self.assertEqual(report["max_position_imbalance"], 0)
+        # 每个种子区组仍包含全部三个处理各一次，只是位置被
+        # 拉丁方轮换。
+        for seed in range(1, 7):
+            block = [
+                item
+                for item in ordered
+                if item["block"] == seed
+            ]
+            self.assertEqual(
+                sorted(item["mode"] for item in block),
+                ["A", "B", "C"],
+            )
+            self.assertEqual(
+                [item["position_in_block"] for item in block],
+                [1, 2, 3],
+            )
+
+    def test_counterbalanced_rejects_unequal_blocks(self):
+        plan = [
+            {
+                "label": "A_seed1",
+                "mode": "A",
+                "balance_coef": 0.01,
+                "seed": 1,
+            },
+            {
+                "label": "B_seed1",
+                "mode": "B",
+                "balance_coef": 0.01,
+                "seed": 1,
+            },
+            {
+                "label": "A_seed2",
+                "mode": "A",
+                "balance_coef": 0.01,
+                "seed": 2,
+            },
+        ]
+        with self.assertRaises(ValueError) as context:
+            experiment.order_sweep_plan(
+                plan, "counterbalanced", 0
+            )
+        self.assertIn("相同的处理单元", str(context.exception))
+
+    def test_order_balance_report_detects_position_confounding(self):
+        plan = [
+            {
+                "label": "A_seed1",
+                "mode": "A",
+                "seed": 1,
+                "block": 1,
+                "position_in_block": 1,
+            },
+            {
+                "label": "B_seed1",
+                "mode": "B",
+                "seed": 1,
+                "block": 1,
+                "position_in_block": 2,
+            },
+            {
+                "label": "A_seed2",
+                "mode": "A",
+                "seed": 2,
+                "block": 2,
+                "position_in_block": 1,
+            },
+            {
+                "label": "B_seed2",
+                "mode": "B",
+                "seed": 2,
+                "block": 2,
+                "position_in_block": 2,
+            },
+        ]
+        report = experiment.run_order_balance_report(plan)
+        self.assertTrue(report["available"])
+        self.assertFalse(report["balanced"])
+        self.assertEqual(report["max_position_imbalance"], 2)
+
+    def test_preregistration_power_accounts_for_attrition(self):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 50))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.005,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "expected_attrition_rate": 0.2,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("启动种子", error)
+
+        payload["seeds"] = list(range(42, 51))
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        plan = experiment.preregistration_power_plan(
+            payload["power"],
+            0.01,
+            len(payload["seeds"]),
+            2,
+        )
+        self.assertEqual(plan["required_seeds"], 7)
+        self.assertEqual(
+            plan["required_seeds_with_attrition"], 9
+        )
+        self.assertEqual(plan["planned_usable_seeds"], 7)
+        self.assertTrue(plan["adequate"])
+
+    def test_preregistration_power_reports_mde_and_sensitivity(self):
+        power = {
+            "expected_seed_sd_relative": 0.005,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 5,
+        }
+        plan = experiment.preregistration_power_plan(
+            power, 0.01, 8, 5
+        )
+        self.assertTrue(plan["adequate"])
+        self.assertIsNotNone(
+            plan["achieved_power_at_min_effect"]
+        )
+        self.assertGreaterEqual(
+            plan["achieved_power_at_min_effect"], 0.8
+        )
+        self.assertIsNotNone(
+            plan["minimum_detectable_effect_relative"]
+        )
+        self.assertLessEqual(
+            plan["minimum_detectable_effect_relative"], 0.01
+        )
+        sensitivity = plan["power_sensitivity"]
+        self.assertEqual(
+            [entry["sd_multiplier"] for entry in sensitivity],
+            [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+        )
+        required = [
+            entry["required_seeds_for_t"]
+            for entry in sensitivity
+            if entry["required_seeds_for_t"] is not None
+        ]
+        self.assertEqual(required, sorted(required))
+
+    def test_preregistration_power_rejects_invalid_attrition(self):
+        payload = self._payload()
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.005,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "expected_attrition_rate": 1.0,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("expected_attrition_rate", error)
+
+        payload["power"]["expected_attrition_rate"] = -0.1
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("expected_attrition_rate", error)
+
+
 class RoutingTests(unittest.TestCase):
     def test_chance_levels_are_reported(self):
         a = torch.tensor([[0, 1], [2, 3], [0, 2]])

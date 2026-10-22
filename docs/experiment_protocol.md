@@ -48,7 +48,7 @@
   "budget_match": "smelt",
   "equivalence_margin": 0.01,
   "run_order": {
-    "scheme": "randomized",
+    "scheme": "counterbalanced",
     "seed": 20261022
   },
   "data": {
@@ -97,18 +97,24 @@
 - `power`（可选）是先验功效分析：`expected_seed_sd_relative`
   （预期种子间标准差，相对基线均值）、`target_power`、`alpha`
   与可选 `planned_comparisons`（默认等于 `comparisons` 数量，
-  不得更小）。按 Bonferroni 下界 `alpha/m` 与稳健符号翻转
-  要求计算所需种子数；当前 `seeds` 不足时默认拒绝启动。确需
-  在功效不足的设计上探索时，必须写
+  不得更小）、可选 `expected_attrition_rate`（预期因数值失败/
+  数据问题不可用的运行比例，`[0, 1)`）。按 Bonferroni 下界
+  `alpha/m`、稳健符号翻转要求与预期脱落折算的可用种子数计算
+  所需启动种子数；当前 `seeds` 不足时默认拒绝启动。报告同时
+  给出计划可用种子数下的实际功效、MDE 与 sd 敏感性。确需在
+  功效不足的设计上探索时，必须写
   `underpowered_acknowledged: true` 并给出非空
   `justification`，承认会随 `config.json` 的
   `preregistration.power` 落盘。详见
   [design_preparation.md](design_preparation.md)。
 - `run_order`（可选）冻结执行顺序：`scheme` 为 `grouped` /
-  `blocked` / `randomized`，`seed` 为确定性洗牌种子。推荐
-  `randomized`（随机化完整区组）：每个种子区组内所有臂都跑
-  一次、臂顺序随机化，避免机器漂移与臂效应混杂。命令行
-  `--run-order` / `--run-order-seed` 显式冲突时拒绝启动。
+  `blocked` / `randomized` / `counterbalanced`，`seed` 为确定性
+  洗牌种子。默认 `randomized`（随机化完整区组）：每个种子区组
+  内所有臂都跑一次、臂顺序随机化，避免机器漂移与臂效应混杂。
+  `counterbalanced` 进一步用循环拉丁方限制性随机化，使每个处理
+  在各区组位置上的出现次数尽可能相等；它要求每个种子区组包含
+  同一组处理，缺格时拒绝生成计划。命令行 `--run-order` /
+  `--run-order-seed` 显式冲突时拒绝启动。
 - `budget_match` 为 `null` 或模式名；非 null 时等价于
   `--budget-match` 的完整计算图硬门。它按**本次运行的候选
   模式**解释：同一 study 若既包含 `base`（循环次数不同，
@@ -143,7 +149,8 @@
   "expected_seed_sd_relative": 0.005,
   "target_power": 0.8,
   "alpha": 0.05,
-  "planned_comparisons": 5
+  "planned_comparisons": 5,
+  "expected_attrition_rate": 0.1
 }
 ```
 
@@ -153,12 +160,13 @@
 python experiment.py --data corpus.txt --out runs/confirm-design \
   --preregistration preregistration.json \
   --suite-modes smelt local_base local_base_k2 A B B_early \
-  --run-order randomized --run-order-seed 20261022 \
+  --run-order counterbalanced --run-order-seed 20261022 \
   --plan-design --hypothesis "延迟合并在完整计算图匹配下改善验证损失"
 ```
 
 它不加载数据、不训练，只写出 `<out>/design_plan.json` 并打印
-运行清单、随机化区组顺序、先验功效与解析 token 预算。确认后
+运行清单、随机化/平衡区组顺序、位置平衡审计、先验功效（含
+脱落折算、实际功效、MDE 与 sd 敏感性）与解析 token 预算。确认后
 再冻结代码并正式运行；正式运行会用同一 `--run-order-seed`
 重建同一顺序，子进程逐项核对计划指纹与自己的分配。详见
 [design_preparation.md](design_preparation.md)。
@@ -247,9 +255,11 @@ python experiment.py --data corpus.txt --out runs/confirm \
   重跑；n=3 的设计删除后不足最小种子数，标为
   `not_evaluable`，不能当作「删除后仍显著」。
 - 报告 `run_order`：计划指纹是否一致、是否仍用 `grouped`
-  顺序、去模式均值后指标与执行顺序的 Spearman 相关。强顺序
-  相关先检查机器负载/热漂移并重跑受影响区组，不能直接把臂间
-  差异解释为方法效应。该诊断是描述性的，不替代随机化设计。
+  顺序、去模式均值后指标与执行顺序的 Spearman 相关；同时报告
+  `design.order_balance`，确认限制性随机化/区组的位置计数是否
+  均衡。强顺序相关先检查机器负载/热漂移并重跑受影响区组，不能
+  直接把臂间差异解释为方法效应。该诊断是描述性的，不替代随机化
+  设计。
 - 路由结论必须带机会水平（`jaccard_chance_*`、`lift`）与干预
   结果，不能只报负载熵/死专家数。
 

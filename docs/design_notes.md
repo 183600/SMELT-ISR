@@ -406,42 +406,52 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 ## 实验设计与准备
 
 训练前的设计与分析阶段同样重要：一个功效不足或顺序混杂的
-设计，无法靠事后统计补救。当前实现把三项准备动作落到代码：
+设计，无法靠事后统计补救。当前实现把以下准备动作落到代码：
 
 - **先验功效（`power`）**：预注册文件可声明
   `expected_seed_sd_relative`（预期种子间标准差，相对基线
-  均值）、`target_power`、`alpha` 与可选
+  均值）、`target_power`、`alpha`、可选
   `planned_comparisons`（默认等于 `comparisons` 数量，不得
-  更小）。`preregistration_power_plan` 按 Bonferroni 下界
+  更小）与可选 `expected_attrition_rate`（预期不可用运行
+  比例）。`preregistration_power_plan` 按 Bonferroni 下界
   `alpha/m` 计算配对 t 所需种子数，并同时满足精确符号翻转
   所需 `ceil(log2(2m/alpha))`，取较大值作为
-  `required_seeds`。种子数不足时预注册入口默认拒绝启动；
-  确需探索时必须写 `underpowered_acknowledged: true` 与
-  `justification`，承认随 `config.json` 的
-  `preregistration.power` 落盘。
-- **随机化完整区组（`run_order`）**：`--run-order
-  {grouped,blocked,randomized}` 与 `--run-order-seed` 控制
-  套件执行顺序，默认 `randomized`——每个种子是一个完整区组，
-  区组内所有臂都跑一次、臂顺序由 `(order_seed, seed)` 确定性
-  洗牌。`grouped` 保留历史顺序，但模式与时间/机器漂移完全
-  混杂，只用于兼容旧运行。预注册可用 `run_order` 冻结方案与
-  种子，命令行显式冲突拒绝启动。
+  `required_seeds`；再按预期脱落率反推
+  `required_seeds_with_attrition` 与 `planned_usable_seeds`。
+  报告还给出计划可用种子数下的
+  `achieved_power_at_min_effect`、
+  `minimum_detectable_effect_relative` 与 `power_sensitivity`
+  （sd 乘以 0.5~2.0 重算），避免只报一个乐观的种子数。
+  种子数不足时预注册入口默认拒绝启动；确需探索时必须写
+  `underpowered_acknowledged: true` 与 `justification`，承认
+  随 `config.json` 的 `preregistration.power` 落盘。
+- **随机化/平衡完整区组（`run_order`）**：`--run-order
+  {grouped,blocked,randomized,counterbalanced}` 与
+  `--run-order-seed` 控制套件执行顺序，默认 `randomized`——
+  每个种子是一个完整区组，区组内所有臂都跑一次、臂顺序由
+  `(order_seed, seed)` 确定性洗牌。`counterbalanced` 用循环
+  拉丁方限制性随机化，使每个处理在各区组位置上的出现次数
+  尽可能相等；它要求每个区组包含同一组处理，缺格时拒绝
+  生成计划。`grouped` 保留历史顺序，但模式与时间/机器漂移
+  完全混杂，只用于兼容旧运行。预注册可用 `run_order` 冻结
+  方案与种子，命令行显式冲突拒绝启动。
 - **设计计划（`design_plan.json`）**：套件父进程在训练前
-  写运行清单、执行顺序/区组、先验功效、种子计划与解析 token
-  预算，`plan_id` 是去掉时间戳后的规范化指纹。
-  `--plan-design` 只生成/打印计划、不加载数据也不训练，供
-  冻结前检查。子进程通过环境变量收到计划文件、SHA-256、
-  `plan_id` 与 (order_index, block, position)，开跑前重新
-  哈希并核对 label/seed/mode/balance；计划被改或分配不符即
-  拒绝训练。实际开始/结束时间写 `<out>/run_order.json`
-  （失败条目也保留），父进程结束后再核对全部子运行的
-  `plan_id` 一致。
+  写运行清单、执行顺序/区组、`order_balance` 位置平衡审计、
+  先验功效、种子计划与解析 token 预算，`plan_id` 是去掉
+  时间戳后的规范化指纹。`--plan-design` 只生成/打印计划、
+  不加载数据也不训练，供冻结前检查。子进程通过环境变量收到
+  计划文件、SHA-256、`plan_id` 与 (order_index, block,
+  position)，开跑前重新哈希并核对 label/seed/mode/balance；
+  计划被改或分配不符即拒绝训练。实际开始/结束时间写
+  `<out>/run_order.json`（失败条目也保留），父进程结束后再
+  核对全部子运行的 `plan_id` 一致。
 - **顺序漂移诊断（`run_order`）**：`--compare` 与套件汇总
-  报告计划指纹是否混杂、是否仍使用 grouped、去模式均值后
-  指标与执行顺序的 Spearman 相关与近似 p 值、各模式内部的
-  顺序相关。强相关以 `[warn]` 提示先检查机器负载/热漂移或
-  重跑受影响区组；这是描述性诊断，不是把时间作为协变量的
-  正式区组模型，随机化只能平衡漂移、不能消除它。
+  报告计划指纹是否混杂、是否仍使用 grouped、设计中的位置
+  平衡审计、去模式均值后指标与执行顺序的 Spearman 相关与
+  近似 p 值、各模式内部的顺序相关。强相关以 `[warn]` 提示
+  先检查机器负载/热漂移或重跑受影响区组；这是描述性诊断，
+  不是把时间作为协变量的正式区组模型，随机化只能平衡漂移、
+  不能消除它。
 
 完整字段、计算口径与推荐流程见
 [design_preparation.md](design_preparation.md)。
@@ -1042,9 +1052,10 @@ A B）、`--allow-underpowered`（显式允许套件在 <3 个种子下
 至少需要 6 个种子，否则用显式豁免并标记 `robust_claim_possible=false`。
 设计准备相关：`--plan-design`（只生成/打印
 `design_plan.json`，不训练）、`--run-order
-{grouped,blocked,randomized}`（默认 randomized 完整区组）、
+{grouped,blocked,randomized,counterbalanced}`（默认 randomized
+完整区组；counterbalanced 进一步平衡区组内位置）、
 `--run-order-seed`（确定性洗牌种子）；预注册文件另有可选
-`power` 与 `run_order` 块。
+`power`（含预期脱落率与 sd 敏感性）与 `run_order` 块。
 套件逐进程调用自身，结束后自动输出完整对比分析并写入
 `<out>/comparison_analysis.json`（调参套件写
 `<out>/baseline_tuning.json`）。基线训练可用

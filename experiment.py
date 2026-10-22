@@ -32051,6 +32051,7 @@ _POWER_KEYS = (
     "target_power",
     "alpha",
     "planned_comparisons",
+    "expected_attrition_rate",
     "underpowered_acknowledged",
     "justification",
 )
@@ -32059,10 +32060,18 @@ _RUN_ORDER_KEYS = ("scheme", "seed")
 
 # grouped 保留历史顺序（按模式分组，时间漂移与臂完全混杂）；
 # blocked 按种子成区组、区组内保持原有臂顺序；randomized 在
-# 每个种子区组内随机化臂顺序（推荐的确证设计）。
-_RUN_ORDER_SCHEMES = ("grouped", "blocked", "randomized")
+# 每个种子区组内随机化臂顺序（默认）；counterbalanced 在完整
+# 区组的基础上用循环拉丁方/平衡排列，使每个处理在各区组位置
+# 上的出现次数尽可能相等，避免小样本随机化偶然把某个臂系统性
+# 地放在更晚/更早的时间片。
+_RUN_ORDER_SCHEMES = (
+    "grouped",
+    "blocked",
+    "randomized",
+    "counterbalanced",
+)
 
-_DESIGN_PLAN_SCHEMA_VERSION = 1
+_DESIGN_PLAN_SCHEMA_VERSION = 2
 _DESIGN_PLAN_FILENAME = "design_plan.json"
 _RUN_ORDER_FILENAME = "run_order.json"
 
@@ -32154,7 +32163,107 @@ def preregistration_power_plan(
     acknowledged = bool(
         power.get("underpowered_acknowledged", False)
     )
-    adequate = required_t is not None and n_seeds >= required
+
+    # 预期数据脱落/数值失败：功效公式里的 n 是**可用**运行数，
+    # 不是启动数。若某个臂历史上约有 20% 的运行会 NaN 发散，
+    # 计划 8 个种子只得到约 6.4 个可用配对；按 8 计算会系统性
+    # 高估功效。这里把预期脱落率作为预注册的一部分，反推需要
+    # 启动多少种子，并把「计划可用种子数」与「达到目标功效所
+    # 需启动数」分开报告。
+    raw_attrition = power.get("expected_attrition_rate", 0.0)
+    try:
+        attrition = float(raw_attrition)
+    except (TypeError, ValueError, OverflowError):
+        attrition = 0.0
+    if (
+        not math.isfinite(attrition)
+        or attrition < 0.0
+        or attrition >= 1.0
+    ):
+        # 直接调用本函数时也要保持可判定；结构错误由
+        # preregistration_schema_error 在入口拒绝。
+        attrition = 0.0
+    usable_seeds = max(
+        1,
+        min(
+            int(n_seeds),
+            int(math.floor(float(n_seeds) * (1.0 - attrition) + 1e-12)),
+        ),
+    )
+    if required_t is None:
+        required_with_attrition = None
+    else:
+        # 向上取整，确保预期可用数仍不低于功效要求；不能把
+        # 「四舍五入后刚好够」当作足够。
+        required_with_attrition = int(
+            math.ceil(float(required) / (1.0 - attrition))
+        )
+    adequate = (
+        required_t is not None
+        and int(n_seeds) >= int(required_with_attrition or required)
+    )
+
+    # 在计划可用种子数下报告实际能达到的功效与 MDE：仅说
+    # 「需要 8 个」不够，研究者还需要看到「按当前计划即使
+    # 真实效应等于最小有意义效应，也只有 0.6 的功效」这类
+    # 直接可执行的诊断。MDE 与 min_effect 同单位（相对基线
+    # 均值），可直接比较。
+    achieved_power = None
+    mde = None
+    if alpha_adjusted > 0.0 and usable_seeds >= _MIN_SEEDS_FOR_STATS:
+        se = sd / math.sqrt(float(usable_seeds))
+        df = float(usable_seeds - 1)
+        achieved_power = _t_power(
+            float(min_effect),
+            se,
+            df,
+            alpha_adjusted,
+        )
+        mde = _minimum_detectable_effect(
+            se,
+            df,
+            target,
+            alpha_adjusted,
+        )
+
+    # 对「预期种子间标准差估计偏小/偏大」做敏感性分析。先验
+    # 功效最大的不确定性来自 sd 本身；只报一个 required_seeds
+    # 会把估计误差藏在点估计后面。
+    sensitivity: List[Dict[str, object]] = []
+    for multiplier in (0.5, 0.75, 1.0, 1.25, 1.5, 2.0):
+        scaled_sd = sd * multiplier
+        scaled_required = (
+            _seeds_to_detect(
+                float(min_effect),
+                scaled_sd,
+                target_power=target,
+                alpha=alpha_adjusted,
+            )
+            if alpha_adjusted > 0.0
+            else None
+        )
+        scaled_with_attrition = (
+            int(
+                math.ceil(
+                    float(scaled_required) / (1.0 - attrition)
+                )
+            )
+            if scaled_required is not None
+            else None
+        )
+        sensitivity.append({
+            "sd_multiplier": multiplier,
+            "expected_seed_sd_relative": scaled_sd,
+            "required_seeds_for_t": scaled_required,
+            "required_seeds_with_attrition": (
+                scaled_with_attrition
+            ),
+            "adequate_at_planned_seeds": (
+                scaled_with_attrition is not None
+                and int(n_seeds) >= scaled_with_attrition
+            ),
+        })
+
     return {
         "expected_seed_sd_relative": sd,
         "min_effect_relative": float(min_effect),
@@ -32164,8 +32273,17 @@ def preregistration_power_plan(
         "alpha_bonferroni": alpha_adjusted,
         "required_seeds_for_t": required_t,
         "required_seeds_for_robust_sign_flip": required_robust,
+        # required_seeds 保持「无脱落时的启动数」，便于与旧报告
+        # 对比；required_seeds_with_attrition 才是本设计的实际
+        # 种子预算。
         "required_seeds": required,
+        "expected_attrition_rate": attrition,
         "planned_seeds": int(n_seeds),
+        "planned_usable_seeds": usable_seeds,
+        "required_seeds_with_attrition": required_with_attrition,
+        "achieved_power_at_min_effect": achieved_power,
+        "minimum_detectable_effect_relative": mde,
+        "power_sensitivity": sensitivity,
         "adequate": adequate,
         "underpowered_acknowledged": acknowledged,
         "justification": power.get("justification"),
@@ -32173,7 +32291,9 @@ def preregistration_power_plan(
             "所需种子数把声明的预期种子间标准差当作真实 sigma；"
             "它本身也是估计，规划时应留余量。adequacy 只表示"
             "设计在声明效应下有目标功效，不保证真实效应一定"
-            "达到最小有意义效应"
+            "达到最小有意义效应。planned_usable_seeds 按声明的"
+            "预期脱落率折算，required_seeds_with_attrition 是"
+            "达到目标功效所需的启动种子数"
         ),
     }
 
@@ -32420,6 +32540,23 @@ def preregistration_schema_error(
                 "power.planned_comparisons 小于 comparisons 数量："
                 "家族规模被低估会让功效与多重比较校正过于乐观"
             )
+        attrition = power.get(
+            "expected_attrition_rate", 0.0
+        )
+        error = _preregistration_finite_number(
+            attrition,
+            "power.expected_attrition_rate",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if error is not None:
+            return error
+        if not 0.0 <= float(attrition) < 1.0:
+            return (
+                "power.expected_attrition_rate 必须在 [0, 1) 内"
+                "（预期因数值失败/数据问题而不可用的运行比例；"
+                "1 表示全部运行都会脱落，无法设计）"
+            )
         acknowledged = power.get(
             "underpowered_acknowledged", False
         )
@@ -32448,7 +32585,16 @@ def preregistration_schema_error(
             required_text = (
                 "无法在 128 个种子内达到目标功效"
                 if plan["required_seeds_for_t"] is None
-                else f"至少需要 {plan['required_seeds']} 个种子"
+                else f"至少需要 {plan['required_seeds_with_attrition']} 个启动种子"
+            )
+            attrition_text = (
+                ""
+                if not plan["expected_attrition_rate"]
+                else (
+                    f"（已按预期脱落率 "
+                    f"{plan['expected_attrition_rate']:.0%} 折算，"
+                    f"计划可用 {plan['planned_usable_seeds']} 个）"
+                )
             )
             return (
                 "预注册 power 分析显示当前种子数 "
@@ -32457,6 +32603,7 @@ def preregistration_schema_error(
                 f"最小效应 {plan['min_effect_relative']:g}、"
                 f"家族规模 {plan['planned_comparisons']}、目标功效 "
                 f"{plan['target_power']:g} 下，{required_text}"
+                f"{attrition_text}"
                 "（配对 t 口径 "
                 f"{plan['required_seeds_for_t']}，稳健符号翻转口径 "
                 f"{plan['required_seeds_for_robust_sign_flip']}）。"
@@ -56435,9 +56582,11 @@ def resolve_run_order(args: argparse.Namespace) -> Tuple[str, int]:
     解析预注册/命令行声明的运行顺序设计。
 
     默认 ``randomized``：每个种子是一个完整区组，区组内的臂
-    顺序随机化。旧行为 ``grouped`` 会先把一个臂的所有种子跑完
-    再跑下一个臂，机器热漂移、共享缓存与集群负载随时间变化
-    时，这些漂移与臂效应完全混杂。
+    顺序随机化。``counterbalanced`` 在同一区组结构上进一步用
+    循环拉丁方约束位置计数，适合种子数较少、担心热漂移与
+    区组内位置混杂的确证运行。旧行为 ``grouped`` 会先把一个
+    臂的所有种子跑完再跑下一个臂，机器热漂移、共享缓存与
+    集群负载随时间变化时，这些漂移与臂效应完全混杂。
     """
     scheme = getattr(args, "run_order", None)
     if scheme is None:
@@ -56481,6 +56630,209 @@ def _order_block_rng(
     return random.Random(int.from_bytes(digest[:16], "big"))
 
 
+def _counterbalance_rng(order_seed: int) -> random.Random:
+    """平衡区组排列的确定性 RNG（与区组洗牌分开命名空间）。"""
+    digest = hashlib.sha256(
+        f"smelt-isr-counterbalance:{int(order_seed)}".encode(
+            "utf-8"
+        )
+    ).digest()
+    return random.Random(int.from_bytes(digest[:16], "big"))
+
+
+_PLAN_IDENTITY_KEYS = frozenset({
+    "label",
+    "seed",
+    "order_index",
+    "block",
+    "position_in_block",
+})
+
+
+def _plan_treatment_key(item: Dict[str, object]):
+    """
+    处理单元的身份：去掉运行标签/种子/顺序等非处理轴后的
+    稳定表示。counterbalanced 用它判断「每个区组是否包含同一
+    组处理」，balance 报告用它统计每个处理的位置分布。
+    """
+    return tuple(
+        (str(key), _stable_factor_key(item.get(key)))
+        for key in sorted(item, key=str)
+        if str(key) not in _PLAN_IDENTITY_KEYS
+    )
+
+
+def _counterbalanced_order(
+    blocks: Dict[object, List[Dict[str, object]]],
+    order_seed: int,
+) -> List[Dict[str, object]]:
+    """
+    构造平衡的完整区组顺序（循环拉丁方）。
+
+    每个种子区组必须包含同一组处理单元各一次。先把处理标签
+    用 order_seed 确定性随机化，再让第 b 个区组使用基础序列的
+    第 (start + b) 个循环移位：任意连续 b 行中，每个处理在
+    每个位置上最多出现一次，因此位置计数之差不超过 1。相比
+    纯随机化，这避免了小样本下某个臂偶然总在同一位置、与
+    机器热漂移/缓存预热混杂。
+    """
+    if not blocks:
+        return []
+    block_keys = sorted(
+        blocks, key=_stable_factor_key
+    )
+    reference: Optional[List] = None
+    keyed_blocks: Dict[object, Dict[object, Dict[str, object]]] = {}
+    for block_key in block_keys:
+        entries = blocks[block_key]
+        keys = [_plan_treatment_key(item) for item in entries]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "counterbalanced 顺序要求同一区组内的处理单元"
+                "互不相同；当前区组 "
+                f"{block_key!r} 有重复处理单元"
+            )
+        block_reference = sorted(set(keys), key=repr)
+        if reference is None:
+            reference = block_reference
+        elif block_reference != reference:
+            raise ValueError(
+                "counterbalanced 顺序要求每个种子区组包含完全"
+                "相同的处理单元集合；当前区组 "
+                f"{block_key!r} 与其它区组不同。请检查套件是否"
+                "有只在部分种子上运行的候选；这种情况不能声称"
+                "位置已平衡，应改用 randomized 或补齐运行。"
+            )
+        keyed_blocks[block_key] = {
+            key: item for key, item in zip(keys, entries)
+        }
+    if reference is None:
+        return []
+
+    base = list(reference)
+    rng = _counterbalance_rng(order_seed)
+    rng.shuffle(base)
+    start = rng.randrange(len(base)) if base else 0
+
+    ordered: List[Dict[str, object]] = []
+    for block_index, block_key in enumerate(block_keys):
+        rotation = (start + block_index) % len(base)
+        row = base[rotation:] + base[:rotation]
+        mapping = keyed_blocks[block_key]
+        ordered.extend(dict(mapping[key]) for key in row)
+    return ordered
+
+
+def run_order_balance_report(
+    plan: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    检查区组内位置是否平衡。
+
+    完整区组设计只保证「每个区组都跑每个处理」，不保证每个
+    处理在各位置上的出现次数相等。纯随机化在小样本下可能让
+    某个臂 5 次里有 4 次排在区组最后；若位置与机器热漂移/
+    缓存状态相关，臂效应就仍会混入时间效应。这里报告每个
+    处理在各位置上的计数与最大失衡，供 `design_plan.json`
+    在设计阶段留证，而不是等分析期才从结果反推。
+    """
+    if not plan:
+        return {
+            "available": False,
+            "balanced": None,
+            "reason": "计划为空",
+        }
+    blocks: Dict[object, List[Dict[str, object]]] = {}
+    for item in plan:
+        block_key = item.get("block")
+        if block_key is None:
+            block_key = item.get("seed")
+        blocks.setdefault(_stable_factor_key(block_key), []).append(
+            item
+        )
+
+    counts: Dict[object, Dict[int, int]] = {}
+    block_treatment_sets: List[set] = []
+    malformed = 0
+    max_position = 0
+    for entries in blocks.values():
+        seen = set()
+        per_block = set()
+        for item in entries:
+            treatment = _plan_treatment_key(item)
+            position = item.get("position_in_block")
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 1
+            ):
+                malformed += 1
+                continue
+            max_position = max(max_position, position)
+            per_block.add(treatment)
+            if treatment in seen:
+                malformed += 1
+                continue
+            seen.add(treatment)
+            position_counts = counts.setdefault(treatment, {})
+            position_counts[position] = (
+                position_counts.get(position, 0) + 1
+            )
+        block_treatment_sets.append(per_block)
+
+    if not counts:
+        return {
+            "available": False,
+            "balanced": None,
+            "reason": "计划没有可识别的区组内位置",
+        }
+    common = set.intersection(*block_treatment_sets) if block_treatment_sets else set()
+    union = set().union(*block_treatment_sets) if block_treatment_sets else set()
+    complete_blocks = (
+        not malformed
+        and bool(block_treatment_sets)
+        and all(
+            block_set == common for block_set in block_treatment_sets
+        )
+        and len(common) == len(union)
+    )
+    max_imbalance = 0
+    details: List[Dict[str, object]] = []
+    for treatment in sorted(counts, key=repr):
+        values = [
+            counts[treatment].get(position, 0)
+            for position in range(1, max_position + 1)
+        ]
+        if not values:
+            continue
+        span = max(values) - min(values)
+        max_imbalance = max(max_imbalance, span)
+        details.append({
+            "treatment": repr(treatment),
+            "position_counts": {
+                str(position): count
+                for position, count in enumerate(values, start=1)
+            },
+            "max_position_imbalance": span,
+        })
+    balanced = bool(complete_blocks and max_imbalance <= 1)
+    return {
+        "available": True,
+        "n_blocks": len(blocks),
+        "n_treatments": len(common),
+        "complete_blocks": complete_blocks,
+        "max_position_imbalance": max_imbalance,
+        "balanced": balanced,
+        "treatments": details,
+        "note": (
+            "均衡定义为每个区组包含同一组处理各一次，且每个"
+            "处理在各位置上的计数极差 <= 1。counterbalanced "
+            "按循环拉丁方保证该性质；randomized 只保证区组内"
+            "随机化，不保证位置计数均衡"
+        ),
+    }
+
+
 def order_sweep_plan(
     plan: List[Dict[str, object]],
     scheme: str = "randomized",
@@ -56492,7 +56844,11 @@ def order_sweep_plan(
     - ``grouped``：保留原顺序（历史行为；模式与时间混杂）；
     - ``blocked``：按种子组成完整区组，区组内保持原臂顺序；
     - ``randomized``：按种子组成完整区组，区组内随机化臂
-      顺序（随机化完整区组设计）。
+      顺序（随机化完整区组设计）；
+    - ``counterbalanced``：按种子组成完整区组，并用确定性
+      循环拉丁方让每个处理在各区组位置上的出现次数尽可能
+      相等（位置平衡/限制性随机化）。它要求每个区组包含同一
+      组处理单元，否则无法定义平衡排列并直接拒绝。
 
     同一区组内每个臂出现一次，因此「先跑/后跑」在臂之间被
     平衡，而不是让某个臂系统性地占据更晚的时间片。
@@ -56508,12 +56864,17 @@ def order_sweep_plan(
             blocks.setdefault(item.get("seed"), []).append(
                 dict(item)
             )
-        ordered = []
-        for block_seed, block in blocks.items():
-            if scheme == "randomized":
-                rng = _order_block_rng(order_seed, int(block_seed))
-                rng.shuffle(block)
-            ordered.extend(block)
+        if scheme == "counterbalanced":
+            ordered = _counterbalanced_order(blocks, order_seed)
+        else:
+            ordered = []
+            for block_seed, block in blocks.items():
+                if scheme == "randomized":
+                    rng = _order_block_rng(
+                        order_seed, int(block_seed)
+                    )
+                    rng.shuffle(block)
+                ordered.extend(block)
 
     positions: Dict[object, int] = {}
     for index, item in enumerate(ordered, start=1):
@@ -56803,6 +57164,7 @@ def write_design_plan(
                 entry[key] = item[key]
         runs.append(entry)
 
+    order_balance = run_order_balance_report(plan)
     core: Dict[str, object] = {
         "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
         "kind": kind,
@@ -56811,6 +57173,7 @@ def write_design_plan(
             "file_sha256"
         ),
         "order": {"scheme": scheme, "seed": int(order_seed)},
+        "order_balance": order_balance,
         "planned_runs": len(runs),
         "runs": runs,
         "planned_comparisons": int(planned_comparisons),
@@ -56868,6 +57231,7 @@ def write_design_plan(
         "kind": kind,
         "order_scheme": scheme,
         "order_seed": int(order_seed),
+        "order_balance": order_balance,
         "planned_runs": len(runs),
         "planned_comparisons": int(planned_comparisons),
         "power": power,
@@ -57297,7 +57661,7 @@ def run_order_drift_report(
         warnings.append(
             "执行顺序是 grouped：同一臂的所有种子先跑完，"
             "时间/机器漂移与臂效应完全混杂；确证实验应使用"
-            "randomized 完整区组"
+            "randomized 或 counterbalanced 完整区组"
         )
     if len(entries) < 3:
         return {
@@ -59650,6 +60014,7 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             "kind",
             "order_scheme",
             "order_seed",
+            "order_balance",
             "planned_runs",
             "training_budget",
         )
@@ -59774,16 +60139,54 @@ def print_design_summary(design: Dict[str, object]) -> None:
             f"{budget.get('total_tokens')} tokens（"
             f"{budget.get('runs')} × {budget.get('tokens_per_run')}）"
         )
+    balance = design.get("order_balance")
+    if isinstance(balance, dict) and balance.get("available"):
+        if balance.get("balanced"):
+            print(
+                "[design][order] 区组位置平衡：每个处理在各位置上"
+                "的计数极差 "
+                f"{balance.get('max_position_imbalance')}（"
+                f"{balance.get('n_blocks')} 个区组、"
+                f"{balance.get('n_treatments')} 个处理）"
+            )
+        elif design.get("order_scheme") == "counterbalanced":
+            print(
+                "[design][order][warn] counterbalanced 计划未达到"
+                "位置平衡（最大极差 "
+                f"{balance.get('max_position_imbalance')}）："
+                "请检查区组是否包含同一组处理"
+            )
+        else:
+            print(
+                "[design][order] 提示：当前顺序的最大位置计数"
+                f"极差为 {balance.get('max_position_imbalance')}；"
+                "randomized 只保证区组内随机化，不保证位置计数"
+                "均衡。若担心热漂移与位置混杂，可改用 "
+                "--run-order counterbalanced"
+            )
     power = design.get("power")
     if isinstance(power, dict):
         status = "充足" if power.get("adequate") else "不足"
+        attrition = float(
+            power.get("expected_attrition_rate") or 0.0
+        )
+        required = power.get(
+            "required_seeds_with_attrition",
+            power.get("required_seeds"),
+        )
         print(
             "[design][power] 先验功效："
             f"计划 {power.get('planned_seeds')} 个种子，"
-            f"所需 {power.get('required_seeds')}（t="
+            f"所需启动种子 {required}（t="
             f"{power.get('required_seeds_for_t')}, 稳健符号翻转="
             f"{power.get('required_seeds_for_robust_sign_flip')}）"
-            f" → {status}"
+            + (
+                f"，预期脱落 {attrition:.0%}、计划可用 "
+                f"{power.get('planned_usable_seeds')} 个"
+                if attrition > 0.0
+                else ""
+            )
+            + f" → {status}"
             + (
                 "；已显式承认功效不足"
                 if power.get("underpowered_acknowledged")
@@ -59791,6 +60194,22 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 else ""
             )
         )
+        achieved = power.get("achieved_power_at_min_effect")
+        mde = power.get("minimum_detectable_effect_relative")
+        if achieved is not None or mde is not None:
+            print(
+                "[design][power] 计划可用种子下："
+                + (
+                    f"对最小效应的功效≈{float(achieved):.2f}"
+                    if achieved is not None
+                    else "功效无法计算"
+                )
+                + (
+                    f"，80% 功效 MDE≈{float(mde):.2%}"
+                    if mde is not None
+                    else ""
+                )
+            )
     else:
         print(
             "[design] 未提供预注册 power 块：种子数只保证检验"
@@ -59907,6 +60326,7 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             "kind",
             "order_scheme",
             "order_seed",
+            "order_balance",
             "planned_runs",
             "planned_comparisons",
             "power",
@@ -60860,7 +61280,10 @@ def main():
             "套件的执行顺序设计：grouped=按臂分组（历史行为，"
             "时间漂移与臂效应完全混杂）；blocked=按种子成完整"
             "区组、区组内保持原臂顺序；randomized=区组内随机化"
-            "臂顺序（默认，随机化完整区组设计）"
+            "臂顺序（默认，随机化完整区组设计）；"
+            "counterbalanced=在完整区组上用循环拉丁方限制性"
+            "随机化，使每个处理在各区组位置上的出现次数尽可能"
+            "相等（要求每个种子区组包含同一组处理）"
         ),
     )
     parser.add_argument(

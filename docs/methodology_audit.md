@@ -604,6 +604,77 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
 偏小，应同时查看逐种子 `window_lag1_autocorrelation`。预测
 区间是频率派 t 近似，不是贝叶斯后验预测。
 
+## 29. 实验设计与准备：脱落折算与位置平衡（本轮补充）
+
+**判定：设计预检已能拒绝「种子数不足」，但仍有三个准备阶段
+的盲点。**
+
+1. 功效公式把**计划种子数**当成**可用观测数**。数值失败、
+   NaN/Inf 或数据问题导致的运行在分析期被排除；若某臂失败率
+   更高，实际进入配对检验的种子会更少。计划 8 个种子、预期
+   20% 不可用时，功效只相当于约 6 个，但旧报告仍会显示
+   `adequate=true`。
+2. `randomized` 完整区组只保证「每个区组都跑每个臂」，不保证
+   每个臂在各区组位置上的出现次数均衡。小样本下某个臂可能
+   5 次里有 4 次排在区组最后；位置若与机器热漂移、缓存预热
+   或集群负载相关，臂效应仍会混入时间效应。旧设计计划也没有
+   把位置平衡作为可核对字段。
+3. 只报一个 `required_seeds` 掩盖了预期 sd 的不确定性；不报
+   计划可用种子数下的实际功效与 MDE，研究者看不到设计离目标
+   有多远，容易把「刚好达到 required」当成「有足够余量」。
+
+**已修正：**
+
+- `power` 新增可选 `expected_attrition_rate`（`[0,1)`，默认 0）。
+  `preregistration_power_plan` 同时报告
+  `required_seeds_with_attrition = ceil(required_seeds/(1-r))`
+  与 `planned_usable_seeds = floor(planned_seeds×(1-r))`；
+  `adequate` 按可用种子数判断，种子不足时错误信息给出所需
+  **启动**种子数。脱落率必须在训练前声明，不能用本轮失败
+  结果事后反推。
+- 同一记录新增 `achieved_power_at_min_effect` 与
+  `minimum_detectable_effect_relative`：按计划可用种子数、
+  家族校正后的 alpha 计算「真实效应等于预注册最小效应时的
+  检出概率」与「80% 功效下能检出的最小相对效应」。两者与
+  `min_effect` 同单位，可直接比较，不再只报所需种子数。
+- 新增 `power_sensitivity`：把 `expected_seed_sd_relative`
+  乘以 0.5/0.75/1.0/1.25/1.5/2.0 重算所需种子数。先验 sd 本身
+  是估计；sd 偏小 25% 就可能让设计从充足变成不足，冻结前
+  应看整张敏感性表而不是点估计。
+- 新增 `--run-order counterbalanced`：在完整区组上用循环拉丁方
+  做限制性随机化。基础处理顺序由 `--run-order-seed` 确定性
+  随机化，第 b 个种子区组使用第 `(start+b)` 个循环移位；任意
+  连续 b 行中每个处理在各位置最多出现一次，位置计数极差
+  ≤1。它要求每个区组包含同一组处理；`--plan-design` 遇到
+  只在部分种子上运行的候选会直接拒绝，而不是生成缺格计划。
+- `design_plan.json` 新增 `order_balance`：每个处理在各位置上的
+  计数、`max_position_imbalance`、`complete_blocks` 与
+  `balanced`。`plan_id` 覆盖该字段，事后改顺序/位置会破坏
+  指纹。`print_design_summary` 在 `counterbalanced` 不均衡时
+  告警，在 `randomized` 不均衡时提示可改用平衡方案。
+- `comparison_analysis.json` 的 `design` 与基线调参报告都带出
+  `order_balance`，分析阶段不必重新猜测执行顺序是否平衡。
+- 新增回归测试：attrition 折算与不足拒绝、实际功效/MDE/
+  敏感性、counterbalanced 的位置平衡与可复现性、区组处理
+  集合不一致时拒绝、位置混杂检测。
+
+**仍有限制：**
+
+- `expected_attrition_rate` 仍是研究者声明的先验值，不是观测
+  到的脱落机制。若脱落与臂别相关（某方法更容易 NaN），按可用
+  运行做配对分析仍相当于条件在「没有崩掉」上；必须同时报告
+  `failure_rates` 与失败率差异，不能只报成功运行的均值。
+- `counterbalanced` 平衡的是**位置计数**，不是所有高阶顺序
+  效应；循环拉丁方不保证一阶 carryover（前一个处理对后一个
+  处理的影响）完全平衡，也不消除机器漂移本身。它只降低小样本
+  随机化偶然造成的位置混杂。
+- 位置平衡要求区组同质（每个种子跑同一组处理）。如果套件本身
+  有缺格，正确做法是补齐运行或改用 `randomized` 并明确承认
+  不平衡，不能把缺格计划标成平衡。
+- 实际功效、MDE 与敏感性都条件于声明的 sd、脱落率与配对 t
+  近似；种子数很少时非中心 t 积分与 sd 估计都不稳定。它们用于
+  设计阶段排序风险，不替代分析阶段的 MDE、TOST 与脆弱性报告。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -613,20 +684,24 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
    默认 val-only 清洗。
 3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
-   最小效应、目标功效）与 `run_order`（randomized + 种子），
-   用 `--plan-design` 检查所需种子数、随机化区组与 token 预算；
+   最小效应、目标功效、预期脱落率）与 `run_order`
+   （`counterbalanced` + 种子；区组缺格时退回 `randomized`
+   并承认位置可能不均衡），用 `--plan-design` 检查所需启动
+   种子数、实际功效/MDE、sd 敏感性、位置平衡与 token 预算；
    功效不足时先加种子，而不是跑完再解释。
 4. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
    **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
    固定 `--common-step` 与训练预算；用 `--budget-match` 报告
-   完整计算图比例；按同一 `--run-order-seed` 执行随机化区组。
+   完整计算图比例；按同一 `--run-order-seed` 执行随机化/
+   平衡区组。
 5. 统计：主检验配对 t + 符号翻转（明确对称性假设）；报告
-   失败率、MDE、门槛检验、TOST、`fragility_summary` 与
-   `run_order`；逐检验 95% CI 只描述效应量，校正后的结论以
-   Holm 为准，并同时报告 Bonferroni `α/m` 同时区间；窗口级
-   证据同时报告种子×窗口两层 bootstrap 与方差占比，用它
-   决定补种子还是扩评估集。删除种子后不再显著的结论不能写成
-   稳健，不把不显著读成等价；顺序强相关先查漂移。
+   失败率、MDE、门槛检验、TOST、`fragility_summary`、
+   `design.order_balance` 与 `run_order`；逐检验 95% CI 只
+   描述效应量，校正后的结论以 Holm 为准，并同时报告
+   Bonferroni `α/m` 同时区间；窗口级证据同时报告种子×窗口
+   两层 bootstrap 与方差占比，用它决定补种子还是扩评估集。
+   删除种子后不再显著的结论不能写成稳健，不把不显著读成等价；
+   顺序强相关先查漂移。
 6. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
    每个候选只解封一次；用 `--final-test-comparison` 报告全部
    候选，而不是只报告最好的那个。

@@ -2,16 +2,18 @@
 
 本文件说明训练开始前应完成的三个设计动作：
 
-1. **先验功效分析**：用预期的种子间波动与最小有意义效应，
-   在训练前判断计划种子数是否足够；
-2. **随机化完整区组**：把「哪个臂先跑」从便利顺序变成预先
-   声明的随机化顺序，避免机器热漂移/负载漂移与处理效应混杂；
-3. **设计计划冻结**：把运行清单、顺序、功效与预算写成
-   `design_plan.json`，子进程开跑前逐项核对。
+1. **先验功效分析**：用预期的种子间波动、最小有意义效应与
+   预期数据脱落率，在训练前判断计划种子数是否足够，并同时
+   报告计划可用种子数下的实际功效与 MDE；
+2. **随机化/平衡完整区组**：把「哪个臂先跑」从便利顺序变成
+   预先声明的顺序，避免机器热漂移/负载漂移与处理效应混杂；
+3. **设计计划冻结**：把运行清单、顺序、位置平衡、功效与预算
+   写成 `design_plan.json`，子进程开跑前逐项核对。
 
 这三项都属于**准备阶段**，与训练后的显著性检验、等价性检验和
-脆弱性分析互补。它们不能替研究者保证结论正确，但能避免两类
-常见、无法在分析阶段补救的设计错误：功效不足与顺序混杂。
+脆弱性分析互补。它们不能替研究者保证结论正确，但能避免几类
+常见、无法在分析阶段补救的设计错误：功效不足、顺序混杂与
+运行脱落造成的有效样本量不足。
 
 ## 1. 先做设计预检，不烧算力
 
@@ -20,7 +22,7 @@ python experiment.py \
   --data corpus.txt --out runs/confirm-design \
   --seeds 42 43 44 45 46 47 48 \
   --suite-modes smelt local_base local_base_k2 A B B_early \
-  --run-order randomized --run-order-seed 20261022 \
+  --run-order counterbalanced --run-order-seed 20261022 \
   --plan-design \
   --hypothesis "延迟合并在完整计算图匹配下改善验证损失"
 ```
@@ -28,9 +30,11 @@ python experiment.py \
 `--plan-design` 只生成并打印计划，**不加载数据、不训练**：
 
 - 每个运行单元的 label / mode / seed / balance 系数；
-- 执行顺序、种子区组与区组内位置；
+- 执行顺序、种子区组与区组内位置，以及位置平衡审计
+  （`order_balance`：每个处理在各位置上的计数与最大极差）；
 - `design_plan.json` 的规范化指纹 `plan_id`；
-- 先验功效（若预注册文件提供 `power` 块）；
+- 先验功效（若预注册文件提供 `power` 块），包括按预期脱落率
+  折算的可用种子数、实际功效、MDE 与 sd 敏感性；
 - 解析 token 预算（`steps × batch_size × seq_len × 运行数`，
   不含评估/重算/优化器开销，也不是墙钟时间）。
 
@@ -49,6 +53,7 @@ python experiment.py \
   "target_power": 0.8,
   "alpha": 0.05,
   "planned_comparisons": 5,
+  "expected_attrition_rate": 0.1,
   "underpowered_acknowledged": false
 }
 ```
@@ -61,6 +66,7 @@ python experiment.py \
 | `target_power` | 是 | 目标功效，惯例 0.8 |
 | `alpha` | 是 | 未校正的家族错误率，惯例 0.05 |
 | `planned_comparisons` | 否 | 检验家族规模，默认等于 `comparisons` 数量；**不得小于**它（低报会高估功效） |
+| `expected_attrition_rate` | 否 | 预期因 NaN/Inf、数值停止或数据问题而不可用的运行比例（默认 0）；必须在 `[0, 1)` 内 |
 | `underpowered_acknowledged` | 否 | 显式承认功效不足仍要运行（默认 false） |
 | `justification` | 条件 | `underpowered_acknowledged=true` 时必填，写明理由 |
 
@@ -76,18 +82,32 @@ python experiment.py \
     `ceil(log2(2m/alpha))`；
 - 取两者较大值作为 `required_seeds`。只主张 t 检验时可单独看
   `required_seeds_for_t`。
+- `required_seeds_with_attrition = ceil(required_seeds / (1 - 预期脱落率))`
+  才是**启动**种子数；`planned_usable_seeds = floor(计划种子数 ×
+  (1 - 预期脱落率))` 是功效公式真正使用的 n。`adequate` 按后者
+  判断，避免把「计划了 8 个、预计坏 2 个」当成 8 个独立重复。
+- `achieved_power_at_min_effect` 与
+  `minimum_detectable_effect_relative` 直接回答「按当前计划，
+  即使真实效应等于预注册最小效应，检出概率是多少」「当前设计
+  在 80% 功效下最小能检出多大效应」。它们与 `min_effect` 同单位，
+  可直接比较。
+- `power_sensitivity` 对 `expected_seed_sd_relative` 乘以
+  0.5/0.75/1.0/1.25/1.5/2.0 重算所需种子数：先验 sd 本身是估计，
+  只报一个 `required_seeds` 会把估计误差藏起来。若 sd 估计偏小
+  25% 就需要更多种子，应在冻结前留余量或承认设计脆弱。
 
-种子数不足时**默认拒绝启动预注册运行**，错误信息给出所需种子数
-与两个口径。确需在功效不足的设计上探索时，必须显式写
-`underpowered_acknowledged: true` 与 `justification`；该承认会随
-`config.json` 的 `preregistration.power` 落盘，分析报告不能把它
-改写成「计划足够」。
+种子数不足时**默认拒绝启动预注册运行**，错误信息给出所需启动
+种子数（含脱落折算）与两个口径。确需在功效不足的设计上探索时，
+必须显式写 `underpowered_acknowledged: true` 与 `justification`；
+该承认会随 `config.json` 的 `preregistration.power` 落盘，分析
+报告不能把它改写成「计划足够」。
 
 注意：`required_seeds` 把声明的预期标准差当作真实 sigma；它本身
 也是估计，规划时应留余量。`adequate=true` 只表示「在声明效应下
-有目标功效」，不保证真实效应一定达到最小有意义效应。
+有目标功效」，不保证真实效应一定达到最小有意义效应。预期脱落率
+也只能来自试点或历史数据，不能用本轮结果事后反推。
 
-## 3. 运行顺序：随机化完整区组
+## 3. 运行顺序：随机化/平衡完整区组
 
 旧行为（`grouped`）按模式分组：
 
@@ -106,13 +126,30 @@ block seed2: A, B
 block seed3: B, A
 ```
 
-三种方案：
+四种方案：
 
 | `--run-order` | 行为 | 用途 |
 |---|---|---|
 | `grouped` | 保留历史顺序（按模式分组） | 只用于兼容旧运行；不能支持时间漂移下的因果归因 |
 | `blocked` | 按种子成区组，区组内保持原臂顺序 | 需要固定臂顺序但希望平衡时间片 |
-| `randomized` | 按种子成区组，区组内随机化 | **推荐的确证设计** |
+| `randomized` | 按种子成区组，区组内随机化 | 默认；区组内顺序随机，但小样本下不保证位置计数均衡 |
+| `counterbalanced` | 按种子成区组，用循环拉丁方轮换臂位置 | 种子数较少、担心位置与热漂移混杂时的限制性随机化；要求每个区组包含同一组处理 |
+
+`randomized` 只保证「每个区组都跑每个臂」，不保证每个臂在
+区组第 1/2/3… 个位置上的出现次数相等。6 个种子、2 个臂时，
+随机化可能让某个臂 5 次都排在后半段；若位置与缓存预热、GPU
+温度或集群负载相关，臂效应仍会混入位置效应。`counterbalanced`
+先把处理标签用 `--run-order-seed` 确定性随机化，再让第 b 个
+种子区组使用基础序列的第 `(start+b)` 个循环移位：任意连续
+b 行中每个处理在各位置最多出现一次，位置计数极差不超过 1。
+它要求每个种子区组包含同一组处理；若某个候选只在部分种子上
+运行，`--plan-design` 会直接拒绝，而不是生成一个看似平衡、
+实则缺格的计划。
+
+`design_plan.json` 的 `order_balance` 会记录每个处理在各位置
+上的计数、`max_position_imbalance` 与 `balanced`。`randomized`
+不均衡时只提示可改用 `counterbalanced`；`counterbalanced`
+不均衡则视为设计错误并告警。
 
 `--run-order-seed` 固定洗牌种子（默认 0）；同一计划必须使用同一
 种子才能复现顺序。看到结果后换顺序不再是原设计。
@@ -121,7 +158,7 @@ block seed3: B, A
 
 ```json
 "run_order": {
-  "scheme": "randomized",
+  "scheme": "counterbalanced",
   "seed": 20261022
 }
 ```
@@ -141,7 +178,9 @@ block seed3: B, A
 
 任一不符即拒绝训练。实际开始/结束时间写到
 `<out>/run_order.json`，失败条目也会保留；套件结束后父进程再核对
-所有子运行的 `design_assignment.plan_id` 一致。
+所有子运行的 `design_assignment.plan_id` 一致。`plan_id` 覆盖
+`order_balance`，因此事后把不平衡顺序改成平衡顺序（或反过来）
+也会改变指纹。
 
 ## 4. 分析阶段的顺序漂移诊断
 
@@ -161,21 +200,24 @@ block seed3: B, A
 
 ## 5. 推荐的确证准备流程
 
-1. 用试点/先前运行估计种子间标准差，写出 `power` 块；
-2. 用 `--plan-design` 检查运行清单、随机化顺序、功效与 token
-   预算；调整种子数或最小效应后再冻结；
+1. 用试点/先前运行估计种子间标准差与预期脱落率，写出 `power`
+   块；同时查看 `power_sensitivity`、实际功效与 MDE；
+2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置平衡、
+   功效与 token 预算；调整种子数或最小效应后再冻结；
 3. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
    放入同一只读目录；
 4. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；
-5. 分析时同时报告 `power`、`seed_plan` 与 `run_order`；顺序相关
-   强时先调查漂移，而不是直接解释臂间差异；
+5. 分析时同时报告 `power`、`seed_plan`、`order_balance` 与
+   `run_order`；顺序相关强时先调查漂移，而不是直接解释臂间
+   差异；
 6. 增加种子/重跑必须作为新研究阶段重新预注册，不能反复换种子
-   直到显著。
+   直到显著。因数值失败而剔除运行也必须按预注册的脱落/失败率
+   口径报告，不能只保留成功运行。
 
 ## 6. 与现有协议的关系
 
 - `docs/experiment_protocol.md` 的冻结 → 预注册 → 运行 → 统一
   解封流程不变；本文件补上「预注册前如何判断设计可执行」；
-- `docs/methodology_audit.md` 第 27 节记录本轮修正；
+- `docs/methodology_audit.md` 第 29 节记录本轮修正；
 - 设计计划不替代 `artifact_manifest.json`：前者是训练前设计，
   后者是训练后归档内容完整性；两者都应随最终报告保存。
