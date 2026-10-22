@@ -51004,6 +51004,7 @@ def main():
     saved_data_test_fraction = None
     saved_data_split_sha256 = None
     saved_data_effective_train_sha256 = None
+    saved_data_split_isolation = None
     saved_numerical_state: Dict[str, object] = {}
 
     if args.resume is not None:
