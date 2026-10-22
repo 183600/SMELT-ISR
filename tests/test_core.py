@@ -1184,6 +1184,157 @@ class DesignPreparationTests(unittest.TestCase):
             )
         )
 
+    def test_planned_comparisons_counts_ablation_balance_axis(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=None,
+            ablation=True,
+            balance_coef=0.01,
+            default_mode="B",
+            ablation_modes=["A", "B"],
+        )
+        # 3 个模式 × 2 个 balance 档 = 6 个处理单元；不能只数
+        # mode 而漏掉 balance 轴，否则家族规模从 15 低估成 3。
+        self.assertEqual(
+            experiment.planned_comparisons_for_plan(plan), 15
+        )
+
+    def test_build_sweep_execution_uses_larger_actual_family(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                suite_modes=["A", "B", "local_base", "local_base_k2"],
+                suite_ablation=False,
+                ablation_modes=None,
+                balance_coef=0.01,
+                mode="B",
+                run_order="randomized",
+                run_order_seed=5,
+                preregistration_record={
+                    "power": {
+                        "expected_seed_sd_relative": 0.01,
+                        "min_effect_relative": 0.01,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "planned_comparisons": 3,
+                        "planned_seeds": 3,
+                        "underpowered_acknowledged": True,
+                        "justification": "test",
+                    }
+                },
+            )
+            plan, design, planned = (
+                experiment.build_sweep_execution(
+                    args, Path(tmp)
+                )
+            )
+            self.assertEqual(len(plan), 12)
+            # 4 个臂的两两对比是 6，大于预注册声明的 3。
+            self.assertEqual(planned, 6)
+            self.assertEqual(
+                design["planned_comparisons"], 6
+            )
+            self.assertEqual(
+                design["seed_plan"]["planned_comparisons"], 6
+            )
+            self.assertEqual(
+                design["power"]["planned_comparisons"], 6
+            )
+
+    def test_design_plan_refuses_to_replace_frozen_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                preregistration_record=None,
+            )
+            plan = experiment.build_sweep_plan(
+                seeds=[1, 2, 3],
+                modes=["A", "B"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            ordered = experiment.order_sweep_plan(
+                plan, "randomized", 5
+            )
+            first = experiment.write_design_plan(
+                root, ordered, "randomized", 5, base_args
+            )
+            # 同一设计重复生成：复用已冻结文件（SHA 不变）。
+            same = experiment.write_design_plan(
+                root, ordered, "randomized", 5, base_args
+            )
+            self.assertEqual(
+                first["plan_id"], same["plan_id"]
+            )
+            self.assertEqual(
+                first["file_sha256"], same["file_sha256"]
+            )
+            # 不同臂集合不能静默覆盖已冻结计划。
+            changed = experiment.build_sweep_plan(
+                seeds=[1, 2, 3, 4],
+                modes=["A", "B"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            changed_ordered = experiment.order_sweep_plan(
+                changed, "randomized", 5
+            )
+            with self.assertRaises(ValueError):
+                experiment.write_design_plan(
+                    root,
+                    changed_ordered,
+                    "randomized",
+                    5,
+                    base_args,
+                )
+
+    def test_run_order_drift_zero_variance_is_insufficient(self):
+        rows = []
+        for index, mode in enumerate(("A", "B", "A", "B"), start=1):
+            rows.append({
+                "run": f"{mode}{index}",
+                "mode": mode,
+                "val_loss": 1.0,
+                "design_order_index": index,
+                "design_block": index,
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": "randomized",
+            })
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertTrue(report["available"])
+        self.assertIsNone(report["detrended_spearman"])
+        self.assertEqual(report["verdict"], "insufficient")
+        self.assertIn("秩方差", report["reason"])
+
+    def test_plan_design_does_not_require_training_hypothesis(self):
+        args = argparse.Namespace(
+            compare=None,
+            final_test_comparison=None,
+            sanity_only=False,
+            statistical_baseline=False,
+            plan_design=True,
+            resume=None,
+            hypothesis="",
+            skip_hypothesis_check=False,
+        )
+        self.assertIsNone(
+            experiment.hypothesis_check_error(args)
+        )
+
     def test_extreme_power_inputs_do_not_crash(self):
         self.assertGreaterEqual(
             experiment._sign_flip_required_seeds(

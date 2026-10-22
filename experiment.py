@@ -37064,7 +37064,11 @@ def print_comparison_analysis(
         )
         for warning in order_audit.get("warnings") or []:
             print(f"  [warn] {warning}")
-        if order_audit.get("verdict") == "ok":
+        if order_audit.get("verdict") == "insufficient":
+            reason = order_audit.get("reason")
+            if reason:
+                print(f"  {reason}")
+        elif order_audit.get("verdict") == "ok":
             print(
                 "  未发现强顺序相关；随机化区组平衡了时间片，"
                 "但描述性诊断不能证明没有漂移"
@@ -55107,16 +55111,18 @@ def hypothesis_check_error(
     返回错误消息（应交给 parser.error 报告）或 None。
 
     --compare（只读对比）、--sanity-only（结构检查）、
-    --statistical-baseline（建立对照坐标系）与 --resume
-    （假设已记录在原运行 config.json）不受此约束；纯工程
-    目的的临时运行可用 --skip-hypothesis-check 显式跳过，
-    跳过本身会随 config.json 存档。
+    --statistical-baseline（建立对照坐标系）、--plan-design
+    （只生成设计计划、不训练）与 --resume（假设已记录在原
+    运行 config.json）不受此约束；纯工程目的的临时运行可用
+    --skip-hypothesis-check 显式跳过，跳过本身会随 config.json
+    存档。
     """
     if (
         args.compare is None
         and getattr(args, "final_test_comparison", None) is None
         and not args.sanity_only
         and not args.statistical_baseline
+        and not getattr(args, "plan_design", False)
         and args.resume is None
         and not args.hypothesis.strip()
         and not args.skip_hypothesis_check
@@ -55673,19 +55679,37 @@ def planned_comparisons_for_plan(
     plan: List[Dict[str, object]],
 ) -> int:
     """
-    计划中实际会做的两两比较数（用于保守的家族校正）。
+    计划中可能执行的比较数（用于保守的家族校正）。
 
-    单臂/多种子设计没有跨臂比较，家族规模按 1 计；多臂设计
-    按不同模式的两两组合数计。消融的主效应/交互家族通常更
-    小，但用两两组合数是保守上界，不会把所需种子数说少。
+    单臂/多种子设计没有跨臂比较，家族规模按 1 计；多处理单元
+    设计按不同处理单元的两两组合数计。处理单元不能只看
+    ``mode``：消融计划里同一模式还有 ``balance_coef``=0/当前
+    值两档，忽略它会系统性少算家族规模，让所需种子数显得更
+    少。用全部处理轴去重后再取两两组合数，是全因子主效应/
+    交互与单因子对比的保守上界。
     """
-    modes = {
-        str(item.get("mode"))
-        for item in plan
-        if item.get("mode") is not None
+    identity_keys = {
+        "label",
+        "seed",
+        "order_index",
+        "block",
+        "position_in_block",
     }
-    if len(modes) >= 2:
-        return len(modes) * (len(modes) - 1) // 2
+    treatment_keys = sorted({
+        str(key)
+        for item in plan
+        for key in item
+        if str(key) not in identity_keys
+    })
+    cells = {
+        tuple(
+            _stable_factor_key(item.get(key))
+            for key in treatment_keys
+        )
+        for item in plan
+    }
+    if len(cells) >= 2:
+        return len(cells) * (len(cells) - 1) // 2
     return 1
 
 
@@ -55733,6 +55757,47 @@ def _design_plan_id(payload: Dict[str, object]) -> str:
             separators=(",", ":"),
         )
     )
+
+
+def _design_power_for_family(
+    power: Optional[Dict[str, object]],
+    family_size: int,
+) -> Optional[Dict[str, object]]:
+    """把先验功效记录对齐到计划实际展开的家族规模。
+
+    预注册里的 ``planned_comparisons`` 可能只覆盖声明过的星形
+    对照，实际套件却会展开全部臂的两两比较。设计计划必须按
+    更大的实际家族重新计算所需种子数，否则会在功效不足的
+    设计上宣称稳健主张可行。
+    """
+    if not isinstance(power, dict):
+        return power
+    declared = power.get("planned_comparisons")
+    if (
+        isinstance(declared, bool)
+        or not isinstance(declared, int)
+        or int(declared) >= int(family_size)
+    ):
+        return power
+    adjusted = dict(power)
+    adjusted["planned_comparisons"] = int(family_size)
+    adjusted["declared_planned_comparisons"] = int(declared)
+    min_effect = power.get("min_effect_relative")
+    planned_seeds = power.get("planned_seeds")
+    try:
+        recomputed = preregistration_power_plan(
+            adjusted,
+            float(min_effect),  # type: ignore[arg-type]
+            int(planned_seeds),  # type: ignore[arg-type]
+            int(family_size),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        # 手工构造/旧版记录可能没有重算所需的原始字段；
+        # 至少保留调整后的家族规模，不能退回低估的声明值。
+        return adjusted
+    recomputed["declared_planned_comparisons"] = int(declared)
+    recomputed["family_size_adjusted_for_plan"] = True
+    return recomputed
 
 
 def _atomic_write_json(
@@ -55793,12 +55858,27 @@ def write_design_plan(
     if not isinstance(power, dict):
         power = None
     if planned_comparisons is None:
-        planned_comparisons = (
+        actual_comparisons = planned_comparisons_for_plan(plan)
+        declared_comparisons = (
             int(power["planned_comparisons"])
             if power is not None
             and isinstance(power.get("planned_comparisons"), int)
-            else planned_comparisons_for_plan(plan)
+            and not isinstance(
+                power.get("planned_comparisons"), bool
+            )
+            else None
         )
+        planned_comparisons = (
+            max(declared_comparisons, actual_comparisons)
+            if declared_comparisons is not None
+            else actual_comparisons
+        )
+    planned_comparisons = int(planned_comparisons)
+    # 内嵌的 power 记录必须与计划实际家族同口径，否则设计文件
+    # 一边按实际家族算 seed_plan，一边保留低估的 required_seeds。
+    power = _design_power_for_family(
+        power, planned_comparisons
+    )
     seeds = [
         int(seed)
         for seed in (getattr(args, "seeds", None) or [])
@@ -55858,8 +55938,42 @@ def write_design_plan(
         datetime.timezone.utc
     ).isoformat()
     path = out_root / _DESIGN_PLAN_FILENAME
-    _atomic_write_json(path, payload)
-    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.exists():
+        try:
+            existing_raw = path.read_bytes()
+            existing = json.loads(
+                existing_raw.decode("utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"输出目录已有无法解析的 {path.name}：{error}；"
+                "为避免覆盖冻结设计，请先归档/移走该文件"
+            ) from error
+        if not isinstance(existing, dict):
+            raise ValueError(
+                f"输出目录已有 {path.name}，但不是 JSON 对象；"
+                "为避免覆盖冻结设计，请先归档/移走该文件"
+            )
+        existing_plan_id = existing.get("plan_id")
+        if _design_plan_id(existing) != existing_plan_id:
+            raise ValueError(
+                f"输出目录已有的 {path.name} 内容与其 plan_id "
+                "不一致：文件可能被改写，拒绝覆盖"
+            )
+        if str(existing_plan_id) != str(plan_id):
+            raise ValueError(
+                "输出目录已有另一份设计计划"
+                f"（plan_id={str(existing_plan_id)[:12]}...，"
+                f"本次为 {plan_id[:12]}...）：事后改变运行清单/"
+                "顺序会破坏预注册设计，请使用全新的 --out 目录"
+                "（或先把旧计划归档/移走）"
+            )
+        # 同一份设计：保留已冻结的文件字节，不因重新运行而
+        # 改写 created_utc；子进程仍会用它的 SHA-256 核对。
+        file_sha256 = hashlib.sha256(existing_raw).hexdigest()
+    else:
+        _atomic_write_json(path, payload)
+        file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
     return {
         "path": str(path),
         "file_sha256": file_sha256,
@@ -56343,6 +56457,35 @@ def run_order_drift_report(
             "spearman_rho": mode_rho,
             "p_value": mode_p,
         })
+
+    if rho is None:
+        # 所有运行指标相同（或执行顺序没有秩方差）时，Spearman
+        # 相关没有定义；不能把它当成「没有发现顺序相关」的
+        # 阳性证据。返回 insufficient，让展示层明确说无法估计。
+        return {
+            "available": True,
+            "verdict": "insufficient",
+            "n_runs": len(entries),
+            "n_blocks": len({
+                entry["block"] for entry in entries
+            }),
+            "plan_ids": plan_ids,
+            "order_schemes": schemes,
+            "detrended_spearman": None,
+            "detrended_p_value": None,
+            "by_mode": by_mode,
+            "warnings": warnings,
+            "reason": (
+                "去模式均值后的指标或执行顺序没有秩方差"
+                "（例如所有运行指标相同），无法估计 Spearman "
+                "顺序相关；这不是「没有漂移」的证据"
+            ),
+            "note": (
+                "这是描述性诊断，不是显著性检验；随机化完整区组"
+                "只能平衡时间漂移，不能消除它。若出现强顺序相关，"
+                "应检查机器/负载并重跑受影响区组"
+            ),
+        }
 
     return {
         "available": True,
@@ -58662,17 +58805,35 @@ def build_sweep_execution(
         if isinstance(prereg_record, dict)
         else None
     )
+    actual_comparisons = planned_comparisons_for_plan(plan)
     if (
         isinstance(prereg_power, dict)
         and isinstance(
             prereg_power.get("planned_comparisons"), int
         )
+        and not isinstance(
+            prereg_power.get("planned_comparisons"), bool
+        )
     ):
-        planned_comparisons = int(
+        declared_comparisons = int(
             prereg_power["planned_comparisons"]
         )
+        # 预注册声明的家族规模可能小于实际计划展开的对比数
+        # （例如 comparisons 只写了星形对照，但套件包含所有
+        # 两两臂）。家族校正与种子计划必须按更大的实际规模，
+        # 否则稳健符号翻转门槛会被低估。
+        planned_comparisons = max(
+            declared_comparisons, actual_comparisons
+        )
+        if planned_comparisons > declared_comparisons:
+            print(
+                "[design][warn] 预注册 power.planned_comparisons="
+                f"{declared_comparisons} 小于计划实际展开的 "
+                f"{actual_comparisons} 个处理单元比较；"
+                f"设计/种子计划按 {planned_comparisons} 校正"
+            )
     else:
-        planned_comparisons = planned_comparisons_for_plan(plan)
+        planned_comparisons = actual_comparisons
     ordered = order_sweep_plan(plan, scheme, order_seed)
     design = write_design_plan(
         out_root,
@@ -58737,7 +58898,10 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
     覆盖报告（基线调参套件输出调参报告）。
     """
     if args.suite_baseline_tuning:
-        run_baseline_tuning_sweep(args)
+        try:
+            run_baseline_tuning_sweep(args)
+        except ValueError as error:
+            raise SystemExit(f"[design] {error}") from error
         return
 
     factors = parse_factor_spec(args.compare_factors)
@@ -58745,9 +58909,12 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
     base_argv = strip_sweep_args(sys.argv[1:])
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
-    plan, design, planned_comparisons = build_sweep_execution(
-        args, out_root
-    )
+    try:
+        plan, design, planned_comparisons = build_sweep_execution(
+            args, out_root
+        )
+    except ValueError as error:
+        raise SystemExit(f"[design] {error}") from error
 
     if len(args.seeds) < _RECOMMENDED_SEEDS:
         print(
