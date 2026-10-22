@@ -56176,20 +56176,27 @@ def verify_design_assignment(
     entry_seed = entry.get("seed")
     entry_block = entry.get("block")
     entry_position = entry.get("position_in_block")
+    entry_order_index = entry.get("order_index")
     if any(
         isinstance(value, bool) or not isinstance(value, int)
-        for value in (entry_seed, entry_block, entry_position)
+        for value in (
+            entry_seed,
+            entry_block,
+            entry_position,
+            entry_order_index,
+        )
     ):
         # 不能对 1.9 之类数值做 int() 截断：计划文件里的
         # seed/区组必须是精确整数，否则“分配不符”会被静默
         # 四舍五入成一个合法分配。
         raise ValueError(
-            "设计计划条目的 seed/区组/区组内位置不是整数："
-            "计划内容损坏或被改写"
+            "设计计划条目的 order_index/seed/区组/区组内位置"
+            "不是整数：计划内容损坏或被改写"
         )
     entry_seed = int(entry_seed)
     entry_block = int(entry_block)
     entry_position = int(entry_position)
+    entry_order_index = int(entry_order_index)
     if entry_seed != int(args.seed):
         raise ValueError(
             "设计计划中的 seed 与当前 --seed 不一致"
