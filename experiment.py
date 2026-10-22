@@ -22911,9 +22911,12 @@ def _component_evidence_summary(
 
     返回 ``supported`` / ``partial`` / ``contradicted`` /
     ``blocked`` / ``inconclusive`` / ``insufficient_data`` /
-    ``missing``。只有所有可用证据都在 Holm 校正后显著且方向
-    改善，才返回 ``supported``；任一显著变差即为
-    ``contradicted``；出现混杂 claim 时一律 ``blocked``。
+    ``missing``。只有所有可用证据都在 Holm 校正后显著、方向
+    改善，且没有落在预注册等价界内，才返回 ``supported``；
+    任一显著变差即为 ``contradicted``；出现混杂 claim 时一律
+    ``blocked``。统计显著但 TOST 已判定为实质等价的效应不能
+    当作组件有用的证据：否则极小幅度的“显著”改进会被包装成
+    创新点有效。
     """
     if not effects:
         return {
@@ -22949,9 +22952,31 @@ def _component_evidence_summary(
             "evidence": summaries,
         }
     if all(claim == "supports_component" for claim in claims):
+        if all(effect.get("equivalent") for effect in effects):
+            return {
+                "status": "not_supported",
+                "reason": (
+                    "效应虽校正后显著，但全部落在预注册等价界内："
+                    "统计上非零不等于有实质改善，不能宣称该组件有用"
+                ),
+                "evidence": summaries,
+            }
+        if any(effect.get("equivalent") for effect in effects):
+            return {
+                "status": "partial",
+                "reason": (
+                    "部分支持效应落在预注册等价界内：这些水平上"
+                    "没有达到最小有意义效应，不能宣称组件在所有"
+                    "设置下有用"
+                ),
+                "evidence": summaries,
+            }
         return {
             "status": "supported",
-            "reason": "全部可用效应校正后显著且方向改善",
+            "reason": (
+                "全部可用效应校正后显著、方向改善，且未落入"
+                "预注册等价界"
+            ),
             "evidence": summaries,
         }
     if any(claim == "supports_component" for claim in claims):
@@ -42071,6 +42096,26 @@ def run_self_test():
             }],
             "low_replicate_cells": [],
         }
+        equivalent_support = _component_evidence_summary([
+            {
+                "claim": "supports_component",
+                "equivalent": True,
+            }
+        ])
+        assert equivalent_support["status"] == "not_supported"
+        assert "等价界" in equivalent_support["reason"]
+        mixed_equivalence = _component_evidence_summary([
+            {
+                "claim": "supports_component",
+                "equivalent": True,
+            },
+            {
+                "claim": "supports_component",
+                "equivalent": False,
+            },
+        ])
+        assert mixed_equivalence["status"] == "partial"
+        assert "等价界" in mixed_equivalence["reason"]
         component_verdicts = ablation_component_verdicts(
             factorial,
             component_coverage,
