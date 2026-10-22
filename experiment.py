@@ -15245,19 +15245,13 @@ def early_stop_state_from_records(
         if metric not in record:
             continue
 
-        value = record.get(metric)
         # 非有限值不算「改善」也不触发「未改善」计数，
         # 与在线训练循环的判定保持一致；否则 NaN 会把 best
         # 永久污染成 NaN，resume 后的选型与早停全部失准。
-        if (
-            value is None
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float))
-        ):
-            continue
-
-        value = float(value)
-        if not math.isfinite(value):
+        # 记录来自 JSON，超范围整数同样按不可用值跳过，
+        # 不能让它以 OverflowError 中断 resume。
+        value = _finite_float(record.get(metric))
+        if value is None:
             continue
 
         if selection_improved(
@@ -31354,12 +31348,11 @@ def _trivial_reference_value(
         # 没有该字段也应能完成稻草人核对。
         return 0.0
 
-    value = reference.get(field)
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-
-    value = float(value)
-    if not math.isfinite(value):
+    # 参考基线来自 config.json：JSON 允许 10**400 这类超出
+    # float 范围的整数。按不可用参考处理，而不是让 float()
+    # 在基线合理性核对里抛 OverflowError。
+    value = _finite_float(reference.get(field))
+    if value is None:
         return None
 
     # unigram_loss 换算到其他口径时与 evaluate / 曲线诊断一致；
@@ -34735,9 +34728,9 @@ def hypothesis_preregistration_error(
             "而不声明方向无法判定「是否达到」"
         )
 
+    min_effect_number = _finite_float(min_effect)
     if min_effect is not None and (
-        not math.isfinite(float(min_effect))
-        or float(min_effect) <= 0.0
+        min_effect_number is None or min_effect_number <= 0.0
     ):
         return (
             "--hypothesis-min-effect 必须是有限正数"
@@ -35142,14 +35135,12 @@ def hypothesis_alignment(
             continue
 
         declared_min_effects = [
-            float(declaration["min_effect"])
+            number
             for declaration in metric_declarations
-            if isinstance(
-                declaration.get("min_effect"), (int, float)
-            )
-            and not isinstance(
-                declaration.get("min_effect"), bool
-            )
+            for number in [
+                _finite_float(declaration.get("min_effect"))
+            ]
+            if number is not None
         ]
         directions = {
             str(declaration["direction"])
@@ -36572,13 +36563,9 @@ def equivalence_margin_preregistration(
       无法裁决；
     - ``unverifiable``：旧运行没有记录，或缺当前界。
     """
-    current = None
-    if isinstance(equivalence_margin, (int, float)) and not isinstance(
-        equivalence_margin, bool
-    ):
-        value = float(equivalence_margin)
-        if math.isfinite(value) and value > 0.0:
-            current = value
+    current = _finite_float(equivalence_margin)
+    if current is not None and current <= 0.0:
+        current = None
 
     declared: Dict[str, float] = {}
     missing: List[str] = []
@@ -36587,17 +36574,19 @@ def equivalence_margin_preregistration(
         if _is_deterministic_run(row):
             continue
         run = str(row.get("run"))
-        value = row.get("hypothesis_equivalence_margin")
-        if value is None:
+        raw_value = row.get("hypothesis_equivalence_margin")
+        if raw_value is None:
             missing.append(run)
             continue
-        if isinstance(value, bool) or not isinstance(
-            value, (int, float)
+        if isinstance(raw_value, bool) or not isinstance(
+            raw_value, (int, float)
         ):
             invalid.append(run)
             continue
-        numeric = float(value)
-        if not math.isfinite(numeric) or numeric <= 0.0:
+        # 超范围整数/非有限值按无效预注册处理，不能因为
+        # 单个损坏运行让整份等价性核对崩溃。
+        numeric = _finite_float(raw_value)
+        if numeric is None or numeric <= 0.0:
             invalid.append(run)
             continue
         declared[run] = numeric

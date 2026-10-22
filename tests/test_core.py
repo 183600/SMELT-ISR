@@ -5694,6 +5694,82 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertIsNone(timing["std"])
 
+    def test_analysis_and_resume_tolerate_out_of_range_numbers(self):
+        huge = 10 ** 400
+
+        # 参考基线来自 config.json：超范围整数按不可用处理。
+        self.assertIsNone(
+            experiment._trivial_reference_value(
+                "val_loss", {"unigram_loss": huge}
+            )
+        )
+
+        # resume 读取历史指标时不能因单个超范围整数崩溃。
+        self.assertEqual(
+            experiment.early_stop_state_from_records(
+                [{"step": 1, "val_loss": huge}],
+                0.0,
+            ),
+            (None, None, 0),
+        )
+
+        # 预注册等价界损坏时标记为 invalid，而不是抛异常。
+        margin = experiment.equivalence_margin_preregistration(
+            [
+                {
+                    "run": "bad_margin",
+                    "hypothesis_equivalence_margin": huge,
+                }
+            ],
+            0.01,
+        )
+        self.assertEqual(margin["invalid_runs"], ["bad_margin"])
+        self.assertEqual(margin["declared_margins"], {})
+
+        # 最小效应预注册值损坏时必须给出可读错误。
+        args = argparse.Namespace(
+            hypothesis_direction="decrease",
+            hypothesis_min_effect=huge,
+            primary_metric="val_loss",
+            hypothesis_baseline=None,
+            compare=None,
+            final_test_comparison=None,
+            sanity_only=False,
+            statistical_baseline=False,
+            hypothesis="验证损失降低 2%",
+        )
+        error = experiment.hypothesis_preregistration_error(args)
+        self.assertIn("有限正数", error or "")
+
+        # 对比阶段不能因坏的最小效应值中断；该运行仍可登记，
+        # 但没有可用的绝对阈值。
+        alignment = experiment.hypothesis_alignment(
+            [
+                {
+                    "run": "bad_effect",
+                    "hypothesis_direction": "decrease",
+                    "primary_metric": "val_loss",
+                    "hypothesis_min_effect": huge,
+                }
+            ],
+            [{"label": "mode=B, seed=1", "runs": ["bad_effect"]}],
+            [
+                {
+                    "variant": "mode=B, seed=1",
+                    "baseline": "mode=A, seed=1",
+                    "factor": "mode",
+                    "delta": -1.0,
+                    "mean_baseline": 1.0,
+                    "p_value_holm": 0.01,
+                    "significant": True,
+                    "confounded": False,
+                }
+            ],
+            "val_loss",
+        )
+        self.assertEqual(len(alignment["checks"]), 1)
+        self.assertIsNone(alignment["checks"][0]["min_effect"])
+
     def test_paired_stats_keep_large_finite_effects(self):
         huge = 1.0e308
         test = experiment._paired_t_test([huge, huge, huge])
