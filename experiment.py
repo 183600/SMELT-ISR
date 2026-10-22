@@ -22391,8 +22391,15 @@ def _stable_factor_key(value):
         )
     if isinstance(value, bool):
         return ("bool", value)
-    if isinstance(value, (int, float)):
-        return ("number", float(value))
+    if isinstance(value, int):
+        try:
+            return ("number", float(value))
+        except OverflowError:
+            # JSON 可含任意大整数；因子键不能因此崩溃，也不能
+            # 把两个不同大整数折成同一个 inf。
+            return ("integer", value)
+    if isinstance(value, float):
+        return ("number", value)
     return ("value", value)
 
 
