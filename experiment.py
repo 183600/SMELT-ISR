@@ -26541,6 +26541,10 @@ def _attach_family_power(
     if critical is None:
         return
     margin_needed = delta_value + critical * se_value
+    if not math.isfinite(margin_needed):
+        # 极大但有限的 se/delta 相加后仍可能越过 float 上限。
+        # 无法表示所需等价界时省略该字段，不把 inf 落盘。
+        return
     contrast["equivalence_margin_needed_bonferroni"] = margin_needed
     baseline_abs = None
     baseline_mean = _finite_float(
@@ -26549,9 +26553,11 @@ def _attach_family_power(
     if baseline_mean is not None and abs(baseline_mean) > 0.0:
         baseline_abs = abs(baseline_mean)
     if baseline_abs is not None:
-        contrast["equivalence_margin_needed_bonferroni_relative"] = (
-            margin_needed / baseline_abs
-        )
+        relative_needed = margin_needed / baseline_abs
+        if math.isfinite(relative_needed):
+            contrast[
+                "equivalence_margin_needed_bonferroni_relative"
+            ] = relative_needed
 
 
 def _attach_power_equivalence(
@@ -26646,6 +26652,11 @@ def _attach_power_equivalence(
         return
 
     margin_abs = margin_relative * baseline_abs
+    if not math.isfinite(margin_abs):
+        # 相对界与基线均值都有限，但绝对界可能超出 float 范围；
+        # 此时无法构造 TOST 的实际意义界，按不可用记录。
+        contrast["equivalence_margin_abs"] = None
+        return
     contrast["equivalence_margin_abs"] = margin_abs
     tost = _tost_test(
         float(delta),
@@ -26673,46 +26684,57 @@ def _attach_power_equivalence(
     if critical is not None:
         noise_half_width = critical * se_value
         margin_needed = abs(float(delta)) + noise_half_width
-        contrast["equivalence_margin_needed"] = margin_needed
-        if baseline_abs is not None:
-            contrast["equivalence_margin_needed_relative"] = (
-                margin_needed / baseline_abs
-            )
-        if abs(float(delta)) >= margin_abs:
-            # 点估计已经在界外：这不是功效问题，是效应本身
-            # 超出实际意义界。
+        if not math.isfinite(margin_needed):
+            # 所需界超出 float 上限：只能判定为精度不足，且不写
+            # 入任何非有限数值（否则 JSON 报告无法严格解析）。
             contrast["equivalence_blocker"] = (
-                "effect_exceeds_margin"
+                "insufficient_precision"
             )
-        elif margin_needed > margin_abs:
-            contrast["equivalence_blocker"] = "insufficient_precision"
-            # 在种子间标准差不变的近似下，se ∝ 1/√n，要把噪声
-            # 半宽从 (needed-|Δ|) 压到 (margin-|Δ|)，需要
-            # n_needed = n·((needed-|Δ|)/(margin-|Δ|))^2。
-            current_n = _current_seed_count(contrast)
-            denominator = margin_abs - abs(float(delta))
-            if (
-                current_n is not None
-                and current_n > 0
-                and denominator > 0.0
-                and math.isfinite(noise_half_width)
-            ):
-                # 合法但极大的 se 会让 ratio² 溢出；此时无法给
-                # 出有限的所需种子数，显式省略该字段，而不是让
-                # int(math.ceil(inf)) 抛 OverflowError 中断整份
-                # 对比报告。正常量级保留原公式以维持历史数值。
-                ratio = noise_half_width / denominator
-                try:
-                    required = current_n * ratio ** 2
-                except OverflowError:
-                    required = None
-                if required is not None and math.isfinite(required):
-                    contrast["equivalence_seeds_to_achieve"] = int(
-                        math.ceil(required)
-                    )
-                    _attach_sd_uncertainty_note(contrast)
         else:
-            contrast["equivalence_blocker"] = None
+            contrast["equivalence_margin_needed"] = margin_needed
+            if baseline_abs is not None:
+                relative_needed = margin_needed / baseline_abs
+                if math.isfinite(relative_needed):
+                    contrast[
+                        "equivalence_margin_needed_relative"
+                    ] = relative_needed
+            if abs(float(delta)) >= margin_abs:
+                # 点估计已经在界外：这不是功效问题，是效应本身
+                # 超出实际意义界。
+                contrast["equivalence_blocker"] = (
+                    "effect_exceeds_margin"
+                )
+            elif margin_needed > margin_abs:
+                contrast["equivalence_blocker"] = (
+                    "insufficient_precision"
+                )
+                # 在种子间标准差不变的近似下，se ∝ 1/√n，要把噪声
+                # 半宽从 (needed-|Δ|) 压到 (margin-|Δ|)，需要
+                # n_needed = n·((needed-|Δ|)/(margin-|Δ|))^2。
+                current_n = _current_seed_count(contrast)
+                denominator = margin_abs - abs(float(delta))
+                if (
+                    current_n is not None
+                    and current_n > 0
+                    and denominator > 0.0
+                    and math.isfinite(noise_half_width)
+                ):
+                    # 合法但极大的 se 会让 ratio² 溢出；此时无法给
+                    # 出有限的所需种子数，显式省略该字段，而不是让
+                    # int(math.ceil(inf)) 抛 OverflowError 中断整份
+                    # 对比报告。正常量级保留原公式以维持历史数值。
+                    ratio = noise_half_width / denominator
+                    try:
+                        required = current_n * ratio ** 2
+                    except OverflowError:
+                        required = None
+                    if required is not None and math.isfinite(required):
+                        contrast["equivalence_seeds_to_achieve"] = int(
+                            math.ceil(required)
+                        )
+                        _attach_sd_uncertainty_note(contrast)
+            else:
+                contrast["equivalence_blocker"] = None
 
 
 def _holm_bonferroni(

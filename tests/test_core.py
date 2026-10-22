@@ -6701,6 +6701,45 @@ class NumericalScaleTests(unittest.TestCase):
             contrast,
         )
 
+    def test_equivalence_margin_overflow_is_omitted(self):
+        contrast = {
+            "mean_baseline": 1.0,
+            "delta": 1.0,
+            "n_pairs": 3,
+            "n_baseline": 3,
+            "n_variant": 3,
+            "test": "paired_t",
+        }
+        # t 临界值 × 1e308 溢出：不能把 inf 写进所需等价界。
+        experiment._attach_power_equivalence(
+            contrast,
+            1.0,
+            {"se": 1.0e308, "df": 2.0},
+            0.02,
+        )
+        self.assertEqual(
+            contrast["equivalence_blocker"],
+            "insufficient_precision",
+        )
+        self.assertNotIn("equivalence_margin_needed", contrast)
+        self.assertNotIn(
+            "equivalence_margin_needed_relative", contrast
+        )
+        json.dumps(contrast, allow_nan=False)
+
+        family = {
+            "se": 1.0e308,
+            "df": 2.0,
+            "delta": 1.0e308,
+            "mean_baseline": 1.0,
+            "equivalence_margin_abs": 1.0e308,
+        }
+        experiment._attach_family_power(family, 3)
+        self.assertNotIn(
+            "equivalence_margin_needed_bonferroni", family
+        )
+        json.dumps(family, allow_nan=False)
+
     def test_environment_identity_falls_back_for_minimal_snapshots(self):
         expected = {
             "schema": experiment._ENVIRONMENT_SCHEMA,
