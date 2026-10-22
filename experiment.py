@@ -46719,9 +46719,9 @@ def main():
             metavar="JS",
             help=(
                 f"分布偏移硬门（0~1）：{shift_label} 超过该值时"
-                "拒绝开始训练/拒绝解封测试集；"
+                "拒绝开始训练/拒绝解封测试集"
                 + (
-                    "该阈值同时约束 train/val 边界的尾/头块"
+                    "；该阈值同时约束 train/val 边界的尾/头块"
                     if shift_flag == "--max-byte-shift"
                     else ""
                 )
