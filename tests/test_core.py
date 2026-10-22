@@ -1603,6 +1603,33 @@ class PreregistrationTests(unittest.TestCase):
             sys.argv = original_argv
         self.assertIn("不在预注册", error)
 
+    def test_protocol_fallback_includes_cleaning_exemptions(self):
+        protocol = experiment.experiment_protocol_from_payload({
+            "config": {"mode": "A"},
+            "args": {
+                "lr": 1e-3,
+                "clean_train_against_test": False,
+                "allow_eval_content_for_cleaning": True,
+                "allow_entity_overlap": True,
+            },
+        })
+        self.assertTrue(
+            protocol["allow_eval_content_for_cleaning"]
+        )
+        self.assertTrue(protocol["allow_entity_overlap"])
+        # 旧配置完全没有 comparison_protocol 时，这两个键也
+        # 必须出现在回填协议里；否则受控变量检查只能报「缺
+        # 记录」，无法识别同口径。
+        self.assertIn(
+            "allow_eval_content_for_cleaning",
+            experiment.COMPARISON_PROTOCOL_KEYS,
+        )
+        for key in (
+            "allow_eval_content_for_cleaning",
+            "allow_entity_overlap",
+        ):
+            self.assertIn(key, protocol)
+
     def test_saved_cleaning_alias_uses_effective_or(self):
         # 旧检查点可能只把 allow_eval_content_for_cleaning 记为
         # True，而 clean_train_against_test 仍是 argparse 默认

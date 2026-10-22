@@ -21928,6 +21928,15 @@ def experiment_protocol_from_payload(
         "allow_data_leakage": bool(
             run_args.get("allow_data_leakage", False)
         ),
+        # 这两个豁免也在 COMPARISON_PROTOCOL_KEYS 中；旧配置
+        # 没有 comparison_protocol 时必须从 args 回填，否则
+        # 同一个有效口径会被当成「缺记录」或与新版不一致。
+        "allow_eval_content_for_cleaning": (
+            _saved_clean_against_test_effective(run_args)
+        ),
+        "allow_entity_overlap": bool(
+            run_args.get("allow_entity_overlap", False)
+        ),
         "allow_corrupt_test_labels": bool(
             run_args.get("allow_corrupt_test_labels", False)
         ),
