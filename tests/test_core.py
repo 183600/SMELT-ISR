@@ -436,6 +436,42 @@ class ReproducibilityTests(unittest.TestCase):
                 )
             )
 
+    def test_tracking_header_fields_are_self_contained(self):
+        class _Dataset:
+            data_sha256 = "data-sha"
+            split_sha256 = {"train": "train-sha"}
+            effective_train_sha256 = "effective-sha"
+
+        class _Args:
+            seed = 7
+
+        header = experiment.tracking_header_fields(
+            _Args(),
+            _Dataset(),
+            {
+                "timestamp_utc": "2026-01-01T00:00:00+00:00",
+                "script_sha256": "script-sha",
+                "git_commit": "commit-sha",
+                "git_dirty": False,
+            },
+            comparison_protocol_sha256="protocol-sha",
+        )
+        self.assertEqual(header["seed"], 7)
+        self.assertEqual(header["data_sha256"], "data-sha")
+        self.assertEqual(
+            header["data_split_sha256"]["train"],
+            "train-sha",
+        )
+        self.assertEqual(
+            header["data_effective_train_sha256"],
+            "effective-sha",
+        )
+        self.assertEqual(header["script_sha256"], "script-sha")
+        self.assertEqual(
+            header["comparison_protocol_sha256"],
+            "protocol-sha",
+        )
+
     def test_tracking_provenance_prefers_original_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

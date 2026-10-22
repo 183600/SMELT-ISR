@@ -11456,6 +11456,11 @@ def run_statistical_baseline(
 
     _write({
         "step": "reference_baselines",
+        **tracking_header_fields(
+            args,
+            dataset,
+            ngram_run_metadata,
+        ),
         **reference,
     })
 
@@ -34990,6 +34995,43 @@ def load_tracking_provenance(
     }
 
 
+def tracking_header_fields(
+    args: argparse.Namespace,
+    dataset: ByteDataset,
+    run_metadata: Dict[str, object],
+    *,
+    run_started_utc: Optional[str] = None,
+    comparison_protocol_sha256: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    metrics.jsonl 首行的运行身份字段。
+
+    config.json 是完整运行卡片，但 metrics.jsonl 经常被单独复制
+    进图表/归档；首行带上种子、数据版本、代码版本与协议指纹，
+    即使脱离 config.json 也能核对曲线属于哪一轮实验。
+    """
+    return {
+        "seed": getattr(args, "seed", None),
+        "data_sha256": getattr(dataset, "data_sha256", None),
+        "data_split_sha256": dict(
+            getattr(dataset, "split_sha256", {}) or {}
+        ),
+        "data_effective_train_sha256": getattr(
+            dataset, "effective_train_sha256", None
+        ),
+        "script_sha256": run_metadata.get("script_sha256"),
+        "git_commit": run_metadata.get("git_commit"),
+        "git_dirty": run_metadata.get("git_dirty"),
+        "run_started_utc": (
+            run_started_utc
+            or run_metadata.get("timestamp_utc")
+        ),
+        "comparison_protocol_sha256": (
+            comparison_protocol_sha256
+        ),
+    }
+
+
 def load_previous_sanity_result(
     out_dir: Path,
 ) -> Optional[Dict[str, object]]:
@@ -55639,12 +55681,13 @@ def main():
     ):
         # 保存追踪信息后退出：失败记录本身也是实验追踪的一部分，
         # 不盲目开始全量训练。
+        sanity_run_metadata = collect_run_metadata(device)
         write_run_config(
             out_dir,
             cfg,
             args,
             n_params=int(sanity_result["n_params"]),
-            run_metadata=collect_run_metadata(device),
+            run_metadata=sanity_run_metadata,
             sanity_result=sanity_result,
             data_audit=data_audit,
             reference_baselines=reference_baselines,
@@ -55656,10 +55699,28 @@ def main():
         if args.resume is None:
             # 全新运行：参考基线记录是 metrics.jsonl 的首行；
             # resume 时保留原运行记录，不重复追加。
+            sanity_tracking = load_tracking_provenance(
+                out_dir
+            )
             write_jsonl_record(
                 out_dir / "metrics.jsonl",
                 {
                     "step": "reference_baselines",
+                    **tracking_header_fields(
+                        args,
+                        dataset,
+                        sanity_run_metadata,
+                        run_started_utc=(
+                            sanity_tracking.get(
+                                "run_started_utc"
+                            )
+                        ),
+                        comparison_protocol_sha256=(
+                            sanity_tracking.get(
+                                "comparison_protocol_sha256"
+                            )
+                        ),
+                    ),
                     **reference_baselines,
                 },
                 append=False,
@@ -56341,6 +56402,21 @@ def main():
             json.dumps(
                 _json_safe({
                     "step": "reference_baselines",
+                    **tracking_header_fields(
+                        args,
+                        dataset,
+                        run_metadata,
+                        run_started_utc=(
+                            tracking_provenance.get(
+                                "run_started_utc"
+                            )
+                        ),
+                        comparison_protocol_sha256=(
+                            tracking_provenance.get(
+                                "comparison_protocol_sha256"
+                            )
+                        ),
+                    ),
                     **reference_baselines,
                 }),
                 ensure_ascii=False,
