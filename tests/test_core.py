@@ -360,6 +360,64 @@ class RoutingInterventionReproducibilityTests(unittest.TestCase):
         )
 
 
+class ReproducibilityTests(unittest.TestCase):
+    def test_set_seed_records_effective_manifest(self):
+        experiment.set_seed(321)
+        manifest = experiment._LAST_SEED_MANIFEST
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["seed"], 321)
+        self.assertEqual(manifest["torch_initial_seed"], 321)
+        self.assertTrue(manifest["python_random"])
+        if torch.cuda.is_available():
+            self.assertTrue(manifest["cuda_initial_seeds"])
+            self.assertTrue(
+                all(
+                    value == 321
+                    for value in manifest[
+                        "cuda_initial_seeds"
+                    ]
+                )
+            )
+
+    def test_optimizer_coverage_detects_missing_params(self):
+        model = experiment.LanguageModel(_tiny_config())
+        optimizer = torch.optim.AdamW(
+            model.token_embedding.parameters(),
+            lr=1e-3,
+        )
+        report = experiment._probe_optimizer_coverage(
+            model, optimizer
+        )
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["missing_params"])
+
+        full = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-3,
+        )
+        self.assertTrue(
+            experiment._probe_optimizer_coverage(
+                model, full
+            )["ok"]
+        )
+
+    def test_non_expert_digest_tracks_parameter_updates(self):
+        model = experiment.LanguageModel(_tiny_config())
+        before = experiment._non_expert_parameter_digest(
+            model
+        )
+        self.assertEqual(
+            before,
+            experiment._non_expert_parameter_digest(model),
+        )
+        with torch.no_grad():
+            model.token_embedding.weight.add_(1.0)
+        self.assertNotEqual(
+            before,
+            experiment._non_expert_parameter_digest(model),
+        )
+
+
 class ProcessTests(unittest.TestCase):
     def test_set_seed_updates_child_hashseed_on_reseed(self):
         if experiment._PYTHONHASHSEED_AT_START is not None:

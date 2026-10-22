@@ -59,6 +59,11 @@ _PYTHONHASHSEED_AT_START = os.environ.get("PYTHONHASHSEED")
 # set_seed 里的一次性提示标志：避免每个进程重复打印。
 _PYTHONHASHSEED_WARNED = False
 
+# 最近一次 set_seed 实际播种的随机源与种子。写入
+# run_metadata，供实验追踪核对「参数里的 --seed 是否真的
+# 作用到了每个后端」，而不只是相信调用点。
+_LAST_SEED_MANIFEST: Optional[Dict[str, object]] = None
+
 
 # ============================================================
 # Configuration
@@ -791,6 +796,47 @@ def seed_error(seed: int) -> Optional[str]:
     return None
 
 
+def _seed_optional_accelerators(seed: int) -> List[str]:
+    """
+    固定 PyTorch 可选的 XPU / MPS 后端随机源。
+
+    CUDA 由 set_seed 直接处理；XPU（Intel GPU）与 MPS（Apple
+    GPU）在对应硬件上同样是训练随机性的来源。旧版 torch 没有
+    这些命名空间或后端不可用时静默跳过，不影响 CPU/CUDA 路径。
+    返回值只列出真正播种成功的后端，写进运行元数据。
+    """
+    seeded: List[str] = []
+
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None:
+        try:
+            if xpu.is_available():
+                xpu.manual_seed_all(seed)
+                seeded.append("xpu")
+        except (AttributeError, RuntimeError):
+            pass
+
+    mps = getattr(torch, "mps", None)
+    if mps is not None:
+        try:
+            mps_available = getattr(
+                getattr(torch, "backends", None),
+                "mps",
+                None,
+            )
+            if (
+                mps_available is not None
+                and mps_available.is_available()
+                and hasattr(mps, "manual_seed")
+            ):
+                mps.manual_seed(seed)
+                seeded.append("mps")
+        except (AttributeError, RuntimeError):
+            pass
+
+    return seeded
+
+
 def set_seed(
     seed: int,
     *,
@@ -825,6 +871,38 @@ def set_seed(
     if torch.cuda.is_available():
         # manual_seed_all 覆盖当前可见的所有 CUDA 设备。
         torch.cuda.manual_seed_all(seed)
+
+    # XPU / MPS 等可选加速后端同样属于训练随机性来源。
+    optional_backends = _seed_optional_accelerators(seed)
+
+    cuda_initial_seeds: List[int] = []
+    if torch.cuda.is_available():
+        for device_index in range(torch.cuda.device_count()):
+            try:
+                with torch.cuda.device(device_index):
+                    cuda_initial_seeds.append(
+                        int(torch.cuda.initial_seed())
+                    )
+            except (AssertionError, RuntimeError):
+                # 设备不可访问时不伪造读数；device_count 本身
+                # 仍记录在清单里。
+                continue
+
+    global _LAST_SEED_MANIFEST
+    _LAST_SEED_MANIFEST = {
+        "seed": int(seed),
+        "python_random": True,
+        "numpy": np is not None,
+        "torch_initial_seed": int(torch.initial_seed()),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": (
+            torch.cuda.device_count()
+            if torch.cuda.is_available()
+            else 0
+        ),
+        "cuda_initial_seeds": cuda_initial_seeds,
+        "optional_backends": optional_backends,
+    }
 
     # PYTHONHASHSEED 只对之后启动的子进程（如 torch.compile 的
     # 编译进程）生效；当前解释器的哈希种子在启动时已经确定，
@@ -32910,6 +32988,110 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
     return probe
 
 
+def _probe_optimizer_coverage(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, object]:
+    """
+    核对优化器参数组是否覆盖全部可训练参数。
+
+    梯度探针只能证明参数「收到了梯度」；如果优化器在模型
+    构造完成前创建、漏掉某个子模块或传入了错误参数列表，
+    这些参数会一直停在初始值，而损失仍可能因其余参数更新
+    而下降。这里直接比较参数对象的 id 集合，给出缺失参数名，
+    并检查重复参数（同一参数被多个 param group 更新两次）。
+    """
+    trainable = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    trainable_ids = {id(parameter) for _, parameter in trainable}
+
+    optimizer_ids = set()
+    duplicate_params: List[str] = []
+    id_to_name = {
+        id(parameter): name
+        for name, parameter in trainable
+    }
+
+    for group in optimizer.param_groups:
+        for parameter in group.get("params", []):
+            parameter_id = id(parameter)
+            if parameter_id in optimizer_ids:
+                duplicate_params.append(
+                    id_to_name.get(
+                        parameter_id,
+                        f"<unknown:{parameter_id}>",
+                    )
+                )
+            optimizer_ids.add(parameter_id)
+
+    missing_params = [
+        name
+        for name, parameter in trainable
+        if id(parameter) not in optimizer_ids
+    ]
+    foreign_param_count = sum(
+        1
+        for parameter_id in optimizer_ids
+        if parameter_id not in trainable_ids
+    )
+
+    return {
+        "n_trainable_params": len(trainable),
+        "n_optimizer_params": len(optimizer_ids),
+        "missing_params": missing_params,
+        "duplicate_params": sorted(set(duplicate_params)),
+        "foreign_param_count": foreign_param_count,
+        "ok": (
+            bool(trainable)
+            and not missing_params
+            and not duplicate_params
+            and foreign_param_count == 0
+        ),
+    }
+
+
+def _non_expert_parameter_digest(
+    model: nn.Module,
+) -> str:
+    """
+    非专家可训练参数的稳定内容指纹。
+
+    sanity check 第一步 optimizer.step 前后各取一次：内容不变
+    说明优化器没有真正更新任何非专家参数（lr=0、参数未加入
+    optimizer、GradScaler 跳步或被冻结），即使损失曲线仍可能
+    因专家参数更新而下降。专家参数允许因本批次未路由而不变，
+    因此不纳入该指纹。
+    """
+    expert_ids = _expert_parameter_ids(model)
+    digest = hashlib.sha256()
+
+    for name, parameter in model.named_parameters():
+        if (
+            not parameter.requires_grad
+            or id(parameter) in expert_ids
+        ):
+            continue
+
+        digest.update(name.encode("utf-8"))
+        raw = parameter.detach().to(
+            device="cpu",
+            dtype=parameter.dtype,
+        ).contiguous()
+        digest.update(str(raw.dtype).encode("ascii"))
+        digest.update(str(tuple(raw.shape)).encode("ascii"))
+        raw_bytes = raw.reshape(-1).view(torch.uint8)
+        try:
+            payload = raw_bytes.numpy().tobytes()
+        except (TypeError, RuntimeError):
+            payload = bytes(raw_bytes.tolist())
+        digest.update(payload)
+
+    return digest.hexdigest()
+
+
 # 梯度探针失败原因到排查建议的映射。
 _GRADIENT_FAILURE_HINTS = {
     "loss_not_connected": (
@@ -33068,6 +33250,23 @@ def run_sanity_overfit(
             weight_decay=0.0,
         )
 
+        # 优化器覆盖检查与「第一步是否真的更新权重」检查：
+        # 梯度存在但参数没进优化器、lr=0 或 GradScaler 跳步，
+        # 都会让训练空转，损失/准确率曲线可能暂时看不出来。
+        optimizer_coverage = _probe_optimizer_coverage(
+            model,
+            optimizer,
+        )
+        if not optimizer_coverage["ok"]:
+            print(
+                "[sanity] [warn] 优化器参数覆盖不完整: "
+                f"missing={optimizer_coverage['missing_params']}, "
+                "duplicate="
+                f"{optimizer_coverage['duplicate_params']}, "
+                "foreign="
+                f"{optimizer_coverage['foreign_param_count']}"
+            )
+
         use_amp = (
             amp_dtype is not None
             and device.type == "cuda"
@@ -33087,6 +33286,8 @@ def run_sanity_overfit(
         final_lm_loss = float("nan")
         final_acc = float("nan")
         grad_probe: Optional[Dict[str, object]] = None
+        pre_step_parameter_digest: Optional[str] = None
+        post_step_parameter_digest: Optional[str] = None
 
         with torch.autocast(
             device_type="cuda",
@@ -33144,9 +33345,21 @@ def run_sanity_overfit(
                             grad_probe = _probe_gradient_flow(
                                 model
                             )
+                            pre_step_parameter_digest = (
+                                _non_expert_parameter_digest(
+                                    model
+                                )
+                            )
 
                         scaler.step(optimizer)
                         scaler.update()
+
+                        if step == 1:
+                            post_step_parameter_digest = (
+                                _non_expert_parameter_digest(
+                                    model
+                                )
+                            )
                     # 损失未连接时没有 scale/backward，GradScaler
                     # 没有 inf 检查记录，调用 step 会直接抛
                     # RuntimeError；此时跳过优化器步进，保留
@@ -33159,8 +33372,18 @@ def run_sanity_overfit(
                             grad_probe = _probe_gradient_flow(
                                 model
                             )
+                            pre_step_parameter_digest = (
+                                _non_expert_parameter_digest(
+                                    model
+                                )
+                            )
 
                     optimizer.step()
+
+                    if step == 1 and loss_connected:
+                        post_step_parameter_digest = (
+                            _non_expert_parameter_digest(model)
+                        )
 
                 # fused AdamW 不推进参数版本号，显式使专家权重
                 # stack 缓存失效，确保下一步前向使用新参数。
@@ -33227,9 +33450,22 @@ def run_sanity_overfit(
             or final_acc >= acc_threshold
         )
 
+        parameter_update_ok = bool(
+            pre_step_parameter_digest is not None
+            and post_step_parameter_digest is not None
+            and pre_step_parameter_digest
+            != post_step_parameter_digest
+        )
+
         passed = metric_ok and learned
 
         if not data_sampling_uses_explicit_generator:
+            passed = False
+
+        if not optimizer_coverage["ok"]:
+            passed = False
+
+        if not parameter_update_ok:
             passed = False
 
         if initial_total_loss is not None:
@@ -33268,6 +33504,26 @@ def run_sanity_overfit(
                 )
             )
 
+        print(
+            "[sanity] 优化器检查: "
+            f"coverage_ok={optimizer_coverage['ok']} "
+            f"({optimizer_coverage['n_optimizer_params']}/"
+            f"{optimizer_coverage['n_trainable_params']}), "
+            f"parameter_update_ok={parameter_update_ok}"
+        )
+        if not optimizer_coverage["ok"]:
+            print(
+                "[sanity] 优化器未覆盖全部可训练参数：请检查"
+                " optimizer 是否在模型构建完成后用 "
+                "model.parameters() 创建，参数组是否遗漏子模块"
+            )
+        if not parameter_update_ok:
+            print(
+                "[sanity] 第一步 optimizer.step 未改变任何非专家"
+                "参数：请检查 lr 是否为 0、参数是否被冻结、"
+                "GradScaler 是否因子梯度溢出跳过了更新"
+            )
+
         return {
             "passed": passed,
             "n_params": n_params,
@@ -33303,6 +33559,15 @@ def run_sanity_overfit(
                 grad_probe is not None
                 and not grad_probe["failures"]
             ),
+            "optimizer_coverage": optimizer_coverage,
+            "optimizer_coverage_ok": optimizer_coverage["ok"],
+            "parameter_update_ok": parameter_update_ok,
+            "pre_step_parameter_sha256": (
+                pre_step_parameter_digest
+            ),
+            "post_step_parameter_sha256": (
+                post_step_parameter_digest
+            ),
             "grad_probe": grad_probe,
         }
     finally:
@@ -33325,6 +33590,8 @@ _SANITY_REPEAT_KEYS: Tuple[str, ...] = (
     "loss_source",
     "learned",
     "gradient_flow_ok",
+    "optimizer_coverage_ok",
+    "parameter_update_ok",
 )
 
 
@@ -33556,6 +33823,13 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         # 未被固定（set_seed 的 setdefault 只对之后的子进程
         # 生效），严格逐位复现应在启动命令行显式设置。
         "pythonhashseed_at_start": _PYTHONHASHSEED_AT_START,
+        # 实际生效的随机源清单：seed 作用到 Python/NumPy/
+        # torch/CUDA 及可选 XPU/MPS 的证据，而不只是参数记录。
+        "rng_seed_manifest": (
+            dict(_LAST_SEED_MANIFEST)
+            if _LAST_SEED_MANIFEST is not None
+            else None
+        ),
         "deterministic_algorithms": (
             torch.are_deterministic_algorithms_enabled()
         ),
@@ -38912,6 +39186,25 @@ def run_self_test():
     if np is not None:
         assert first_draw[2] == second_draw[2]
 
+    # 随机源清单必须记录真实生效的根种子，而不是只记录
+    # 命令行参数；可选加速后端也要出现在清单里。
+    assert _LAST_SEED_MANIFEST is not None
+    assert _LAST_SEED_MANIFEST["seed"] == 2024
+    assert _LAST_SEED_MANIFEST["torch_initial_seed"] == 2024
+    if torch.cuda.is_available():
+        assert _LAST_SEED_MANIFEST["cuda_initial_seeds"]
+        assert all(
+            seed_value == 2024
+            for seed_value in _LAST_SEED_MANIFEST[
+                "cuda_initial_seeds"
+            ]
+        )
+        torch.manual_seed(2024)
+        first_cuda = torch.rand(4, device="cuda")
+        torch.manual_seed(2024)
+        second_cuda = torch.rand(4, device="cuda")
+        assert torch.equal(first_cuda, second_cuda)
+
     # 非法种子必须在改动任何随机流之前被拒绝；合法域与 NumPy
     # 的 RandomState 一致，避免 Python/torch 已播种而 NumPy
     # 抛错留下的半初始化状态。
@@ -39031,6 +39324,53 @@ def run_self_test():
     assert not grad_probe["failures"], grad_probe
     assert grad_probe["grad_norm"] > 0.0
     assert grad_probe["n_with_grad"] > 0
+
+    # 优化器覆盖与第一步权重更新：健康模型必须两者都通过，
+    # 且报告里的前后参数指纹确实不同。
+    assert sanity_metrics["optimizer_coverage_ok"] is True
+    coverage = sanity_metrics["optimizer_coverage"]
+    assert coverage["missing_params"] == [], coverage
+    assert coverage["duplicate_params"] == [], coverage
+    assert coverage["foreign_param_count"] == 0, coverage
+    assert sanity_metrics["parameter_update_ok"] is True
+    assert (
+        sanity_metrics["pre_step_parameter_sha256"]
+        != sanity_metrics["post_step_parameter_sha256"]
+    )
+
+    # 负例：优化器漏掉部分可训练参数时必须被覆盖探针发现，
+    # 不能因为其余参数正常更新而静默通过。
+    tiny_probe_model = LanguageModel(
+        Config(**common, mode="B")
+    )
+    partial_optimizer = torch.optim.AdamW(
+        tiny_probe_model.token_embedding.parameters(),
+        lr=1e-3,
+    )
+    partial_coverage = _probe_optimizer_coverage(
+        tiny_probe_model,
+        partial_optimizer,
+    )
+    assert partial_coverage["ok"] is False
+    assert (
+        "token_embedding.weight"
+        not in partial_coverage["missing_params"]
+    )
+    assert partial_coverage["missing_params"]
+    class _DuplicateGroupOptimizer:
+        # 只提供探针读取的 param_groups 结构；PyTorch 自带
+        # optimizer 会拒绝重复参数，但自定义实现未必。
+        param_groups = [
+            {"params": list(tiny_probe_model.parameters())},
+            {"params": list(tiny_probe_model.parameters())},
+        ]
+
+    duplicate_coverage = _probe_optimizer_coverage(
+        tiny_probe_model,
+        _DuplicateGroupOptimizer(),
+    )
+    assert duplicate_coverage["ok"] is False
+    assert duplicate_coverage["duplicate_params"]
 
     # 同一台机器、同一随机种子重复运行：最终损失/准确率必须
     # 逐位一致（端到端可复现性，包含模型初始化、数据采样与
@@ -55076,6 +55416,25 @@ def main():
                     "同一份数据会随模型初始化等其他全局随机"
                     "消耗的顺序漂移，同种子难以稳定复现；请先"
                     "修正数据管线的随机源再开始全量训练。"
+                )
+            elif not sanity_result.get(
+                "optimizer_coverage_ok",
+                True,
+            ):
+                print(
+                    "[sanity] FAILED: 优化器未覆盖全部可训练"
+                    "参数（或参数被重复加入多个 param group），"
+                    "这些参数会一直停在初始值；请先修正 "
+                    "optimizer 的参数列表再开始全量训练。"
+                )
+            elif not sanity_result.get(
+                "parameter_update_ok",
+                True,
+            ):
+                print(
+                    "[sanity] FAILED: 第一步 optimizer.step 未改变"
+                    "任何非专家参数；请检查学习率是否为 0、参数"
+                    "是否被冻结或 GradScaler 是否跳过了更新。"
                 )
             elif not sanity_result.get(
                 "gradient_flow_ok",
