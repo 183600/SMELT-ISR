@@ -1729,6 +1729,31 @@ class PreregistrationTests(unittest.TestCase):
         ):
             self.assertIn(key, protocol)
 
+    def test_protocol_fallback_preserves_recorded_lr_schedule(self):
+        payload = {
+            "config": {"mode": "A"},
+            "args": {
+                "lr": 1e-3,
+                "lr_schedule": "wsd",
+                "steps": 100,
+            },
+        }
+        protocol = experiment.experiment_protocol_from_payload(
+            payload
+        )
+        self.assertEqual(protocol["lr_schedule_name"], "wsd")
+        self.assertEqual(protocol["lr_schedule"], "wsd")
+
+        payload["args"]["lr_schedule"] = "cosine"
+        protocol = experiment.experiment_protocol_from_payload(
+            payload
+        )
+        self.assertEqual(
+            protocol["lr_schedule"],
+            "linear_warmup_cosine_to_10pct",
+        )
+        self.assertEqual(protocol["lr_schedule_name"], "cosine")
+
     def test_saved_cleaning_alias_uses_effective_or(self):
         # 旧检查点可能只把 allow_eval_content_for_cleaning 记为
         # True，而 clean_train_against_test 仍是 argparse 默认

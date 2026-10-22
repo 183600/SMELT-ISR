@@ -21771,15 +21771,25 @@ def experiment_protocol_from_payload(
             [0.9, 0.999] if has_training else None
         ),
         "optimizer_eps": 1e-8 if has_training else None,
+        # 缺 comparison_protocol 时按 args 里存档的实际调度回填：
+        # 不能一律假定 cosine，否则旧 WSD 运行的调度会被误记成
+        # cosine，跨运行协议核对要么误报不一致，要么漏掉真实差异。
         "lr_schedule": (
-            "linear_warmup_cosine_to_10pct"
+            (
+                "linear_warmup_cosine_to_10pct"
+                if str(
+                    run_args.get("lr_schedule", "cosine")
+                )
+                == "cosine"
+                else "wsd"
+            )
             if has_training
             else None
         ),
-        # 历史运行只有 cosine；缺记录时回填 cosine，避免与
-        # 新记录口径产生无意义的受控变量不一致。
         "lr_schedule_name": (
-            "cosine" if has_training else None
+            str(run_args.get("lr_schedule", "cosine"))
+            if has_training
+            else None
         ),
         "wsd_stable_steps": run_args.get(
             "wsd_stable_steps"
