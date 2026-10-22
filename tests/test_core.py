@@ -1213,6 +1213,20 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertEqual(
             experiment.planned_comparisons_for_plan(plan), 15
         )
+        # 两模式消融（local_base + A）× 2 档：单因子两两组合
+        # 有 6 个，但每个延迟方案的 2×2 主效应/交互/简单效应
+        # 家族有 7 个检验，不能仍报 6。
+        partial = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=None,
+            ablation=True,
+            balance_coef=0.01,
+            default_mode="B",
+            ablation_modes=["A"],
+        )
+        self.assertEqual(
+            experiment.planned_comparisons_for_plan(partial), 7
+        )
 
     def test_build_sweep_execution_uses_larger_actual_family(self):
         with tempfile.TemporaryDirectory() as tmp:

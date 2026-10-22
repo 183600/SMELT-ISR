@@ -55710,9 +55710,35 @@ def planned_comparisons_for_plan(
         )
         for item in plan
     }
-    if len(cells) >= 2:
-        return len(cells) * (len(cells) - 1) // 2
-    return 1
+    pairwise = (
+        len(cells) * (len(cells) - 1) // 2
+        if len(cells) >= 2
+        else 1
+    )
+    # 消融还包含每个延迟合并方案的 2×2 主效应/交互家族：
+    # 主效应 2 + 交互 1 + 简单效应 4 = 7 个检验。两模式
+    # （local_base + 一个延迟方案）时 7 大于 4 个单元的 6 个
+    # 两两组合；只取两两组合仍会低估，因此显式取上界。
+    varying_keys = {
+        key
+        for position, key in enumerate(treatment_keys)
+        if len({cell[position] for cell in cells}) > 1
+    }
+    mode_values = {
+        str(item.get("mode"))
+        for item in plan
+        if item.get("mode") is not None
+    }
+    factorial_upper = 0
+    if (
+        "mode" in varying_keys
+        and "balance_coef" in varying_keys
+        and "local_base" in mode_values
+    ):
+        factorial_upper = 7 * len(
+            mode_values & set(_DELAYED_MERGE_MODES)
+        )
+    return max(pairwise, factorial_upper, 1)
 
 
 def _training_budget_summary(
