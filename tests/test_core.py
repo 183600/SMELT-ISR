@@ -5407,6 +5407,40 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_baseline_adequacy_tolerates_out_of_range_costs(self):
+        huge = 10 ** 400
+        rows = [
+            {
+                "run": "baseline",
+                "mode": "dense",
+                "seed": 1,
+                "val_loss": 1.0,
+                "n_params": 100.0,
+                "flops_per_forward": 100.0,
+            },
+            {
+                "run": "huge_metric",
+                "mode": "B",
+                "seed": 2,
+                "val_loss": huge,
+                "n_params": huge,
+                "flops_per_forward": huge,
+            },
+            {
+                "run": "huge_cost",
+                "mode": "B",
+                "seed": 3,
+                "val_loss": 1.1,
+                "n_params": huge,
+                "flops_per_forward": huge,
+            },
+        ]
+        report = experiment.baseline_adequacy(
+            rows, "dense", "val_loss"
+        )
+        self.assertEqual(report["capacity_confounds"], [])
+        self.assertIsNone(report["baseline_capacity"])
+
     def test_curve_analysis_treats_out_of_range_numbers_as_nonfinite(self):
         huge = 10 ** 400
         records = [

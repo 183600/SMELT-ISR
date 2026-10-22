@@ -32050,44 +32050,39 @@ def baseline_adequacy(
         for row in rows
         if str(row.get("mode")) != baseline_mode
         and str(row.get("mode")) != "ngram"
-        and isinstance(row.get(metric), (int, float))
-        and not isinstance(row.get(metric), bool)
-        and math.isfinite(float(row[metric]))
+        and _finite_float(row.get(metric)) is not None
     ]
     capacity_findings: List[str] = []
     if challengers:
         def _finite_cost(value: object) -> Optional[float]:
-            if isinstance(value, (int, float)) and not isinstance(
-                value, bool
-            ):
-                value = float(value)
-                if math.isfinite(value):
-                    return value
-            return None
+            return _finite_float(value)
 
         best_challenger = (
             max(
                 challengers,
-                key=lambda row: float(row[metric]),
+                key=lambda row: _finite_float(
+                    row.get(metric)
+                ),
             )
             if higher_is_better
             else min(
                 challengers,
-                key=lambda row: float(row[metric]),
+                key=lambda row: _finite_float(
+                    row.get(metric)
+                ),
             )
         )
         for field, label in (
             ("n_params", "参数量"),
             ("flops_per_forward", "前向 FLOPs"),
         ):
-            baseline_cost = _mean([
-                float(row[field])
+            baseline_costs = [
+                cost
                 for row in baseline_rows
-                if isinstance(row.get(field), (int, float))
-                and not isinstance(row.get(field), bool)
-                and math.isfinite(float(row[field]))
-                and float(row[field]) > 0.0
-            ])
+                for cost in [_finite_float(row.get(field))]
+                if cost is not None and cost > 0.0
+            ]
+            baseline_cost = _mean(baseline_costs)
             challenger_cost = _finite_cost(
                 best_challenger.get(field)
             )
@@ -35321,11 +35316,10 @@ def imbalance_metric_advisory(
     # PR-AUC 自身必须相对随机水平解读：正类越稀疏，随机
     # PR-AUC 越低，绝对值看起来「差」不代表模型无用。
     pr_values = [
-        (str(row.get("run")), float(row[metric]))
+        (str(row.get("run")), value)
         for row in rows
-        if isinstance(row.get(metric), (int, float))
-        and not isinstance(row.get(metric), bool)
-        and math.isfinite(float(row[metric]))
+        for value in [_finite_float(row.get(metric))]
+        if value is not None
     ]
     if metric == "val_pr_auc_macro" and pr_values:
         best_run, best_value = min(pr_values, key=lambda item: item[1])
