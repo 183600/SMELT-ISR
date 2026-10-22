@@ -30912,11 +30912,14 @@ def preregistration_apply(
             return applied, error
 
     if "steps" in payload:
+        # --steps 的 argparse 默认值非 None；只有命令行显式给出
+        # 时才与预注册比较，否则文件应能补齐训练预算。
         error = assign(
             "steps",
             "steps",
             payload["steps"],
             numeric=True,
+            respect_explicit=True,
         )
         if error is not None:
             return applied, error

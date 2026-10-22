@@ -1515,6 +1515,37 @@ class PreregistrationTests(unittest.TestCase):
         )
         self.assertIsNone(error)
 
+    def test_apply_fills_steps_only_when_not_explicit(self):
+        payload = self._payload()
+        payload["steps"] = 10
+        payload["common_step"] = 5
+        args = self._args(steps=2000)
+        previous = sys.argv
+        try:
+            sys.argv = ["experiment.py"]
+            applied, error = experiment.preregistration_apply(
+                args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+            )
+            self.assertIsNone(error)
+            self.assertIn("steps", applied)
+            self.assertEqual(args.steps, 10)
+
+            args = self._args(steps=2000)
+            sys.argv = ["experiment.py", "--steps", "2000"]
+            applied, error = experiment.preregistration_apply(
+                args,
+                payload,
+                current_commit="a" * 40,
+                working_tree_dirty=False,
+            )
+            self.assertIn("steps", error)
+            self.assertEqual(args.steps, 2000)
+        finally:
+            sys.argv = previous
+
     def test_apply_rejects_common_step_beyond_steps(self):
         payload = self._payload()
         payload.pop("steps")
