@@ -56050,6 +56050,36 @@ def main():
                     "(学习率轨迹是采样/优化轨迹的一部分)"
                 )
                 setattr(args, schedule_field, saved_value)
+
+        # 切分声明与时间证据同样属于数据协议：前者决定「前缀
+        # 切分」能否被解释为时间切分，后者是支撑该声明的清单。
+        # resume 未显式覆盖时应按存档恢复，否则同一份 split 在
+        # config.json 里会被静默改记成另一种口径（或丢失时间
+        # 证据），跨运行对比与审计链都会对不上。
+        for evidence_field in (
+            "split_policy",
+            "time_order_manifest",
+        ):
+            if evidence_field not in saved_args:
+                continue
+            if _argv_has_flag(
+                "--" + evidence_field.replace("_", "-")
+            ):
+                continue
+            saved_value = saved_args.get(evidence_field)
+            current_value = getattr(
+                args, evidence_field, None
+            )
+            if saved_value != current_value:
+                print(
+                    f"resume restored {evidence_field} "
+                    f"{current_value!r} -> {saved_value!r} "
+                    "(切分声明/时间证据是数据协议的一部分)"
+                )
+                setattr(
+                    args, evidence_field, saved_value
+                )
+
         # 文档级 segment mask 决定注意力可见性，是模型语义
         # 的一部分，不能靠命令行静默切换。
         if "document_masks" in saved_args:
