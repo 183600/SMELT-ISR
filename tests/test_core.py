@@ -1569,5 +1569,63 @@ class PreregistrationTests(unittest.TestCase):
         )
 
 
+    def test_cleaning_aliases_are_equivalent_for_data_check(self):
+        # `--clean-train-against-test` 与
+        # `--allow-eval-content-for-cleaning` 是同义入口：任一
+        # 为真都表示训练集清洗读取 test。预注册文件写哪个别名
+        # 都不应改变核对结果。
+        payload = self._payload()
+        payload["data"]["cleaning"] = {
+            "allow_eval_content_for_cleaning": True,
+        }
+        args = self._args(
+            split_policy="contiguous",
+            group_separator=None,
+            clean_train_against_test=True,
+            allow_eval_content_for_cleaning=False,
+            deduplicate_train_groups=True,
+        )
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            )
+        )
+
+        payload["data"]["cleaning"] = {
+            "clean_train_against_test": True,
+        }
+        args = self._args(
+            split_policy="contiguous",
+            group_separator=None,
+            clean_train_against_test=False,
+            allow_eval_content_for_cleaning=True,
+            deduplicate_train_groups=True,
+        )
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
+            )
+        )
+
+    def test_schema_rejects_conflicting_cleaning_aliases(self):
+        payload = self._payload()
+        payload["data"]["cleaning"] = {
+            "clean_train_against_test": True,
+            "allow_eval_content_for_cleaning": False,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIn("同义开关", error)
+
+    def test_normalize_cleaning_aliases_sets_both_fields(self):
+        args = self._args(
+            clean_train_against_test=False,
+            allow_eval_content_for_cleaning=True,
+        )
+        effective = experiment._normalize_clean_against_test(args)
+        self.assertTrue(effective)
+        self.assertTrue(args.clean_train_against_test)
+        self.assertTrue(args.allow_eval_content_for_cleaning)
+
+
 if __name__ == "__main__":
     unittest.main()

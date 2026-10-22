@@ -4733,6 +4733,31 @@ def parse_group_separator(text: str) -> bytes:
     return bytes(result)
 
 
+# `--clean-train-against-test` 与
+# `--allow-eval-content-for-cleaning` 是同义入口：只要任一为真，
+# 训练集清洗就会读取 test 内容。所有下游（ByteDataset、resume、
+# comparison_protocol、外部预注册核对）必须看到同一个归一化值，
+# 否则同一种清洗口径会因使用不同别名被误报为协议不一致。
+_CLEAN_AGAINST_TEST_ALIASES = (
+    "clean_train_against_test",
+    "allow_eval_content_for_cleaning",
+)
+
+
+def _clean_against_test_effective(args: object) -> bool:
+    return bool(
+        getattr(args, "clean_train_against_test", False)
+        or getattr(args, "allow_eval_content_for_cleaning", False)
+    )
+
+
+def _normalize_clean_against_test(args: object) -> bool:
+    effective = _clean_against_test_effective(args)
+    setattr(args, "clean_train_against_test", effective)
+    setattr(args, "allow_eval_content_for_cleaning", effective)
+    return effective
+
+
 def _iter_group_boundaries(
     buf: bytearray,
     separator: bytes,
@@ -30545,6 +30570,17 @@ def preregistration_schema_error(
         for key, value in cleaning.items():
             if not isinstance(value, bool):
                 return f"data.cleaning.{key} 必须是布尔值"
+        declared_alias_values = {
+            bool(cleaning[key])
+            for key in _CLEAN_AGAINST_TEST_ALIASES
+            if key in cleaning
+        }
+        if len(declared_alias_values) > 1:
+            return (
+                "data.cleaning.clean_train_against_test 与 "
+                "data.cleaning.allow_eval_content_for_cleaning "
+                "是同义开关，不能给出相反的取值"
+            )
 
     for key in (
         "entity_manifest_sha256",
@@ -31052,7 +31088,34 @@ def preregistration_data_error(
 
     cleaning = data.get("cleaning")
     if isinstance(cleaning, dict):
+        # 两个同义开关按「任一为真即读取 test」归一化核对：
+        # 用户用哪个别名不应改变协议是否一致。
+        declared_alias_values = {
+            bool(cleaning[key])
+            for key in _CLEAN_AGAINST_TEST_ALIASES
+            if key in cleaning
+        }
+        if len(declared_alias_values) > 1:
+            return (
+                "预注册 data.cleaning 的两个同义开关取值相反："
+                "clean_train_against_test 与 "
+                "allow_eval_content_for_cleaning"
+            )
+        if declared_alias_values:
+            declared_effective = next(iter(declared_alias_values))
+            actual_effective = _clean_against_test_effective(args)
+            if actual_effective != declared_effective:
+                return (
+                    "预注册 data.cleaning."
+                    "clean_train_against_test/"
+                    "allow_eval_content_for_cleaning="
+                    f"{declared_effective} 与当前 {actual_effective} "
+                    "不一致：清洗开关会改变实际参与训练/去重的"
+                    "数据，不能在看到结果后再改"
+                )
         for key, expected in cleaning.items():
+            if key in _CLEAN_AGAINST_TEST_ALIASES:
+                continue
             actual = bool(getattr(args, key, False))
             if actual != bool(expected):
                 return (
@@ -56504,6 +56567,12 @@ def main():
 
     args = parser.parse_args()
 
+    # 两个同义清洗入口必须在任何下游使用之前归一化：否则
+    # `--clean-train-against-test` 与
+    # `--allow-eval-content-for-cleaning` 会产生相同的实际数据
+    # 口径，却在 config/预注册核对里显示成不同协议。
+    _normalize_clean_against_test(args)
+
     # 论文复现预设必须在其它校验与 Config 构造之前落地：
     # --paper-cell 决定模型结构，--paper-protocol 决定训练协议
     # 与 WSD 调度参数。
@@ -57626,6 +57695,11 @@ def main():
             saved_clean_test = bool(
                 saved_args.get("clean_train_against_test")
             )
+        elif "allow_eval_content_for_cleaning" in saved_args:
+            # 旧检查点可能只记录了两个同义入口中的另一个。
+            saved_clean_test = bool(
+                saved_args.get("allow_eval_content_for_cleaning")
+            )
         else:
             saved_clean_test = bool(
                 saved_args.get("deduplicate_train_groups", False)
@@ -57653,6 +57727,15 @@ def main():
                 "一部分)"
             )
             args.clean_train_against_test = saved_clean_test
+            args.allow_eval_content_for_cleaning = (
+                saved_clean_test
+            )
+        elif bool(
+            getattr(args, "allow_eval_content_for_cleaning", False)
+        ) != bool(args.clean_train_against_test):
+            # 两个字段可能因旧检查点/旧命令行不同步；resume 后
+            # 仍必须让下游看到同一个有效值。
+            _normalize_clean_against_test(args)
 
         # 标签噪声清洗同样改变实际参与训练的样本集合，是采样
         # 轨迹的一部分；按存档恢复，避免续跑悄悄换回含损坏标签
