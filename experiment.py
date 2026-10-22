@@ -21521,6 +21521,81 @@ def _sign_flip_required_seeds(
 _TARGET_POWER = 0.80
 _DEFAULT_EQUIVALENCE_MARGIN = 0.01
 
+# 全因子/消融对比的类型 → 方差乘数（相对于两格配对差值）。
+#
+# 假设单个实验单元的种子间噪声方差为 σ_cell²，两格配对差
+# y_A − y_B 的方差是 2σ_cell²；预注册的
+# ``expected_seed_sd_relative`` 就是该**配对差值**的标准差。
+# 在 2×2 设计（L_off、L_on、M_off、M_on）中：
+# - 两两/简单效应：两个格子相减，方差 2σ_cell² → 1×；
+# - 主效应 0.5[(M_on−M_off)+(L_on−L_off)]：方差 σ_cell² → 0.5×；
+# - 交互 (M_on−M_off)−(L_on−L_off)：方差 4σ_cell² → 2×。
+# 因此交互的标准误是两两对比的 √2 倍，同样效应下约需 2 倍
+# 种子。只按两两对比算「够不够」会把消融交互的功效系统性
+# 高估；预注册的功效门槛必须按实际计划中最吃种子的对比类型
+# （通常是 interaction）判定。
+_CONTRAST_VARIANCE_FACTORS = {
+    "pairwise": 1.0,
+    "simple": 1.0,
+    "main": 0.5,
+    "interaction": 2.0,
+}
+_CONTRAST_ORDER = ("pairwise", "simple", "main", "interaction")
+_CONTRAST_LABELS = {
+    "pairwise": "两两对比",
+    "simple": "简单效应",
+    "main": "主效应",
+    "interaction": "交互效应",
+}
+
+
+def _contrast_types_error(value: object) -> Optional[str]:
+    """校验 ``power.planned_contrasts`` 的取值；返回错误或 None。"""
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        return (
+            "power.planned_contrasts 必须是字符串数组，可选值: "
+            + ", ".join(_CONTRAST_ORDER)
+        )
+    if not value:
+        return "power.planned_contrasts 不能为空"
+    seen = set()
+    for item in value:
+        if not isinstance(item, str):
+            return (
+                "power.planned_contrasts 的每一项必须是字符串，"
+                "可选值: "
+                + ", ".join(_CONTRAST_ORDER)
+            )
+        if item not in _CONTRAST_VARIANCE_FACTORS:
+            return (
+                "power.planned_contrasts 含未知对比类型 "
+                f"{item!r}；可选值: "
+                + ", ".join(_CONTRAST_ORDER)
+            )
+        if item in seen:
+            return (
+                "power.planned_contrasts 含重复类型: " + item
+            )
+        seen.add(item)
+    return None
+
+
+def _normalize_contrast_types(
+    value: object,
+) -> List[str]:
+    """把对比类型规范化成去重后的有序列表；非法输入抛 ValueError。"""
+    error = _contrast_types_error(value)
+    if error is not None:
+        raise ValueError(error)
+    values = [str(item) for item in value]  # type: ignore[union-attr]
+    # 用固定顺序输出，避免预注册里换个书写顺序就得到不同的
+    # 计划指纹；同时让交互等较弱的对比在展示时排在后面。
+    return [
+        contrast
+        for contrast in _CONTRAST_ORDER
+        if contrast in values
+    ]
+
 # 预注册最小效应按对照均值的比例解释。对照均值恰为零（或
 # 小到低于该绝对下限）时，比例阈值退化为 0 或远低于数值
 # 分辨率，任何非零差值都会被误判成「达到最小效应」。这类
@@ -27606,6 +27681,19 @@ def factorial_effects(
                     "effect_name": effect_name,
                     "description": description,
                     "kind": kind,
+                    # 与设计阶段功效口径对接：主效应方差是两两
+                    # 对比的 0.5 倍、交互是 2 倍、简单效应相同。
+                    # 分析时仍用该效应自己的实测 se，不看乘数；
+                    # 记录该字段是为了让报告能核对「设计时按哪种
+                    # 对比准备种子」与「现在报的是哪种对比」。
+                    "contrast_type": (
+                        kind
+                        if kind in ("main", "interaction", "simple")
+                        else "pairwise"
+                    ),
+                    "contrast_variance_factor": (
+                        _CONTRAST_VARIANCE_FACTORS.get(kind)
+                    ),
                     "coefficients": coefficients,
                     "cells": {
                         alias: cell["label"]
@@ -32051,6 +32139,7 @@ _POWER_KEYS = (
     "target_power",
     "alpha",
     "planned_comparisons",
+    "planned_contrasts",
     "expected_attrition_rate",
     "underpowered_acknowledged",
     "justification",
@@ -32116,11 +32205,114 @@ def _preregistration_sha256_text(value: object) -> bool:
     )
 
 
+def _contrast_power_entry(
+    contrast: str,
+    min_effect: float,
+    sd: float,
+    planned_seeds: int,
+    usable_seeds: int,
+    alpha_adjusted: float,
+    target: float,
+    attrition: float,
+    required_robust: int,
+) -> Dict[str, object]:
+    """按某一对比类型的方差乘数计算功效/所需种子数。"""
+    factor = _CONTRAST_VARIANCE_FACTORS[contrast]
+    sd_contrast = sd * math.sqrt(factor)
+    if alpha_adjusted > 0.0:
+        required_t = _seeds_to_detect(
+            float(min_effect),
+            sd_contrast,
+            target_power=target,
+            alpha=alpha_adjusted,
+        )
+    else:
+        required_t = None
+    required = max(required_t or 0, int(required_robust))
+    if required_t is None:
+        required_with_attrition = None
+    else:
+        required_with_attrition = int(
+            math.ceil(float(required) / (1.0 - attrition))
+        )
+    achieved_power = None
+    mde = None
+    if alpha_adjusted > 0.0 and usable_seeds >= _MIN_SEEDS_FOR_STATS:
+        se = sd_contrast / math.sqrt(float(usable_seeds))
+        df = float(usable_seeds - 1)
+        achieved_power = _t_power(
+            float(min_effect),
+            se,
+            df,
+            alpha_adjusted,
+        )
+        mde = _minimum_detectable_effect(
+            se,
+            df,
+            target,
+            alpha_adjusted,
+        )
+    adequate = (
+        required_t is not None
+        and int(planned_seeds)
+        >= int(required_with_attrition or required)
+    )
+    return {
+        "contrast": contrast,
+        "label": _CONTRAST_LABELS[contrast],
+        "variance_factor": factor,
+        "se_multiplier": math.sqrt(factor),
+        # 该对比实际使用的（配对差值口径）标准差；两两/简单
+        # 效应等于声明值，主效应更小，交互更大。
+        "expected_seed_sd_relative": sd_contrast,
+        "required_seeds_for_t": required_t,
+        "required_seeds": required,
+        "required_seeds_with_attrition": required_with_attrition,
+        "achieved_power_at_min_effect": achieved_power,
+        "minimum_detectable_effect_relative": mde,
+        "adequate": adequate,
+    }
+
+
+def _pick_binding_contrast(
+    entries: Dict[str, Dict[str, object]],
+    contrasts: List[str],
+) -> str:
+    """选出最吃种子的对比类型；所需种子相同时优先报交互。"""
+    order = {
+        contrast: index
+        for index, contrast in enumerate(_CONTRAST_ORDER)
+    }
+    binding = contrasts[0]
+    for contrast in contrasts[1:]:
+        current = entries[binding]
+        candidate = entries[contrast]
+        current_required = current.get("required_seeds_for_t")
+        candidate_required = candidate.get("required_seeds_for_t")
+        if current_required is None:
+            # None 表示「有限种子数内无法达到目标功效」，是最
+            # 严格的结果，不能被后面的有限值覆盖。
+            continue
+        if candidate_required is None:
+            binding = contrast
+            continue
+        if (
+            int(candidate_required) > int(current_required)
+            or (
+                int(candidate_required) == int(current_required)
+                and order[contrast] > order[binding]
+            )
+        ):
+            binding = contrast
+    return binding
+
+
 def preregistration_power_plan(
     power: Dict[str, object],
     min_effect: float,
     n_seeds: int,
     comparisons_count: int,
+    contrast_types: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """
     先验功效分析：在训练前判断预注册的种子数能否检出预注册
@@ -32128,9 +32320,21 @@ def preregistration_power_plan(
 
     预期种子间标准差与最小效应都按**相对基线均值**解释，因此
     二者相除后是尺度无关的效应量（Cohen's d 的配对版本），
-    不需要事先知道基线均值。多重比较按 Bonferroni 下界
+    不需要事先知道基线均值。``expected_seed_sd_relative`` 是
+    **两格配对差值**的标准差；主效应/交互的方差不同（见
+    ``_CONTRAST_VARIANCE_FACTORS``），因此不能只用两两对比的
+    公式回答「消融设计是否足够」。
+
+    多重比较按 Bonferroni 下界
     ``alpha / planned_comparisons`` 计算；这与分析阶段的 Holm
     首步阈值一致，是保守口径，不会把功效说得比实际更乐观。
+
+    ``contrast_types`` 声明本次研究会主张哪些对比类型
+    （``pairwise`` / ``simple`` / ``main`` / ``interaction``）。
+    每种类型分别计算所需种子数，``adequate`` 取最吃种子的
+    类型（通常是交互）判定，并在 ``contrast_power`` 中逐项
+    报告；不传时退回预注册的 ``planned_contrasts``，再退回
+    只按 ``pairwise``（与旧报告兼容）。
 
     同时给出精确符号翻转在家族校正下所需的最小种子数。稳健
     主张（配对 t 与符号翻转同时显著）要求二者都满足；只用 t
@@ -32143,23 +32347,20 @@ def preregistration_power_plan(
         power.get("planned_comparisons", comparisons_count)
     )
     family_size = max(1, planned_comparisons)
+    if contrast_types is None:
+        raw_contrasts = power.get(
+            "planned_contrasts", ["pairwise"]
+        )
+    else:
+        raw_contrasts = contrast_types
+    contrasts = _normalize_contrast_types(raw_contrasts)
     try:
         alpha_adjusted = alpha / family_size
     except OverflowError:
         # 家族规模是合法 JSON 整数但大到无法转成浮点：校正后
         # 的 alpha 实际为 0，任何有限 n 都不可能达到目标功效。
         alpha_adjusted = 0.0
-    if alpha_adjusted > 0.0:
-        required_t = _seeds_to_detect(
-            float(min_effect),
-            sd,
-            target_power=target,
-            alpha=alpha_adjusted,
-        )
-    else:
-        required_t = None
     required_robust = _sign_flip_required_seeds(alpha, family_size)
-    required = max(required_t or 0, required_robust)
     acknowledged = bool(
         power.get("underpowered_acknowledged", False)
     )
@@ -32190,77 +32391,83 @@ def preregistration_power_plan(
             int(math.floor(float(n_seeds) * (1.0 - attrition) + 1e-12)),
         ),
     )
-    if required_t is None:
-        required_with_attrition = None
-    else:
-        # 向上取整，确保预期可用数仍不低于功效要求；不能把
-        # 「四舍五入后刚好够」当作足够。
-        required_with_attrition = int(
-            math.ceil(float(required) / (1.0 - attrition))
+
+    contrast_power = {
+        contrast: _contrast_power_entry(
+            contrast,
+            float(min_effect),
+            sd,
+            int(n_seeds),
+            usable_seeds,
+            alpha_adjusted,
+            target,
+            attrition,
+            required_robust,
         )
-    adequate = (
-        required_t is not None
-        and int(n_seeds) >= int(required_with_attrition or required)
+        for contrast in contrasts
+    }
+    binding = _pick_binding_contrast(contrast_power, contrasts)
+    binding_entry = contrast_power[binding]
+    required_t = binding_entry["required_seeds_for_t"]
+    required = max(
+        int(entry["required_seeds"])
+        for entry in contrast_power.values()
+    )
+    required_with_attrition = binding_entry[
+        "required_seeds_with_attrition"
+    ]
+    adequate = all(
+        bool(entry["adequate"])
+        for entry in contrast_power.values()
     )
 
     # 在计划可用种子数下报告实际能达到的功效与 MDE：仅说
     # 「需要 8 个」不够，研究者还需要看到「按当前计划即使
     # 真实效应等于最小有意义效应，也只有 0.6 的功效」这类
     # 直接可执行的诊断。MDE 与 min_effect 同单位（相对基线
-    # 均值），可直接比较。
-    achieved_power = None
-    mde = None
-    if alpha_adjusted > 0.0 and usable_seeds >= _MIN_SEEDS_FOR_STATS:
-        se = sd / math.sqrt(float(usable_seeds))
-        df = float(usable_seeds - 1)
-        achieved_power = _t_power(
-            float(min_effect),
-            se,
-            df,
-            alpha_adjusted,
-        )
-        mde = _minimum_detectable_effect(
-            se,
-            df,
-            target,
-            alpha_adjusted,
-        )
+    # 均值），可直接比较。绑定对比的方差最大，其功效/MDE
+    # 就是整个计划最保守的那一项。
+    achieved_power = binding_entry["achieved_power_at_min_effect"]
+    mde = binding_entry["minimum_detectable_effect_relative"]
 
     # 对「预期种子间标准差估计偏小/偏大」做敏感性分析。先验
     # 功效最大的不确定性来自 sd 本身；只报一个 required_seeds
-    # 会把估计误差藏在点估计后面。
+    # 会把估计误差藏在点估计后面。每种 sd 下仍按最吃种子的
+    # 对比类型报告，避免敏感性表比主表更乐观。
     sensitivity: List[Dict[str, object]] = []
     for multiplier in (0.5, 0.75, 1.0, 1.25, 1.5, 2.0):
         scaled_sd = sd * multiplier
-        scaled_required = (
-            _seeds_to_detect(
+        scaled_entries = {
+            contrast: _contrast_power_entry(
+                contrast,
                 float(min_effect),
                 scaled_sd,
-                target_power=target,
-                alpha=alpha_adjusted,
+                int(n_seeds),
+                usable_seeds,
+                alpha_adjusted,
+                target,
+                attrition,
+                required_robust,
             )
-            if alpha_adjusted > 0.0
-            else None
+            for contrast in contrasts
+        }
+        scaled_binding = _pick_binding_contrast(
+            scaled_entries, contrasts
         )
-        scaled_with_attrition = (
-            int(
-                math.ceil(
-                    float(scaled_required) / (1.0 - attrition)
-                )
-            )
-            if scaled_required is not None
-            else None
-        )
+        scaled_entry = scaled_entries[scaled_binding]
         sensitivity.append({
             "sd_multiplier": multiplier,
             "expected_seed_sd_relative": scaled_sd,
-            "required_seeds_for_t": scaled_required,
-            "required_seeds_with_attrition": (
-                scaled_with_attrition
-            ),
-            "adequate_at_planned_seeds": (
-                scaled_with_attrition is not None
-                and int(n_seeds) >= scaled_with_attrition
+            "binding_contrast": scaled_binding,
+            "required_seeds_for_t": scaled_entry[
+                "required_seeds_for_t"
+            ],
+            "required_seeds_with_attrition": scaled_entry[
+                "required_seeds_with_attrition"
+            ],
+            "adequate_at_planned_seeds": all(
+                bool(entry["adequate"])
+                for entry in scaled_entries.values()
             ),
         })
 
@@ -32271,6 +32478,13 @@ def preregistration_power_plan(
         "alpha": alpha,
         "planned_comparisons": family_size,
         "alpha_bonferroni": alpha_adjusted,
+        "planned_contrasts": list(contrasts),
+        "binding_contrast": binding,
+        "binding_contrast_label": _CONTRAST_LABELS[binding],
+        "contrast_power": contrast_power,
+        "contrast_variance_factor": binding_entry[
+            "variance_factor"
+        ],
         "required_seeds_for_t": required_t,
         "required_seeds_for_robust_sign_flip": required_robust,
         # required_seeds 保持「无脱落时的启动数」，便于与旧报告
@@ -32289,9 +32503,12 @@ def preregistration_power_plan(
         "justification": power.get("justification"),
         "note": (
             "所需种子数把声明的预期种子间标准差当作真实 sigma；"
-            "它本身也是估计，规划时应留余量。adequacy 只表示"
-            "设计在声明效应下有目标功效，不保证真实效应一定"
-            "达到最小有意义效应。planned_usable_seeds 按声明的"
+            "它本身也是估计，规划时应留余量。adequacy 按计划中"
+            "最吃种子的对比类型（binding_contrast）判定：主效应"
+            "方差是两两对比的 0.5 倍，交互是 2 倍，因此同一"
+            "最小效应下交互约需 2 倍种子。adequacy 只表示设计"
+            "在声明效应下有目标功效，不保证真实效应一定达到"
+            "最小有意义效应。planned_usable_seeds 按声明的"
             "预期脱落率折算，required_seeds_with_attrition 是"
             "达到目标功效所需的启动种子数"
         ),
@@ -32575,11 +32792,20 @@ def preregistration_schema_error(
                 " non-empty justification，说明为何仍要在功效"
                 "不足的设计上运行"
             )
+        planned_contrasts = power.get(
+            "planned_contrasts", ["pairwise"]
+        )
+        contrast_error = _contrast_types_error(planned_contrasts)
+        if contrast_error is not None:
+            return contrast_error
         plan = preregistration_power_plan(
             power,
             float(min_effect),
             len(normalized_seeds),
             len(comparisons),
+            contrast_types=_normalize_contrast_types(
+                planned_contrasts
+            ),
         )
         if not plan["adequate"] and not plan["underpowered_acknowledged"]:
             required_text = (
@@ -32604,10 +32830,14 @@ def preregistration_schema_error(
                 f"家族规模 {plan['planned_comparisons']}、目标功效 "
                 f"{plan['target_power']:g} 下，{required_text}"
                 f"{attrition_text}"
-                "（配对 t 口径 "
+                "（最吃种子的对比类型 "
+                f"{plan['binding_contrast']}"
+                f"（{plan['binding_contrast_label']}），配对 t 口径 "
                 f"{plan['required_seeds_for_t']}，稳健符号翻转口径 "
                 f"{plan['required_seeds_for_robust_sign_flip']}）。"
-                "请增加 seeds，或在 power 中显式设置 "
+                "主效应方差是两两对比的 0.5 倍、交互是 2 倍；"
+                "若计划包含消融交互，请按 interaction 的所需种子"
+                "数准备，或增加 seeds。也可以显式设置 "
                 "underpowered_acknowledged=true 并写明 justification"
             )
 
@@ -57037,6 +57267,62 @@ def planned_comparisons_for_plan(
     return max(pairwise, factorial_upper, 1)
 
 
+def planned_contrast_types_for_plan(
+    plan: List[Dict[str, object]],
+) -> List[str]:
+    """计划实际会估计哪些类型的对比（用于先验功效，不用于显著性）。
+
+    - 普通多种子/单臂：没有跨臂对比；
+    - ``--suite-modes``：只有两两对比；
+    - ``--suite-ablation``（mode × balance 两轴且含 local_base）：
+      除两两对比外还会估计两条主效应、一条交互与四条简单效应。
+    功效门槛必须按这些类型中最吃种子的那一种判定，不能只按
+    两两对比的方差。
+    """
+    if not plan:
+        return []
+    identity_keys = {
+        "label",
+        "seed",
+        "order_index",
+        "block",
+        "position_in_block",
+    }
+    treatment_keys = sorted({
+        str(key)
+        for item in plan
+        for key in item
+        if str(key) not in identity_keys
+    })
+    cells = {
+        tuple(
+            _stable_factor_key(item.get(key))
+            for key in treatment_keys
+        )
+        for item in plan
+    }
+    if len(cells) < 2:
+        return []
+    varying_keys = {
+        key
+        for position, key in enumerate(treatment_keys)
+        if len({cell[position] for cell in cells}) > 1
+    }
+    mode_values = {
+        str(item.get("mode"))
+        for item in plan
+        if item.get("mode") is not None
+    }
+    if (
+        "mode" in varying_keys
+        and "balance_coef" in varying_keys
+        and "local_base" in mode_values
+        and mode_values & set(_DELAYED_MERGE_MODES)
+    ):
+        return ["pairwise", "main", "interaction", "simple"]
+    return ["pairwise"]
+
+
 def _training_budget_summary(
     args: argparse.Namespace,
     n_runs: int,
@@ -57086,26 +57372,57 @@ def _design_plan_id(payload: Dict[str, object]) -> str:
 def _design_power_for_family(
     power: Optional[Dict[str, object]],
     family_size: int,
+    contrast_types: Optional[List[str]] = None,
 ) -> Optional[Dict[str, object]]:
-    """把先验功效记录对齐到计划实际展开的家族规模。
+    """把先验功效记录对齐到计划实际展开的家族规模与对比类型。
 
     预注册里的 ``planned_comparisons`` 可能只覆盖声明过的星形
-    对照，实际套件却会展开全部臂的两两比较。设计计划必须按
-    更大的实际家族重新计算所需种子数，否则会在功效不足的
-    设计上宣称稳健主张可行。
+    对照，实际套件却会展开全部臂的两两比较；``planned_contrasts``
+    也可能只声明了两两对比，而消融实际还会估计主效应/交互/简单
+    效应。设计计划必须按更大的实际家族与更吃种子的对比类型重新
+    计算所需种子数，否则会在功效不足的设计上宣称稳健主张可行。
     """
     if not isinstance(power, dict):
         return power
     declared = power.get("planned_comparisons")
-    if (
-        isinstance(declared, bool)
-        or not isinstance(declared, int)
-        or int(declared) >= int(family_size)
-    ):
+    try:
+        declared_contrasts = _normalize_contrast_types(
+            power.get("planned_contrasts", ["pairwise"])
+        )
+    except ValueError:
+        declared_contrasts = ["pairwise"]
+    try:
+        plan_contrasts = _normalize_contrast_types(
+            contrast_types or []
+        )
+    except ValueError:
+        plan_contrasts = []
+    effective_contrasts = list(declared_contrasts)
+    for contrast in plan_contrasts:
+        if contrast not in effective_contrasts:
+            effective_contrasts.append(contrast)
+
+    declared_is_int = (
+        isinstance(declared, int)
+        and not isinstance(declared, bool)
+    )
+    family_grew = declared_is_int and int(declared) < int(family_size)
+    contrasts_grew = set(effective_contrasts) != set(
+        declared_contrasts
+    )
+    if not family_grew and not contrasts_grew:
         return power
+
     adjusted = dict(power)
-    adjusted["planned_comparisons"] = int(family_size)
-    adjusted["declared_planned_comparisons"] = int(declared)
+    effective_family = (
+        max(int(declared), int(family_size))
+        if declared_is_int
+        else int(family_size)
+    )
+    adjusted["planned_comparisons"] = effective_family
+    adjusted["planned_contrasts"] = _normalize_contrast_types(
+        effective_contrasts
+    )
     min_effect = power.get("min_effect_relative")
     planned_seeds = power.get("planned_seeds")
     try:
@@ -57113,14 +57430,22 @@ def _design_power_for_family(
             adjusted,
             float(min_effect),  # type: ignore[arg-type]
             int(planned_seeds),  # type: ignore[arg-type]
-            int(family_size),
+            effective_family,
+            contrast_types=effective_contrasts,
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         # 手工构造/旧版记录可能没有重算所需的原始字段；
-        # 至少保留调整后的家族规模，不能退回低估的声明值。
+        # 至少保留调整后的家族规模与对比类型，不能退回低估的
+        # 声明值。
         return adjusted
-    recomputed["declared_planned_comparisons"] = int(declared)
-    recomputed["family_size_adjusted_for_plan"] = True
+    recomputed["declared_planned_comparisons"] = declared
+    recomputed["declared_planned_contrasts"] = declared_contrasts
+    recomputed["family_size_adjusted_for_plan"] = bool(
+        family_grew
+    )
+    recomputed["contrasts_adjusted_for_plan"] = bool(
+        contrasts_grew
+    )
     return recomputed
 
 
@@ -57209,10 +57534,14 @@ def write_design_plan(
             planned_comparisons,
             int(power["planned_comparisons"]),
         )
-    # 内嵌的 power 记录必须与计划实际家族同口径，否则设计文件
-    # 一边按实际家族算 seed_plan，一边保留低估的 required_seeds。
+    # 计划实际会估计的对比类型（消融含主效应/交互/简单效应）。
+    # 先验功效必须按最吃种子的类型判定，不能只按两两对比。
+    planned_contrasts = planned_contrast_types_for_plan(plan)
+    # 内嵌的 power 记录必须与计划实际家族/对比类型同口径，否则
+    # 设计文件一边按实际计划算 seed_plan，一边保留低估的
+    # required_seeds。
     power = _design_power_for_family(
-        power, planned_comparisons
+        power, planned_comparisons, planned_contrasts
     )
     seeds = [
         int(seed)
@@ -57264,6 +57593,7 @@ def write_design_plan(
         "planned_runs": len(runs),
         "runs": runs,
         "planned_comparisons": int(planned_comparisons),
+        "planned_contrasts": list(planned_contrasts),
         "power": power,
         "seed_plan": seed_plan,
         "training_budget": budget,
@@ -57321,6 +57651,7 @@ def write_design_plan(
         "order_balance": order_balance,
         "planned_runs": len(runs),
         "planned_comparisons": int(planned_comparisons),
+        "planned_contrasts": list(planned_contrasts),
         "power": power,
         "seed_plan": seed_plan,
         "training_budget": budget,
@@ -60297,6 +60628,37 @@ def print_design_summary(design: Dict[str, object]) -> None:
                     else ""
                 )
             )
+        contrast_power = power.get("contrast_power")
+        if (
+            isinstance(contrast_power, dict)
+            and len(contrast_power) > 1
+        ):
+            parts = []
+            for contrast in _CONTRAST_ORDER:
+                entry = contrast_power.get(contrast)
+                if not isinstance(entry, dict):
+                    continue
+                required_contrast = entry.get(
+                    "required_seeds_for_t"
+                )
+                parts.append(
+                    f"{contrast}="
+                    + (
+                        str(required_contrast)
+                        if required_contrast is not None
+                        else "NA"
+                    )
+                )
+            binding = power.get("binding_contrast")
+            print(
+                "[design][power] 各对比类型所需种子（"
+                f"binding={binding}）：" + ", ".join(parts)
+            )
+            if binding == "interaction":
+                print(
+                    "[design][power] 交互的方差是两两对比的 2 倍，"
+                    "所需种子约为 2 倍；消融设计应按该口径准备种子"
+                )
     else:
         print(
             "[design] 未提供预注册 power 块：种子数只保证检验"
@@ -60306,6 +60668,51 @@ def print_design_summary(design: Dict[str, object]) -> None:
     print(
         f"[design] 设计计划已写入 {design['path']}"
         "（子进程开跑前会重新核对指纹与自己的分配）"
+    )
+
+
+def design_power_gate_error(
+    design: Dict[str, object],
+    allow_underpowered: bool = False,
+) -> Optional[str]:
+    """训练前的硬门：计划实际展开的对比是否达到先验功效。
+
+    预注册入口只能按文件里声明的 ``comparisons``/``planned_contrasts``
+    检查；套件真正展开的家族可能更大（全部臂两两对比），消融还
+    会估计方差更大的交互。设计计划重算后仍不足时，必须在开跑前
+    拒绝，而不是等分析时再说「交互不显著」。
+    """
+    power = design.get("power")
+    if not isinstance(power, dict):
+        return None
+    if (
+        power.get("adequate")
+        or power.get("underpowered_acknowledged")
+        or allow_underpowered
+    ):
+        return None
+    binding = str(power.get("binding_contrast") or "pairwise")
+    binding_label = str(
+        power.get("binding_contrast_label")
+        or _CONTRAST_LABELS.get(binding, binding)
+    )
+    required = power.get(
+        "required_seeds_with_attrition",
+        power.get("required_seeds"),
+    )
+    planned = power.get("planned_seeds")
+    return (
+        "设计计划显示先验功效不足：计划实际展开的最吃种子对比"
+        f"类型是 {binding}（{binding_label}），至少需要 "
+        f"{required} 个启动种子，计划只有 {planned} 个；"
+        f"家族规模 {power.get('planned_comparisons')}、目标功效 "
+        f"{power.get('target_power')}。"
+        "交互对比的方差是两两对比的 2 倍，不能把「按两两对比"
+        "够用」当成「消融交互也够用」。请增加 --seeds，或在预"
+        "注册 power 中显式设置 underpowered_acknowledged=true "
+        "并写明 justification；冒烟/调试可显式加 "
+        "--allow-underpowered。调整后请使用新的 --out（被拒绝"
+        "的设计计划已落盘，旧目录会按冻结设计拒绝覆盖）。"
     )
 
 
@@ -60333,6 +60740,19 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
         )
     except ValueError as error:
         raise SystemExit(f"[design] {error}") from error
+
+    # 预注册入口只能按文件声明的家族/对比类型做功效检查；套件
+    # 实际展开的家族可能更大（全部臂两两对比），消融还会估计
+    # 方差更大的交互。设计计划重算后仍不足时，必须在第一个子
+    # 进程启动前拒绝，不能等分析阶段再解释「交互不显著」。
+    power_gate_error = design_power_gate_error(
+        design,
+        allow_underpowered=bool(
+            getattr(args, "allow_underpowered", False)
+        ),
+    )
+    if power_gate_error is not None:
+        raise SystemExit(f"[design] {power_gate_error}")
 
     if len(args.seeds) < _RECOMMENDED_SEEDS:
         print(
@@ -60416,11 +60836,26 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             "order_balance",
             "planned_runs",
             "planned_comparisons",
+            "planned_contrasts",
             "power",
             "seed_plan",
             "training_budget",
         )
     }
+    analysis_power = analysis["design"].get("power")
+    if (
+        isinstance(analysis_power, dict)
+        and not analysis_power.get("adequate")
+    ):
+        print(
+            "[analysis][warn] 本轮设计功效不足（最吃种子的对比 "
+            f"{analysis_power.get('binding_contrast')}，需要 "
+            f"{analysis_power.get('required_seeds_with_attrition')} "
+            "个启动种子，计划 "
+            f"{analysis_power.get('planned_seeds')} 个）："
+            "结论只能作为探索性证据，不能把交互/主效应的不显著"
+            "读成「没有效应」；该豁免已随 design.power 落盘"
+        )
     analysis["run_order"] = run_order_drift_report(
         rows, args.compare_metric
     )

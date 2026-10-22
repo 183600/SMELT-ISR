@@ -9,7 +9,9 @@
 > 数据切分口径声明、测试内容参与清洗的披露、测试集访问账本与
 > 工作流冻结开关。本轮另补上结果脆弱性/单种子依赖检查与精确
 > 符号检验（见第 26 节），以及同时置信区间与种子×窗口两层
-> 不确定性/方差分解（见第 28 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> 不确定性/方差分解（见第 28 节）；还补上了按对比类型分层的
+> 先验功效（主效应/交互方差不同，交互约需 2 倍种子，见第 30
+> 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
 > context、文档级 segment attention mask、WSD 调度与
 > `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
 > 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
@@ -675,6 +677,80 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
   近似；种子数很少时非中心 t 积分与 sd 估计都不稳定。它们用于
   设计阶段排序风险，不替代分析阶段的 MDE、TOST 与脆弱性报告。
 
+## 30. 消融对比的先验功效：不同对比类型的方差不同（本轮补充）
+
+**判定：原先验功效把「两两配对差值」的方差套到所有对比上，
+消融交互被系统性高估功效。**
+
+1. `preregistration_power_plan` 用
+   `_seeds_to_detect(min_effect, expected_seed_sd_relative)`，
+   即 `se = sd/√n`。这对两格配对对比成立，但 2×2 消融还有
+   主效应与交互：若两格配对差值的方差为 `2σ_cell²`，则主效应
+   `½[(M_on−M_off)+(L_on−L_off)]` 的方差是 `σ_cell²`（0.5×），
+   交互 `(M_on−M_off)−(L_on−L_off)` 的方差是 `4σ_cell²`
+   （2×）。交互的 SE 是两两对比的 √2 倍，同样效应下约需 2 倍
+   种子。原实现虽然把消融家族规模按 7 个检验计入了
+   `planned_comparisons`，却仍用同一个 `sd` 计算所需种子数，
+   所以「按两两对比够用」会被当成「交互也够用」。
+2. 预注册入口只按文件里的 `comparisons` 数量检查功效；套件实际
+   展开的全部臂两两比较、消融主效应/交互/简单效应只在
+   `design_plan.json` 里重算家族规模，且重算时仍未区分对比
+   类型。设计计划可以显示「不足」，但正式运行不会因此停下。
+
+**已修正：**
+
+- 新增 `_CONTRAST_VARIANCE_FACTORS`：`pairwise`/`simple`=1、
+  `main`=0.5、`interaction`=2（方差相对两格配对差值）。
+  `preregistration_power_plan` 对每种声明类型分别计算所需种子、
+  计划可用种子下的实际功效与 MDE，并在 `contrast_power` 中
+  逐项落盘；`binding_contrast` 是最吃种子的类型（同分时优先
+  报交互），`adequate` 按它判定，顶层
+  `required_seeds_for_t`/`achieved_power_at_min_effect`/
+  `minimum_detectable_effect_relative` 也取该类型口径。
+  `power_sensitivity` 对每个 sd 乘数同样按绑定类型重算，避免
+  敏感性表比主表更乐观。
+- 预注册新增可选 `power.planned_contrasts`（`pairwise` /
+  `simple` / `main` / `interaction`，非空、不重复、拒绝未知
+  类型），默认 `["pairwise"]` 兼容旧文件。`expected_seed_sd_relative`
+  明确为**两格配对差值**的标准差；若只有单配置跨种子 sd
+  σ_cell，应乘 √2 或直接用配对差值估计。
+- 新增 `planned_contrast_types_for_plan`：从实际运行计划推断
+  会估计哪些类型。`--suite-ablation`（mode × balance 两轴且含
+  `local_base`）返回 `pairwise`/`main`/`interaction`/`simple`；
+  `--suite-modes` 返回 `pairwise`；单臂返回空。
+- `_design_power_for_family` 改为同时接收实际家族规模与对比
+  类型，把「预注册声明」与「计划实际展开」取并集后重算；
+  `design_plan.json` 新增 `planned_contrasts`，`power` 记录带
+  `declared_planned_contrasts`/`contrasts_adjusted_for_plan`。
+- 新增 `design_power_gate_error`：正式套件在第一个子进程启动
+  前检查设计计划；绑定对比仍不足且没有
+  `underpowered_acknowledged`/`--allow-underpowered` 时直接
+  拒绝。`--plan-design` 仍只打印（不训练），便于冻结前调整
+  `seeds` 或最小效应。
+- 全因子效应记录新增 `contrast_type` 与
+  `contrast_variance_factor`，分析报告可核对「设计时按哪种
+  对比准备种子」与「现在报的是哪种对比」；分析阶段的 MDE/
+  功效仍用该效应的实测 `se`，不使用乘数。
+- 新增回归测试：主效应所需种子不多于两两对比、交互严格更多；
+  只按两两对比够用但交互不足时 `adequate=false`；预注册拒绝
+  未知对比类型；消融设计计划的 `planned_contrasts` 含交互、
+  `binding_contrast=interaction`，启动硬门可被显式豁免。
+
+**仍有限制：**
+
+- 方差乘数假设同一批种子上各实验单元的噪声相关结构相同
+  （共享 seed 效应在差值中抵消，交互方差为两两差值的 2 倍）。
+  若某些单元之间的配对相关性明显不同，设计阶段的乘数只是
+  近似；应以试点运行中**该对比自身**的种子间 sd 估计，或按
+  最保守的乘数准备种子。分析阶段不受影响：每个效应都用自己
+  的实测 `se` 做 t 检验与 MDE。
+- `planned_contrasts` 只描述「打算主张哪些类型」，不改变分析
+  阶段实际计算的家族；设计计划会把实际展开的类型并进来，所以
+  少报类型不能让硬门静默通过。
+- 交互功效仍受 `expected_seed_sd_relative` 估计误差影响；sd
+  偏小 25% 就会让所需种子数明显上升，冻结前应查看
+  `power_sensitivity` 与 `binding_contrast`。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -684,11 +760,13 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
    默认 val-only 清洗。
 3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
-   最小效应、目标功效、预期脱落率）与 `run_order`
+   最小效应、目标功效、预期脱落率；消融还要写
+   `planned_contrasts` 含 `interaction`）与 `run_order`
    （`counterbalanced` + 种子；区组缺格时退回 `randomized`
    并承认位置可能不均衡），用 `--plan-design` 检查所需启动
-   种子数、实际功效/MDE、sd 敏感性、位置平衡与 token 预算；
-   功效不足时先加种子，而不是跑完再解释。
+   种子数、按对比类型分层的实际功效/MDE（`binding_contrast`，
+   消融通常是 `interaction`）、sd 敏感性、位置平衡与 token
+   预算；功效不足时先加种子，而不是跑完再解释。
 4. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
    **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
    固定 `--common-step` 与训练预算；用 `--budget-match` 报告

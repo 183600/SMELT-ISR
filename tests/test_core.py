@@ -1910,6 +1910,216 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertIsInstance(error, str)
         self.assertIn("expected_attrition_rate", error)
 
+    def test_contrast_power_accounts_for_factorial_variance(self):
+        power = {
+            "expected_seed_sd_relative": 0.01,
+            "target_power": 0.8,
+            "alpha": 0.05,
+        }
+        pairwise = experiment.preregistration_power_plan(
+            power, 0.02, 6, 1, contrast_types=["pairwise"]
+        )
+        main = experiment.preregistration_power_plan(
+            power, 0.02, 6, 1, contrast_types=["main"]
+        )
+        interaction = experiment.preregistration_power_plan(
+            power,
+            0.02,
+            6,
+            1,
+            contrast_types=[
+                "pairwise",
+                "main",
+                "interaction",
+                "simple",
+            ],
+        )
+        # 主效应方差是两两对比的 0.5 倍，交互是 2 倍；同样
+        # 最小效应下交互必须要求更多（或相等）种子，且不能
+        # 比两两对比更少。
+        self.assertLessEqual(
+            main["required_seeds_for_t"],
+            pairwise["required_seeds_for_t"],
+        )
+        self.assertGreater(
+            interaction["contrast_power"]["interaction"][
+                "required_seeds_for_t"
+            ],
+            interaction["contrast_power"]["pairwise"][
+                "required_seeds_for_t"
+            ],
+        )
+        self.assertEqual(
+            interaction["binding_contrast"], "interaction"
+        )
+        self.assertAlmostEqual(
+            interaction["contrast_power"]["main"][
+                "variance_factor"
+            ],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            interaction["contrast_power"]["interaction"][
+                "variance_factor"
+            ],
+            2.0,
+        )
+        # 6 个种子对两两对比够用，但对交互不够：adequacy 必须
+        # 按最吃种子的对比类型判定。
+        self.assertTrue(pairwise["adequate"])
+        self.assertFalse(interaction["adequate"])
+
+    def test_preregistration_power_rejects_underpowered_interaction(self):
+        payload = self._payload()
+        payload["min_effect"] = 0.02
+        payload["seeds"] = list(range(42, 49))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.01,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_contrasts": ["pairwise", "interaction"],
+        }
+        # 7 个种子足以做两两对比，但不足以检验方差更大的交互。
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("interaction", error)
+        self.assertIn("交互", error)
+
+        payload["seeds"] = list(range(42, 50))
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+
+        payload["power"]["planned_contrasts"] = ["pairwise"]
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+
+    def test_preregistration_power_rejects_unknown_contrast_type(self):
+        payload = self._payload()
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.005,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_contrasts": ["pairwise", "interactoin"],
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("planned_contrasts", error)
+        self.assertIn("interactoin", error)
+
+    def test_planned_contrast_types_follow_plan_shape(self):
+        modes_only = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=["A", "B"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        self.assertEqual(
+            experiment.planned_contrast_types_for_plan(modes_only),
+            ["pairwise"],
+        )
+        ablation = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=None,
+            ablation=True,
+            balance_coef=0.01,
+            default_mode="B",
+            ablation_modes=["A"],
+        )
+        self.assertEqual(
+            experiment.planned_contrast_types_for_plan(ablation),
+            ["pairwise", "main", "interaction", "simple"],
+        )
+        single_arm = experiment.build_sweep_plan(
+            seeds=[1, 2, 3],
+            modes=None,
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="A",
+        )
+        self.assertEqual(
+            experiment.planned_contrast_types_for_plan(single_arm),
+            [],
+        )
+
+    def test_design_plan_uses_ablation_contrast_power(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = argparse.Namespace(
+                seeds=[1, 2, 3, 4, 5, 6, 7],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                suite_modes=None,
+                suite_ablation=True,
+                ablation_modes=["A"],
+                balance_coef=0.01,
+                mode="B",
+                run_order="randomized",
+                run_order_seed=5,
+                preregistration_record={
+                    "study_id": "ablation-power-test",
+                    "power": {
+                        "expected_seed_sd_relative": 0.01,
+                        "min_effect_relative": 0.02,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "planned_comparisons": 7,
+                        "planned_seeds": 7,
+                        "underpowered_acknowledged": False,
+                    },
+                },
+            )
+            plan, design, planned = (
+                experiment.build_sweep_execution(
+                    args, Path(tmp)
+                )
+            )
+            self.assertEqual(len(plan), 4 * 7)
+            self.assertEqual(planned, 7)
+            # 计划实际会估计主效应/交互/简单效应，设计文件不能
+            # 只保留预注册里默认的两两对比口径。
+            self.assertEqual(
+                design["planned_contrasts"],
+                ["pairwise", "main", "interaction", "simple"],
+            )
+            power = design["power"]
+            self.assertEqual(
+                power["binding_contrast"], "interaction"
+            )
+            self.assertIn("interaction", power["contrast_power"])
+            self.assertGreater(
+                power["contrast_power"]["interaction"][
+                    "required_seeds_for_t"
+                ],
+                power["contrast_power"]["pairwise"][
+                    "required_seeds_for_t"
+                ],
+            )
+            # 7 个种子对两两对比够、对交互不够：启动硬门必须
+            # 在设计阶段拒绝，而不是等分析时解释不显著。
+            self.assertFalse(power["adequate"])
+            self.assertIsNotNone(
+                experiment.design_power_gate_error(design)
+            )
+            self.assertIsNone(
+                experiment.design_power_gate_error(
+                    design, allow_underpowered=True
+                )
+            )
+
+            acknowledged = dict(design)
+            acknowledged_power = dict(power)
+            acknowledged_power[
+                "underpowered_acknowledged"
+            ] = True
+            acknowledged["power"] = acknowledged_power
+            self.assertIsNone(
+                experiment.design_power_gate_error(acknowledged)
+            )
+
 
 class RoutingTests(unittest.TestCase):
     def test_chance_levels_are_reported(self):

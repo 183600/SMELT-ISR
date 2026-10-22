@@ -95,16 +95,24 @@
   `--evaluate-test` 使用其中一个；两者都未给出时自动按文件
   种子集合运行完整套件。
 - `power`（可选）是先验功效分析：`expected_seed_sd_relative`
-  （预期种子间标准差，相对基线均值）、`target_power`、`alpha`
-  与可选 `planned_comparisons`（默认等于 `comparisons` 数量，
-  不得更小）、可选 `expected_attrition_rate`（预期因数值失败/
-  数据问题不可用的运行比例，`[0, 1)`）。按 Bonferroni 下界
+  （预期**两格配对差值**的种子间标准差，相对基线均值）、
+  `target_power`、`alpha` 与可选 `planned_comparisons`（默认
+  等于 `comparisons` 数量，不得更小）、可选 `planned_contrasts`
+  （要主张的对比类型数组 `pairwise` / `simple` / `main` /
+  `interaction`，默认 `["pairwise"]`；消融设计应声明
+  `interaction`）、可选 `expected_attrition_rate`（预期因数值
+  失败/数据问题不可用的运行比例，`[0, 1)`）。按 Bonferroni 下界
   `alpha/m`、稳健符号翻转要求与预期脱落折算的可用种子数计算
-  所需启动种子数；当前 `seeds` 不足时默认拒绝启动。报告同时
-  给出计划可用种子数下的实际功效、MDE 与 sd 敏感性。确需在
-  功效不足的设计上探索时，必须写
-  `underpowered_acknowledged: true` 并给出非空
-  `justification`，承认会随 `config.json` 的
+  所需启动种子数；不同对比类型的方差不同：主效应是两两对比的
+  0.5 倍、简单效应相同、交互是 2 倍，因此 `adequate` 按最吃
+  种子的类型（`binding_contrast`，消融通常是 `interaction`）
+  判定，并在 `contrast_power` 中逐项报告。当前 `seeds` 不足时
+  默认拒绝启动；正式套件还会按实际展开的运行计划（含全部臂
+  两两对比与消融主效应/交互/简单效应）重算一次，仍不足且未
+  显式承认时在第一个子进程启动前拒绝。报告同时给出计划可用
+  种子数下的实际功效、MDE 与 sd 敏感性。确需在功效不足的
+  设计上探索时，必须写 `underpowered_acknowledged: true` 并
+  给出非空 `justification`，承认会随 `config.json` 的
   `preregistration.power` 落盘。详见
   [design_preparation.md](design_preparation.md)。
 - `run_order`（可选）冻结执行顺序：`scheme` 为 `grouped` /
@@ -153,6 +161,13 @@
   "expected_attrition_rate": 0.1
 }
 ```
+
+该示例对应 `--suite-modes` 的两两对比（`planned_contrasts`
+默认 `pairwise`）。若同一设计改跑 `--suite-ablation`，必须把
+`"planned_contrasts": ["pairwise", "main", "interaction", "simple"]`
+写进 `power`，此时 `binding_contrast` 通常是 `interaction`，
+交互的方差是两两对比的 2 倍，8 个种子通常不够；设计计划会在
+开跑前按实际计划重算并拒绝不足的设计。
 
 写好预注册文件后，先用 `--plan-design` 检查设计是否可执行：
 
@@ -241,6 +256,11 @@ python experiment.py --data corpus.txt --out runs/confirm \
   为 `training_seed` 时优先增加独立种子；为
   `evaluation_windows` 时优先扩大/改进评估集；两层区间都只
   条件于当前固定窗口，不能外推到换文档/来源。
+- 消融的主效应/交互不显著时，先对照 `design.power.contrast_power`
+  与 `design.power.binding_contrast`：交互的方差是两两对比的
+  2 倍，按两两对比「够用」的种子数不能支撑交互结论；再看该效应
+  自己的 `mde_80`/`power_at_effect`。不能把「交互不显著」直接读成
+  「没有交互」。
 - 不显著 ≠ 等价；只有 TOST 校正后通过才能说「无实质差异」。
 - 共同步数用预注册的 `--common-step`；报告
   `target_step_rule` 与 `target_step_data_dependent`。

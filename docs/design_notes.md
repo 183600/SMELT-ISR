@@ -409,22 +409,29 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 设计，无法靠事后统计补救。当前实现把以下准备动作落到代码：
 
 - **先验功效（`power`）**：预注册文件可声明
-  `expected_seed_sd_relative`（预期种子间标准差，相对基线
-  均值）、`target_power`、`alpha`、可选
+  `expected_seed_sd_relative`（预期**两格配对差值**的种子间
+  标准差，相对基线均值）、`target_power`、`alpha`、可选
   `planned_comparisons`（默认等于 `comparisons` 数量，不得
-  更小）与可选 `expected_attrition_rate`（预期不可用运行
-  比例）。`preregistration_power_plan` 按 Bonferroni 下界
-  `alpha/m` 计算配对 t 所需种子数，并同时满足精确符号翻转
-  所需 `ceil(log2(2m/alpha))`，取较大值作为
-  `required_seeds`；再按预期脱落率反推
+  更小）、可选 `planned_contrasts`（`pairwise` / `simple` /
+  `main` / `interaction`，默认 `["pairwise"]`）与可选
+  `expected_attrition_rate`（预期不可用运行比例）。
+  `preregistration_power_plan` 按 Bonferroni 下界 `alpha/m`
+  计算配对 t 所需种子数，并同时满足精确符号翻转所需
+  `ceil(log2(2m/alpha))`。不同对比类型方差不同：主效应是
+  两两对比的 0.5 倍、简单效应相同、交互是 2 倍；报告逐项给出
+  `contrast_power` 与最吃种子的 `binding_contrast`（消融通常
+  是 `interaction`），`adequate` 按它判定，再按预期脱落率反推
   `required_seeds_with_attrition` 与 `planned_usable_seeds`。
   报告还给出计划可用种子数下的
   `achieved_power_at_min_effect`、
   `minimum_detectable_effect_relative` 与 `power_sensitivity`
   （sd 乘以 0.5~2.0 重算），避免只报一个乐观的种子数。
-  种子数不足时预注册入口默认拒绝启动；确需探索时必须写
-  `underpowered_acknowledged: true` 与 `justification`，承认
-  随 `config.json` 的 `preregistration.power` 落盘。
+  种子数不足时预注册入口默认拒绝启动；正式套件还会按实际
+  运行计划（含全部臂两两对比与消融主效应/交互/简单效应）
+  在第一个子进程启动前重算并拒绝，除非显式承认
+  `underpowered_acknowledged: true`（附 `justification`）或
+  冒烟运行加 `--allow-underpowered`。承认会随 `config.json` 的
+  `preregistration.power` 落盘。
 - **随机化/平衡完整区组（`run_order`）**：`--run-order
   {grouped,blocked,randomized,counterbalanced}` 与
   `--run-order-seed` 控制套件执行顺序，默认 `randomized`——
@@ -437,9 +444,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   方案与种子，命令行显式冲突拒绝启动。
 - **设计计划（`design_plan.json`）**：套件父进程在训练前
   写运行清单、执行顺序/区组、`order_balance` 位置平衡审计、
-  先验功效、种子计划与解析 token 预算，`plan_id` 是去掉
-  时间戳后的规范化指纹。`--plan-design` 只生成/打印计划、
-  不加载数据也不训练，供冻结前检查。子进程通过环境变量收到
+  先验功效、计划实际会估计的 `planned_contrasts`、种子计划与
+  解析 token 预算，`plan_id` 是去掉时间戳后的规范化指纹。
+  `--plan-design` 只生成/打印计划、不加载数据也不训练，供
+  冻结前检查。子进程通过环境变量收到
   计划文件、SHA-256、`plan_id` 与 (order_index, block,
   position)，开跑前重新哈希并核对 label/seed/mode/balance；
   计划被改或分配不符即拒绝训练。实际开始/结束时间写
