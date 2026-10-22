@@ -14124,15 +14124,14 @@ def analyze_training_curve(
             # 保留 NaN/Inf），也可能只落在梯度上。判据必须覆盖
             # 原值非有限的情况，否则 NaN 会流进 _sparkline 的
             # int() 转换。
-            train_finite = (
-                isinstance(train_loss, (int, float))
-                and not isinstance(train_loss, bool)
-                and math.isfinite(float(train_loss))
-            )
-            grad_nonfinite = "grad_norm" in record and not (
-                isinstance(grad_norm, (int, float))
-                and not isinstance(grad_norm, bool)
-                and math.isfinite(float(grad_norm))
+            # JSON 允许任意大整数（如 10**400）；float() 会溢出，
+            # 必须与 NaN/Inf 一样按非有限事件处理，而不是让整份
+            # 曲线诊断崩溃。
+            train_value = _finite_float(train_loss)
+            train_finite = train_value is not None
+            grad_value = _finite_float(grad_norm)
+            grad_nonfinite = (
+                "grad_norm" in record and grad_value is None
             )
             nonfinite = not train_finite or grad_nonfinite
             if nonfinite:
@@ -14142,26 +14141,18 @@ def analyze_training_curve(
                 ):
                     nonfinite_steps.append(step)
             if train_finite:
-                train_loss = float(train_loss)
-                train_points.append((step, train_loss))
-                pending.append(train_loss)
+                train_points.append((step, train_value))
+                pending.append(train_value)
 
             # 有限梯度范数序列：用于在损失尚未变成 NaN 时发现
             # 梯度尖峰（爆炸/学习率过大的前兆）。
             if "grad_norm" in record and not grad_nonfinite:
-                grad_points.append(
-                    (step, float(grad_norm))
-                )
+                grad_points.append((step, grad_value))
 
             # 学习率曲线（每步记录）：用于区分「双平台」是调度
             # 末期的正常收敛，还是高学习率下的训练停滞。
-            record_lr = record.get("lr")
-            if (
-                isinstance(record_lr, (int, float))
-                and not isinstance(record_lr, bool)
-                and math.isfinite(float(record_lr))
-            ):
-                record_lr = float(record_lr)
+            record_lr = _finite_float(record.get("lr"))
+            if record_lr is not None:
                 last_lr = record_lr
                 if (
                     peak_lr is None
@@ -14172,16 +14163,11 @@ def analyze_training_curve(
         if "val_loss" not in record:
             continue
 
-        val_loss = record.get("val_loss")
-
         # 盘上记录里的 NaN/Inf 会被 _json_safe 写成 null，在线
-        # 记录保留原值；两者都按非有限事件处理，避免 NaN
-        # 流入 _sparkline 的 int() 转换。
-        if (
-            val_loss is None
-            or not isinstance(val_loss, (int, float))
-            or not math.isfinite(float(val_loss))
-        ):
+        # 记录保留原值；超出 float 范围的整数同样按非有限事件
+        # 处理，避免 NaN/溢出值流入 _sparkline 的 int() 转换。
+        val_loss = _finite_float(record.get("val_loss"))
+        if val_loss is None:
             if (
                 not nonfinite_steps
                 or nonfinite_steps[-1] != step
@@ -14203,7 +14189,7 @@ def analyze_training_curve(
 
         eval_points.append({
             "step": step,
-            "val_loss": float(val_loss),
+            "val_loss": val_loss,
             "train_loss": train_at_eval,
         })
         pending = []

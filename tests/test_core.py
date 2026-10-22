@@ -5407,6 +5407,31 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_curve_analysis_treats_out_of_range_numbers_as_nonfinite(self):
+        huge = 10 ** 400
+        records = [
+            {
+                "step": 1,
+                "train_loss": huge,
+                "val_loss": huge,
+                "grad_norm": huge,
+                "lr": huge,
+            },
+            {
+                "step": 2,
+                "train_loss": 1.0,
+                "val_loss": 1.0,
+                "grad_norm": 1.0,
+                "lr": 1e-3,
+            },
+        ]
+        analysis = experiment.analyze_training_curve(records)
+        self.assertEqual(analysis["n_nonfinite_events"], 1)
+        self.assertEqual(analysis["n_eval_points"], 1)
+        self.assertEqual(analysis["n_train_steps"], 1)
+        self.assertEqual(analysis["peak_lr"], 1e-3)
+        self.assertIn(1, analysis["nonfinite_steps"])
+
     def test_timing_summary_handles_out_of_range_integers(self):
         huge_integer = 10 ** 400
         timing = experiment._timing_summary([huge_integer])
