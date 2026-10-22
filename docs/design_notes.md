@@ -260,6 +260,12 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   删除 1~3 个种子后的显著性敏感性分析（含最少删除数、
   `stable`/`fragile`/`direction_mixed`/`not_evaluable` 判定）
   与报告级汇总；详见「结果分析方法」的结果脆弱性条目。
+- `_cell_attrition_support`、`_attrition_bounds`、
+  `_attrition_bounds_summary`：按单元统计已观测/缺失运行，
+  在观测支持范围内计算两两对比与线性因子效应的部分识别界
+  （`effect_min`/`effect_max`、`zero_within_bounds`、
+  `sign_robust`）并汇总到报告顶层；详见「结果分析方法」的
+  缺失/失败运行部分识别界条目。
 - `_holm_rank_thresholds`：按 Holm step-down 的实际位置给出
   `alpha/(m-rank+1)` 阈值，供脆弱性检查与最终显著性判定同口径。
 - `cross_family_protocol_check`：神经运行与 ngram 统计基线
@@ -370,6 +376,20 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   该检查是**描述性敏感性分析**，不新增显著性检验，也不替代
   主检验；但它把「显著但只靠少数种子」与「多数种子同向且
   删除后仍显著」区分开。
+- **缺失/失败运行的部分识别界**：失败率与差分缺失只说明
+  完整案例子集可能不同；它们不回答「缺失结果最多能把效应
+  推到多远」。每个两两对比与全因子主效应/交互/简单效应现在
+  附带 `attrition_bounds`：把每个单元的缺失运行（数值失败 +
+  成功但缺指标）分别赋到两臂已观测结果的联合范围
+  `[min, max]` 两端，按线性组合系数取极值，得到
+  `effect_min` / `effect_max`、`zero_within_bounds` 与
+  `sign_robust`。`crosses_zero` / `unbounded` 的支持效应会把
+  组件联合判定降级为 `inconclusive`；报告顶层落盘
+  `attrition_bounds_summary`，展示层以 `[attrition-bounds]` 点名缺失
+  比例与跨零条目。该界是**有界结果假设下的部分识别**，不是
+  置信区间：缺失值可能超出观测范围时真实界为无穷宽，正确
+  反应是补齐/重跑缺失单元，而不是把「界内同向」写成
+  「缺失无偏」。
 - **同时置信区间（与多重比较判定同族）**：每个对比/因子效应
   的 `ci95_low/high` 是**逐检验**区间，对应未校正 p 值；显著性
   判定却以 Holm 校正为准。家族 m>1 时两者可能「看起来矛盾」

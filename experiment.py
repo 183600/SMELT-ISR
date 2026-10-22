@@ -27447,6 +27447,470 @@ def _contrast_test(
     return result
 
 
+_ATTRITION_BOUND_SCHEMA = "smelt-isr/attrition-bounds/v1"
+
+
+def _cell_attrition_support(
+    cell: Dict[str, object],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    汇总一个实验单元的「已观测值 + 缺失运行数」。
+
+    缺失包括两类运行：数值失败/发散（``numerical_failures``）
+    与成功运行但缺该指标（例如曲线或指标未计算）。两者都不
+    进入均值/检验，却会让完整案例分析只覆盖幸存子集；本函数
+    把「计划中有多少运行、实际看到多少值」显式记下来，供
+    ``_attrition_bounds`` 计算部分识别界。
+    """
+    if not isinstance(cell, dict):
+        cell = {}
+    sample_map = _as_dict(cell.get("samples"))
+    raw_samples = sample_map.get(metric, [])
+    values: List[float] = []
+    if isinstance(raw_samples, list):
+        for sample in raw_samples:
+            if not isinstance(sample, dict):
+                continue
+            value = _finite_float(sample.get("value"))
+            if value is not None:
+                values.append(value)
+    usable_runs = _nonnegative_int(cell.get("n_runs"))
+    failures = cell.get("numerical_failures")
+    failed_runs = len(failures) if isinstance(failures, list) else 0
+    observed_runs = len(values)
+    # n_runs 只统计可用运行；失败运行单独放在 numerical_failures。
+    # 取 max 是防御旧/手工数据把已观测值算得比计划还多的情况；
+    # 这种数据不会让缺失数变成负数。
+    attempted_runs = max(
+        usable_runs + failed_runs,
+        observed_runs,
+    )
+    return {
+        "label": str(cell.get("label", "")),
+        "deterministic": bool(cell.get("deterministic")),
+        "observed_runs": observed_runs,
+        "usable_runs": usable_runs,
+        "failed_runs": failed_runs,
+        "attempted_runs": attempted_runs,
+        "missing_runs": max(0, attempted_runs - observed_runs),
+        "observed_mean": _mean(values) if values else None,
+        "observed_min": min(values) if values else None,
+        "observed_max": max(values) if values else None,
+    }
+
+
+def _attrition_bounds(
+    cells: Dict[str, Dict[str, object]],
+    coefficients: Dict[str, float],
+    metric: str,
+    observed_effect: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    缺失/失败运行下对比效应的部分识别界（Manski 风格）。
+
+    完整案例分析（complete-case）默认假设「缺失与结果无关」，
+    但数值失败、曲线缺失或某臂更容易崩掉时，这个假设通常
+    不成立。这里不假装能估计缺失值，而是给出一个**透明的
+    有界结果假设**：若某个运行的真实结果落在两臂全部已观测
+    结果的联合范围 ``[L, U]`` 内，则把该单元的所有缺失运行
+    分别赋到 L 或 U，可得到线性组合效应的下界/上界。
+
+    报告 ``effect_min`` / ``effect_max``、``zero_within_bounds``
+    与 ``sign_robust``。若界跨 0，支持组件的显著性结论可能
+    只是「失败运行恰好都更差」造成的，不能作为稳健证据；若
+    缺失值可能落在观测范围之外，则真实界是无穷宽，本函数
+    会明确写明这一限制，不把有界假设当成无假设。
+
+    这是**部分识别**（partial identification），不是置信区间，
+    也不替代主检验：它回答「在最强/最弱的缺失结果下，效应
+    方向是否可能反转」，不回答「缺失的概率是多少」。
+    """
+    report: Dict[str, object] = {
+        "schema": _ATTRITION_BOUND_SCHEMA,
+        "applicable": False,
+        "verdict": "not_applicable",
+        "reason": None,
+        "assumption": (
+            "未观测结果落在参与比较的全部单元已观测结果的联合"
+            "范围 [min, max] 内；这是有界结果假设下的部分识别界，"
+            "不是置信区间。若缺失结果可能超出该范围，真实界为"
+            "无穷宽"
+        ),
+        "complete_cases": False,
+        "observed_effect": observed_effect,
+        "effect_min": None,
+        "effect_max": None,
+        "observed_effect_within_bounds": None,
+        "zero_within_bounds": None,
+        "sign_robust": None,
+        "attempted_runs": 0,
+        "observed_runs": 0,
+        "missing_runs": 0,
+        "observed_fraction": None,
+        "support": {"min": None, "max": None},
+        "cells": [],
+        "note": (
+            "缺失运行不进入均值/检验；本界只说明在观测支持范围内"
+            "缺失结果最多能把效应推到多远"
+        ),
+    }
+    if not cells or not coefficients:
+        report["reason"] = "没有可用的实验单元或线性组合系数"
+        return report
+
+    supports = {
+        alias: _cell_attrition_support(cell, metric)
+        for alias, cell in cells.items()
+    }
+    cell_rows: List[Dict[str, object]] = []
+    total_attempted = 0
+    total_observed = 0
+    total_missing = 0
+    support_values: List[float] = []
+    deterministic = False
+    for alias, coefficient in coefficients.items():
+        support = supports.get(alias)
+        if support is None:
+            report["reason"] = f"缺少单元 {alias}"
+            return report
+        coefficient_value = _finite_float(coefficient)
+        if coefficient_value is None:
+            report["reason"] = (
+                f"单元 {alias} 的线性组合系数不是有限数值"
+            )
+            return report
+        deterministic = deterministic or bool(
+            support.get("deterministic")
+        )
+        total_attempted += int(support["attempted_runs"])
+        total_observed += int(support["observed_runs"])
+        total_missing += int(support["missing_runs"])
+        for key in ("observed_min", "observed_max"):
+            value = _finite_float(support.get(key))
+            if value is not None:
+                support_values.append(value)
+        cell_rows.append({
+            "cell": support["label"] or str(alias),
+            "alias": str(alias),
+            "coefficient": coefficient_value,
+            "observed_runs": support["observed_runs"],
+            "attempted_runs": support["attempted_runs"],
+            "missing_runs": support["missing_runs"],
+            "observed_min": support["observed_min"],
+            "observed_max": support["observed_max"],
+        })
+
+    report["cells"] = cell_rows
+    report["attempted_runs"] = total_attempted
+    report["observed_runs"] = total_observed
+    report["missing_runs"] = total_missing
+    report["observed_fraction"] = (
+        float(total_observed) / float(total_attempted)
+        if total_attempted > 0
+        else None
+    )
+
+    if deterministic:
+        report["reason"] = (
+            "确定性基线（如 ngram）换 seed 是同一估计的复制，"
+            "不适用按运行缺失的部分识别界"
+        )
+        return report
+    if total_attempted == 0:
+        report["reason"] = (
+            "没有计划运行/已观测运行：不是缺失问题，"
+            "不生成部分识别界"
+        )
+        return report
+    if total_observed == 0:
+        report["verdict"] = "unbounded"
+        report["reason"] = (
+            "参与比较的单元没有任何已观测结果：无法给出有界"
+            "结果假设下的有限界"
+        )
+        return report
+
+    support_min = min(support_values)
+    support_max = max(support_values)
+    report["support"] = {
+        "min": support_min,
+        "max": support_max,
+    }
+    report["applicable"] = True
+    report["complete_cases"] = total_missing == 0
+
+    # 对线性组合的每个单元分别取「最不利/最有利」的缺失赋值。
+    # 系数为正的单元要最小化就赋 L、最大化就赋 U；系数为负时
+    # 方向相反。所有单元同时取各自极值即可得到组合的极值。
+    effect_min = 0.0
+    effect_max = 0.0
+    for alias, coefficient in coefficients.items():
+        support = supports[alias]
+        observed = int(support["observed_runs"])
+        attempted = int(support["attempted_runs"])
+        observed_mean = _finite_float(
+            support.get("observed_mean")
+        )
+        coefficient_value = _finite_float(coefficient)
+        if coefficient_value is None:
+            report["verdict"] = "not_applicable"
+            report["reason"] = (
+                f"单元 {alias} 的线性组合系数不是有限数值"
+            )
+            report["applicable"] = False
+            return report
+        if attempted <= 0 or observed <= 0 or observed_mean is None:
+            # 整个单元都没有观测值时，所有运行都可取 L 或 U。
+            mean_low = support_min
+            mean_high = support_max
+        else:
+            # 用「观测均值 × 观测比例 + 极值 × 缺失比例」而不是
+            # 先求总和：极大有限值直接相加可能溢出，比例写法
+            # 在极端量级下仍不会抛异常（非有限结果由下方统一
+            # 标成 unbounded）。
+            observed_share = (
+                float(observed) / float(attempted)
+            )
+            missing_share = 1.0 - observed_share
+            mean_low = (
+                observed_share * observed_mean
+                + missing_share * support_min
+            )
+            mean_high = (
+                observed_share * observed_mean
+                + missing_share * support_max
+            )
+        if coefficient_value >= 0.0:
+            effect_min += coefficient_value * mean_low
+            effect_max += coefficient_value * mean_high
+        else:
+            effect_min += coefficient_value * mean_high
+            effect_max += coefficient_value * mean_low
+
+    if not math.isfinite(effect_min) or not math.isfinite(effect_max):
+        report["verdict"] = "unbounded"
+        report["reason"] = "极端赋值下的效应不是有限值"
+        return report
+    if effect_min > effect_max:
+        effect_min, effect_max = effect_max, effect_min
+    report["effect_min"] = effect_min
+    report["effect_max"] = effect_max
+    report["max_abs_shift_from_observed"] = (
+        max(
+            abs(effect_min - observed_effect),
+            abs(effect_max - observed_effect),
+        )
+        if observed_effect is not None
+        else None
+    )
+    tolerance = 1e-12
+    report["observed_effect_within_bounds"] = bool(
+        observed_effect is not None
+        and effect_min - tolerance
+        <= observed_effect
+        <= effect_max + tolerance
+    )
+    report["zero_within_bounds"] = bool(
+        effect_min - tolerance <= 0.0 <= effect_max + tolerance
+    )
+
+    if total_missing == 0:
+        report["verdict"] = "complete_cases"
+        report["sign_robust"] = True
+        report["note"] = (
+            "没有缺失/失败运行：完整案例即全部计划运行，"
+            "无需做缺失敏感性外推"
+        )
+        return report
+
+    observed_sign = 0
+    if observed_effect is not None:
+        if observed_effect > tolerance:
+            observed_sign = 1
+        elif observed_effect < -tolerance:
+            observed_sign = -1
+    low_sign = (
+        1
+        if effect_min > tolerance
+        else -1
+        if effect_min < -tolerance
+        else 0
+    )
+    high_sign = (
+        1
+        if effect_max > tolerance
+        else -1
+        if effect_max < -tolerance
+        else 0
+    )
+    report["sign_robust"] = bool(
+        observed_sign != 0
+        and low_sign == observed_sign
+        and high_sign == observed_sign
+    )
+    if report["zero_within_bounds"]:
+        report["verdict"] = "crosses_zero"
+        report["reason"] = (
+            "在观测支持范围内给缺失运行取极端值时，效应方向"
+            "可能反转或变为 0：完整案例的显著结论不能当作对"
+            "缺失机制稳健"
+        )
+    elif observed_sign == 0:
+        report["verdict"] = "zero_effect"
+        report["reason"] = "观测效应为 0，方向稳健性无定义"
+    else:
+        report["verdict"] = "bounded_same_sign"
+        report["reason"] = (
+            "在观测支持范围内取最不利/最有利的缺失赋值，效应"
+            "方向仍与完整案例一致；结论对缺失机制稳健（仍以"
+            "有界结果假设为前提）"
+        )
+    return report
+
+
+def _attrition_bounds_summary(
+    contrasts: Sequence[Dict[str, object]],
+    label: str = "combined",
+) -> Dict[str, object]:
+    """
+    汇总一组对比/因子效应的缺失敏感性界，供报告顶层落盘。
+
+    只统计 ``attrition_bounds.applicable`` 的条目；确定性基线
+    与没有任何观测的条目单独计数，避免把「无法计算」写成
+    「没有缺失问题」。
+    """
+    def _format_bound(value: object) -> str:
+        number = _finite_float(value)
+        return "n/a" if number is None else f"{number:.4g}"
+
+    entries: List[Dict[str, object]] = []
+    skipped: List[Dict[str, object]] = []
+    seen: set = set()
+    for contrast in contrasts:
+        bounds = contrast.get("attrition_bounds")
+        if not isinstance(bounds, dict):
+            continue
+        baseline = contrast.get("baseline")
+        variant = contrast.get("variant")
+        design = contrast.get("design")
+        effect_name = contrast.get("effect_name")
+        if baseline is None and variant is None:
+            baseline = design or effect_name
+            variant = effect_name or baseline
+        key = (
+            str(label),
+            tuple(sorted((str(baseline), str(variant)))),
+            str(design),
+            str(effect_name),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {
+            "family": label,
+            "baseline": baseline,
+            "variant": variant,
+            "design": design,
+            "effect_name": effect_name,
+            "verdict": bounds.get("verdict"),
+            "applicable": bool(bounds.get("applicable")),
+            "complete_cases": bool(bounds.get("complete_cases")),
+            "missing_runs": bounds.get("missing_runs"),
+            "attempted_runs": bounds.get("attempted_runs"),
+            "observed_runs": bounds.get("observed_runs"),
+            "observed_effect": bounds.get("observed_effect"),
+            "effect_min": bounds.get("effect_min"),
+            "effect_max": bounds.get("effect_max"),
+            "zero_within_bounds": bounds.get("zero_within_bounds"),
+            "sign_robust": bounds.get("sign_robust"),
+            "observed_effect_within_bounds": bounds.get(
+                "observed_effect_within_bounds"
+            ),
+            "significant": bool(contrast.get("significant")),
+        }
+        if not bounds.get("applicable"):
+            skipped.append(entry)
+        else:
+            entries.append(entry)
+
+    verdict_counts: Dict[str, int] = {}
+    for entry in entries:
+        verdict = str(entry.get("verdict"))
+        verdict_counts[verdict] = (
+            verdict_counts.get(verdict, 0) + 1
+        )
+    with_missing = [
+        entry for entry in entries
+        if int(entry.get("missing_runs") or 0) > 0
+    ]
+    not_robust = [
+        entry for entry in entries
+        if entry.get("verdict") in {"crosses_zero", "unbounded"}
+    ]
+    advisories: List[str] = []
+    if not_robust:
+        advisories.append(
+            "以下对比在观测支持范围内给缺失/失败运行取极端值时，"
+            "效应方向可能反转（或无法给出有限界）：完整案例的"
+            "显著结论不能当作对缺失机制稳健，应补齐运行或报告"
+            "失败率与界："
+            + "; ".join(
+                f"{entry['baseline']}→{entry['variant']}"
+                f"（缺失 {entry.get('missing_runs')}/"
+                f"{entry.get('attempted_runs')}，"
+                f"界=[{_format_bound(entry.get('effect_min'))}, "
+                f"{_format_bound(entry.get('effect_max'))}]）"
+                for entry in not_robust
+            )
+        )
+    elif with_missing:
+        advisories.append(
+            "有缺测/失败运行的对比在观测支持范围内仍保持效应"
+            "方向；这以「缺失结果不超出观测范围」为前提，不能"
+            "替代补齐运行。"
+        )
+    elif entries:
+        advisories.append(
+            "所有可核对对比都没有缺失/失败运行；无需做缺失"
+            "敏感性外推。"
+        )
+    if skipped:
+        advisories.append(
+            f"{len(skipped)} 个条目无法计算缺失敏感性界"
+            "（确定性基线或没有任何已观测结果）：不能把"
+            "「未计算」读成「没有缺失问题」。"
+        )
+    outside_bounds = [
+        entry for entry in entries
+        if entry.get("observed_effect_within_bounds") is False
+    ]
+    if outside_bounds:
+        advisories.append(
+            "以下条目的配对点估计落在按聚合均值计算的缺失界之外"
+            "（种子不完全对齐或均值/配对口径不同）：不能把该界"
+            "直接套到配对效应上，应同时查看 common_seeds 与"
+            "differential_missingness："
+            + "; ".join(
+                f"{entry['baseline']}→{entry['variant']}"
+                for entry in outside_bounds
+            )
+        )
+    return {
+        "schema": "smelt-isr/attrition-summary/v1",
+        "entries": entries,
+        "skipped": skipped,
+        "verdict_counts": verdict_counts,
+        "with_missing": with_missing,
+        "not_robust": not_robust,
+        "advisories": advisories,
+        "note": (
+            "有界结果假设下的部分识别，不是置信区间；缺失值"
+            "可能超出观测支持范围时真实界为无穷宽"
+        ),
+    }
+
+
 def _cost_verdict_from_ratios(
     cost_ratios: Dict[str, float],
     verdict: str,
@@ -28190,6 +28654,17 @@ def factor_contrasts(
                 test,
                 equivalence_margin,
             )
+            # 完整案例分析只覆盖「有该指标且未数值失败」的运行。
+            # 在观测支持范围内给缺失运行取极端值，检查效应方向
+            # 是否仍能成立；跨 0 时显著结论不能当作对缺失机制
+            # 稳健。该界与失败率、差分缺失一起读，不能单独用
+            # 完整案例均值掩盖幸存者偏差。
+            contrast["attrition_bounds"] = _attrition_bounds(
+                {"baseline": cell_a, "variant": cell_b},
+                {"baseline": -1.0, "variant": 1.0},
+                metric,
+                delta,
+            )
             contrasts.append(contrast)
 
     # 家族的显著性判定必须在全部对比都生成后统一校正，
@@ -28827,6 +29302,18 @@ def factorial_effects(
                         result,
                         equivalence_margin,
                     )
+                # 全因子主效应/交互/简单效应同样只覆盖完整案例。
+                # 每个单元的缺失运行数量可能不同；把缺失值推到
+                # 观测支持的两端，检查该线性组合的方向是否仍
+                # 成立，避免某个更容易失败的消融格伪装成主效应。
+                effect_record["attrition_bounds"] = (
+                    _attrition_bounds(
+                        cells,
+                        coefficients,
+                        metric,
+                        effect_value,
+                    )
+                )
                 report["effects"].append(effect_record)
 
     eligible = [
@@ -29006,6 +29493,16 @@ def factorial_effects(
                 "单元的全部运行"
             )
 
+    # 缺失敏感性：某个消融格更容易数值失败时，完整案例的
+    # 主效应/交互可能由「哪些格留下了」驱动。这里把每个效应
+    # 的缺失支持界汇总到因子层，跨 0 的效应不能作为组件证据。
+    attrition_sensitivity = _attrition_bounds_summary(
+        report["effects"], label="factorial"
+    )
+    report["attrition_sensitivity"] = attrition_sensitivity
+    for message in attrition_sensitivity["advisories"]:
+        report["advisories"].append(message)
+
     if report["incomplete_designs"]:
         report["advisories"].append(
             "存在不完整的 2×2 设计：缺格时不能估计对应"
@@ -29064,6 +29561,16 @@ def _component_evidence_summary(
             "fragility_verdict": (
                 _as_dict(effect.get("fragility")).get("verdict")
             ),
+            "attrition_verdict": (
+                _as_dict(effect.get("attrition_bounds")).get(
+                    "verdict"
+                )
+            ),
+            "attrition_sign_robust": (
+                _as_dict(effect.get("attrition_bounds")).get(
+                    "sign_robust"
+                )
+            ),
         }
         for effect in effects
     ]
@@ -29071,6 +29578,12 @@ def _component_evidence_summary(
         summary
         for summary in summaries
         if summary.get("fragility_verdict") == "fragile"
+    ]
+    attrition_unstable = [
+        summary
+        for summary in summaries
+        if summary.get("attrition_verdict")
+        in {"crosses_zero", "unbounded"}
     ]
 
     if any(claim in _COMPONENT_BLOCKING_CLAIMS for claim in claims):
@@ -29097,6 +29610,19 @@ def _component_evidence_summary(
                 ),
                 "evidence": summaries,
                 "fragile_effects": fragile_effects,
+            }
+        if attrition_unstable:
+            return {
+                "status": "inconclusive",
+                "reason": (
+                    "效应校正后显著，但在观测支持范围内给缺失/"
+                    "失败运行取极端值时方向可能反转（attrition_"
+                    "bounds 跨 0 或无界）：完整案例的结论可能由"
+                    "「哪些运行留下了」驱动，不能作为组件有用的"
+                    "稳健证据；应补齐运行或报告失败率与部分识别界"
+                ),
+                "evidence": summaries,
+                "attrition_unstable_effects": attrition_unstable,
             }
         if all(effect.get("equivalent") for effect in effects):
             return {
@@ -29252,6 +29778,13 @@ def ablation_component_verdicts(
                     "主效应支持，但简单效应受混杂/未核对控制项"
                     "阻塞"
                 )
+            elif simple_summary.get("attrition_unstable_effects"):
+                status = "inconclusive"
+                reasons.append(
+                    "主效应支持，但至少一个简单效应在缺失/失败"
+                    "运行的支持界内方向可能反转：不能宣称组件"
+                    "在所有设置下有用；应补齐运行或调查失败原因"
+                )
             elif (
                 interaction_significant
                 and simple_summary["status"] != "supported"
@@ -29317,6 +29850,15 @@ def ablation_component_verdicts(
             balance_reasons.append(
                 "均衡损失主效应支持，但简单效应受混杂/未核对"
                 "控制项阻塞"
+            )
+        elif balance_simple_summary.get(
+            "attrition_unstable_effects"
+        ):
+            balance_status = "inconclusive"
+            balance_reasons.append(
+                "均衡损失主效应支持，但至少一个简单效应在缺失/"
+                "失败运行的支持界内方向可能反转：不能宣称该组件"
+                "在所有设置下有用；应补齐运行或调查失败原因"
             )
         elif (
             balance_interaction_significant
@@ -30701,6 +31243,14 @@ def compare_cells_to_baseline(
             delta,
             result,
             equivalence_margin,
+        )
+        # 与单因子对比同口径：指定基线的直接对比同样只覆盖
+        # 完整案例，缺失敏感性界必须随对比一起落盘。
+        entry["attrition_bounds"] = _attrition_bounds(
+            {"baseline": reference, "variant": aggregate},
+            {"baseline": -1.0, "variant": 1.0},
+            metric,
+            delta,
         )
         contrasts.append(entry)
 
@@ -37628,6 +38178,10 @@ def print_comparison_analysis(
         list(contrasts) + list(reference) + factorial_fragility,
         label="combined",
     )
+    attrition_summary = _attrition_bounds_summary(
+        list(contrasts) + list(reference) + factorial_fragility,
+        label="combined",
+    )
 
     print()
     print(
@@ -38562,6 +39116,66 @@ def print_comparison_analysis(
             "  注：fragility 是描述性敏感性分析，不替代显著性"
             "检验；但「显著」若依赖少数种子，应增加独立种子"
             "或调查异常运行后再下结论"
+        )
+
+    # 缺失/失败运行下的部分识别界：失败率本身不能说明
+    # 「幸存者条件均值」是否可信，必须检查缺失结果最多能把
+    # 效应推到多远。
+    print()
+    print(
+        "[attrition-bounds] 缺失/失败运行下的部分识别界（假设缺失结果"
+        "落在两臂已观测结果的联合范围内；不是置信区间）"
+    )
+    attrition_entries = attrition_summary.get("entries", [])
+    if not attrition_entries:
+        print(
+            "  无可用条目（确定性基线或没有任何已观测结果，"
+            "无法计算缺失敏感性界）"
+        )
+    else:
+        counts = attrition_summary.get("verdict_counts", {})
+        print(
+            "  判定分布: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in sorted(counts.items())
+            )
+        )
+        with_missing = attrition_summary.get("with_missing", [])
+        not_robust = attrition_summary.get("not_robust", [])
+        print(
+            f"  有缺测/失败={len(with_missing)}，"
+            f"界跨零或无界={len(not_robust)}"
+        )
+        for entry in not_robust:
+            missing = entry.get("missing_runs")
+            attempted = entry.get("attempted_runs")
+            low = _finite_float(entry.get("effect_min"))
+            high = _finite_float(entry.get("effect_max"))
+            bounds_text = (
+                f"[{low:.4g}, {high:.4g}]"
+                if low is not None and high is not None
+                else "无有限界"
+            )
+            print(
+                f"  [warn] {entry['baseline']}→"
+                f"{entry['variant']}: 缺失 {missing}/{attempted}，"
+                f"{bounds_text}；完整案例的显著结论可能由"
+                "「哪些运行留下了」驱动"
+            )
+        if not not_robust and with_missing:
+            print(
+                "  有缺测/失败运行的对比在观测支持范围内仍保持"
+                "效应方向；这以缺失结果不超出观测范围为前提，"
+                "不能替代补齐运行"
+            )
+        for message in attrition_summary.get("advisories", []):
+            if not not_robust:
+                print(f"  [note] {message}")
+        print(
+            "  注：这是有界结果假设下的部分识别，不替代显著性"
+            "检验；缺失值可能超出观测范围时真实界为无穷宽，"
+            "不能把「界内同向」写成「缺失无偏」"
         )
 
     if baseline_mode:
@@ -39652,6 +40266,7 @@ def print_comparison_analysis(
         "target_power": _TARGET_POWER,
         "power_equivalence": equivalence_entries,
         "fragility_summary": fragility_summary,
+        "attrition_bounds_summary": attrition_summary,
         "n_runs": len(rows),
     }
 

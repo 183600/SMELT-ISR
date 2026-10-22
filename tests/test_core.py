@@ -473,6 +473,203 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(len(summary["fragile"]), 1)
         self.assertIn("删除少量种子", summary["advisories"][0])
 
+    def _attrition_cell(self, label, values, failed=0):
+        return {
+            "label": label,
+            "n_runs": len(values),
+            "samples": {
+                "val_loss": [
+                    {
+                        "seed": index + 1,
+                        "run": f"{label}{index + 1}",
+                        "value": value,
+                    }
+                    for index, value in enumerate(values)
+                ]
+            },
+            "numerical_failures": [
+                {"run": f"{label}_failed{index}"}
+                for index in range(failed)
+            ],
+        }
+
+    def test_attrition_bounds_complete_cases_match_observed_effect(self):
+        bounds = experiment._attrition_bounds(
+            {
+                "baseline": self._attrition_cell(
+                    "local_base", [10.0, 10.0, 10.0]
+                ),
+                "variant": self._attrition_cell(
+                    "A", [9.0, 9.0, 9.0]
+                ),
+            },
+            {"baseline": -1.0, "variant": 1.0},
+            "val_loss",
+            -1.0,
+        )
+        self.assertTrue(bounds["applicable"])
+        self.assertEqual(bounds["verdict"], "complete_cases")
+        self.assertEqual(bounds["missing_runs"], 0)
+        self.assertAlmostEqual(bounds["effect_min"], -1.0)
+        self.assertAlmostEqual(bounds["effect_max"], -1.0)
+        self.assertTrue(bounds["sign_robust"])
+
+    def test_attrition_bounds_extreme_missing_can_cross_zero(self):
+        # 两臂观测范围 [0, 10]；A 有 2 个失败运行。完整案例
+        # 差值为 +0.1，但把 A 的缺失运行放到 0、baseline 的
+        # 缺失运行放到 10 时方向可反转。
+        bounds = experiment._attrition_bounds(
+            {
+                "baseline": self._attrition_cell(
+                    "local_base", [0.0, 10.0, 0.0, 10.0], failed=2
+                ),
+                "variant": self._attrition_cell(
+                    "A", [5.0, 5.0, 5.0, 5.0], failed=2
+                ),
+            },
+            {"baseline": -1.0, "variant": 1.0},
+            "val_loss",
+            0.1,
+        )
+        self.assertTrue(bounds["applicable"])
+        self.assertEqual(bounds["verdict"], "crosses_zero")
+        self.assertEqual(bounds["missing_runs"], 4)
+        self.assertTrue(bounds["zero_within_bounds"])
+        self.assertFalse(bounds["sign_robust"])
+        self.assertLess(bounds["effect_min"], 0.0)
+        self.assertGreater(bounds["effect_max"], 0.0)
+
+    def test_attrition_bounds_unbounded_without_observed_outcomes(self):
+        bounds = experiment._attrition_bounds(
+            {
+                "baseline": self._attrition_cell(
+                    "local_base", [], failed=4
+                ),
+                "variant": self._attrition_cell("A", [], failed=4),
+            },
+            {"baseline": -1.0, "variant": 1.0},
+            "val_loss",
+            None,
+        )
+        self.assertFalse(bounds["applicable"])
+        self.assertEqual(bounds["verdict"], "unbounded")
+        self.assertIn("没有任何已观测结果", bounds["reason"])
+
+    def test_factor_contrast_attaches_attrition_bounds(self):
+        rows = []
+        for seed in range(1, 7):
+            rows.append({
+                "run": f"base{seed}",
+                "mode": "local_base",
+                "seed": seed,
+                "val_loss": 10.0,
+            })
+            rows.append({
+                "run": f"A{seed}",
+                "mode": "A",
+                "seed": seed,
+                "val_loss": 9.0,
+            })
+        # A 的第 7 个计划运行数值失败：完整案例只覆盖 6 个，
+        # 缺失敏感性必须显式附着，不能被静默丢弃。
+        rows.append({
+            "run": "A7",
+            "mode": "A",
+            "seed": 7,
+            "val_loss": None,
+            "numerical_status": "failed",
+        })
+        aggregates = experiment.aggregate_runs(rows, ["mode"])
+        contrast = experiment.factor_contrasts(
+            aggregates, ["mode"], "val_loss"
+        )[0]
+        bounds = contrast["attrition_bounds"]
+        self.assertEqual(bounds["missing_runs"], 1)
+        self.assertEqual(bounds["verdict"], "bounded_same_sign")
+        self.assertTrue(bounds["sign_robust"])
+        summary = experiment._attrition_bounds_summary(
+            [contrast]
+        )
+        self.assertEqual(len(summary["with_missing"]), 1)
+        self.assertEqual(summary["not_robust"], [])
+        self.assertIn("有缺测", summary["advisories"][0])
+
+    def test_component_summary_downgrades_attrition_crossing(self):
+        effect = {
+            "effect_name": "delayed_merge_main",
+            "delayed_mode": "A",
+            "claim": "supports_component",
+            "mean_effect": -0.1,
+            "p_value_holm": 0.01,
+            "significant": True,
+            "equivalent": False,
+            "n_pairs": 6,
+            "fragility": {"verdict": "stable"},
+            "attrition_bounds": {"verdict": "crosses_zero"},
+        }
+        summary = experiment._component_evidence_summary([effect])
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertIn("缺失", summary["reason"])
+        self.assertEqual(
+            len(summary["attrition_unstable_effects"]), 1
+        )
+
+    def test_ablation_verdict_downgrades_attrition_unstable_simple_effect(self):
+        def effect(name, attrition_verdict):
+            return {
+                "effect_name": name,
+                "delayed_mode": "A",
+                "claim": "supports_component",
+                "mean_effect": -0.1,
+                "p_value_holm": 0.01,
+                "significant": True,
+                "equivalent": False,
+                "n_pairs": 6,
+                "fragility": {"verdict": "stable"},
+                "attrition_bounds": {
+                    "verdict": attrition_verdict
+                },
+            }
+
+        factorial = {
+            "applicable": True,
+            "metric": "val_loss",
+            "effects": [
+                effect("delayed_merge_main", "bounded_same_sign"),
+                effect(
+                    "delayed_merge_at_balance_off",
+                    "bounded_same_sign",
+                ),
+                effect(
+                    "delayed_merge_at_balance_on",
+                    "crosses_zero",
+                ),
+            ],
+            "incomplete_designs": [],
+            "confounded_designs": [],
+            "controlled_variables_ok": True,
+        }
+        coverage = {
+            "expected_delayed_modes": ["A"],
+            "project_delayed_modes": ["A"],
+            "common_step_sensitivity": {"applicable": False},
+        }
+        report = experiment.ablation_component_verdicts(
+            factorial, coverage
+        )
+        component = next(
+            item
+            for item in report["components"]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertEqual(component["status"], "inconclusive")
+        self.assertTrue(
+            any(
+                "简单效应" in reason and "缺失" in reason
+                for reason in component["reasons"]
+            )
+        )
+
     def test_seed_plan_flags_robust_impossible(self):
         plan = experiment._build_seed_plan(
             [1, 2, 3, 4, 5], False

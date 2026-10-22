@@ -294,6 +294,14 @@ python experiment.py --data corpus.txt --out runs/confirm \
   `target_step_rule` 与 `target_step_data_dependent`。
 - 报告 `failure_rates`、`pseudo_replication`、差分缺失、
   `scale_guard` 与 `budget_match_report`。
+- 报告 `attrition_bounds_summary`：两两对比与全因子效应各有
+  `attrition_bounds`，在「缺失结果落在已观测联合范围」的有界
+  结果假设下给出 `effect_min` / `effect_max`。界跨 0
+  （`crosses_zero`）或无有限界（`unbounded`）时，完整案例的
+  显著结论不能写成对缺失机制稳健；组件联合判定会降级为
+  `inconclusive`。这是部分识别，不是置信区间；缺失值可能超出
+  观测范围时真实界为无穷宽，正确反应是补齐/重跑缺失单元，而
+  不是把「界内同向」当作「缺失无偏」。
 - 只读对比用 `--compare ... --compare-report runs/analysis.json`
   把完整分析落盘；默认的 `--compare` 只打印，终端输出不是
   可归档的分析记录。归档时把该 JSON 与输入运行目录一起保存。
