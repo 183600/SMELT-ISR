@@ -17436,6 +17436,10 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 精度：不同运行用不同的 --eval-bootstrap 会得到不同宽度
     # 的误差线，跨运行比较误差线时口径不再一致。
     "eval_bootstrap",
+    # 周期验证是否计算 PR-AUC / lift / ROC-AUC：显式
+    # --periodic-auc 与 AUC 选型都会生成共同步数无偏 AUC 指标；
+    # 一个跑有一个没跑时，敏感性分析的可比口径不同。
+    "periodic_auc",
     "data_sha256",
     # final/test 评估所用模型的选型口径：旧运行（无记录）是
     # 最后一步参数，新运行是验证集选中的最优验证点；两者混在
@@ -17672,6 +17676,19 @@ _AUC_METRIC_KEYS = frozenset({
     "val_pr_auc_macro_lift",
     "val_roc_auc_macro",
 })
+
+
+def _periodic_auc_enabled(
+    periodic_auc: object,
+    selection_metric: object,
+) -> bool:
+    """周期验证是否实际计算排序指标。
+
+    AUC 选型会自动启用周期 AUC，与显式 ``--periodic-auc``
+    等价；协议记录生效值，避免两种等价配置被误报为不同口径。
+    """
+    return bool(periodic_auc) or selection_metric in _AUC_METRIC_KEYS
+
 
 # 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
 # 才计算的 AUC），但不含路由诊断与共同步数派生指标——调参
@@ -18040,6 +18057,13 @@ def build_comparison_protocol(
         "eval_bootstrap": getattr(
             args, "eval_bootstrap", None
         ),
+        # 周期验证是否计算排序指标决定无偏共同步数 AUC 指标
+        # 是否存在。AUC 选型会自动启用，因此记录生效值而非
+        # 原始 flag，避免等价配置被误报为协议差异。
+        "periodic_auc": _periodic_auc_enabled(
+            getattr(args, "periodic_auc", False),
+            getattr(args, "selection_metric", "val_loss"),
+        ),
         "data_sha256": getattr(args, "data_sha256", None),
         # 逐 split 内容指纹：同源文件但不同群组吸附/清洗/切分
         # 结果的运行不能算同一数据协议。
@@ -18241,6 +18265,20 @@ def experiment_protocol_from_payload(
         # 旧运行未记录时保持 None（检查器标为缺记录），
         # 不能默认成当前 CLI 的 500。
         "eval_bootstrap": run_args.get("eval_bootstrap"),
+        # 旧神经运行没有该字段时，历史行为等价于 False；
+        # 但若当时已按 AUC 选型，周期验证实际会计算排序指标，
+        # 回退为生效值。ngram 没有周期验证，保持 None。
+        "periodic_auc": (
+            _periodic_auc_enabled(
+                run_args.get("periodic_auc", False),
+                _pick(
+                    run_args.get("selection_metric"),
+                    "val_loss",
+                ),
+            )
+            if has_training
+            else None
+        ),
         "data_sha256": data.get("sha256"),
         # 逐 split 指纹：新运行写在 data.split_sha256；旧运行
         # 没有该字段时保持 None，由检查器列为「未核对」而不是
@@ -38811,6 +38849,13 @@ def run_self_test():
     # 神经运行之间以及神经/统计基线之间保持一致。
     assert "eval_bootstrap" in COMPARISON_PROTOCOL_KEYS
     assert "eval_bootstrap" in _CROSS_FAMILY_PROTOCOL_KEYS
+    # 周期验证是否计算排序指标决定共同步数 AUC 指标是否存在；
+    # AUC 选型会自动启用，与显式 --periodic-auc 是同一生效口径。
+    assert "periodic_auc" in COMPARISON_PROTOCOL_KEYS
+    assert "periodic_auc" not in _CROSS_FAMILY_PROTOCOL_KEYS
+    assert not _periodic_auc_enabled(False, "val_loss")
+    assert _periodic_auc_enabled(True, "val_loss")
+    assert _periodic_auc_enabled(False, "val_pr_auc_macro")
     # 旧 ngram 运行的 comparison_protocol 缺少清洗/泄露键时，
     # 必须从 args 回填它实际使用的数据口径；不能因为统计基线
     # 没有优化器就把这些键一律当成 False，否则会伪造「与神经
@@ -38851,6 +38896,23 @@ def run_self_test():
     # 旧运行没有 eval_bootstrap 记录时不能默认成当前 CLI
     # 的 500；保持 None 让对比检查显式标为缺记录。
     assert legacy_statistical_protocol["eval_bootstrap"] is None
+    assert legacy_statistical_protocol["periodic_auc"] is None
+    # 旧神经运行没有 periodic_auc 字段时按历史行为回退为
+    # False；若当时按 AUC 选型，周期验证实际计算了排序指标，
+    # 必须回退为生效值 True。
+    legacy_neural_protocol = experiment_protocol_from_payload({
+        "config": {"mode": "smelt"},
+        "args": {"lr": 3e-4},
+    })
+    assert legacy_neural_protocol["periodic_auc"] is False
+    legacy_auc_protocol = experiment_protocol_from_payload({
+        "config": {"mode": "smelt"},
+        "args": {
+            "lr": 3e-4,
+            "selection_metric": "val_pr_auc_macro",
+        },
+    })
+    assert legacy_auc_protocol["periodic_auc"] is True
     with tempfile.TemporaryDirectory() as analysis_dir:
         def _write_analysis_run(
             name: str,
@@ -51252,6 +51314,27 @@ def main():
             )
             args.eval_bootstrap = saved_eval_bootstrap
 
+        # 周期排序指标决定是否存在避开选型偏差的共同步数 AUC
+        # 指标；resume 时按存档恢复，避免续跑静默改变评估协议
+        # 和可用的敏感性分析口径。
+        saved_periodic_auc = rng_payload.get(
+            "args",
+            {},
+        ).get("periodic_auc")
+
+        if (
+            isinstance(saved_periodic_auc, bool)
+            and saved_periodic_auc
+            != bool(args.periodic_auc)
+        ):
+            print(
+                "resume restored periodic_auc "
+                f"{bool(args.periodic_auc)} -> "
+                f"{saved_periodic_auc} "
+                "(周期排序指标是评估协议的一部分)"
+            )
+            args.periodic_auc = saved_periodic_auc
+
         # 确定性实现开关与 CPU 线程数会改变浮点行为；resume
         # 时按存档恢复，避免「同一随机流 + 不同数值环境」的
         # 续跑轨迹与原运行分叉。
@@ -51886,9 +51969,9 @@ def main():
                 # 选型更新，最终回退到最后一步参数。
                 # --periodic-auc 让不按 AUC 选型的运行也能
                 # 记录周期排序指标，供共同步数无偏复核。
-                compute_auc=(
-                    args.selection_metric in _AUC_METRIC_KEYS
-                    or bool(getattr(args, "periodic_auc", False))
+                compute_auc=_periodic_auc_enabled(
+                    getattr(args, "periodic_auc", False),
+                    args.selection_metric,
                 ),
             )
             # 同一步已有 nan_diagnosis 时合并而不是覆盖。
