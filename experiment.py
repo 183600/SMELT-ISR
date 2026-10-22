@@ -19607,6 +19607,54 @@ def _hedges_g_correction(
     return correction
 
 
+def _paired_effect_size(
+    delta: object,
+    test: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    配对设计的标准化效应量：Cohen's dz 与 Hedges gz。
+
+    ``delta_over_noise`` / Hedges g 用合并标准差，适合两臂独立
+    的情形；同种子配对时种子间的共同难度会进入合并标准差，
+    使标准化效应被低估。配对设计应以差值标准差为尺度：
+    dz = |Δ| / sd(差值)，并由配对 t 的 se 反推
+    sd(差值) = se·√n。只对 ``paired_t`` 且 n_pairs≥2 的结果
+    计算；非配对/零方差返回空字典，不伪造效应量。
+    """
+    try:
+        delta_value = abs(float(delta))
+    except (TypeError, ValueError):
+        return {}
+    if test.get("test") != "paired_t":
+        return {}
+    n_pairs = test.get("n_pairs")
+    if (
+        not isinstance(n_pairs, int)
+        or isinstance(n_pairs, bool)
+        or n_pairs < 2
+    ):
+        return {}
+    se = test.get("se")
+    if not isinstance(se, (int, float)) or isinstance(se, bool):
+        return {}
+    se_value = float(se)
+    if not math.isfinite(se_value) or se_value < 0.0:
+        return {}
+    if se_value == 0.0:
+        if delta_value == 0.0:
+            return {"cohens_dz": 0.0}
+        return {}
+    sd_difference = se_value * math.sqrt(float(n_pairs))
+    if sd_difference <= 0.0 or not math.isfinite(sd_difference):
+        return {}
+    dz = delta_value / sd_difference
+    result: Dict[str, object] = {"cohens_dz": dz}
+    correction = _hedges_g_correction(test.get("df"))
+    if correction is not None:
+        result["hedges_gz"] = dz * correction
+    return result
+
+
 def _observed_seed_sd(
     contrast: Dict[str, object],
     se_value: float,
@@ -20922,6 +20970,7 @@ def factor_contrasts(
                 significant,
             )
 
+            paired_effect_size = _paired_effect_size(delta, test)
             contrast.update({
                 "factor": factor,
                 "baseline": cell_a["label"],
@@ -20935,6 +20984,12 @@ def factor_contrasts(
                 "delta": delta,
                 "delta_over_noise": noise_ratio,
                 "hedges_g": hedges_g,
+                "cohens_dz": paired_effect_size.get(
+                    "cohens_dz"
+                ),
+                "hedges_gz": paired_effect_size.get(
+                    "hedges_gz"
+                ),
                 "test": test.get("test"),
                 "t": test.get("t"),
                 "df": test.get("df"),
@@ -21104,8 +21159,16 @@ def _paired_linear_effect(
         effect = result.get("effect")
         if effect is None:
             effect = _mean(effect_values)
+        effect_test = dict(result)
+        effect_test["n_pairs"] = len(effect_values)
+        paired_effect_size = _paired_effect_size(
+            effect,
+            effect_test,
+        )
         return {
             "effect": effect,
+            "cohens_dz": paired_effect_size.get("cohens_dz"),
+            "hedges_gz": paired_effect_size.get("hedges_gz"),
             "test": result.get("test"),
             "leave_one_out_effect_min": stability.get(
                 "leave_one_out_effect_min"
@@ -21891,6 +21954,16 @@ def _contrast_display(
     hedges = contrast.get("hedges_g")
     if noise is not None and hedges is not None:
         noise_text += f"（Hedges g={float(hedges):.2f}）"
+    # 配对设计的标准化效应必须用差值标准差（dz），不能用
+    # 合并标准差；共同种子难度会把合并标准差抬高、把效应
+    # 系统性压低。非配对对比没有该字段，不打印。
+    dz = contrast.get("cohens_dz")
+    if dz is not None:
+        dz_text = f"；配对 dz={float(dz):.2f}"
+        dz_hedges = contrast.get("hedges_gz")
+        if dz_hedges is not None:
+            dz_text += f"（Hedges gz={float(dz_hedges):.2f}）"
+        noise_text += dz_text
 
     ci_low = contrast.get("ci95_low")
     ci_high = contrast.get("ci95_high")
@@ -22308,6 +22381,7 @@ def compare_cells_to_baseline(
             and hedges_correction is not None
             else None
         )
+        paired_effect_size = _paired_effect_size(delta, result)
 
         entry = {
             "factor": "mode",
@@ -22322,6 +22396,8 @@ def compare_cells_to_baseline(
             "delta": delta,
             "delta_over_noise": noise_ratio,
             "hedges_g": hedges_g,
+            "cohens_dz": paired_effect_size.get("cohens_dz"),
+            "hedges_gz": paired_effect_size.get("hedges_gz"),
             "test": result.get("test"),
             "t": result.get("t"),
             "df": result.get("df"),
@@ -36745,6 +36821,34 @@ def run_self_test():
             "val_loss",
         )
         assert "Hedges g=" in display_with_g
+
+        # 配对设计必须另给以差值标准差为尺度的 dz：合并标准差
+        # 会把种子共同难度算进噪声、系统性压低标准化效应。
+        # 配对 t 与 dz 的关系是 dz = |t|/√n_pairs。
+        assert powered_contrast["cohens_dz"] is not None
+        assert powered_contrast["hedges_gz"] is not None
+        assert (
+            abs(
+                float(powered_contrast["cohens_dz"])
+                - abs(float(powered_contrast["t"]))
+                / math.sqrt(float(powered_contrast["n_pairs"]))
+            )
+            < 1e-12
+        )
+        assert abs(
+            float(powered_contrast["hedges_gz"])
+        ) < abs(float(powered_contrast["cohens_dz"]))
+        assert "配对 dz=" in display_with_g
+
+        # 非配对/无配对检验结果不能伪造 dz。
+        assert _paired_effect_size(
+            -0.2,
+            {"test": "welch_t", "se": 0.1, "df": 4.0},
+        ) == {}
+        assert _paired_effect_size(
+            -0.2,
+            {"test": "paired_t", "se": 0.1, "df": 2.0},
+        ) == {}
 
         # 等价界预注册：训练前写入 config.json，分析期放宽必须
         # 被点名，不能把事后调宽的 TOST 当成确证性证据。
