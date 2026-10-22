@@ -163,6 +163,19 @@ class CostModelTests(unittest.TestCase):
             profile["expert_assignments_per_token"], 16
         )
 
+    def test_b_counts_first_round_branch_routing(self):
+        cfg = _tiny_config(mode="B")
+        profile = experiment.mode_cost_profile(cfg)
+        # middle=2, pre=post=1, top_k=k1=k2=2:
+        # first block creates k1 branches (k1 assignments), the
+        # remaining middle-1 first-round blocks route k1 experts
+        # on each of the k1 branches (k1*k1 each), and the second
+        # round routes k2 experts on each branch.
+        self.assertEqual(
+            profile["expert_assignments_per_token"],
+            2 * (1 + 1) + 2 + 1 * 2 * 2 + 2 * 2 * 2,
+        )
+
     def test_b_early_matches_b_execution_counts(self):
         b = experiment.mode_cost_profile(
             _tiny_config(mode="B")

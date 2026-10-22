@@ -342,10 +342,15 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
         branch_exec = 1 + (middle - 1) * k1 + middle * k1
         attention_executions = pre + branch_exec + post
         moe_passes = pre + branch_exec + post
-        # 第一轮 m 个 Block 每 token 都路由 k1 个专家；第二轮
-        # m 个 Block 的每个分支各路由 k2 个专家。
+        # 第一轮第一个 Block 由 k1 个专家创建 k1 个分支；之后
+        # 第一轮剩余 m-1 个 Block 的每个分支都独立路由 k1 个
+        # 专家（分支内 top-k 合并），第二轮 m 个 Block 的每个
+        # 分支各路由 k2 个专家。
         expert_assignments = (
-            top_k * (pre + post) + middle * k1 + middle * k1 * k2
+            top_k * (pre + post)
+            + k1
+            + (middle - 1) * k1 * k1
+            + middle * k1 * k2
         )
         router_calls = moe_passes
     elif mode == "B_early":
@@ -356,7 +361,10 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
         attention_executions = pre + branch_exec + post
         moe_passes = pre + branch_exec + post
         expert_assignments = (
-            top_k * (pre + post) + middle * k1 + middle * k1 * k2
+            top_k * (pre + post)
+            + k1
+            + (middle - 1) * k1 * k1
+            + middle * k1 * k2
         )
         router_calls = moe_passes
     else:
@@ -433,12 +441,13 @@ def mode_cost_profile(cfg: Config) -> Dict[str, object]:
                     "top_k*(pre+post) + middle*(k1 + k2)"
                 ),
                 "B": (
-                    "top_k*(pre+post) + middle*k1 + "
-                    "middle*k1*k2"
+                    "top_k*(pre+post) + k1 + "
+                    "(middle-1)*k1*k1 + middle*k1*k2"
                 ),
                 "B_early": (
-                    "top_k*(pre+post) + middle*k1 + "
-                    "middle*k1*k2 (与 B 相同)"
+                    "top_k*(pre+post) + k1 + "
+                    "(middle-1)*k1*k1 + middle*k1*k2 "
+                    "(与 B 相同)"
                 ),
                 "base": "top_k * n_layers",
                 "dense": "0（无 MoE）",

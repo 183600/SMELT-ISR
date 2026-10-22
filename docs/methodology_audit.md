@@ -98,7 +98,9 @@ CLI 提示中删除该说法。
 
 原说法 `k1×k2≈2×top_k` 只匹配专家组合数，漏掉了第一阶段
 `k1` 次执行。对 A，专家 assignment 是 `k1 + k1·k2`；对 B，还要
-加分支创建后的 `(m−1)·k1` 次第一轮分支执行。**已修正：**
+加分支创建时的 `k1` 次 assignment，以及第一轮其余 `(m−1)` 个
+Block 上每个分支各自路由 `k1` 个专家的 `(m−1)·k1·k1` 次
+assignment。**已修正：**
 `budget_match_report` 用完整计算图搜索整数 k2（A/local 系列）或
 (k1,k2) 网格（B 系列），并报告实测/解析 FLOPs 比例；
 `--budget-match smelt` 把预算匹配变成启动硬门。
