@@ -4766,6 +4766,22 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
 
+    def test_plan_treatment_keys_may_be_non_strings(self):
+        # 手工/旧计划可能用非字符串键；不能因 str(key) 后查不到
+        # 值就把不同处理单元静默合并。
+        plan = [
+            {"label": "a", "mode": "A", 1: 0, "seed": 1},
+            {"label": "b", "mode": "A", 1: 1, "seed": 2},
+            {"label": "c", "mode": "A", 1: 2, "seed": 3},
+        ]
+        self.assertEqual(
+            experiment.planned_comparisons_for_plan(plan), 3
+        )
+        self.assertEqual(
+            experiment.planned_contrast_types_for_plan(plan),
+            ["pairwise"],
+        )
+
     def test_cost_comparison_tolerates_zero_and_huge_variants(self):
         def cell(mean, std=1.0, n=3):
             return {

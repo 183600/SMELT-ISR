@@ -57571,12 +57571,18 @@ def planned_comparisons_for_plan(
         "block",
         "position_in_block",
     }
-    treatment_keys = sorted({
-        str(key)
-        for item in plan
-        for key in item
-        if str(key) not in identity_keys
-    })
+    # 收集真实键而不是 str(key)：旧/手工计划的键可能不是字符串，
+    # 转成字符串后再 item.get("1") 会把所有值读成 None，导致
+    # 不同处理单元被静默合并。
+    treatment_keys = sorted(
+        {
+            key
+            for item in plan
+            for key in item
+            if str(key) not in identity_keys
+        },
+        key=str,
+    )
     cells = {
         tuple(
             _stable_factor_key(item.get(key))
@@ -57636,12 +57642,18 @@ def planned_contrast_types_for_plan(
         "block",
         "position_in_block",
     }
-    treatment_keys = sorted({
-        str(key)
-        for item in plan
-        for key in item
-        if str(key) not in identity_keys
-    })
+    # 收集真实键而不是 str(key)：旧/手工计划的键可能不是字符串，
+    # 转成字符串后再 item.get("1") 会把所有值读成 None，导致
+    # 不同处理单元被静默合并。
+    treatment_keys = sorted(
+        {
+            key
+            for item in plan
+            for key in item
+            if str(key) not in identity_keys
+        },
+        key=str,
+    )
     cells = {
         tuple(
             _stable_factor_key(item.get(key))
