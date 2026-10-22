@@ -18681,8 +18681,24 @@ def _timing_summary(
             "coefficient_of_variation": None,
         }
 
-    ordered = sorted(float(value) for value in timings)
-    count = len(ordered)
+    # 记录来自 JSON 时可能是 10**400 这类合法但超出 float 范围
+    # 的整数；直接 float() 会让整份计时摘要崩溃。按不可用值
+    # 处理，保留 n 并让各统计量为 None。
+    numeric = _finite_values(list(timings))
+    count = len(timings)
+    if numeric is None:
+        return {
+            "n": count,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "p99": None,
+            "min": None,
+            "max": None,
+            "std": None,
+            "coefficient_of_variation": None,
+        }
+    ordered = sorted(numeric)
     mean = _mean(ordered)
     if mean is None:
         return {

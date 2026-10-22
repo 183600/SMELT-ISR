@@ -5407,6 +5407,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_timing_summary_handles_out_of_range_integers(self):
+        huge_integer = 10 ** 400
+        timing = experiment._timing_summary([huge_integer])
+        self.assertEqual(timing["n"], 1)
+        self.assertIsNone(timing["mean"])
+        self.assertIsNone(timing["median"])
+        # 混入一个不可用值不能只丢掉它后继续算，否则会把单次
+        # 观测伪装成完整分布。
+        timing = experiment._timing_summary([1.0, huge_integer])
+        self.assertEqual(timing["n"], 2)
+        self.assertIsNone(timing["mean"])
+        self.assertIsNone(timing["std"])
+
     def test_paired_stats_keep_large_finite_effects(self):
         huge = 1.0e308
         test = experiment._paired_t_test([huge, huge, huge])
