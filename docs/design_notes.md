@@ -73,7 +73,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   标签噪声；`final` 只在文件真正末尾置 True，截断字符才会报
   U+FFFD。每个 split 的内容指纹写入 `data.split_sha256`，并作为
   受控变量核对：源文件相同但切分/群组吸附/清洗实现不同，仍会被
-  识别为不同数据协议。
+  识别为不同数据协议。清洗后的有效训练集另有
+  `data.effective_train_sha256`：它把剔除区间清单与保留字节一起
+  哈希，resume 或跨运行对比时能发现「split 与清洗开关相同、实际
+  训练字节不同」的隐性变化。
 - **群组数据**：传入 `--group-separator` 时，语料按分隔符切成
   「群组」（同一文档/用户/物体产生的内容），train/val/test 的切分
   位置吸附到群组边界：任何群组整体落在同一个 split，两侧之间零
@@ -306,7 +309,8 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 - **受控变量协议**：每次训练把优化器（AdamW 及 betas/eps）、
   学习率与调度、warmup、训练步数、weight decay、梯度裁剪、
   batch size、数据增强（当前为无增强，显式记录）、整体数据指纹
-  `data_sha256` 与逐 split 内容指纹 `split_sha256`、
+  `data_sha256`、逐 split 内容指纹 `split_sha256` 与清洗后有效
+  训练集指纹 `effective_train_sha256`、
   模型结构（含分支几何 `k1/k2`、路由宽度 `top_k`、均衡损失
   系数 `balance_coef`、`dense_fnn_hidden`、`residual_scale`）、
   评估协议与选型口径（`model_selection` 与 `selection_metric`：

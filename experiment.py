@@ -250,6 +250,35 @@ def resume_split_change_error(
     )
 
 
+def resume_effective_train_change_error(
+    saved_sha256: Optional[object],
+    current_sha256: Optional[str],
+) -> Optional[str]:
+    """
+    检查续跑检查点的有效训练集指纹是否与当前一致。
+
+    整体数据 sha256 与 split 指纹相同、清洗开关也相同，仍可能
+    因为清洗实现变化而剔除不同区间：网络窗口、unigram/n-gram
+    计数与数据采样的有效范围都会变。此时续跑等于把旧检查点的
+    优化器/RNG 轨迹接到另一套训练样本上，必须拒绝。
+    """
+    if not isinstance(saved_sha256, str) or not saved_sha256:
+        return None
+    if not isinstance(current_sha256, str) or not current_sha256:
+        return None
+    if saved_sha256 == current_sha256:
+        return None
+
+    return (
+        "resume 有效训练集指纹已变化（"
+        f"{saved_sha256[:12]}... -> "
+        f"{current_sha256[:12]}...）：整体数据与 split 边界"
+        "可能相同，但清洗剔除区间/实际参与训练的字节不同。"
+        "检查点对应旧的训练样本集合，续跑会把两套数据混成"
+        "一条轨迹。请换用全新的 --out 目录与检查点从头训练。"
+    )
+
+
 def resume_amp_change_error(
     saved_args: object,
     current_amp_dtype: Optional[object],
@@ -2864,6 +2893,50 @@ def _merge_byte_intervals(
     return merged
 
 
+def _effective_train_fingerprint(
+    raw: memoryview,
+    train_end: int,
+    excluded_spans: List[Tuple[int, int]],
+) -> str:
+    """
+    对「实际进入训练的 train 内容」做独立指纹。
+
+    只比对整体数据 sha256、split 边界与清洗开关还不够：同一份
+    数据、同一组开关下，清洗实现变化（或 bug）会剔除不同区间，
+    实际参与训练/计数的字节随之改变，resume 或跨运行对比却仍
+    显示协议一致。这里把 train 的原始区间、清洗区间清单与保留
+    内容的长度前缀一起哈希，任何一项变化都会得到不同指纹。
+    """
+    merged = _merge_byte_intervals(excluded_spans)
+    manifest = json.dumps(
+        {
+            "train_end": int(train_end),
+            "excluded_spans": [
+                [int(start), int(end)]
+                for start, end in merged
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    hasher = hashlib.sha256()
+    hasher.update(len(manifest).to_bytes(8, "little"))
+    hasher.update(manifest)
+
+    for start, end in _subtract_byte_intervals(
+        0,
+        train_end,
+        merged,
+    ):
+        hasher.update(
+            (end - start).to_bytes(8, "little")
+        )
+        hasher.update(raw[start:end])
+
+    return hasher.hexdigest()
+
+
 def _valid_window_start_intervals(
     total_starts: int,
     seq_len: int,
@@ -3628,6 +3701,16 @@ class ByteDataset:
         self.val = tokens[n_train:n_val_end]
         self.test = tokens[n_val_end:]
         self.seq_len = seq_len
+
+        # 清洗后的有效训练集指纹：resume/对比不能只看整体数据
+        # 指纹与清洗开关，必须确认剔除区间及保留内容完全一致。
+        self.effective_train_sha256 = (
+            _effective_train_fingerprint(
+                self._raw,
+                n_train,
+                self.train_excluded_spans,
+            )
+        )
 
         # 窗口暂存槽按调用方的 device 决定是否启用。
         self._stage_slots = None
@@ -10966,6 +11049,11 @@ def run_statistical_baseline(
             # 字节段；只比整体文件指纹无法发现群组吸附/清洗/
             # 切分实现差异。
             "split_sha256": dict(dataset.split_sha256) or None,
+            # 清洗后的有效训练集指纹：ngram 计数必须与神经
+            # 窗口覆盖同一套训练字节。
+            "effective_train_sha256": (
+                dataset.effective_train_sha256
+            ),
         },
         "args": {
             key: value
@@ -10994,6 +11082,9 @@ def run_statistical_baseline(
             "split_sha256": dict(dataset.split_sha256),
             "effective_train_bytes": (
                 dataset.effective_train_bytes
+            ),
+            "effective_train_sha256": (
+                dataset.effective_train_sha256
             ),
             "train_cleaning": dataset.train_cleaning,
             "group_cuts": (
@@ -17485,6 +17576,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 实际划分也纳入受控变量，避免两次运行在不同验证/测试
     # 数据上比较却显示协议一致。
     "split_sha256",
+    # 清洗后的有效训练集指纹：同一 split/开关下清洗实现变化
+    # 会改变实际参与训练的字节，必须能被跨运行核对。
+    "effective_train_sha256",
     # 泄露豁免会改变「允许哪些数据进入训练」的资格判断；
     # 同一对比里有的运行显式豁免、有的没有，不能算同一协议。
     "allow_data_leakage",
@@ -17523,6 +17617,9 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 神经运行与 ngram 必须看到同一组 train/val/test 字节段；
     # 只比整体文件指纹无法发现群组吸附/清洗实现差异。
     "split_sha256",
+    # 两者还必须看到同一套清洗后的有效训练字节；否则 ngram
+    # 计数与神经窗口覆盖的训练分布不同，基线比较失效。
+    "effective_train_sha256",
     "seq_len",
     "val_fraction",
     "test_fraction",
@@ -18144,6 +18241,13 @@ def build_comparison_protocol(
             dict(getattr(args, "data_split_sha256", {}) or {})
             or None
         ),
+        # 清洗后的有效训练集内容指纹：split 与开关相同仍可能
+        # 因清洗实现变化得到不同训练样本集合。
+        "effective_train_sha256": getattr(
+            args,
+            "data_effective_train_sha256",
+            None,
+        ),
         # 选型协议：final/test 都在验证集选中的模型上评估
         # （best.pt 不可用时回退到最后一步并明确提示）。
         "model_selection": "best_val_with_last_fallback",
@@ -18370,6 +18474,12 @@ def experiment_protocol_from_payload(
         # 没有该字段时保持 None，由检查器列为「未核对」而不是
         # 默认为一致。
         "split_sha256": data.get("split_sha256"),
+        # 清洗后的有效训练集指纹：旧运行没有记录时保持 None，
+        # 由检查器列为「未核对」，不能默认成一致。
+        "effective_train_sha256": _pick(
+            data.get("effective_train_sha256"),
+            run_args.get("data_effective_train_sha256"),
+        ),
         # 旧运行没有选型记录，其 final/test 一律基于最后一步
         # 参数；显式回退为 "last_step"，与新版选型协议混用时
         # 会被受控变量检查标记出来。
@@ -31258,6 +31368,9 @@ def write_run_config(
         payload["data"]["effective_train_bytes"] = (
             dataset.effective_train_bytes
         )
+        payload["data"]["effective_train_sha256"] = (
+            dataset.effective_train_sha256
+        )
         payload["data"]["train_cleaning"] = dataset.train_cleaning
         payload["data"]["group_cuts"] = (
             dict(dataset.group_cuts)
@@ -34390,6 +34503,22 @@ def run_self_test():
     # 统计基线/参考基线必须与神经网络窗口使用同一「有效
     # 训练字节」口径：被清洗的重复群组不能进入计数。
     assert dedup_dataset.effective_train_bytes == 28
+    assert dedup_dataset.effective_train_sha256 == (
+        _effective_train_fingerprint(
+            dedup_dataset._raw,
+            48,
+            dedup_dataset.train_excluded_spans,
+        )
+    )
+    # 同样数据、同样 split 边界，一旦清洗剔除区间不同，有效
+    # 训练集指纹必须变化（resume/对比据此拒绝混用）。
+    assert dedup_dataset.effective_train_sha256 != (
+        _effective_train_fingerprint(
+            dedup_dataset._raw,
+            48,
+            [],
+        )
+    )
     dedup_counts = dedup_dataset.effective_train_byte_counts()
     assert int(dedup_counts.sum()) == 28
     # B 群组在 train 中的唯一一次出现与 val 重复，已被清洗；
@@ -34467,6 +34596,10 @@ def run_self_test():
         "cleaning_eval_splits"
     ] == ["val"]
     assert sealed_dedup_dataset.effective_train_bytes == 36
+    assert (
+        sealed_dedup_dataset.effective_train_sha256
+        != leaky_dedup_dataset.effective_train_sha256
+    )
     assert sealed_dedup_audit["leakage_violations"]
     assert not enforce_data_leakage_gate(sealed_dedup_audit)
 
@@ -35837,6 +35970,22 @@ def run_self_test():
     )
     assert split_change_error is not None
     assert "val" in split_change_error
+
+    # 有效训练集指纹：split 相同、清洗开关相同，但剔除区间
+    # 变化时也必须拒绝 resume。
+    assert (
+        resume_effective_train_change_error(None, "abc") is None
+    )
+    assert (
+        resume_effective_train_change_error("abc", "abc")
+        is None
+    )
+    effective_change_error = (
+        resume_effective_train_change_error("abc", "def")
+    )
+    assert effective_change_error is not None
+    assert "abc" in effective_change_error
+    assert "def" in effective_change_error
 
     assert resume_amp_change_error({}, "torch.bfloat16") is None
     assert (
@@ -39008,6 +39157,13 @@ def run_self_test():
         "clean_train_against_test"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
+    # 有效训练集指纹把「同一 split/开关但清洗结果不同」的
+    # 运行识别为不同数据协议。
+    assert "effective_train_sha256" in COMPARISON_PROTOCOL_KEYS
+    assert (
+        "effective_train_sha256"
+        in _CROSS_FAMILY_PROTOCOL_KEYS
+    )
     # 评估集重复豁免同样改变评估样本资格，必须进入协议核对，
     # 否则一个跑过 --allow-eval-duplicates、一个没跑，会被误判
     # 为同一评估口径。
@@ -39068,6 +39224,10 @@ def run_self_test():
     # 的 500；保持 None 让对比检查显式标为缺记录。
     assert legacy_statistical_protocol["eval_bootstrap"] is None
     assert legacy_statistical_protocol["periodic_auc"] is None
+    assert (
+        legacy_statistical_protocol["effective_train_sha256"]
+        is None
+    )
     # 旧版去重默认读取 test：缺键时按历史行为回填 True，
     # 不能假装它和新版默认的 val-only 清洗一致。
     assert (
@@ -49998,6 +50158,7 @@ def main():
     saved_data_val_fraction = None
     saved_data_test_fraction = None
     saved_data_split_sha256 = None
+    saved_data_effective_train_sha256 = None
     saved_numerical_state: Dict[str, object] = {}
 
     if args.resume is not None:
@@ -50122,6 +50283,9 @@ def main():
         )
         saved_data_split_sha256 = saved_args.get(
             "data_split_sha256"
+        )
+        saved_data_effective_train_sha256 = saved_args.get(
+            "data_effective_train_sha256"
         )
         # 模型结构配置从检查点读取；忽略未知的配置键。
         saved_config = rng_payload["config"]
@@ -50742,6 +50906,9 @@ def main():
     args.data_val_fraction = dataset.val_fraction
     args.data_test_fraction = dataset.test_fraction
     args.data_split_sha256 = dict(dataset.split_sha256)
+    args.data_effective_train_sha256 = (
+        dataset.effective_train_sha256
+    )
 
     data_change_error = resume_data_change_error(
         saved_data_sha256,
@@ -50763,6 +50930,23 @@ def main():
             "resume checkpoint predates per-split content "
             "fingerprints; 仅凭整体 sha256 与比例无法确认 "
             "train/val/test 的实际字节段未变"
+        )
+
+    effective_train_change_error = (
+        resume_effective_train_change_error(
+            saved_data_effective_train_sha256,
+            dataset.effective_train_sha256,
+        )
+    )
+    if effective_train_change_error is not None:
+        parser.error(effective_train_change_error)
+    elif saved_data_sha256 is not None and (
+        saved_data_effective_train_sha256 is None
+    ):
+        print(
+            "resume checkpoint predates the effective train "
+            "fingerprint; 仅凭 split 指纹与清洗开关无法确认"
+            "清洗剔除区间未变"
         )
 
     if saved_data_sha256 is not None and (
