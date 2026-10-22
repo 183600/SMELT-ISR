@@ -29274,6 +29274,13 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_corrupt_bytes": bool(
+                getattr(
+                    args,
+                    "drop_train_corrupt_bytes",
+                    False,
+                )
+            ),
             "drop_train_degenerate_groups": bool(
                 getattr(
                     args,
