@@ -6846,6 +6846,9 @@ def distribution_shift_violations(
     JS 距离越大表示两个 split 的分布差异越大；阈值只在该
     flag 被显式设置时生效，默认仍保留「警告但继续」的诊断
     模式。返回逐对 split 的超阈值说明。
+
+    ``max_byte_js`` 同时约束时间边界块（相邻 split 的尾/头
+    分布）：只检查全局直方图会让切分边界附近的突变漏过硬门。
     """
     checks = (
         ("distribution_shift", "字节分布 JS", max_byte_js),
@@ -6879,6 +6882,32 @@ def distribution_shift_violations(
                     f"{pair}: {label} = {distance:.4f} "
                     f"> 阈值 {float(limit):.4f}"
                 )
+
+    # 全局分布可能把边界两侧的漂移平均掉；显式设置单字节
+    # 阈值时，边界块也必须受同一个硬门约束。
+    if max_byte_js is not None:
+        boundary = report.get("temporal_boundary_shift") or {}
+        pairs = (
+            boundary.get("pairs")
+            if isinstance(boundary, dict)
+            else None
+        )
+        if isinstance(pairs, dict):
+            for pair, info in pairs.items():
+                if not isinstance(info, dict):
+                    continue
+                value = info.get("js")
+                if not isinstance(value, (int, float)):
+                    continue
+                distance = float(value)
+                if not math.isfinite(distance):
+                    continue
+                if distance > float(max_byte_js):
+                    violations.append(
+                        f"{pair}: 时间边界字节分布 JS = "
+                        f"{distance:.4f} > 阈值 "
+                        f"{float(max_byte_js):.4f}"
+                    )
 
     return violations
 
@@ -31830,6 +31859,30 @@ def run_self_test():
         shift_report,
         max_byte_js=0.11,
     )
+    # 单字节硬门必须同时覆盖时间边界块：全局 JS 很低，但
+    # train 尾部与 val 头部差异很大时不能悄悄放过。
+    boundary_shift_report = {
+        "distribution_shift": {"train_val": 0.02},
+        "temporal_boundary_shift": {
+            "pairs": {
+                "train_tail_val_head": {
+                    "js": 0.20,
+                    "left_bytes": 4096,
+                    "right_bytes": 4096,
+                }
+            }
+        },
+    }
+    boundary_shift = distribution_shift_violations(
+        boundary_shift_report,
+        max_byte_js=0.10,
+    )
+    assert len(boundary_shift) == 1
+    assert "时间边界" in boundary_shift[0]
+    assert not enforce_distribution_shift_gate(
+        boundary_shift_report,
+        max_byte_js=0.10,
+    )
     assert all(
         info["shared_chunks"] == 0
         for info in clean_audit["content_chunks"][
@@ -46666,7 +46719,13 @@ def main():
             metavar="JS",
             help=(
                 f"分布偏移硬门（0~1）：{shift_label} 超过该值时"
-                "拒绝开始训练/拒绝解封测试集；不设置时只警告"
+                "拒绝开始训练/拒绝解封测试集；"
+                + (
+                    "该阈值同时约束 train/val 边界的尾/头块"
+                    if shift_flag == "--max-byte-shift"
+                    else ""
+                )
+                + "；不设置时只警告"
             ),
         )
     parser.add_argument(
