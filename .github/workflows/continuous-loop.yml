@@ -711,7 +711,6 @@ jobs:
             case "$1" in
               perf) printf '先用不超过 5-8 分钟快速扫描性能热点（可写入 `%s`，该临时清单不是报告），然后持续优化；在本阶段预算内尽可能多完成高价值、可验证的优化，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
               bug)  printf '先快速定位 bug（可把要点写入 `%s`，该临时清单不是报告），然后持续修复；在本阶段预算内尽可能多修复高价值、可验证的 bug，不要只修一个就停，也不要为了赶时间提前结束。每个修复后运行自检；修完删除该临时清单。每完成一个可验证的修复就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
-              sci)  printf '先用不超过 5-8 分钟选出高价值实验方法问题（可写入 `%s`，该临时清单不是报告），然后持续改进；在本阶段预算内尽可能多完成实质性改进，不要只做 1-2 个就停，也不要为了赶时间提前结束。每个改动后运行自检；修复完成后删除该临时清单。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。\n\n%s\n' "$ISSUES_FILE" "$2" ;;
             esac
           }
 
@@ -846,7 +845,7 @@ jobs:
 
               echo ">>> iteration #$i | phase=$phase | budget=${T}s"
               case "$phase" in
-                perf|bug|sci) P="$(fast_prompt "$phase" "$P")" ;;
+                perf|bug) P="$(fast_prompt "$phase" "$P")" ;;
               esac
               run_phase "$phase" "$P" "$T"
 
