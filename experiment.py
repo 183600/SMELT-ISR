@@ -23350,31 +23350,57 @@ def tuning_seed_overlap_report(
     配置在这批种子上本来就更占优，后续评估不再独立。调参仍可
     证明「配置被调过」，但该运行的指标不能当作独立验证。
 
-    返回结构化报告；没有调参记录时 ``ok=None``（不虚报通过）。
+    返回结构化报告；没有调参记录，或存在无法取得调参种子/
+    最终评估种子的运行且未发现重合时 ``ok=None``（不虚报通过）；
+    发现重合时 ``ok=False``。
     """
     entries: List[Dict[str, object]] = []
+    unverifiable_runs: List[Dict[str, object]] = []
     advisories: List[str] = []
     with_tuning = 0
+    verifiable = 0
     overlapping = 0
     for row in rows:
         record = row.get("baseline_tuning")
         if not isinstance(record, dict):
             continue
-        tuning_seeds = _baseline_tuning_seed_values(record)
-        if not tuning_seeds:
-            continue
         with_tuning += 1
+        run_name = str(row.get("run"))
+        tuning_seeds = _baseline_tuning_seed_values(record)
         evaluation_seed = row.get("seed")
-        if not isinstance(evaluation_seed, int) or isinstance(
-            evaluation_seed, bool
-        ):
+        evaluation_seed_valid = isinstance(
+            evaluation_seed, int
+        ) and not isinstance(evaluation_seed, bool)
+        if not tuning_seeds or not evaluation_seed_valid:
+            if not tuning_seeds and not evaluation_seed_valid:
+                reason = (
+                    "调参记录缺少可解析的种子列表，且运行缺少"
+                    "可解析的最终评估种子"
+                )
+            elif not tuning_seeds:
+                reason = "调参记录缺少可解析的种子列表"
+            else:
+                reason = "运行缺少可解析的最终评估种子"
+            unverifiable_runs.append(
+                {
+                    "run": run_name,
+                    "mode": row.get("mode"),
+                    "reason": reason,
+                }
+            )
+            advisories.append(
+                f"{run_name} 的调参种子独立性无法核对"
+                f"（{reason}）：不能假设调参种子与最终评估"
+                "种子不相交"
+            )
             continue
+        verifiable += 1
         overlap = sorted(set(tuning_seeds) & {int(evaluation_seed)})
         if not overlap:
             continue
         overlapping += 1
         entry = {
-            "run": str(row.get("run")),
+            "run": run_name,
             "mode": row.get("mode"),
             "evaluation_seed": int(evaluation_seed),
             "tuning_seeds": tuning_seeds,
@@ -23393,16 +23419,23 @@ def tuning_seed_overlap_report(
 
     report: Dict[str, object] = {
         "n_runs_with_tuning": with_tuning,
+        "n_verifiable_runs": verifiable,
         "n_overlapping_runs": overlapping,
+        "n_unverifiable_runs": len(unverifiable_runs),
         "overlap_share": (
-            overlapping / with_tuning if with_tuning else None
+            overlapping / verifiable if verifiable else None
         ),
         "entries": entries,
+        "unverifiable_runs": unverifiable_runs,
         "advisories": advisories,
         "ok": (
             None
             if with_tuning == 0
-            else (False if overlapping else True)
+            else (
+                False
+                if overlapping
+                else (None if unverifiable_runs else True)
+            )
         ),
     }
     return report
@@ -27865,10 +27898,10 @@ def print_comparison_analysis(
             "  OK：所有带调参来源的运行，其调参种子与最终"
             "评估种子均不相交"
         )
-    elif tuning_seed_overlap["ok"] is None:
+    elif tuning_seed_overlap["n_runs_with_tuning"] == 0:
         print(
-            "  [note] 没有可核对的调参种子记录（无调参来源或"
-            "旧版报告缺种子列表）：无法排除种子复用"
+            "  [note] 没有可核对的调参种子记录（无调参来源）"
+            "：无法排除种子复用"
         )
     else:
         for message in tuning_seed_overlap["advisories"]:
@@ -39426,6 +39459,48 @@ def run_self_test():
             {"run": "smelt_seed42", "mode": "smelt", "seed": 42}
         ])
         assert no_tuning_report["ok"] is None
+        missing_seed_report = tuning_seed_overlap_report([
+            {
+                "run": "legacy_seed1",
+                "mode": "smelt",
+                "seed": 1,
+                "baseline_tuning": {
+                    "source": "baseline_tuning.json",
+                    "mode": "smelt",
+                },
+            }
+        ])
+        assert missing_seed_report["ok"] is None
+        assert missing_seed_report["n_runs_with_tuning"] == 1
+        assert missing_seed_report["n_unverifiable_runs"] == 1
+        missing_eval_report = tuning_seed_overlap_report([
+            {
+                "run": "smelt_seed1",
+                "mode": "smelt",
+                "baseline_tuning": good_tuning,
+            }
+        ])
+        assert missing_eval_report["ok"] is None
+        assert missing_eval_report["n_verifiable_runs"] == 0
+        mixed_seed_report = tuning_seed_overlap_report([
+            {
+                "run": "smelt_seed42",
+                "mode": "smelt",
+                "seed": 42,
+                "baseline_tuning": good_tuning,
+            },
+            {
+                "run": "legacy_seed1",
+                "mode": "smelt",
+                "seed": 1,
+                "baseline_tuning": {
+                    "source": "baseline_tuning.json"
+                },
+            },
+        ])
+        assert mixed_seed_report["ok"] is None
+        assert mixed_seed_report["n_verifiable_runs"] == 1
+        assert mixed_seed_report["n_unverifiable_runs"] == 1
 
         # 基线没有优于 unigram 参考（稻草人）：必须被标记，
         # 且 ok=False。5.20 > 5.0（越低越好）。
