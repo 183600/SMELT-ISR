@@ -67434,18 +67434,17 @@ def main():
             # final / test 评估使用该模型（验证集用于选型，测试
             # 集只在选定的模型上解封一次）。非有限值不作数，
             # 避免故障顺带触发早停或污染选型。
-            selection_value = eval_metrics.get(
-                args.selection_metric
+            selection_value = _finite_float(
+                eval_metrics.get(args.selection_metric)
             )
-            val_loss = eval_metrics.get("val_loss")
+            val_loss = _finite_float(
+                eval_metrics.get("val_loss")
+            )
 
-            if (
-                selection_value is None
-                or not math.isfinite(float(selection_value))
-            ):
+            if selection_value is None:
                 pass
             elif selection_improved(
-                float(selection_value),
+                selection_value,
                 best_selection_value,
                 metric_higher_is_better(args.selection_metric),
                 args.early_stop_min_delta,
@@ -67454,15 +67453,10 @@ def main():
                     str(selected_model_path),
                     model,
                     step + 1,
-                    (
-                        float(val_loss)
-                        if val_loss is not None
-                        and math.isfinite(float(val_loss))
-                        else None
-                    ),
+                    val_loss,
                     args,
                     selection_metric=args.selection_metric,
-                    selection_value=float(selection_value),
+                    selection_value=selection_value,
                 )
                 if not saved_selected:
                     # 选型指标有限但权重含 NaN/Inf：这不是
@@ -67474,7 +67468,7 @@ def main():
                         "NaN/Inf，拒绝写入 best.pt，停止训练"
                     )
                     break
-                best_selection_value = float(selection_value)
+                best_selection_value = selection_value
                 best_selection_step = step + 1
                 evals_without_improvement = 0
             else:
@@ -67637,12 +67631,11 @@ def main():
             best_selection_step
         ):
             selection_policy = "best_val"
-            payload_val_loss = selected_payload.get("val_loss")
-            if (
-                payload_val_loss is not None
-                and math.isfinite(float(payload_val_loss))
-            ):
-                selected_val_loss = float(payload_val_loss)
+            payload_val_loss = _finite_float(
+                selected_payload.get("val_loss")
+            )
+            if payload_val_loss is not None:
+                selected_val_loss = payload_val_loss
             print(
                 "[select] 使用验证集选中的模型做最终评估："
                 f"step={best_selection_step}, "
