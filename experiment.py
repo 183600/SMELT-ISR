@@ -5912,6 +5912,7 @@ def audit_data_splits(
     warnings: List[str] = []
     violations: List[str] = []
     leakage_violations: List[str] = []
+    evaluation_violations: List[str] = []
 
     for split in split_names:
         tokens = getattr(dataset, split)
@@ -6319,6 +6320,12 @@ def audit_data_splits(
             warnings.append(
                 f"{split}: 采样窗口中有"
                 f"{scan['within_duplicates']}个 split 内部重复"
+                + (
+                    "；固定窗口 bootstrap 会把重复窗口当作"
+                    "独立抽样单位，评估区间可能偏窄"
+                    if split in ("val", "test")
+                    else ""
+                )
             )
 
     for left, right in (
@@ -6404,11 +6411,14 @@ def audit_data_splits(
                 "per_split"
             ].items():
                 if info["within_split_duplicates"] > 0:
-                    warnings.append(
+                    message = (
                         f"{split}: 检测到 "
                         f"{info['within_split_duplicates']} 个"
                         "完全重复的群组（重复样本/标签噪声）"
                     )
+                    warnings.append(message)
+                    if split in ("val", "test"):
+                        evaluation_violations.append(message)
 
             for pair, info in content_duplicates[
                 "cross_split"
@@ -6482,6 +6492,7 @@ def audit_data_splits(
         "warnings": warnings,
         "violations": violations,
         "leakage_violations": leakage_violations,
+        "evaluation_violations": evaluation_violations,
     }
 
 
@@ -6524,6 +6535,40 @@ def enforce_data_leakage_gate(
         "[data] 默认拒绝在泄露数据上继续。请先去重/清洗数据；"
         "若已确认这些重复内容不构成泄露，可显式传 "
         "--allow-data-leakage（会被记录进配置）。"
+    )
+
+    return False
+
+
+def enforce_evaluation_duplicate_gate(
+    report: Dict[str, object],
+    context: str = "",
+) -> bool:
+    """
+    评估集重复样本硬门：val/test 内部完全重复的群组会虚增
+    评估样本量，并让固定窗口 bootstrap 把同一条样本重复计入，
+    从而低估评估不确定性；验证集重复还会让 checkpoint 选型在
+    相同样本上过拟合。
+
+    val/test 不参与清洗（清洗评估集会改变被评估的分布），
+    因此默认拒绝继续，要求重新切分/去重或在确认重复是目标
+    分布的一部分时显式传 ``--allow-eval-duplicates``。返回
+    False 表示调用方必须拒绝训练/拒绝解封测试集。
+    """
+    duplicates = report.get("evaluation_violations") or []
+
+    if not duplicates:
+        return True
+
+    where = f"（{context}）" if context else ""
+    print(f"[data] 评估集重复样本检查未通过{where}：")
+    for violation in duplicates:
+        print(f"[data]   重复: {violation}")
+    print(
+        "[data] val/test 不参与清洗；重复评估样本会虚增有效样本"
+        "并使区间偏窄。请先去重后重新切分，或在确认这些重复"
+        "属于目标分布时显式传 --allow-eval-duplicates"
+        "（会被记录进配置）。"
     )
 
     return False
@@ -10316,6 +10361,15 @@ def run_statistical_baseline(
                 "test",
             )
         )
+        eval_duplicate_blocked = (
+            not getattr(
+                args, "allow_eval_duplicates", False
+            )
+            and not enforce_evaluation_duplicate_gate(
+                test_audit,
+                "test",
+            )
+        )
         strict_blocked = (
             args.strict_data_audit
             and not enforce_strict_data_audit(
@@ -10341,6 +10395,7 @@ def run_statistical_baseline(
         )
         if (
             leakage_blocked
+            or eval_duplicate_blocked
             or strict_blocked
             or shift_blocked
             or label_integrity_blocked
@@ -10520,6 +10575,9 @@ def run_statistical_baseline(
             ),
             "allow_corrupt_test_labels": bool(
                 getattr(args, "allow_corrupt_test_labels", False)
+            ),
+            "allow_eval_duplicates": bool(
+                getattr(args, "allow_eval_duplicates", False)
             ),
             "eval_interval": None,
             "eval_batches": args.eval_batches,
@@ -17032,6 +17090,7 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     # 标签噪声豁免会改变 test 是否被封条拒绝；两个运行最终
     # 指标的可信资格不同，同样不能算同一评估口径。
     "allow_corrupt_test_labels",
+    "allow_eval_duplicates",
     "eval_interval",
     "eval_batches",
     "data_sha256",
@@ -17067,6 +17126,7 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "drop_train_degenerate_runs",
     "allow_data_leakage",
     "allow_corrupt_test_labels",
+    "allow_eval_duplicates",
     "batch_size",
     "eval_batches",
     "data_augmentation",
@@ -17620,6 +17680,9 @@ def build_comparison_protocol(
         "allow_corrupt_test_labels": bool(
             getattr(args, "allow_corrupt_test_labels", False)
         ),
+        "allow_eval_duplicates": bool(
+            getattr(args, "allow_eval_duplicates", False)
+        ),
         "eval_interval": getattr(args, "eval_interval", None),
         "eval_batches": getattr(args, "eval_batches", None),
         "data_sha256": getattr(args, "data_sha256", None),
@@ -17807,6 +17870,9 @@ def experiment_protocol_from_payload(
         ),
         "allow_corrupt_test_labels": bool(
             run_args.get("allow_corrupt_test_labels", False)
+        ),
+        "allow_eval_duplicates": bool(
+            run_args.get("allow_eval_duplicates", False)
         ),
         "eval_interval": run_args.get("eval_interval"),
         "eval_batches": run_args.get("eval_batches"),
@@ -32126,6 +32192,94 @@ def run_self_test():
         "test": 1,
     }
     assert grouped_audit["violations"] == []
+    assert grouped_audit["evaluation_violations"] == []
+    assert enforce_evaluation_duplicate_gate(grouped_audit)
+
+    # val 内部完全重复的群组是重复评估样本：它不属于跨 split
+    # 泄露，但会虚增有效样本量、让验证集选型在重复样本上反复
+    # 计分。审计必须单列并默认拒绝，而不是只打一行警告。
+    duplicate_eval_groups = [
+        b"A" * 10,
+        b"B" * 10,
+        b"C" * 10,
+        b"D" * 10,
+        b"D" * 10,
+        b"E" * 10,
+    ]
+    duplicate_eval_payload = (
+        separator.join(duplicate_eval_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as duplicate_eval_file:
+        duplicate_eval_file.write(duplicate_eval_payload)
+        duplicate_eval_file.flush()
+
+        duplicate_val_dataset = ByteDataset(
+            duplicate_eval_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 3.0,
+            test_fraction=1.0 / 6.0,
+            group_separator=separator,
+        )
+        duplicate_val_audit = audit_data_splits(
+            duplicate_val_dataset,
+            include_test=True,
+        )
+
+    assert duplicate_val_audit["leakage_violations"] == []
+    assert (
+        duplicate_val_audit["groups"]["content_duplicates"][
+            "per_split"
+        ]["val"]["within_split_duplicates"]
+        == 1
+    )
+    assert any(
+        "val" in violation and "重复" in violation
+        for violation in duplicate_val_audit[
+            "evaluation_violations"
+        ]
+    )
+    assert not enforce_evaluation_duplicate_gate(
+        duplicate_val_audit
+    )
+
+    # test 内部重复同样会污染唯一的最终评估证据。
+    duplicate_test_groups = [
+        b"A" * 10,
+        b"B" * 10,
+        b"C" * 10,
+        b"D" * 10,
+        b"E" * 10,
+        b"E" * 10,
+    ]
+    duplicate_test_payload = (
+        separator.join(duplicate_test_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as duplicate_test_file:
+        duplicate_test_file.write(duplicate_test_payload)
+        duplicate_test_file.flush()
+
+        duplicate_test_dataset = ByteDataset(
+            duplicate_test_file.name,
+            seq_len=8,
+            val_fraction=1.0 / 6.0,
+            test_fraction=1.0 / 3.0,
+            group_separator=separator,
+        )
+        duplicate_test_audit = audit_data_splits(
+            duplicate_test_dataset,
+            include_test=True,
+        )
+
+    assert duplicate_test_audit["leakage_violations"] == []
+    assert any(
+        "test" in violation and "重复" in violation
+        for violation in duplicate_test_audit[
+            "evaluation_violations"
+        ]
+    )
+    assert not enforce_evaluation_duplicate_gate(
+        duplicate_test_audit
+    )
 
     # test_fraction=0 时 test split 为空且起点可能等于文件末尾
     #（语料末尾没有分隔符）。数据探针不能把这个空 split 误判为
@@ -36734,6 +36888,14 @@ def run_self_test():
     assert "allow_corrupt_test_labels" in COMPARISON_PROTOCOL_KEYS
     assert (
         "allow_corrupt_test_labels"
+        in _CROSS_FAMILY_PROTOCOL_KEYS
+    )
+    # 评估集重复豁免同样改变评估样本资格，必须进入协议核对，
+    # 否则一个跑过 --allow-eval-duplicates、一个没跑，会被误判
+    # 为同一评估口径。
+    assert "allow_eval_duplicates" in COMPARISON_PROTOCOL_KEYS
+    assert (
+        "allow_eval_duplicates"
         in _CROSS_FAMILY_PROTOCOL_KEYS
     )
     # 旧 ngram 运行的 comparison_protocol 缺少清洗/泄露键时，
@@ -46313,6 +46475,17 @@ def main():
             "的一部分时使用，豁免会记录进 config.json"
         ),
     )
+    parser.add_argument(
+        "--allow-eval-duplicates",
+        action="store_true",
+        help=(
+            "显式允许在 val/test 内部含完全重复群组时继续运行："
+            "重复评估样本会虚增有效样本量、让固定窗口 bootstrap "
+            "区间偏窄，验证集重复还会放大选型过拟合。默认拒绝"
+            "训练/拒绝解封测试集；仅当重复确实属于目标分布时"
+            "使用，豁免会记录进 config.json"
+        ),
+    )
 
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=128)
@@ -48134,6 +48307,28 @@ def main():
         print(
             "[data] [warn] 已通过 --allow-data-leakage 显式豁免"
             "跨 split 泄露拦截；本次结果不能作为无泄露证据。"
+        )
+
+    # val 内部重复群组会让周期验证在重复样本上反复计分并
+    # 放大选型过拟合；默认拒绝，显式豁免才继续。
+    if (
+        not args.allow_eval_duplicates
+        and not enforce_evaluation_duplicate_gate(
+            data_audit,
+            "train/val",
+        )
+    ):
+        raise SystemExit(
+            "评估集重复样本检查未通过：请先去重后重新切分，"
+            "或确认重复属于目标分布后显式传 "
+            "--allow-eval-duplicates。"
+        )
+    if args.allow_eval_duplicates and data_audit.get(
+        "evaluation_violations"
+    ):
+        print(
+            "[data] [warn] 已通过 --allow-eval-duplicates 显式"
+            "豁免评估集重复样本拦截；评估区间可能偏窄。"
         )
 
     # 严格数据审计：发现越界 token、编码/NUL 损坏等标签噪声
@@ -50092,6 +50287,13 @@ def main():
                     "test",
                 )
             )
+            eval_duplicate_blocked = (
+                not args.allow_eval_duplicates
+                and not enforce_evaluation_duplicate_gate(
+                    test_audit,
+                    "test",
+                )
+            )
             strict_blocked = (
                 args.strict_data_audit
                 and not enforce_strict_data_audit(
@@ -50126,6 +50328,7 @@ def main():
             )
             if (
                 leakage_blocked
+                or eval_duplicate_blocked
                 or strict_blocked
                 or shift_blocked
                 or label_integrity_blocked
