@@ -47598,8 +47598,11 @@ def main():
     except ValueError as error:
         parser.error(f"模型结构/损失配置无效: {error}")
 
-    # resume 可能把 group_separator 恢复成存档值，
-    # 统一在构造数据管线前重新解析。
+    # resume 可能把 group_separator 恢复成存档值（包括 None），
+    # 必须从 args 重新解析/清空。否则命令行传入的分隔符会在
+    # 检查点把它恢复成 None 后仍残留在 group_separator_bytes
+    # 中，数据管线会继续按群组切分，与存档的划分协议不一致。
+    group_separator_bytes = None
     if args.group_separator is not None:
         try:
             group_separator_bytes = parse_group_separator(
