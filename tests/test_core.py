@@ -5,6 +5,7 @@ Run with: python -m unittest discover -s tests -v
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -972,6 +973,155 @@ class DesignPreparationTests(unittest.TestCase):
             self.assertIsNotNone(error)
             self.assertIn("bad", error)
             self.assertIn("missing", error)
+
+    def test_design_plan_recomputes_canonical_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                preregistration_record=None,
+                run_order="randomized",
+                run_order_seed=5,
+            )
+            plan = experiment.build_sweep_plan(
+                seeds=[1, 2, 3],
+                modes=["A", "B"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            ordered = experiment.order_sweep_plan(
+                plan, "randomized", 5
+            )
+            design = experiment.write_design_plan(
+                root, ordered, "randomized", 5, args
+            )
+            item = next(
+                entry
+                for entry in ordered
+                if entry["order_index"] == 3
+            )
+            child_args = argparse.Namespace(
+                out=str(root / str(item["label"])),
+                seed=item["seed"],
+                mode=item["mode"],
+                balance_coef=item["balance_coef"],
+            )
+            path = Path(design["path"])
+            payload = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            payload["runs"][0]["label"] = "tampered"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            # 同时把文件 SHA 与 plan_id 环境变量改成「与当前
+            # 文件一致」：仅比对文件 SHA/字段值仍应被规范化
+            # 指纹识别出来。
+            env = {
+                "SMELT_DESIGN_PLAN_FILE": str(path),
+                "SMELT_DESIGN_PLAN_SHA256": hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest(),
+                "SMELT_DESIGN_PLAN_ID": payload["plan_id"],
+                "SMELT_DESIGN_ORDER_SCHEME": design[
+                    "order_scheme"
+                ],
+                "SMELT_DESIGN_ORDER_SEED": str(
+                    design["order_seed"]
+                ),
+                "SMELT_DESIGN_ORDER_INDEX": str(
+                    item["order_index"]
+                ),
+                "SMELT_DESIGN_BLOCK": str(item["block"]),
+                "SMELT_DESIGN_BLOCK_POSITION": str(
+                    item["position_in_block"]
+                ),
+            }
+            with mock.patch.dict(
+                os.environ, env, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    experiment.verify_design_assignment(
+                        child_args
+                    )
+
+    def test_run_order_drift_skips_deterministic_modes(self):
+        rows = [
+            {
+                "run": f"ngram{index}",
+                "mode": "ngram",
+                "val_loss": float(index),
+                "design_order_index": index,
+                "design_block": index,
+                "design_block_position": 1,
+                "design_plan_id": "plan-1",
+                "design_order_scheme": "randomized",
+            }
+            for index in (1, 2, 3, 4)
+        ]
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        # 旧 ngram 运行可能没有显式 deterministic 字段；模式本身
+        # 已说明它不消耗随机性，不能当作独立随机重复。
+        self.assertFalse(report["available"])
+        self.assertEqual(report["verdict"], "unavailable")
+
+    def test_run_order_drift_warns_missing_plan_record(self):
+        rows = []
+        for index in (1, 2, 3, 4):
+            rows.append({
+                "run": f"r{index}",
+                "mode": "A" if index % 2 else "B",
+                "val_loss": float(index),
+                "design_order_index": index,
+                "design_block": index,
+                "design_block_position": 1,
+                "design_plan_id": (
+                    None if index == 4 else "plan-1"
+                ),
+                "design_order_scheme": "randomized",
+            })
+        report = experiment.run_order_drift_report(
+            rows, "val_loss"
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["verdict"], "warn")
+        self.assertTrue(
+            any(
+                "缺少设计计划指纹" in warning
+                for warning in report["warnings"]
+            )
+        )
+
+    def test_extreme_power_inputs_do_not_crash(self):
+        self.assertGreaterEqual(
+            experiment._sign_flip_required_seeds(
+                1e-320, 1
+            ),
+            6,
+        )
+        self.assertGreaterEqual(
+            experiment._sign_flip_required_seeds(
+                0.05, 10**400
+            ),
+            6,
+        )
+        payload = self._payload()
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.01,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "planned_comparisons": 10**400,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
 
 
 class RoutingTests(unittest.TestCase):

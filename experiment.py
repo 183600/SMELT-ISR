@@ -21467,11 +21467,15 @@ def _sign_flip_required_seeds(
     Holm 首步阈值为 alpha/m；要求 2/2^n <= alpha/m，即
     n >= ceil(log2(2m/alpha))。家族规模 m=1、alpha=0.05 时为 6。
     """
-    if alpha <= 0.0:
+    if not math.isfinite(alpha) or alpha <= 0.0:
         return _MIN_SEEDS_FOR_ROBUST_SIGN_FLIP
     m = max(1, int(family_size))
+    # 用 log2(m) + 1 - log2(alpha) 而不是 log2(2*m/alpha)：
+    # 后者会先把 m 转成浮点，m 很大时溢出；alpha 极小（如
+    # 5e-324）时 2*m/alpha 又会变成 inf，使 ceil 抛错。
+    # 分开取对数后，正常范围与极端合法数值都能给出整数结果。
     required = math.ceil(
-        math.log2(2.0 * m / float(alpha))
+        math.log2(m) + 1.0 - math.log2(float(alpha))
     )
     return max(_MIN_SEEDS_FOR_STATS, int(required))
 
@@ -31340,13 +31344,21 @@ def preregistration_power_plan(
         power.get("planned_comparisons", comparisons_count)
     )
     family_size = max(1, planned_comparisons)
-    alpha_adjusted = alpha / family_size
-    required_t = _seeds_to_detect(
-        float(min_effect),
-        sd,
-        target_power=target,
-        alpha=alpha_adjusted,
-    )
+    try:
+        alpha_adjusted = alpha / family_size
+    except OverflowError:
+        # 家族规模是合法 JSON 整数但大到无法转成浮点：校正后
+        # 的 alpha 实际为 0，任何有限 n 都不可能达到目标功效。
+        alpha_adjusted = 0.0
+    if alpha_adjusted > 0.0:
+        required_t = _seeds_to_detect(
+            float(min_effect),
+            sd,
+            target_power=target,
+            alpha=alpha_adjusted,
+        )
+    else:
+        required_t = None
     required_robust = _sign_flip_required_seeds(alpha, family_size)
     required = max(required_t or 0, required_robust)
     acknowledged = bool(
@@ -55700,6 +55712,29 @@ def _training_budget_summary(
     }
 
 
+def _design_plan_id(payload: Dict[str, object]) -> str:
+    """设计计划内容的规范化指纹（排除 plan_id 与创建时间）。
+
+    写入与核对必须使用同一套规范化规则；否则一个被改写、但
+    plan_id 字段没有同步更新的计划文件会仅凭文件 SHA 通过核对。
+    ``plan_id`` / ``created_utc`` 不参与指纹：前者是结果，后者
+    只是写入时间，重复生成同一计划时应得到同一个 id。
+    """
+    core = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("plan_id", "created_utc")
+    }
+    return _sha256_text(
+        json.dumps(
+            _json_safe(core),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 def _atomic_write_json(
     path: Path,
     payload: Dict[str, object],
@@ -55816,14 +55851,7 @@ def write_design_plan(
         "seed_plan": seed_plan,
         "training_budget": budget,
     }
-    plan_id = _sha256_text(
-        json.dumps(
-            _json_safe(core),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
+    plan_id = _design_plan_id(core)
     payload = dict(core)
     payload["plan_id"] = plan_id
     payload["created_utc"] = datetime.datetime.now(
@@ -55911,6 +55939,20 @@ def verify_design_assignment(
         raise ValueError(
             "设计计划的 plan_id 与环境变量不一致："
             "计划内容被替换或改写"
+        )
+    # plan_id 必须真的是计划核心内容的规范化指纹，而不是一个
+    # 可以随文件一起被改写的标签。仅比对文件 SHA-256 时，若
+    # 有人同时更新了环境变量里的 SHA 与 plan_id，篡改后的
+    # runs/顺序仍会被接受。
+    canonical_plan_id = _design_plan_id(payload)
+    if canonical_plan_id != payload.get("plan_id"):
+        raise ValueError(
+            "设计计划内容与其 plan_id 不一致："
+            "计划被改写或 plan_id 不是规范化指纹"
+        )
+    if canonical_plan_id != values["SMELT_DESIGN_PLAN_ID"]:
+        raise ValueError(
+            "设计计划的规范化 plan_id 与环境变量不一致"
         )
     order = payload.get("order")
     if not isinstance(order, dict):
@@ -56116,7 +56158,7 @@ def run_order_drift_report(
     """
     entries: List[Dict[str, object]] = []
     for row in rows:
-        if row.get("deterministic"):
+        if _is_deterministic_run(row):
             continue
         index = row.get("design_order_index")
         value = row.get(metric)
@@ -56163,6 +56205,28 @@ def run_order_drift_report(
         if entry.get("scheme")
     })
     warnings: List[str] = []
+    missing_plan_ids = [
+        str(entry.get("run"))
+        for entry in entries
+        if not entry.get("plan_id")
+    ]
+    missing_schemes = [
+        str(entry.get("run"))
+        for entry in entries
+        if not entry.get("scheme")
+    ]
+    if missing_plan_ids:
+        warnings.append(
+            "部分运行缺少设计计划指纹（plan_id）："
+            + ", ".join(missing_plan_ids)
+            + "；不能把这些运行与已计划运行当作同一项研究"
+        )
+    if missing_schemes:
+        warnings.append(
+            "部分运行缺少执行顺序方案（order scheme）："
+            + ", ".join(missing_schemes)
+            + "；无法判断时间漂移是否被区组设计平衡"
+        )
     if len(plan_ids) > 1:
         warnings.append(
             "运行来自多份设计计划（plan_id 不一致）："
