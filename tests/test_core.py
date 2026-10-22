@@ -3768,6 +3768,20 @@ class ArtifactManifestTests(unittest.TestCase):
             )
         self.assertIsNone(experiment._manifest_relative_path(3))
 
+    def test_manifest_writer_refuses_unverifiable_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_run(Path(tmp) / "run")
+            try:
+                (root / "bad\\name.txt").write_text(
+                    "x", encoding="utf-8"
+                )
+            except OSError:
+                self.skipTest("当前平台不允许该文件名")
+            # 写入端不能生成一份校验端必然拒绝的清单；反斜杠
+            # 路径在跨平台归档中不安全，应明确失败。
+            with self.assertRaises(ValueError):
+                experiment.write_artifact_manifest(root)
+
     def test_manifest_rejects_unsafe_and_duplicate_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")

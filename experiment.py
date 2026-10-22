@@ -39330,6 +39330,15 @@ def _iter_manifest_entries(
         # 清单自身不进入清单：否则写入后哈希立刻失效。
         if current is None and child.name == _ARTIFACT_MANIFEST_NAME:
             continue
+        # 写入端与校验端必须使用同一套路径规则：Linux 允许
+        # 反斜杠/盘符前缀文件名，但这类清单换到 Windows 会
+        # 被解析到目录外。宁可让 --write-manifest 明确失败，
+        # 也不能生成一份自己都通不过校验的清单。
+        if _manifest_relative_path(relative) is None:
+            raise ValueError(
+                "文件名不能安全写入跨平台归档清单: "
+                f"{relative!r}"
+            )
         if child.is_symlink():
             consume()
             entries.append(_manifest_file_entry(
