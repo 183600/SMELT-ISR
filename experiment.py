@@ -2002,16 +2002,30 @@ def pythonhashseed_error(
     的 setdefault 无法追溯固定；需要严格逐位复现的正式运行
     必须由用户在命令行显式设置。
     """
-    if (
-        require_pythonhashseed
-        and _PYTHONHASHSEED_AT_START is None
-    ):
+    if not require_pythonhashseed:
+        return None
+    if _PYTHONHASHSEED_AT_START is None:
         return (
             "--require-pythonhashseed 要求进程启动前显式设置 "
             "PYTHONHASHSEED（例如 "
             "PYTHONHASHSEED=42 python experiment.py ...）；"
             "当前进程的 hash 随机化未被固定，严格逐位复现"
             "无法保证"
+        )
+    text = str(_PYTHONHASHSEED_AT_START).strip()
+    # "random"/空字符串与超范围整数要么显式随机化、要么被
+    # 解释器拒绝/回退；它们都不构成一个固定的 hash 种子。
+    if (
+        not text
+        or text.lower() == "random"
+        or not text.isdigit()
+        or int(text) > MAX_SEED
+    ):
+        return (
+            "--require-pythonhashseed 要求 PYTHONHASHSEED 是 "
+            f"[0, {MAX_SEED}] 内的整数（当前值 "
+            f"{_PYTHONHASHSEED_AT_START!r} 不能固定本进程的 "
+            "hash 随机化）；请用如 PYTHONHASHSEED=42 重新启动"
         )
     return None
 

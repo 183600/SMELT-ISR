@@ -828,6 +828,28 @@ class ProcessTests(unittest.TestCase):
             else:
                 os.environ["PYTHONHASHSEED"] = saved_env
 
+    def test_require_pythonhashseed_rejects_non_fixed_values(self):
+        previous = experiment._PYTHONHASHSEED_AT_START
+        try:
+            for value in (None, "", "random", "abc", "-1", "4294967296"):
+                experiment._PYTHONHASHSEED_AT_START = value
+                self.assertIsNotNone(
+                    experiment.pythonhashseed_error(True),
+                    value,
+                )
+            for value in ("0", "42", " 7 "):
+                experiment._PYTHONHASHSEED_AT_START = value
+                self.assertIsNone(
+                    experiment.pythonhashseed_error(True),
+                    value,
+                )
+            experiment._PYTHONHASHSEED_AT_START = ""
+            self.assertIsNone(
+                experiment.pythonhashseed_error(False)
+            )
+        finally:
+            experiment._PYTHONHASHSEED_AT_START = previous
+
     def test_split_policy_default_is_contiguous(self):
         cfg = _tiny_config()
         self.assertEqual(
