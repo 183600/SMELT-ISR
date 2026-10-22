@@ -23054,6 +23054,11 @@ def _stable_factor_key(value):
         # 转成精确整数可同时保留 int/float 等价性与大整数精度。
         if math.isfinite(value) and value.is_integer():
             return ("number", int(value))
+        if math.isnan(value):
+            # float('nan') != float('nan') 且不同对象的 hash 不同；
+            # 原样返回会让同一损坏/手工配置里的 NaN 因子水平被
+            # 拆成多个不可复现的桶。所有 NaN 统一成稳定的哨兵。
+            return ("nonfinite", "nan")
         return ("number", value)
     try:
         hash(value)
@@ -23079,6 +23084,11 @@ def _factor_sort_rank(value):
     if isinstance(value, float):
         if math.isfinite(value) and value.is_integer():
             return (0, int(value), "")
+        if math.isnan(value):
+            # 排序键也必须构成全序：含 NaN 的元组比较既不小于
+            # 也不大于其它数值，排序结果会依赖输入顺序。用稳定
+            # 的无穷大占位（第三项区分 +inf）保持确定性。
+            return (0, float("inf"), "nan")
         return (0, value, "")
     if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
         return (1, float(_FACTOR_VALUE_ORDER[value]), value)

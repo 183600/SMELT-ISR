@@ -6415,6 +6415,37 @@ class NumericalScaleTests(unittest.TestCase):
         )
         self.assertFalse(report["ok"])
 
+    def test_nan_factor_keys_are_stable_and_ordered(self):
+        first = float("nan")
+        second = float("nan")
+        first_key = experiment._stable_factor_key(first)
+        second_key = experiment._stable_factor_key(second)
+        self.assertEqual(first_key, second_key)
+        self.assertEqual(hash(first_key), hash(second_key))
+
+        values = [
+            float("nan"),
+            1.0,
+            float("nan"),
+            float("inf"),
+            0.0,
+        ]
+        ordered = sorted(
+            values, key=experiment._factor_sort_rank
+        )
+        # 相同输入顺序下排序必须确定；两个 NaN 落在同一稳定位置。
+        self.assertEqual(
+            [experiment._factor_sort_rank(value) for value in ordered],
+            sorted(
+                experiment._factor_sort_rank(value)
+                for value in values
+            ),
+        )
+        self.assertEqual(
+            experiment._factor_sort_rank(float("nan")),
+            experiment._factor_sort_rank(float("nan")),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
