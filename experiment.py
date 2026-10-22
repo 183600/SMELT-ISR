@@ -21467,7 +21467,11 @@ def _sign_flip_required_seeds(
     Holm 首步阈值为 alpha/m；要求 2/2^n <= alpha/m，即
     n >= ceil(log2(2m/alpha))。家族规模 m=1、alpha=0.05 时为 6。
     """
-    if not math.isfinite(alpha) or alpha <= 0.0:
+    try:
+        alpha_finite = math.isfinite(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return _MIN_SEEDS_FOR_ROBUST_SIGN_FLIP
+    if not alpha_finite or alpha <= 0.0:
         return _MIN_SEEDS_FOR_ROBUST_SIGN_FLIP
     m = max(1, int(family_size))
     # 用 log2(m) + 1 - log2(alpha) 而不是 log2(2*m/alpha)：

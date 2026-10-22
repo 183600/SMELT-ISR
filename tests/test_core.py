@@ -1469,6 +1469,12 @@ class DesignPreparationTests(unittest.TestCase):
             ),
             6,
         )
+        self.assertEqual(
+            experiment._sign_flip_required_seeds(
+                10**400, 1
+            ),
+            6,
+        )
         payload = self._payload()
         payload["power"] = {
             "expected_seed_sd_relative": 0.01,
