@@ -5772,6 +5772,17 @@ class EdgeCaseRegressionTests(unittest.TestCase):
 
     def test_print_comparison_tolerates_out_of_range_numbers(self):
         huge = 10 ** 400
+        self.assertEqual(experiment._format_finite(huge), "-")
+        self.assertEqual(
+            experiment._format_finite(float("nan")), "-"
+        )
+        self.assertEqual(
+            experiment._format_finite(1.25), "1.2500"
+        )
+        # 乘上展示缩放后溢出也必须按缺失值处理。
+        self.assertEqual(
+            experiment._format_finite(1e308, ".1f", 100.0), "-"
+        )
         rows = [
             {
                 "run": "huge",

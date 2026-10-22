@@ -19532,6 +19532,25 @@ def _finite_float(value: object) -> Optional[float]:
     return numeric
 
 
+def _format_finite(
+    value: object,
+    spec: str = ".4f",
+    scale: float = 1.0,
+) -> str:
+    """格式化有限数值用于终端展示；损坏/超范围值返回 "-"。
+
+    报告里的数值可能来自手工编辑或旧版 JSON（含超出 float
+    范围的整数与 NaN/Inf），单行坏记录不能中断整张对比表。
+    """
+    number = _finite_float(value)
+    if number is None:
+        return "-"
+    scaled = number * scale
+    if not math.isfinite(scaled):
+        return "-"
+    return format(scaled, spec)
+
+
 def _nonnegative_int(value: object) -> int:
     """非负整数计数；bool/损坏值按 0 处理，供旧报告兼容。"""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -21399,13 +21418,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
         # config/metrics 里的数值可能损坏（含超出 float 范围的
         # 整数或 NaN/Inf）；展示层按缺失值处理，不能让一行坏
         # 记录中断整张对比表。
-        number = _finite_float(value)
-        if number is None:
-            return "-"
-        scaled = number * scale
-        if not math.isfinite(scaled):
-            return "-"
-        return format(scaled, spec)
+        return _format_finite(value, spec, scale)
 
     for row in rows:
         flops = _finite_float(row.get("flops_per_forward"))
@@ -21464,10 +21477,7 @@ def print_comparison(rows: List[Dict[str, object]]) -> None:
         print("-" * len(routing_header))
 
         def _rv(value, spec=".4f") -> str:
-            number = _finite_float(value)
-            if number is None:
-                return "-"
-            return format(number, spec)
+            return _format_finite(value, spec)
 
         for row in routing_rows:
             print(
@@ -38917,9 +38927,7 @@ def print_comparison_analysis(
         print("-" * len(curve_header))
 
         def _curve_value(value, spec=".2f"):
-            if value is None:
-                return "-"
-            return format(float(value) * 100.0, spec)
+            return _format_finite(value, spec, 100.0)
 
         for entry in curve_diagnostics["runs"]:
             print(
@@ -38975,9 +38983,7 @@ def print_comparison_analysis(
         print("-" * len(bad_header))
 
         def _bad_value(value, spec=".4f"):
-            if value is None:
-                return "-"
-            return format(float(value), spec)
+            return _format_finite(value, spec)
 
         for entry in bad_case_comparison["runs"]:
             shares = entry["error_category_shares"]
