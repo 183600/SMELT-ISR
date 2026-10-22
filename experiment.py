@@ -22423,13 +22423,15 @@ def _stable_factor_key(value):
     if isinstance(value, bool):
         return ("bool", value)
     if isinstance(value, int):
-        try:
-            return ("number", float(value))
-        except OverflowError:
-            # JSON 可含任意大整数；因子键不能因此崩溃，也不能
-            # 把两个不同大整数折成同一个 inf。
-            return ("integer", value)
+        # 保留整数本身而不是转成 float：2**53 以上的相邻整数
+        # 转 float 后会折成同一个值，两个不同的因子水平会被
+        # 静默合并到同一实验单元（或同一种子被当成伪重复）。
+        return ("number", value)
     if isinstance(value, float):
+        # 整数值的 float 与同值 int 必须仍属于同一个因子水平；
+        # 转成精确整数可同时保留 int/float 等价性与大整数精度。
+        if math.isfinite(value) and value.is_integer():
+            return ("number", int(value))
         return ("number", value)
     return ("value", value)
 
@@ -22443,14 +22445,12 @@ def _factor_sort_rank(value):
     if isinstance(value, bool):
         return (2, float(value), "")
     if isinstance(value, int):
-        try:
-            return (0, float(value), "")
-        except OverflowError:
-            # 与 _stable_factor_key 同一口径：JSON 可含任意大整
-            # 数。返回整数本身（而不是 inf）既避免溢出，也保留
-            # 不同大整数之间的可比较顺序。
-            return (0, value, "")
+        # 与 _stable_factor_key 同一口径：整数直接参与排序，
+        # 不经过会丢精度的 float 转换。
+        return (0, value, "")
     if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
         return (0, value, "")
     if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
         return (1, float(_FACTOR_VALUE_ORDER[value]), value)
@@ -39587,7 +39587,10 @@ def verify_artifact_manifest(
             check_path.resolve(strict=False).relative_to(
                 root_resolved
             )
-        except (OSError, ValueError, RuntimeError) as error:
+        except (OSError, ValueError):
+            fail(relative, "escapes_root")
+            continue
+        except RuntimeError as error:
             # Path.resolve 遇到符号链接环会抛 RuntimeError（不是
             # OSError）；恶意/损坏清单可用 a/x 这类路径触发它。
             # 校验必须把它报告为路径解析失败，而不是让整个

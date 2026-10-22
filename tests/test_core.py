@@ -4462,6 +4462,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
 
+    def test_factor_keys_preserve_large_integer_precision(self):
+        left = 2 ** 53
+        right = left + 1
+        self.assertNotEqual(
+            experiment._stable_factor_key(left),
+            experiment._stable_factor_key(right),
+        )
+        # int/float 的同一数值仍必须合并为同一水平。
+        self.assertEqual(
+            experiment._stable_factor_key(7),
+            experiment._stable_factor_key(7.0),
+        )
+        self.assertLess(
+            experiment._factor_sort_rank(left),
+            experiment._factor_sort_rank(right),
+        )
+
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [
             {"seed": 1, "value": 10.0},
