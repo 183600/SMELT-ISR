@@ -10345,9 +10345,15 @@ def _ar1_adjusted_mean_test(
         result["note"] = "autocorrelation_below_threshold"
         return result
 
-    mean = sum(values) / n
+    mean = _mean(values)
     std = _sample_std(values)
+    if mean is None or std is None:
+        result["note"] = "invalid_values"
+        return result
     se = std / math.sqrt(n) * inflation
+    if not math.isfinite(se):
+        result["note"] = "invalid_values"
+        return result
     if se == 0.0:
         if mean == 0.0:
             result["p_value"] = 1.0
@@ -23276,8 +23282,13 @@ def _paired_t_test(
     values = _finite_values(differences)
     if values is None:
         return {"test": "invalid_values"}
-    mean = sum(values) / n
+    # 用带缩放的均值：直接 sum 对合法的 1e308 会溢出成 inf，
+    # 让 effect 字段（以及后续落盘）丢失真实点估计。正常量级
+    # 仍走完全相同的直接求和路径。
+    mean = _mean(values)
     std = _sample_std(values)
+    if mean is None or std is None:
+        return {"test": "invalid_values"}
 
     if std == 0.0:
         if mean == 0.0:
@@ -24494,12 +24505,21 @@ def _leave_one_out_effect_stability(
     if numeric is None:
         return {}
 
-    total = sum(numeric)
-    full_effect = total / n
+    full_effect = _mean(numeric)
+    if full_effect is None:
+        return {}
+    # 逐个用剩余观测重新求均值，而不是 inf - value：后者在
+    # 总和溢出时会把每个 leave-one-out 效应都变成 inf/nan。
     leave_one_out = [
-        (total - value) / (n - 1)
-        for value in numeric
+        effect
+        for effect in (
+            _mean(numeric[:index] + numeric[index + 1:])
+            for index in range(n)
+        )
+        if effect is not None
     ]
+    if len(leave_one_out) != n:
+        return {}
     tolerance = 1e-12 * max(1.0, abs(full_effect))
     if abs(full_effect) <= tolerance:
         stable = all(
@@ -24645,7 +24665,13 @@ def _paired_result_fragility(
             "n": n,
         }
 
-    mean = sum(numeric) / n
+    mean = _mean(numeric)
+    if mean is None:
+        return {
+            "available": False,
+            "reason": "non_finite_differences",
+            "n": n,
+        }
     sd = _sample_std(numeric)
     base_test = _paired_t_test(numeric)
     base_p = base_test.get("p_value")

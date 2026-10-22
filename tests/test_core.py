@@ -5407,6 +5407,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_paired_stats_keep_large_finite_effects(self):
+        huge = 1.0e308
+        test = experiment._paired_t_test([huge, huge, huge])
+        self.assertEqual(test["note"], "noise_free_separation")
+        self.assertTrue(math.isfinite(test["effect"]))
+        self.assertEqual(test["effect"], huge)
+        fragility = experiment._paired_result_fragility(
+            [huge, huge, huge]
+        )
+        self.assertEqual(fragility["mean_difference"], huge)
+        self.assertTrue(
+            math.isfinite(fragility["mean_difference"])
+        )
+        stability = experiment._leave_one_out_effect_stability(
+            [huge, huge, huge]
+        )
+        self.assertEqual(
+            stability["leave_one_out_effect_min"], huge
+        )
+        self.assertEqual(
+            stability["leave_one_out_effect_max"], huge
+        )
+        self.assertTrue(
+            stability["leave_one_out_sign_stable"]
+        )
+
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [
             {"seed": 1, "value": 10.0},
