@@ -62587,7 +62587,7 @@ def baseline_tuning_provenance_error(
             f"{mode}：该报告不能证明当前模式的基线被调过参"
         )
 
-    winner = payload.get("winner") or {}
+    winner = _as_dict(payload.get("winner"))
 
     # 完整调参报告必须带 axes：紧凑来源记录（config.json 里的
     # baseline_tuning）虽然也没有 axes，但它不是 --baseline-tuning-
@@ -62626,7 +62626,12 @@ def baseline_tuning_provenance_error(
             if "value" in axis_winner:
                 tuned_values[key] = axis_winner["value"]
     if not tuned_values:
-        winner_lr = float(winner.get("lr"))
+        winner_lr = _finite_float(winner.get("lr"))
+        if winner_lr is None or winner_lr <= 0.0:
+            return (
+                "调参报告缺少有效的 winner.lr（必须是有限正数）："
+                "调参失败或损坏的报告不能作为基线来源"
+            )
         tuned_values = {"lr": winner_lr}
 
     for key, expected in tuned_values.items():
@@ -62644,9 +62649,15 @@ def baseline_tuning_provenance_error(
         ):
             flag = _axis_cli_flag(key)
             if key == "lr":
+                expected_lr = _finite_float(expected)
+                expected_text = (
+                    format(expected_lr, "g")
+                    if expected_lr is not None
+                    else _axis_value_text(expected)
+                )
                 return (
                     f"当前 --lr={format(lr, 'g')} 与调参 winner "
-                    f"lr={format(float(expected), 'g')} 不一致："
+                    f"lr={expected_text} 不一致："
                     "调参来源必须真实复用于基线训练，不能借用"
                     "调参报告"
                 )
@@ -62752,12 +62763,24 @@ def baseline_tuning_provenance_error(
 
     config = payload.get("training_config") or {}
     record_steps = config.get("total_steps")
-    if record_steps is not None and int(steps) != int(record_steps):
-        return (
-            f"当前 --steps={int(steps)} 与调参训练配置 "
-            f"steps={int(record_steps)} 不一致：学习率是在"
-            "原训练配置下调出来的，训练配置变了应重新调参"
-        )
+    if record_steps is not None:
+        record_steps_value = _finite_float(record_steps)
+        if (
+            record_steps_value is None
+            or not record_steps_value.is_integer()
+        ):
+            return (
+                "调参报告的 training_config.total_steps 不是"
+                "有限整数：无法核对训练步数，拒绝把损坏的报告"
+                "作为基线来源"
+            )
+        if int(steps) != int(record_steps_value):
+            return (
+                f"当前 --steps={int(steps)} 与调参训练配置 "
+                f"steps={int(record_steps_value)} 不一致："
+                "学习率是在原训练配置下调出来的，训练配置变了"
+                "应重新调参"
+            )
 
     record_batch = config.get("batch_size")
     if (

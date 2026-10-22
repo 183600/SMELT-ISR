@@ -6480,6 +6480,18 @@ class NumericalScaleTests(unittest.TestCase):
             digests.append(digest)
         self.assertEqual(digests, sorted(digests))
 
+    def test_baseline_provenance_rejects_corrupt_winner(self):
+        for winner in ({}, {"lr": "not-a-number"}, ["bad"]):
+            error = experiment.baseline_tuning_provenance_error(
+                {"mode": "dense", "winner": winner},
+                mode="dense",
+                lr=1.0e-4,
+                steps=100,
+                data_sha256="0" * 64,
+            )
+            self.assertIsInstance(error, str)
+            self.assertIn("winner", error)
+
 
 if __name__ == "__main__":
     unittest.main()
