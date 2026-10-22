@@ -5464,7 +5464,10 @@ def read_time_order_manifest(
             elif isinstance(payload, str):
                 value = payload
             else:
-                value = None
+                # 全数字的 ISO-8601 basic 日期（如 20200101）会被
+                # json.loads 解析成整数；它不是 JSON 清单，仍应
+                # 按纯文本时间戳回退，而不是报「缺少 timestamp」。
+                value = text
             if not isinstance(value, str) or not value:
                 raise ValueError(
                     f"时间清单第 {line_number} 行缺少 timestamp"
@@ -12733,7 +12736,7 @@ def _select_ngram_candidate_one_se(
         for value in raw:
             try:
                 number = float(value)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
             if not math.isfinite(number):
                 return None
@@ -16415,7 +16418,10 @@ def _routing_set_bool(
     n_experts: int,
 ) -> torch.Tensor:
     """把 [N, k] 的专家下标转成 [N, n_experts] 的集合指示位。"""
-    indices = indices.to(torch.int64).clamp_(
+    # 不能用原地 clamp_：.to(int64) 对已经是 int64 的输入返回
+    # 同一张量，会改写调用方数据；对 expand 出来的 stride-0
+    # 视图则直接抛「multiple elements refer to single memory」。
+    indices = indices.to(torch.int64).clamp(
         min=0,
         max=n_experts - 1,
     )
@@ -16554,7 +16560,9 @@ def _routing_set_metrics(
 
     # slot 口径：第二轮每个 assignment 的专家是否落在第一轮集合中
     # （重复专家按 slot 各计一次，反映实际计算里的复用比例）。
-    b_slots = b.to(torch.int64).clamp_(min=0, max=n_experts - 1)
+    b_slots = b.to(torch.int64).clamp(
+        min=0, max=n_experts - 1
+    )
     metrics["second_round_slot_reuse_mean"] = float(
         a_bool.float().gather(1, b_slots).mean()
     )
@@ -16681,7 +16689,7 @@ class RoutingProbe:
                 return
 
             n_experts = int(module.n_experts)
-            flat_indices = indices.to(torch.int64).clamp_(
+            flat_indices = indices.to(torch.int64).clamp(
                 min=0,
                 max=n_experts - 1,
             ).reshape(-1)
@@ -16787,7 +16795,10 @@ class RoutingProbe:
                 "usage": usage.to(torch.int64),
                 "gate_mass": gate_mass,
                 "scalars": scalars,
-                "indices": indices.to(torch.int16),
+                # int16 在 n_experts>32767 时会静默溢出成负下标，
+                # 后续集合指标会从错误的专家上计算；int32 足够
+                # 覆盖任何可实际分配的路由表规模。
+                "indices": indices.to(torch.int32),
             })
 
     @staticmethod
@@ -16999,12 +17010,15 @@ class RoutingProbe:
                 time_steps,
                 k2,
             )
-            a_expanded = a_tokens.unsqueeze(1).expand(
-                batch,
-                k1,
-                time_steps,
-                k1,
-            ).reshape(-1, k1)
+            # 分支 j 的第二轮只应和「该分支携带的第一轮专家」
+            # 比较，而不是和父 token 的整个 top-k 集合比较：
+            # a_tokens[..., j] 才是分支 j 的起点。行序必须与
+            # b_branch 的 (batch, branch, time) 一致。
+            a_expanded = (
+                a_tokens.permute(0, 2, 1)
+                .unsqueeze(-1)
+                .reshape(-1, 1)
+            )
             result["branch_level"] = _routing_set_metrics(
                 a_expanded,
                 b_branch.reshape(-1, k2).contiguous(),
@@ -20282,7 +20296,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
                     config_payload = loaded
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 config_payload = {}
 
         # 逐窗口评估记录（eval_windows.json）：固定评估窗口在所有
@@ -20299,7 +20313,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
                     loaded_windows = json.load(f)
                 if isinstance(loaded_windows, dict):
                     row["eval_windows"] = loaded_windows
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 row["eval_windows"] = None
 
         # 确定性标记：ngram 统计基线换 seed 不会产生新的独立
@@ -21537,13 +21551,28 @@ def _build_seed_plan(
     后更大）。n<6 时 ``significant_robust`` 在数学上不可能为
     True，报告必须区分「效应不稳健」与「设计无法判定稳健性」。
     """
-    n = len(seeds)
+    # 重复 seed 是伪重复，不是独立重复：种子计划若按列表长度
+    # 计数，会在一份 --seeds 1 1 1 1 1 1 的计划上声称具备 6 个
+    # 独立种子的稳健性。按稳定键去重后再算功效下限。
+    unique_seeds: List[int] = []
+    seen_keys: set = set()
+    repeated: List[int] = []
+    for seed in seeds:
+        value = int(seed)
+        key = _stable_factor_key(value)
+        if key in seen_keys:
+            repeated.append(value)
+            continue
+        seen_keys.add(key)
+        unique_seeds.append(value)
+    n = len(unique_seeds)
     required_robust = _sign_flip_required_seeds(
         _SIGNIFICANCE_LEVEL, planned_comparisons
     )
     return {
-        "seeds": [int(seed) for seed in seeds],
+        "seeds": unique_seeds,
         "n_seeds": n,
+        "duplicate_seeds": repeated,
         "min_seeds_for_significance": _MIN_SEEDS_FOR_STATS,
         "min_seeds_for_robust_sign_flip": required_robust,
         "planned_comparisons": int(planned_comparisons),
@@ -21553,7 +21582,8 @@ def _build_seed_plan(
             "0.25/0.125/0.0625，均不能达到 0.05。"
             "significant_robust（配对 t 与符号翻转同时显著）"
             "至少需要 n=6，家族校正后按 "
-            "ceil(log2(2m/alpha)) 增加"
+            "ceil(log2(2m/alpha)) 增加。重复 seed 按一个"
+            "独立观测计。"
         ),
         "underpowered_override": bool(
             allow_underpowered and n < _MIN_SEEDS_FOR_STATS
@@ -24904,7 +24934,7 @@ def _t_power(
         se_value = float(se)
         df_value = float(df)
         alpha_value = float(alpha)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     if (
@@ -24919,6 +24949,10 @@ def _t_power(
     if se_value <= 0.0:
         # 零标准误：非零效应必然被检出；零效应必然不显著。
         return 1.0 if effect_value > 0.0 else alpha_value
+    if effect_value == 0.0:
+        # 非中心参数恰为 0 时低功效积分在数值上仍可能因网格
+        # 截断而偏离 alpha；这是可精确知道的值，直接返回。
+        return alpha_value
 
     critical = _t_critical(df_value, alpha_value)
     if critical is None:
@@ -24964,7 +24998,7 @@ def _minimum_detectable_effect(
         se_value = float(se)
         df_value = float(df)
         target = float(target_power)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     if (
@@ -25008,11 +25042,18 @@ def _seeds_to_detect(
     target_power: float = _TARGET_POWER,
     alpha: float = _SIGNIFICANCE_LEVEL,
     max_seeds: int = 128,
+    design: str = "paired",
 ) -> Optional[int]:
     """
-    以每个种子一次运行的配对设计，要在目标功效下检出给定
-    效应量所需的种子数（近似：把观测到的种子间标准差当作
-    真值，se = sd/sqrt(n)、df = n-1）。
+    要在目标功效下检出给定效应量所需的种子数（近似：把观测
+    到的种子间标准差当作真值）。
+
+    ``design="paired"``：同一种子上的配对比较，n 为配对数，
+    se = sd/√n、df = n-1。
+
+    ``design="welch"``：两臂独立种子、每臂 n 个（等分配），
+    se = sd·√(2/n)、df ≈ 2(n-1)。配对公式会低估所需种子数，
+    不能把配对口径直接套到 Welch 对比上。
 
     用于回答「不显著到底是没效应还是种子太少」：若当前种子
     数远小于所需种子数，结论只能是「该规模下无法判定」。
@@ -25022,7 +25063,7 @@ def _seeds_to_detect(
         effect_value = abs(float(effect))
         sd_value = float(sd)
         target = float(target_power)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     if (
@@ -25036,12 +25077,22 @@ def _seeds_to_detect(
         return None
     if sd_value <= 0.0:
         return 1
+    if design not in ("paired", "welch"):
+        raise ValueError(
+            "所需种子数的设计口径必须是 paired 或 welch"
+        )
 
     for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
+        if design == "welch":
+            se = sd_value * math.sqrt(2.0 / float(n))
+            df = float(2 * (n - 1))
+        else:
+            se = sd_value / math.sqrt(float(n))
+            df = float(n - 1)
         power = _t_power(
             effect_value,
-            sd_value / math.sqrt(n),
-            float(n - 1),
+            se,
+            df,
             alpha,
         )
         if power is not None and power >= target:
@@ -25092,7 +25143,7 @@ def _tost_test(
         df_value = float(df)
         margin_value = abs(float(margin))
         alpha_value = float(alpha)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return {}
 
     if (
@@ -25177,7 +25228,7 @@ def _hedges_g_correction(
     """
     try:
         df_value = float(df)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(df_value) or df_value <= 1.0:
         return None
@@ -25203,7 +25254,7 @@ def _paired_effect_size(
     """
     try:
         delta_value = abs(float(delta))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return {}
     if test.get("test") != "paired_t":
         return {}
@@ -25214,11 +25265,8 @@ def _paired_effect_size(
         or n_pairs < 2
     ):
         return {}
-    se = test.get("se")
-    if not isinstance(se, (int, float)) or isinstance(se, bool):
-        return {}
-    se_value = float(se)
-    if not math.isfinite(se_value) or se_value < 0.0:
+    se_value = _finite_float(test.get("se"))
+    if se_value is None or se_value < 0.0:
         return {}
     if se_value == 0.0:
         if delta_value == 0.0:
@@ -25315,7 +25363,7 @@ def _attach_family_power(
     try:
         se_value = float(se)  # type: ignore[arg-type]
         df_value = float(df)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return
     if (
         not math.isfinite(se_value)
@@ -25334,7 +25382,7 @@ def _attach_family_power(
     delta = contrast.get("delta")
     try:
         delta_value = abs(float(delta))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         delta_value = None
     if delta_value is not None and math.isfinite(delta_value):
         power = _t_power(
@@ -25344,13 +25392,20 @@ def _attach_family_power(
             contrast["power_at_effect_bonferroni"] = power
         sd_observed = _observed_seed_sd(contrast, se_value)
         if sd_observed is not None and delta_value > 0.0:
+            design = (
+                "welch"
+                if contrast.get("test") == "welch_t"
+                else "paired"
+            )
             seeds_needed = _seeds_to_detect(
                 delta_value,
                 sd_observed,
                 alpha=alpha_family,
+                design=design,
             )
             if seeds_needed is not None:
                 contrast["seeds_to_detect_bonferroni"] = seeds_needed
+                contrast["seeds_to_detect_design"] = design
 
     if contrast.get("equivalence_margin_abs") is None:
         return
@@ -25362,14 +25417,11 @@ def _attach_family_power(
     margin_needed = delta_value + critical * se_value
     contrast["equivalence_margin_needed_bonferroni"] = margin_needed
     baseline_abs = None
-    baseline_mean = contrast.get("mean_baseline")
-    if (
-        isinstance(baseline_mean, (int, float))
-        and not isinstance(baseline_mean, bool)
-        and math.isfinite(float(baseline_mean))
-        and abs(float(baseline_mean)) > 0.0
-    ):
-        baseline_abs = abs(float(baseline_mean))
+    baseline_mean = _finite_float(
+        contrast.get("mean_baseline")
+    )
+    if baseline_mean is not None and abs(baseline_mean) > 0.0:
+        baseline_abs = abs(baseline_mean)
     if baseline_abs is not None:
         contrast["equivalence_margin_needed_bonferroni_relative"] = (
             margin_needed / baseline_abs
@@ -25411,18 +25463,15 @@ def _attach_power_equivalence(
     try:
         se_value = float(se)
         df_value = float(df)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return
 
-    baseline_mean = contrast.get("mean_baseline")
+    baseline_mean = _finite_float(
+        contrast.get("mean_baseline")
+    )
     baseline_abs = None
-    if (
-        isinstance(baseline_mean, (int, float))
-        and not isinstance(baseline_mean, bool)
-        and math.isfinite(float(baseline_mean))
-        and abs(float(baseline_mean)) > 0.0
-    ):
-        baseline_abs = abs(float(baseline_mean))
+    if baseline_mean is not None and abs(baseline_mean) > 0.0:
+        baseline_abs = abs(baseline_mean)
 
     mde = _minimum_detectable_effect(se_value, df_value)
     if mde is not None:
@@ -25438,19 +25487,26 @@ def _attach_power_equivalence(
 
         sd_observed = _observed_seed_sd(contrast, se_value)
         if sd_observed is not None and delta_value != 0.0:
+            design = (
+                "welch"
+                if contrast.get("test") == "welch_t"
+                else "paired"
+            )
             seeds_needed = _seeds_to_detect(
                 delta_value,
                 sd_observed,
+                design=design,
             )
             if seeds_needed is not None:
                 contrast["seeds_to_detect"] = seeds_needed
+                contrast["seeds_to_detect_design"] = design
                 _attach_sd_uncertainty_note(contrast)
 
     if equivalence_margin is None or delta is None:
         return
     try:
         margin_relative = float(equivalence_margin)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return
     if (
         not math.isfinite(margin_relative)
@@ -25760,16 +25816,26 @@ def aggregate_runs(
             if r.get("seed") is not None
         ]
         seed_counts: Dict[object, int] = {}
+        seed_originals: Dict[object, object] = {}
         for seed in seed_values:
-            seed_counts[seed] = seed_counts.get(seed, 0) + 1
+            seed_key = _stable_factor_key(seed)
+            seed_counts[seed_key] = (
+                seed_counts.get(seed_key, 0) + 1
+            )
+            seed_originals.setdefault(seed_key, seed)
         # 伪重复检测：同一实验单元里同一随机种子出现多次
         # （如重复目录、复制运行）会被当成独立重复实验参与
         # 均值/方差/配对检验，种子间方差被低估。这里显式记录，
         # 统计与展示层据此拒绝把伪重复当重复实验。
+        # 用稳定键计数、用因子排序键排序：损坏的旧 config 可能
+        # 混入 1 与 "1"，直接 sorted 会抛 TypeError。
         duplicate_seeds = sorted(
-            seed
-            for seed, count in seed_counts.items()
-            if count > 1
+            (
+                seed_originals[key]
+                for key, count in seed_counts.items()
+                if count > 1
+            ),
+            key=_factor_sort_rank,
         )
 
         deterministic_rows = [
@@ -26933,7 +26999,17 @@ def _cell_seed_values(
     配对；``duplicate_seeds`` 列出同一 seed 出现多次的种子，
     这些复制运行虽被折叠成一个观测，但不能当作额外独立重复。
     """
-    samples = cell.get("samples", {}).get(metric, [])
+    sample_map = cell.get("samples")
+    if not isinstance(sample_map, dict):
+        sample_map = {}
+    raw_samples = sample_map.get(metric, [])
+    if not isinstance(raw_samples, list):
+        raw_samples = []
+    samples = [
+        sample
+        for sample in raw_samples
+        if isinstance(sample, dict)
+    ]
     collapsed = _collapse_seed_samples(samples)
     seed_counts: Dict[object, int] = {}
     seed_values: Dict[object, object] = {}
@@ -26952,7 +27028,13 @@ def _cell_seed_values(
         if count > 1
     ]
     mapping: Dict[object, Tuple[object, float]] = {}
-    complete = True
+    complete = (
+        len(samples) == len(raw_samples)
+        and all(
+            _finite_float(sample.get("value")) is not None
+            for sample in samples
+        )
+    )
     for sample in collapsed:
         seed = sample.get("seed")
         if seed is None:
@@ -27277,18 +27359,16 @@ def factorial_effects(
             mode = str(aggregate["keys"].get("mode"))
             if mode not in ("local_base", *_DELAYED_MERGE_MODES):
                 continue
-            balance = aggregate["keys"].get("balance_coef")
-            if (
-                not isinstance(balance, (int, float))
-                or isinstance(balance, bool)
-                or not math.isfinite(float(balance))
-            ):
+            balance = _finite_float(
+                aggregate["keys"].get("balance_coef")
+            )
+            if balance is None:
                 continue
-            if float(balance) > 0.0:
+            if balance > 0.0:
                 positive_balances[
                     _stable_factor_key(balance)
-                ] = float(balance)
-            level = "off" if float(balance) == 0.0 else "on"
+                ] = balance
+            level = "off" if balance == 0.0 else "on"
             cells_by_key[(mode, level)] = aggregate
 
         # 「开启臂」必须只有一个明确的均衡强度。若同一上下文里
@@ -27429,15 +27509,11 @@ def factorial_effects(
                     effect_name,
                     (),
                 ):
-                    mean = cells[alias].get(
-                        f"{metric}_mean"
+                    mean = _finite_float(
+                        cells[alias].get(f"{metric}_mean")
                     )
-                    if (
-                        isinstance(mean, (int, float))
-                        and not isinstance(mean, bool)
-                        and math.isfinite(float(mean))
-                    ):
-                        reference_values.append(float(mean))
+                    if mean is not None:
+                        reference_values.append(mean)
                 reference_mean = (
                     sum(reference_values)
                     / len(reference_values)
@@ -29491,14 +29567,12 @@ def ablation_coverage(
         mode = str(_row_factor_value(row, "mode"))
         if mode not in ablation_related:
             continue
-        balance = _row_factor_value(row, "balance_coef")
-        if (
-            not isinstance(balance, (int, float))
-            or isinstance(balance, bool)
-            or not math.isfinite(float(balance))
-        ):
+        balance = _finite_float(
+            _row_factor_value(row, "balance_coef")
+        )
+        if balance is None:
             continue
-        cell_key = (mode, "off" if float(balance) == 0.0 else "on")
+        cell_key = (mode, "off" if balance == 0.0 else "on")
         attempted_cells[cell_key] = (
             attempted_cells.get(cell_key, 0) + 1
         )
@@ -29729,12 +29803,10 @@ def ablation_coverage(
         field: str,
     ) -> Optional[float]:
         values = [
-            float(row[field])
+            number
             for row in rows_by_mode.get(mode_name, [])
-            if isinstance(row.get(field), (int, float))
-            and not isinstance(row.get(field), bool)
-            and math.isfinite(float(row[field]))
-            and float(row[field]) > 0.0
+            for number in [_finite_float(row.get(field))]
+            if number is not None and number > 0.0
         ]
         return _mean(values)
 
@@ -30663,12 +30735,8 @@ def baseline_adequacy(
         )
     else:
         for row in baseline_rows:
-            value = row.get(metric)
-            if not (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(float(value))
-            ):
+            value = _finite_float(row.get(metric))
+            if value is None:
                 continue
 
             reference_value = _trivial_reference_value(
@@ -30687,12 +30755,9 @@ def baseline_adequacy(
                 fallback_chance = row.get(
                     "val_pr_auc_macro_chance"
                 )
-                if (
-                    isinstance(fallback_chance, (int, float))
-                    and not isinstance(fallback_chance, bool)
-                    and math.isfinite(float(fallback_chance))
-                ):
-                    reference_value = float(fallback_chance)
+                fallback_value = _finite_float(fallback_chance)
+                if fallback_value is not None:
+                    reference_value = fallback_value
                     reference_source = (
                         "val_pr_auc_macro_chance"
                         "（该运行的 PR-AUC 随机水平）"
@@ -30749,9 +30814,7 @@ def baseline_adequacy(
         row
         for row in matching_ngram_rows
         if row.get("numerical_status") != "failed"
-        and isinstance(row.get(metric), (int, float))
-        and not isinstance(row.get(metric), bool)
-        and math.isfinite(float(row[metric]))
+        and _finite_float(row.get(metric)) is not None
     ]
     if failed_ngram_rows and baseline_mode != "ngram":
         report["advisories"].append(
@@ -32680,7 +32743,7 @@ def preregistration_apply(
         if numeric:
             try:
                 same = float(current) == float(expected)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 same = False
         else:
             same = current == expected
@@ -33017,7 +33080,7 @@ def preregistration_sweep_error(
         try:
             with open(config_path, encoding="utf-8") as f:
                 config = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             missing.append(Path(path).name)
             continue
         record = (
@@ -34824,7 +34887,7 @@ def _balance_width_profile(
 
     try:
         balance_coef = float(protocol.get("balance_coef"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if balance_coef < 0.0:
         return None
@@ -34835,7 +34898,7 @@ def _balance_width_profile(
             return None
         try:
             parsed = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return parsed if parsed > 0 else None
 
@@ -39830,7 +39893,7 @@ def write_run_config(
         try:
             with open(config_path, encoding="utf-8") as f:
                 previous = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             previous = None
         if (
             isinstance(previous, dict)
@@ -40131,17 +40194,45 @@ def _records_at_or_before_step(
     return kept
 
 
+# 这些非数值 step 记录是「本次运行已经结束/已经分析完」的结果，
+# resume 后旧结果不能继续冒充新训练段的终态；reference_baselines
+# 与 curve_monitor 是可复用的历史说明，保留。
+_RESUME_TERMINAL_STEP_LABELS = frozenset({
+    "final",
+    "bad_cases",
+    "curve_analysis",
+    "efficiency",
+    "routing",
+    "routing_interventions",
+})
+
+
 def _truncate_metrics_after_step(path: Path, step: int) -> None:
     """
-    删除 metrics.jsonl 中 step 大于恢复点的数值记录行。
+    删除 metrics.jsonl 中属于恢复点之后的记录行。
 
-    只重写「需要保留」的行（数值 step <= 恢复点，或非数值 step 的
-    说明性记录如 reference_baselines / curve_monitor），保持其余
-    行字节原样。文件不存在或无需裁剪时不改动。
+    删除两类记录：数值 step 大于恢复点的记录，以及上一次运行
+    已经写下的终态/分析记录（``final`` / ``bad_cases`` /
+    ``curve_analysis`` / ``efficiency`` / ``routing`` 等）。否则
+    resume 到更大 --steps 后、在新训练段崩溃时，旧 ``final``
+    仍在文件里，后续 --compare 会把上一次的结果当成这次已完成
+    的终态。``reference_baselines`` / ``curve_monitor`` 是可复用
+    的历史说明，保留。文件不存在或无需裁剪时不改动。
     """
     if not path.exists():
         return
     threshold = int(step)
+
+    def should_drop(record: object) -> bool:
+        if not isinstance(record, dict):
+            return False
+        record_step = record.get("step")
+        if isinstance(record_step, int) and not isinstance(
+            record_step, bool
+        ):
+            return record_step > threshold
+        return record_step in _RESUME_TERMINAL_STEP_LABELS
+
     kept_lines: List[str] = []
     dropped = 0
     changed = False
@@ -40163,16 +40254,7 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
             except json.JSONDecodeError:
                 changed = True
                 continue
-            record_step = (
-                record.get("step")
-                if isinstance(record, dict)
-                else None
-            )
-            if (
-                isinstance(record_step, int)
-                and not isinstance(record_step, bool)
-                and record_step > threshold
-            ):
+            if should_drop(record):
                 dropped += 1
             else:
                 kept_lines.append(line + "\n")
@@ -40187,16 +40269,7 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
         except json.JSONDecodeError:
             kept_lines.append(line)
             continue
-        record_step = (
-            record.get("step")
-            if isinstance(record, dict)
-            else None
-        )
-        if (
-            isinstance(record_step, int)
-            and not isinstance(record_step, bool)
-            and record_step > threshold
-        ):
+        if should_drop(record):
             dropped += 1
             changed = True
             continue
@@ -40221,9 +40294,14 @@ def read_metrics_records(path: Path) -> List[Dict[str, object]]:
 
     records: List[Dict[str, object]] = []
 
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+    # 逐行按字节解码：崩溃或磁盘损坏可能在任意一行留下非法
+    # UTF-8，不能因此让整份指标记录（包括前面完好的行）不可读。
+    with open(path, "rb") as f:
+        for raw_line in f:
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
             if not line:
                 continue
             try:
@@ -40516,14 +40594,21 @@ def print_final_test_comparison(
             config = json.loads(
                 (path / "config.json").read_text(encoding="utf-8")
             )
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
+        if not isinstance(config, dict):
+            config = {}
         record = _read_test_records(path)
-        cfg = config.get("config") or {}
+        cfg = config.get("config")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        config_args = config.get("args")
+        if not isinstance(config_args, dict):
+            config_args = {}
         row = {
             "run": str(path),
             "mode": cfg.get("mode"),
-            "seed": (config.get("args") or {}).get("seed"),
+            "seed": config_args.get("seed"),
             "test_available": bool(record.get("available")),
             "test_loss": record.get("test_loss"),
             "test_ppl": record.get("test_ppl"),
@@ -40609,7 +40694,7 @@ def load_tracking_provenance(
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return empty
 
     if not isinstance(payload, dict):
@@ -40706,7 +40791,7 @@ def load_previous_sanity_result(
     try:
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
     if not isinstance(payload, dict):
@@ -55752,6 +55837,8 @@ def _restore_resume_cleaning_justification(
 
     返回是否恢复了值。
     """
+    if not isinstance(saved_args, dict):
+        return False
     current = getattr(args, "domain_justification", None)
     if current is not None and str(current).strip():
         return False
@@ -56929,7 +57016,7 @@ def design_plan_consistency_error(
         try:
             with open(config_path, encoding="utf-8") as handle:
                 config_payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             missing.append(Path(path).name)
             continue
         assignment = (

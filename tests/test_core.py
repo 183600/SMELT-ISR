@@ -1718,8 +1718,93 @@ class RoutingTests(unittest.TestCase):
             metrics["jaccard_lift_over_marginal"]
         )
 
+    def test_routing_set_bool_does_not_mutate_or_fail_on_views(self):
+        indices = torch.tensor([[-1, 99]], dtype=torch.int64)
+        experiment._routing_set_bool(indices, 5)
+        self.assertEqual(indices.tolist(), [[-1, 99]])
+        # stride-0 的 expand 视图不能做原地 clamp_；分支创建时
+        # 的 a_expanded 正是这种布局。
+        base = torch.tensor([[0, 1]], dtype=torch.int64)
+        expanded = base.expand(2, 2)
+        flags = experiment._routing_set_bool(expanded, 4)
+        self.assertEqual(flags.shape, (2, 4))
+        self.assertEqual(base.tolist(), [[0, 1]])
 
-class RoutingInterventionReproducibilityTests(unittest.TestCase):
+    def test_branch_creation_overlap_aligns_each_branch_slot(self):
+        cfg = experiment.Config(
+            mode="B",
+            n_experts=4,
+            d_model=4,
+            n_heads=1,
+            n_layers=4,
+            seq_len=1,
+            expert_hidden=2,
+            top_k=2,
+            k1=2,
+            k2=2,
+        )
+        probe = experiment.RoutingProbe(cfg, batch_size=2)
+        first = {
+            "indices": torch.tensor([[[0, 1]], [[2, 3]]]),
+            "input_shape": [2, 1, 4],
+        }
+        second = {
+            "indices": torch.tensor(
+                [[0, 2], [1, 3], [2, 0], [3, 1]]
+            ),
+            "input_shape": [4, 1, 4],
+        }
+        overlap = probe._pair_overlap(
+            first, second, cfg.middle_start
+        )
+        # 每个分支只与它自己携带的第一轮专家比较：
+        # {0}->{0,2}, {1}->{1,3}, {2}->{2,0}, {3}->{3,1}。
+        self.assertAlmostEqual(
+            overlap["branch_level"][
+                "second_round_jaccard_mean"
+            ],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            overlap["branch_level"]["first_round_recall_mean"],
+            1.0,
+        )
+        self.assertEqual(overlap["branch_self_reuse_share"], 1.0)
+
+    def test_routing_indices_keep_large_expert_ids(self):
+        class _FakeMoE:
+            n_experts = 40000
+
+        cfg = experiment.Config(
+            mode="base",
+            n_experts=40000,
+            d_model=2,
+            n_heads=1,
+            n_layers=4,
+            seq_len=1,
+            expert_hidden=1,
+            top_k=1,
+            k1=1,
+            k2=1,
+        )
+        probe = experiment.RoutingProbe(cfg, batch_size=1)
+        module = _FakeMoE()
+        probe._block_index[id(module)] = 0
+        logits = torch.zeros(1, 40000)
+        logits[0, 39999] = 10.0
+        probe.record(
+            module,
+            torch.zeros(1, 1, 2),
+            torch.tensor([[0, 39999]]),
+            torch.tensor([[0.5, 0.5]]),
+            logits,
+        )
+        probe._materialize_events()
+        self.assertEqual(
+            probe.events[0]["indices"].tolist(),
+            [[0, 39999]],
+        )
+
     def test_routing_shuffle_seed_uses_stable_module_index(self):
         first = experiment._routing_shuffle_seed(7, 0)
         self.assertEqual(
@@ -4161,6 +4246,118 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertTrue(sign["available"])
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
+
+    def test_welch_seed_plan_uses_two_sample_power(self):
+        samples_a = [
+            {"seed": 1, "value": 10.0},
+            {"seed": 2, "value": 10.2},
+            {"seed": 3, "value": 9.8},
+        ]
+        samples_b = [
+            {"seed": 4, "value": 10.2},
+            {"seed": 5, "value": 10.4},
+            {"seed": 6, "value": 10.0},
+        ]
+        test = experiment._contrast_test(samples_a, samples_b)
+        self.assertEqual(test["test"], "welch_t")
+        contrast = {
+            "test": test["test"],
+            "se": test["se"],
+            "df": test["df"],
+            "delta": test["effect"],
+            "mean_baseline": 10.0,
+            "n_baseline": 3,
+            "n_variant": 3,
+        }
+        experiment._attach_power_equivalence(
+            contrast, test["effect"], test, 0.01
+        )
+        self.assertEqual(
+            contrast["seeds_to_detect_design"], "welch"
+        )
+        # 每臂 n 个、se=sd·sqrt(2/n)、df=2(n-1)；n=17 才达到
+        # 80% 功效，配对公式给出的 10 会系统性低估。
+        self.assertEqual(contrast["seeds_to_detect"], 17)
+
+    def test_zero_effect_power_is_exactly_alpha(self):
+        self.assertEqual(
+            experiment._t_power(0.0, 1.0, 2.0, 1e-5),
+            1e-5,
+        )
+
+    def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
+        plan = experiment._build_seed_plan(
+            [1, 1, 1, 1, 1, 1], False
+        )
+        self.assertEqual(plan["n_seeds"], 1)
+        self.assertEqual(plan["seeds"], [1])
+        self.assertEqual(plan["duplicate_seeds"], [1] * 5)
+        self.assertFalse(plan["robust_claim_possible"])
+
+        rows = [
+            {"run": "a", "mode": "A", "seed": 1, "val_loss": 1.0},
+            {"run": "b", "mode": "A", "seed": 1, "val_loss": 1.1},
+            {"run": "c", "mode": "A", "seed": "1", "val_loss": 1.2},
+            {"run": "d", "mode": "A", "seed": "1", "val_loss": 1.3},
+        ]
+        aggregate = experiment.aggregate_runs(rows, ["mode"])[0]
+        self.assertEqual(
+            aggregate["duplicate_seeds"], [1, "1"]
+        )
+
+    def test_time_order_manifest_accepts_all_digit_plain_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "times.txt"
+            # 全数字 ISO-8601 basic 日期会被 json.loads 解析成
+            # 整数，必须回退到纯文本而不是报缺少 timestamp。
+            path.write_text(
+                "20200101\n20200102\n", encoding="utf-8"
+            )
+            report = experiment.read_time_order_manifest(
+                str(path)
+            )
+        self.assertEqual(report["records"], 2)
+        self.assertTrue(report["monotonic_non_decreasing"])
+
+    def test_metrics_reader_skips_invalid_utf8_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_bytes(
+                b'{"step": 1, "val_loss": 1.0}\n\xff\n'
+            )
+            records = experiment.read_metrics_records(path)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["step"], 1)
+
+    def test_resume_truncation_drops_stale_terminal_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_text(
+                json.dumps({"step": 10, "val_loss": 1.0})
+                + "\n"
+                + json.dumps({"step": "final", "val_loss": 9.9})
+                + "\n",
+                encoding="utf-8",
+            )
+            experiment._truncate_metrics_after_step(path, 10)
+            steps = [
+                record.get("step")
+                for record in experiment.read_metrics_records(path)
+            ]
+        self.assertEqual(steps, [10])
+
+    def test_resume_cleaning_justification_tolerates_bad_args(self):
+        args = argparse.Namespace(domain_justification=None)
+        self.assertFalse(
+            experiment._restore_resume_cleaning_justification(
+                args, None
+            )
+        )
+        self.assertFalse(
+            experiment._restore_resume_cleaning_justification(
+                args, ["not-a-dict"]
+            )
+        )
 
     def test_paper_protocol_keeps_undisclosed_warmup_defaults(self):
         previous = sys.argv
