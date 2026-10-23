@@ -9537,6 +9537,8 @@ class NumericalScaleTests(unittest.TestCase):
             {"p_value": float("inf"), "significant": True},
             {"p_value": float("nan"), "significant": True},
             {"p_value": 10**400, "significant": True},
+            {"p_value": -0.01, "significant": True},
+            {"p_value": 1.01, "significant": True},
         ]
         experiment._apply_multiple_comparison_correction(contrasts)
         # 只对两个可用的 p 值做家族校正；损坏记录跳过而不是
@@ -9548,15 +9550,15 @@ class NumericalScaleTests(unittest.TestCase):
             self.assertNotIn("p_value_bh", contrast)
         self.assertEqual(
             experiment._holm_bonferroni(
-                [0.01, "bad", float("nan"), 0.04]
+                [0.01, "bad", float("nan"), -0.01, 1.01, 0.04]
             ),
-            [0.02, None, None, 0.04],
+            [0.02, None, None, None, None, 0.04],
         )
         self.assertEqual(
             experiment._benjamini_hochberg(
-                [0.01, "bad", float("inf"), 0.04]
+                [0.01, "bad", float("inf"), -0.01, 1.01, 0.04]
             ),
-            [0.02, None, None, 0.04],
+            [0.02, None, None, None, None, 0.04],
         )
 
     def test_environment_identity_falls_back_for_minimal_snapshots(self):

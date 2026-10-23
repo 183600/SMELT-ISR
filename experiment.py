@@ -28926,6 +28926,14 @@ def _attach_power_equivalence(
                 contrast["equivalence_blocker"] = None
 
 
+def _finite_probability(value: object) -> Optional[float]:
+    """有限且位于 [0, 1] 的 p 值；损坏记录返回 None。"""
+    numeric = _finite_float(value)
+    if numeric is None or not 0.0 <= numeric <= 1.0:
+        return None
+    return numeric
+
+
 def _holm_bonferroni(
     p_values: List[Optional[float]],
 ) -> List[Optional[float]]:
@@ -28935,7 +28943,7 @@ def _holm_bonferroni(
     第 i 小（0 起）的 p 值乘以 m - i 并做单调化；None
     （未执行检验，如种子不足）不参与家族计数。
     """
-    numeric = [_finite_float(p) for p in p_values]
+    numeric = [_finite_probability(p) for p in p_values]
     total = sum(1 for p in numeric if p is not None)
     adjusted: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
@@ -28969,7 +28977,7 @@ def _holm_rank_thresholds(
     不显著。删除种子不会改变家族规模，因此沿用原位置阈值是
     保守近似（删除后 p 排序可能变化，但不会放宽判定）。
     """
-    numeric = [_finite_float(p) for p in p_values]
+    numeric = [_finite_probability(p) for p in p_values]
     total = sum(1 for p in numeric if p is not None)
     thresholds: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
@@ -28993,7 +29001,7 @@ def _benjamini_hochberg(
     以 Holm（FWER）为准，BH 值随报告给出以标明「更宽松的
     口径下也不显著」的稳健性。
     """
-    numeric = [_finite_float(p) for p in p_values]
+    numeric = [_finite_probability(p) for p in p_values]
     total = sum(1 for p in numeric if p is not None)
     adjusted: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
@@ -30531,7 +30539,7 @@ def _apply_multiple_comparison_correction(
     for contrast in contrasts:
         # 旧/手工记录的 p 值可能是字符串、NaN/Inf 或超范围整数；
         # 这些不是可校正的检验结果，跳过而不是中断整份报告。
-        p_value = _finite_float(contrast.get("p_value"))
+        p_value = _finite_probability(contrast.get("p_value"))
         if p_value is None:
             continue
         eligible.append(contrast)
@@ -30639,7 +30647,7 @@ def _apply_multiple_comparison_correction(
     randomization_eligible: List[Dict[str, object]] = []
     randomization_values: List[float] = []
     for contrast in contrasts:
-        value = _finite_float(
+        value = _finite_probability(
             contrast.get("randomization_p_value")
         )
         if value is None:
@@ -30697,7 +30705,7 @@ def _apply_multiple_comparison_correction(
     tost_eligible: List[Dict[str, object]] = []
     tost_values: List[float] = []
     for contrast in contrasts:
-        value = _finite_float(contrast.get("tost_p_value"))
+        value = _finite_probability(contrast.get("tost_p_value"))
         if value is None:
             continue
         tost_eligible.append(contrast)
