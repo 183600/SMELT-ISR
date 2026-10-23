@@ -12387,8 +12387,18 @@ def _group_stats_bootstrap_ci(
     ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
 ) -> Optional[Tuple[float, float]]:
     """按群组有放回重采样、再加权平均的分位区间。"""
+    try:
+        replicate_count = int(replicates)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (
+        isinstance(ci_level, (int, float))
+        and not isinstance(ci_level, bool)
+        and 0.0 < float(ci_level) < 1.0
+    ):
+        return None
     n_groups = int(point_values.numel())
-    if n_groups < 2 or replicates <= 1:
+    if n_groups < 2 or replicate_count <= 1:
         return None
     if (
         int(weights.numel()) != n_groups
@@ -12404,7 +12414,7 @@ def _group_stats_bootstrap_ci(
     indices = torch.randint(
         low=0,
         high=n_groups,
-        size=(int(replicates), n_groups),
+        size=(replicate_count, n_groups),
         generator=generator,
     )
     sampled_weights = weights[indices].sum(dim=1)
@@ -12446,6 +12456,20 @@ def _group_cluster_eval_intervals(
         return {
             "available": False,
             "reason": "missing_or_invalid_group_stats",
+        }
+    try:
+        replicate_count = int(replicates)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": replicates,
+        }
+    if replicate_count <= 1:
+        return {
+            "available": False,
+            "reason": "insufficient_bootstrap_replicates",
+            "replicates": replicate_count,
         }
     if parsed["unit"] not in (None, "document_group"):
         return {
@@ -12489,13 +12513,13 @@ def _group_cluster_eval_intervals(
     loss_interval = _group_stats_bootstrap_ci(
         loss_scaled,
         tokens,
-        int(replicates),
+        replicate_count,
         generator,
     )
     accuracy_interval = _group_stats_bootstrap_ci(
         accuracy_point,
         tokens,
-        int(replicates),
+        replicate_count,
         generator,
     )
     if loss_interval is None:
@@ -12519,7 +12543,7 @@ def _group_cluster_eval_intervals(
         "tokens": (
             token_total if math.isfinite(token_total) else None
         ),
-        "bootstrap_replicates": int(replicates),
+        "bootstrap_replicates": replicate_count,
         "bootstrap_unit": "document_group",
         "loss_ci95_low": max(0.0, low),
         "loss_ci95_high": max(0.0, high),

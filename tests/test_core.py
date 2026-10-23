@@ -10533,6 +10533,15 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 [], replicates=10
             )["available"]
         )
+        stats = self._stats([
+            [0, 10.0, 20.0, 5.0],
+            [1, 10.0, 30.0, 5.0],
+        ])
+        for replicates in (0, 1, "bad", None):
+            report = experiment._group_cluster_eval_intervals(
+                stats, replicates=replicates, seed=1
+            )
+            self.assertFalse(report["available"])
 
     def test_group_reports_stay_json_safe_with_extreme_tokens(self):
         token_count = 1.0e308
