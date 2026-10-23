@@ -9074,11 +9074,21 @@ def _near_duplicate_bottom_k(
     决定。
     """
     heap: List[int] = []
+    present: set = set()
     for value in hashes:
+        # bottom-k 是 shingle **集合**的最小哈希，不是多重集：
+        # 高度重复的内容（同一行重复很多次）会产生大量相同
+        # shingle 哈希；若不去重，草图会被同一个值占满，丢掉
+        # 真正参与 Jaccard 的其他值，近重复候选因此漏检。
+        if value in present:
+            continue
         if len(heap) < sketch_size:
             heapq.heappush(heap, -value)
+            present.add(value)
         elif value < -heap[0]:
-            heapq.heapreplace(heap, -value)
+            removed = -heapq.heapreplace(heap, -value)
+            present.discard(removed)
+            present.add(value)
     return tuple(sorted(-item for item in heap))
 
 

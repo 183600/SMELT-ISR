@@ -2947,6 +2947,23 @@ class NearDuplicateDataTests(unittest.TestCase):
         variant = base.replace(b"alpha", b"omega", 1)
         return base, variant
 
+    def test_bottom_k_sketch_uses_distinct_shingle_hashes(self):
+        # 重复 shingle 的哈希不能占满 bottom-k 草图：MinHash
+        # 的集合口径要求每个值只计一次，否则高度重复内容的
+        # 草图会丢掉其他真实值并造成近重复候选漏检。
+        self.assertEqual(
+            experiment._near_duplicate_bottom_k(
+                [5] * 20, 8
+            ),
+            (5,),
+        )
+        self.assertEqual(
+            experiment._near_duplicate_bottom_k(
+                [9, 3, 9, 3, 7, 7, 1], 3
+            ),
+            (1, 3, 7),
+        )
+
     def test_planner_drops_near_duplicate_train_group(self):
         base, variant = self._near_pair()
         separator = b"\n\n"
