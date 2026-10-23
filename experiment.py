@@ -66858,16 +66858,28 @@ def print_design_summary(design: Dict[str, object]) -> None:
         required_robust = power.get(
             "required_seeds_for_robust_sign_flip"
         )
+        planned_text = power.get("planned_seeds")
+        planned_text = (
+            f"{planned_text} 个"
+            if planned_text is not None
+            else "未知"
+        )
+        usable_text = power.get("planned_usable_seeds")
+        usable_text = (
+            f"{usable_text} 个"
+            if usable_text is not None
+            else "未知"
+        )
         print(
             "[design][power] 先验功效："
-            f"计划 {power.get('planned_seeds')} 个种子，"
+            f"计划 {planned_text}种子，"
             f"所需启动种子 {required_text}（t="
             f"{required_t if required_t is not None else 'NA'}, "
             "稳健符号翻转="
             f"{required_robust if required_robust is not None else 'NA'}）"
             + (
                 f"，预期脱落 {attrition:.0%}、计划可用 "
-                f"{power.get('planned_usable_seeds')} 个"
+                f"{usable_text}"
                 if attrition > 0.0
                 else ""
             )
