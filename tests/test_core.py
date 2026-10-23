@@ -7178,6 +7178,40 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertFalse(result["available"])
         json.dumps(result, allow_nan=False)
 
+    def test_window_overlap_huge_int_is_not_formatted(self):
+        def payload(overlap):
+            return {
+                "split": "val",
+                "data_sha256": "deadbeef",
+                "split_sha256": "cafebabe",
+                "seq_len": 4,
+                "batch_size": 1,
+                "batches": 2,
+                "overlap_fraction": overlap,
+                "windows": [
+                    {"tokens": 1, "loss_sum": 1.0, "correct": 0},
+                    {"tokens": 1, "loss_sum": 1.0, "correct": 0},
+                ],
+            }
+
+        def cell(losses, overlap=0.0):
+            return {
+                "window_payloads": [
+                    {
+                        "seed": seed,
+                        "payload": payload(overlap),
+                    }
+                    for seed, _ in enumerate(losses, 1)
+                ]
+            }
+
+        result = experiment._cell_window_paired_analysis(
+            cell([0.0, 0.0], 10 ** 400),
+            cell([1.0, 1.0]),
+        )
+        self.assertTrue(result["available"])
+        json.dumps(result, allow_nan=False)
+
     def test_linear_effect_no_common_seed_sum_does_not_overflow(self):
         cells = {
             "a": {

@@ -25250,7 +25250,9 @@ def paired_window_comparison(
         "window_p_value_ar1": ar1_test.get("p_value"),
         "window_df_ar1": ar1_test.get("df"),
         "window_ar1_note": ar1_test.get("note"),
-        "overlap_fraction": payload_a.get("overlap_fraction"),
+        "overlap_fraction": _finite_float(
+            payload_a.get("overlap_fraction")
+        ),
         "bootstrap_ci95": bootstrap,
     }
     if invalid_accuracy_windows:
@@ -25981,7 +25983,8 @@ def _cell_window_paired_analysis(
     if overlap_fractions:
         notes.append(
             "评估窗口可能重叠（overlap_fraction="
-            f"{max(overlap_fractions):.3f}）：窗口不是独立抽样"
+            f"{_format_finite(max(overlap_fractions), '.3f')}）："
+            "窗口不是独立抽样"
             "单位，窗口级原始 p 值偏小；已另给 AR(1) 有效窗口"
             "校正 p 值，训练随机性仍由种子级检验覆盖"
         )
