@@ -6369,6 +6369,22 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(report["most_imbalanced_run"])
         self.assertIsNone(report["pr_auc_chance_mean"])
 
+    def test_imbalance_advisory_omits_overflowing_pr_auc_lift(self):
+        report = experiment.imbalance_metric_advisory(
+            [
+                {
+                    "run": "huge_lift",
+                    "val_majority_accuracy": 0.9995,
+                    "val_pr_auc_macro": 1.0e308,
+                    "val_pr_auc_macro_chance": -1.0e308,
+                }
+            ],
+            "val_pr_auc_macro",
+        )
+        self.assertIsNone(report["pr_auc_over_chance"])
+        self.assertIn("无法表示", report["advisories"][-1])
+        json.dumps(report, allow_nan=False)
+
     def test_baseline_ngram_delta_overflow_is_omitted(self):
         rows = [
             {

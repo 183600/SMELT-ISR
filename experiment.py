@@ -38575,14 +38575,21 @@ def imbalance_metric_advisory(
     if metric == "val_pr_auc_macro" and pr_values:
         best_run, best_value = min(pr_values, key=lambda item: item[1])
         if chance_mean is not None:
-            report["pr_auc_over_chance"] = best_value - chance_mean
+            lift = best_value - chance_mean
+            report["pr_auc_over_chance"] = (
+                lift if math.isfinite(lift) else None
+            )
             report["pr_auc_worst_run"] = best_run
             report["advisories"].append(
                 f"PR-AUC 的随机水平不是 0 而是≈平均 prevalence"
                 f"（{chance_mean:.4f}）：当前最差运行 {best_run} "
                 f"的 {metric}={best_value:.4f}，高出随机水平 "
-                f"{best_value - chance_mean:+.4f}；"
-                "对比 PR-AUC 时应同时报告该差值（lift），"
+                + (
+                    f"{lift:+.4f}；"
+                    if math.isfinite(lift)
+                    else "（差值超出浮点范围，无法表示）；"
+                )
+                + "对比 PR-AUC 时应同时报告该差值（lift），"
                 "而不是只看绝对值"
             )
         else:
