@@ -67228,6 +67228,21 @@ def design_power_gate_error(
         )
     if not isinstance(power, dict):
         return None
+    if isinstance(pilot_evidence, dict):
+        pilot_cells = _finite_float(
+            pilot_evidence.get("cell_count")
+        )
+        if pilot_cells is not None and pilot_cells <= 0.0:
+            return (
+                pilot_note
+                + "设计计划显示试点证据没有任何可归入处理单元"
+                "的运行（每个运行都必须有 mode 与整数 seed）："
+                "无法从这批证据核对声明 sd/脱落率。请补齐 "
+                "config.json 中的 mode/seed，或传入正确的运行"
+                "目录，再用新的 --out 重新生成设计计划；确需在"
+                "不足设计中探索，请显式设置 "
+                "underpowered_acknowledged=true 并写明 justification"
+            )
     if power.get("adequacy_recomputed") is False:
         reason = power.get("adequacy_recompute_error")
         return (

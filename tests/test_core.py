@@ -3106,6 +3106,52 @@ class DesignPreparationTests(unittest.TestCase):
         json.dumps(design, allow_nan=False)
         json.dumps(design["pilot_evidence"], allow_nan=False)
 
+    def test_pilot_evidence_with_no_usable_cell_blocks_start(self):
+        # 运行缺少 mode/seed 但指标本身有效：虽然不算「数值
+        # 失败」，也没有任何单元可用于核对 sd/脱落率，不能
+        # 当作功效足够放行。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "unassigned"
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps({
+                    "config": {"mode": None, "balance_coef": 0.01},
+                    "args": {"seed": None},
+                }),
+                encoding="utf-8",
+            )
+            (run_dir / "metrics.jsonl").write_text(
+                json.dumps({"step": 1, "val_loss": 1.0})
+                + "\n"
+                + json.dumps({
+                    "step": "final",
+                    "val_loss": 1.0,
+                    "numerical_integrity_ok": True,
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            evidence = experiment.build_pilot_power_evidence(
+                [str(run_dir)], "val_loss"
+            )
+        self.assertEqual(evidence["cell_count"], 0)
+        self.assertFalse(
+            evidence["attrition_check"]["unusable"]
+        )
+        design = {
+            "power": {"adequate": True},
+            "pilot_evidence": evidence,
+        }
+        gate = experiment.design_power_gate_error(design)
+        self.assertIsNotNone(gate)
+        self.assertIn("没有", gate)
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                design, allow_underpowered=True
+            )
+        )
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
