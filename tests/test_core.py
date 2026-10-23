@@ -7584,6 +7584,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             [],
         )
 
+    def test_json_safe_converts_sets_deterministically(self):
+        payload = {"a": {3, 1, 2}, "b": frozenset([2, 1])}
+        first = experiment._json_safe(payload)
+        second = experiment._json_safe(payload)
+        self.assertEqual(first["a"], [1, 2, 3])
+        self.assertEqual(first["b"], [1, 2])
+        self.assertEqual(first, second)
+        json.dumps(first, allow_nan=False)
+
     def test_artifact_readers_tolerate_unreadable_path(self):
         long_path = Path("x" * 10000)
         self.assertFalse(experiment._path_exists(long_path))

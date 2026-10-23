@@ -44610,6 +44610,14 @@ def _json_safe(value):
         }
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        # JSON 没有集合类型；手工/旧计划或自定义记录可能混入
+        # set。按 repr 排序转成列表，保证同一集合跨进程得到
+        # 相同顺序，而不是让 json.dumps 抛 TypeError。
+        return [
+            _json_safe(item)
+            for item in sorted(value, key=repr)
+        ]
     return value
 
 
