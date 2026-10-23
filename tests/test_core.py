@@ -7714,6 +7714,26 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(tiny["variance_of_mean"])
         json.dumps(tiny, allow_nan=False)
 
+    def test_attrition_bounds_scale_with_tiny_effect(self):
+        cell = {
+            "label": "a",
+            "n_runs": 1,
+            "samples": {
+                "val_loss": [{"value": 1.0e-13}]
+            },
+            "numerical_failures": [],
+        }
+        bounds = experiment._attrition_bounds(
+            {"a": cell},
+            {"a": 1.0},
+            "val_loss",
+            1.0e-13,
+        )
+        self.assertEqual(bounds["verdict"], "complete_cases")
+        self.assertFalse(bounds["zero_within_bounds"])
+        self.assertTrue(bounds["sign_robust"])
+        json.dumps(bounds, allow_nan=False)
+
     def test_leave_one_out_stability_scales_with_effect(self):
         stable = experiment._leave_one_out_effect_stability(
             [1.0e-13, 2.0e-13, 3.0e-13]

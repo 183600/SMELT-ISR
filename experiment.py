@@ -29242,7 +29242,17 @@ def _attrition_bounds(
     report["max_abs_shift_from_observed"] = (
         shift if shift is not None and math.isfinite(shift) else None
     )
-    tolerance = 1e-12
+    # 容差随效应尺度缩放：固定 1e-12 会把 1e-13 量级的真实
+    # 效应误判为 0（既可能伪造方向稳健，也可能把有方向的界
+    # 说成跨零）。
+    effect_scale = max(
+        abs(effect_min),
+        abs(effect_max),
+        abs(observed_effect_value)
+        if observed_effect_value is not None
+        else 0.0,
+    )
+    tolerance = 1e-12 * effect_scale if effect_scale > 0.0 else 0.0
     report["observed_effect_within_bounds"] = bool(
         observed_effect_value is not None
         and effect_min - tolerance
