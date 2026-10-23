@@ -14007,8 +14007,16 @@ def _select_ngram_candidate_one_se(
         }
 
     n_windows = len(point_values)
-    point_mean = sum(point_values) / n_windows
-    tolerance = 1e-12 * max(1.0, abs(point_mean))
+    point_mean = _mean(point_values)
+    if point_mean is None:
+        return {
+            "rule": "paired_one_se",
+            "available": False,
+            "reason": "nonfinite_point_mean",
+        }
+    # 容差必须相对于指标本身，而不是固定 1e-12：极小但非零的
+    # loss 差异（如 1e-13）否则会被当成数值噪声而误判并列。
+    tolerance = 1e-12 * abs(point_mean)
 
     tied: List[Dict[str, object]] = []
     for candidate in candidates:
@@ -14027,8 +14035,12 @@ def _select_ngram_candidate_one_se(
                 candidate_values, point_values
             )
         ]
-        mean_diff = sum(differences) / n_windows
+        mean_diff = _mean(differences)
+        if mean_diff is None:
+            continue
         se = _sample_std(differences) / math.sqrt(n_windows)
+        if se is None:
+            continue
         rho1 = _lag1_autocorrelation(
             torch.tensor(differences, dtype=torch.float64)
         )

@@ -7714,6 +7714,41 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(tiny["variance_of_mean"])
         json.dumps(tiny, allow_nan=False)
 
+    def test_ngram_one_se_tolerance_scales_with_metric(self):
+        # 极小但非零的 loss 差异不能被固定 1e-12 容差当成并列：
+        # 否则更简单的候选配置会因为一条恒定的微小劣化被误选。
+        point = {
+            "order": 2,
+            "alpha": 0.5,
+            "val_loss": 3.0e-13,
+        }
+        candidates = [
+            point,
+            {
+                "order": 2,
+                "alpha": 0.1,
+                "val_loss": 5.0e-13,
+            },
+        ]
+        window_values = {
+            (2, 0.5): [3.0e-13] * 4,
+            (2, 0.1): [5.0e-13] * 4,
+        }
+        report = experiment._select_ngram_candidate_one_se(
+            point,
+            candidates,
+            window_values,
+            "val_loss",
+        )
+        self.assertTrue(report["available"])
+        self.assertTrue(report["selected_is_point_best"])
+        self.assertEqual(
+            report["selected"],
+            {"order": 2, "alpha": 0.5},
+        )
+        self.assertEqual(len(report["tied"]), 1)
+        json.dumps(report, allow_nan=False)
+
     def test_paired_window_bootstrap_is_scale_stable(self):
         small = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
         large = [value * 1.0e300 for value in small]
