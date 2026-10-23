@@ -6409,6 +6409,14 @@ class ByteDataset:
         # 固定评估起点按 split 分开保存。
         self._fixed_starts: Dict[str, Dict[str, object]] = {}
 
+        # 群组（文档）起始位置缓存：评估不确定性的 cluster
+        # bootstrap 需要把同一文档的 token 当成一个抽样单位，
+        # 而不是把窗口当独立样本。只在支持 --group-separator
+        # 的数据上可用；没有群组边界时保持 None，不伪造簇。
+        self._split_group_starts: Dict[
+            str, Optional[List[int]]
+        ] = {}
+
         # 固定评估批的结果（设备侧）：键为
         # (split, batches, batch_size, batch_index, device)，
         # 值为 (x, y)；累计字节受 _EVAL_BATCH_CACHE_MAX_BYTES
@@ -6675,6 +6683,146 @@ class ByteDataset:
         data = self.val if split == "val" else self.test
         return windows, data
 
+    def _ensure_fixed_starts(
+        self,
+        split: str,
+        total_batches: int,
+        num_starts: int,
+    ) -> torch.Tensor:
+        """生成（或复用）固定评估窗口起点。"""
+        cache = self._fixed_starts.setdefault(
+            split,
+            {"total": None, "starts": None},
+        )
+
+        if cache["total"] != total_batches:
+            # 均匀覆盖整个评估流。total_batches <= num_starts，
+            # linspace 的间距不小于 1，round 后不会重复。
+            cache["starts"] = torch.linspace(
+                0,
+                num_starts - 1,
+                steps=total_batches,
+                dtype=torch.float64,
+            ).round().long()
+            cache["total"] = total_batches
+        starts = cache["starts"]
+        assert isinstance(starts, torch.Tensor)
+        return starts
+
+    def split_group_starts(
+        self,
+        split: str,
+    ) -> Optional[List[int]]:
+        """
+        评估 split 内各群组（文档）的起始字节位置（相对 split
+        起点）；没有 --group-separator 或 split 为空时返回 None。
+
+        群组按 ``_iter_group_spans`` 的口径定义：分隔符之间的
+        非空连续片段。分隔符本身不属于任何群组，但在下面的
+        ``group_ids_for_starts`` 中并入前一个群组，保证每个
+        目标 token 都能归属到一个文档簇；前导分隔符并入第一个
+        群组。没有群组边界时不做任何近似（返回 None），避免
+        把窗口当作文档簇写入报告。
+        """
+        if self.group_separator is None:
+            return None
+        if split not in self.split_bounds:
+            raise ValueError(f"未知 split: {split}")
+        if split in self._split_group_starts:
+            return self._split_group_starts[split]
+
+        begin, end = self.split_bounds[split]
+        starts = sorted(
+            {
+                span_start - begin
+                for span_start, _span_end in _iter_group_spans(
+                    self._raw_buffer,
+                    self.group_separator,
+                    begin,
+                    end,
+                )
+            }
+        )
+        result: Optional[List[int]]
+        result = starts if starts else None
+        self._split_group_starts[split] = result
+        return result
+
+    def group_assignment_fingerprint(self) -> Optional[str]:
+        """群组定义指纹；没有群组分隔符时为 None。"""
+        if self.group_separator is None:
+            return None
+        return hashlib.sha256(self.group_separator).hexdigest()
+
+    def group_ids_for_starts(
+        self,
+        split: str,
+        starts: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """
+        固定评估窗口内每个**目标 token**（x 右移一位）所属的
+        群组下标，形状 [n_windows, seq_len]，int64 CPU 张量。
+
+        群组下标是 split 内部的 0 基序号，与
+        ``split_group_starts`` 的顺序一致。位置 p 归属
+        ``max{i: group_start_i <= p}``；因此分隔符与空群组
+        并入前一个群组，前导分隔符并入第一个群组。没有群组
+        边界时返回 None。
+        """
+        group_starts = self.split_group_starts(split)
+        if group_starts is None:
+            return None
+        start_tensor = torch.tensor(
+            group_starts,
+            dtype=torch.long,
+        )
+        window_starts = torch.as_tensor(
+            starts,
+            dtype=torch.long,
+        ).reshape(-1)
+        if window_starts.numel() == 0:
+            return torch.empty(
+                (0, self.seq_len),
+                dtype=torch.long,
+            )
+        offsets = torch.arange(
+            1,
+            self.seq_len + 1,
+            dtype=torch.long,
+        )
+        positions = (
+            window_starts.unsqueeze(1) + offsets.unsqueeze(0)
+        )
+        # right=True 让恰好落在群组起点的位置归入新群组；
+        # clamp 处理前导分隔符（下标 -1）与空 split。
+        ids = (
+            torch.searchsorted(
+                start_tensor,
+                positions.reshape(-1),
+                right=True,
+            )
+            - 1
+        ).clamp_(min=0)
+        return ids.view(positions.shape)
+
+    def fixed_eval_group_ids(
+        self,
+        split: str,
+        batches: int,
+        batch_size: int,
+    ) -> Optional[torch.Tensor]:
+        """全部固定评估窗口的目标 token 群组下标；不可用时 None。"""
+        windows, data = self._eval_windows(split)
+        _ = windows
+        num_starts = len(data) - self.seq_len
+        total_batches = min(batches * batch_size, num_starts)
+        starts = self._ensure_fixed_starts(
+            split,
+            total_batches,
+            num_starts,
+        )
+        return self.group_ids_for_starts(split, starts)
+
     def fixed_eval_batch(
         self,
         split: str,
@@ -6703,21 +6851,11 @@ class ByteDataset:
             num_starts,
         )
 
-        cache = self._fixed_starts.setdefault(
+        starts_all = self._ensure_fixed_starts(
             split,
-            {"total": None, "starts": None},
+            total_batches,
+            num_starts,
         )
-
-        if cache["total"] != total_batches:
-            # 均匀覆盖整个评估流。total_batches <= num_starts，
-            # linspace 的间距不小于 1，round 后不会重复。
-            cache["starts"] = torch.linspace(
-                0,
-                num_starts - 1,
-                steps=total_batches,
-                dtype=torch.float64,
-            ).round().long()
-            cache["total"] = total_batches
 
         cache_key = (
             split,
@@ -6732,7 +6870,7 @@ class ByteDataset:
 
         begin = batch_index * batch_size
         # starts 为 CPU 张量，窗口收集与搬运与训练批一致。
-        starts = cache["starts"][begin:begin + batch_size]
+        starts = starts_all[begin:begin + batch_size]
 
         chunks = self._gather_windows(
             windows,
@@ -12089,6 +12227,649 @@ def _ar1_adjusted_mean_test(
         df,
     )
     return result
+
+
+# ============================================================
+# 文档/群组 cluster bootstrap
+# ============================================================
+
+# 评估窗口不是天然的独立抽样单位：同一文档会被多个重叠窗口
+# 覆盖，同一来源/主题的相邻文档也高度相关。窗口级 bootstrap
+# 把同一文档的重复证据当成独立样本，会系统性低估评估不确定性。
+# 有 --group-separator 时，把每个目标 token 归入其所属群组，
+# 以群组为 resampling unit；没有群组边界时不伪造簇。
+_GROUP_STATS_SCHEMA = "smelt-isr/eval-group-stats/v1"
+_GROUP_ASSIGNMENT = (
+    "split_group_starts_gaps_to_preceding_v1"
+)
+
+
+def _empty_group_stats_state(
+    n_groups: int,
+) -> Dict[str, torch.Tensor]:
+    """逐群组充分统计量的累加缓冲（CPU float64）。"""
+    return {
+        "tokens": torch.zeros(n_groups, dtype=torch.float64),
+        "loss_sum": torch.zeros(n_groups, dtype=torch.float64),
+        "correct": torch.zeros(n_groups, dtype=torch.float64),
+    }
+
+
+def _finalize_group_stats(
+    state: Dict[str, torch.Tensor],
+    *,
+    group_separator_sha256: Optional[str],
+) -> Dict[str, object]:
+    """
+    把逐群组累加缓冲变成可落盘的记录。
+
+    ``groups`` 只保留在固定评估窗口中出现过 token 的群组；
+    每条记录是 ``[group_id, tokens, loss_sum, correct]``。
+    群组 id 是 split 内部的 0 基序号，不含绝对字节位置，
+    因此同一数据协议下的不同运行可以直接按 id 配对。
+    """
+    tokens = state["tokens"].to(torch.float64)
+    loss_sum = state["loss_sum"].to(torch.float64)
+    correct = state["correct"].to(torch.float64)
+    observed = (
+        torch.isfinite(tokens)
+        & torch.isfinite(loss_sum)
+        & torch.isfinite(correct)
+        & (tokens > 0.0)
+    )
+    indices = torch.nonzero(observed, as_tuple=False).reshape(-1)
+    records: List[List[object]] = []
+    for index in indices.tolist():
+        records.append([
+            int(index),
+            float(tokens[index].item()),
+            float(loss_sum[index].item()),
+            float(correct[index].item()),
+        ])
+    return {
+        "schema": _GROUP_STATS_SCHEMA,
+        "assignment": _GROUP_ASSIGNMENT,
+        "unit": "document_group",
+        "group_separator_sha256": group_separator_sha256,
+        "n_groups_total": int(tokens.numel()),
+        "n_groups_observed": len(records),
+        "tokens_observed": float(
+            sum(float(record[1]) for record in records)
+        ),
+        "groups": records,
+        "note": (
+            "group id 是 split 内部 0 基群组序号；分隔符与空群组"
+            "并入前一个群组，前导分隔符并入第一个群组。"
+            "cluster bootstrap 以群组为抽样单位；没有群组边界"
+            "时不生成该记录"
+        ),
+    }
+
+
+def _parse_group_stats(
+    payload: object,
+) -> Optional[Dict[str, object]]:
+    """
+    解析并校验 eval_windows.json 里的 ``group_stats``。
+
+    损坏/缺字段/重复 id/非有限值一律返回 None：不能把无法
+    核对的群组记录当成可用证据。
+    """
+    if not isinstance(payload, dict):
+        return None
+    stats = payload.get("group_stats")
+    if not isinstance(stats, dict):
+        return None
+    if stats.get("schema") != _GROUP_STATS_SCHEMA:
+        return None
+    if stats.get("assignment") != _GROUP_ASSIGNMENT:
+        return None
+    records = stats.get("groups")
+    if not isinstance(records, list) or not records:
+        return None
+    mapping: Dict[int, Tuple[float, float, float]] = {}
+    for record in records:
+        if not isinstance(record, (list, tuple)):
+            return None
+        if len(record) < 4:
+            return None
+        group_id = record[0]
+        if (
+            not isinstance(group_id, int)
+            or isinstance(group_id, bool)
+            or group_id < 0
+        ):
+            return None
+        tokens = _finite_float(record[1])
+        loss_sum = _finite_float(record[2])
+        correct = _finite_float(record[3])
+        if (
+            tokens is None
+            or loss_sum is None
+            or correct is None
+            or tokens <= 0.0
+            or correct < 0.0
+            or correct > tokens + 1e-9
+        ):
+            return None
+        if group_id in mapping:
+            return None
+        mapping[group_id] = (tokens, loss_sum, correct)
+    separator = stats.get("group_separator_sha256")
+    if separator is not None and not isinstance(separator, str):
+        return None
+    return {
+        "mapping": mapping,
+        "group_separator_sha256": separator,
+        "unit": stats.get("unit"),
+    }
+
+
+def _group_stats_bootstrap_ci(
+    point_values: torch.Tensor,
+    weights: torch.Tensor,
+    replicates: int,
+    generator: torch.Generator,
+    ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
+) -> Optional[Tuple[float, float]]:
+    """按群组有放回重采样、再加权平均的分位区间。"""
+    n_groups = int(point_values.numel())
+    if n_groups < 2 or replicates <= 1:
+        return None
+    indices = torch.randint(
+        low=0,
+        high=n_groups,
+        size=(int(replicates), n_groups),
+        generator=generator,
+    )
+    sampled_weights = weights[indices].sum(dim=1)
+    valid = sampled_weights > 0.0
+    if not bool(valid.any()):
+        return None
+    sampled = (
+        (point_values[indices] * weights[indices]).sum(dim=1)
+        / sampled_weights
+    )
+    sampled = sampled[valid]
+    if sampled.numel() == 0:
+        return None
+    low, high = _percentile_interval(sampled, ci_level)
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return None
+    return low, high
+
+
+def _group_cluster_eval_intervals(
+    group_stats: Dict[str, object],
+    replicates: int,
+    seed: int,
+    ci_level: float = _EVAL_BOOTSTRAP_CI_LEVEL,
+) -> Dict[str, object]:
+    """
+    以文档/群组为单位的评估集 cluster bootstrap 区间。
+
+    逐窗口 bootstrap 把同一文档上的重叠窗口当独立样本；本函数
+    用 ``group_stats`` 的逐群组 loss 和/正确数直接重采样群组，
+    给出 token 加权的 loss / ppl / token accuracy 区间。它不
+    替代窗口级区间，而是回答「换一批同分布文档」时点估计有
+    多不确定；没有群组记录时返回不可用。
+    """
+    parsed = _parse_group_stats({
+        "group_stats": group_stats,
+    })
+    if parsed is None:
+        return {
+            "available": False,
+            "reason": "missing_or_invalid_group_stats",
+        }
+    mapping = parsed["mapping"]
+    assert isinstance(mapping, dict)
+    group_ids = sorted(mapping)
+    if len(group_ids) < 2:
+        return {
+            "available": False,
+            "reason": "fewer_than_two_document_groups",
+            "n_groups": len(group_ids),
+        }
+    tokens = torch.tensor(
+        [mapping[group_id][0] for group_id in group_ids],
+        dtype=torch.float64,
+    )
+    loss_sums = torch.tensor(
+        [mapping[group_id][1] for group_id in group_ids],
+        dtype=torch.float64,
+    )
+    correct = torch.tensor(
+        [mapping[group_id][2] for group_id in group_ids],
+        dtype=torch.float64,
+    )
+    loss_point = loss_sums / tokens
+    scale = float(loss_point.abs().max().item())
+    if scale > 1.0e150:
+        loss_scaled = loss_point / scale
+    elif 0.0 < scale < 1.0e-150:
+        # 极小 loss 的加权和可能下溢；归一化后还原。
+        loss_scaled = loss_point / scale
+    else:
+        scale = 1.0
+        loss_scaled = loss_point
+    accuracy_point = correct / tokens
+    generator = torch.Generator().manual_seed(int(seed))
+    loss_interval = _group_stats_bootstrap_ci(
+        loss_scaled,
+        tokens,
+        int(replicates),
+        generator,
+    )
+    accuracy_interval = _group_stats_bootstrap_ci(
+        accuracy_point,
+        tokens,
+        int(replicates),
+        generator,
+    )
+    if loss_interval is None:
+        return {
+            "available": False,
+            "reason": "bootstrap_unavailable",
+            "n_groups": len(group_ids),
+        }
+    low = loss_interval[0] * scale
+    high = loss_interval[1] * scale
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return {
+            "available": False,
+            "reason": "unrepresentable_bounds",
+            "n_groups": len(group_ids),
+        }
+    result: Dict[str, object] = {
+        "available": True,
+        "n_groups": len(group_ids),
+        "tokens": float(tokens.sum().item()),
+        "bootstrap_replicates": int(replicates),
+        "bootstrap_unit": "document_group",
+        "loss_ci95_low": max(0.0, low),
+        "loss_ci95_high": max(0.0, high),
+        "ppl_ci95_low": math.exp(min(80.0, max(0.0, low))),
+        "ppl_ci95_high": math.exp(min(80.0, high)),
+        "method": "group_cluster_percentile_bootstrap",
+        "note": (
+            "以文档/群组为重采样单位的 token 加权区间；"
+            "群组来自 --group-separator。它反映换一批同分布"
+            "文档的评估不确定性，不替代训练种子级检验"
+        ),
+    }
+    if accuracy_interval is not None:
+        result["token_accuracy_ci95_low"] = max(
+            0.0, accuracy_interval[0]
+        )
+        result["token_accuracy_ci95_high"] = min(
+            1.0, accuracy_interval[1]
+        )
+    return result
+
+
+def _group_cluster_paired_comparison(
+    payload_a: Dict[str, object],
+    payload_b: Dict[str, object],
+    include_differences: bool = False,
+) -> Optional[Dict[str, object]]:
+    """
+    两个运行在同一批固定评估窗口上的文档/群组级配对比较。
+
+    两个运行的 ``group_stats`` 必须来自同一群组定义（分隔符
+    指纹与 assignment 版本一致），且共同群组的 token 数逐项
+    相同；否则不是同一批评估单位，直接返回不可用原因。差值 =
+    b − a，按群组内 token 加权汇总；bootstrap 以群组为单位
+    有放回重采样。
+
+    该区间只覆盖「换一批同分布文档」的评估不确定性；训练
+    随机性仍由种子级检验负责。群组数很少时百分位区间很粗，
+    只作描述性证据。
+    """
+    parsed_a = _parse_group_stats(payload_a)
+    parsed_b = _parse_group_stats(payload_b)
+    if parsed_a is None and parsed_b is None:
+        return None
+    if parsed_a is None or parsed_b is None:
+        return {
+            "available": False,
+            "reason": "group_stats_missing_in_one_run",
+        }
+    if (
+        parsed_a["group_separator_sha256"]
+        != parsed_b["group_separator_sha256"]
+    ):
+        return {
+            "available": False,
+            "reason": "group_separator_mismatch",
+        }
+    mapping_a = parsed_a["mapping"]
+    mapping_b = parsed_b["mapping"]
+    assert isinstance(mapping_a, dict)
+    assert isinstance(mapping_b, dict)
+    common = sorted(set(mapping_a) & set(mapping_b))
+    if len(common) < 2:
+        return {
+            "available": False,
+            "reason": "fewer_than_two_common_groups",
+            "n_common_groups": len(common),
+        }
+    tokens: List[float] = []
+    loss_differences: List[float] = []
+    accuracy_differences: List[float] = []
+    for group_id in common:
+        tokens_a, loss_a, correct_a = mapping_a[group_id]
+        tokens_b, loss_b, correct_b = mapping_b[group_id]
+        if not math.isclose(
+            tokens_a,
+            tokens_b,
+            rel_tol=1e-12,
+            abs_tol=0.0,
+        ):
+            return {
+                "available": False,
+                "reason": "group_token_count_mismatch",
+                "group_id": group_id,
+                "tokens_a": tokens_a,
+                "tokens_b": tokens_b,
+            }
+        loss_differences.append(
+            loss_b / tokens_b - loss_a / tokens_a
+        )
+        accuracy_differences.append(
+            correct_b / tokens_b - correct_a / tokens_a
+        )
+        tokens.append(tokens_a)
+    weight_tensor = torch.tensor(
+        tokens,
+        dtype=torch.float64,
+    )
+    difference_tensor = torch.tensor(
+        loss_differences,
+        dtype=torch.float64,
+    )
+    scale = float(difference_tensor.abs().max().item())
+    if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
+        scaled_differences = difference_tensor / scale
+    else:
+        scale = 1.0
+        scaled_differences = difference_tensor
+    generator = torch.Generator().manual_seed(
+        _randomization_seed(loss_differences)
+    )
+    interval = _group_stats_bootstrap_ci(
+        scaled_differences,
+        weight_tensor,
+        _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+        generator,
+    )
+    if interval is None:
+        return {
+            "available": False,
+            "reason": "bootstrap_unavailable",
+            "n_common_groups": len(common),
+        }
+    low = interval[0] * scale
+    high = interval[1] * scale
+    weighted_mean = (
+        float(
+            (
+                difference_tensor * weight_tensor
+            ).sum().item()
+        )
+        / float(weight_tensor.sum().item())
+    )
+    unweighted_mean = sum(loss_differences) / len(
+        loss_differences
+    )
+    accuracy_weights = weight_tensor
+    accuracy_tensor = torch.tensor(
+        accuracy_differences,
+        dtype=torch.float64,
+    )
+    accuracy_interval = _group_stats_bootstrap_ci(
+        accuracy_tensor,
+        accuracy_weights,
+        _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+        torch.Generator().manual_seed(
+            _randomization_seed(accuracy_differences)
+        ),
+    )
+    result: Dict[str, object] = {
+        "available": True,
+        "n_groups": len(common),
+        "tokens": float(weight_tensor.sum().item()),
+        "group_separator_sha256": (
+            parsed_a["group_separator_sha256"]
+        ),
+        "mean_loss_diff": weighted_mean,
+        "unweighted_mean_loss_diff": unweighted_mean,
+        "median_loss_diff": _median(loss_differences),
+        "fraction_groups_better": (
+            sum(
+                1
+                for value in loss_differences
+                if value < 0.0
+            )
+            / len(loss_differences)
+        ),
+        "bootstrap_ci95": {
+            "available": bool(
+                math.isfinite(low) and math.isfinite(high)
+            ),
+            "low": low if math.isfinite(low) else None,
+            "high": high if math.isfinite(high) else None,
+            "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+            "method": "group_cluster_percentile_bootstrap",
+        },
+        "sign_test": _exact_sign_test(loss_differences),
+        "method": "document_group_cluster_bootstrap",
+        "note": (
+            "以文档/群组为单位的配对评估证据；差值按群组内 "
+            "token 加权。群组数少时区间很粗，且与种子级检验"
+            "来自同一批运行，不是独立验证"
+        ),
+    }
+    if accuracy_interval is not None:
+        result["mean_accuracy_diff"] = (
+            float(
+                (
+                    accuracy_tensor * weight_tensor
+                ).sum().item()
+            )
+            / float(weight_tensor.sum().item())
+        )
+        result["accuracy_bootstrap_ci95"] = {
+            "low": max(0.0, accuracy_interval[0]),
+            "high": min(1.0, accuracy_interval[1]),
+            "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+        }
+    if include_differences:
+        result["group_differences"] = [
+            [
+                int(group_id),
+                float(difference),
+                float(token),
+            ]
+            for group_id, difference, token in zip(
+                common,
+                loss_differences,
+                tokens,
+            )
+        ]
+    return result
+
+
+def _hierarchical_group_bootstrap_ci(
+    per_seed_group_differences: Dict[
+        int, Dict[int, Tuple[float, float]]
+    ],
+    replicates: int = _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+) -> Dict[str, object]:
+    """
+    种子 × 文档/群组交叉 design 的两层 cluster bootstrap。
+
+    每个种子给出「群组 → (差值, token 数)」；只保留所有种子
+    都有的群组，并核对 token 数一致。先有放回重采样种子，再
+    对所有抽中的种子共用同一组群组下标做有放回重采样，最后
+    对交叉重采样后的 token 加权差值取种子平均。区间反映
+    「换一批训练种子 + 换一批同分布文档」的联合不确定性。
+    """
+    cleaned: Dict[int, Dict[int, Tuple[float, float]]] = {}
+    for seed, mapping in per_seed_group_differences.items():
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+            or not isinstance(mapping, dict)
+        ):
+            continue
+        entry: Dict[int, Tuple[float, float]] = {}
+        for group_id, value in mapping.items():
+            if (
+                not isinstance(group_id, int)
+                or isinstance(group_id, bool)
+                or group_id < 0
+                or not isinstance(value, (list, tuple))
+                or len(value) < 2
+            ):
+                continue
+            difference = _finite_float(value[0])
+            tokens = _finite_float(value[1])
+            if (
+                difference is None
+                or tokens is None
+                or tokens <= 0.0
+            ):
+                continue
+            entry[int(group_id)] = (difference, tokens)
+        if entry:
+            cleaned[int(seed)] = entry
+    if len(cleaned) < 2:
+        return {
+            "available": False,
+            "reason": "insufficient_seeds_or_groups",
+            "n_seeds": len(cleaned),
+        }
+    seed_order = sorted(cleaned)
+    common_groups = set(cleaned[seed_order[0]])
+    for seed in seed_order[1:]:
+        common_groups &= set(cleaned[seed])
+    group_order = sorted(common_groups)
+    if len(group_order) < 2:
+        return {
+            "available": False,
+            "reason": "insufficient_seeds_or_groups",
+            "n_seeds": len(seed_order),
+            "n_groups": len(group_order),
+        }
+    reference_tokens = [
+        cleaned[seed_order[0]][group_id][1]
+        for group_id in group_order
+    ]
+    for seed in seed_order[1:]:
+        tokens = [
+            cleaned[seed][group_id][1]
+            for group_id in group_order
+        ]
+        if any(
+            not math.isclose(
+                left,
+                right,
+                rel_tol=1e-12,
+                abs_tol=0.0,
+            )
+            for left, right in zip(reference_tokens, tokens)
+        ):
+            return {
+                "available": False,
+                "reason": "group_token_count_mismatch",
+                "n_seeds": len(seed_order),
+                "n_groups": len(group_order),
+            }
+    seed_count = len(seed_order)
+    group_count = len(group_order)
+    values = torch.tensor(
+        [
+            [
+                cleaned[seed][group_id][0]
+                for group_id in group_order
+            ]
+            for seed in seed_order
+        ],
+        dtype=torch.float64,
+    )
+    tokens = torch.tensor(
+        reference_tokens,
+        dtype=torch.float64,
+    )
+    scale = float(values.abs().max().item())
+    if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
+        values = values / scale
+    else:
+        scale = 1.0
+    generator = torch.Generator().manual_seed(
+        _randomization_seed(
+            [
+                value
+                for row in values.tolist()
+                for value in row
+            ]
+            + reference_tokens
+        )
+    )
+    seed_indices = torch.randint(
+        low=0,
+        high=seed_count,
+        size=(int(replicates), seed_count),
+        generator=generator,
+    )
+    group_indices = torch.randint(
+        low=0,
+        high=group_count,
+        size=(int(replicates), group_count),
+        generator=generator,
+    )
+    sampled_groups = group_indices
+    sampled_tokens = tokens[sampled_groups]
+    sampled_total = sampled_tokens.sum(dim=1)
+    seed_means = torch.empty(
+        (int(replicates), seed_count),
+        dtype=torch.float64,
+    )
+    for column in range(seed_count):
+        sampled_values = values[column][sampled_groups]
+        seed_means[:, column] = (
+            (sampled_values * sampled_tokens).sum(dim=1)
+            / sampled_total
+        )
+    draws = (
+        torch.gather(seed_means, 1, seed_indices).mean(dim=1)
+        * scale
+    )
+    low = float(torch.quantile(draws, 0.025).item())
+    high = float(torch.quantile(draws, 0.975).item())
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return {
+            "available": False,
+            "reason": "unrepresentable_bounds",
+            "n_seeds": seed_count,
+            "n_groups": group_count,
+        }
+    return {
+        "available": True,
+        "low": low,
+        "high": high,
+        "replicates": int(replicates),
+        "n_seeds": seed_count,
+        "n_groups": group_count,
+        "method": "crossed_seed_group_percentile_bootstrap",
+        "resampling": "seeds_and_document_groups_with_replacement",
+        "note": (
+            "同时反映训练种子与文档/群组两层不确定性；"
+            "群组按可交换单位重采样。种子或群组数很少时"
+            "百分位区间很粗，只作描述性证据"
+        ),
+    }
 
 
 def _bootstrap_window_indices(
