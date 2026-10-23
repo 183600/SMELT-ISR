@@ -7766,6 +7766,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(1.0, 1.0, 2.0, 1e-5),
         )
 
+    def test_t_power_matches_noncentral_t_reference_near_df_one(self):
+        # df<3 时 chi 密度在 0 附近有弱奇异项 u^(df-1)；固定 u
+        # 网格的 Simpson 会少积概率质量。以下参考值由高精度
+        # 非中心 t 积分得到，修复前 df=1.1 的误差约 4.4%。
+        for effect, df, expected in (
+            (0.05, 1.01, 0.050062837107652636),
+            (0.05, 1.1, 0.050068256192849915),
+            (0.05, 1.5, 0.050091063051014614),
+            (0.2, 2.0, 0.051850694985949765),
+            (2.0, 2.5, 0.256924795068195),
+        ):
+            self.assertAlmostEqual(
+                experiment._t_power(effect, 1.0, df, 0.05),
+                expected,
+                delta=1e-8,
+            )
+
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
             [1, 1, 1, 1, 1, 1], False

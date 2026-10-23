@@ -27787,13 +27787,72 @@ def _t_power_nodes(
 
     积分区间上界取 chi 分布众数 sqrt(df-1) 加 _T_POWER_TAIL
     （chi 分布的宽度约 1/√2，右尾可安全截断）；节点数随区间
-    长度自适应，保证 df 从 2 到数千都足够精确。
+    长度自适应，保证 df 从 0.5 到数千都足够精确。
+
+    对 df<3，chi 密度在 u=0 附近以 u^(df-1) 变化；df 接近 1
+    时导数无界，固定 u 网格上的 Simpson 会少积概率质量
+    （df=1.1 时功效误差可达 4%）。此时改用 u=t^p：积分变为
+    t^(p·df-1)·exp(-t^(2p)/2)·p 的形式，选 p 使 p·df-1≥2，
+    被积函数在 0 附近足够光滑，再在 t 网格上做 Simpson。
+    df≥3 时原网格误差已很小，保持历史路径与数值。
 
     返回 (u_i, simpson_weight_i · g(u_i))；密度用对数域计算，
     df 较大时也不会溢出。
     """
     mode = math.sqrt(df - 1.0) if df > 1.0 else 0.0
     u_max = mode + _T_POWER_TAIL
+    log_gamma = math.lgamma(df / 2.0)
+    log_const = (1.0 - df / 2.0) * math.log(2.0) - log_gamma
+
+    if df < 3.0:
+        exponent = max(
+            5, min(1000, int(math.ceil(3.0 / df)))
+        )
+        t_max = u_max ** (1.0 / exponent)
+        intervals = max(
+            _T_POWER_MIN_INTERVALS,
+            math.ceil(t_max * 24.0),
+        )
+        intervals = min(intervals, _T_POWER_MAX_INTERVALS)
+        if intervals % 2:
+            intervals += 1
+
+        step = t_max / intervals
+        u_values: List[float] = []
+        weighted: List[float] = []
+        for index in range(intervals + 1):
+            t = index * step
+            u = t ** exponent
+            if index == 0 or index == intervals:
+                simpson = step / 3.0
+            elif index % 2 == 0:
+                simpson = 2.0 * step / 3.0
+            else:
+                simpson = 4.0 * step / 3.0
+
+            if u <= 0.0:
+                # df==1 时 g(0)=sqrt(2/π)；df>1 时 u^(df-1)=0。
+                density = (
+                    math.sqrt(2.0 / math.pi)
+                    if df == 1.0
+                    else 0.0
+                )
+            else:
+                density = math.exp(
+                    log_const
+                    + (df - 1.0) * math.log(u)
+                    - u * u / 2.0
+                )
+            jacobian = (
+                exponent * t ** (exponent - 1)
+                if t > 0.0
+                else 0.0
+            )
+            u_values.append(u)
+            weighted.append(simpson * density * jacobian)
+
+        return tuple(u_values), tuple(weighted)
+
     intervals = max(
         _T_POWER_MIN_INTERVALS,
         math.ceil(u_max * 24.0),
@@ -27803,11 +27862,8 @@ def _t_power_nodes(
         intervals += 1
 
     step = u_max / intervals
-    log_gamma = math.lgamma(df / 2.0)
-    log_const = (1.0 - df / 2.0) * math.log(2.0) - log_gamma
-
-    u_values: List[float] = []
-    weighted: List[float] = []
+    u_values = []
+    weighted = []
     for index in range(intervals + 1):
         u = index * step
         if index == 0 or index == intervals:
@@ -27876,12 +27932,16 @@ def _t_power(
     noncentrality = effect_value / se_value
     scale = critical / math.sqrt(df_value)
 
-    if scale > 10.0:
-        # alpha 很小 / df 很小时临界值巨大，固定 u 网格在
+    if scale > 10.0 and df_value >= 3.0:
+        # alpha 很小 / df 较小时临界值巨大，固定 u 网格在
         # u≈0 附近完全分辨不出被积函数的尖峰，会低估功效。
         # 换到 w = scale·u 后按 w 做 Simpson：被积函数在
         # w≈0 附近变成多项式尺度，且 w > δ+12 后正态尾概率
         # 已可忽略，可安全截断。
+        #
+        # df<3 时改走 ``_t_power_nodes`` 的 t=u^(1/p) 变换：
+        # chi 密度在 0 附近的弱奇异项已被变换吸收，既不依赖
+        # 固定 u 网格，也不需要尖峰尺度重参数化。
         u_max = (
             math.sqrt(df_value - 1.0) + _T_POWER_TAIL
             if df_value > 1.0
