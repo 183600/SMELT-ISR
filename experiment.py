@@ -27642,8 +27642,8 @@ def _t_critical(
     except (TypeError, ValueError, OverflowError):
         return None
     if (
-        df_value <= 0.0
-        or not math.isfinite(df_value)
+        math.isnan(df_value)
+        or df_value <= 0.0
         or not math.isfinite(alpha_value)
         or not 0.0 < alpha_value < 1.0
     ):

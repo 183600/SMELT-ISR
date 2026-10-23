@@ -7841,6 +7841,20 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_t_critical_supports_normal_limit(self):
+        normal_critical = 1.959963984540054
+        self.assertAlmostEqual(
+            experiment._t_critical(float("inf")),
+            normal_critical,
+            delta=1e-12,
+        )
+        self.assertAlmostEqual(
+            experiment._t_critical(1.0e16),
+            normal_critical,
+            delta=1e-12,
+        )
+        self.assertIsNone(experiment._t_critical(float("nan")))
+
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
             [1, 1, 1, 1, 1, 1], False
