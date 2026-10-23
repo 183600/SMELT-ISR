@@ -30015,7 +30015,9 @@ def factor_contrasts(
 
             noise_ratio = None
             if delta is not None and pooled_std:
-                noise_ratio = abs(delta) / pooled_std
+                candidate = abs(delta) / pooled_std
+                if math.isfinite(candidate):
+                    noise_ratio = candidate
 
             test = _contrast_test(samples_a, samples_b)
 
@@ -30036,6 +30038,9 @@ def factor_contrasts(
                 noise_ratio * hedges_correction
                 if noise_ratio is not None
                 and hedges_correction is not None
+                and math.isfinite(
+                    noise_ratio * hedges_correction
+                )
                 else None
             )
             # 展示的样本数按独立种子口径（伪重复折叠后），

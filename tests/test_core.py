@@ -7210,6 +7210,32 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(contrast["verdict"], "missing_metric")
         json.dumps(contrast, allow_nan=False)
 
+    def test_contrast_noise_ratio_overflow_is_treated_as_missing(self):
+        def cell(mode, mean, std):
+            return {
+                "label": mode,
+                "keys": {"mode": mode},
+                "samples": {"val_loss": []},
+                "val_loss_mean": mean,
+                "val_loss_std": std,
+                "n_runs": 0,
+                "effective_seed_count": 0,
+                "costs": {},
+            }
+
+        contrast = experiment.factor_contrasts(
+            [
+                cell("A", 0.0, 1.0e-154),
+                cell("B", 1.0e308, 1.0e-154),
+            ],
+            ["mode"],
+            "val_loss",
+        )[0]
+        self.assertEqual(contrast["delta"], 1.0e308)
+        self.assertIsNone(contrast["delta_over_noise"])
+        self.assertIsNone(contrast["hedges_g"])
+        json.dumps(contrast, allow_nan=False)
+
     def test_window_analysis_cross_seed_mean_does_not_overflow(self):
         def payload(loss_sum):
             return {
