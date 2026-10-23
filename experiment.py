@@ -31799,7 +31799,7 @@ def _contrast_display(
     if delta is None:
         delta_text = "Δ=NA"
     else:
-        delta_text = f"Δ={float(delta):+.4f}"
+        delta_text = f"Δ={_format_finite(delta, '+.4f')}"
 
     if test == "paired_t":
         test_text = f"配对 t (n={n_pairs})"
@@ -31808,17 +31808,20 @@ def _contrast_display(
     else:
         test_text = "种子不足"
 
+    p_value_number = _finite_float(p_value)
     if p_value is None:
         p_text = "p=NA"
     else:
-        p_text = f"p={float(p_value):.4f}"
+        p_text = f"p={_format_finite(p_value)}"
         # 家族内做了多重比较校正时，展示校正后的 p 值；
         # 单检验家族（或未参与校正）时两者相同，不重复。
+        p_holm_number = _finite_float(p_holm)
         if (
-            p_holm is not None
-            and abs(float(p_holm) - float(p_value)) > 1e-9
+            p_holm_number is not None
+            and p_value_number is not None
+            and abs(p_holm_number - p_value_number) > 1e-9
         ):
-            p_text += f"(Holm {float(p_holm):.4f})"
+            p_text += f"(Holm {_format_finite(p_holm)})"
         randomization_p = contrast.get(
             "randomization_p_value"
         )
@@ -31827,17 +31830,26 @@ def _contrast_display(
                 "randomization_p_value_holm"
             )
             randomization_text = (
-                f"符号翻转 p={float(randomization_p):.4f}"
+                "符号翻转 p="
+                f"{_format_finite(randomization_p)}"
+            )
+            randomization_p_number = _finite_float(
+                randomization_p
+            )
+            randomization_holm_number = _finite_float(
+                randomization_holm
             )
             if (
-                randomization_holm is not None
+                randomization_holm_number is not None
+                and randomization_p_number is not None
                 and abs(
-                    float(randomization_holm)
-                    - float(randomization_p)
+                    randomization_holm_number
+                    - randomization_p_number
                 ) > 1e-9
             ):
                 randomization_text += (
-                    f"(Holm {float(randomization_holm):.4f})"
+                    "(Holm "
+                    f"{_format_finite(randomization_holm)})"
                 )
             # 只在小样本精确检验或两种检验结论不一致时展示，
             # 避免每行都堆叠两种 p 值；不一致是必须暴露的
@@ -31852,8 +31864,9 @@ def _contrast_display(
     star = "*" if contrast.get("significant") else ""
 
     noise = contrast.get("delta_over_noise")
+    noise_number = _finite_float(noise)
     noise_text = (
-        f" 噪声比={float(noise):.2f}"
+        f" 噪声比={_format_finite(noise, '.2f')}"
         if noise is not None
         else ""
     )
@@ -31861,16 +31874,21 @@ def _contrast_display(
     # 达 43%，同时展示才不会把 d 当成真实效应大小。
     hedges = contrast.get("hedges_g")
     if noise is not None and hedges is not None:
-        noise_text += f"（Hedges g={float(hedges):.2f}）"
+        noise_text += (
+            f"（Hedges g={_format_finite(hedges, '.2f')}）"
+        )
     # 配对设计的标准化效应必须用差值标准差（dz），不能用
     # 合并标准差；共同种子难度会把合并标准差抬高、把效应
     # 系统性压低。非配对对比没有该字段，不打印。
     dz = contrast.get("cohens_dz")
     if dz is not None:
-        dz_text = f"；配对 dz={float(dz):.2f}"
+        dz_text = f"；配对 dz={_format_finite(dz, '.2f')}"
         dz_hedges = contrast.get("hedges_gz")
         if dz_hedges is not None:
-            dz_text += f"（Hedges gz={float(dz_hedges):.2f}）"
+            dz_text += (
+                "（Hedges gz="
+                f"{_format_finite(dz_hedges, '.2f')}）"
+            )
         noise_text += dz_text
     # 种子集合不完全相同时，主检验是 Welch；共同种子上的
     # 配对敏感性能说明丢掉配对是否改变了结论，但缺失机制
@@ -31888,16 +31906,22 @@ def _contrast_display(
             f"（n={partial.get('n_common')}"
         )
         if isinstance(partial_effect, (int, float)):
-            partial_text += f", Δ={float(partial_effect):+.4f}"
+            partial_text += (
+                f", Δ={_format_finite(partial_effect, '+.4f')}"
+            )
         if isinstance(partial_p, (int, float)):
-            partial_text += f", p={float(partial_p):.4f}"
+            partial_text += (
+                f", p={_format_finite(partial_p)}"
+            )
         partial_text += "，不替代主检验）"
         noise_text += partial_text
 
     ci_low = contrast.get("ci95_low")
     ci_high = contrast.get("ci95_high")
     ci_text = (
-        f" 95%CI=[{float(ci_low):+.4f},{float(ci_high):+.4f}]"
+        " 95%CI=["
+        f"{_format_finite(ci_low, '+.4f')},"
+        f"{_format_finite(ci_high, '+.4f')}]"
         if ci_low is not None and ci_high is not None
         else ""
     )
@@ -31916,8 +31940,9 @@ def _contrast_display(
         and adjusted_family > 1
     ):
         ci_text += (
-            f"；同时95%CI=[{float(adjusted_low):+.4f},"
-            f"{float(adjusted_high):+.4f}]"
+            "；同时95%CI=["
+            f"{_format_finite(adjusted_low, '+.4f')},"
+            f"{_format_finite(adjusted_high, '+.4f')}]"
             f"(Bonferroni α/{adjusted_family}，比Holm保守)"
         )
 
@@ -31950,7 +31975,7 @@ def _contrast_display(
     # 声称提升，并区分「本来就不显著」与「校正后翻转」。
     caveat = ""
     if contrast.get("significant"):
-        if noise is not None and float(noise) < 1.0:
+        if noise_number is not None and noise_number < 1.0:
             caveat = "（差值小于典型种子波动，实际意义存疑）"
     elif (
         contrast.get("significant_raw")
@@ -32005,9 +32030,10 @@ def _contrast_display(
             ):
                 caveat += (
                     f"（脆弱：删除 {deleted} 个种子后 "
-                    f"p={float(deleted_p):.4f}"
+                    f"p={_format_finite(deleted_p)}"
                     + (
-                        f" > alpha={float(alpha_value):.4f}"
+                        " > alpha="
+                        f"{_format_finite(alpha_value)}"
                         if isinstance(
                             alpha_value, (int, float)
                         )
@@ -32032,7 +32058,8 @@ def _contrast_display(
             sign_test = _as_dict(fragility.get("sign_test"))
             caveat += (
                 "（方向混合：配对差值并非多数同向，"
-                f"符号检验 p={float(sign_test.get('p_value')):.4f}"
+                "符号检验 p="
+                f"{_format_finite(sign_test.get('p_value'))}"
                 if isinstance(sign_test.get("p_value"), (int, float))
                 else "（方向混合：配对差值并非多数同向"
             )
@@ -32046,7 +32073,8 @@ def _contrast_display(
         minimum = contrast.get("randomization_min_attainable_p")
         caveat += (
             "（精确符号翻转检验的最小可达双侧 p="
-            f"{float(minimum):.3f}（n={contrast.get('n_pairs')}），"
+            f"{_format_finite(minimum, '.3f')}"
+            f"（n={contrast.get('n_pairs')}），"
             "该样本量在数学上无法达到 0.05 显著；"
             "不显著不能解读为无效应，请增加独立种子）"
         )
@@ -32060,13 +32088,14 @@ def _contrast_display(
         margin_abs = contrast.get("equivalence_margin_abs")
         if contrast.get("equivalent"):
             margin_text = (
-                f"±{float(margin_abs):.4f}"
+                f"±{_format_finite(margin_abs)}"
                 if isinstance(margin_abs, (int, float))
                 else "等价界内"
             )
             tost_holm = contrast.get("tost_p_value_holm")
             tost_text = (
-                f"，Holm p={float(tost_holm):.3f}"
+                "，Holm p="
+                f"{_format_finite(tost_holm, '.3f')}"
                 if isinstance(tost_holm, (int, float))
                 else ""
             )
@@ -32082,7 +32111,8 @@ def _contrast_display(
         elif not contrast.get("significant"):
             mde = contrast.get("mde_80")
             mde_text = (
-                f"80% 功效下只能检出 |Δ|≥{float(mde):.4f}，"
+                "80% 功效下只能检出 |Δ|≥"
+                f"{_format_finite(mde)}，"
                 if isinstance(mde, (int, float))
                 else ""
             )
@@ -32112,7 +32142,8 @@ def _contrast_display(
             ):
                 family_text = (
                     f"（家族 m={family_size} 的保守口径：Holm 首步"
-                    f"alpha/m 下 MDE={float(mde_family):.4f}"
+                    "alpha/m 下 MDE="
+                    f"{_format_finite(mde_family)}"
                 )
                 seeds_family = contrast.get(
                     "seeds_to_detect_bonferroni"
@@ -32154,7 +32185,7 @@ def _contrast_display(
                 continue
             part = (
                 f"{_COST_FIELD_LABELS[field]}"
-                f"×{float(ratios[field]):.2f}"
+                f"×{_format_finite(ratios[field], '.2f')}"
             )
             detail = (
                 uncertainty.get(field)
@@ -32165,8 +32196,9 @@ def _contrast_display(
                 interval = detail.get("ratio_ci95")
                 if isinstance(interval, list):
                     part += (
-                        f" [{float(interval[0]):.2f},"
-                        f"{float(interval[1]):.2f}]"
+                        " ["
+                        f"{_format_finite(interval[0], '.2f')},"
+                        f"{_format_finite(interval[1], '.2f')}]"
                     )
                 elif field in _COST_TIMING_FIELDS:
                     part += "（无重复计时）"

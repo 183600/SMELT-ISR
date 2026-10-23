@@ -8085,6 +8085,44 @@ class NumericalScaleTests(unittest.TestCase):
             )
         self.assertNotIn("10" * 50, output.getvalue())
 
+    def test_contrast_display_tolerates_huge_numbers(self):
+        display = experiment._contrast_display({
+            "factor": "mode",
+            "baseline_value": "smelt",
+            "variant_value": "A",
+            "delta": 10 ** 400,
+            "p_value": 10 ** 400,
+            "p_value_holm": 10 ** 400,
+            "test": "paired_t",
+            "n_pairs": 3,
+            "delta_over_noise": 10 ** 400,
+            "hedges_g": 10 ** 400,
+            "cohens_dz": 10 ** 400,
+            "hedges_gz": 10 ** 400,
+            "ci95_low": 10 ** 400,
+            "ci95_high": 10 ** 400,
+            "ci_family_adjusted_low": 10 ** 400,
+            "ci_family_adjusted_high": 10 ** 400,
+            "ci_family_adjusted_family_size": 2,
+            "window_paired": {
+                "available": True,
+                "mean_loss_diff": 10 ** 400,
+            },
+            "fragility": {
+                "available": True,
+                "verdict": "fragile",
+                "min_seed_deletions_to_lose_significance": 1,
+                "min_seed_deletions_p_value": 10 ** 400,
+                "alpha": 10 ** 400,
+            },
+            "equivalent": True,
+            "equivalence_margin_abs": 10 ** 400,
+            "tost_p_value_holm": 10 ** 400,
+            "significant": True,
+        }, "val_loss")
+        self.assertIn("mode: smelt→A", display)
+        self.assertIn("Δ=-", display)
+
     def test_curve_print_tolerates_huge_numbers(self):
         analysis = {
             "status": "healthy",
