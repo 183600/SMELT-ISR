@@ -19938,21 +19938,36 @@ def _safe_ratio(
     """两个有限数的比值；缺失、除零或结果不可表示时返回 None。"""
     if numerator is None or denominator is None:
         return None
-    try:
-        left = float(numerator)
-        right = float(denominator)
-    except (TypeError, ValueError, OverflowError):
-        return None
     if (
-        not math.isfinite(left)
-        or not math.isfinite(right)
-        or right == 0.0
+        isinstance(numerator, int)
+        and not isinstance(numerator, bool)
+        and isinstance(denominator, int)
+        and not isinstance(denominator, bool)
     ):
-        return None
-    try:
-        ratio = left / right
-    except OverflowError:
-        return None
+        if denominator == 0:
+            return None
+        try:
+            # 两个超大但同量级的整数计数可以直接相除；
+            # 先各自转 float 会无谓地丢掉可表示的倍率。
+            ratio = numerator / denominator
+        except (OverflowError, ValueError):
+            return None
+    else:
+        try:
+            left = float(numerator)
+            right = float(denominator)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(left)
+            or not math.isfinite(right)
+            or right == 0.0
+        ):
+            return None
+        try:
+            ratio = left / right
+        except OverflowError:
+            return None
     if not math.isfinite(ratio):
         return None
     return round(ratio, 6)
@@ -21114,9 +21129,10 @@ def selection_bias_report(
         high = max(counts)
         if high > low:
             try:
-                ratio = (
-                    float(high) / float(low) if low > 0 else None
-                )
+                # 直接做整数真除法：两个超大但同量级的计数
+                # 仍可能给出可表示的倍率，只有倍率本身越过
+                # float 上限时才省略。
+                ratio = high / low if low > 0 else None
             except (OverflowError, ValueError):
                 ratio = None
             if ratio is not None and not math.isfinite(ratio):

@@ -7999,6 +7999,26 @@ class NumericalScaleTests(unittest.TestCase):
             rows, "val_loss"
         )
         self.assertIsNone(report["opportunity_imbalance"]["ratio"])
+        same_scale = [
+            {
+                "run": "a",
+                "mode": "A",
+                "selected_model": "best_val",
+                "curve_n_eval_points": 10 ** 400,
+            },
+            {
+                "run": "b",
+                "mode": "A",
+                "selected_model": "best_val",
+                "curve_n_eval_points": 10 ** 399,
+            },
+        ]
+        report = experiment.selection_bias_report(
+            same_scale, "val_loss"
+        )
+        self.assertEqual(
+            report["opportunity_imbalance"]["ratio"], 10.0
+        )
 
     def test_extended_split_near_duplicate_reason_is_counted(self):
         spans, stats = experiment._plan_train_near_duplicate_cleaning(
@@ -8084,6 +8104,19 @@ class NumericalScaleTests(unittest.TestCase):
                 metric="val_loss",
             )
         self.assertNotIn("10" * 50, output.getvalue())
+
+    def test_safe_ratio_keeps_representable_huge_int_ratio(self):
+        self.assertEqual(
+            experiment._safe_ratio(10 ** 400, 10 ** 399),
+            10.0,
+        )
+        self.assertEqual(
+            experiment._safe_ratio(10 ** 400, 10 ** 400),
+            1.0,
+        )
+        self.assertIsNone(
+            experiment._safe_ratio(10 ** 400, 1)
+        )
 
     def test_contrast_display_tolerates_huge_numbers(self):
         display = experiment._contrast_display({
