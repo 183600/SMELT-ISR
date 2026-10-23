@@ -27565,6 +27565,32 @@ def _welch_t_test(
             if se is not None:
                 scaled["se"] = se * max_abs
         return scaled
+    if max_abs > 1.0e150:
+        # 极大尺度下方差/离差平方会溢出成 inf，不能把合法数据
+        # 误判成 invalid_values；t 检验本身对公共尺度不变。
+        # 还原效应与标准误时若越过 float 上限则置空，不能写 inf。
+        scaled = _welch_t_test(
+            [value / max_abs for value in values_a],
+            [value / max_abs for value in values_b],
+        )
+        if scaled.get("test") == "welch_t":
+            effect = _finite_float(scaled.get("effect"))
+            se = _finite_float(scaled.get("se"))
+            if effect is not None:
+                rescaled_effect = effect * max_abs
+                scaled["effect"] = (
+                    rescaled_effect
+                    if math.isfinite(rescaled_effect)
+                    else None
+                )
+            if se is not None:
+                rescaled_se = se * max_abs
+                scaled["se"] = (
+                    rescaled_se
+                    if math.isfinite(rescaled_se)
+                    else None
+                )
+        return scaled
     mean_a = _mean(values_a)
     mean_b = _mean(values_b)
     if mean_a is None or mean_b is None:

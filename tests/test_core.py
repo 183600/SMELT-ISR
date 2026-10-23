@@ -7304,13 +7304,16 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )["note"],
             "zero_variance",
         )
-        self.assertEqual(
-            experiment._welch_t_test(
-                [0.0, 1e200, 2e200],
-                [0.0, 1e200, 2e200],
-            )["test"],
-            "invalid_values",
+        identical_large = experiment._welch_t_test(
+            [0.0, 1e200, 2e200],
+            [0.0, 1e200, 2e200],
         )
+        self.assertEqual(identical_large["test"], "welch_t")
+        self.assertEqual(identical_large["t"], 0.0)
+        self.assertEqual(identical_large["p_value"], 1.0)
+        self.assertEqual(identical_large["effect"], 0.0)
+        self.assertIsNotNone(identical_large["se"])
+        json.dumps(identical_large, allow_nan=False)
         # 符号翻转统计量对尺度不变：同一组大到 1e308 的差值
         # 不能因求和溢出而被误判成退化的 p=1。
         sign = experiment._paired_sign_flip_test(
@@ -7881,6 +7884,49 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             normal["se"],
             places=12,
         )
+
+    def test_welch_test_preserves_large_scale(self):
+        base_a = [1.0, 2.0, 3.0, 4.0, 5.0]
+        base_b = [1.1, 2.1, 3.1, 4.1, 5.1]
+        normal = experiment._welch_t_test(base_a, base_b)
+        for scale in (1.0e154, 1.0e200, 1.0e300):
+            large = experiment._welch_t_test(
+                [value * scale for value in base_a],
+                [value * scale for value in base_b],
+            )
+            self.assertEqual(large["test"], "welch_t")
+            self.assertAlmostEqual(
+                large["t"], normal["t"], places=12
+            )
+            self.assertAlmostEqual(
+                large["p_value"], normal["p_value"], places=12
+            )
+            self.assertAlmostEqual(
+                large["df"], normal["df"], places=12
+            )
+            self.assertAlmostEqual(
+                large["effect"] / scale,
+                normal["effect"],
+                places=12,
+            )
+            self.assertAlmostEqual(
+                large["se"] / scale,
+                normal["se"],
+                places=12,
+            )
+
+    def test_welch_test_omits_unrepresentable_effect(self):
+        result = experiment._welch_t_test(
+            [-1.0e308, -1.0e308, -1.0e308],
+            [1.0e308, 1.0e308, 1.0e308],
+        )
+        self.assertEqual(result["test"], "welch_t")
+        self.assertEqual(
+            result["note"], "noise_free_separation"
+        )
+        self.assertIsNone(result["effect"])
+        self.assertEqual(result["se"], 0.0)
+        json.dumps(result, allow_nan=False)
 
     def test_bad_case_ignores_invalid_confusion_pairs(self):
         report = experiment.bad_case_comparison_report([{
