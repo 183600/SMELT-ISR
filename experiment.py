@@ -12401,9 +12401,12 @@ def _group_stats_bootstrap_ci(
     if n_groups < 2 or replicate_count <= 1:
         return None
     if (
-        int(weights.numel()) != n_groups
+        point_values.dim() != 1
+        or weights.dim() != 1
+        or int(weights.numel()) != n_groups
         or not bool(torch.isfinite(point_values).all())
         or not bool(torch.isfinite(weights).all())
+        or bool((weights < 0.0).any())
     ):
         return None
     max_weight = float(weights.abs().max().item())
