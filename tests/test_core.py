@@ -7841,6 +7841,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_curve_diagnostics_sanitizes_nonfinite_metrics(self):
+        report = experiment.curve_diagnostics_report([{
+            "run": "damaged",
+            "mode": "A",
+            "seed": 1,
+            "curve_available": True,
+            "curve_status": "overfitting",
+            "curve_best_val_loss": float("inf"),
+            "curve_recent_train_drop": float("nan"),
+            "curve_n_eval_points": 4,
+            "curve_gap_widening_warning": True,
+        }])
+        run = report["runs"][0]
+        self.assertIsNone(run["best_val_loss"])
+        self.assertIsNone(run["recent_train_drop"])
+        self.assertEqual(run["n_eval_points"], 4)
+        self.assertTrue(run["gap_widening_warning"])
+        json.dumps(report, allow_nan=False)
+
     def test_t_critical_supports_normal_limit(self):
         normal_critical = 1.959963984540054
         self.assertAlmostEqual(

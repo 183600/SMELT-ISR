@@ -22372,7 +22372,7 @@ def curve_diagnostics_report(
             "seed": row.get("seed"),
             "status": row.get("curve_status"),
             **{
-                key: row.get(f"curve_{key}")
+                key: _json_safe(row.get(f"curve_{key}"))
                 for key in _CURVE_ROW_FIELDS
             },
         }
