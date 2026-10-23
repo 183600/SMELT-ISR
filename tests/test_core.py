@@ -614,6 +614,30 @@ class StatisticsTests(unittest.TestCase):
             len(summary["attrition_unstable_effects"]), 1
         )
 
+    def test_component_summary_downgrades_nonrobust_attrition_sign(self):
+        effect = {
+            "effect_name": "delayed_merge_main",
+            "delayed_mode": "A",
+            "claim": "supports_component",
+            "mean_effect": -0.1,
+            "p_value_holm": 0.01,
+            "significant": True,
+            "equivalent": False,
+            "n_pairs": 6,
+            "fragility": {"verdict": "stable"},
+            "attrition_bounds": {
+                "verdict": "complete_cases",
+                "sign_robust": False,
+                "observed_effect_within_bounds": False,
+            },
+        }
+        summary = experiment._component_evidence_summary([effect])
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertIn("符号", summary["reason"])
+        self.assertEqual(
+            len(summary["attrition_unstable_effects"]), 1
+        )
+
     def test_ablation_verdict_downgrades_attrition_unstable_simple_effect(self):
         def effect(name, attrition_verdict):
             return {

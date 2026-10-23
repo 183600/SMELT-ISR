@@ -31169,6 +31169,7 @@ def _component_evidence_summary(
         for summary in summaries
         if summary.get("attrition_verdict")
         in {"crosses_zero", "unbounded"}
+        or summary.get("attrition_sign_robust") is False
     ]
 
     if any(claim in _COMPONENT_BLOCKING_CLAIMS for claim in claims):
@@ -31201,10 +31202,12 @@ def _component_evidence_summary(
                 "status": "inconclusive",
                 "reason": (
                     "效应校正后显著，但在观测支持范围内给缺失/"
-                    "失败运行取极端值时方向可能反转（attrition_"
-                    "bounds 跨 0 或无界）：完整案例的结论可能由"
-                    "「哪些运行留下了」驱动，不能作为组件有用的"
-                    "稳健证据；应补齐运行或报告失败率与部分识别界"
+                    "失败运行取极端值时方向可能反转，或界的符号"
+                    "与配对点估计不一致（attrition_bounds 跨 0、"
+                    "无界或 sign_robust=false）：完整案例的结论"
+                    "可能由「哪些运行留下了」驱动，不能作为组件"
+                    "有用的稳健证据；应补齐运行或报告失败率与"
+                    "部分识别界"
                 ),
                 "evidence": summaries,
                 "attrition_unstable_effects": attrition_unstable,
