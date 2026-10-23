@@ -6742,6 +6742,44 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(result["test"], "invalid_values")
         json.dumps(result, allow_nan=False)
 
+    def test_linear_effect_common_seeds_does_not_overflow(self):
+        # 交互项系数 (+1,-1,-1,+1) 下，四个 1e308/-1e308 的
+        # 真实线性组合为 0；顺序累加会在第二步溢出成 inf，
+        # 必须按尺度缩放后保留真实相消。
+        def cell(value):
+            return {
+                "samples": {
+                    "val_loss": [
+                        {"seed": seed, "value": value}
+                        for seed in (1, 2, 3)
+                    ],
+                },
+                "val_loss_mean": value,
+            }
+
+        cells = {
+            "L_off": cell(1.0e308),
+            "L_on": cell(-1.0e308),
+            "M_off": cell(1.0e308),
+            "M_on": cell(-1.0e308),
+        }
+        result = experiment._paired_linear_effect(
+            cells,
+            {
+                "L_off": 1.0,
+                "L_on": -1.0,
+                "M_off": -1.0,
+                "M_on": 1.0,
+            },
+            "val_loss",
+        )
+        self.assertEqual(result["effect"], 0.0)
+        self.assertEqual(result["test"], "paired_t")
+        self.assertEqual(
+            result["paired_differences"], [0.0, 0.0, 0.0]
+        )
+        json.dumps(result, allow_nan=False)
+
     def test_factorial_reference_mean_does_not_overflow(self):
         def cell(mode, balance, mean):
             return {

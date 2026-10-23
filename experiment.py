@@ -28901,9 +28901,32 @@ def _paired_linear_effect(
     seed_keys = sorted(common, key=str)
     first_cell = next(iter(maps.values()))
     for seed_key in seed_keys:
+        terms: List[float] = []
         total = 0.0
         for cell_key, coefficient in coefficients.items():
-            total += coefficient * maps[cell_key][seed_key][1]
+            term = (
+                coefficient
+                * maps[cell_key][seed_key][1]
+            )
+            terms.append(term)
+            total += term
+        # 主效应/交互的线性组合可能先出现同号中间和再相消：
+        # 例如 +1e308 -(-1e308) -1e308 +(-1e308) 的真实效应
+        # 为 0，但顺序累加在第二步就溢出成 inf。此时按最大
+        # 绝对值缩放后再求和，保留真实相消；正常量级仍走上面
+        # 的顺序累加，不改变历史数值。若缩放后仍不可表示，
+        # 保留非有限值，让下游检验按 invalid_values 处理。
+        if not math.isfinite(total) and terms:
+            scale = max(
+                (abs(term) for term in terms),
+                default=0.0,
+            )
+            if scale > 0.0 and math.isfinite(scale):
+                candidate = math.fsum(
+                    term / scale for term in terms
+                ) * scale
+                if math.isfinite(candidate):
+                    total = candidate
         effect_values.append(total)
         raw_seeds.append(first_cell[seed_key][0])
 
