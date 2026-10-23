@@ -7910,6 +7910,150 @@ class NumericalScaleTests(unittest.TestCase):
             self.assertIsInstance(error, str)
             self.assertIn("winner", error)
 
+    def test_near_duplicate_threshold_huge_int_falls_back(self):
+        self.assertEqual(
+            experiment._near_duplicate_threshold_or_default(
+                10 ** 400
+            ),
+            experiment._NEAR_DUP_DEFAULT_THRESHOLD,
+        )
+
+    def test_near_duplicate_plan_rejects_huge_threshold(self):
+        with self.assertRaises(ValueError):
+            experiment._plan_train_near_duplicate_cleaning(
+                bytearray(b"aaa|bbb|aaa|"),
+                b"|",
+                8,
+                {},
+                [],
+                threshold=10 ** 400,
+                shingle_bytes=1,
+            )
+
+    def test_byte_dataset_rejects_huge_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data.txt"
+            path.write_bytes(b"a\nb\nc\nd\ne\nf\n")
+            with self.assertRaises(ValueError):
+                experiment.ByteDataset(
+                    str(path),
+                    seq_len=2,
+                    near_duplicate_threshold=10 ** 400,
+                    device=torch.device("cpu"),
+                )
+
+    def test_preregistration_schema_rejects_huge_threshold(self):
+        payload = {
+            "study_id": "extreme-numbers",
+            "frozen_commit": "a" * 40,
+            "primary_metric": "val_loss",
+            "common_step": 100,
+            "min_effect": 0.01,
+            "direction": "decrease",
+            "baseline_mode": "smelt",
+            "comparisons": [["smelt", "A"]],
+            "seeds": [42, 43, 44],
+            "budget_match": "smelt",
+            "steps": 200,
+            "data": {
+                "sha256": "b" * 64,
+                "split_policy": "contiguous",
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+                "cleaning": {
+                    "near_duplicate_threshold": 10 ** 400,
+                },
+            },
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsInstance(error, str)
+        self.assertIn("near_duplicate_threshold", error)
+
+    def test_extreme_int_reports_do_not_overflow(self):
+        self.assertIsNone(experiment._t_critical(10 ** 400))
+        self.assertIsNone(
+            experiment._percentile([1.0, 10 ** 400], 0.5)
+        )
+        self.assertEqual(
+            experiment.distribution_shift_violations(
+                {"distribution_shift": {"train/val": 10 ** 400}},
+                0.1,
+            ),
+            [],
+        )
+        rows = [
+            {
+                "run": "a",
+                "mode": "A",
+                "selected_model": "best_val",
+                "curve_n_eval_points": 10 ** 400,
+            },
+            {
+                "run": "b",
+                "mode": "A",
+                "selected_model": "best_val",
+                "curve_n_eval_points": 1,
+            },
+        ]
+        report = experiment.selection_bias_report(
+            rows, "val_loss"
+        )
+        self.assertIsNone(report["opportunity_imbalance"]["ratio"])
+
+    def test_extended_split_near_duplicate_reason_is_counted(self):
+        spans, stats = experiment._plan_train_near_duplicate_cleaning(
+            bytearray(b"aaa|bbb|aaa|"),
+            b"|",
+            8,
+            {"holdout": (8, 11)},
+            [],
+            threshold=0.5,
+            shingle_bytes=1,
+        )
+        self.assertEqual(spans, [(0, 3)])
+        self.assertEqual(stats["flagged_duplicate_of"]["holdout"], 1)
+
+    def test_format_helpers_tolerate_huge_report_numbers(self):
+        display = experiment._format_window_paired({
+            "window_paired": {
+                "available": True,
+                "mean_loss_diff": 10 ** 400,
+                "n_seeds": 2,
+                "per_seed": [
+                    {
+                        "window_p_value": 10 ** 400,
+                        "window_ar1_adjustment_applied": True,
+                        "window_p_value_ar1": 10 ** 400,
+                    },
+                ],
+                "hierarchical_bootstrap_ci95": {
+                    "available": True,
+                    "low": 10 ** 400,
+                    "high": 10 ** 400,
+                    "n_seeds": 2,
+                    "replicates": 10,
+                },
+                "variance_components": {
+                    "available": True,
+                    "variance_share_seed": 10 ** 400,
+                    "variance_share_window": 10 ** 400,
+                    "variance_share_interaction": 10 ** 400,
+                    "dominant_source": "training_seed",
+                },
+            },
+        })
+        self.assertIn("Δloss=-", display)
+        effect_line = experiment._format_factorial_effect({
+            "kind": "ablation",
+            "design": "smelt",
+            "description": "A",
+            "mean_effect": 10 ** 400,
+            "p_value": 10 ** 400,
+            "ci95_low": 10 ** 400,
+            "ci95_high": 10 ** 400,
+        })
+        self.assertIn("Δ=-", effect_line)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5766,7 +5766,7 @@ class ByteDataset:
             checked_threshold = float(
                 near_duplicate_threshold
             )
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(
                 "near_duplicate_threshold 必须是数值"
             ) from error
@@ -9115,7 +9115,7 @@ def _near_duplicate_threshold_or_default(
     """把存档/协议里的阈值转成有限 (0,1] 浮点，损坏值回退默认。"""
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _NEAR_DUP_DEFAULT_THRESHOLD
     if not math.isfinite(number) or not 0.0 < number <= 1.0:
         return _NEAR_DUP_DEFAULT_THRESHOLD
@@ -9167,7 +9167,7 @@ def _plan_train_near_duplicate_cleaning(
     """
     try:
         threshold = float(threshold)
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, OverflowError) as error:
         raise ValueError("near-duplicate threshold 必须是数值") from error
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
         raise ValueError(
@@ -9477,7 +9477,10 @@ def _plan_train_near_duplicate_cleaning(
         if best_reason is not None:
             stats["groups_flagged"] += 1
             stats["flagged_bytes"] += length
-            stats["flagged_duplicate_of"][best_reason] += 1
+            stats["flagged_duplicate_of"][best_reason] = (
+                stats["flagged_duplicate_of"].get(best_reason, 0)
+                + 1
+            )
             flagged_spans.append(span)
             if len(stats["examples"]) < 5:
                 stats["examples"].append([
@@ -10810,45 +10813,44 @@ def distribution_shift_violations(
     for field, label, limit in checks:
         if limit is None:
             continue
+        limit_value = _finite_float(limit)
+        if limit_value is None:
+            continue
         values = report.get(field) or {}
         if not isinstance(values, dict):
             continue
         for pair, value in values.items():
-            if not isinstance(value, (int, float)):
+            distance = _finite_float(value)
+            if distance is None:
                 continue
-            distance = float(value)
-            if not math.isfinite(distance):
-                continue
-            if distance > float(limit):
+            if distance > limit_value:
                 violations.append(
                     f"{pair}: {label} = {distance:.4f} "
-                    f"> 阈值 {float(limit):.4f}"
+                    f"> 阈值 {limit_value:.4f}"
                 )
 
     # 全局分布可能把边界两侧的漂移平均掉；显式设置单字节
     # 阈值时，边界块也必须受同一个硬门约束。
     if max_byte_js is not None:
+        limit_value = _finite_float(max_byte_js)
         boundary = report.get("temporal_boundary_shift") or {}
         pairs = (
             boundary.get("pairs")
             if isinstance(boundary, dict)
             else None
         )
-        if isinstance(pairs, dict):
+        if limit_value is not None and isinstance(pairs, dict):
             for pair, info in pairs.items():
                 if not isinstance(info, dict):
                     continue
-                value = info.get("js")
-                if not isinstance(value, (int, float)):
+                distance = _finite_float(info.get("js"))
+                if distance is None:
                     continue
-                distance = float(value)
-                if not math.isfinite(distance):
-                    continue
-                if distance > float(max_byte_js):
+                if distance > limit_value:
                     violations.append(
                         f"{pair}: 时间边界字节分布 JS = "
                         f"{distance:.4f} > 阈值 "
-                        f"{float(max_byte_js):.4f}"
+                        f"{limit_value:.4f}"
                     )
 
     return violations
@@ -19927,17 +19929,22 @@ def _percentile(
     """线性插值分位数；空列表返回 None。"""
     if not sorted_values:
         return None
-    if len(sorted_values) == 1:
-        return float(sorted_values[0])
-    position = (len(sorted_values) - 1) * fraction
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return float(sorted_values[lower])
-    weight = position - lower
-    return float(
-        sorted_values[lower] * (1.0 - weight)
-        + sorted_values[upper] * weight
+    try:
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+        position = (len(sorted_values) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return float(sorted_values[lower])
+        weight = position - lower
+        lower_value = float(sorted_values[lower])
+        upper_value = float(sorted_values[upper])
+    except (IndexError, OverflowError, TypeError, ValueError):
+        return None
+    return (
+        lower_value * (1.0 - weight)
+        + upper_value * weight
     )
 
 
@@ -21123,9 +21130,14 @@ def selection_bias_report(
         low = min(counts)
         high = max(counts)
         if high > low:
-            ratio = (
-                float(high) / float(low) if low > 0 else None
-            )
+            try:
+                ratio = (
+                    float(high) / float(low) if low > 0 else None
+                )
+            except (OverflowError, ValueError):
+                ratio = None
+            if ratio is not None and not math.isfinite(ratio):
+                ratio = None
             report["opportunity_imbalance"] = {
                 "min_eval_points": low,
                 "max_eval_points": high,
@@ -26638,16 +26650,26 @@ def _t_critical(
     Student t 分布在显著性水平 alpha（双侧）下的临界值
     t_{1-alpha/2}：对 p 值函数做二分求根，仍然不依赖 SciPy。
     """
-    if df <= 0.0 or not math.isfinite(df):
+    try:
+        df_value = float(df)
+        alpha_value = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        df_value <= 0.0
+        or not math.isfinite(df_value)
+        or not math.isfinite(alpha_value)
+        or not 0.0 < alpha_value < 1.0
+    ):
         return None
 
     low = 0.0
     high = 1.0
     while True:
-        p_high = _two_sided_t_p_value(high, df)
+        p_high = _two_sided_t_p_value(high, df_value)
         if p_high is None:
             return None
-        if p_high <= alpha:
+        if p_high <= alpha_value:
             break
         high *= 2.0
         if high > 1.0e6:
@@ -26655,10 +26677,10 @@ def _t_critical(
 
     for _ in range(200):
         mid = (low + high) / 2.0
-        p_mid = _two_sided_t_p_value(mid, df)
+        p_mid = _two_sided_t_p_value(mid, df_value)
         if p_mid is None:
             return None
-        if p_mid > alpha:
+        if p_mid > alpha_value:
             low = mid
         else:
             high = mid
@@ -31682,7 +31704,8 @@ def _format_window_paired(
     against = int(window_paired.get("n_seeds_favoring_baseline", 0))
     n_seeds = int(window_paired.get("n_seeds", 0))
     parts = [
-        f"[window] 固定评估窗口逐窗口配对: Δloss={float(mean_diff):+.4f}"
+        "[window] 固定评估窗口逐窗口配对: Δloss="
+        f"{_format_finite(mean_diff, '+.4f')}"
         f"（{favoring}/{n_seeds} 个种子方向偏向变体，"
         f"{against}/{n_seeds} 偏向基线）"
     ]
@@ -31698,7 +31721,8 @@ def _format_window_paired(
             parts.append(
                 "逐种子窗口级原始 p: "
                 + ", ".join(
-                    f"{float(value):.3g}" for value in p_values
+                    _format_finite(value, ".3g")
+                    for value in p_values
                 )
             )
         ar1_p_values = []
@@ -31709,7 +31733,9 @@ def _format_window_paired(
                 continue
             value = entry.get("window_p_value_ar1")
             if isinstance(value, (int, float)):
-                ar1_p_values.append(f"{float(value):.3g}")
+                ar1_p_values.append(
+                    _format_finite(value, ".3g")
+                )
             else:
                 ar1_p_values.append("有效窗口不足")
         if ar1_p_values:
@@ -31724,8 +31750,8 @@ def _format_window_paired(
     ):
         parts.append(
             "两层 bootstrap 95%CI=["
-            f"{float(hierarchical['low']):+.4f},"
-            f"{float(hierarchical['high']):+.4f}]"
+            f"{_format_finite(hierarchical.get('low'), '+.4f')},"
+            f"{_format_finite(hierarchical.get('high'), '+.4f')}]"
             f"（种子 {hierarchical.get('n_seeds')} × 窗口，"
             f"{hierarchical.get('replicates')} 次）"
         )
@@ -31750,9 +31776,11 @@ def _format_window_paired(
             }.get(str(dominant), "多层")
             parts.append(
                 "方差占比: 种子 "
-                f"{float(share_seed) * 100:.0f}% / 窗口 "
-                f"{float(share_window) * 100:.0f}% / 交互 "
-                f"{float(share_interaction) * 100:.0f}%"
+                f"{_format_finite(share_seed, '.0f', 100.0)}%"
+                " / 窗口 "
+                f"{_format_finite(share_window, '.0f', 100.0)}%"
+                " / 交互 "
+                f"{_format_finite(share_interaction, '.0f', 100.0)}%"
                 f"（主要来自{source_text}）"
             )
     notes = window_paired.get("notes")
@@ -36201,11 +36229,16 @@ def preregistration_schema_error(
             return "data.cleaning 含未知开关: " + ", ".join(unknown)
         for key, value in cleaning.items():
             if key == "near_duplicate_threshold":
+                try:
+                    threshold = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    threshold = None
                 if (
-                    not isinstance(value, (int, float))
-                    or isinstance(value, bool)
-                    or not math.isfinite(float(value))
-                    or not 0.0 < float(value) <= 1.0
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or threshold is None
+                    or not math.isfinite(threshold)
+                    or not 0.0 < threshold <= 1.0
                 ):
                     return (
                         "data.cleaning.near_duplicate_threshold "
@@ -36949,7 +36982,7 @@ def preregistration_data_error(
         actual = getattr(args, key, default)
         try:
             same = float(expected) == float(actual)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             same = False
         if not same:
             return (
@@ -38816,9 +38849,9 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     """把一条因子效应格式化为控制台行（主分析/等计算量分析共用）。"""
     p_holm = effect.get("p_value_holm")
     if p_holm is not None:
-        p_text = f"Holm p={float(p_holm):.4f}"
+        p_text = f"Holm p={_format_finite(p_holm)}"
     elif effect.get("p_value") is not None:
-        p_text = f"p={float(effect['p_value']):.4f}"
+        p_text = f"p={_format_finite(effect.get('p_value'))}"
     else:
         p_text = "p=NA"
     ci_text = ""
@@ -38828,8 +38861,8 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     ):
         ci_text = (
             " 95%CI=["
-            f"{float(effect['ci95_low']):+.4f},"
-            f"{float(effect['ci95_high']):+.4f}]"
+            f"{_format_finite(effect.get('ci95_low'), '+.4f')},"
+            f"{_format_finite(effect.get('ci95_high'), '+.4f')}]"
         )
     adjusted_low = effect.get("ci_family_adjusted_low")
     adjusted_high = effect.get("ci_family_adjusted_high")
@@ -38842,8 +38875,8 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     ):
         ci_text += (
             "；同时95%CI=["
-            f"{float(adjusted_low):+.4f},"
-            f"{float(adjusted_high):+.4f}]"
+            f"{_format_finite(adjusted_low, '+.4f')},"
+            f"{_format_finite(adjusted_high, '+.4f')}]"
             f"(Bonferroni α/{adjusted_family}，比Holm保守)"
         )
     qualifiers = []
@@ -38866,7 +38899,7 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         qualifiers.append(
             "精确符号翻转最小可达 p="
             + (
-                f"{float(minimum):.3f}"
+                _format_finite(minimum, ".3f")
                 if isinstance(minimum, (int, float))
                 else "NA"
             )
@@ -38915,19 +38948,19 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     if tost_holm is not None:
         margin_abs = effect.get("equivalence_margin_abs")
         margin_text = (
-            f"±{float(margin_abs):.4f}"
+            f"±{_format_finite(margin_abs)}"
             if margin_abs is not None
             else "界=NA"
         )
         if effect.get("equivalent"):
             qualifiers.append(
                 "等价 TOST Holm p="
-                f"{float(tost_holm):.4f}（{margin_text}）"
+                f"{_format_finite(tost_holm)}（{margin_text}）"
             )
         else:
             qualifiers.append(
                 "未达等价 TOST Holm p="
-                f"{float(tost_holm):.4f}（{margin_text}）"
+                f"{_format_finite(tost_holm)}（{margin_text}）"
             )
     if effect.get("significant"):
         claim = {
@@ -38957,7 +38990,7 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
         if effect.get("mde_80") is not None:
             qualifiers.append(
                 "80% 功效 MDE="
-                f"{float(effect['mde_80']):.4f}"
+                f"{_format_finite(effect.get('mde_80'))}"
             )
     if effect.get("test") in (
         "paired_t",
@@ -38969,7 +39002,7 @@ def _format_factorial_effect(effect: Dict[str, object]) -> str:
     return (
         f"  [{effect['kind']}] {effect['design']} "
         f"{effect['description']}  "
-        f"Δ={float(effect['mean_effect']):+.4f}  "
+        f"Δ={_format_finite(effect.get('mean_effect'), '+.4f')}  "
         f"{test_text} {p_text}{ci_text}  {claim}"
         + (
             "（" + "；".join(qualifiers) + "）"
@@ -68461,13 +68494,17 @@ def main():
             )
             try:
                 saved_threshold = float(saved_threshold)
-            except (TypeError, ValueError):
+                current_threshold = float(
+                    args.near_duplicate_threshold
+                )
+            except (TypeError, ValueError, OverflowError):
                 saved_threshold = None
+                current_threshold = None
             if (
                 saved_threshold is not None
+                and current_threshold is not None
                 and math.isfinite(saved_threshold)
-                and saved_threshold
-                != float(args.near_duplicate_threshold)
+                and saved_threshold != current_threshold
             ):
                 print(
                     "resume restored near_duplicate_threshold "
