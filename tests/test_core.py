@@ -10578,6 +10578,15 @@ class GroupClusterRegressionTests(unittest.TestCase):
             self.assertTrue(math.isfinite(report["low"]))
             self.assertTrue(math.isfinite(report["high"]))
             json.dumps(report, allow_nan=False)
+        mixed = {
+            1: {0: (1.0, 1.0e308), 1: (2.0, 1.0e-308)},
+            2: {0: (2.0, 1.0e308), 1: (3.0, 1.0e-308)},
+        }
+        report = experiment._hierarchical_group_bootstrap_ci(
+            mixed, replicates=100
+        )
+        self.assertTrue(report["available"])
+        json.dumps(report, allow_nan=False)
 
     def test_group_comparison_rejects_unit_mismatch(self):
         groups = [

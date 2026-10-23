@@ -12879,13 +12879,13 @@ def _hierarchical_group_bootstrap_ci(
     seed_indices = torch.randint(
         low=0,
         high=seed_count,
-        size=(int(replicates), seed_count),
+        size=(replicate_count, seed_count),
         generator=generator,
     )
     group_indices = torch.randint(
         low=0,
         high=group_count,
-        size=(int(replicates), group_count),
+        size=(replicate_count, group_count),
         generator=generator,
     )
     token_scale = max(reference_tokens)
@@ -12896,8 +12896,22 @@ def _hierarchical_group_bootstrap_ci(
     sampled_groups = group_indices
     sampled_tokens = token_weights[sampled_groups]
     sampled_total = sampled_tokens.sum(dim=1)
+    usable_draws = (
+        torch.isfinite(sampled_total) & (sampled_total > 0.0)
+    )
+    if not bool(usable_draws.any()):
+        return {
+            "available": False,
+            "reason": "bootstrap_unavailable",
+            "n_seeds": seed_count,
+            "n_groups": group_count,
+        }
+    sampled_groups = sampled_groups[usable_draws]
+    sampled_tokens = sampled_tokens[usable_draws]
+    sampled_total = sampled_total[usable_draws]
+    seed_indices = seed_indices[usable_draws]
     seed_means = torch.empty(
-        (int(replicates), seed_count),
+        (int(sampled_groups.size(0)), seed_count),
         dtype=torch.float64,
     )
     for column in range(seed_count):
