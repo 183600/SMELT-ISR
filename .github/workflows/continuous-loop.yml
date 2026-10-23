@@ -215,18 +215,77 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu \
             || echo "[warn] requirements-ci.txt 安装失败，跳过（不影响后续步骤）"
 
-      - name: Install DeepSeek Harness (dsh)
+      - name: Install AI harnesses (dsh primary, opencode fallback)
         run: |
+          set +e
           npm i -g @deepseek-ai/dsh@0.2.1-rc.2
-          dsh --version
+          if command -v dsh >/dev/null 2>&1; then
+            dsh --version
+          else
+            echo "[warn] dsh 安装失败，将使用 opencode 兜底"
+          fi
+          npm i -g opencode-ai
+          if command -v opencode >/dev/null 2>&1; then
+            opencode --version
+          else
+            echo "[warn] opencode 安装失败"
+          fi
+          if ! command -v dsh >/dev/null 2>&1 && ! command -v opencode >/dev/null 2>&1; then
+            echo "[error] dsh 与 opencode 均不可用" >&2
+            exit 1
+          fi
 
-      - name: Configure dsh (DeepSeek official API)
+      - name: Configure AI harnesses (dsh primary, opencode fallback)
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
-          set -e
-          [ -n "$DEEPSEEK_API_KEY" ] || { echo "[error] secrets.DEEPSEEK_API_KEY 未配置" >&2; exit 1; }
-          echo "[info] dsh $(dsh --version) | provider=deepseek-official | model=deepseek-flash"
+          set +e
+          mkdir -p ~/.config/opencode
+          if [ -n "$DEEPSEEK_API_KEY" ]; then
+            echo "[info] DEEPSEEK_API_KEY 已配置（dsh 使用）"
+          else
+            echo "[warn] DEEPSEEK_API_KEY 未配置：dsh 不可用，将走 opencode 免费模型"
+          fi
+          if command -v dsh >/dev/null 2>&1; then
+            echo "[info] dsh $(dsh --version) | provider=deepseek-official | model=deepseek-flash"
+          fi
+          if command -v opencode >/dev/null 2>&1; then
+            echo "[info] opencode $(opencode --version) | fallback ready"
+          fi
+
+      - name: Configure opencode permissions (fallback)
+        run: |
+          mkdir -p ~/.config/opencode
+          cat > ~/.config/opencode/opencode.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {
+              "*": "allow",
+              "edit": {
+                "*": "allow",
+                ".github/**": "deny",
+                "**/.github/**": "deny",
+                "LICENSE": "deny",
+                "**/LICENSE": "deny",
+                "**/LICENSE.*": "deny"
+              },
+              "bash": {
+                "*": "allow",
+                "rm -rf .github*": "deny",
+                "rm -r .github*": "deny",
+                "rm .github*": "deny",
+                "mv .github*": "deny",
+                "git rm -r .github*": "deny",
+                "rm *LICENSE*": "deny",
+                "mv *LICENSE*": "deny",
+                "cp *LICENSE*": "deny",
+                "git rm *LICENSE*": "deny",
+                "git push*": "deny"
+              }
+            },
+            "model": "opencode/deepseek-v4.1-flash-free"
+          }
+          EOF
 
       - name: Configure git
         run: |
@@ -241,6 +300,7 @@ jobs:
         timeout-minutes: 180
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -520,41 +580,136 @@ jobs:
           esac
           echo "[info] 候选顺序：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% 优先 / opencode(免费deepseek→big-pickle) 优先；免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
           # run 开始时探测一次；失败也不阻塞，run_phase 需要时会再试
-          # ================= harness: DeepSeek Harness (dsh) + DeepSeek 官方 API =================
-          # 固定 provider=deepseek-official、model=deepseek-flash；API key 从启动环境
-          # DEEPSEEK_API_KEY 读取（headless profile 不读 GUI 凭据库）。
-          # 本段覆盖下方（或上方）原有的 provider 探测实现：不再探测 NVIDIA / opencode Zen。
-          SELECTED_MODEL="deepseek-official/deepseek-flash"
-          SELECTED_PROVIDER="deepseek-official"
-          CURRENT_MODEL="$SELECTED_MODEL"
-          CURRENT_PROVIDER="$SELECTED_PROVIDER"
-          pick_model() {
-            CURRENT_MODEL="deepseek-official/deepseek-flash"
-            CURRENT_PROVIDER="deepseek-official"
-            return 0
+          # ================= harness: dsh 主用，opencode 兜底 =================
+          # 首选 DeepSeek Harness（dsh + DeepSeek 官方 API）；当 dsh 无法安装、
+          # 无法执行、启动冒烟失败或阶段调用失败时，自动切换到 opencode。
+          # opencode 的调用方式与 2026-10-22 备份中的旧 workflow 完全一致：
+          #     opencode run -m "$SELECTED_MODEL" [--variant ...] "$prompt"
+          DSH_MODEL="deepseek-official/deepseek-flash"
+          HARNESS=""
+          SELECTED_MODEL=""
+          SELECTED_PROVIDER=""
+          SELECTED_VARIANT=""
+          CURRENT_MODEL=""
+          CURRENT_PROVIDER=""
+          OC_BROKEN=""
+
+          oc_mark_broken() {
+            [ -n "$1" ] || return 0
+            case ",$OC_BROKEN," in *",$1,"*) ;; *) OC_BROKEN="$OC_BROKEN${OC_BROKEN:+,}$1" ;; esac
           }
-          pick_provider() {
-            CURRENT_MODEL="deepseek-official/deepseek-flash"
-            CURRENT_PROVIDER="deepseek-official"
-            return 0
+          oc_is_broken() {
+            case ",$OC_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
           }
-          smoke_test() {
-            timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+
+          opencode_smoke() {
+            local m="$1" v="$2" extra=""
+            [ -n "$v" ] && extra="--variant $v"
+            # shellcheck disable=SC2086
+            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/oc_smoke_test.log 2>&1
           }
-          detect_provider() {
-            SELECTED_MODEL="deepseek-official/deepseek-flash"
-            SELECTED_PROVIDER="deepseek-official"
-            CURRENT_MODEL="$SELECTED_MODEL"
-            CURRENT_PROVIDER="$SELECTED_PROVIDER"
-            export SELECTED_MODEL SELECTED_PROVIDER
-            echo "[provider] 固定使用 $SELECTED_MODEL（DeepSeek 官方 API）"
-            if smoke_test; then
-              return 0
+
+          opencode_detect() {
+            local cand v
+            # 与备份一致：优先 DeepSeek 官方 API（若该仓库原本支持），
+            # 然后走 opencode Zen 免费池 deepseek-v4.1-flash-free → big-pickle。
+            if declare -F probe_deepseek >/dev/null 2>&1 \
+               && declare -F switch_provider >/dev/null 2>&1 \
+               && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+              if probe_deepseek; then
+                switch_provider deepseek
+                if opencode_smoke "deepseek/$DEEPSEEK_MODEL" ""; then
+                  SELECTED_MODEL="deepseek/$DEEPSEEK_MODEL"
+                  SELECTED_PROVIDER="deepseek"
+                  SELECTED_VARIANT=""
+                  CURRENT_MODEL="$SELECTED_MODEL"
+                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+                  echo "[provider] opencode 兜底选定 $SELECTED_MODEL（DeepSeek 官方 API）"
+                  return 0
+                fi
+              fi
             fi
-            echo "[warn] dsh 冒烟测试失败（API key / 网络 / 配额）"
+            for cand in opencode/deepseek-v4.1-flash-free opencode/big-pickle; do
+              oc_is_broken "$cand" && continue
+              if [ "$cand" = "opencode/big-pickle" ]; then
+                if opencode_smoke "$cand" ""; then
+                  SELECTED_MODEL="$cand"
+                  SELECTED_PROVIDER="$cand"
+                  SELECTED_VARIANT=""
+                  CURRENT_MODEL="$SELECTED_MODEL"
+                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+                  echo "[provider] opencode 兜底选定 $cand"
+                  return 0
+                fi
+              else
+                for v in max high ""; do
+                  if opencode_smoke "$cand" "$v"; then
+                    SELECTED_MODEL="$cand"
+                    SELECTED_PROVIDER="$cand"
+                    SELECTED_VARIANT="$v"
+                    CURRENT_MODEL="$SELECTED_MODEL"
+                    CURRENT_PROVIDER="$SELECTED_PROVIDER"
+                    export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+                    echo "[provider] opencode 兜底选定 $cand${v:+ (variant=$v)}"
+                    return 0
+                  fi
+                done
+              fi
+              oc_mark_broken "$cand"
+            done
+            SELECTED_MODEL=""
+            SELECTED_PROVIDER=""
+            SELECTED_VARIANT=""
+            CURRENT_MODEL=""
+            CURRENT_PROVIDER=""
+            export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
             return 1
           }
-          if detect_provider; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
+
+          use_dsh() {
+            HARNESS="dsh"
+            SELECTED_MODEL="$DSH_MODEL"
+            SELECTED_PROVIDER="deepseek-official"
+            SELECTED_VARIANT=""
+            CURRENT_MODEL="$SELECTED_MODEL"
+            CURRENT_PROVIDER="$SELECTED_PROVIDER"
+            export HARNESS SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+            echo "[provider] 主 harness=dsh，模型=$SELECTED_MODEL"
+          }
+
+          switch_to_opencode() {
+            HARNESS="opencode"
+            SELECTED_MODEL=""
+            SELECTED_PROVIDER=""
+            SELECTED_VARIANT=""
+            CURRENT_MODEL=""
+            CURRENT_PROVIDER=""
+            export HARNESS
+            echo "[warn] dsh 不可用，切换到 opencode 兜底（调用方式与 2026-10-22 备份一致）"
+            opencode_detect
+          }
+
+          select_harness_model() {
+            if [ "$HARNESS" = "opencode" ]; then
+              opencode_detect
+              return $?
+            fi
+            if command -v dsh >/dev/null 2>&1; then
+              use_dsh
+              if timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1; then
+                return 0
+              fi
+              echo "[warn] dsh 冒烟测试失败（API key / 网络 / 配额 / 安装）"
+            else
+              echo "[warn] dsh 未安装"
+            fi
+            switch_to_opencode
+          }
+
+          if select_harness_model; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
+
 
           i=0
 
@@ -655,7 +810,7 @@ jobs:
 
               # 正常路径：run 开始时已选定模型，这里不会发起任何网络探测
               if [ -z "$SELECTED_MODEL" ]; then
-                if ! detect_provider; then
+                if ! select_harness_model; then
                   echo "[warn] phase=$phase 暂时没有可用模型，180s 后重试 (attempt=$attempt)"
                   sleep 180
                   continue
@@ -671,7 +826,14 @@ jobs:
               record_model "$SELECTED_MODEL"
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$SELECTED_MODEL ==========="
               # shellcheck disable=SC2086
-              timeout --kill-after=180 "$budget_now" dsh --profile headless "$prompt" 2>&1 | tee "$OUT"
+              if [ "$HARNESS" = "dsh" ]; then
+                timeout --kill-after=180 "$budget_now" dsh --profile headless "$prompt" 2>&1 | tee "$OUT"
+              else
+                local oc_extra=""
+                [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
+                # shellcheck disable=SC2086
+                timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
+              fi
               local EC=$?
 
               # 成功
@@ -684,6 +846,18 @@ jobs:
                 echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
                 return $EC
               fi
+
+              # dsh 调用失败（非超时）→ 自动切到 opencode 兜底
+              if [ "$HARNESS" = "dsh" ]; then
+                echo "[warn] phase=$phase dsh 调用失败 (exit=$EC)，切换 opencode 兜底"
+                if switch_to_opencode; then
+                  continue
+                fi
+                SELECTED_MODEL=""
+                sleep 60
+                continue
+              fi
+              [ "$HARNESS" = "opencode" ] && oc_mark_broken "$SELECTED_MODEL"
 
               # 429 限流 / 5xx / 连接失败：丢弃当前模型，下一次循环重新探测（并跳过它）
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
