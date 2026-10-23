@@ -3041,6 +3041,17 @@ class DesignPreparationTests(unittest.TestCase):
                 design, allow_underpowered=True
             )
         )
+        # --allow-underpowered 是显式的探索逃生口，即使设计
+        # 计划没有 power 块也必须生效（与旧行为一致）。
+        no_power = {"pilot_evidence": evidence}
+        self.assertIsNotNone(
+            experiment.design_power_gate_error(no_power)
+        )
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                no_power, allow_underpowered=True
+            )
+        )
 
 
 class RoutingTests(unittest.TestCase):

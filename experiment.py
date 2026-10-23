@@ -67131,12 +67131,15 @@ def design_power_gate_error(
     power = design.get("power")
     pilot_evidence = design.get("pilot_evidence")
     pilot_note = _pilot_gate_note(pilot_evidence)
+    # --allow-underpowered 必须独立于 power 记录生效：即使设计
+    # 计划没有（或损坏了）power 块，冒烟/探索运行也应能显式
+    # 绕过启动门；否则会在试点证据不可用时比旧行为更严格，
+    # 且与错误信息里「或加 --allow-underpowered」矛盾。
+    if allow_underpowered:
+        return None
     acknowledged = (
         isinstance(power, dict)
-        and (
-            power.get("underpowered_acknowledged")
-            or allow_underpowered
-        )
+        and bool(power.get("underpowered_acknowledged"))
     )
     if acknowledged:
         return None
