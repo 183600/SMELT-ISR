@@ -63538,6 +63538,33 @@ def _design_power_for_family(
         adjusted["adequate"] = None
         adjusted["adequacy_recomputed"] = False
         adjusted["adequacy_recompute_error"] = str(error)
+        # 重算失败时，所有依赖旧家族/旧对比类型/旧功效输入的
+        # 派生字段都已过期。不能只清 adequate 而把旧
+        # required_seeds、achieved_power、MDE 留在报告里；把它
+        # 们冻结到 stale_derived_fields 供追溯，有效字段置空。
+        stale_keys = (
+            "contrast_power",
+            "contrast_variance_factor",
+            "binding_contrast",
+            "binding_contrast_label",
+            "required_seeds_for_t",
+            "required_seeds_for_robust_sign_flip",
+            "required_seeds",
+            "required_seeds_with_attrition",
+            "achieved_power_at_min_effect",
+            "minimum_detectable_effect_relative",
+            "power_sensitivity",
+            "superiority_adequate",
+            "equivalence_adequate",
+            "equivalence",
+        )
+        adjusted["stale_derived_fields"] = {
+            key: adjusted.get(key)
+            for key in stale_keys
+            if key in adjusted
+        }
+        for key in stale_keys:
+            adjusted.pop(key, None)
         return adjusted
     recomputed["declared_planned_comparisons"] = declared
     recomputed["declared_planned_contrasts"] = declared_contrasts
@@ -66793,7 +66820,25 @@ def print_design_summary(design: Dict[str, object]) -> None:
             )
     power = design.get("power")
     if isinstance(power, dict):
-        status = "充足" if power.get("adequate") else "不足"
+        recompute_failed = (
+            power.get("adequacy_recomputed") is False
+        )
+        if recompute_failed:
+            print(
+                "[design][power][warn] 无法按实际家族/对比类型或"
+                "试点观测值重算先验功效：不沿用旧的 adequate/"
+                "所需种子/功效/MDE 记录"
+                + (
+                    f"（{power.get('adequacy_recompute_error')}）"
+                    if power.get("adequacy_recompute_error")
+                    else ""
+                )
+            )
+        status = (
+            "无法重算"
+            if recompute_failed
+            else ("充足" if power.get("adequate") else "不足")
+        )
         attrition = _finite_float(
             power.get("expected_attrition_rate")
         )
@@ -66803,12 +66848,20 @@ def print_design_summary(design: Dict[str, object]) -> None:
             "required_seeds_with_attrition",
             power.get("required_seeds"),
         )
+        required_text = (
+            str(required) if required is not None else "NA"
+        )
+        required_t = power.get("required_seeds_for_t")
+        required_robust = power.get(
+            "required_seeds_for_robust_sign_flip"
+        )
         print(
             "[design][power] 先验功效："
             f"计划 {power.get('planned_seeds')} 个种子，"
-            f"所需启动种子 {required}（t="
-            f"{power.get('required_seeds_for_t')}, 稳健符号翻转="
-            f"{power.get('required_seeds_for_robust_sign_flip')}）"
+            f"所需启动种子 {required_text}（t="
+            f"{required_t if required_t is not None else 'NA'}, "
+            "稳健符号翻转="
+            f"{required_robust if required_robust is not None else 'NA'}）"
             + (
                 f"，预期脱落 {attrition:.0%}、计划可用 "
                 f"{power.get('planned_usable_seeds')} 个"

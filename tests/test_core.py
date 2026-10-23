@@ -6534,6 +6534,13 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "planned_comparisons": 3,
             "planned_seeds": 7,
             "adequate": True,
+            # 这些是旧家族/旧对比类型下的派生字段，重算失败后
+            # 不能再作为有效结论展示。
+            "required_seeds": 99,
+            "required_seeds_with_attrition": 120,
+            "achieved_power_at_min_effect": 0.99,
+            "minimum_detectable_effect_relative": 0.001,
+            "contrast_power": {"pairwise": {"adequate": True}},
         }
         adjusted = experiment._design_power_for_family(
             power,
@@ -6542,6 +6549,18 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertIsNone(adjusted["adequate"])
         self.assertFalse(adjusted["adequacy_recomputed"])
+        self.assertEqual(
+            adjusted["stale_derived_fields"]["required_seeds"],
+            99,
+        )
+        for key in (
+            "required_seeds",
+            "required_seeds_with_attrition",
+            "achieved_power_at_min_effect",
+            "minimum_detectable_effect_relative",
+            "contrast_power",
+        ):
+            self.assertNotIn(key, adjusted)
         design = {"power": adjusted}
         self.assertIsNotNone(
             experiment.design_power_gate_error(design)
