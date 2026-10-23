@@ -6412,6 +6412,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertIsNone(timing["std"])
 
+    def test_timing_summary_cv_does_not_overflow(self):
+        # 有限极值相互抵消后均值可以合法地接近 0，而标准差仍
+        # 极大；std/mean 越过 float 上限时 CV 必须是 None。
+        timing = experiment._timing_summary(
+            [1.0e-308, 1.0e308, -1.0e308]
+        )
+        self.assertIsNone(timing["coefficient_of_variation"])
+        json.dumps(timing, allow_nan=False)
+
     def test_analysis_and_resume_tolerate_out_of_range_numbers(self):
         huge = 10 ** 400
 
@@ -6964,6 +6973,28 @@ class NumericalScaleTests(unittest.TestCase):
             ),
             "dominated_regression",
         )
+
+    def test_aggregate_cost_cv_omits_unrepresentable_ratio(self):
+        # 成本均值接近 0、离散度极大时变异系数越过 float 上限；
+        # 聚合记录不能写 inf。
+        rows = [
+            {
+                "run": f"r{seed}",
+                "mode": "A",
+                "seed": seed,
+                "n_params": value,
+            }
+            for seed, value in enumerate(
+                (1.0e-308, 1.0e308, -1.0e308), 1
+            )
+        ]
+        aggregate = experiment.aggregate_runs(rows, ["mode"])[0]
+        self.assertIsNone(
+            aggregate["costs"]["n_params"][
+                "coefficient_of_variation"
+            ]
+        )
+        json.dumps(aggregate, allow_nan=False)
 
     def test_contrast_intervals_omit_unrepresentable_bounds(self):
         test = {

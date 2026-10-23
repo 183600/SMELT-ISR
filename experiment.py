@@ -19898,6 +19898,19 @@ def _percentile(
     )
 
 
+def _safe_cv(std: float, mean: float) -> Optional[float]:
+    """变异系数；均值非正或比值超出 float 范围时返回 None。"""
+    if mean <= 0.0 or not math.isfinite(mean):
+        return None
+    try:
+        ratio = std / mean
+    except OverflowError:
+        return None
+    if not math.isfinite(ratio):
+        return None
+    return round(ratio, 6)
+
+
 def _timing_summary(
     timings: List[float],
     unit_scale: float = 1e3,
@@ -19974,9 +19987,7 @@ def _timing_summary(
         "min": scaled(ordered[0]),
         "max": scaled(ordered[-1]),
         "std": scaled(std),
-        "coefficient_of_variation": (
-            round(std / mean, 6) if mean > 0.0 else None
-        ),
+        "coefficient_of_variation": _safe_cv(std, mean),
     }
 
 
@@ -28064,9 +28075,8 @@ def aggregate_runs(
                         for value in values
                     ],
                     "coefficient_of_variation": (
-                        round(field_std / field_mean, 6)
+                        _safe_cv(field_std, field_mean)
                         if field_std is not None
-                        and field_mean > 0.0
                         else None
                     ),
                 }
