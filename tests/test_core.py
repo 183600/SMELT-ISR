@@ -7821,6 +7821,26 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._two_sided_t_p_value(float("inf"), float("nan"))
         )
 
+    def test_t_p_value_stays_stable_for_large_finite_df(self):
+        # 大而有限的自由度会让 df/(df+t²) 舍入成 1，
+        # 原实现因此把 p 值退化成 1.0 或接近 0；应平滑趋近
+        # 标准正态尾概率。
+        for t in (1.0, 1.96, 3.0, 10.0):
+            normal = math.erfc(t / math.sqrt(2.0))
+            previous = None
+            for df in (1.0e6, 1.0e9, 1.0e16, 1.0e100):
+                p_value = experiment._two_sided_t_p_value(t, df)
+                self.assertIsNotNone(p_value)
+                self.assertAlmostEqual(
+                    p_value,
+                    normal,
+                    delta=1e-6,
+                )
+                self.assertGreaterEqual(p_value, normal)
+                if previous is not None:
+                    self.assertLessEqual(p_value, previous)
+                previous = p_value
+
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
             [1, 1, 1, 1, 1, 1], False

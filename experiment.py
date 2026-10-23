@@ -25676,6 +25676,22 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
     if not math.isfinite(t):
         return 0.0
 
+    if df >= 1.0e6:
+        magnitude = abs(t)
+        if magnitude > 40.0:
+            return 0.0
+        normal_tail = math.erfc(magnitude / math.sqrt(2.0))
+        density = (
+            math.exp(-0.5 * magnitude * magnitude)
+            / math.sqrt(2.0 * math.pi)
+        )
+        correction = (
+            (magnitude * magnitude * magnitude + magnitude)
+            * density
+            / (2.0 * df)
+        )
+        return min(1.0, normal_tail + correction)
+
     x = df / (df + t * t)
     return _regularized_incomplete_beta(x, df / 2.0, 0.5)
 
