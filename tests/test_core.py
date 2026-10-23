@@ -10638,6 +10638,51 @@ class GroupClusterRegressionTests(unittest.TestCase):
             small_ci["high"],
             places=12,
         )
+        before = self._stats([
+            [0, 10.0, 0.0, 0.0],
+            [1, 10.0, 1.0, 0.0],
+            [2, 10.0, 3.0, 0.0],
+        ])
+        after = self._stats([
+            [0, 10.0, 1.0, 0.0],
+            [1, 10.0, 3.0, 0.0],
+            [2, 10.0, 4.0, 0.0],
+        ])
+        scaled_before = self._stats([
+            [0, 10.0, 0.0, 0.0],
+            [1, 10.0, 1.0e300, 0.0],
+            [2, 10.0, 3.0e300, 0.0],
+        ])
+        scaled_after = self._stats([
+            [0, 10.0, 1.0e300, 0.0],
+            [1, 10.0, 3.0e300, 0.0],
+            [2, 10.0, 4.0e300, 0.0],
+        ])
+        small_pair = experiment._group_cluster_paired_comparison(
+            {"group_stats": before},
+            {"group_stats": after},
+        )
+        large_pair = experiment._group_cluster_paired_comparison(
+            {"group_stats": scaled_before},
+            {"group_stats": scaled_after},
+        )
+        self.assertTrue(small_pair["available"])
+        self.assertTrue(large_pair["available"])
+        self.assertAlmostEqual(
+            large_pair["mean_loss_diff"] / 1.0e300,
+            small_pair["mean_loss_diff"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_pair["bootstrap_ci95"]["low"] / 1.0e300,
+            small_pair["bootstrap_ci95"]["low"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_pair["bootstrap_ci95"]["high"] / 1.0e300,
+            small_pair["bootstrap_ci95"]["high"],
+            places=12,
+        )
 
     def test_hierarchical_window_bootstrap_handles_bad_replicates(self):
         differences = {

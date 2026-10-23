@@ -12665,8 +12665,18 @@ def _group_cluster_paired_comparison(
     else:
         scale = 1.0
         scaled_differences = difference_tensor
+    seed_values = loss_differences
+    if all(math.isfinite(value) for value in loss_differences):
+        seed_scale = max(
+            abs(value) for value in loss_differences
+        )
+        if seed_scale > 0.0:
+            seed_values = [
+                float(f"{value / seed_scale:.12g}")
+                for value in loss_differences
+            ]
     generator = torch.Generator().manual_seed(
-        _randomization_seed(loss_differences)
+        _randomization_seed(seed_values)
     )
     interval = _group_stats_bootstrap_ci(
         scaled_differences,
