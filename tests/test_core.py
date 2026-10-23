@@ -10448,11 +10448,16 @@ class CurveMeanMetricTests(unittest.TestCase):
 class GroupClusterRegressionTests(unittest.TestCase):
     """文档/群组 cluster bootstrap 的边界条件回归。"""
 
-    def _stats(self, groups, separator="separator-sha"):
+    def _stats(
+        self,
+        groups,
+        separator="separator-sha",
+        unit="document_group",
+    ):
         return {
             "schema": experiment._GROUP_STATS_SCHEMA,
             "assignment": experiment._GROUP_ASSIGNMENT,
-            "unit": "document_group",
+            "unit": unit,
             "group_separator_sha256": separator,
             "groups": groups,
         }
@@ -10528,6 +10533,22 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 [], replicates=10
             )["available"]
         )
+
+    def test_group_comparison_rejects_unit_mismatch(self):
+        groups = [
+            [0, 10.0, 20.0, 5.0],
+            [1, 10.0, 30.0, 5.0],
+        ]
+        report = experiment._group_cluster_paired_comparison(
+            {"group_stats": self._stats(groups)},
+            {
+                "group_stats": self._stats(
+                    groups, unit="window"
+                )
+            },
+        )
+        self.assertFalse(report["available"])
+        self.assertEqual(report["reason"], "group_unit_mismatch")
 
 
 if __name__ == "__main__":

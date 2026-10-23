@@ -12552,6 +12552,13 @@ def _group_cluster_paired_comparison(
             "available": False,
             "reason": "group_stats_missing_in_one_run",
         }
+    if parsed_a["unit"] != parsed_b["unit"]:
+        return {
+            "available": False,
+            "reason": "group_unit_mismatch",
+            "unit_a": parsed_a["unit"],
+            "unit_b": parsed_b["unit"],
+        }
     if (
         parsed_a["group_separator_sha256"]
         != parsed_b["group_separator_sha256"]
