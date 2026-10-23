@@ -63766,10 +63766,16 @@ def write_design_plan(
             or prereg.get("primary_metric")
             or "val_loss"
         )
+        # 直接调用 write_design_plan 时 args.common_step 可能尚未
+        # 被 preregistration_apply 补齐；预注册文件里的 common_step
+        # 同样是训练前固定的，不能因此退回数据依赖端点。
+        pilot_target_step = getattr(args, "common_step", None)
+        if pilot_target_step is None:
+            pilot_target_step = prereg.get("common_step")
         pilot_evidence = build_pilot_power_evidence(
             list(pilot_runs),
             str(metric),
-            target_step=getattr(args, "common_step", None),
+            target_step=pilot_target_step,
             declared_sd=declared_sd,
             declared_attrition=declared_attrition,
             planned_modes=[
