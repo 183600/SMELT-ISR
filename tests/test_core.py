@@ -6566,6 +6566,22 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment.design_power_gate_error(design)
         )
 
+    def test_design_gate_handles_uncomputable_required_seeds(self):
+        design = {
+            "power": {
+                "adequate": False,
+                "binding_contrast": "interaction",
+                "binding_contrast_label": "交互",
+                "planned_comparisons": 6,
+                "planned_seeds": 4,
+                "target_power": 0.8,
+            }
+        }
+        gate = experiment.design_power_gate_error(design)
+        self.assertIsNotNone(gate)
+        self.assertNotIn("None 个", gate)
+        self.assertIn("无法计算", gate)
+
     def test_plan_treatment_keys_may_be_non_strings(self):
         # 手工/旧计划可能用非字符串键；不能因 str(key) 后查不到
         # 值就把不同处理单元静默合并。

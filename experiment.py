@@ -67182,16 +67182,23 @@ def design_power_gate_error(
         power.get("binding_contrast_label")
         or _CONTRAST_LABELS.get(binding, binding)
     )
-    required = power.get(
-        "required_seeds_with_attrition",
-        power.get("required_seeds"),
-    )
+    required = power.get("required_seeds_with_attrition")
+    if required is None:
+        required = power.get("required_seeds")
     planned = power.get("planned_seeds")
+    required_text = (
+        f"{required} 个启动种子"
+        if required is not None
+        else "在当前精度/显著性水平下无法计算的启动种子数"
+    )
+    planned_text = (
+        f"{planned} 个" if planned is not None else "未知"
+    )
     return (
         pilot_note
         + "设计计划显示先验功效不足：计划实际展开的最吃种子对比"
         f"类型是 {binding}（{binding_label}），至少需要 "
-        f"{required} 个启动种子，计划只有 {planned} 个；"
+        f"{required_text}，计划只有 {planned_text}；"
         f"家族规模 {power.get('planned_comparisons')}、目标功效 "
         f"{power.get('target_power')}。"
         "交互对比的方差是两两对比的 2 倍，不能把「按两两对比"
