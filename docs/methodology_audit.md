@@ -1,7 +1,8 @@
-# 方法学审计与修正记录（对应 23 项问题）
+# 方法学审计与修正记录（外部审计 23 项 + 后续补充）
 
-本文件逐项记录外部审计提出的 23 个问题在**当前代码**中的判定与处理。
-判定只依据源码与可运行行为，不依据本仓库此前的文档承诺。
+本文件逐项记录外部审计提出的 23 个问题及后续每轮补充在
+**当前代码**中的判定与处理。判定只依据源码与可运行行为，
+不依据本仓库此前的文档承诺。
 
 > 结论先行：本轮修正补上了 A/B 的机制对照、完整计算图预算核对、
 > 循环区域 1/r 残差缩放、GQA/KV 估计、伪重复处理、种子功效下限、
@@ -11,7 +12,8 @@
 > 符号检验（见第 26 节），以及同时置信区间与种子×窗口两层
 > 不确定性/方差分解（见第 28 节）；还补上了按对比类型分层的
 > 先验功效（主效应/交互方差不同，交互约需 2 倍种子，见第 30
-> 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> 节），以及评估集内部与 val↔test 的近重复簇/有效群组审计
+> （见第 38 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
 > context、文档级 segment attention mask、WSD 调度与
 > `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
 > 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
@@ -1219,6 +1221,68 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
   `design_plan.json` 一起归档。只保留预注册文件会失去试点
   校准证据，只剩研究者声明值。
 
+## 38. 数据处理：评估集内部的近重复与有效样本量（本轮补充）
+
+**判定：此前的近重复审计只回答「train 是否与 val/test 或更早
+train 近似」，没有检查 val/test 自身。精确重复群组有默认硬门，
+但同一文档的修订版/转载版仍可能同时落在 val 内部、test 内部或
+val↔test 两侧。它们不在精确指纹的命中范围内，却会让
+固定窗口 bootstrap 与 checkpoint 选型把同源内容当成独立样本：
+名义窗口/群组数被虚增，评估区间偏窄；val↔test 近重复还会让
+val 选型通过近似内容间接看到 test，使「测试集只解封一次」的
+独立性主张被削弱。**
+
+**已修正：**
+
+- 扩展 `--near-duplicate-audit`（只读，需要
+  `--group-separator`）：在原有 `data_audit.near_duplicates`
+  之外新增 `data_audit.evaluation_near_duplicates`，扫描
+  val 内部、test 内部与 val↔test 的群组近重复。相似度仍是
+  字节 k-shingle 集合的精确 Jaccard；bottom-k 草图只用于
+  候选生成，达到阈值的候选再用完整 shingle 集合精确复核。
+  阈值、shingle 长度、哈希口径与训练集近重复审计共用同一组
+  参数，不能在两处使用不同阈值后拼出一个「更干净」的结论。
+- 对每个 split 用并查集把达到阈值的近重复群组合并为簇，报告
+  `groups_scanned`、`within_pairs`、`clusters`、
+  `effective_groups`、`redundant_groups`、`effective_fraction`
+  与 `largest_cluster_groups`。`effective_groups` 按「簇内全部
+  冗余」计是独立内容单元数的保守下界，而不是「真实独立样本
+  数」；报告把它与名义群组数并列，避免把重复内容当成额外证据。
+- 跨 split 报告 `cross_split.val_test.pairs` 与示例；val 内部
+  或 test 内部存在近重复时以 `[warn]` 点名「bootstrap/选型会
+  把同源内容当独立样本，区间可能偏窄」；val↔test 存在近重复
+  时点名「val 选型可能间接看到 test」。近重复是相似而非逐字节
+  相同，因此默认只告警、不进入硬门，也不自动删除评估内容
+  （修改 val/test 会改变被评估分布）。
+- 默认仍只读 val；只有解封 test（`include_test=True`）时才
+  把 test 范围加入扫描，并把 `test_content_used` 写入报告。
+  审计不改变 `split_sha256`、群组边界或 `train_excluded_spans`。
+  示例、簇与候选按群组位置确定性排序，不依赖 `PYTHONHASHSEED`。
+- 新增回归测试：val/test 内部近重复分别被聚类为正确簇数；
+  跨 split 近重复只在显式解封 test 后出现；审计不删除任何
+  训练内容、两次运行结果逐位一致；非法阈值/shingle/草图大小
+  被拒绝。
+
+**仍有限制：**
+
+- 近重复是内容级相似，不是语义重复；同义改写、翻译、结构性
+  复制不在字节 shingle 的检测范围内。`effective_groups` 是
+  按簇全冗余计的保守下界，不能反过来声称「簇内内容都不同」。
+- 阈值与 shingle 长度是研究者事先声明的操作化定义。阈值越低
+  候选越多、簇越大；报告必须与预注册/冻结参数一起读，不能
+  在看到评估结果后调整阈值来「消除」重复。
+- bottom-k 草图只负责候选生成，可能漏掉长度差异极大但短文本
+  被长文本完整包含的群组（Jaccard 本身很低）。这类关系应另用
+  containment 指标或实体清单处理，不能偷偷降低 Jaccard 阈值。
+- 过短（不足一个 shingle）或超过 4 MiB 的群组被显式跳过并计数；
+  「未标记」不等于「不重复」。val/test 内部近重复目前只告警，
+  不是硬门；若研究要主张评估区间/选型独立，应在报告中披露
+  `effective_groups`，或按文档/群组做 cluster bootstrap，
+  而不是继续按窗口 i.i.d. 解读。
+- 本审计不自动修正置信区间，也不替代窗口重叠比例、AR(1)
+  膨胀与种子×窗口方差分解；它提供的是「独立单位被高估」的
+  证据，修正口径仍需在分析阶段显式选择并报告。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1227,7 +1291,9 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
 2. 固定数据协议：`--split-policy chronological` + 时间清单，
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
    默认 val-only 清洗；训练前核对 `data_audit.label_coverage`、
-   `data_audit.near_duplicates`（若启用近重复审计/清洗）与（清洗
+   `data_audit.near_duplicates`（若启用近重复审计/清洗）、
+   `data_audit.evaluation_near_duplicates`（val/test 内部与
+   val↔test 的 `effective_groups`、最大簇与跨 split 对）与（清洗
    确有删除时的）`train_cleaning.deletion_bias`，把高删除偏差、
    未见评估标签或阈值下仍存在的近重复写进限制/敏感性分析计划。
 3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、

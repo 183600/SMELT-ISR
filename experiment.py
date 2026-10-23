@@ -4785,6 +4785,7 @@ class LanguageModel(nn.Module):
 # 相关，先对每个群组取 shingle 哈希的 bottom-k 草图（MinHash
 # 家族的最小哈希样本），用草图哈希做倒排索引生成候选，再对候选
 # 用完整 shingle 集合复核精确 Jaccard；只有精确值达到阈值才删除。
+# 同一口径也用于评估集内部/val↔test 的只读近重复审计（不删除）。
 _NEAR_DUP_DEFAULT_THRESHOLD = 0.8
 _NEAR_DUP_DEFAULT_SHINGLE_BYTES = 8
 _NEAR_DUP_DEFAULT_SKETCH_SIZE = 128
@@ -9109,6 +9110,46 @@ def _near_duplicate_shingle_set(
     )
 
 
+def _near_duplicate_exact_values(
+    raw,
+    start: int,
+    end: int,
+    shingle_bytes: int,
+) -> Tuple[object, int]:
+    """
+    返回 [start, end) 的完整 shingle 集合与近似内存占用。
+
+    NumPy 可用时用去重后的 uint64 数组（8 字节/值）并配合
+    ``intersect1d`` 做精确交集；没有 NumPy 时退回 Python set。
+    与训练集近重复审计的精确复核口径一致，只是把缓存管理留给
+    调用方。
+    """
+    count = max(0, end - start - shingle_bytes + 1)
+    if np is not None:
+        values = np.unique(
+            np.fromiter(
+                _near_duplicate_shingle_hashes(
+                    raw,
+                    start,
+                    end,
+                    shingle_bytes,
+                ),
+                dtype=np.uint64,
+                count=count,
+            )
+        )
+        return values, int(values.nbytes)
+
+    values = _near_duplicate_shingle_set(
+        raw,
+        start,
+        end,
+        shingle_bytes,
+    )
+    # Python set 中每个 int 对象加哈希槽远大于 8 字节。
+    return values, len(values) * 48 + max(1, end - start)
+
+
 def _near_duplicate_threshold_or_default(
     value: object,
 ) -> float:
@@ -9535,6 +9576,369 @@ def _plan_train_near_duplicate_cleaning(
     if apply_cleaning:
         return flagged_spans, stats
     return [], stats
+
+
+def _eval_near_duplicate_audit(
+    raw: bytearray,
+    separator: bytes,
+    ranges: Dict[str, Tuple[int, int]],
+    threshold: float = _NEAR_DUP_DEFAULT_THRESHOLD,
+    shingle_bytes: int = _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+    sketch_size: int = _NEAR_DUP_DEFAULT_SKETCH_SIZE,
+) -> Dict[str, object]:
+    """
+    评估集内部与 val↔test 之间的近重复群组只读审计。
+
+    精确重复群组已由内容指纹门拦截，但同一文档的修订版/转载版
+    仍可能以不同字节同时出现在 val 或 test：
+
+    - split 内部近重复群组会把同一内容重复计入评估损失、
+      固定窗口 bootstrap 与 checkpoint 选型，使有效样本量
+      小于名义窗口/群组数，置信区间偏窄；
+    - val↔test 近重复会让 val 选型通过近似内容间接看到 test，
+      test 指标不再完全独立。
+
+    本函数只读、只报告，不删除/修改任何字节。相似度仍是字节
+    k-shingle 集合的精确 Jaccard，bottom-k 草图只用于生成候选。
+    对每个 split 用并查集把达到阈值的近重复群组合并为簇，报告
+    ``effective_groups``（簇数，即按「簇内全部冗余」计的独立
+    内容单元保守下界）与 ``redundant_groups``（名义群组数 -
+    簇数）。
+
+    与训练集近重复审计的分工：训练集审计回答「train 是否把
+    val/test 内容带进训练」，本函数回答「评估集自己是否把同一
+    内容重复计数」。两者不能互相替代。
+    """
+    try:
+        checked_threshold = float(threshold)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "evaluation near-duplicate threshold 必须是数值"
+        ) from error
+    if (
+        not math.isfinite(checked_threshold)
+        or not 0.0 < checked_threshold <= 1.0
+    ):
+        raise ValueError(
+            "evaluation near-duplicate threshold 必须落在 (0, 1]"
+        )
+    if (
+        not isinstance(shingle_bytes, int)
+        or isinstance(shingle_bytes, bool)
+        or not 1 <= shingle_bytes <= _NEAR_DUP_MAX_SHINGLE_BYTES
+    ):
+        raise ValueError(
+            "evaluation near-duplicate shingle_bytes 必须是 1.."
+            f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+        )
+    if (
+        not isinstance(sketch_size, int)
+        or isinstance(sketch_size, bool)
+        or not 8 <= sketch_size <= _NEAR_DUP_MAX_SKETCH_SIZE
+    ):
+        raise ValueError(
+            "evaluation near-duplicate sketch_size 必须是 8.."
+            f"{_NEAR_DUP_MAX_SKETCH_SIZE} 的整数"
+        )
+    if separator is None or len(separator) == 0:
+        raise ValueError(
+            "evaluation near-duplicate 扫描需要非空群组分隔符"
+        )
+
+    split_order = [
+        split
+        for split in ("val", "test")
+        if (
+            split in ranges
+            and int(ranges[split][1]) > int(ranges[split][0])
+        )
+    ]
+
+    groups: List[Tuple[str, int, int]] = []
+    split_group_indices: Dict[str, List[int]] = {
+        split: [] for split in split_order
+    }
+    per_split: Dict[str, Dict[str, object]] = {}
+    for split in split_order:
+        per_split[split] = {
+            "groups_total": 0,
+            "groups_scanned": 0,
+            "groups_too_short": 0,
+            "groups_too_large": 0,
+            "within_pairs": 0,
+            "clusters": 0,
+            "effective_groups": 0,
+            "redundant_groups": 0,
+            "effective_fraction": None,
+            "largest_cluster_groups": 0,
+        }
+
+    candidate_pairs = 0
+    exact_cache: "OrderedDict[Tuple[int, int], Tuple[object, int]]" = (
+        OrderedDict()
+    )
+    exact_cache_bytes = 0
+
+    def _full_shingle_set(
+        span: Tuple[int, int],
+    ) -> object:
+        nonlocal exact_cache_bytes
+        cached = exact_cache.get(span)
+        if cached is not None:
+            exact_cache.move_to_end(span)
+            return cached[0]
+
+        values, size = _near_duplicate_exact_values(
+            raw,
+            span[0],
+            span[1],
+            shingle_bytes,
+        )
+        while (
+            exact_cache
+            and exact_cache_bytes + size
+            > _NEAR_DUP_EXACT_CACHE_BYTES
+        ):
+            _, (_, old_size) = exact_cache.popitem(
+                last=False
+            )
+            exact_cache_bytes -= old_size
+        exact_cache[span] = (values, size)
+        exact_cache_bytes += size
+        return values
+
+    def _exact_jaccard(
+        left: Tuple[int, int],
+        right: Tuple[int, int],
+    ) -> float:
+        left_values = _full_shingle_set(left)
+        right_values = _full_shingle_set(right)
+        if np is not None:
+            if (
+                left_values.size == 0
+                or right_values.size == 0
+            ):
+                return 0.0
+            intersection = int(
+                np.intersect1d(
+                    left_values,
+                    right_values,
+                    assume_unique=True,
+                ).size
+            )
+            union = (
+                int(left_values.size)
+                + int(right_values.size)
+                - intersection
+            )
+        else:
+            if not left_values or not right_values:
+                return 0.0
+            intersection = len(
+                left_values & right_values
+            )
+            union = (
+                len(left_values)
+                + len(right_values)
+                - intersection
+            )
+        if union <= 0:
+            return 0.0
+        return intersection / union
+
+    # 只用 bottom-k 草图生成候选；是否近重复由完整 shingle
+    # 集合的精确 Jaccard 决定。所有群组按 split 与位置顺序进入
+    # 倒排索引，因此每对群组只比较一次，报告顺序确定。
+    sketch_index: Dict[int, List[int]] = {}
+    within_pairs: List[Tuple[int, int, float]] = []
+    cross_pairs: List[Tuple[int, int, float]] = []
+
+    for split in split_order:
+        begin, end = (
+            int(ranges[split][0]),
+            int(ranges[split][1]),
+        )
+        for span_start, span_end in _iter_group_spans(
+            raw,
+            separator,
+            begin,
+            end,
+        ):
+            per_split[split]["groups_total"] += 1
+            length = span_end - span_start
+            if length > _NEAR_DUP_MAX_GROUP_BYTES:
+                per_split[split]["groups_too_large"] += 1
+                continue
+
+            sketch = _near_duplicate_bottom_k(
+                _near_duplicate_shingle_hashes(
+                    raw,
+                    span_start,
+                    span_end,
+                    shingle_bytes,
+                ),
+                sketch_size,
+            )
+            if not sketch:
+                per_split[split]["groups_too_short"] += 1
+                continue
+
+            group_index = len(groups)
+            groups.append((split, span_start, span_end))
+            split_group_indices[split].append(group_index)
+            per_split[split]["groups_scanned"] += 1
+
+            candidates = set()
+            for value in sketch:
+                for other_index in sketch_index.get(
+                    value, ()
+                ):
+                    candidates.add(other_index)
+
+            span = (span_start, span_end)
+            for other_index in sorted(candidates):
+                candidate_pairs += 1
+                other_split, other_start, other_end = groups[
+                    other_index
+                ]
+                jaccard = _exact_jaccard(
+                    span,
+                    (other_start, other_end),
+                )
+                if jaccard + 1e-12 < checked_threshold:
+                    continue
+                if other_split == split:
+                    within_pairs.append(
+                        (group_index, other_index, jaccard)
+                    )
+                else:
+                    cross_pairs.append(
+                        (group_index, other_index, jaccard)
+                    )
+
+            for value in sketch:
+                sketch_index.setdefault(value, []).append(
+                    group_index
+                )
+
+    # 并查集只在 split 内部合并：同一近重复簇是一个「独立内容
+    # 单元」，跨 split 的近似内容不计入 split 内部有效群组数。
+    parent = list(range(len(groups)))
+    rank = [0] * len(groups)
+
+    def _find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _union(left: int, right: int) -> None:
+        left_root = _find(left)
+        right_root = _find(right)
+        if left_root == right_root:
+            return
+        if rank[left_root] < rank[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        if rank[left_root] == rank[right_root]:
+            rank[left_root] += 1
+
+    for left, right, _jaccard in within_pairs:
+        _union(left, right)
+
+    for split in split_order:
+        info = per_split[split]
+        indices = split_group_indices[split]
+        root_sizes: Dict[int, int] = {}
+        for index in indices:
+            root = _find(index)
+            root_sizes[root] = root_sizes.get(root, 0) + 1
+        clusters = len(root_sizes)
+        scanned = int(info["groups_scanned"])
+        info["within_pairs"] = sum(
+            1
+            for left, right, _jaccard in within_pairs
+            if groups[left][0] == split
+        )
+        info["clusters"] = clusters
+        info["effective_groups"] = clusters
+        info["redundant_groups"] = max(0, scanned - clusters)
+        info["effective_fraction"] = (
+            clusters / scanned if scanned > 0 else None
+        )
+        info["largest_cluster_groups"] = (
+            max(root_sizes.values()) if root_sizes else 0
+        )
+        examples = []
+        for left, right, jaccard in within_pairs:
+            if groups[left][0] != split:
+                continue
+            if len(examples) >= 5:
+                break
+            # 先报告较晚出现的群组，再报告其更早的匹配对象，
+            # 与训练集近重复审计的示例口径一致。
+            examples.append([
+                groups[left][1],
+                groups[left][2],
+                groups[right][1],
+                groups[right][2],
+                round(jaccard, 6),
+            ])
+        info["examples"] = examples
+
+    cross_split: Dict[str, Dict[str, object]] = {}
+    for left_index in range(len(split_order)):
+        for right_index in range(left_index + 1, len(split_order)):
+            left = split_order[left_index]
+            right = split_order[right_index]
+            key = f"{left}_{right}"
+            entries = [
+                (i, j, value)
+                for i, j, value in cross_pairs
+                if {
+                    groups[i][0],
+                    groups[j][0],
+                } == {left, right}
+            ]
+            cross_split[key] = {
+                "pairs": len(entries),
+                "examples": [
+                    [
+                        groups[i][1],
+                        groups[i][2],
+                        groups[j][1],
+                        groups[j][2],
+                        round(value, 6),
+                    ]
+                    for i, j, value in entries[:5]
+                ],
+            }
+
+    return {
+        "schema": "smelt-isr/eval-near-duplicate/v1",
+        "mode": "audit",
+        "policy": (
+            "read-only near-duplicate audit within val/test and "
+            "across val/test; no bytes are removed"
+        ),
+        "threshold": round(checked_threshold, 6),
+        "shingle_bytes": shingle_bytes,
+        "sketch_size": sketch_size,
+        "similarity": "jaccard_of_byte_shingle_sets",
+        "shingle_hash": "rolling_polynomial_64bit",
+        "exact_verification": True,
+        "max_group_bytes": _NEAR_DUP_MAX_GROUP_BYTES,
+        "splits": list(split_order),
+        "test_content_used": "test" in split_order,
+        "candidate_pairs": candidate_pairs,
+        "per_split": per_split,
+        "cross_split": cross_split,
+        "note": (
+            "effective_groups 是近重复簇数；按「簇内全部冗余」"
+            "计这是独立样本量的保守下界，簇内群组仍可能包含"
+            "不同内容"
+        ),
+    }
 
 
 def _train_group_health_audit(
@@ -10498,6 +10902,7 @@ def audit_data_splits(
     # 近重复是相似而非逐字节相同，默认只告警、不进入泄露硬门；
     # 清洗需显式 --drop-train-near-duplicate-groups。
     near_duplicates: Optional[Dict[str, object]] = None
+    evaluation_near_duplicates: Optional[Dict[str, object]] = None
     if (
         dataset.group_separator is not None
         and getattr(dataset, "near_duplicate_audit", False)
@@ -10576,6 +10981,62 @@ def audit_data_splits(
                 "「未标记」当成「不重复」"
             )
 
+        # 评估集内部的近重复与 train→eval 是两类不同的问题：
+        # 前者让同一内容在评估中被重复计数，后者才是训练污染。
+        # 使用与训练集审计相同的阈值/shingle 口径；test 只在
+        # 显式解封（include_test=True）时读取。
+        evaluation_near_duplicates = _eval_near_duplicate_audit(
+            dataset._raw_buffer,
+            dataset.group_separator,
+            near_eval_ranges,
+            threshold=getattr(
+                dataset,
+                "near_duplicate_threshold",
+                _NEAR_DUP_DEFAULT_THRESHOLD,
+            ),
+            shingle_bytes=getattr(
+                dataset,
+                "near_duplicate_shingle_bytes",
+                _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+            ),
+        )
+
+        for split, info in (
+            evaluation_near_duplicates["per_split"] or {}
+        ).items():
+            if int(info["within_pairs"]) <= 0:
+                continue
+            consumers = (
+                "固定窗口 bootstrap 与 checkpoint 选型"
+                if split == "val"
+                else "固定窗口 bootstrap"
+            )
+            warnings.append(
+                f"{split}: 评估集内部检测到 "
+                f"{info['within_pairs']} 对近重复群组"
+                f"（{info['clusters']} 个独立簇 / 共 "
+                f"{info['groups_scanned']} 个可比群组，"
+                f"有效群组 {info['effective_groups']}，"
+                "最大簇 "
+                f"{info['largest_cluster_groups']} 个）；"
+                f"{consumers}会把同源内容当作独立样本，"
+                "评估区间可能偏窄，也不能把名义群组/窗口数"
+                "当作独立样本量"
+            )
+
+        for pair, info in (
+            evaluation_near_duplicates["cross_split"] or {}
+        ).items():
+            if int(info["pairs"]) <= 0:
+                continue
+            warnings.append(
+                f"{pair}: 检测到 {info['pairs']} 对跨 split "
+                "近重复评估群组（shingle Jaccard >= "
+                f"{evaluation_near_duplicates['threshold']}）；"
+                "val 选型可能通过近似内容间接看到 test，"
+                "test 指标不再完全独立，需披露或重新划分"
+            )
+
     return {
         "max_windows": max_windows,
         "splits": splits_report,
@@ -10598,6 +11059,9 @@ def audit_data_splits(
         "leakage_scan_coverage": scan_coverage,
         "content_chunks": content_chunks,
         "near_duplicates": near_duplicates,
+        "evaluation_near_duplicates": (
+            evaluation_near_duplicates
+        ),
         "degenerate_runs": degenerate_runs,
         "val_label_noise": val_label_noise,
         "split_isolation": _split_isolation_record(
@@ -11151,6 +11615,41 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 f"[{example[0]},{example[1]}) ≈ "
                 f"[{example[4]},{example[5]}) "
                 f"reason={example[2]} J={example[3]}"
+            )
+
+    eval_near = report.get("evaluation_near_duplicates")
+    if isinstance(eval_near, dict):
+        print(
+            "[data]   评估集近重复审计: "
+            f"Jaccard>={eval_near.get('threshold')}, "
+            f"shingle={eval_near.get('shingle_bytes')}B, "
+            f"candidates={eval_near.get('candidate_pairs')}"
+            + (
+                "（含 test 内容）"
+                if eval_near.get("test_content_used")
+                else "（仅 val）"
+            )
+        )
+        for split, info in (
+            eval_near.get("per_split") or {}
+        ).items():
+            print(
+                f"[data]     {split}: 可比群组 "
+                f"{info.get('groups_scanned')}, "
+                f"近重复对 {info.get('within_pairs')}, "
+                f"有效群组 {info.get('effective_groups')}"
+                f"/{info.get('groups_scanned')}, "
+                "最大簇 "
+                f"{info.get('largest_cluster_groups')}"
+            )
+        for pair, info in (
+            eval_near.get("cross_split") or {}
+        ).items():
+            if int(info.get("pairs", 0)) <= 0:
+                continue
+            print(
+                f"[data]     {pair} 跨 split 近重复对 = "
+                f"{info.get('pairs')}"
             )
 
     violation_set = set(report.get("violations", []))
@@ -67963,11 +68462,14 @@ def main():
         action="store_true",
         help=(
             "只读近重复审计（需要 --group-separator）：不删除"
-            "任何数据，在 data_audit.near_duplicates 中报告与 "
-            "val（解封时含 test）或更早 train 近似的训练群组、"
-            "最佳匹配位置、Jaccard 值与哈希/草图口径。用于先"
-            "看清重复程度再决定是否启用 "
-            "--drop-train-near-duplicate-groups"
+            "任何数据。data_audit.near_duplicates 报告与 val"
+            "（解封时含 test）或更早 train 近似的训练群组；"
+            "data_audit.evaluation_near_duplicates 另报告 val/"
+            "test 内部与 val↔test 的近重复评估群组、独立簇数"
+            "与有效群组数，用于判断 bootstrap/选型的有效样本"
+            "是否被近重复内容虚增。两处都给出最佳匹配位置、"
+            "Jaccard 值与哈希/草图口径。用于先看清重复程度再"
+            "决定是否启用 --drop-train-near-duplicate-groups"
         ),
     )
     parser.add_argument(

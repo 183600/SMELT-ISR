@@ -3949,6 +3949,246 @@ class NearDuplicateDataTests(unittest.TestCase):
             leaky.train_excluded_spans, [(0, 640)]
         )
 
+    @staticmethod
+    def _mutate_byte(content: bytes, position: int) -> bytes:
+        """把一个可打印字节改成另一个可打印字节，制造近重复。"""
+        value = content[position]
+        replacement = 32 + ((value - 32 + 1) % 95)
+        return (
+            content[:position]
+            + bytes([replacement])
+            + content[position + 1:]
+        )
+
+    def test_eval_near_duplicate_audit_reports_effective_groups(self):
+        separator = b"\n\n"
+        val_base = self._printable("eval-val-base", 640)
+        val_variant = self._mutate_byte(val_base, 300)
+        val_other = self._printable("eval-val-other", 640)
+        test_base = self._printable("eval-test-base", 640)
+        test_variant = self._mutate_byte(test_base, 320)
+        test_other = self._printable("eval-test-other", 640)
+
+        val_raw = separator.join(
+            [val_base, val_variant, val_other]
+        )
+        test_raw = separator.join(
+            [test_base, test_variant, test_other]
+        )
+        raw = bytearray(val_raw + separator + test_raw)
+        val_range = (0, len(val_raw))
+        test_range = (
+            len(val_raw) + len(separator),
+            len(raw),
+        )
+
+        report = experiment._eval_near_duplicate_audit(
+            raw,
+            separator,
+            {"val": val_range, "test": test_range},
+            threshold=0.8,
+            shingle_bytes=8,
+        )
+
+        self.assertEqual(
+            report["schema"],
+            "smelt-isr/eval-near-duplicate/v1",
+        )
+        self.assertEqual(report["splits"], ["val", "test"])
+        self.assertTrue(report["test_content_used"])
+        self.assertTrue(report["exact_verification"])
+
+        val_info = report["per_split"]["val"]
+        self.assertEqual(val_info["groups_total"], 3)
+        self.assertEqual(val_info["groups_scanned"], 3)
+        self.assertEqual(val_info["within_pairs"], 1)
+        self.assertEqual(val_info["clusters"], 2)
+        self.assertEqual(val_info["effective_groups"], 2)
+        self.assertEqual(val_info["redundant_groups"], 1)
+        self.assertEqual(val_info["largest_cluster_groups"], 2)
+        self.assertEqual(val_info["effective_fraction"], 2 / 3)
+        self.assertTrue(
+            val_info["examples"][0][4] >= 0.8
+        )
+
+        test_info = report["per_split"]["test"]
+        self.assertEqual(test_info["groups_scanned"], 3)
+        self.assertEqual(test_info["within_pairs"], 1)
+        self.assertEqual(test_info["effective_groups"], 2)
+
+        # 两组近重复内容分别来自不同随机基串，跨 split 不应
+        # 被误报为近重复。
+        self.assertEqual(
+            report["cross_split"]["val_test"]["pairs"], 0
+        )
+
+    def test_eval_near_duplicate_audit_detects_cross_split_only_with_test(self):
+        separator = b"\n\n"
+        val_base = self._printable("cross-val-base", 640)
+        test_variant = self._mutate_byte(val_base, 200)
+        raw = bytearray(
+            val_base + separator + test_variant
+        )
+        val_range = (0, len(val_base))
+        test_range = (
+            len(val_base) + len(separator),
+            len(raw),
+        )
+
+        val_only = experiment._eval_near_duplicate_audit(
+            raw,
+            separator,
+            {"val": val_range},
+            threshold=0.8,
+            shingle_bytes=8,
+        )
+        self.assertFalse(val_only["test_content_used"])
+        self.assertEqual(val_only["splits"], ["val"])
+        self.assertEqual(
+            val_only["cross_split"], {}
+        )
+
+        with_test = experiment._eval_near_duplicate_audit(
+            raw,
+            separator,
+            {"val": val_range, "test": test_range},
+            threshold=0.8,
+            shingle_bytes=8,
+        )
+        self.assertTrue(with_test["test_content_used"])
+        self.assertGreaterEqual(
+            with_test["cross_split"]["val_test"]["pairs"], 1
+        )
+        self.assertEqual(
+            with_test["per_split"]["val"]["within_pairs"], 0
+        )
+        self.assertEqual(
+            with_test["per_split"]["test"]["within_pairs"], 0
+        )
+
+    def test_eval_near_duplicate_audit_is_read_only_and_deterministic(self):
+        separator = b"\n\n"
+        base = self._printable("audit-base", 640)
+        variant = self._mutate_byte(base, 100)
+        groups = [
+            *[
+                self._printable(f"audit-train-{index}", 640)
+                for index in range(6)
+            ],
+            base,
+            variant,
+            self._printable("audit-val-other", 640),
+            self._mutate_byte(base, 300),
+            self._mutate_byte(variant, 400),
+            self._printable("audit-test-other", 640),
+        ]
+        payload = separator.join(groups)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "eval-near.txt"
+            path.write_bytes(payload)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=separator,
+                near_duplicate_audit=True,
+                near_duplicate_threshold=0.8,
+                near_duplicate_shingle_bytes=8,
+            )
+            sealed_one = experiment.audit_data_splits(dataset)
+            sealed_two = experiment.audit_data_splits(dataset)
+            unsealed = experiment.audit_data_splits(
+                dataset,
+                include_test=True,
+            )
+            excluded_after = list(dataset.train_excluded_spans)
+
+        self.assertEqual(excluded_after, [])
+        self.assertEqual(sealed_one, sealed_two)
+        self.assertIsNotNone(
+            sealed_one["evaluation_near_duplicates"]
+        )
+        self.assertEqual(
+            sealed_one["evaluation_near_duplicates"]["splits"],
+            ["val"],
+        )
+        self.assertFalse(
+            sealed_one["evaluation_near_duplicates"][
+                "test_content_used"
+            ]
+        )
+        self.assertNotIn(
+            "test",
+            sealed_one["evaluation_near_duplicates"][
+                "per_split"
+            ],
+        )
+        self.assertEqual(
+            sealed_one["evaluation_near_duplicates"][
+                "cross_split"
+            ],
+            {},
+        )
+        self.assertTrue(
+            any(
+                "评估集内部" in warning
+                for warning in sealed_one["warnings"]
+            )
+        )
+
+        self.assertEqual(
+            unsealed["evaluation_near_duplicates"]["splits"],
+            ["val", "test"],
+        )
+        self.assertTrue(
+            unsealed["evaluation_near_duplicates"][
+                "test_content_used"
+            ]
+        )
+        self.assertIn(
+            "test",
+            unsealed["evaluation_near_duplicates"][
+                "per_split"
+            ],
+        )
+        self.assertGreaterEqual(
+            unsealed["evaluation_near_duplicates"][
+                "cross_split"
+            ]["val_test"]["pairs"],
+            1,
+        )
+        self.assertTrue(
+            any(
+                "跨 split 近重复评估群组" in warning
+                for warning in unsealed["warnings"]
+            )
+        )
+
+    def test_eval_near_duplicate_audit_rejects_invalid_parameters(self):
+        raw = bytearray(b"abc" * 100)
+        for kwargs in (
+            {"threshold": 0.0},
+            {"threshold": 1.5},
+            {"shingle_bytes": 0},
+            {"shingle_bytes": 65},
+            {"sketch_size": 1},
+        ):
+            with self.assertRaises(ValueError):
+                experiment._eval_near_duplicate_audit(
+                    raw,
+                    b"\n\n",
+                    {"val": (0, len(raw))},
+                    **kwargs,
+                )
+        with self.assertRaises(ValueError):
+            experiment._eval_near_duplicate_audit(
+                raw,
+                b"",
+                {"val": (0, len(raw))},
+            )
+
 
 class ProcessTests(unittest.TestCase):
     def test_set_seed_updates_child_hashseed_on_reseed(self):

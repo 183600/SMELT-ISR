@@ -119,6 +119,17 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `eval_content_access` 写入 `train_cleaning`、`config.data` 与受控
   协议（该运行不再被视为完全尘封测试集）。解封前独立探针再核对
   test 固定窗口的输入/标签逐位对齐。
+- **近重复与评估独立单位**：`--near-duplicate-audit`（需配合
+  `--group-separator`）除报告 train 与 val/test/更早 train 的
+  近重复训练群组外，还在 `data_audit.evaluation_near_duplicates`
+  报告 val 内部、test 内部与 val↔test 的近重复评估群组。
+  后者用字节 k-shingle 的精确 Jaccard 判定，并以并查集把达到
+  阈值的群组合并为簇，报告 `effective_groups`（按簇全冗余计的
+  独立样本量保守下界）与最大簇。它回答「评估集是否把同一内容
+  重复计数」：固定窗口 bootstrap 与 val 选型都假设样本独立，
+  近重复会虚增名义样本量、使区间偏窄；val↔test 近重复还会让
+  选型间接看到 test。审计只读、不修改任何字节，test 仅在显式
+  解封时参与。
 - **跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
   群组分隔符）用与审计相同的内容定义分块指纹，把与 val（默认；
   显式 `--clean-train-against-test` 时含 test）共享连续字节块的整个
