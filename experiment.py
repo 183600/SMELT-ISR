@@ -62852,9 +62852,22 @@ def build_pilot_power_evidence(
 
     annotation: Dict[str, object] = {
         "kind": annotation_kind,
-        "target_step": target_step,
-        "target_step_rule": None,
-        "target_step_data_dependent": None,
+        # ``val_loss`` 等记录值没有共同步数/计算量口径：
+        # 不能把命令行 --common-step 写进这里冒充「该指标
+        # 取自共同步数」。只有派生指标才带 target_step。
+        "target_step": (
+            None if annotation_kind == "recorded_metric"
+            else target_step
+        ),
+        "target_step_rule": (
+            "not_applicable"
+            if annotation_kind == "recorded_metric"
+            else None
+        ),
+        "target_step_data_dependent": (
+            False if annotation_kind == "recorded_metric"
+            else None
+        ),
     }
     if isinstance(annotation_report, dict):
         if annotation_kind == "curve_mean":
@@ -62984,13 +62997,24 @@ def build_pilot_power_evidence(
         )
         cell_mean = _mean(list(values_by_seed.values()))
         cell["mean"] = cell_mean
-        cell["seed_sd_relative"] = (
-            cell["seed_sd_abs"] / abs(cell_mean)
-            if cell["seed_sd_abs"] is not None
+        cell_sd_relative = None
+        if (
+            cell["seed_sd_abs"] is not None
             and cell_mean is not None
             and cell_mean != 0.0
-            else None
-        )
+        ):
+            try:
+                cell_sd_relative = (
+                    cell["seed_sd_abs"] / abs(cell_mean)
+                )
+            except OverflowError:
+                cell_sd_relative = None
+            if (
+                cell_sd_relative is not None
+                and not math.isfinite(cell_sd_relative)
+            ):
+                cell_sd_relative = None
+        cell["seed_sd_relative"] = cell_sd_relative
         finalized_cells.append(cell)
 
     pairs: List[Dict[str, object]] = []
@@ -63018,13 +63042,21 @@ def build_pilot_power_evidence(
                 denominator = min(
                     abs(first_mean), abs(second_mean)
                 )
-            paired_sd_relative = (
-                paired_sd / denominator
-                if paired_sd is not None
+            paired_sd_relative = None
+            if (
+                paired_sd is not None
                 and denominator is not None
                 and denominator > 0.0
-                else None
-            )
+            ):
+                try:
+                    paired_sd_relative = paired_sd / denominator
+                except OverflowError:
+                    paired_sd_relative = None
+                if (
+                    paired_sd_relative is not None
+                    and not math.isfinite(paired_sd_relative)
+                ):
+                    paired_sd_relative = None
             pairs.append({
                 "first": first["label"],
                 "second": second["label"],
@@ -63139,17 +63171,28 @@ def build_pilot_power_evidence(
     attrition_status = _pilot_declared_check(
         declared_attrition, observed_attrition
     )
+    observed_over_declared = None
+    if (
+        observed_sd_relative is not None
+        and declared_sd
+        and declared_sd > 0.0
+    ):
+        try:
+            observed_over_declared = (
+                observed_sd_relative / declared_sd
+            )
+        except OverflowError:
+            observed_over_declared = None
+        if (
+            observed_over_declared is not None
+            and not math.isfinite(observed_over_declared)
+        ):
+            observed_over_declared = None
     sd_check = {
         "declared": declared_sd,
         "observed": observed_sd_relative,
         "observed_absolute": observed_sd_abs,
-        "ratio_observed_over_declared": (
-            observed_sd_relative / declared_sd
-            if observed_sd_relative is not None
-            and declared_sd
-            and declared_sd > 0.0
-            else None
-        ),
+        "ratio_observed_over_declared": observed_over_declared,
         "status": sd_status,
         "min_pairs": _DESIGN_PILOT_MIN_PAIRS,
         "n_evaluable_pairs": len(evaluable_pairs),

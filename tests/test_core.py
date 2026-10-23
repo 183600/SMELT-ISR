@@ -2628,6 +2628,15 @@ class DesignPreparationTests(unittest.TestCase):
 
         self.assertEqual(evidence["cell_count"], 2)
         self.assertEqual(evidence["pair_count"], 1)
+        # val_loss 是记录值而不是共同步数派生指标：即使调用方
+        # 传了 target_step，也不能声称该指标取自共同步数。
+        self.assertEqual(
+            evidence["metric_annotation"]["kind"],
+            "recorded_metric",
+        )
+        self.assertIsNone(
+            evidence["metric_annotation"]["target_step"]
+        )
         pair = evidence["pairs"][0]
         # A 的第 5 个种子数值失败，不能进入配对差值。
         self.assertEqual(pair["n_pairs"], 4)
@@ -2817,6 +2826,44 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertIsNotNone(gate)
         self.assertIn("无法", gate)
         self.assertNotIn("None 个启动种子", gate)
+
+    def test_pilot_evidence_ratios_do_not_overflow(self):
+        # 一个单元内 ±1e308 与极小的值可以同时让均值和 sd
+        # 有限，但相对 sd 的除法溢出；这类字段必须省略而不是
+        # 写入 inf/NaN。
+        smelt = [1.0e308, -1.0e308, 1.0e-308, 1.0e-308,
+                 1.0e-308, 1.0e-308]
+        variant = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 7)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, smelt[index]
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "A", seed, variant[index]
+                    ))
+                )
+            evidence = experiment.build_pilot_power_evidence(
+                paths,
+                "val_loss",
+                declared_sd=1.0e-300,
+                declared_attrition=0.0,
+            )
+        cell = next(
+            item
+            for item in evidence["cells"]
+            if item["mode"] == "smelt"
+        )
+        self.assertIsNone(cell["seed_sd_relative"])
+        self.assertIsNone(
+            evidence["sd_check"]["ratio_observed_over_declared"]
+        )
+        json.dumps(evidence, allow_nan=False)
 
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
