@@ -12369,10 +12369,13 @@ def _parse_group_stats(
     separator = stats.get("group_separator_sha256")
     if separator is not None and not isinstance(separator, str):
         return None
+    unit = stats.get("unit")
+    if unit is not None and not isinstance(unit, str):
+        return None
     return {
         "mapping": mapping,
         "group_separator_sha256": separator,
-        "unit": stats.get("unit"),
+        "unit": unit,
     }
 
 
@@ -12443,6 +12446,12 @@ def _group_cluster_eval_intervals(
         return {
             "available": False,
             "reason": "missing_or_invalid_group_stats",
+        }
+    if parsed["unit"] not in (None, "document_group"):
+        return {
+            "available": False,
+            "reason": "unsupported_group_unit",
+            "unit": parsed["unit"],
         }
     mapping = parsed["mapping"]
     assert isinstance(mapping, dict)
@@ -12566,6 +12575,12 @@ def _group_cluster_paired_comparison(
             "reason": "group_unit_mismatch",
             "unit_a": parsed_a["unit"],
             "unit_b": parsed_b["unit"],
+        }
+    if parsed_a["unit"] not in (None, "document_group"):
+        return {
+            "available": False,
+            "reason": "unsupported_group_unit",
+            "unit": parsed_a["unit"],
         }
     if (
         parsed_a["group_separator_sha256"]

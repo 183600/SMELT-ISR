@@ -10603,6 +10603,26 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
         self.assertEqual(report["reason"], "group_unit_mismatch")
+        for unit in ("window", "token"):
+            stats = self._stats(groups, unit=unit)
+            self.assertFalse(
+                experiment._group_cluster_eval_intervals(
+                    stats, replicates=50, seed=1
+                )["available"]
+            )
+            self.assertFalse(
+                experiment._group_cluster_paired_comparison(
+                    {"group_stats": stats},
+                    {"group_stats": stats},
+                )["available"]
+            )
+        invalid = self._stats(groups)
+        invalid["unit"] = {"name": "document_group"}
+        self.assertIsNone(
+            experiment._parse_group_stats(
+                {"group_stats": invalid}
+            )
+        )
 
 
 if __name__ == "__main__":
