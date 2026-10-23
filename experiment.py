@@ -10936,7 +10936,7 @@ def print_data_audit(report: Dict[str, object]) -> None:
         print(
             "[data]   实际 split 占比: "
             + ", ".join(
-                f"{name}:{value:.4f}"
+                f"{name}:{_format_finite(value)}"
                 for name, value in fractions.items()
             )
         )
@@ -10996,13 +10996,15 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 + (
                     "（删除非随机，清洗前后分布不可直接比较）"
                     if (
-                        isinstance(bias.get("drop_fraction"), (int, float))
-                        and float(bias["drop_fraction"])
+                        _finite_float(bias.get("drop_fraction"))
+                        is not None
+                        and _finite_float(bias.get("drop_fraction"))
                         > _AUDIT_DELETION_DROP_WARN
                     )
                     or (
-                        isinstance(bias.get("byte_js"), (int, float))
-                        and float(bias["byte_js"])
+                        _finite_float(bias.get("byte_js"))
+                        is not None
+                        and _finite_float(bias.get("byte_js"))
                         > _AUDIT_DELETION_BIAS_WARN
                     )
                     else ""
@@ -11023,7 +11025,8 @@ def print_data_audit(report: Dict[str, object]) -> None:
         print(
             f"[data]   {split} 标签覆盖: 未见 "
             f"{info.get('unseen_label_classes')} 类，占评估 "
-            f"token {info.get('unseen_label_token_share'):.4%}"
+            "token "
+            f"{_format_finite(info.get('unseen_label_token_share'), '.4%')}"
         )
 
     if isinstance(groups, dict):
@@ -11035,7 +11038,8 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 f"/{health.get('long_groups_checked')} "
                 "长群组（单一字节占比阈值 "
                 f"{health.get('top_share_threshold')}），"
-                f"最大占比 {health.get('max_top_byte_share'):.4f}"
+                "最大占比 "
+                f"{_format_finite(health.get('max_top_byte_share'))}"
             )
 
         duplicates = groups.get("content_duplicates") or {}
@@ -11051,7 +11055,10 @@ def print_data_audit(report: Dict[str, object]) -> None:
         "distribution_shift",
         {},
     ).items():
-        print(f"[data]   {key} 字节分布 JS 距离 = {distance:.4f}")
+        print(
+            f"[data]   {key} 字节分布 JS 距离 = "
+            f"{_format_finite(distance)}"
+        )
 
     for key, distance in report.get(
         "distribution_shift_bigram",
@@ -11059,18 +11066,21 @@ def print_data_audit(report: Dict[str, object]) -> None:
     ).items():
         print(
             f"[data]   {key} 字节二元组分布 JS 距离 = "
-            f"{distance:.4f}"
+            f"{_format_finite(distance)}"
         )
 
     for key, distance in report.get(
         "distribution_shift_conditional",
         {},
     ).items():
+        unseen_share = (
+            report.get("unseen_transition_share", {}).get(key, 0.0)
+        )
         print(
             f"[data]   {key} 条件标签分布 JS 距离 = "
-            f"{distance:.4f} "
+            f"{_format_finite(distance)} "
             "(未见转移 "
-            f"{report.get('unseen_transition_share', {}).get(key, 0.0):.1%})"
+            f"{_format_finite(unseen_share, '.1%')})"
         )
 
     for key, info in report.get(
@@ -20277,7 +20287,7 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
     def _format(value, unit="", spec=".3f"):
         if value is None:
             return "-"
-        return format(float(value), spec) + unit
+        return _format_finite(value, spec) + unit
 
     print(
         "[efficiency] "
@@ -31624,25 +31634,31 @@ def _current_seed_count(
     返回 None。
     """
     n_pairs = contrast.get("n_pairs")
+    n_pairs_value = _finite_float(n_pairs)
     if (
         isinstance(n_pairs, int)
         and not isinstance(n_pairs, bool)
-        and n_pairs >= _MIN_SEEDS_FOR_STATS
+        and n_pairs_value is not None
+        and n_pairs_value >= _MIN_SEEDS_FOR_STATS
     ):
-        return float(n_pairs)
+        return n_pairs_value
 
     n_baseline = contrast.get("n_baseline")
     n_variant = contrast.get("n_variant")
+    baseline_value = _finite_float(n_baseline)
+    variant_value = _finite_float(n_variant)
     if (
         isinstance(n_baseline, int)
         and not isinstance(n_baseline, bool)
         and isinstance(n_variant, int)
         and not isinstance(n_variant, bool)
-        and min(n_baseline, n_variant) >= _MIN_SEEDS_FOR_STATS
+        and baseline_value is not None
+        and variant_value is not None
+        and min(baseline_value, variant_value)
+        >= _MIN_SEEDS_FOR_STATS
     ):
-        return (
-            2.0 * n_baseline * n_variant
-            / (n_baseline + n_variant)
+        return 2.0 / (
+            1.0 / baseline_value + 1.0 / variant_value
         )
     return None
 
@@ -65387,9 +65403,11 @@ def print_design_summary(design: Dict[str, object]) -> None:
     power = design.get("power")
     if isinstance(power, dict):
         status = "充足" if power.get("adequate") else "不足"
-        attrition = float(
-            power.get("expected_attrition_rate") or 0.0
+        attrition = _finite_float(
+            power.get("expected_attrition_rate")
         )
+        if attrition is None:
+            attrition = 0.0
         required = power.get(
             "required_seeds_with_attrition",
             power.get("required_seeds"),
@@ -65420,13 +65438,15 @@ def print_design_summary(design: Dict[str, object]) -> None:
             print(
                 "[design][power] 计划可用种子下："
                 + (
-                    f"对最小效应的功效≈{float(achieved):.2f}"
-                    if achieved is not None
+                    "对最小效应的功效≈"
+                    f"{_format_finite(achieved, '.2f')}"
+                    if _finite_float(achieved) is not None
                     else "功效无法计算"
                 )
                 + (
-                    f"，80% 功效 MDE≈{float(mde):.2%}"
-                    if mde is not None
+                    "，80% 功效 MDE≈"
+                    f"{_format_finite(mde, '.2%')}"
+                    if _finite_float(mde) is not None
                     else ""
                 )
             )
@@ -65475,14 +65495,18 @@ def print_design_summary(design: Dict[str, object]) -> None:
             claim = "硬门" if equivalence.get(
                 "claim_planned"
             ) else "信息性"
+            margin_relative = equivalence.get("margin_relative")
+            if margin_relative is None:
+                margin_relative = 0.0
             print(
                 "[design][equivalence] "
                 f"{claim}：等价界 ±"
-                f"{float(equivalence.get('margin_relative') or 0.0):.2%}，"
+                f"{_format_finite(margin_relative, '.2%')}，"
                 "真实差异为零时 "
                 + (
-                    f"功效≈{float(eq_power):.2f}"
-                    if eq_power is not None
+                    "功效≈"
+                    f"{_format_finite(eq_power, '.2f')}"
+                    if _finite_float(eq_power) is not None
                     else "功效无法计算"
                 )
                 + (
@@ -65492,8 +65516,8 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 )
                 + (
                     "；当前精度可支持的最小界≈"
-                    f"±{float(eq_margin_needed):.2%}"
-                    if eq_margin_needed is not None
+                    f"±{_format_finite(eq_margin_needed, '.2%')}"
+                    if _finite_float(eq_margin_needed) is not None
                     else ""
                 )
             )
@@ -65556,9 +65580,12 @@ def design_power_gate_error(
             if eq_required is not None
             else "无法在 128 个可用种子内达到目标功效"
         )
+        margin_relative = equivalence.get("margin_relative")
+        if margin_relative is None:
+            margin_relative = 0.0
         return (
             "设计计划显示等价性（TOST）功效不足：等价界 ±"
-            f"{float(equivalence.get('margin_relative') or 0.0):g}、"
+            f"{_format_finite(margin_relative, 'g')}、"
             "真实差异为零、目标功效 "
             f"{power.get('target_power')}、家族规模 "
             f"{power.get('planned_comparisons')} 下，"
@@ -65566,8 +65593,8 @@ def design_power_gate_error(
             f"{power.get('planned_seeds')} 个"
             + (
                 f"；当前精度可支持的最小界约 ±"
-                f"{float(eq_margin_needed):g}"
-                if eq_margin_needed is not None
+                f"{_format_finite(eq_margin_needed, 'g')}"
+                if _finite_float(eq_margin_needed) is not None
                 else ""
             )
             + "。等价性主张不能靠事后放宽界来「制造」：请增加 "

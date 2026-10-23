@@ -8085,6 +8085,103 @@ class NumericalScaleTests(unittest.TestCase):
             )
         self.assertNotIn("10" * 50, output.getvalue())
 
+    def test_efficiency_and_design_print_tolerate_huge_numbers(self):
+        efficiency = {
+            "n_params_total": 10 ** 400,
+            "flops_per_forward": 10 ** 400,
+            "latency_ms": {
+                "n": 2,
+                "median": 10 ** 400,
+                "p95": 10 ** 400,
+                "p99": 10 ** 400,
+                "std": 10 ** 400,
+                "coefficient_of_variation": 10 ** 400,
+                "max": 10 ** 400,
+            },
+        }
+        design = {
+            "planned_runs": 2,
+            "order_scheme": "randomized",
+            "order_seed": 1,
+            "plan_id": "x" * 20,
+            "path": "design.json",
+            "power": {
+                "adequate": False,
+                "expected_attrition_rate": 10 ** 400,
+                "required_seeds_with_attrition": 10 ** 400,
+                "required_seeds_for_t": 10 ** 400,
+                "required_seeds_for_robust_sign_flip": 10 ** 400,
+                "planned_seeds": 2,
+                "planned_usable_seeds": 2,
+                "achieved_power_at_min_effect": 10 ** 400,
+                "minimum_detectable_effect_relative": 10 ** 400,
+                "equivalence": {
+                    "margin_relative": 10 ** 400,
+                    "power_at_null_difference": 10 ** 400,
+                    "margin_for_target_power": 10 ** 400,
+                },
+            },
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_efficiency(efficiency)
+            experiment.print_design_summary(design)
+        self.assertIn("[efficiency]", output.getvalue())
+        self.assertIn("[design]", output.getvalue())
+
+    def test_current_seed_count_tolerates_huge_counts(self):
+        self.assertIsNone(
+            experiment._current_seed_count({"n_pairs": 10 ** 400})
+        )
+        self.assertIsNone(
+            experiment._current_seed_count({
+                "n_baseline": 10 ** 400,
+                "n_variant": 10 ** 400,
+            })
+        )
+        self.assertAlmostEqual(
+            experiment._current_seed_count({
+                "n_baseline": 100,
+                "n_variant": 3,
+            }),
+            2.0 * 100 * 3 / 103,
+        )
+
+    def test_data_audit_print_tolerates_huge_numbers(self):
+        report = {
+            "splits": {
+                "train": {
+                    "bytes": 10 ** 400,
+                    "effective_bytes": 10 ** 400,
+                },
+            },
+            "dataset_split_fractions": {"train": 10 ** 400},
+            "train_cleaning": {
+                "groups_total": 1,
+                "groups_dropped": 0,
+                "deletion_bias": {
+                    "drop_fraction": 10 ** 400,
+                    "byte_js": 10 ** 400,
+                },
+            },
+            "label_coverage": {
+                "val": {
+                    "unseen_label_classes": 1,
+                    "unseen_label_token_share": 10 ** 400,
+                },
+            },
+            "distribution_shift": {"train/val": 10 ** 400},
+            "distribution_shift_bigram": {"train/val": 10 ** 400},
+            "distribution_shift_conditional": {
+                "train/val": 10 ** 400,
+            },
+            "unseen_transition_share": {"train/val": 10 ** 400},
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_data_audit(report)
+        self.assertIn("[data]", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
