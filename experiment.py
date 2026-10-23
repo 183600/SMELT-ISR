@@ -13821,24 +13821,13 @@ def _ngram_tuning_diagnostics(
       最终选择、并列候选与配对标准误，避免把微小噪声优势
       当成唯一最优。
     """
-    best_value = best.get(tuning_metric)
-    best_value_float: Optional[float] = None
-    if (
-        isinstance(best_value, (int, float))
-        and not isinstance(best_value, bool)
-        and math.isfinite(float(best_value))
-    ):
-        best_value_float = float(best_value)
+    best_value_float = _finite_float(best.get(tuning_metric))
 
     runner_value_float: Optional[float] = None
     if runner_up is not None:
-        runner_value = runner_up.get(tuning_metric)
-        if (
-            isinstance(runner_value, (int, float))
-            and not isinstance(runner_value, bool)
-            and math.isfinite(float(runner_value))
-        ):
-            runner_value_float = float(runner_value)
+        runner_value_float = _finite_float(
+            runner_up.get(tuning_metric)
+        )
 
     gap: Optional[float] = None
     gap_relative: Optional[float] = None
@@ -14046,13 +14035,7 @@ def _select_ngram_candidate_one_se(
             tied.append({
                 "order": int(candidate["order"]),
                 "alpha": float(candidate["alpha"]),
-                "value": (
-                    float(value)
-                    if isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and math.isfinite(float(value))
-                    else None
-                ),
+                "value": _finite_float(value),
                 "paired_mean_diff": mean_diff,
                 "paired_se": se,
                 "ar1_inflation": inflation,
@@ -14373,17 +14356,15 @@ def run_statistical_baseline(
                         ):
                             usable = False
                             break
-                        value = classification.get(
-                            classification_metric_key
+                        number = _finite_float(
+                            classification.get(
+                                classification_metric_key
+                            )
                         )
-                        if not (
-                            isinstance(value, (int, float))
-                            and not isinstance(value, bool)
-                            and math.isfinite(float(value))
-                        ):
+                        if number is None:
                             usable = False
                             break
-                        values.append(float(value))
+                        values.append(number)
                     if usable and len(values) >= 3:
                         candidate_window_classification[
                             (order, alpha)
@@ -14395,27 +14376,21 @@ def run_statistical_baseline(
                 ):
                     if key in candidate_metrics:
                         record[key] = candidate_metrics[key]
-                value = candidate_metrics.get(tuning_metric)
-                if (
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and math.isfinite(float(value))
-                ):
-                    record[tuning_metric] = float(value)
+                number = _finite_float(
+                    candidate_metrics.get(tuning_metric)
+                )
+                if number is not None:
+                    record[tuning_metric] = number
 
             record["tuning_value"] = record.get(tuning_metric)
             _write(record)
             candidates.append(record)
 
         def _display_value(row: Dict[str, object]) -> str:
-            value = row.get(tuning_metric)
-            if not (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(float(value))
-            ):
+            value = _finite_float(row.get(tuning_metric))
+            if value is None:
                 return "NA"
-            return f"{float(value):.4f}"
+            return f"{value:.4f}"
 
         print(
             "[ngram] alpha="
@@ -14433,14 +14408,9 @@ def run_statistical_baseline(
     # val 上选最优；并列时偏向更小的阶数与更小的 alpha
     # （简单优先，避免在验证集上过拟合出复杂配置）。
     def _candidate_rank(row: Dict[str, object]):
-        value = row.get(tuning_metric)
-        if not (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(float(value))
-        ):
+        value = _finite_float(row.get(tuning_metric))
+        if value is None:
             return (1, 0.0, row["order"], row["alpha"])
-        value = float(value)
         return (
             0,
             -value if higher_is_better else value,
@@ -40109,13 +40079,12 @@ def print_comparison_analysis(
                 "_window_lag1_autocorrelation"
             ):
                 continue
+            numeric = _finite_float(value)
             if (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and float(value)
-                >= _EVAL_WINDOW_AUTOCORRELATION
+                numeric is not None
+                and numeric >= _EVAL_WINDOW_AUTOCORRELATION
             ):
-                autocorrelated_splits[key] = float(value)
+                autocorrelated_splits[key] = numeric
     if autocorrelated_splits:
         print(
             "  [warn] 以下评估 split 的窗口 lag-1 自相关 ρ̂ ≥ "
@@ -41340,7 +41309,7 @@ def print_comparison_analysis(
             def _delta_text(value: object) -> str:
                 if value is None:
                     return "-"
-                return f"{float(value):+.4f}"
+                return _format_finite(value, "+.4f")
 
             for item in common_step_sensitivity["effects"]:
                 flag = ""

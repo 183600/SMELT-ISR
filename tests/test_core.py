@@ -8054,6 +8054,37 @@ class NumericalScaleTests(unittest.TestCase):
         })
         self.assertIn("Δ=-", effect_line)
 
+    def test_ngram_tuning_diagnostics_tolerate_huge_values(self):
+        report = experiment._ngram_tuning_diagnostics(
+            {"order": 1, "alpha": 0.1, "val_loss": 10 ** 400},
+            {"order": 2, "alpha": 0.2, "val_loss": 10 ** 400},
+            "val_loss",
+            [0.1, 0.2],
+            2,
+            2,
+            2,
+        )
+        self.assertIsNone(report["best"]["value"])
+        self.assertIsNone(report["runner_up"]["value"])
+        self.assertIsNone(report["metric_gap"])
+
+    def test_comparison_print_tolerates_huge_autocorrelation(self):
+        rows = [{
+            "run": "A1",
+            "mode": "A",
+            "seed": 1,
+            "val_loss": 1.0,
+            "val_loss_window_lag1_autocorrelation": 10 ** 400,
+        }]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_comparison_analysis(
+                rows,
+                factors=["mode"],
+                metric="val_loss",
+            )
+        self.assertNotIn("10" * 50, output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
