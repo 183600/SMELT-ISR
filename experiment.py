@@ -67053,8 +67053,6 @@ def design_power_gate_error(
         )
     if not isinstance(power, dict):
         return None
-    if power.get("adequate"):
-        return None
     if power.get("adequacy_recomputed") is False:
         reason = power.get("adequacy_recompute_error")
         return (
@@ -67067,6 +67065,8 @@ def design_power_gate_error(
             "生成设计计划，或显式设置 "
             "underpowered_acknowledged=true 并写明 justification"
         )
+    if power.get("adequate"):
+        return None
     if (
         power.get("plan_equivalence")
         and not power.get("equivalence_adequate")
