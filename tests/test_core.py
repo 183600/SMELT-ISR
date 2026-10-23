@@ -8241,6 +8241,16 @@ class NumericalScaleTests(unittest.TestCase):
                     "metric_mean": huge,
                 },
             }, Path("/tmp"))
+        text = experiment._format_window_paired({
+            "window_paired": {
+                "available": True,
+                "mean_loss_diff": 1.0,
+                "n_seeds_favoring_variant": 10 ** 400,
+                "n_seeds_favoring_baseline": float("inf"),
+                "n_seeds": "x",
+            }
+        })
+        self.assertIn("Δloss=+1.0000", text)
 
     def test_safe_ratio_keeps_representable_huge_int_ratio(self):
         self.assertEqual(

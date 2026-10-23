@@ -31701,6 +31701,14 @@ def _format_seed_count(value: float) -> str:
     return f"{value:.1f}"
 
 
+def _display_count(value: object) -> int:
+    """展示用非负计数；损坏/超范围值按 0，避免 int(inf) 崩溃。"""
+    number = _finite_float(value)
+    if number is None or number < 0.0:
+        return 0
+    return int(number)
+
+
 def _format_window_paired(
     contrast: Dict[str, object],
 ) -> str:
@@ -31717,9 +31725,13 @@ def _format_window_paired(
     mean_diff = window_paired.get("mean_loss_diff")
     if not isinstance(mean_diff, (int, float)):
         return ""
-    favoring = int(window_paired.get("n_seeds_favoring_variant", 0))
-    against = int(window_paired.get("n_seeds_favoring_baseline", 0))
-    n_seeds = int(window_paired.get("n_seeds", 0))
+    favoring = _display_count(
+        window_paired.get("n_seeds_favoring_variant", 0)
+    )
+    against = _display_count(
+        window_paired.get("n_seeds_favoring_baseline", 0)
+    )
+    n_seeds = _display_count(window_paired.get("n_seeds", 0))
     parts = [
         "[window] 固定评估窗口逐窗口配对: Δloss="
         f"{_format_finite(mean_diff, '+.4f')}"
