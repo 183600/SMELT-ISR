@@ -1967,6 +1967,21 @@ class DesignPreparationTests(unittest.TestCase):
         }
         error = experiment.preregistration_schema_error(payload)
         self.assertIsInstance(error, str)
+        # 直接调用功效规划也不能因超大种子数在 float()/int()
+        # 处崩溃；报告保留原始种子数。
+        plan = experiment.preregistration_power_plan(
+            {
+                "expected_seed_sd_relative": 0.01,
+                "target_power": 0.8,
+                "alpha": 0.05,
+                "planned_comparisons": 1,
+            },
+            0.01,
+            10**400,
+            1,
+        )
+        self.assertEqual(plan["planned_seeds"], 10**400)
+        json.dumps(plan, allow_nan=False)
 
 
     def test_counterbalanced_order_balances_positions(self):

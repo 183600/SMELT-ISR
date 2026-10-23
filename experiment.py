@@ -35991,11 +35991,26 @@ def preregistration_power_plan(
         # 直接调用本函数时也要保持可判定；结构错误由
         # preregistration_schema_error 在入口拒绝。
         attrition = 0.0
+    # n_seeds 可能来自手工/旧记录里的超大 JSON 整数：
+    # float(10**400) 会 OverflowError。保留原始值用于报告，
+    # 但功效数值计算用一个足够大的上限，避免 sqrt/df 溢出；
+    # 对任何实际设计，1e6 个种子的功效已饱和。
+    try:
+        raw_n_seeds = int(n_seeds)
+    except (TypeError, ValueError, OverflowError):
+        raw_n_seeds = 0
+    compute_n_seeds = max(1, min(raw_n_seeds, 1_000_000))
     usable_seeds = max(
         1,
         min(
-            int(n_seeds),
-            int(math.floor(float(n_seeds) * (1.0 - attrition) + 1e-12)),
+            compute_n_seeds,
+            int(
+                math.floor(
+                    float(compute_n_seeds)
+                    * (1.0 - attrition)
+                    + 1e-12
+                )
+            ),
         ),
     )
 
@@ -36004,7 +36019,7 @@ def preregistration_power_plan(
             contrast,
             float(min_effect),
             sd,
-            int(n_seeds),
+            raw_n_seeds,
             usable_seeds,
             alpha_adjusted,
             target,
@@ -36109,7 +36124,7 @@ def preregistration_power_plan(
                 contrast,
                 float(min_effect),
                 scaled_sd,
-                int(n_seeds),
+                raw_n_seeds,
                 usable_seeds,
                 alpha_adjusted,
                 target,
@@ -36181,7 +36196,7 @@ def preregistration_power_plan(
         # 种子预算。
         "required_seeds": required,
         "expected_attrition_rate": attrition,
-        "planned_seeds": int(n_seeds),
+        "planned_seeds": raw_n_seeds,
         "planned_usable_seeds": usable_seeds,
         "required_seeds_with_attrition": required_with_attrition,
         "achieved_power_at_min_effect": achieved_power,
