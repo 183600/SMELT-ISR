@@ -20946,9 +20946,17 @@ def annotate_common_step_metrics(
     else:
         # target_step 可能来自手工/旧记录或直接调用（如超大
         # JSON 整数），float() 会抛 OverflowError；非有限/非正
-        # 步数也不能作为可观测的共同点。
-        target_value = _finite_float(target_step)
-        if target_value is None or target_value <= 0.0:
+        # 步数也不能作为可观测的共同点。保留 float() 对数字
+        # 字符串/布尔值的旧兼容性，只拒绝不可表示的值。
+        try:
+            target_value = float(target_step)
+        except (TypeError, ValueError, OverflowError):
+            target_value = None
+        if (
+            target_value is None
+            or not math.isfinite(target_value)
+            or target_value <= 0.0
+        ):
             report["advisories"].append(
                 "共同步数不是有限正数：无法计算共同步数处的"
                 "选型无关验证指标"
