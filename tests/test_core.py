@@ -9548,6 +9548,8 @@ class NumericalScaleTests(unittest.TestCase):
         for contrast in contrasts[2:]:
             self.assertNotIn("p_value_holm", contrast)
             self.assertNotIn("p_value_bh", contrast)
+            self.assertTrue(contrast["significant_raw"])
+            self.assertFalse(contrast["significant"])
         self.assertEqual(
             experiment._holm_bonferroni(
                 [0.01, "bad", float("nan"), -0.01, 1.01, 0.04]

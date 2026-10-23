@@ -30541,6 +30541,12 @@ def _apply_multiple_comparison_correction(
         # 这些不是可校正的检验结果，跳过而不是中断整份报告。
         p_value = _finite_probability(contrast.get("p_value"))
         if p_value is None:
+            if "p_value" in contrast:
+                if "significant_raw" not in contrast:
+                    contrast["significant_raw"] = bool(
+                        contrast.get("significant")
+                    )
+                contrast["significant"] = False
             continue
         eligible.append(contrast)
         p_values.append(p_value)
