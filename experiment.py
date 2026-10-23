@@ -12473,7 +12473,7 @@ def _group_cluster_eval_intervals(
         return {
             "available": False,
             "reason": "invalid_bootstrap_replicates",
-            "replicates": replicates,
+            "replicates": _finite_float(replicates),
         }
     if replicate_count <= 1:
         return {
@@ -12824,7 +12824,7 @@ def _hierarchical_group_bootstrap_ci(
         return {
             "available": False,
             "reason": "invalid_bootstrap_replicates",
-            "replicates": replicates,
+            "replicates": _finite_float(replicates),
         }
     if replicate_count <= 1:
         return {
@@ -27298,7 +27298,7 @@ def _hierarchical_window_bootstrap_ci(
         return {
             "available": False,
             "reason": "invalid_bootstrap_replicates",
-            "replicates": replicates,
+            "replicates": _finite_float(replicates),
         }
     if replicate_count <= 1:
         return {

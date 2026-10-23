@@ -10597,6 +10597,38 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertTrue(report["available"])
         json.dumps(report, allow_nan=False)
 
+    def test_invalid_bootstrap_replicates_stay_json_safe(self):
+        group_stats = {
+            "schema": experiment._GROUP_STATS_SCHEMA,
+            "assignment": experiment._GROUP_ASSIGNMENT,
+            "unit": "document_group",
+            "group_separator_sha256": "x",
+            "groups": [
+                [0, 10.0, 1.0, 10.0],
+                [1, 10.0, 2.0, 9.0],
+            ],
+        }
+        for result in (
+            experiment._group_cluster_eval_intervals(
+                group_stats,
+                float("inf"),
+                0,
+            ),
+            experiment._hierarchical_group_bootstrap_ci(
+                {1: {0: (1.0, 10.0), 1: (2.0, 10.0)}},
+                float("inf"),
+            ),
+            experiment._hierarchical_window_bootstrap_ci(
+                {1: [1.0, 2.0], 2: [2.0, 3.0]},
+                float("inf"),
+            ),
+        ):
+            self.assertEqual(
+                result["reason"],
+                "invalid_bootstrap_replicates",
+            )
+            json.dumps(result, allow_nan=False)
+
     def test_group_bootstrap_is_scale_stable(self):
         weights = torch.ones(3, dtype=torch.float64)
         small = torch.tensor(
