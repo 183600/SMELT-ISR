@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import codecs
-from collections import deque
+from collections import OrderedDict, deque
 import contextlib
 import datetime
 import functools
 import hashlib
+import heapq
 import itertools
 import json
 import math
@@ -4775,6 +4776,32 @@ class LanguageModel(nn.Module):
 # Dataset
 # ============================================================
 
+# 近重复（near-duplicate）群组审计/清洗口径。
+#
+# 精确群组指纹与内容定义分块只能发现「完全相同」的内容；同一篇
+# 文档的两次修订、转载时改标题/改一两句话，shingle 集合仍高度
+# 重合但指纹不同。这里用字节 k-shingle 的 Jaccard 相似度定义
+# 近重复：|S_a ∩ S_b| / |S_a ∪ S_b|。为把成本压到与语料大小线性
+# 相关，先对每个群组取 shingle 哈希的 bottom-k 草图（MinHash
+# 家族的最小哈希样本），用草图哈希做倒排索引生成候选，再对候选
+# 用完整 shingle 集合复核精确 Jaccard；只有精确值达到阈值才删除。
+_NEAR_DUP_DEFAULT_THRESHOLD = 0.8
+_NEAR_DUP_DEFAULT_SHINGLE_BYTES = 8
+_NEAR_DUP_DEFAULT_SKETCH_SIZE = 128
+_NEAR_DUP_MAX_SHINGLE_BYTES = 64
+_NEAR_DUP_MAX_SKETCH_SIZE = 4096
+# 单个群组过大时完整 shingle 集合的内存不可控；显式跳过并在
+# 审计里记录，而不是静默截断内容（截断会把长文档误判为短文档）。
+_NEAR_DUP_MAX_GROUP_BYTES = 4 * 1024 * 1024
+# 精确复核缓存：候选对很少，但同一评估群组可能被很多训练群组
+# 比较；缓存按近似字节数限界，避免大语料把内存吃满。
+_NEAR_DUP_EXACT_CACHE_BYTES = 64 * 1024 * 1024
+# 64 位滚动多项式哈希（模 2^64）。碰撞概率在千万级 shingle 下
+# 约 1e-6 量级；审计同时记录这是近似哈希而非逐字节比较。
+_NEAR_DUP_HASH_BASE = 0x100000001B3
+_NEAR_DUP_HASH_MASK = (1 << 64) - 1
+
+
 # 群组分隔符允许的反斜杠转义：\n / \t / \r / \0 / \\ / \xHH / \uXXXX。
 _GROUP_SEPARATOR_SIMPLE_ESCAPES = {
     "n": 10,
@@ -4916,6 +4943,9 @@ def _saved_clean_against_test_effective(
     return bool(
         saved_args.get("deduplicate_train_groups", False)
         or saved_args.get("drop_train_shared_chunks", False)
+        or saved_args.get(
+            "drop_train_near_duplicate_groups", False
+        )
     )
 
 
@@ -5622,6 +5652,14 @@ class ByteDataset:
         group_separator: Optional[bytes] = None,
         deduplicate_train_groups: bool = False,
         drop_train_shared_chunks: bool = False,
+        drop_train_near_duplicate_groups: bool = False,
+        near_duplicate_audit: bool = False,
+        near_duplicate_threshold: float = (
+            _NEAR_DUP_DEFAULT_THRESHOLD
+        ),
+        near_duplicate_shingle_bytes: int = (
+            _NEAR_DUP_DEFAULT_SHINGLE_BYTES
+        ),
         drop_train_corrupt_groups: bool = False,
         drop_train_corrupt_bytes: bool = False,
         drop_train_degenerate_groups: bool = False,
@@ -5704,6 +5742,59 @@ class ByteDataset:
             drop_train_shared_chunks
         )
 
+        if (
+            drop_train_near_duplicate_groups
+            and group_separator is None
+        ):
+            raise ValueError(
+                "drop_train_near_duplicate_groups 需要 "
+                "group_separator：没有显式的群组边界就无法在"
+                "不改动 val/test 的前提下整组剔除近重复训练"
+                "样本"
+            )
+        self.drop_train_near_duplicate_groups = bool(
+            drop_train_near_duplicate_groups
+        )
+        if near_duplicate_audit and group_separator is None:
+            raise ValueError(
+                "near_duplicate_audit 需要 group_separator："
+                "近重复按群组定义，没有群组边界就无法区分"
+                "文档/记录"
+            )
+        self.near_duplicate_audit = bool(near_duplicate_audit)
+        try:
+            checked_threshold = float(
+                near_duplicate_threshold
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "near_duplicate_threshold 必须是数值"
+            ) from error
+        if (
+            not math.isfinite(checked_threshold)
+            or not 0.0 < checked_threshold <= 1.0
+        ):
+            raise ValueError(
+                "near_duplicate_threshold 必须落在 (0, 1]"
+            )
+        if (
+            not isinstance(
+                near_duplicate_shingle_bytes, int
+            )
+            or isinstance(near_duplicate_shingle_bytes, bool)
+            or not 1
+            <= near_duplicate_shingle_bytes
+            <= _NEAR_DUP_MAX_SHINGLE_BYTES
+        ):
+            raise ValueError(
+                "near_duplicate_shingle_bytes 必须是 1.."
+                f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+            )
+        self.near_duplicate_threshold = checked_threshold
+        self.near_duplicate_shingle_bytes = int(
+            near_duplicate_shingle_bytes
+        )
+
         if drop_train_corrupt_groups and group_separator is None:
             raise ValueError(
                 "drop_train_corrupt_groups 需要 group_separator："
@@ -5767,11 +5858,13 @@ class ByteDataset:
         if self.clean_train_against_test and not (
             deduplicate_train_groups
             or drop_train_shared_chunks
+            or drop_train_near_duplicate_groups
         ):
             raise ValueError(
                 "clean_train_against_test 需要同时启用 "
-                "deduplicate_train_groups 或 "
-                "drop_train_shared_chunks"
+                "deduplicate_train_groups、"
+                "drop_train_shared_chunks 或 "
+                "drop_train_near_duplicate_groups"
             )
 
         # 训练集清洗（可选的群组级/字节级）：只剔除 train 中
@@ -5941,6 +6034,26 @@ class ByteDataset:
                 )
             )
 
+        near_duplicate_excluded: List[Tuple[int, int]] = []
+        near_duplicate_stats: Optional[Dict[str, object]] = None
+
+        if drop_train_near_duplicate_groups:
+            (
+                near_duplicate_excluded,
+                near_duplicate_stats,
+            ) = _plan_train_near_duplicate_cleaning(
+                self._raw_buffer,
+                group_separator,
+                n_train,
+                cleaning_eval_ranges,
+                dedup_excluded + shared_chunk_excluded,
+                threshold=self.near_duplicate_threshold,
+                shingle_bytes=(
+                    self.near_duplicate_shingle_bytes
+                ),
+                apply_cleaning=True,
+            )
+
         corrupt_excluded: List[Tuple[int, int]] = []
         corrupt_stats: Optional[Dict[str, object]] = None
 
@@ -5950,7 +6063,11 @@ class ByteDataset:
                     self._raw_buffer,
                     group_separator,
                     n_train,
-                    dedup_excluded + shared_chunk_excluded,
+                    (
+                        dedup_excluded
+                        + shared_chunk_excluded
+                        + near_duplicate_excluded
+                    ),
                 )
             )
 
@@ -5992,6 +6109,7 @@ class ByteDataset:
                     (
                         dedup_excluded
                         + shared_chunk_excluded
+                        + near_duplicate_excluded
                         + corrupt_excluded
                     ),
                 )
@@ -6004,6 +6122,7 @@ class ByteDataset:
             sorted(
                 dedup_excluded
                 + shared_chunk_excluded
+                + near_duplicate_excluded
                 + corrupt_excluded
                 + corrupt_byte_excluded
                 + degenerate_run_excluded
@@ -6023,6 +6142,7 @@ class ByteDataset:
         if (
             dedup_stats is not None
             or shared_chunk_stats is not None
+            or near_duplicate_stats is not None
             or corrupt_stats is not None
             or degenerate_stats is not None
             or corrupt_byte_stats is not None
@@ -6037,6 +6157,7 @@ class ByteDataset:
                 for stats in (
                     dedup_stats,
                     shared_chunk_stats,
+                    near_duplicate_stats,
                     corrupt_stats,
                     degenerate_stats,
                 )
@@ -6087,6 +6208,10 @@ class ByteDataset:
                 combined_stats["shared_chunks"] = (
                     shared_chunk_stats
                 )
+            if near_duplicate_stats is not None:
+                combined_stats["near_duplicates"] = (
+                    near_duplicate_stats
+                )
             if corrupt_stats is not None:
                 combined_stats["corruption"] = corrupt_stats
             if corrupt_byte_stats is not None:
@@ -6105,6 +6230,8 @@ class ByteDataset:
                 cleaning_kinds.append("duplicate")
             if shared_chunk_stats is not None:
                 cleaning_kinds.append("shared_chunks")
+            if near_duplicate_stats is not None:
+                cleaning_kinds.append("near_duplicate")
             if corrupt_stats is not None:
                 cleaning_kinds.append("corrupt")
             if degenerate_stats is not None:
@@ -7235,6 +7362,7 @@ _AUDIT_CHUNK_GEAR_TABLE = tuple(
     for value in range(256)
 )
 _AUDIT_CHUNK_UINT64_MASK = (1 << 64) - 1
+
 
 # 训练集清洗的删除偏差审计：被删除内容与保留内容的字节/二元组
 # 分布差异过大时，说明清洗不是随机删除，训练分布已被选择性改变。
@@ -8892,6 +9020,510 @@ def _plan_train_shared_chunk_cleaning(
     return excluded, stats
 
 
+def _near_duplicate_shingle_hashes(
+    raw,
+    start: int,
+    end: int,
+    shingle_bytes: int,
+):
+    """
+    逐个产出 [start, end) 内长度为 shingle_bytes 的字节 shingle
+    的 64 位滚动多项式哈希。
+
+    与逐 shingle 调用 blake2b 相比，滚动哈希把「提取全部 shingle」
+    的成本降到线性；Jaccard 的精确复核仍在完整 shingle 哈希集合
+    上做。64 位碰撞概率很低，但审计记录哈希口径，不把它说成
+    逐字节完全相等。
+    """
+    length = end - start
+    if length < shingle_bytes:
+        return
+
+    base = _NEAR_DUP_HASH_BASE
+    mask = _NEAR_DUP_HASH_MASK
+    # base^(shingle_bytes-1) mod 2^64：滚出最左字节时减去它的贡献。
+    base_power = pow(base, shingle_bytes - 1, 1 << 64)
+
+    value = 0
+    for position in range(start, start + shingle_bytes):
+        value = ((value * base) + raw[position]) & mask
+    yield value
+
+    for position in range(start + shingle_bytes, end):
+        value = (
+            (
+                value
+                - raw[position - shingle_bytes] * base_power
+            )
+            * base
+            + raw[position]
+        ) & mask
+        yield value
+
+
+def _near_duplicate_bottom_k(
+    hashes,
+    sketch_size: int,
+) -> Tuple[int, ...]:
+    """
+    取 shingle 哈希的 bottom-k（最小的 k 个值），返回升序签名。
+
+    bottom-k 是 Jaccard 的 MinHash 家族草图：两个高度重合的集合
+    会共享大量最小哈希值，因此可把每个签名值当作倒排键生成候选。
+    草图只用于候选生成，是否删除由完整 shingle 集合的精确 Jaccard
+    决定。
+    """
+    heap: List[int] = []
+    for value in hashes:
+        if len(heap) < sketch_size:
+            heapq.heappush(heap, -value)
+        elif value < -heap[0]:
+            heapq.heapreplace(heap, -value)
+    return tuple(sorted(-item for item in heap))
+
+
+def _near_duplicate_shingle_set(
+    raw,
+    start: int,
+    end: int,
+    shingle_bytes: int,
+) -> set:
+    """返回 [start, end) 的完整 shingle 哈希集合（精确复核用）。"""
+    return set(
+        _near_duplicate_shingle_hashes(
+            raw,
+            start,
+            end,
+            shingle_bytes,
+        )
+    )
+
+
+def _near_duplicate_threshold_or_default(
+    value: object,
+) -> float:
+    """把存档/协议里的阈值转成有限 (0,1] 浮点，损坏值回退默认。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _NEAR_DUP_DEFAULT_THRESHOLD
+    if not math.isfinite(number) or not 0.0 < number <= 1.0:
+        return _NEAR_DUP_DEFAULT_THRESHOLD
+    return number
+
+
+def _near_duplicate_shingle_or_default(
+    value: object,
+) -> int:
+    """把存档/协议里的 shingle 长度转成合法整数，损坏值回退默认。"""
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= _NEAR_DUP_MAX_SHINGLE_BYTES
+    ):
+        return value
+    return _NEAR_DUP_DEFAULT_SHINGLE_BYTES
+
+
+def _plan_train_near_duplicate_cleaning(
+    raw: bytearray,
+    separator: bytes,
+    train_end: int,
+    eval_ranges: Dict[str, Tuple[int, int]],
+    already_excluded: List[Tuple[int, int]],
+    threshold: float = _NEAR_DUP_DEFAULT_THRESHOLD,
+    shingle_bytes: int = _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+    sketch_size: int = _NEAR_DUP_DEFAULT_SKETCH_SIZE,
+    apply_cleaning: bool = True,
+) -> Tuple[List[Tuple[int, int]], Dict[str, object]]:
+    """
+    扫描训练集群组的近重复（默认只对照 val，绝不改动 val/test）。
+
+    流程：
+    1. 对评估群组与训练群组分别计算字节 k-shingle 的 bottom-k 草图；
+    2. 用草图哈希建倒排索引，为每个训练群组找候选；
+    3. 对候选计算完整 shingle 集合的精确 Jaccard；
+    4. 达到阈值时整组标记/删除（``apply_cleaning``）。
+
+    ``apply_cleaning=False`` 是只读审计：不返回删除区间，但报告
+    ``groups_flagged``、每个被标记群组的最佳匹配与 Jaccard。默认
+    只对照 val；只有显式把 test 放进 ``eval_ranges`` 才会读取 test
+    内容决定训练集删除，调用方负责把该事实写入清洗记录。
+
+    近重复是内容级「相似」而不是逐字节相同：阈值是研究者事先声明
+    的相似度门槛，报告同时给出实际 Jaccard 与匹配对象，避免把
+    「被标记」当成确定泄露。群组过短（不足一个 shingle）或过大
+    （完整集合内存不可控）时显式跳过并计数。
+    """
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError) as error:
+        raise ValueError("near-duplicate threshold 必须是数值") from error
+    if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
+        raise ValueError(
+            "near-duplicate threshold 必须落在 (0, 1]"
+        )
+    if (
+        not isinstance(shingle_bytes, int)
+        or isinstance(shingle_bytes, bool)
+        or not 1 <= shingle_bytes <= _NEAR_DUP_MAX_SHINGLE_BYTES
+    ):
+        raise ValueError(
+            "near-duplicate shingle_bytes 必须是 1.."
+            f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+        )
+    if (
+        not isinstance(sketch_size, int)
+        or isinstance(sketch_size, bool)
+        or not 8 <= sketch_size <= _NEAR_DUP_MAX_SKETCH_SIZE
+    ):
+        raise ValueError(
+            "near-duplicate sketch_size 必须是 8.."
+            f"{_NEAR_DUP_MAX_SKETCH_SIZE} 的整数"
+        )
+    if separator is None or len(separator) == 0:
+        raise ValueError(
+            "near-duplicate 扫描需要非空群组分隔符"
+        )
+
+    excluded_set = set(
+        (int(start), int(end))
+        for start, end in already_excluded
+    )
+    eval_order = [
+        split
+        for split in ("val", "test")
+        if split in eval_ranges
+    ]
+    eval_order.extend(
+        sorted(
+            split
+            for split in eval_ranges
+            if split not in ("val", "test")
+        )
+    )
+
+    eval_groups: List[Tuple[str, int, int]] = []
+    eval_index: Dict[int, List[int]] = {}
+    eval_too_short = 0
+    eval_too_large = 0
+
+    for split in eval_order:
+        begin, end = eval_ranges[split]
+        if end <= begin:
+            continue
+        for span_start, span_end in _iter_group_spans(
+            raw,
+            separator,
+            begin,
+            end,
+        ):
+            length = span_end - span_start
+            if length > _NEAR_DUP_MAX_GROUP_BYTES:
+                eval_too_large += 1
+                continue
+            sketch = _near_duplicate_bottom_k(
+                _near_duplicate_shingle_hashes(
+                    raw,
+                    span_start,
+                    span_end,
+                    shingle_bytes,
+                ),
+                sketch_size,
+            )
+            if not sketch:
+                eval_too_short += 1
+                continue
+
+            group_index = len(eval_groups)
+            eval_groups.append(
+                (split, span_start, span_end)
+            )
+            for value in sketch:
+                eval_index.setdefault(value, []).append(
+                    group_index
+                )
+
+    # 精确复核缓存：按 (start, end) 复用完整 shingle 集合。
+    # NumPy 可用时用 uint64 数组（每个 shingle 8 字节）并调用
+    # intersect1d；没有 NumPy 时退回 Python set。缓存按近似
+    # 占用限界，避免大语料把内存吃满。
+    exact_cache: "OrderedDict[Tuple[int, int], Tuple[object, int]]" = (
+        OrderedDict()
+    )
+    exact_cache_bytes = 0
+
+    def _full_shingle_values(
+        span: Tuple[int, int],
+    ):
+        nonlocal exact_cache_bytes
+        cached = exact_cache.get(span)
+        if cached is not None:
+            exact_cache.move_to_end(span)
+            return cached[0]
+
+        count = max(
+            0,
+            span[1] - span[0] - shingle_bytes + 1,
+        )
+        if np is not None:
+            values = np.unique(
+                np.fromiter(
+                    _near_duplicate_shingle_hashes(
+                        raw,
+                        span[0],
+                        span[1],
+                        shingle_bytes,
+                    ),
+                    dtype=np.uint64,
+                    count=count,
+                )
+            )
+            size = int(values.nbytes)
+        else:
+            value_set = _near_duplicate_shingle_set(
+                raw,
+                span[0],
+                span[1],
+                shingle_bytes,
+            )
+            values = value_set
+            # Python set 中每个 int 对象加哈希槽远大于 8 字节。
+            size = len(value_set) * 48 + (
+                span[1] - span[0]
+            )
+
+        while (
+            exact_cache
+            and exact_cache_bytes + size
+            > _NEAR_DUP_EXACT_CACHE_BYTES
+        ):
+            _, (_, old_size) = exact_cache.popitem(
+                last=False
+            )
+            exact_cache_bytes -= old_size
+        exact_cache[span] = (values, size)
+        exact_cache_bytes += size
+        return values
+
+    def _jaccard(
+        left: Tuple[int, int],
+        right: Tuple[int, int],
+    ) -> float:
+        left_values = _full_shingle_values(left)
+        right_values = _full_shingle_values(right)
+        if np is not None:
+            if left_values.size == 0 or right_values.size == 0:
+                return 0.0
+            intersection = int(
+                np.intersect1d(
+                    left_values,
+                    right_values,
+                    assume_unique=True,
+                ).size
+            )
+            union = (
+                int(left_values.size)
+                + int(right_values.size)
+                - intersection
+            )
+        else:
+            if not left_values or not right_values:
+                return 0.0
+            intersection = len(
+                left_values & right_values
+            )
+            union = (
+                len(left_values)
+                + len(right_values)
+                - intersection
+            )
+        if union <= 0:
+            return 0.0
+        return intersection / union
+
+    split_rank = {"val": 0, "test": 1, "train": 2}
+    prior_spans: List[Tuple[int, int]] = []
+    prior_index: Dict[int, List[int]] = {}
+
+    stats: Dict[str, object] = {
+        "enabled": True,
+        "policy": (
+            "drop train groups with shingle Jaccard >= threshold "
+            "against val/test or earlier train; val/test untouched"
+            if apply_cleaning
+            else "audit train groups with shingle Jaccard >= threshold "
+            "against val/test or earlier train; read-only"
+        ),
+        "mode": "clean" if apply_cleaning else "audit",
+        "threshold": round(threshold, 6),
+        "shingle_bytes": shingle_bytes,
+        "sketch_size": sketch_size,
+        "similarity": "jaccard_of_byte_shingle_sets",
+        "shingle_hash": "rolling_polynomial_64bit",
+        "exact_verification": True,
+        "max_group_bytes": _NEAR_DUP_MAX_GROUP_BYTES,
+        "eval_splits": list(eval_order),
+        "eval_groups": len(eval_groups),
+        "eval_groups_too_short": eval_too_short,
+        "eval_groups_too_large": eval_too_large,
+        "groups_total": 0,
+        "groups_scanned": 0,
+        "groups_already_excluded": 0,
+        "groups_too_short": 0,
+        "groups_too_large": 0,
+        "groups_flagged": 0,
+        "groups_dropped": 0,
+        "flagged_bytes": 0,
+        "dropped_bytes": 0,
+        "flagged_duplicate_of": {
+            "val": 0,
+            "test": 0,
+            "train": 0,
+        },
+        "candidate_pairs": 0,
+        "examples": [],
+    }
+
+    flagged_spans: List[Tuple[int, int]] = []
+
+    for span_start, span_end in _iter_group_spans(
+        raw,
+        separator,
+        0,
+        train_end,
+    ):
+        stats["groups_total"] += 1
+        span = (span_start, span_end)
+
+        if span in excluded_set:
+            stats["groups_already_excluded"] += 1
+            continue
+
+        length = span_end - span_start
+        if length > _NEAR_DUP_MAX_GROUP_BYTES:
+            stats["groups_too_large"] += 1
+            continue
+
+        sketch = _near_duplicate_bottom_k(
+            _near_duplicate_shingle_hashes(
+                raw,
+                span_start,
+                span_end,
+                shingle_bytes,
+            ),
+            sketch_size,
+        )
+        if not sketch:
+            stats["groups_too_short"] += 1
+            continue
+
+        stats["groups_scanned"] += 1
+
+        candidates = set()
+        for value in sketch:
+            for index in eval_index.get(value, ()):
+                candidates.add(("eval", index))
+            for index in prior_index.get(value, ()):
+                candidates.add(("train", index))
+
+        stats["candidate_pairs"] += len(candidates)
+
+        best_key = None
+        best_jaccard = 0.0
+        best_reason: Optional[str] = None
+        best_other: Optional[Tuple[int, int]] = None
+
+        # 候选按来源与位置排序，保证同一数据/参数下报告与
+        # 示例在不同 PYTHONHASHSEED 下完全一致。
+        for origin, index in sorted(candidates):
+            if origin == "eval":
+                reason, other_start, other_end = eval_groups[
+                    index
+                ]
+            else:
+                reason = "train"
+                other_start, other_end = prior_spans[index]
+            other = (other_start, other_end)
+            if other == span:
+                continue
+
+            jaccard = _jaccard(span, other)
+            if jaccard + 1e-12 < threshold:
+                continue
+
+            key = (
+                -jaccard,
+                split_rank.get(reason, 3),
+                other_start,
+                other_end,
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_jaccard = jaccard
+                best_reason = reason
+                best_other = other
+
+        if best_reason is not None:
+            stats["groups_flagged"] += 1
+            stats["flagged_bytes"] += length
+            stats["flagged_duplicate_of"][best_reason] += 1
+            flagged_spans.append(span)
+            if len(stats["examples"]) < 5:
+                stats["examples"].append([
+                    span_start,
+                    span_end,
+                    best_reason,
+                    round(best_jaccard, 6),
+                    best_other[0],
+                    best_other[1],
+                ])
+
+            if apply_cleaning:
+                stats["groups_dropped"] += 1
+                stats["dropped_bytes"] += length
+            # 被标记的群组（无论删除还是只读审计）不能再作为
+            # 后续群组的「更早 train」匹配对象：只保留第一个
+            # 出现的群组，避免重复簇内产生 O(n^2) 候选。
+            continue
+
+        # 未标记的群组进入 prior 索引；只保留第一个出现的
+        # 群组，避免重复簇内候选爆炸。
+        prior_position = len(prior_spans)
+        prior_spans.append(span)
+        for value in sketch:
+            prior_index.setdefault(value, []).append(
+                prior_position
+            )
+
+    merged = _merge_byte_intervals(
+        sorted(
+            list(excluded_set)
+            + (flagged_spans if apply_cleaning else [])
+        )
+    )
+    projected = _merge_byte_intervals(
+        sorted(list(excluded_set) + flagged_spans)
+    )
+    stats["groups_kept"] = (
+        int(stats["groups_scanned"])
+        - int(stats["groups_dropped"])
+    )
+    stats["groups_unflagged"] = (
+        int(stats["groups_scanned"])
+        - int(stats["groups_flagged"])
+    )
+    stats["post_clean_train_bytes"] = (
+        train_end - sum(end - start for start, end in merged)
+    )
+    stats["projected_train_bytes_if_flagged_dropped"] = (
+        train_end - sum(end - start for start, end in projected)
+    )
+    if apply_cleaning:
+        return flagged_spans, stats
+    return [], stats
+
+
 def _train_group_health_audit(
     dataset: ByteDataset,
 ) -> Optional[Dict[str, object]]:
@@ -9846,6 +10478,91 @@ def audit_data_splits(
         violations.append(message)
         leakage_violations.append(message)
 
+    # 近重复只读审计：精确群组指纹与内容定义分块都要求内容
+    # 完全相同/共享完整块；改写、转载、轻微编辑的群组仍可能
+    # 把评估内容带进训练。这里按 shingle Jaccard 找近重复，
+    # 默认只对照 val；只有解封测试集时才把 test 纳入。
+    # 近重复是相似而非逐字节相同，默认只告警、不进入泄露硬门；
+    # 清洗需显式 --drop-train-near-duplicate-groups。
+    near_duplicates: Optional[Dict[str, object]] = None
+    if (
+        dataset.group_separator is not None
+        and getattr(dataset, "near_duplicate_audit", False)
+    ):
+        near_eval_ranges: Dict[str, Tuple[int, int]] = {
+            "val": dataset.split_bounds["val"],
+        }
+        near_include_test = bool(
+            include_test and dataset.has_test
+        )
+        if near_include_test:
+            near_eval_ranges["test"] = (
+                dataset.split_bounds["test"]
+            )
+
+        _, near_duplicates = (
+            _plan_train_near_duplicate_cleaning(
+                dataset._raw_buffer,
+                dataset.group_separator,
+                dataset.split_bounds["train"][1],
+                near_eval_ranges,
+                dataset.train_excluded_spans,
+                threshold=getattr(
+                    dataset,
+                    "near_duplicate_threshold",
+                    _NEAR_DUP_DEFAULT_THRESHOLD,
+                ),
+                shingle_bytes=getattr(
+                    dataset,
+                    "near_duplicate_shingle_bytes",
+                    _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                ),
+                apply_cleaning=False,
+            )
+        )
+        near_duplicates["include_test"] = near_include_test
+        near_duplicates["test_content_used"] = (
+            near_include_test
+        )
+
+        flagged = int(near_duplicates["groups_flagged"])
+        if flagged > 0:
+            matched = ", ".join(
+                f"{split}:{count}"
+                for split, count in (
+                    near_duplicates[
+                        "flagged_duplicate_of"
+                    ] or {}
+                ).items()
+                if int(count) > 0
+            )
+            warnings.append(
+                "train: 近重复审计发现 "
+                f"{flagged} 个训练群组与评估/更早训练群组"
+                "的 shingle Jaccard 达到阈值 "
+                f"{near_duplicates['threshold']}（{matched}；"
+                f"shingle={near_duplicates['shingle_bytes']}B）；"
+                "精确指纹/内容定义分块只能发现完全相同或"
+                "共享完整块的重复，改写/转载可能仍把评估"
+                "内容带入训练。检查 "
+                "data_audit.near_duplicates.examples 后可用 "
+                "--drop-train-near-duplicate-groups 整组清洗"
+            )
+        skipped = (
+            int(near_duplicates["groups_too_short"])
+            + int(near_duplicates["groups_too_large"])
+            + int(near_duplicates["eval_groups_too_short"])
+            + int(near_duplicates["eval_groups_too_large"])
+        )
+        if skipped > 0:
+            warnings.append(
+                "train/eval: 近重复审计跳过 "
+                f"{skipped} 个群组（过短或超过 "
+                f"{near_duplicates['max_group_bytes']}B）："
+                "这些群组没有参与近重复判断，不能把"
+                "「未标记」当成「不重复」"
+            )
+
     return {
         "max_windows": max_windows,
         "splits": splits_report,
@@ -9867,6 +10584,7 @@ def audit_data_splits(
         "duplicate_windows": duplicate_windows,
         "leakage_scan_coverage": scan_coverage,
         "content_chunks": content_chunks,
+        "near_duplicates": near_duplicates,
         "degenerate_runs": degenerate_runs,
         "val_label_noise": val_label_noise,
         "split_isolation": _split_isolation_record(
@@ -10384,6 +11102,33 @@ def print_data_audit(report: Dict[str, object]) -> None:
                 f"[data]   {key} 共享内容定义块 = "
                 f"{info['shared_chunks']} "
                 f"({info['shared_bytes']}B)"
+            )
+
+    near = report.get("near_duplicates")
+    if isinstance(near, dict):
+        print(
+            "[data]   近重复审计: "
+            f"flagged={near.get('groups_flagged')}"
+            f"/{near.get('groups_scanned')} 群组, "
+            f"Jaccard>={near.get('threshold')}, "
+            f"shingle={near.get('shingle_bytes')}B, "
+            f"candidates={near.get('candidate_pairs')}"
+            + (
+                "（含 test 内容）"
+                if near.get("test_content_used")
+                else "（仅 val）"
+            )
+        )
+        for example in (near.get("examples") or [])[:3]:
+            if not isinstance(example, (list, tuple)) or len(
+                example
+            ) < 6:
+                continue
+            print(
+                "[data]     近重复示例: "
+                f"[{example[0]},{example[1]}) ≈ "
+                f"[{example[4]},{example[5]}) "
+                f"reason={example[2]} J={example[3]}"
             )
 
     violation_set = set(report.get("violations", []))
@@ -14222,6 +14967,31 @@ def run_statistical_baseline(
                     False,
                 )
             ),
+            "drop_train_near_duplicate_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_near_duplicate_groups",
+                    False,
+                )
+            ),
+            "near_duplicate_threshold": (
+                _near_duplicate_threshold_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_threshold",
+                        _NEAR_DUP_DEFAULT_THRESHOLD,
+                    )
+                )
+            ),
+            "near_duplicate_shingle_bytes": (
+                _near_duplicate_shingle_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_shingle_bytes",
+                        _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                    )
+                )
+            ),
             "clean_train_against_test": bool(
                 getattr(
                     args,
@@ -14321,6 +15091,40 @@ def run_statistical_baseline(
             "val_fraction": dataset.val_fraction,
             "test_fraction": dataset.test_fraction,
             "group_separator": getattr(args, "group_separator", None),
+            "deduplicate_train_groups": bool(
+                getattr(args, "deduplicate_train_groups", False)
+            ),
+            "drop_train_shared_chunks": bool(
+                getattr(args, "drop_train_shared_chunks", False)
+            ),
+            "drop_train_near_duplicate_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_near_duplicate_groups",
+                    False,
+                )
+            ),
+            "near_duplicate_audit": bool(
+                getattr(args, "near_duplicate_audit", False)
+            ),
+            "near_duplicate_threshold": (
+                _near_duplicate_threshold_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_threshold",
+                        _NEAR_DUP_DEFAULT_THRESHOLD,
+                    )
+                )
+            ),
+            "near_duplicate_shingle_bytes": (
+                _near_duplicate_shingle_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_shingle_bytes",
+                        _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                    )
+                )
+            ),
             "split_bounds": {
                 split: list(bounds)
                 for split, bounds in dataset.split_bounds.items()
@@ -21671,6 +22475,9 @@ COMPARISON_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
+    "drop_train_near_duplicate_groups",
+    "near_duplicate_threshold",
+    "near_duplicate_shingle_bytes",
     # 训练集清洗是否读取 test 内容：默认 False（test 尘封）；
     # True 会让训练样本集合依赖 test，必须作为协议差异核对。
     "clean_train_against_test",
@@ -21749,6 +22556,9 @@ _CROSS_FAMILY_PROTOCOL_KEYS: Tuple[str, ...] = (
     "group_separator",
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
+    "drop_train_near_duplicate_groups",
+    "near_duplicate_threshold",
+    "near_duplicate_shingle_bytes",
     "clean_train_against_test",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
@@ -22528,6 +23338,31 @@ def build_comparison_protocol(
         "drop_train_shared_chunks": bool(
             getattr(args, "drop_train_shared_chunks", False)
         ),
+        "drop_train_near_duplicate_groups": bool(
+            getattr(
+                args,
+                "drop_train_near_duplicate_groups",
+                False,
+            )
+        ),
+        "near_duplicate_threshold": (
+            _near_duplicate_threshold_or_default(
+                getattr(
+                    args,
+                    "near_duplicate_threshold",
+                    _NEAR_DUP_DEFAULT_THRESHOLD,
+                )
+            )
+        ),
+        "near_duplicate_shingle_bytes": (
+            _near_duplicate_shingle_or_default(
+                getattr(
+                    args,
+                    "near_duplicate_shingle_bytes",
+                    _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                )
+            )
+        ),
         # 训练集清洗是否对照 test：默认 False；True 意味着
         # 训练样本选择读取过 test，不能与其他运行混为同一
         # 数据协议。
@@ -22843,6 +23678,31 @@ def experiment_protocol_from_payload(
         ),
         "drop_train_shared_chunks": bool(
             run_args.get("drop_train_shared_chunks", False)
+        ),
+        "drop_train_near_duplicate_groups": bool(
+            run_args.get(
+                "drop_train_near_duplicate_groups", False
+            )
+        ),
+        "near_duplicate_threshold": (
+            _near_duplicate_threshold_or_default(
+                _pick(
+                    run_args.get(
+                        "near_duplicate_threshold"
+                    ),
+                    _NEAR_DUP_DEFAULT_THRESHOLD,
+                )
+            )
+        ),
+        "near_duplicate_shingle_bytes": (
+            _near_duplicate_shingle_or_default(
+                _pick(
+                    run_args.get(
+                        "near_duplicate_shingle_bytes"
+                    ),
+                    _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                )
+            )
         ),
         # 旧运行没有该键时按历史行为回填：旧版只要启用去重/
         # 共享块清洗就会读取 test。不能默认成新版的 False，
@@ -33944,15 +34804,28 @@ _PREREGISTRATION_DATA_REQUIRED_FIELDS = (
 # 可选的清洗协议：清洗会改变实际参与训练/去重的字节范围，
 # 看到验证结果后再改清洗开关等于事后改数据。字段名与命令行
 # dest 一致，便于逐项核对。
-_PREREGISTRATION_CLEANING_KEYS = (
+_PREREGISTRATION_CLEANING_BOOL_KEYS = (
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
+    "drop_train_near_duplicate_groups",
     "drop_train_corrupt_groups",
     "drop_train_corrupt_bytes",
     "drop_train_degenerate_groups",
     "drop_train_degenerate_runs",
     "clean_train_against_test",
     "allow_eval_content_for_cleaning",
+)
+
+# 近重复阈值与 shingle 长度直接决定删除哪些训练群组，和清洗
+# 开关一样必须在训练前冻结；它们不是布尔量，单独校验。
+_PREREGISTRATION_CLEANING_NUMERIC_KEYS = (
+    "near_duplicate_threshold",
+    "near_duplicate_shingle_bytes",
+)
+
+_PREREGISTRATION_CLEANING_KEYS = (
+    _PREREGISTRATION_CLEANING_BOOL_KEYS
+    + _PREREGISTRATION_CLEANING_NUMERIC_KEYS
 )
 
 _PREREGISTRATION_OPTIONAL_FIELDS = (
@@ -35122,6 +35995,32 @@ def preregistration_schema_error(
         if unknown:
             return "data.cleaning 含未知开关: " + ", ".join(unknown)
         for key, value in cleaning.items():
+            if key == "near_duplicate_threshold":
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or not 0.0 < float(value) <= 1.0
+                ):
+                    return (
+                        "data.cleaning.near_duplicate_threshold "
+                        "必须是 (0, 1] 内的有限数"
+                    )
+                continue
+            if key == "near_duplicate_shingle_bytes":
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 1
+                    <= value
+                    <= _NEAR_DUP_MAX_SHINGLE_BYTES
+                ):
+                    return (
+                        "data.cleaning.near_duplicate_shingle_bytes "
+                        "必须是 1.."
+                        f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+                    )
+                continue
             if not isinstance(value, bool):
                 return f"data.cleaning.{key} 必须是布尔值"
         declared_alias_values = {
@@ -35821,7 +36720,7 @@ def preregistration_data_error(
             "不一致：清洗开关会改变实际参与训练/去重的"
             "数据，不能在看到结果后再改"
         )
-    for key in _PREREGISTRATION_CLEANING_KEYS:
+    for key in _PREREGISTRATION_CLEANING_BOOL_KEYS:
         if key in _CLEAN_AGAINST_TEST_ALIASES:
             continue
         expected = bool(declared_cleaning.get(key, False))
@@ -35832,6 +36731,28 @@ def preregistration_data_error(
                 f"与当前 {actual} 不一致：清洗开关会改变"
                 "实际参与训练/去重的数据，不能在看到结果后"
                 "再改；未声明的清洗开关按 false 处理"
+            )
+
+    numeric_defaults = {
+        "near_duplicate_threshold": _NEAR_DUP_DEFAULT_THRESHOLD,
+        "near_duplicate_shingle_bytes": (
+            _NEAR_DUP_DEFAULT_SHINGLE_BYTES
+        ),
+    }
+    for key, default in numeric_defaults.items():
+        expected = declared_cleaning.get(key, default)
+        actual = getattr(args, key, default)
+        try:
+            same = float(expected) == float(actual)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            return (
+                f"预注册 data.cleaning.{key}={expected!r} "
+                f"与当前 {actual!r} 不一致：近重复阈值/"
+                "shingle 长度会改变删除哪些训练群组，"
+                "不能在看到结果后再改；未声明时按默认值"
+                f" {default!r} 核对"
             )
 
     for key, attr in (
@@ -43707,6 +44628,38 @@ def write_run_config(
                     False,
                 )
             ),
+            "drop_train_near_duplicate_groups": bool(
+                getattr(
+                    args,
+                    "drop_train_near_duplicate_groups",
+                    False,
+                )
+            ),
+            "near_duplicate_audit": bool(
+                getattr(
+                    args,
+                    "near_duplicate_audit",
+                    False,
+                )
+            ),
+            "near_duplicate_threshold": (
+                _near_duplicate_threshold_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_threshold",
+                        _NEAR_DUP_DEFAULT_THRESHOLD,
+                    )
+                )
+            ),
+            "near_duplicate_shingle_bytes": (
+                _near_duplicate_shingle_or_default(
+                    getattr(
+                        args,
+                        "near_duplicate_shingle_bytes",
+                        _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                    )
+                )
+            ),
             "drop_train_corrupt_groups": bool(
                 getattr(
                     args,
@@ -48103,6 +49056,130 @@ def run_self_test():
         batches=1,
     )
     assert shared_probe["ok"], shared_probe["failures"]
+
+    # 近重复清洗：精确指纹与内容定义分块只能抓完全相同/共享
+    # 完整块的内容。这里构造一个只改了一个词的 train/val 群组
+    # 对，验证 shingle Jaccard 能发现它、只删除 train、val/test
+    # 的内容与切分指纹逐位不变，且只读审计不会删除。
+    def _near_random(length: int, seed: int) -> bytes:
+        generator = random.Random(seed)
+        return bytes(
+            generator.randrange(32, 127)
+            for _ in range(length)
+        )
+
+    near_core = (
+        b"alpha beta gamma delta epsilon zeta eta theta " * 12
+    )[:576]
+    near_base = near_core + _near_random(
+        640 - len(near_core), 20241101
+    )
+    near_variant = near_base.replace(
+        b"alpha", b"omega", 1
+    )
+    assert len(near_base) == len(near_variant) == 640
+    near_groups = [
+        _near_random(640, 1),
+        near_base,
+        _near_random(640, 2),
+        _near_random(640, 3),
+        near_variant,
+        _near_random(640, 4),
+        _near_random(640, 5),
+        _near_random(640, 6),
+    ]
+    near_payload = (
+        separator.join(near_groups) + separator
+    )
+    with tempfile.NamedTemporaryFile() as near_file:
+        near_file.write(near_payload)
+        near_file.flush()
+
+        raw_near_dataset = ByteDataset(
+            near_file.name,
+            seq_len=8,
+            val_fraction=0.25,
+            test_fraction=0.25,
+            group_separator=separator,
+        )
+        cleaned_near_dataset = ByteDataset(
+            near_file.name,
+            seq_len=8,
+            val_fraction=0.25,
+            test_fraction=0.25,
+            group_separator=separator,
+            drop_train_near_duplicate_groups=True,
+            near_duplicate_threshold=0.8,
+            near_duplicate_shingle_bytes=8,
+        )
+        audited_near_dataset = ByteDataset(
+            near_file.name,
+            seq_len=8,
+            val_fraction=0.25,
+            test_fraction=0.25,
+            group_separator=separator,
+            near_duplicate_audit=True,
+            near_duplicate_threshold=0.8,
+            near_duplicate_shingle_bytes=8,
+        )
+
+        audited_near_report = audit_data_splits(
+            audited_near_dataset,
+        )
+
+    assert cleaned_near_dataset.split_bounds == (
+        raw_near_dataset.split_bounds
+    )
+    for split_name in ("val", "test"):
+        assert (
+            cleaned_near_dataset.split_sha256[split_name]
+            == raw_near_dataset.split_sha256[split_name]
+        )
+    # 训练集第 1 个群组（起点 642）与 val 中改写后的群组近重复。
+    assert cleaned_near_dataset.train_excluded_spans == [
+        (642, 1282)
+    ]
+    assert cleaned_near_dataset.train_cleaning[
+        "cleaning_kinds"
+    ] == ["near_duplicate"]
+    near_stats = cleaned_near_dataset.train_cleaning[
+        "near_duplicates"
+    ]
+    assert near_stats["flagged_duplicate_of"] == {
+        "val": 1,
+        "test": 0,
+        "train": 0,
+    }
+    assert near_stats["groups_dropped"] == 1
+    assert near_stats["examples"][0][3] >= 0.8
+    assert (
+        cleaned_near_dataset.effective_train_bytes
+        == raw_near_dataset.effective_train_bytes - 640
+    )
+    assert cleaned_near_dataset.train_num_valid_starts is not None
+    near_probe = probe_data_pipeline(
+        cleaned_near_dataset,
+        eval_device,
+        batch_size=4,
+        batches=1,
+    )
+    assert near_probe["ok"], near_probe["failures"]
+
+    # 只读审计：不删除任何训练字节，但报告同一近重复匹配。
+    assert audited_near_dataset.train_excluded_spans == []
+    assert audited_near_report["near_duplicates"][
+        "groups_flagged"
+    ] == 1
+    assert audited_near_report["near_duplicates"][
+        "groups_dropped"
+    ] == 0
+    assert audited_near_report["near_duplicates"][
+        "test_content_used"
+    ] is False
+    assert any(
+        "近重复" in warning
+        for warning in audited_near_report["warnings"]
+    )
 
     # 无群组连续字节流的异常值清洗：只从 train 剔除长同字节
     # 退化段（填充/重复字符污染），val/test 的字节与切分位置
@@ -64838,6 +65915,55 @@ def main():
         ),
     )
     parser.add_argument(
+        "--drop-train-near-duplicate-groups",
+        action="store_true",
+        help=(
+            "训练集近重复清洗（需要 --group-separator）："
+            "按字节 k-shingle 集合的 Jaccard 相似度，把与 val "
+            "（默认；显式 --clean-train-against-test 时含 test）"
+            "或更早 train 群组相似度达到阈值的训练群组整组剔除；"
+            "精确群组指纹与内容定义分块抓不到的改写/转载/轻微"
+            "编辑重复会被这条内容级规则发现。val/test 的字节、"
+            "切分位置与指纹完全不变"
+        ),
+    )
+    parser.add_argument(
+        "--near-duplicate-audit",
+        action="store_true",
+        help=(
+            "只读近重复审计（需要 --group-separator）：不删除"
+            "任何数据，在 data_audit.near_duplicates 中报告与 "
+            "val（解封时含 test）或更早 train 近似的训练群组、"
+            "最佳匹配位置、Jaccard 值与哈希/草图口径。用于先"
+            "看清重复程度再决定是否启用 "
+            "--drop-train-near-duplicate-groups"
+        ),
+    )
+    parser.add_argument(
+        "--near-duplicate-threshold",
+        type=float,
+        default=_NEAR_DUP_DEFAULT_THRESHOLD,
+        metavar="JACCARD",
+        help=(
+            "近重复判定的 Jaccard 阈值（0, 1]，默认 "
+            f"{_NEAR_DUP_DEFAULT_THRESHOLD}；相似度按完整 "
+            "shingle 集合精确复核，草图只用于候选生成。"
+            "阈值决定删除比例，必须与清洗开关一起写入预注册"
+        ),
+    )
+    parser.add_argument(
+        "--near-duplicate-shingle-bytes",
+        type=int,
+        default=_NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+        metavar="BYTES",
+        help=(
+            "近重复相似度的字节 shingle 长度，默认 "
+            f"{_NEAR_DUP_DEFAULT_SHINGLE_BYTES}；越短越敏感于"
+            "局部改写、候选越多，越长越接近整段复制检测。"
+            f"允许 1..{_NEAR_DUP_MAX_SHINGLE_BYTES}"
+        ),
+    )
+    parser.add_argument(
         "--clean-train-against-test",
         action="store_true",
         help=(
@@ -67082,6 +68208,70 @@ def main():
                     saved_shared_drop
                 )
 
+        # 近重复清洗同样改变实际参与训练的样本集合，是采样
+        # 轨迹的一部分；开关、阈值与 shingle 长度都按存档恢复，
+        # 避免续跑时用不同阈值悄悄换一套训练数据。
+        for key in (
+            "drop_train_near_duplicate_groups",
+            "near_duplicate_audit",
+        ):
+            if key not in saved_args:
+                continue
+            saved_value = bool(saved_args.get(key))
+            if saved_value != bool(getattr(args, key, False)):
+                print(
+                    f"resume restored {key} "
+                    f"{bool(getattr(args, key, False))} -> "
+                    f"{saved_value} (训练集清洗/审计口径是"
+                    "采样轨迹的一部分)"
+                )
+                setattr(args, key, saved_value)
+
+        if "near_duplicate_threshold" in saved_args:
+            saved_threshold = saved_args.get(
+                "near_duplicate_threshold"
+            )
+            try:
+                saved_threshold = float(saved_threshold)
+            except (TypeError, ValueError):
+                saved_threshold = None
+            if (
+                saved_threshold is not None
+                and math.isfinite(saved_threshold)
+                and saved_threshold
+                != float(args.near_duplicate_threshold)
+            ):
+                print(
+                    "resume restored near_duplicate_threshold "
+                    f"{args.near_duplicate_threshold} -> "
+                    f"{saved_threshold} (训练集清洗是采样轨迹"
+                    "的一部分)"
+                )
+                args.near_duplicate_threshold = saved_threshold
+
+        if "near_duplicate_shingle_bytes" in saved_args:
+            saved_shingle = saved_args.get(
+                "near_duplicate_shingle_bytes"
+            )
+            if (
+                isinstance(saved_shingle, int)
+                and not isinstance(saved_shingle, bool)
+                and 1
+                <= saved_shingle
+                <= _NEAR_DUP_MAX_SHINGLE_BYTES
+                and saved_shingle
+                != int(args.near_duplicate_shingle_bytes)
+            ):
+                print(
+                    "resume restored near_duplicate_shingle_bytes "
+                    f"{args.near_duplicate_shingle_bytes} -> "
+                    f"{saved_shingle} (训练集清洗是采样轨迹"
+                    "的一部分)"
+                )
+                args.near_duplicate_shingle_bytes = (
+                    saved_shingle
+                )
+
         # 清洗是否读取 test 决定训练样本集合是否依赖测试集，
         # 与清洗开关一样是采样轨迹的一部分。旧检查点没有该键
         # 时回填历史行为（启用去重/共享块清洗即读取 test），
@@ -67092,6 +68282,7 @@ def main():
         if saved_clean_test and not (
             args.deduplicate_train_groups
             or args.drop_train_shared_chunks
+            or args.drop_train_near_duplicate_groups
         ):
             print(
                 "resume checkpoint recorded test-dependent train "
@@ -67432,15 +68623,57 @@ def main():
             "内容而不改动 val/test"
         )
 
+    if (
+        args.drop_train_near_duplicate_groups
+        and group_separator_bytes is None
+    ):
+        parser.error(
+            "--drop-train-near-duplicate-groups 需要 "
+            "--group-separator：近重复按群组定义，没有显式"
+            "群组边界时无法只清洗 train 而不改动 val/test"
+        )
+
+    if args.near_duplicate_audit and group_separator_bytes is None:
+        parser.error(
+            "--near-duplicate-audit 需要 --group-separator："
+            "近重复按群组定义，没有群组边界就无法区分"
+            "文档/记录"
+        )
+
+    if (
+        not math.isfinite(args.near_duplicate_threshold)
+        or not 0.0 < args.near_duplicate_threshold <= 1.0
+    ):
+        parser.error(
+            "--near-duplicate-threshold 必须是 (0, 1] 内的"
+            "有限数"
+        )
+
+    if not (
+        isinstance(args.near_duplicate_shingle_bytes, int)
+        and not isinstance(
+            args.near_duplicate_shingle_bytes, bool
+        )
+        and 1
+        <= args.near_duplicate_shingle_bytes
+        <= _NEAR_DUP_MAX_SHINGLE_BYTES
+    ):
+        parser.error(
+            "--near-duplicate-shingle-bytes 必须是 1.."
+            f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+        )
+
     if args.clean_train_against_test and not (
         args.deduplicate_train_groups
         or args.drop_train_shared_chunks
+        or args.drop_train_near_duplicate_groups
     ):
         parser.error(
             "--clean-train-against-test 需要与 "
-            "--deduplicate-train-groups 或 "
-            "--drop-train-shared-chunks 一起使用：没有训练集"
-            "清洗时 test 不会被读取"
+            "--deduplicate-train-groups、"
+            "--drop-train-shared-chunks 或 "
+            "--drop-train-near-duplicate-groups 一起使用："
+            "没有训练集清洗时 test 不会被读取"
         )
 
     if (
@@ -67691,6 +68924,16 @@ def main():
             ),
             drop_train_shared_chunks=(
                 args.drop_train_shared_chunks
+            ),
+            drop_train_near_duplicate_groups=(
+                args.drop_train_near_duplicate_groups
+            ),
+            near_duplicate_audit=args.near_duplicate_audit,
+            near_duplicate_threshold=(
+                args.near_duplicate_threshold
+            ),
+            near_duplicate_shingle_bytes=(
+                args.near_duplicate_shingle_bytes
             ),
             drop_train_corrupt_groups=(
                 args.drop_train_corrupt_groups

@@ -60,6 +60,9 @@
     "cleaning": {
       "deduplicate_train_groups": false,
       "drop_train_shared_chunks": false,
+      "drop_train_near_duplicate_groups": false,
+      "near_duplicate_threshold": 0.8,
+      "near_duplicate_shingle_bytes": 8,
       "drop_train_corrupt_groups": false,
       "drop_train_corrupt_bytes": false,
       "drop_train_degenerate_groups": false,
@@ -142,7 +145,10 @@
   `test_fraction`；可选的 `group_separator`、`cleaning`、
   `entity_manifest_sha256`、`time_order_manifest_sha256`
   也会在数据加载后逐项核对。清洗开关会改变实际参与训练/
-  去重的字节，必须在预注册中固定。
+  去重的字节，必须在预注册中固定；近重复清洗还必须在
+  `cleaning` 中冻结 `near_duplicate_threshold`（(0,1]）与
+  `near_duplicate_shingle_bytes`（1~64）。未声明这两个数值
+  时按默认 0.8 / 8 核对，看到结果后再改阈值同样会被拒绝。
 - 顶层与 `data` 都拒绝未知字段：拼写错误（如把 `seeds`
   写成 `seed`）会让协议静默失效，不能当作「多写了一个
   备注」放行；要写备注请用 `notes` / `metadata`。

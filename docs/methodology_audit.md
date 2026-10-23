@@ -275,8 +275,14 @@ bootstrap；但种子层级已并入窗口区间：逐窗口配对的跨种子�
 - 文档明确：分隔符只保证连续片段完整，不识别非相邻片段的同一
   用户/作者/文档版本；内容定义分块是**精确块**扫描，不是近重复
   检测。
-- 仍有限制：没有实现 MinHash/SimHash 近重复检测，也没有
-  document-stratified 切分；`--group-separator '\n\n'` 仍可能把
+- 已补上近重复（near-duplicate）检测：`--near-duplicate-audit`
+  做只读审计，`--drop-train-near-duplicate-groups` 做 train-only
+  整组清洗；相似度定义为字节 k-shingle 集合的 Jaccard，先用
+  bottom-k 草图倒排索引生成候选，再用完整 shingle 集合精确复核
+  （见第 35 节）。
+- 仍有限制：近重复是内容级相似而非语义等价；64 位 shingle 哈希
+  存在可忽略但非零的碰撞概率；超长/过短群组显式跳过；也没有
+  document-stratified 切分。`--group-separator '\n\n'` 仍可能把
   同一文档拆到不同 split，必须用真实文档/实体 ID。
 
 ## 17. 测试内容参与训练集删除（第 18 项）
@@ -1004,6 +1010,70 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
   概率模型、多重插补、逆概率加权或 Rosenbaum 敏感性分析；这些
   需要额外的缺失假设，不能从现有数据自动推出。
 
+## 35. 数据处理：近重复群组审计与 train-only 清洗（本轮补充）
+
+**判定：精确内容指纹只能发现「完全相同」的群组；内容定义分块
+只能发现「共享完整连续块」的重复。同一文档的修订版、转载时改
+标题/改一两句话、拼接了局部段落的副本，指纹与共享块都可能不同，
+但这些内容仍会把评估信息带入训练。**
+
+**已修正：**
+
+- 新增 `--near-duplicate-audit`（只读）与
+  `--drop-train-near-duplicate-groups`（整组清洗），都需要
+  `--group-separator`。相似度是字节 k-shingle 集合的 Jaccard：
+  `|S_a ∩ S_b| / |S_a ∪ S_b|`，阈值由
+  `--near-duplicate-threshold`（默认 0.8）声明，shingle 长度由
+  `--near-duplicate-shingle-bytes`（默认 8）声明。
+- 成本控制不是「用草图近似删除」：每个群组先取 shingle 哈希的
+  bottom-k 草图（默认 128 个最小哈希值，MinHash 家族的最小哈希
+  样本），用草图哈希做倒排索引生成候选；是否删除由候选双方的
+  **完整 shingle 集合**精确计算 Jaccard 后决定。审计记录
+  `similarity`、`shingle_hash`、`exact_verification`、`sketch_size`
+  与候选数，不能把草图当成最终相似度。
+- 默认只对照 val 与更早 train，val/test 的字节、切分位置与
+  `split_sha256` 完全不变；只有显式
+  `--clean-train-against-test` / `--allow-eval-content-for-cleaning`
+  才把 test 放入 `eval_ranges`，并把
+  `cleaning_eval_splits=["test","val"]`、
+  `test_used_for_cleaning=true` 写入 `train_cleaning`。近重复清洗
+  与精确去重/共享块清洗一样，会被
+  `effective_train_sha256`、`comparison_protocol` 与预注册
+  `data.cleaning` 逐项核对，不能在看到结果后改阈值。
+- 只读审计写入 `data_audit.near_duplicates`：被标记群组数、
+  `flagged_duplicate_of`（val/test/train）、最佳匹配区间与 Jaccard、
+  跳过的过短/超长群组数，默认只告警、不进入泄露硬门（相似不是
+  逐字节相同，不能把启发式标记直接写成确定泄露）；清洗开关则是
+  显式干预，删除后照常计算 `deletion_bias`，提醒删除不是随机缺失。
+- 跳过条件显式记录：群组短于一个 shingle 或超过
+  `max_group_bytes`（4 MiB）时不参与判断，审计写出
+  `groups_too_short` / `groups_too_large`；不能把「未标记」读成
+  「不重复」。64 位滚动多项式哈希有极小碰撞概率，报告记录哈希
+  口径而不是声称逐字节完全相等。
+- 回归覆盖：改写版 train/val 群组被精确 Jaccard 命中；只读审计
+  不删除且报告确定；默认不读取 test，显式开关后才删除与 test
+  近似的 train 群组；split 边界/`split_sha256`/有效训练字节的
+  train-only 约束；非法阈值与 shingle 长度被拒绝。
+
+**仍有限制：**
+
+- 近重复是内容级相似，不是语义重复；同义改写、翻译、图片/表格
+  的结构性复制不在字节 shingle 的检测范围内。
+- 阈值与 shingle 长度是研究者事先声明的操作化定义，改变它们会
+  改变删除集合与有效训练分布；预注册必须与开关一起冻结，报告
+  不能把「阈值下的未标记」写成「没有重复」。默认 0.8 的候选
+  召回由共享 bottom-k 草图保证；阈值远低于 0.5 时候选生成可能
+  漏检，应视为探索性设置并同时报告 `candidate_pairs` 与人工
+  抽查结果。
+- bottom-k 草图只负责候选生成，候选可能漏掉「长度差异极大但短
+  文档被完整包含」的群组：这类关系的 Jaccard 本身很低，应该用
+  单独的 containment 指标或实体清单处理，而不是偷偷降低阈值。
+- 近重复审计回答的是「train 是否与 val/test 或更早 train 近似」，
+  不扫描 val/test 内部的近重复；评估集内部近重复仍由精确群组
+  审计与 `--allow-eval-duplicates` 处理，二者的检测对象不同。
+- 超过 4 MiB 的群组跳过，避免完整 shingle 集合内存不可控；大文档
+  应先在文档内分块/按小节定义群组，再运行近重复审计。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1011,9 +1081,10 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
    假设一起归档。
 2. 固定数据协议：`--split-policy chronological` + 时间清单，
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
-   默认 val-only 清洗；训练前核对 `data_audit.label_coverage`
-   与（清洗确有删除时的）`train_cleaning.deletion_bias`，把高删除
-   偏差或未见评估标签写进限制/敏感性分析计划。
+   默认 val-only 清洗；训练前核对 `data_audit.label_coverage`、
+   `data_audit.near_duplicates`（若启用近重复审计/清洗）与（清洗
+   确有删除时的）`train_cleaning.deletion_bias`，把高删除偏差、
+   未见评估标签或阈值下仍存在的近重复写进限制/敏感性分析计划。
 3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
    最小效应、目标功效、预期脱落率；消融还要写
    `planned_contrasts` 含 `interaction`）与 `run_order`

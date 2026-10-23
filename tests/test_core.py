@@ -2920,6 +2920,269 @@ class ReproducibilityTests(unittest.TestCase):
         )
 
 
+class NearDuplicateDataTests(unittest.TestCase):
+    """近重复数据审计/清洗：候选生成、精确复核与 train-only 边界。"""
+
+    @staticmethod
+    def _printable(tag: str, size: int) -> bytes:
+        raw = hashlib.sha256(tag.encode("utf-8")).digest()
+        out = bytearray()
+        counter = 0
+        while len(out) < size:
+            raw = hashlib.sha256(
+                raw + str(counter).encode("ascii")
+            ).digest()
+            out.extend(32 + (value % 95) for value in raw)
+            counter += 1
+        return bytes(out[:size])
+
+    @classmethod
+    def _near_pair(cls, size: int = 640):
+        core = (
+            b"alpha beta gamma delta epsilon zeta eta theta "
+            * 12
+        )[: size - 64]
+        filler = cls._printable("near-filler", size - len(core))
+        base = core + filler
+        variant = base.replace(b"alpha", b"omega", 1)
+        return base, variant
+
+    def test_planner_drops_near_duplicate_train_group(self):
+        base, variant = self._near_pair()
+        separator = b"\n\n"
+        unrelated = [
+            self._printable(f"doc-{index}", 640)
+            for index in range(2)
+        ]
+        raw = bytearray(
+            separator.join([base, *unrelated, variant])
+        )
+        train_end = len(base) + len(unrelated[0]) + 2 * len(
+            separator
+        )
+        eval_ranges = {"val": (train_end, len(raw))}
+
+        excluded, stats = (
+            experiment._plan_train_near_duplicate_cleaning(
+                raw,
+                separator,
+                train_end,
+                eval_ranges,
+                [],
+                threshold=0.8,
+                shingle_bytes=8,
+                apply_cleaning=True,
+            )
+        )
+
+        self.assertEqual(excluded, [(0, len(base))])
+        self.assertEqual(stats["groups_dropped"], 1)
+        self.assertEqual(stats["groups_flagged"], 1)
+        self.assertEqual(
+            stats["flagged_duplicate_of"],
+            {"val": 1, "test": 0, "train": 0},
+        )
+        self.assertGreaterEqual(
+            stats["examples"][0][3], 0.8
+        )
+        self.assertLessEqual(
+            stats["examples"][0][3], 1.0
+        )
+
+        # 只读审计报告同一匹配，但不返回删除区间。
+        audit_excluded, audit_stats = (
+            experiment._plan_train_near_duplicate_cleaning(
+                raw,
+                separator,
+                train_end,
+                eval_ranges,
+                [],
+                threshold=0.8,
+                shingle_bytes=8,
+                apply_cleaning=False,
+            )
+        )
+        self.assertEqual(audit_excluded, [])
+        self.assertEqual(audit_stats["groups_dropped"], 0)
+        self.assertEqual(audit_stats["groups_flagged"], 1)
+        self.assertGreater(
+            audit_stats["projected_train_bytes_if_flagged_dropped"],
+            0,
+        )
+
+    def test_planner_rejects_invalid_parameters(self):
+        raw = bytearray(b"abc" * 100)
+        for kwargs in (
+            {"threshold": 0.0},
+            {"threshold": 1.5},
+            {"shingle_bytes": 0},
+            {"shingle_bytes": 65},
+            {"sketch_size": 1},
+        ):
+            with self.assertRaises(ValueError):
+                experiment._plan_train_near_duplicate_cleaning(
+                    raw,
+                    b"\n\n",
+                    len(raw),
+                    {"val": (0, 0)},
+                    [],
+                    **kwargs,
+                )
+
+    def test_dataset_cleaning_only_changes_train(self):
+        base, variant = self._near_pair()
+        groups = [
+            self._printable("u1", 640),
+            base,
+            self._printable("u2", 640),
+            self._printable("u3", 640),
+            variant,
+            self._printable("v2", 640),
+            self._printable("t1", 640),
+            self._printable("t2", 640),
+        ]
+        payload = b"\n\n".join(groups)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "near.txt"
+            path.write_bytes(payload)
+
+            plain = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=b"\n\n",
+            )
+            cleaned = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=b"\n\n",
+                drop_train_near_duplicate_groups=True,
+                near_duplicate_threshold=0.8,
+                near_duplicate_shingle_bytes=8,
+            )
+
+        self.assertEqual(
+            plain.split_bounds, cleaned.split_bounds
+        )
+        self.assertEqual(
+            plain.split_sha256, cleaned.split_sha256
+        )
+        self.assertEqual(
+            cleaned.train_excluded_spans, [(642, 1282)]
+        )
+        self.assertEqual(
+            cleaned.train_cleaning["cleaning_kinds"],
+            ["near_duplicate"],
+        )
+        self.assertEqual(
+            cleaned.train_cleaning["near_duplicates"][
+                "flagged_duplicate_of"
+            ],
+            {"val": 1, "test": 0, "train": 0},
+        )
+        self.assertEqual(
+            cleaned.effective_train_bytes,
+            plain.effective_train_bytes - 640,
+        )
+
+    def test_audit_does_not_delete_and_is_deterministic(self):
+        base, variant = self._near_pair()
+        groups = [
+            self._printable("u1", 640),
+            base,
+            self._printable("u2", 640),
+            self._printable("u3", 640),
+            variant,
+            self._printable("v2", 640),
+            self._printable("t1", 640),
+            self._printable("t2", 640),
+        ]
+        payload = b"\n\n".join(groups)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.txt"
+            path.write_bytes(payload)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=b"\n\n",
+                near_duplicate_audit=True,
+            )
+            audit_one = experiment.audit_data_splits(dataset)
+            audit_two = experiment.audit_data_splits(dataset)
+
+        self.assertEqual(dataset.train_excluded_spans, [])
+        self.assertEqual(
+            audit_one["near_duplicates"]["groups_flagged"], 1
+        )
+        self.assertEqual(
+            audit_one["near_duplicates"],
+            audit_two["near_duplicates"],
+        )
+        self.assertTrue(
+            any(
+                "近重复" in warning
+                for warning in audit_one["warnings"]
+            )
+        )
+
+    def test_test_content_is_not_used_for_near_dedup_by_default(self):
+        base, variant = self._near_pair()
+        groups = [
+            base,
+            self._printable("u1", 640),
+            self._printable("u2", 640),
+            self._printable("u3", 640),
+            self._printable("v1", 640),
+            self._printable("v2", 640),
+            variant,
+            self._printable("t2", 640),
+        ]
+        payload = b"\n\n".join(groups)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sealed.txt"
+            path.write_bytes(payload)
+            sealed = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=b"\n\n",
+                drop_train_near_duplicate_groups=True,
+            )
+            leaky = experiment.ByteDataset(
+                str(path),
+                seq_len=8,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=b"\n\n",
+                drop_train_near_duplicate_groups=True,
+                clean_train_against_test=True,
+            )
+
+        self.assertEqual(sealed.train_excluded_spans, [])
+        self.assertFalse(
+            sealed.train_cleaning["test_used_for_cleaning"]
+        )
+        self.assertEqual(
+            leaky.train_cleaning["cleaning_eval_splits"],
+            ["test", "val"],
+        )
+        self.assertTrue(
+            leaky.train_cleaning["test_used_for_cleaning"]
+        )
+        self.assertEqual(
+            leaky.train_excluded_spans, [(0, 640)]
+        )
+
+
 class ProcessTests(unittest.TestCase):
     def test_set_seed_updates_child_hashseed_on_reseed(self):
         if experiment._PYTHONHASHSEED_AT_START is not None:
@@ -4213,6 +4476,58 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIsNone(
             experiment.preregistration_data_error(
                 args, self._payload(), self._dataset()
+            )
+        )
+
+    def test_schema_rejects_invalid_near_duplicate_cleaning_values(self):
+        payload = self._payload()
+        payload["data"]["cleaning"] = {
+            "near_duplicate_threshold": 1.5,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIn("near_duplicate_threshold", error)
+
+        payload["data"]["cleaning"] = {
+            "near_duplicate_shingle_bytes": 0,
+        }
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIn("near_duplicate_shingle_bytes", error)
+
+        payload["data"]["cleaning"] = {
+            "near_duplicate_threshold": 0.8,
+            "near_duplicate_shingle_bytes": 8,
+        }
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+
+    def test_data_rejects_changed_near_duplicate_threshold(self):
+        # 阈值决定删除哪些训练群组，看到结果后再调阈值等于
+        # 事后改变数据；预注册显式写了就必须逐项核对。
+        payload = self._payload()
+        payload["data"]["cleaning"] = {
+            "drop_train_near_duplicate_groups": True,
+            "near_duplicate_threshold": 0.7,
+            "near_duplicate_shingle_bytes": 8,
+        }
+        args = self._args(
+            split_policy="contiguous",
+            group_separator=None,
+            drop_train_near_duplicate_groups=True,
+            near_duplicate_threshold=0.8,
+            near_duplicate_shingle_bytes=8,
+        )
+        error = experiment.preregistration_data_error(
+            args, payload, self._dataset()
+        )
+        self.assertIn("near_duplicate_threshold", error)
+
+        payload["data"]["cleaning"][
+            "near_duplicate_threshold"
+        ] = 0.8
+        self.assertIsNone(
+            experiment.preregistration_data_error(
+                args, payload, self._dataset()
             )
         )
 
