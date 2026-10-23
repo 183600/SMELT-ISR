@@ -11440,11 +11440,16 @@ def _lag1_autocorrelation(
     tail = numeric[1:]
     head = head - head.mean()
     tail = tail - tail.mean()
-    # 两个平方和各自可能合法但很小（如 1e-200）；先相乘再开方
-    # 会在 1e-400 量级下溢成 0。分别开方后相乘等价且不丢尺度。
+    # 正常量级沿用「平方和相乘后开方」以保持历史末位；两个
+    # 平方和各自可能合法但很小（如 1e-200），先相乘会在 1e-400
+    # 量级下溢成 0，此时改用分别开方后相乘（数学等价）。
     head_square = float((head * head).sum())
     tail_square = float((tail * tail).sum())
-    denominator = math.sqrt(head_square) * math.sqrt(tail_square)
+    product = head_square * tail_square
+    if product > 0.0 and math.isfinite(product):
+        denominator = math.sqrt(product)
+    else:
+        denominator = math.sqrt(head_square) * math.sqrt(tail_square)
     if float(denominator) <= 0.0:
         return None
     raw_rho = float((head * tail).sum() / denominator)
