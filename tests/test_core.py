@@ -7714,6 +7714,21 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(tiny["variance_of_mean"])
         json.dumps(tiny, allow_nan=False)
 
+    def test_ngram_diagnostics_tie_tolerance_scales_with_value(self):
+        report = experiment._ngram_tuning_diagnostics(
+            {"order": 1, "alpha": 0.2, "val_loss": 3.0e-13},
+            {"order": 2, "alpha": 0.3, "val_loss": 5.0e-13},
+            "val_loss",
+            [0.1, 0.2, 0.3],
+            3,
+            2,
+            2,
+        )
+        self.assertFalse(
+            any("并列" in message for message in report["advisories"])
+        )
+        json.dumps(report, allow_nan=False)
+
     def test_axis_value_equality_scales_with_tiny_values(self):
         self.assertFalse(
             experiment._axis_value_equal(0.0, 1.0e-13)

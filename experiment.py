@@ -13865,7 +13865,9 @@ def _ngram_tuning_diagnostics(
 
     advisories: List[str] = []
     if gap is not None:
-        tolerance = 1e-12 * max(1.0, abs(best_value_float or 0.0))
+        # 并列判定按指标尺度取相对容差；固定 1e-12 会把
+        # 1e-13 量级的真实 gap 误报成并列。
+        tolerance = 1e-12 * abs(best_value_float or 0.0)
         if gap <= tolerance and runner_up is not None:
             advisories.append(
                 "winner 与 runner-up 在调参指标上并列：当前仅是"
