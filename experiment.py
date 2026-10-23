@@ -20415,6 +20415,25 @@ _COMMON_STEP_METRICS: Tuple[str, ...] = tuple(
 )
 _COMMON_STEP_METRIC = "val_loss_at_common_step"
 
+# RQ1 里的「收敛速度」不能只由共同步数处的单点 loss 回答：
+# 单点只描述某一时刻的质量，两个方法可以在该点相同、但整个
+# 训练过程中的损失轨迹明显不同。这里新增一个分析期派生指标：
+# 在共同的训练步数窗口上对周期验证曲线做梯形积分，再除以窗口
+# 长度，得到「时均验证损失」（越低说明窗口内整体损失更低，
+# 常与更早收敛一致，但不能单独分离速度与最终水平）。
+#
+# 它仍使用周期验证记录（不经过 checkpoint 选型），窗口起点取
+# 各运行**第一个**周期验证步的最大值、终点取训练前固定的
+# ``--common-step``（未固定时退回各运行最后验证步的最小值），
+# 两端都在曲线范围内做线性插值，不做外推。窗口起点也是观测
+# 端点：首段（0 到第一次验证）没有观测，不能凭空假设，因此
+# 该指标回答的是「共同可观测窗口内谁的整体损失更低」，不是
+# 从第 0 步开始的完整曲线面积。
+_CURVE_MEAN_METRIC = "val_loss_curve_mean_to_common_step"
+_CURVE_DERIVED_METRICS: Tuple[str, ...] = (
+    _CURVE_MEAN_METRIC,
+)
+
 
 def _common_step_metric_name(base_metric: str) -> Optional[str]:
     """周期指标名 → 共同步数派生指标名；非周期指标返回 None。"""
@@ -21031,6 +21050,278 @@ def annotate_common_step_metrics(
             + ", ".join(incomplete)
         )
 
+    return report
+
+
+def _curve_trapezoid_mean(
+    points: List[Tuple[float, float]],
+    start: float,
+    end: float,
+) -> Optional[Dict[str, object]]:
+    """
+    在 [start, end] 上对分段线性验证曲线做梯形积分并取均值。
+
+    只对可观测窗口积分：起点/终点都通过相邻验证点线性插值，
+    不把窗口外的点外推进来。用「每段权重×段内均值」而不是先
+    求总面积再除以窗口长度，避免两个合法但极大的有限 loss
+    在求和/相除时溢出；无法得到有限均值时返回 None，由调用方
+    把运行标为缺失，而不是写入 ±inf。
+    """
+    if not points or not (
+        math.isfinite(start)
+        and math.isfinite(end)
+        and end > start
+    ):
+        return None
+
+    start_value, start_method = _interpolate_curve(points, start)
+    end_value, end_method = _interpolate_curve(points, end)
+    if start_value is None or end_value is None:
+        return None
+
+    breakpoints = [start]
+    values = [start_value]
+    for x, y in points:
+        if start < x < end:
+            breakpoints.append(x)
+            values.append(y)
+    breakpoints.append(end)
+    values.append(end_value)
+
+    window = end - start
+    terms: List[float] = []
+    for index in range(1, len(breakpoints)):
+        width = breakpoints[index] - breakpoints[index - 1]
+        if not math.isfinite(width) or width < 0.0:
+            return None
+        # v1/2 + v2/2 避免先相加再除二造成的中间溢出。
+        average = values[index - 1] / 2.0 + values[index] / 2.0
+        fraction = width / window
+        term = fraction * average
+        if not math.isfinite(term):
+            return None
+        terms.append(term)
+
+    try:
+        mean = math.fsum(terms)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(mean):
+        return None
+    return {
+        "mean": mean,
+        "window_steps": window,
+        "start_value": start_value,
+        "end_value": end_value,
+        "start_interpolation": start_method,
+        "end_interpolation": end_method,
+        "trapezoid_segments": len(terms),
+    }
+
+
+def annotate_curve_metrics(
+    rows: List[Dict[str, object]],
+    target_step: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    为每个运行计算共同训练窗口内的「时均验证损失」。
+
+    动机：RQ1 要比较「验证损失和收敛速度」，但
+    ``val_loss_at_common_step`` 只是共同步数处的一个瞬时值：
+    两条曲线可以在该点相同，前段轨迹却完全不同。这里把从
+    第一个共同可观测验证步到共同终点的周期验证曲线做梯形
+    积分，再除以窗口长度，得到不经过 checkpoint 选型的
+    ``val_loss_curve_mean_to_common_step``（越低越好）。它直接
+    回答「在相同训练预算的前半段，谁的整体损失更低」，可作为
+    ``--compare-metric`` 或预注册主指标进入聚合与显著性检验。
+
+    协议：
+    - 只用周期验证记录中的有限 ``val_loss``，排除 ``final``；
+    - 窗口起点 = 所有可比运行第一个验证步的最大值（首段
+      0→第一次验证无观测，不外推）；
+    - 窗口终点 = 训练前固定的 ``--common-step``；未给定时退回
+      各运行最后验证步的最小值，并显式标记为数据依赖；
+    - 端点落在两个验证点之间时线性插值，任何一端超出曲线
+      范围都判为缺失，不裁剪、不外推；
+    - 数值失败运行不参与，也不能用其短曲线缩短共同窗口；
+    - 与共同步数单点指标一样，这是分析期派生指标，不用于
+      训练期选型/早停。
+
+    局限：时均损失同时受早期下降速度和最终水平影响，不能单独
+    解释为「收敛速率」；必须与 ``val_loss_at_common_step`` /
+    ``final`` 一起报告。窗口起点是观测端点，改变评估间隔会改变
+    该指标，跨运行必须保持相同的验证调度。
+    """
+    report: Dict[str, object] = {
+        "metric": _CURVE_MEAN_METRIC,
+        "start_step": None,
+        "end_step": None,
+        "start_rule": "max_first_validation_step",
+        "end_rule": None,
+        "start_data_dependent": True,
+        "end_data_dependent": None,
+        "runs": [],
+        "excluded_runs": [],
+        "advisories": [],
+        "ok": False,
+    }
+
+    curves: Dict[int, List[Tuple[float, float]]] = {}
+    for index, row in enumerate(rows):
+        for field in (
+            _CURVE_MEAN_METRIC,
+            "curve_mean_start_step",
+            "curve_mean_end_step",
+            "curve_mean_window_steps",
+        ):
+            row.pop(field, None)
+
+        if row.get("numerical_status") == "failed":
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "数值失败运行已从聚合与检验排除，"
+                    "不参与曲线时均指标"
+                ),
+            })
+            continue
+        points = _val_step_curve_points(
+            Path(str(row.get("path")))
+        )
+        if not points:
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "没有可用的周期验证曲线"
+                    "（metrics.jsonl 缺数值 step + val_loss）"
+                ),
+            })
+            continue
+        curves[index] = points
+
+    if not curves:
+        report["advisories"].append(
+            "没有任何运行具备周期验证曲线：无法计算共同窗口内"
+            "的时均验证损失；请用未跳过周期验证的新版运行重跑"
+        )
+        return report
+
+    start_step = max(points[0][0] for points in curves.values())
+    if target_step is None:
+        end_step = min(
+            points[-1][0] for points in curves.values()
+        )
+        end_rule = "min_last_validation_step"
+        end_data_dependent = True
+    else:
+        end_value = _finite_float(target_step)
+        if end_value is None or end_value <= 0.0:
+            report["advisories"].append(
+                "共同终点不是正有限数：无法定义曲线时均指标"
+            )
+            return report
+        end_step = end_value
+        end_rule = "preregistered_fixed_step"
+        end_data_dependent = False
+
+    report["start_step"] = start_step
+    report["end_step"] = end_step
+    report["end_rule"] = end_rule
+    report["end_data_dependent"] = end_data_dependent
+    if end_step <= start_step:
+        report["advisories"].append(
+            "共同窗口为空（终点不晚于各运行第一个共同验证步）："
+            "无法计算时均验证损失；请增大 --common-step 或"
+            "延长训练/提高验证密度"
+        )
+        return report
+
+    for index, points in curves.items():
+        row = rows[index]
+        result = _curve_trapezoid_mean(
+            points, start_step, end_step
+        )
+        if result is None:
+            report["excluded_runs"].append({
+                "run": row.get("run"),
+                "reason": (
+                    "验证曲线不覆盖共同窗口 "
+                    f"[{start_step:g}, {end_step:g}]，"
+                    "不裁剪也不外推"
+                ),
+            })
+            continue
+
+        row[_CURVE_MEAN_METRIC] = result["mean"]
+        row["curve_mean_start_step"] = start_step
+        row["curve_mean_end_step"] = end_step
+        row["curve_mean_window_steps"] = result[
+            "window_steps"
+        ]
+        span = points[-1][0] - points[0][0]
+        curve_coverage = (
+            result["window_steps"] / span
+            if span > 0.0
+            else None
+        )
+        if (
+            curve_coverage is not None
+            and not math.isfinite(curve_coverage)
+        ):
+            curve_coverage = None
+        report["runs"].append({
+            "run": row.get("run"),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "value": result["mean"],
+            "start_step": start_step,
+            "end_step": end_step,
+            "window_steps": result["window_steps"],
+            "start_value": result["start_value"],
+            "end_value": result["end_value"],
+            "start_interpolation": result[
+                "start_interpolation"
+            ],
+            "end_interpolation": result["end_interpolation"],
+            "trapezoid_segments": result[
+                "trapezoid_segments"
+            ],
+            "curve_coverage": curve_coverage,
+            "selected_model": row.get("selected_model"),
+        })
+
+    report["ok"] = bool(report["runs"])
+    coverages = [
+        float(item["curve_coverage"])
+        for item in report["runs"]
+        if isinstance(item.get("curve_coverage"), (int, float))
+        and not isinstance(item["curve_coverage"], bool)
+    ]
+    if coverages and min(coverages) < 0.5:
+        report["advisories"].append(
+            "共同窗口只覆盖某个运行不到一半的验证曲线"
+            f"（最小比例 {min(coverages):.1%}）：结论只适用于该"
+            "窗口，不能当作完整训练过程/最终收敛水平的替代"
+        )
+    if not report["runs"]:
+        report["advisories"].append(
+            "没有运行能在共同窗口内提供验证 loss：无法做曲线"
+            "时均对比"
+        )
+    if report["excluded_runs"]:
+        report["advisories"].append(
+            "以下运行未参与曲线时均对比（不虚报指标）: "
+            + "; ".join(
+                f"{item['run']}（{item['reason']}）"
+                for item in report["excluded_runs"]
+            )
+        )
+    if end_data_dependent:
+        report["advisories"].append(
+            "共同终点取各运行最后验证步的最小值，由观察到的"
+            "端点决定（早停/不等步数时与结果相关）；正式对比"
+            "应在训练前固定 --common-step"
+        )
     return report
 
 
@@ -22804,6 +23095,7 @@ COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
     "val_loss",
     "val_loss_at_matched_flops",
     *_COMMON_STEP_METRICS,
+    _CURVE_MEAN_METRIC,
     "val_ppl",
     "val_bits_per_byte",
     # 类平衡似然：val_loss 按 token 频率加权，高频字节几乎
@@ -22855,6 +23147,7 @@ COMPARISON_METRIC_KEYS = COMPARISON_METRIC_KEYS + _ROUTING_ROW_FIELDS
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
     "val_loss_at_matched_flops",
+    _CURVE_MEAN_METRIC,
     "val_ppl",
     "val_bits_per_byte",
     # 类平衡似然：同样是 NLL，越低越好。
@@ -22880,13 +23173,14 @@ _LOWER_IS_BETTER_METRICS = {
 }
 
 # ``final`` 中来源于验证集选中模型的 val 指标：它们都会被
-# checkpoint 选择影响。等计算量与全部共同步数指标是曲线
-# 派生值，不在其中。
+# checkpoint 选择影响。等计算量、全部共同步数指标与曲线时均
+# 指标都是曲线派生值，不在其中。
 _SELECTION_BIASED_METRICS = frozenset(
     key
     for key in COMPARISON_METRIC_KEYS
     if key != _COMPUTE_MATCHED_METRIC
     and key not in _COMMON_STEP_METRICS
+    and key not in _CURVE_DERIVED_METRICS
 )
 
 # 周期验证实际会计算的指标才有资格作为 checkpoint 选型与早停
@@ -22895,8 +23189,8 @@ _SELECTION_BIASED_METRICS = frozenset(
 # ROC-AUC（见训练入口的 compute_auc 开关），因此可以作为选型
 # 依据——极度不平衡场景推荐以 PR-AUC 判定，选型口径必须能跟着
 # 判定口径走，而不是固定按 val_loss 选模型。路由诊断要等训练
-# 结束后的一次专门前向，等计算量 / 共同步数指标更是 --compare
-# 阶段才从曲线派生，训练过程中拿不到，仍不能用于选型。
+# 结束后的一次专门前向，等计算量 / 共同步数 / 曲线时均指标更是
+# --compare 阶段才从曲线派生，训练过程中拿不到，仍不能用于选型。
 _SELECTION_METRIC_KEYS = tuple(
     key
     for key in COMPARISON_METRIC_KEYS
@@ -22905,6 +23199,7 @@ _SELECTION_METRIC_KEYS = tuple(
     not in {
         "val_loss_at_matched_flops",
         *_COMMON_STEP_METRICS,
+        *_CURVE_DERIVED_METRICS,
     }
 )
 
@@ -22942,6 +23237,7 @@ _BASELINE_TUNING_METRIC_KEYS = tuple(
     for key in COMPARISON_METRIC_KEYS
     if key not in _ROUTING_ROW_FIELDS
     and key not in _COMMON_STEP_METRICS
+    and key not in _CURVE_DERIVED_METRICS
     and key != _COMPUTE_MATCHED_METRIC
 )
 
@@ -33433,6 +33729,9 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     # unigram 参考仍然是它的稻草人下界。
     "val_loss_at_matched_flops": "unigram_loss",
     "val_loss_at_common_step": "unigram_loss",
+    # 时均验证损失与 val_loss 同单位：unigram 的验证曲线是
+    # 常数，因此其窗口均值仍是同一个 unigram_loss 稻草人。
+    _CURVE_MEAN_METRIC: "unigram_loss",
     "val_ppl": "unigram_loss",
     "val_bits_per_byte": "unigram_loss",
     # 类平衡似然：稻草人参考是同口径的 unigram macro NLL
@@ -34825,6 +35124,12 @@ def baseline_adequacy(
 # （Jaccard/熵）同样算有效判定口径。
 _HYPOTHESIS_METRIC_PATTERNS: Tuple[Tuple[str, str], ...] = (
     ("loss", r"loss|损失|nll|负对数似然"),
+    # RQ1 明确包含「收敛速度」；只有写成可判定的曲线口径，
+    # 「收敛更快」才不是不可检验的定性说法。
+    (
+        "convergence",
+        r"收敛(?:速度|更快|曲线|轨迹)?|convergence|converge",
+    ),
     # 类平衡似然：假设点名它时，判定口径必须与频率加权的
     # val_loss 区分开（不平衡场景下二者结论可能相反）。
     (
@@ -34859,7 +35164,9 @@ _HYPOTHESIS_METRIC_SUPPORT: Dict[str, Tuple[str, ...]] = {
     "loss": (
         "val_loss",
         "val_loss_at_matched_flops",
+        _CURVE_MEAN_METRIC,
     ),
+    "convergence": (_CURVE_MEAN_METRIC,),
     "macro_nll": ("val_macro_nll",),
     "ppl": ("val_ppl",),
     "bits_per_byte": ("val_bits_per_byte",),
@@ -38010,6 +38317,7 @@ def hypothesis_alignment(
         "val_loss",
         "val_ppl",
         "val_bits_per_byte",
+        _CURVE_MEAN_METRIC,
     }
     balanced_likelihood_metrics = {"val_macro_nll"}
     declared_primary_metrics = {
@@ -38198,6 +38506,7 @@ def imbalance_metric_advisory(
         "val_loss",
         "val_ppl",
         "val_bits_per_byte",
+        _CURVE_MEAN_METRIC,
     )
     if (
         base_metric in frequency_weighted_metrics
@@ -39404,6 +39713,16 @@ def print_comparison_analysis(
         rows,
         target_step=common_step,
     )
+    # RQ1 的「收敛速度」需要整条曲线，而不只是共同步数处的
+    # 单点：在共同可观测窗口上对周期验证曲线取时均 loss。
+    curve_mean = annotate_curve_metrics(
+        rows,
+        target_step=(
+            common_step.get("target_step")
+            if not common_step.get("target_step_data_dependent")
+            else None
+        ),
+    )
     selection_bias = selection_bias_report(
         rows,
         metric,
@@ -40386,6 +40705,54 @@ def print_comparison_analysis(
             "只代表共同步数处，不等于完整训练结束时的排序"
         )
     for message in common_step["advisories"]:
+        print(f"  [note] {message}")
+
+    # 曲线时均指标：RQ1 的收敛速度不能由单点 loss 代表。这里
+    # 固定共同可观测窗口，报告各运行窗口内的时均验证损失。
+    print()
+    print(
+        "[convergence] 共同训练窗口内的时均验证损失"
+        "（周期曲线梯形积分/窗口长度；越低表示窗口内整体损失"
+        "更低，常与更早收敛一致，但不能单独分离速度与最终水平）"
+    )
+    if not curve_mean["runs"]:
+        print("  无可用的曲线时均对比")
+    else:
+        print(
+            "  窗口 = ["
+            f"{_format_finite(curve_mean.get('start_step'), '.0f')}, "
+            f"{_format_finite(curve_mean.get('end_step'), '.0f')}"
+            "]，起点取各运行第一个验证步的最大值，"
+            + (
+                "终点为训练前固定步"
+                if curve_mean.get("end_rule")
+                == "preregistered_fixed_step"
+                else "终点取各运行最后验证步的最小值（数据依赖）"
+            )
+        )
+        for item in curve_mean["runs"]:
+            curve_coverage = item.get("curve_coverage")
+            coverage_text = (
+                "（覆盖自身验证曲线 "
+                f"{_format_finite(curve_coverage, '.1%')}）"
+                if isinstance(curve_coverage, (int, float))
+                else ""
+            )
+            print(
+                f"  {str(item.get('run'))[:36]:<37} "
+                f"mode={str(item.get('mode')):<10} "
+                f"mean_loss={_format_finite(item.get('value'))}"
+                f"{coverage_text}"
+                f" [start={item['start_interpolation']}, "
+                f"end={item['end_interpolation']}]"
+            )
+        print(
+            "  可用 --compare-metric "
+            f"{_CURVE_MEAN_METRIC} 把它作为判定口径做聚合、"
+            "显著性检验与 TOST；该指标同时受早期下降和最终"
+            "水平影响，不能替代共同步数单点与 final 对照"
+        )
+    for message in curve_mean["advisories"]:
         print(f"  [note] {message}")
 
     print()
@@ -41725,6 +42092,7 @@ def print_comparison_analysis(
         "bad_case_comparison": bad_case_comparison,
         "compute_matched": compute_matched,
         "common_step": common_step,
+        "curve_mean": curve_mean,
         "selection_bias": selection_bias,
         "run_order": order_audit,
         "equivalence_margin": equivalence_margin,
@@ -66838,7 +67206,9 @@ def main():
             "val_loss 来自验证集选中的 checkpoint，跨运行"
             "比较有选型偏差，建议同时/改用 "
             "val_loss_at_common_step（共同训练步数处的即时"
-            "验证损失，不经过选型）或 "
+            "验证损失，不经过选型）、"
+            "val_loss_curve_mean_to_common_step（共同窗口内的"
+            "时均验证损失，用于 RQ1 收敛速度）或 "
             "val_loss_at_matched_flops（等训练计算量）；"
             "只允许 val 口径指标（测试集尘封协议：test "
             "指标不参与跨运行对比与选择，只在单个运行的"
