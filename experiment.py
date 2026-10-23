@@ -25997,6 +25997,23 @@ def _paired_window_bootstrap_ci(
         high = midpoint + half_width
     low *= scale
     high *= scale
+    if not (math.isfinite(low) and math.isfinite(high)):
+        # AR(1) 膨胀可能把归一化区间放大到超过 float 上限：
+        # 乘回原始尺度后端点溢出为 inf。此时没有可落盘的有限
+        # 区间，不能把 inf 写进报告（也不是合法的标准 JSON）；
+        # 明确标记不可用，保留诊断量供追溯。
+        return {
+            "available": False,
+            "reason": "unrepresentable_bounds",
+            "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
+            "lag1_autocorrelation": rho1,
+            "effective_windows": effective_windows,
+            "ci_inflation": inflation,
+            "note": (
+                "AR(1) 膨胀后的区间端点超出 float 可表示范围；"
+                "不写出 inf 端点，逐窗口点估计与检验结果仍保留"
+            ),
+        }
     return {
         "available": True,
         "low": low,

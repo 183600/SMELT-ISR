@@ -8900,6 +8900,18 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(constant["high"], 1.0e308)
         self.assertIsNone(constant["lag1_autocorrelation"])
 
+        # AR(1) 膨胀后端点可能越过 float 上限；此时必须明确
+        # 标记区间不可用，不能把 inf 写进报告/JSON。
+        overflow = experiment._paired_window_bootstrap_ci(
+            [1.7e308 * (1.0 - 0.1 * index) for index in range(6)],
+            7,
+        )
+        self.assertFalse(overflow["available"])
+        self.assertEqual(
+            overflow["reason"], "unrepresentable_bounds"
+        )
+        json.dumps(overflow, allow_nan=False)
+
     def test_hierarchical_window_bootstrap_is_scale_stable(self):
         small = {
             1: [1.0, 2.0, 3.0],
