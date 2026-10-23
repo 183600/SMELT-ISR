@@ -63044,6 +63044,42 @@ def build_pilot_power_evidence(
         cell["seed_sd_relative"] = cell_sd_relative
         finalized_cells.append(cell)
 
+    # mode+balance 相同的处理单元可能只在 k1/k2/top_k 等轴上
+    # 不同；标签相同会让 pair 的 first/second 无法区分。只在
+    # 发生碰撞时追加结构轴后缀，正常单轴对比保持简短标签。
+    label_counts: Dict[str, int] = {}
+    for cell in finalized_cells:
+        label = str(cell.get("label"))
+        label_counts[label] = label_counts.get(label, 0) + 1
+    used_labels: set = set()
+    for index, cell in enumerate(finalized_cells):
+        base_label = str(cell.get("label"))
+        candidate = base_label
+        if label_counts.get(base_label, 0) > 1:
+            suffix = ",".join(
+                f"{field}={cell.get(field)!r}"
+                for field in (
+                    "k1",
+                    "k2",
+                    "top_k",
+                    "dense_fnn_hidden",
+                    "n_experts",
+                    "expert_hidden",
+                )
+                if cell.get(field) is not None
+            )
+            candidate = (
+                f"{base_label}[{suffix}]"
+                if suffix
+                else f"{base_label}#{index + 1}"
+            )
+        # 极端情况下 repr 仍可能相同（如 1 与 "1" 的稳定键
+        # 不同但文本相同）；用序号兜底保证 pair 可区分。
+        while candidate in used_labels:
+            candidate = f"{candidate}#{index + 1}"
+        cell["label"] = candidate
+        used_labels.add(candidate)
+
     pairs: List[Dict[str, object]] = []
     for index, first in enumerate(finalized_cells):
         for second in finalized_cells[index + 1:]:

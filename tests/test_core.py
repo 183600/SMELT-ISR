@@ -2999,6 +2999,55 @@ class DesignPreparationTests(unittest.TestCase):
                 self.assertIsNone(source["balance_coef"])
         json.dumps(evidence, allow_nan=False)
 
+    def test_pilot_labels_disambiguate_structural_axes(self):
+        # 同一 mode/balance 但 k1 不同的两个处理单元不能共用
+        # 标签，否则 pair 的 first/second 无法区分。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for k1 in (1, 2):
+                for seed in (1, 2, 3):
+                    run_dir = root / f"A_k{k1}_{seed}"
+                    run_dir.mkdir()
+                    (run_dir / "config.json").write_text(
+                        json.dumps({
+                            "config": {
+                                "mode": "A",
+                                "balance_coef": 0.01,
+                                "k1": k1,
+                            },
+                            "args": {"seed": seed},
+                        }),
+                        encoding="utf-8",
+                    )
+                    value = 1.0 - 0.1 * k1 + 0.001 * seed
+                    (run_dir / "metrics.jsonl").write_text(
+                        "\n".join(
+                            json.dumps(record)
+                            for record in (
+                                {"step": 10, "val_loss": value},
+                                {
+                                    "step": "final",
+                                    "val_loss": value,
+                                    "numerical_integrity_ok": True,
+                                },
+                            )
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    paths.append(str(run_dir))
+            evidence = experiment.build_pilot_power_evidence(
+                paths, "val_loss"
+            )
+        labels = [cell["label"] for cell in evidence["cells"]]
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(set(labels)), 2)
+        self.assertNotEqual(
+            evidence["pairs"][0]["first"],
+            evidence["pairs"][0]["second"],
+        )
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
