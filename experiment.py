@@ -25661,12 +25661,18 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
     """
     Student t 分布的双侧 p 值 P(|T| >= |t|)。
     """
-    if df <= 0.0:
+    if math.isnan(df) or df <= 0.0:
+        # 自由度必须是正有限数，或 +inf（正态极限）。NaN/负值
+        # 没有定义；必须先校验 df，否则 t=inf 会被误报为 p=0。
         return None
     if math.isnan(t):
         # NaN 的 p 值没有定义：返回 0.0 会被当成“极显著”，
         # 必须显式返回 None 让调用方走「无检验结果」分支。
         return None
+    if math.isinf(df):
+        # df→+inf 时 t 分布退化为标准正态；直接代公式会得到
+        # inf/inf=NaN，必须显式走正态尾概率。
+        return math.erfc(abs(t) / math.sqrt(2.0))
     if not math.isfinite(t):
         return 0.0
 

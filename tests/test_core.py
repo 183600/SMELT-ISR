@@ -7801,6 +7801,26 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=1e-8,
             )
 
+    def test_t_p_value_handles_infinite_and_invalid_df(self):
+        # df→+inf 时 t 分布退化为标准正态；原实现得到
+        # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None
+        # 而不是让调用方把 NaN 当成数值继续传播。
+        for t in (0.0, 1.0, 1.959963984540054, 10.0):
+            self.assertAlmostEqual(
+                experiment._two_sided_t_p_value(t, float("inf")),
+                math.erfc(t / math.sqrt(2.0)),
+                delta=1e-12,
+            )
+        self.assertIsNone(
+            experiment._two_sided_t_p_value(1.0, float("nan"))
+        )
+        self.assertIsNone(
+            experiment._two_sided_t_p_value(1.0, float("-inf"))
+        )
+        self.assertIsNone(
+            experiment._two_sided_t_p_value(float("inf"), float("nan"))
+        )
+
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
             [1, 1, 1, 1, 1, 1], False
