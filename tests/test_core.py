@@ -7841,6 +7841,33 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_bad_case_ignores_invalid_confusion_pairs(self):
+        report = experiment.bad_case_comparison_report([{
+            "run": "damaged",
+            "mode": "A",
+            "seed": 1,
+            "bad_case_available": True,
+            "bad_case_tokens_evaluated": 10,
+            "bad_case_wrong_tokens": 4,
+            "bad_case_top_confusions": [
+                ["bad", 66, 2],
+                [65, 66, -3],
+                [65, 66, 0],
+                [70, 71, 4],
+            ],
+        }])
+        run = report["runs"][0]
+        self.assertEqual(run["top_confusion"], [70, 71, 4])
+        self.assertEqual(
+            report["persistent_confusions"],
+            [{
+                "target": 70,
+                "predicted": 71,
+                "runs_present": 1,
+                "top_count_sum": 4,
+            }],
+        )
+
     def test_t_power_uses_normal_limit_for_large_df(self):
         expected = 0.17007504575308752
         for df in (1.0e6, 1.0e9, 1.0e16, float("inf")):

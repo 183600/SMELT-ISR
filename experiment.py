@@ -22477,6 +22477,7 @@ def bad_case_comparison_report(
             else []
         )
         seen_pairs = set()
+        valid_pairs = []
         for pair in pairs:
             if not isinstance(pair, (list, tuple)) or len(pair) < 3:
                 continue
@@ -22487,9 +22488,12 @@ def bad_case_comparison_report(
                 for value in (target, predicted, count)
             ):
                 continue
+            if target < 0 or predicted < 0 or count <= 0:
+                continue
             key = (int(target), int(predicted))
             pair_totals[key] = pair_totals.get(key, 0) + int(count)
             seen_pairs.add(key)
+            valid_pairs.append([target, predicted, count])
         for key in seen_pairs:
             pair_run_counts[key] = pair_run_counts.get(key, 0) + 1
 
@@ -22538,14 +22542,8 @@ def bad_case_comparison_report(
                 name: _finite_float(shares.get(name))
                 for name in category_names
             },
-            "top_confusion": next(
-                (
-                    pair
-                    for pair in pairs
-                    if isinstance(pair, (list, tuple))
-                    and len(pair) >= 3
-                ),
-                None,
+            "top_confusion": (
+                valid_pairs[0] if valid_pairs else None
             ),
         })
 
