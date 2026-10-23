@@ -12877,8 +12877,13 @@ def _hierarchical_group_bootstrap_ci(
         size=(int(replicates), group_count),
         generator=generator,
     )
+    token_scale = max(reference_tokens)
+    if token_scale > 1.0e150 or 0.0 < token_scale < 1.0e-150:
+        token_weights = tokens / token_scale
+    else:
+        token_weights = tokens
     sampled_groups = group_indices
-    sampled_tokens = tokens[sampled_groups]
+    sampled_tokens = token_weights[sampled_groups]
     sampled_total = sampled_tokens.sum(dim=1)
     seed_means = torch.empty(
         (int(replicates), seed_count),

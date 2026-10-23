@@ -10534,6 +10534,26 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )["available"]
         )
 
+    def test_hierarchical_group_bootstrap_normalizes_extreme_tokens(self):
+        for token_count in (1.0e308, 1.0e-308):
+            differences = {
+                1: {
+                    0: (1.0, token_count),
+                    1: (2.0, token_count),
+                },
+                2: {
+                    0: (2.0, token_count),
+                    1: (3.0, token_count),
+                },
+            }
+            report = experiment._hierarchical_group_bootstrap_ci(
+                differences, replicates=100
+            )
+            self.assertTrue(report["available"])
+            self.assertTrue(math.isfinite(report["low"]))
+            self.assertTrue(math.isfinite(report["high"]))
+            json.dumps(report, allow_nan=False)
+
     def test_group_comparison_rejects_unit_mismatch(self):
         groups = [
             [0, 10.0, 20.0, 5.0],
