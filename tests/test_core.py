@@ -7086,6 +7086,31 @@ class NumericalScaleTests(unittest.TestCase):
         )
         self.assertFalse(zero["sign_robust"])
 
+    def test_attrition_bounds_cancelling_terms_do_not_overflow(self):
+        def cell(label, value):
+            return {
+                "label": label,
+                "n_runs": 1,
+                "samples": {"val_loss": [{"value": value}]},
+                "numerical_failures": [],
+            }
+
+        bounds = experiment._attrition_bounds(
+            {
+                "a": cell("a", 1.0e308),
+                "b": cell("b", 1.0e308),
+                "c": cell("c", 1.0e308),
+            },
+            {"a": 1.0, "b": 1.0, "c": -1.0},
+            "val_loss",
+            1.0e308,
+        )
+        self.assertEqual(bounds["verdict"], "complete_cases")
+        self.assertEqual(bounds["effect_min"], 1.0e308)
+        self.assertEqual(bounds["effect_max"], 1.0e308)
+        self.assertTrue(bounds["sign_robust"])
+        json.dumps(bounds, allow_nan=False)
+
     def test_contrast_delta_overflow_is_treated_as_missing(self):
         def cell(mode, mean):
             return {

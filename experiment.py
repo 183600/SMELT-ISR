@@ -29093,8 +29093,8 @@ def _attrition_bounds(
     # 对线性组合的每个单元分别取「最不利/最有利」的缺失赋值。
     # 系数为正的单元要最小化就赋 L、最大化就赋 U；系数为负时
     # 方向相反。所有单元同时取各自极值即可得到组合的极值。
-    effect_min = 0.0
-    effect_max = 0.0
+    effect_min_terms: List[float] = []
+    effect_max_terms: List[float] = []
     for alias, coefficient in coefficients.items():
         support = supports[alias]
         observed = int(support["observed_runs"])
@@ -29132,13 +29132,36 @@ def _attrition_bounds(
                 + missing_share * support_max
             )
         if coefficient_value >= 0.0:
-            effect_min += coefficient_value * mean_low
-            effect_max += coefficient_value * mean_high
+            effect_min_terms.append(
+                coefficient_value * mean_low
+            )
+            effect_max_terms.append(
+                coefficient_value * mean_high
+            )
         else:
-            effect_min += coefficient_value * mean_high
-            effect_max += coefficient_value * mean_low
+            effect_min_terms.append(
+                coefficient_value * mean_high
+            )
+            effect_max_terms.append(
+                coefficient_value * mean_low
+            )
 
-    if not math.isfinite(effect_min) or not math.isfinite(effect_max):
+    def _bounded_sum(terms: List[float]) -> Optional[float]:
+        direct = sum(terms)
+        if math.isfinite(direct):
+            return direct
+        if any(not math.isfinite(term) for term in terms):
+            return None
+        scale = max(abs(term) for term in terms)
+        if scale == 0.0:
+            return 0.0
+        scaled = sum(term / scale for term in terms)
+        result = scaled * scale
+        return result if math.isfinite(result) else None
+
+    effect_min = _bounded_sum(effect_min_terms)
+    effect_max = _bounded_sum(effect_max_terms)
+    if effect_min is None or effect_max is None:
         report["verdict"] = "unbounded"
         report["reason"] = "极端赋值下的效应不是有限值"
         return report
