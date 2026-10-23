@@ -63254,7 +63254,10 @@ def build_pilot_power_evidence(
         ),
     }
 
-    return {
+    # 配置字段可能来自手工编辑/旧运行的 JSON（含 NaN/Inf），
+    # 直接回传会让 pilot_evidence 无法按标准 JSON 写出。这里
+    # 统一把非有限浮点降级为 None，保留字段本身。
+    return _json_safe({
         "schema": f"smelt-isr/design-pilot/v{_DESIGN_PILOT_SCHEMA_VERSION}",
         "metric": metric,
         "metric_annotation": annotation,
@@ -63286,7 +63289,7 @@ def build_pilot_power_evidence(
             "实测方差/失败率；试点协议与正式协议不可比时不能"
             "把观测值直接当作目标设计的真实 sigma"
         ),
-    }
+    })
 
 
 def _apply_pilot_evidence_to_power(

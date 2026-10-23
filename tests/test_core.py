@@ -2963,6 +2963,42 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertIn("未声明", text)
         self.assertNotIn("无法估计配对差值", text)
 
+    def test_pilot_evidence_sanitizes_nonfinite_config_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for seed in (1, 2, 3):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root,
+                        "smelt",
+                        seed,
+                        1.0 + seed * 0.001,
+                        balance_coef=float("nan"),
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root,
+                        "A",
+                        seed,
+                        0.99 + seed * 0.001,
+                    ))
+                )
+            evidence = experiment.build_pilot_power_evidence(
+                paths, "val_loss"
+            )
+        cell = next(
+            item
+            for item in evidence["cells"]
+            if item["mode"] == "smelt"
+        )
+        self.assertIsNone(cell["balance_coef"])
+        for source in evidence["source_runs"]:
+            if source["mode"] == "smelt":
+                self.assertIsNone(source["balance_coef"])
+        json.dumps(evidence, allow_nan=False)
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
