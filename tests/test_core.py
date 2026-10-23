@@ -10597,6 +10597,48 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertTrue(report["available"])
         json.dumps(report, allow_nan=False)
 
+    def test_hierarchical_group_bootstrap_is_scale_stable(self):
+        small = {
+            1: {
+                0: (1.0, 10.0),
+                1: (2.0, 10.0),
+                2: (3.0, 10.0),
+            },
+            2: {
+                0: (2.0, 10.0),
+                1: (3.0, 10.0),
+                2: (4.0, 10.0),
+            },
+        }
+        large = {
+            seed: {
+                group: (
+                    difference * 1.0e300,
+                    tokens * 1.0e200,
+                )
+                for group, (difference, tokens) in mapping.items()
+            }
+            for seed, mapping in small.items()
+        }
+        small_ci = experiment._hierarchical_group_bootstrap_ci(
+            small
+        )
+        large_ci = experiment._hierarchical_group_bootstrap_ci(
+            large
+        )
+        self.assertTrue(small_ci["available"])
+        self.assertTrue(large_ci["available"])
+        self.assertAlmostEqual(
+            large_ci["low"] / 1.0e300,
+            small_ci["low"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_ci["high"] / 1.0e300,
+            small_ci["high"],
+            places=12,
+        )
+
     def test_hierarchical_window_bootstrap_handles_bad_replicates(self):
         differences = {
             1: [1.0, 2.0],

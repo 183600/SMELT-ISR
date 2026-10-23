@@ -12905,14 +12905,40 @@ def _hierarchical_group_bootstrap_ci(
         values = values / scale
     else:
         scale = 1.0
+    token_scale = max(reference_tokens)
+    if token_scale > 1.0e150 or 0.0 < token_scale < 1.0e-150:
+        token_weights = tokens / token_scale
+    else:
+        token_weights = tokens
+    value_scale = float(values.abs().max().item())
+    if math.isfinite(value_scale) and value_scale > 0.0:
+        seed_values = [
+            [
+                float(f"{value:.12g}")
+                for value in row
+            ]
+            for row in (values / value_scale).tolist()
+        ]
+    else:
+        seed_values = values.tolist()
+    token_seed_scale = max(
+        abs(value) for value in reference_tokens
+    )
+    if math.isfinite(token_seed_scale) and token_seed_scale > 0.0:
+        seed_tokens = [
+            float(f"{value / token_seed_scale:.12g}")
+            for value in reference_tokens
+        ]
+    else:
+        seed_tokens = list(reference_tokens)
     generator = torch.Generator().manual_seed(
         _randomization_seed(
             [
                 value
-                for row in values.tolist()
+                for row in seed_values
                 for value in row
             ]
-            + reference_tokens
+            + seed_tokens
         )
     )
     seed_indices = torch.randint(
@@ -12927,11 +12953,6 @@ def _hierarchical_group_bootstrap_ci(
         size=(replicate_count, group_count),
         generator=generator,
     )
-    token_scale = max(reference_tokens)
-    if token_scale > 1.0e150 or 0.0 < token_scale < 1.0e-150:
-        token_weights = tokens / token_scale
-    else:
-        token_weights = tokens
     sampled_groups = group_indices
     sampled_tokens = token_weights[sampled_groups]
     sampled_total = sampled_tokens.sum(dim=1)
