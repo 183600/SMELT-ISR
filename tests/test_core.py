@@ -6345,6 +6345,37 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(report["most_imbalanced_run"])
         self.assertIsNone(report["pr_auc_chance_mean"])
 
+    def test_baseline_ngram_delta_overflow_is_omitted(self):
+        rows = [
+            {
+                "run": "baseline",
+                "mode": "dense",
+                "seed": 1,
+                "val_loss": 1.0e308,
+                "protocol": {
+                    "data_sha256": "d",
+                    "eval_batches": 1,
+                },
+            },
+            {
+                "run": "ngram",
+                "mode": "ngram",
+                "seed": 2,
+                "val_loss": -1.0e308,
+                "protocol": {
+                    "data_sha256": "d",
+                    "eval_batches": 1,
+                },
+            },
+        ]
+        report = experiment.baseline_adequacy(
+            rows, "dense", "val_loss"
+        )
+        comparison = report["ngram_comparison"]
+        self.assertIsNone(comparison["delta"])
+        self.assertIsNone(comparison["seeds_to_detect"])
+        json.dumps(report, allow_nan=False)
+
     def test_baseline_adequacy_tolerates_out_of_range_costs(self):
         huge = 10 ** 400
         rows = [

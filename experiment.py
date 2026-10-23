@@ -34404,14 +34404,20 @@ def baseline_adequacy(
         # 单看均值会把种子波动当成「基线强于/弱于统计基线」的
         # 结论。对差值做单样本 t 检验，并给出当前设计能检出的
         # MDE 与所需种子数。
+        delta_value = baseline_mean - float(ngram_mean)
         ngram_comparison: Dict[str, object] = {
             "metric": metric,
             "baseline_mode": baseline_mode,
             "baseline_mean": baseline_mean,
             "ngram_mean": float(ngram_mean),
             # 原始差值（基线 - ngram）；方向好坏由
-            # baseline_better 与指标方向共同解释。
-            "delta": baseline_mean - float(ngram_mean),
+            # baseline_better 与指标方向共同解释。两个有限均值
+            # 相减仍可能越过 float 上限，无法表示时按缺失处理。
+            "delta": (
+                delta_value
+                if math.isfinite(delta_value)
+                else None
+            ),
             "baseline_better": baseline_better,
             "n_baseline_runs": len(baseline_rows),
             "n_baseline_values": len(baseline_values),
@@ -34463,11 +34469,15 @@ def baseline_adequacy(
                         ngram_comparison["mde_80_relative"] = (
                             mde_relative
                         )
-        if abs(float(ngram_comparison["delta"])) > 0.0:
+        if (
+            isinstance(delta_value, float)
+            and math.isfinite(delta_value)
+            and abs(delta_value) > 0.0
+        ):
             baseline_sd = ngram_comparison["baseline_std"]
             if isinstance(baseline_sd, (int, float)):
                 seeds_needed = _seeds_to_detect(
-                    float(ngram_comparison["delta"]),
+                    delta_value,
                     float(baseline_sd),
                 )
                 if seeds_needed is not None:
