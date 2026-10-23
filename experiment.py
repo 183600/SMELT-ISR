@@ -62908,6 +62908,7 @@ def build_pilot_power_evidence(
     warnings: List[str] = []
     source_runs: List[Dict[str, object]] = []
     unassigned: List[str] = []
+    unassigned_rows: List[Dict[str, object]] = []
     cells: Dict[tuple, Dict[str, object]] = {}
 
     for row in rows:
@@ -62931,6 +62932,11 @@ def build_pilot_power_evidence(
             or not isinstance(seed, int)
         ):
             unassigned.append(run_name)
+            unassigned_rows.append({
+                "run": run_name,
+                "value": value,
+                "numerical_status": status,
+            })
             continue
         key = _pilot_treatment_key(row)
         cell = cells.setdefault(
@@ -63101,6 +63107,19 @@ def build_pilot_power_evidence(
         for cell in finalized_cells
         if cell.get("n_attempted")
     ]
+    # 缺少 mode/seed 的运行无法归入处理单元，但如果它本身是
+    # 数值失败或缺指标，静默丢掉就会把脱落率低估为 0。把它
+    # 当作一个不可配对的保守单元计入脱落率上界，并显式告警。
+    unassigned_unusable = [
+        item for item in unassigned_rows
+        if item.get("numerical_status") == "failed"
+        or item.get("value") is None
+    ]
+    unassigned_attrition = (
+        len(unassigned_unusable) / len(unassigned_rows)
+        if unassigned_rows
+        else None
+    )
     observed_attrition = None
     cell_attrition = [
         float(cell["attrition_rate"])
@@ -63109,14 +63128,30 @@ def build_pilot_power_evidence(
     ]
     if cell_attrition:
         observed_attrition = max(cell_attrition)
+    if unassigned_attrition is not None:
+        observed_attrition = max(
+            observed_attrition or 0.0,
+            unassigned_attrition,
+        )
+    total_attempted = sum(attempted) + len(unassigned_rows)
+    total_failed = sum(failed) + len(unassigned_unusable)
     overall_attrition = (
-        sum(failed) / sum(attempted) if sum(attempted) else None
+        total_failed / total_attempted if total_attempted else None
     )
 
     if unassigned:
         warnings.append(
             "以下试点运行缺少 mode/整数 seed，无法归入处理单元: "
             + ", ".join(unassigned[:5])
+        )
+    if unassigned_unusable:
+        warnings.append(
+            "以下无法归入处理单元的试点运行自身是数值失败/缺"
+            "指标，已按保守口径计入脱落率上界: "
+            + ", ".join(
+                str(item.get("run"))
+                for item in unassigned_unusable[:5]
+            )
         )
     if duplicate_seeds:
         warnings.append(
@@ -63210,9 +63245,12 @@ def build_pilot_power_evidence(
             observed_attrition is not None
             and observed_attrition >= 1.0
         ),
+        "unassigned_runs": len(unassigned_rows),
+        "unassigned_unusable": len(unassigned_unusable),
         "note": (
             "observed 取各处理单元脱落率的最大值；失败包括"
             "数值失败与缺失该指标，pilot 目录必须包含失败运行"
+            "；无法归入处理单元且自身失败的运行按保守上界计入"
         ),
     }
 

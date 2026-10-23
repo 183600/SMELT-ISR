@@ -2865,6 +2865,60 @@ class DesignPreparationTests(unittest.TestCase):
         )
         json.dumps(evidence, allow_nan=False)
 
+    def test_pilot_unassigned_failed_run_counts_toward_attrition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 4)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, 1.0 + index * 0.001
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "A", seed, 0.99 + index * 0.001
+                    ))
+                )
+            # 崩溃到连 config/metrics 都没写出的运行目录：无法
+            # 归入处理单元，但不能静默把它的脱落忽略。
+            empty = root / "crashed"
+            empty.mkdir()
+            paths.append(str(empty))
+            evidence = experiment.build_pilot_power_evidence(
+                paths,
+                "val_loss",
+                declared_sd=0.01,
+                declared_attrition=0.0,
+            )
+        self.assertEqual(evidence["cell_count"], 2)
+        self.assertEqual(
+            evidence["attrition_check"]["unassigned_runs"], 1
+        )
+        self.assertEqual(
+            evidence["attrition_check"]["unassigned_unusable"], 1
+        )
+        self.assertEqual(
+            evidence["attrition_check"]["observed"], 1.0
+        )
+        self.assertTrue(
+            evidence["attrition_check"]["unusable"]
+        )
+        self.assertTrue(
+            any(
+                "无法归入处理单元" in warning
+                for warning in evidence["warnings"]
+            )
+        )
+        design = {
+            "power": {"adequate": True},
+            "pilot_evidence": evidence,
+        }
+        self.assertIsNotNone(
+            experiment.design_power_gate_error(design)
+        )
+        json.dumps(evidence, allow_nan=False)
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
