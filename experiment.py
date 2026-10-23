@@ -11434,15 +11434,17 @@ def _lag1_autocorrelation(
     # 公共尺度不变，按最大绝对值归一化后再计算；正常量级保持
     # 原路径，避免改变历史结果的末位舍入。
     scale = float(numeric.abs().max().item())
-    if scale > 1.0e150:
+    if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
         numeric = numeric / scale
     head = numeric[:-1]
     tail = numeric[1:]
     head = head - head.mean()
     tail = tail - tail.mean()
-    denominator = torch.sqrt(
-        (head * head).sum() * (tail * tail).sum()
-    )
+    # 两个平方和各自可能合法但很小（如 1e-200）；先相乘再开方
+    # 会在 1e-400 量级下溢成 0。分别开方后相乘等价且不丢尺度。
+    head_square = float((head * head).sum())
+    tail_square = float((tail * tail).sum())
+    denominator = math.sqrt(head_square) * math.sqrt(tail_square)
     if float(denominator) <= 0.0:
         return None
     raw_rho = float((head * tail).sum() / denominator)
@@ -25904,8 +25906,12 @@ def _window_variance_components(
         abs(value) for row in matrix for value in row
     )
     # 正常量级不缩放（scale=1.0），保持历史方差分量的逐位一致；
-    # 只有平方可能溢出的超大输入才归一化。
-    scale = max_abs if max_abs > 1.0e150 else 1.0
+    # 平方可能溢出（超大）或下溢（极小但非零）时归一化。
+    scale = (
+        max_abs
+        if max_abs > 1.0e150 or 0.0 < max_abs < 1.0e-150
+        else 1.0
+    )
     if scale == 0.0:
         scaled_matrix = [
             [0.0 for _ in row] for row in matrix
@@ -26000,7 +26006,13 @@ def _window_variance_components(
         if value < 0.0 and not signed:
             return None
         result = (value * scale) * scale
-        return result if math.isfinite(result) else None
+        if not math.isfinite(result):
+            return None
+        # 正的归一化分量还原后下溢为 0：真实方差/均方小于
+        # float 可表示范围，报告为缺失而不是伪造零方差。
+        if value != 0.0 and result == 0.0:
+            return None
+        return result
 
     def _rescale_root(value: float) -> Optional[float]:
         """把归一化标准差还原到原始尺度；溢出时返回 None。"""

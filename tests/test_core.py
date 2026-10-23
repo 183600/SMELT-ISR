@@ -7680,6 +7680,40 @@ class NumericalScaleTests(unittest.TestCase):
             )
         )
 
+        # 极小但非零的尺度同样必须保持自相关：先相乘再开方会
+        # 在 1e-400 量级下溢，独立开方再相乘则不会。
+        for factor in (1.0e-100, 1.0e-200, 1.0e-300):
+            tiny = experiment._lag1_autocorrelation(
+                small * factor
+            )
+            self.assertIsNotNone(tiny)
+            self.assertAlmostEqual(tiny, expected, places=12)
+
+    def test_variance_decomposition_is_tiny_scale_stable(self):
+        small = {1: [1.0, 2.0], 2: [1.0, 2.0]}
+        expected = experiment._window_variance_components(small)
+        tiny = experiment._window_variance_components(
+            {1: [1.0e-200, 2.0e-200], 2: [1.0e-200, 2.0e-200]}
+        )
+        self.assertTrue(tiny["available"])
+        self.assertAlmostEqual(
+            tiny["std_error_of_mean"] / 1.0e-200,
+            expected["std_error_of_mean"],
+            places=12,
+        )
+        self.assertEqual(
+            tiny["variance_share_window"],
+            expected["variance_share_window"],
+        )
+        self.assertEqual(
+            tiny["dominant_source"],
+            expected["dominant_source"],
+        )
+        # 绝对方差小于 float 可表示范围时应明确缺失，而不是
+        # 在 std_error 非零的同时报告零方差。
+        self.assertIsNone(tiny["variance_of_mean"])
+        json.dumps(tiny, allow_nan=False)
+
     def test_paired_window_bootstrap_is_scale_stable(self):
         small = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
         large = [value * 1.0e300 for value in small]
