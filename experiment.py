@@ -26671,7 +26671,8 @@ def _attach_family_adjusted_intervals(
     family_size = sum(
         1
         for item in items
-        if isinstance(item, dict) and item.get("p_value") is not None
+        if isinstance(item, dict)
+        and _finite_float(item.get("p_value")) is not None
     )
     if family_size == 0:
         family_size = len(eligible)
@@ -27719,21 +27720,22 @@ def _holm_bonferroni(
     第 i 小（0 起）的 p 值乘以 m - i 并做单调化；None
     （未执行检验，如种子不足）不参与家族计数。
     """
-    total = sum(1 for p in p_values if p is not None)
+    numeric = [_finite_float(p) for p in p_values]
+    total = sum(1 for p in numeric if p is not None)
     adjusted: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
         return adjusted
 
     ranked = sorted(
-        (index for index, p in enumerate(p_values) if p is not None),
-        key=lambda index: float(p_values[index]),
+        (index for index, p in enumerate(numeric) if p is not None),
+        key=lambda index: float(numeric[index]),
     )
 
     running = 0.0
     for position, index in enumerate(ranked):
         candidate = min(
             1.0,
-            float(p_values[index]) * (total - position),
+            float(numeric[index]) * (total - position),
         )
         running = max(running, candidate)
         adjusted[index] = running
@@ -27752,13 +27754,14 @@ def _holm_rank_thresholds(
     不显著。删除种子不会改变家族规模，因此沿用原位置阈值是
     保守近似（删除后 p 排序可能变化，但不会放宽判定）。
     """
-    total = sum(1 for p in p_values if p is not None)
+    numeric = [_finite_float(p) for p in p_values]
+    total = sum(1 for p in numeric if p is not None)
     thresholds: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
         return thresholds
     ranked = sorted(
-        (index for index, p in enumerate(p_values) if p is not None),
-        key=lambda index: float(p_values[index]),
+        (index for index, p in enumerate(numeric) if p is not None),
+        key=lambda index: float(numeric[index]),
     )
     for position, index in enumerate(ranked):
         thresholds[index] = float(alpha) / float(total - position)
@@ -27775,14 +27778,15 @@ def _benjamini_hochberg(
     以 Holm（FWER）为准，BH 值随报告给出以标明「更宽松的
     口径下也不显著」的稳健性。
     """
-    total = sum(1 for p in p_values if p is not None)
+    numeric = [_finite_float(p) for p in p_values]
+    total = sum(1 for p in numeric if p is not None)
     adjusted: List[Optional[float]] = [None] * len(p_values)
     if total == 0:
         return adjusted
 
     ranked = sorted(
-        (index for index, p in enumerate(p_values) if p is not None),
-        key=lambda index: float(p_values[index]),
+        (index for index, p in enumerate(numeric) if p is not None),
+        key=lambda index: float(numeric[index]),
     )
 
     running = 1.0
@@ -27790,7 +27794,7 @@ def _benjamini_hochberg(
         index = ranked[position]
         candidate = min(
             1.0,
-            float(p_values[index]) * total / (position + 1),
+            float(numeric[index]) * total / (position + 1),
         )
         running = min(running, candidate)
         adjusted[index] = running
@@ -28981,9 +28985,18 @@ def _cost_verdict_from_ratios(
         return None
 
     ignored = set(noisy_timing_fields or ())
+    # 损坏的旧报告可能把倍率写成字符串/NaN；只接受有限数值。
+    finite_ratios = {
+        field: ratio
+        for field, ratio in (
+            (field, _finite_float(value))
+            for field, value in cost_ratios.items()
+        )
+        if ratio is not None
+    }
     considered = {
         field: ratio
-        for field, ratio in cost_ratios.items()
+        for field, ratio in finite_ratios.items()
         if field not in ignored
     }
     # 真实倍率可以越过 float 上限：它没有可表示的有限值，但
@@ -28995,7 +29008,7 @@ def _cost_verdict_from_ratios(
         if field not in ignored
     }
     if not considered and not overflow:
-        considered = cost_ratios
+        considered = finite_ratios
 
     most_expensive = (
         max(considered.values()) if considered else None
@@ -29262,12 +29275,16 @@ def _apply_multiple_comparison_correction(
     至少出现一个假阳性的概率约 26%。只有校正后的显著性才是
     可以在结论中主张的显著性；等价主张同理。
     """
-    eligible = [
-        contrast
-        for contrast in contrasts
-        if contrast.get("p_value") is not None
-    ]
-    p_values = [float(contrast["p_value"]) for contrast in eligible]
+    eligible: List[Dict[str, object]] = []
+    p_values: List[float] = []
+    for contrast in contrasts:
+        # 旧/手工记录的 p 值可能是字符串、NaN/Inf 或超范围整数；
+        # 这些不是可校正的检验结果，跳过而不是中断整份报告。
+        p_value = _finite_float(contrast.get("p_value"))
+        if p_value is None:
+            continue
+        eligible.append(contrast)
+        p_values.append(p_value)
     holm_values = _holm_bonferroni(p_values)
     bh_values = _benjamini_hochberg(p_values)
     holm_thresholds = _holm_rank_thresholds(p_values)
@@ -29337,18 +29354,19 @@ def _apply_multiple_comparison_correction(
         # stable/fragile 计数。
         paired_values = contrast.get("paired_differences")
         if isinstance(paired_values, list):
-            threshold = contrast.get("holm_alpha_threshold")
+            threshold = _finite_float(
+                contrast.get("holm_alpha_threshold")
+            )
+            if threshold is None:
+                threshold = _finite_float(
+                    contrast.get("alpha_bonferroni")
+                )
+            if threshold is None:
+                threshold = _SIGNIFICANCE_LEVEL
             fragility = _paired_result_fragility(
                 paired_values,
                 contrast.get("paired_seeds"),
-                alpha=float(
-                    threshold
-                    if threshold is not None
-                    else contrast.get(
-                        "alpha_bonferroni",
-                        _SIGNIFICANCE_LEVEL,
-                    )
-                ),
+                alpha=threshold,
             )
             if (
                 not corrected
@@ -29367,15 +29385,16 @@ def _apply_multiple_comparison_correction(
     # 符号翻转检验与 t 检验同属一个显著性家族：它只在配对
     # 对比上执行，但同样要受多重比较约束。展示层用二者是否
     # 一致来提示「结论依赖正态性假设」的风险。
-    randomization_eligible = [
-        contrast
-        for contrast in contrasts
-        if contrast.get("randomization_p_value") is not None
-    ]
-    randomization_values = [
-        float(contrast["randomization_p_value"])
-        for contrast in randomization_eligible
-    ]
+    randomization_eligible: List[Dict[str, object]] = []
+    randomization_values: List[float] = []
+    for contrast in contrasts:
+        value = _finite_float(
+            contrast.get("randomization_p_value")
+        )
+        if value is None:
+            continue
+        randomization_eligible.append(contrast)
+        randomization_values.append(value)
     randomization_holm = _holm_bonferroni(
         randomization_values
     )
@@ -29424,14 +29443,14 @@ def _apply_multiple_comparison_correction(
     # Holm（FWER）/ BH（FDR）校正：只有校正后仍 <= alpha 的
     # 等价结论才是可以在报告中主张的「无实质差异」，其余只能
     # 报告「未发现显著差异（结论不确定）」。
-    tost_eligible = [
-        contrast
-        for contrast in contrasts
-        if contrast.get("tost_p_value") is not None
-    ]
-    tost_values = [
-        float(contrast["tost_p_value"]) for contrast in tost_eligible
-    ]
+    tost_eligible: List[Dict[str, object]] = []
+    tost_values: List[float] = []
+    for contrast in contrasts:
+        value = _finite_float(contrast.get("tost_p_value"))
+        if value is None:
+            continue
+        tost_eligible.append(contrast)
+        tost_values.append(value)
     tost_holm = _holm_bonferroni(tost_values)
     tost_bh = _benjamini_hochberg(tost_values)
 
