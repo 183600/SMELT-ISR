@@ -20581,6 +20581,13 @@ def _val_curve_points(
             * _TRAIN_FLOPS_MULTIPLIER
             * flops_per_forward
         )
+        # 累计 FLOPs 也可能超出 float 范围（例如有限的前向
+        # FLOPs 接近上限时再乘训练倍率/步数）。inf 作为曲线
+        # 横坐标会让共同计算量变成 inf、比值变成 NaN，最终
+        # 产出非法 JSON；这类点按不可用丢弃，而不是当作正常
+        # 观测。
+        if not math.isfinite(cumulative):
+            continue
         # 同一步有多条验证记录（如 NaN 诊断附加记录）时保留
         # 最后一条；评估协议相同，值应一致。
         points[float(cumulative)] = loss
@@ -21118,6 +21125,11 @@ def _curve_trapezoid_mean(
     values.append(end_value)
 
     window = end - start
+    # 两端各自有限不代表差值有限：-1e308 到 1e308 的窗口
+    # 宽度会溢出为 inf，此时 width/window 全是 0，会静默返回
+    # 0.0 这种看似合法的损失。无法表示窗口就按缺失处理。
+    if not math.isfinite(window) or window <= 0.0:
+        return None
     terms: List[float] = []
     for index in range(1, len(breakpoints)):
         width = breakpoints[index] - breakpoints[index - 1]

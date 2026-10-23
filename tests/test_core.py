@@ -9174,6 +9174,49 @@ class CurveMeanMetricTests(unittest.TestCase):
         )
         json.dumps(report, allow_nan=False)
 
+    def test_matched_flops_curve_skips_overflowed_cumulative(self):
+        # 有限但极大的前向 FLOPs 乘上训练倍率/步数后可能溢出
+        # 为 inf；inf 不能成为曲线横坐标，否则共同计算量、
+        # 倍率会变成 inf/NaN 并写出非法 JSON。
+        with tempfile.TemporaryDirectory() as tmp:
+            huge = self._run(
+                tmp, "huge", [(10, 1.0), (20, 0.5)]
+            )
+            huge["flops_per_forward"] = 1.0e308
+            normal = self._run(
+                tmp, "normal", [(10, 1.2), (20, 0.9)]
+            )
+            normal["flops_per_forward"] = 1.0e3
+            rows = [huge, normal]
+            report = experiment.annotate_compute_matched_metrics(
+                rows
+            )
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            [item["run"] for item in report["runs"]],
+            ["normal"],
+        )
+        self.assertNotIn(
+            experiment._COMPUTE_MATCHED_METRIC, huge
+        )
+        self.assertTrue(
+            any(
+                item["run"] == "huge"
+                for item in report["excluded_runs"]
+            )
+        )
+        json.dumps(report, allow_nan=False)
+
+    def test_trapezoid_mean_rejects_unrepresentable_window(self):
+        # 两端各自有限，但差值可溢出为 inf；此时不能把
+        # width/inf=0 的项求和成看似合法的 0.0 损失。
+        result = experiment._curve_trapezoid_mean(
+            [(-1.0e308, 1.0), (0.0, 2.0), (1.0e308, 3.0)],
+            -1.0e308,
+            1.0e308,
+        )
+        self.assertIsNone(result)
+
     def test_comparison_report_exposes_curve_mean(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [
