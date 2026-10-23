@@ -15291,8 +15291,19 @@ def _sparkline(values, width=48):
                 for index in range(width)
             ]
 
-    low = min(values)
-    high = max(values)
+    # 合法但极大的有限值（如 -1e308 与 +1e308）会让 high-low
+    # 溢出成 inf，进而 (value-low)/(high-low) 变成 inf/inf=NaN，
+    # int(NaN) 在展示路径抛异常。归一化到 [-1,1] 后分块位置
+    # 不变；正常量级不缩放，保持历史输出逐位一致。
+    scale = max(abs(value) for value in values)
+    if scale > 1.0e150:
+        low = min(value / scale for value in values)
+        high = max(value / scale for value in values)
+        normalized = [value / scale for value in values]
+    else:
+        low = min(values)
+        high = max(values)
+        normalized = values
 
     if high - low <= 0.0:
         return _SPARK_BLOCKS[0] * len(values)
@@ -15309,8 +15320,21 @@ def _sparkline(values, width=48):
                 ),
             )
         ]
-        for value in values
+        for value in normalized
     )
+
+
+def _finite_gap(
+    train_loss: Optional[float],
+    val_loss: Optional[float],
+) -> Optional[float]:
+    """训练/验证损失之差；任一端缺失或差值溢出时返回 None。"""
+    if train_loss is None or val_loss is None:
+        return None
+    difference = float(train_loss) - float(val_loss)
+    if not math.isfinite(difference):
+        return None
+    return round(difference, 6)
 
 
 def analyze_training_curve(
@@ -15527,7 +15551,7 @@ def analyze_training_curve(
         "peak_lr": peak_lr,
         "last_lr": last_lr,
         "last_lr_over_peak": (
-            round(last_lr / peak_lr, 6)
+            _safe_ratio(last_lr, peak_lr)
             if peak_lr is not None
             and peak_lr > 0.0
             and last_lr is not None
@@ -15612,6 +15636,10 @@ def analyze_training_curve(
         (last["val_loss"] - best["val_loss"])
         / max(float(best["val_loss"]), 1e-12)
     )
+    # 两端损失各自有限，但差值/相对值仍可能越过 float 上限；
+    # 无法表示时按缺失处理，不能让 inf 进入状态判定与报告。
+    if not math.isfinite(regression):
+        regression = None
 
     def _relative_drop(newer, older):
         if older is None or newer is None:
@@ -15620,7 +15648,11 @@ def analyze_training_curve(
         newer = float(newer)
         if older <= 0.0:
             return None
-        return (older - newer) / older
+        try:
+            value = (older - newer) / older
+        except OverflowError:
+            return None
+        return value if math.isfinite(value) else None
 
     train_drop_total = _relative_drop(
         last["train_loss"],
@@ -15673,9 +15705,14 @@ def analyze_training_curve(
             or float(point["val_loss"]) <= 0.0
         ):
             return None
-        return (
-            float(point["val_loss"]) - float(point["train_loss"])
-        ) / float(point["val_loss"])
+        try:
+            value = (
+                float(point["val_loss"])
+                - float(point["train_loss"])
+            ) / float(point["val_loss"])
+        except OverflowError:
+            return None
+        return value if math.isfinite(value) else None
 
     generalization_gap_ratio = _gap_ratio(last)
     generalization_gap_ratio_first = _gap_ratio(first)
@@ -15685,6 +15722,11 @@ def analyze_training_curve(
         and generalization_gap_ratio_first is not None
         else None
     )
+    if (
+        generalization_gap_trend is not None
+        and not math.isfinite(generalization_gap_trend)
+    ):
+        generalization_gap_trend = None
     train_below_val = (
         generalization_gap_ratio is not None
         and generalization_gap_ratio >= _CURVE_GENERALIZATION_GAP
@@ -15697,24 +15739,16 @@ def analyze_training_curve(
         "last_val_loss": last["val_loss"],
         "best_val_loss": best["val_loss"],
         "best_val_step": best["step"],
-        "val_regression_from_best": round(regression, 6),
-        "train_val_gap_first": (
-            round(
-                float(first["train_loss"])
-                - float(first["val_loss"]),
-                6,
-            )
-            if first["train_loss"] is not None
+        "val_regression_from_best": (
+            round(regression, 6)
+            if regression is not None
             else None
         ),
-        "train_val_gap_last": (
-            round(
-                float(last["train_loss"])
-                - float(last["val_loss"]),
-                6,
-            )
-            if last["train_loss"] is not None
-            else None
+        "train_val_gap_first": _finite_gap(
+            first["train_loss"], first["val_loss"]
+        ),
+        "train_val_gap_last": _finite_gap(
+            last["train_loss"], last["val_loss"]
         ),
         "generalization_gap_ratio_last": (
             None
@@ -15792,6 +15826,7 @@ def analyze_training_curve(
         )
     elif (
         best_index <= len(finite_evals) - 2
+        and regression is not None
         and regression >= _CURVE_OVERFIT_REGRESSION
         and (train_still_down or train_below_val)
     ):
@@ -16055,13 +16090,21 @@ def selection_improved(
     方向由指标本身决定（loss/ppl 越低越好，F1/accuracy 越高
     越好）。非有限值一律不算改善。
     """
-    if not math.isfinite(value):
+    value = _finite_float(value)
+    if value is None:
         return False
-    if best is None:
+    best_value = _finite_float(best) if best is not None else None
+    # 损坏的 CLI/旧记录可能把 min_delta 写成 None/字符串/NaN；
+    # 不可用时按 0 处理（不额外要求改善幅度），而不是让 resume
+    # 在减法处崩溃。
+    delta = _finite_float(min_delta)
+    if delta is None:
+        delta = 0.0
+    if best_value is None:
         return True
     if higher_is_better:
-        return value > best + min_delta
-    return value < best - min_delta
+        return value > best_value + delta
+    return value < best_value - delta
 
 
 def early_stop_state_from_records(
@@ -19896,6 +19939,33 @@ def _percentile(
         sorted_values[lower] * (1.0 - weight)
         + sorted_values[upper] * weight
     )
+
+
+def _safe_ratio(
+    numerator: Optional[float],
+    denominator: Optional[float],
+) -> Optional[float]:
+    """两个有限数的比值；缺失、除零或结果不可表示时返回 None。"""
+    if numerator is None or denominator is None:
+        return None
+    try:
+        left = float(numerator)
+        right = float(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(left)
+        or not math.isfinite(right)
+        or right == 0.0
+    ):
+        return None
+    try:
+        ratio = left / right
+    except OverflowError:
+        return None
+    if not math.isfinite(ratio):
+        return None
+    return round(ratio, 6)
 
 
 def _safe_cv(std: float, mean: float) -> Optional[float]:

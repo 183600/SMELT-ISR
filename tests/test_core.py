@@ -6287,6 +6287,11 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._sparkline([1.0, float("inf")]), ""
         )
         self.assertEqual(len(experiment._sparkline([1, 2, 3])), 3)
+        # 有限但符号相反的极值：high-low 会溢出成 inf，走势条
+        # 仍必须能按相对大小分块，而不是 int(NaN) 崩溃。
+        spark = experiment._sparkline([-1.0e308, 0.0, 1.0e308])
+        self.assertEqual(len(spark), 3)
+        self.assertNotEqual(spark, "")
 
     def test_bad_case_comparison_skips_out_of_range_shares(self):
         huge = 10 ** 400
@@ -7333,6 +7338,37 @@ class NumericalScaleTests(unittest.TestCase):
         # 超大整数仍保持精确，不能因清洗被截断。
         self.assertEqual(rows[0]["n_params"], 10 ** 400)
         json.dumps(rows, allow_nan=False)
+
+    def test_curve_analysis_omits_overflowing_relative_fields(self):
+        records = []
+        val_losses = [1.0e-308, 2.0e-308, 1.0e308]
+        for index, val_loss in enumerate(val_losses, 1):
+            records.append({
+                "step": index * 2 - 1,
+                "train_loss": -1.0e308,
+                "grad_norm": 1.0,
+                "lr": 1.0e-3,
+            })
+            records.append({
+                "step": index * 2,
+                "val_loss": val_loss,
+            })
+        analysis = experiment.analyze_training_curve(records)
+        # 最优验证损失极小、最终验证损失极大：回升比例与
+        # train-val 差值都会越过 float 上限，必须是 None。
+        self.assertIsNone(analysis["val_regression_from_best"])
+        self.assertIsNone(analysis["train_val_gap_last"])
+        self.assertTrue(
+            math.isfinite(analysis["last_train_loss"])
+        )
+        json.dumps(analysis, allow_nan=False)
+
+        # 损坏的 min_delta 不应让 resume 的减法崩溃。
+        self.assertTrue(
+            experiment.selection_improved(
+                1.0, None, False, None
+            )
+        )
 
     def test_curve_analysis_does_not_overflow_finite_losses(self):
         # 两次各自有限的 1e308 训练损失在求验证点均值时不能
