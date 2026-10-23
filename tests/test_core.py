@@ -6677,6 +6677,21 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNotNone(gate)
         self.assertNotIn("None 个", gate)
         self.assertIn("无法计算", gate)
+        # 损坏的 equivalence 标量不能触发 AttributeError，也不能
+        # 把缺失的目标功效/家族规模写成 None。
+        malformed = {
+            "power": {
+                "adequate": False,
+                "plan_equivalence": True,
+                "equivalence_adequate": False,
+                "equivalence": 1.0,
+            }
+        }
+        malformed_gate = experiment.design_power_gate_error(
+            malformed
+        )
+        self.assertIsNotNone(malformed_gate)
+        self.assertNotIn("None", malformed_gate)
 
     def test_plan_treatment_keys_may_be_non_strings(self):
         # 手工/旧计划可能用非字符串键；不能因 str(key) 后查不到

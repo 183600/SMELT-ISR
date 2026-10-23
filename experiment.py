@@ -67225,7 +67225,10 @@ def design_power_gate_error(
         power.get("plan_equivalence")
         and not power.get("equivalence_adequate")
     ):
-        equivalence = power.get("equivalence") or {}
+        # 旧/手工编辑的 design_plan 可能把 equivalence 写成
+        # 标量或列表；损坏字段按空对象处理，不能让整份启动门
+        # 在标量上调用 .get 崩溃。
+        equivalence = _as_dict(power.get("equivalence"))
         eq_required = equivalence.get(
             "required_seeds_with_attrition"
         )
@@ -67240,15 +67243,32 @@ def design_power_gate_error(
         margin_relative = equivalence.get("margin_relative")
         if margin_relative is None:
             margin_relative = 0.0
+        target_text = _format_finite(
+            power.get("target_power"), "g"
+        )
+        if target_text == "-":
+            target_text = "未知"
+        family_text = power.get("planned_comparisons")
+        family_text = (
+            str(family_text)
+            if family_text is not None
+            else "未知"
+        )
+        planned_text = power.get("planned_seeds")
+        planned_text = (
+            f"{planned_text} 个"
+            if planned_text is not None
+            else "未知"
+        )
         return (
             pilot_note
             + "设计计划显示等价性（TOST）功效不足：等价界 ±"
             f"{_format_finite(margin_relative, 'g')}、"
             "真实差异为零、目标功效 "
-            f"{power.get('target_power')}、家族规模 "
-            f"{power.get('planned_comparisons')} 下，"
+            f"{target_text}、家族规模 "
+            f"{family_text} 下，"
             f"{eq_required_text}，计划只有 "
-            f"{power.get('planned_seeds')} 个"
+            f"{planned_text}"
             + (
                 f"；当前精度可支持的最小界约 ±"
                 f"{_format_finite(eq_margin_needed, 'g')}"
@@ -67279,13 +67299,22 @@ def design_power_gate_error(
     planned_text = (
         f"{planned} 个" if planned is not None else "未知"
     )
+    target_text = _format_finite(
+        power.get("target_power"), "g"
+    )
+    if target_text == "-":
+        target_text = "未知"
+    family_text = power.get("planned_comparisons")
+    family_text = (
+        str(family_text) if family_text is not None else "未知"
+    )
     return (
         pilot_note
         + "设计计划显示先验功效不足：计划实际展开的最吃种子对比"
         f"类型是 {binding}（{binding_label}），至少需要 "
         f"{required_text}，计划只有 {planned_text}；"
-        f"家族规模 {power.get('planned_comparisons')}、目标功效 "
-        f"{power.get('target_power')}。"
+        f"家族规模 {family_text}、目标功效 "
+        f"{target_text}。"
         "交互对比的方差是两两对比的 2 倍，不能把「按两两对比"
         "够用」当成「消融交互也够用」。请增加 --seeds，或在预"
         "注册 power 中显式设置 underpowered_acknowledged=true "
