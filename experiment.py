@@ -20556,6 +20556,14 @@ def _path_is_dir(value: object) -> bool:
         return False
 
 
+def _path_exists(value: object) -> bool:
+    """Path.exists 的容错版本；不可判定的路径按「不存在」处理。"""
+    try:
+        return Path(value).exists()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _val_curve_points(
     run_dir: Path,
     flops_per_forward: float,
@@ -46016,7 +46024,7 @@ def _truncate_metrics_after_step(path: Path, step: int) -> None:
     的终态。``reference_baselines`` / ``curve_monitor`` 是可复用
     的历史说明，保留。文件不存在或无需裁剪时不改动。
     """
-    if not path.exists():
+    if not _path_exists(path):
         return
     threshold = int(step)
 
@@ -46259,7 +46267,13 @@ def test_record_exists(path: Path) -> bool:
     --evaluate-test 会被拒绝，避免测试集在反复查看中变成隐式
     验证集。
     """
-    if not path.exists():
+    try:
+        path_exists = path.exists()
+    except OSError:
+        # 路径本身不可判定时不能当作「没有 test 记录」放行
+        # 后续操作：尘封协议宁可保守拒绝一次。
+        return True
+    if not path_exists:
         return False
 
     try:
@@ -46294,7 +46308,7 @@ def _read_test_records(run_dir: Path) -> Dict[str, object]:
     """读取单个运行的 test 汇总记录（最后一次 test 行）。"""
     path = Path(run_dir) / "metrics.jsonl"
     record: Optional[Dict[str, object]] = None
-    if not path.exists():
+    if not _path_exists(path):
         return {"run": str(run_dir), "available": False}
     try:
         with open(path, encoding="utf-8") as handle:
@@ -46315,7 +46329,7 @@ def _read_test_records(run_dir: Path) -> Dict[str, object]:
 def read_test_access_ledger(path: Path) -> List[Dict[str, object]]:
     """读取测试集访问账本（JSONL，只追加）。"""
     path = Path(path)
-    if not path.exists():
+    if not _path_exists(path):
         return []
     entries: List[Dict[str, object]] = []
     # 账本可能由崩溃中的追加写入留下半行/非法 UTF-8；损坏的
@@ -46521,7 +46535,7 @@ def load_tracking_provenance(
         "resume_count": 0,
         "comparison_protocol_sha256": None,
     }
-    if not path.exists():
+    if not _path_exists(path):
         return empty
 
     try:
@@ -46622,7 +46636,7 @@ def load_previous_sanity_result(
     """
     path = out_dir / "config.json"
 
-    if not path.exists():
+    if not _path_exists(path):
         return None
 
     try:
@@ -46941,7 +46955,7 @@ def load_selected_model(
     """
     path = Path(filename)
 
-    if not path.exists():
+    if not _path_exists(path):
         return None
 
     try:

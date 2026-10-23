@@ -7584,6 +7584,18 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             [],
         )
 
+    def test_artifact_readers_tolerate_unreadable_path(self):
+        long_path = Path("x" * 10000)
+        self.assertFalse(experiment._path_exists(long_path))
+        # 不能判定是否存在 metrics.jsonl 时，尘封检查取保守值，
+        # 避免把不可读路径误判成「没有 test 记录」。
+        self.assertTrue(experiment.test_record_exists(long_path))
+        record = experiment._read_test_records(long_path)
+        self.assertFalse(record["available"])
+        self.assertEqual(
+            experiment.read_test_access_ledger(long_path), []
+        )
+
     def test_compare_and_pilot_tolerate_unreadable_run_path(self):
         # 与 metrics 读取一致：损坏/超长运行路径不能让
         # --compare 或 --design-pilot-runs 整份崩溃。
