@@ -10597,6 +10597,22 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertTrue(report["available"])
         json.dumps(report, allow_nan=False)
 
+    def test_hierarchical_window_bootstrap_handles_bad_replicates(self):
+        differences = {
+            1: [1.0, 2.0],
+            2: [2.0, 3.0],
+        }
+        for replicates in (0, 1, -5, "bad", None):
+            report = experiment._hierarchical_window_bootstrap_ci(
+                differences, replicates=replicates
+            )
+            self.assertFalse(report["available"])
+        self.assertFalse(
+            experiment._hierarchical_window_bootstrap_ci(
+                [], replicates=10
+            )["available"]
+        )
+
     def test_group_comparison_rejects_unit_mismatch(self):
         groups = [
             [0, 10.0, 20.0, 5.0],

@@ -27246,6 +27246,26 @@ def _hierarchical_window_bootstrap_ci(
     区间可能偏窄/不稳定；它只作为两层不确定性的描述，不能
     替代增加独立种子，也不改变种子级主检验的判定。
     """
+    if not isinstance(per_seed_differences, dict):
+        return {
+            "available": False,
+            "reason": "invalid_seed_window_differences",
+        }
+    try:
+        replicate_count = int(replicates)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": replicates,
+        }
+    if replicate_count <= 1:
+        return {
+            "available": False,
+            "reason": "insufficient_bootstrap_replicates",
+            "replicates": replicate_count,
+        }
+    replicates = replicate_count
     cleaned = _clean_window_differences(per_seed_differences)
     usable = {
         seed: values
@@ -27307,17 +27327,17 @@ def _hierarchical_window_bootstrap_ci(
     seed_indices = torch.randint(
         low=0,
         high=seed_count,
-        size=(int(replicates), seed_count),
+        size=(replicate_count, seed_count),
         generator=generator,
     )
     window_indices = torch.randint(
         low=0,
         high=window_count,
-        size=(int(replicates), window_count),
+        size=(replicate_count, window_count),
         generator=generator,
     )
     resampled_means = torch.empty(
-        (int(replicates), seed_count),
+        (replicate_count, seed_count),
         dtype=torch.float64,
     )
     for column, seed in enumerate(seed_order):
@@ -27336,7 +27356,7 @@ def _hierarchical_window_bootstrap_ci(
         "available": True,
         "low": low,
         "high": high,
-        "replicates": int(replicates),
+        "replicates": replicate_count,
         "n_seeds": seed_count,
         "n_windows": window_count,
         "n_windows_min": window_count,
