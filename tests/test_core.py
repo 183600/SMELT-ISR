@@ -6821,6 +6821,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["step"], 1)
 
+    def test_metrics_reader_tolerates_unreadable_path(self):
+        # 损坏/手工编辑的运行记录可能把 path 写成超长字符串；
+        # 分析层应把它当成没有曲线，而不是让 Path.exists 抛
+        # ENAMETOOLONG 中断整份对比报告。
+        self.assertEqual(
+            experiment.read_metrics_records(Path("x" * 10000)),
+            [],
+        )
+
     def test_resume_truncation_drops_stale_terminal_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "metrics.jsonl"

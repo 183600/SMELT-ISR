@@ -46025,27 +46025,37 @@ def read_metrics_records(path: Path) -> List[Dict[str, object]]:
     训练结束后的曲线诊断、坏案例报告与 --compare 汇总都基于
     这份记录，保证分析与训练写盘使用同一份数据来源。
     """
-    if not path.exists():
+    # 路径本身可能来自损坏/手工编辑的 config（例如超长字符串），
+    # Path.exists()/open() 会抛 OSError（文件名过长、权限、IO）；
+    # 分析层应把该运行当作「没有曲线记录」而不是中断整份报告。
+    try:
+        if not path.exists():
+            return []
+    except OSError:
         return []
 
     records: List[Dict[str, object]] = []
 
     # 逐行按字节解码：崩溃或磁盘损坏可能在任意一行留下非法
     # UTF-8，不能因此让整份指标记录（包括前面完好的行）不可读。
-    with open(path, "rb") as f:
-        for raw_line in f:
-            try:
-                line = raw_line.decode("utf-8").strip()
-            except UnicodeDecodeError:
-                continue
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
+    try:
+        with open(path, "rb") as f:
+            for raw_line in f:
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        # 读取中途失败时保留已经解析出的完整记录。
+        return records
 
     return records
 
