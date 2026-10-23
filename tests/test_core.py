@@ -7205,6 +7205,22 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertTrue(bounds["sign_robust"])
         json.dumps(bounds, allow_nan=False)
 
+    def test_curve_interpolation_avoids_endpoint_difference_overflow(self):
+        value, method = experiment._interpolate_curve(
+            [(1.0, -1.0e308), (2.0, 1.0e308)],
+            1.5,
+        )
+        self.assertEqual(value, 0.0)
+        self.assertEqual(method, "linear_between_evals")
+
+        value, method = experiment._interpolate_curve(
+            [(1.0, 1.0e308), (2.0, 1.0e308)],
+            1.5,
+        )
+        self.assertEqual(value, 1.0e308)
+        self.assertEqual(method, "linear_between_evals")
+        json.dumps(value, allow_nan=False)
+
     def test_contrast_delta_overflow_is_treated_as_missing(self):
         def cell(mode, mean):
             return {

@@ -20619,8 +20619,16 @@ def _interpolate_curve(
             if x == x_next:
                 return y_next, "exact_eval_point"
             ratio = (x - x_prev) / (x_next - x_prev)
+            direct = y_prev + ratio * (y_next - y_prev)
+            if math.isfinite(direct):
+                return direct, "linear_between_evals"
+            # 两端一正一负且都接近 float 上限时，差值会先溢出；
+            # 用两个已按比例缩放的端点相加，真实插值仍在范围内。
+            scaled = (
+                y_prev * (1.0 - ratio) + y_next * ratio
+            )
             return (
-                y_prev + ratio * (y_next - y_prev),
+                scaled if math.isfinite(scaled) else None,
                 "linear_between_evals",
             )
 
