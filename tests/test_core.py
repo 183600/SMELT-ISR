@@ -10470,6 +10470,28 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
 
+    def test_paired_accuracy_interval_keeps_negative_differences(self):
+        before = self._stats([
+            [0, 10.0, 20.0, 9.0],
+            [1, 10.0, 20.0, 9.0],
+            [2, 10.0, 20.0, 9.0],
+        ])
+        after = self._stats([
+            [0, 10.0, 20.0, 0.0],
+            [1, 10.0, 20.0, 0.0],
+            [2, 10.0, 20.0, 0.0],
+        ])
+        report = experiment._group_cluster_paired_comparison(
+            {"group_stats": before},
+            {"group_stats": after},
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["mean_accuracy_diff"], -0.9)
+        interval = report["accuracy_bootstrap_ci95"]
+        self.assertEqual(interval["low"], -0.9)
+        self.assertEqual(interval["high"], -0.9)
+        self.assertLessEqual(interval["low"], interval["high"])
+
 
 if __name__ == "__main__":
     unittest.main()

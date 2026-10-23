@@ -12686,7 +12686,7 @@ def _group_cluster_paired_comparison(
             / float(weight_tensor.sum().item())
         )
         result["accuracy_bootstrap_ci95"] = {
-            "low": max(0.0, accuracy_interval[0]),
+            "low": max(-1.0, accuracy_interval[0]),
             "high": min(1.0, accuracy_interval[1]),
             "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
         }
