@@ -9574,6 +9574,29 @@ class CurveMeanMetricTests(unittest.TestCase):
         )
         json.dumps(report, allow_nan=False)
 
+    def test_common_step_rejects_out_of_range_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                self._run(
+                    tmp,
+                    "a",
+                    [(10, 4.0), (20, 2.0), (30, 1.0)],
+                )
+            ]
+            report = experiment.annotate_common_step_metrics(
+                rows, target_step=10 ** 400
+            )
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any(
+                "有限正数" in advisory
+                for advisory in report["advisories"]
+            )
+        )
+        self.assertNotIn(
+            experiment._COMMON_STEP_METRIC, rows[0]
+        )
+
     def test_trapezoid_mean_rejects_unrepresentable_window(self):
         # 两端各自有限，但差值可溢出为 inf；此时不能把
         # width/inf=0 的项求和成看似合法的 0.0 损失。

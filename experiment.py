@@ -20944,7 +20944,17 @@ def annotate_common_step_metrics(
         target_step_rule = "min_last_validation_step"
         target_step_data_dependent = True
     else:
-        target_step = float(target_step)
+        # target_step 可能来自手工/旧记录或直接调用（如超大
+        # JSON 整数），float() 会抛 OverflowError；非有限/非正
+        # 步数也不能作为可观测的共同点。
+        target_value = _finite_float(target_step)
+        if target_value is None or target_value <= 0.0:
+            report["advisories"].append(
+                "共同步数不是有限正数：无法计算共同步数处的"
+                "选型无关验证指标"
+            )
+            return report
+        target_step = target_value
         target_step_rule = "preregistered_fixed_step"
         target_step_data_dependent = False
     report["target_step"] = target_step
