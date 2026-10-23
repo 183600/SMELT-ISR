@@ -63823,6 +63823,13 @@ def write_design_plan(
             pilot_evidence["power_recompute_error"] = power.get(
                 "adequacy_recompute_error"
             )
+    # power 可能来自手工/旧记录（含 inf/NaN），_apply 也会把
+    # 原始声明值复制进 pilot_evidence。落盘前统一清洗，保证
+    # 返回给调用方的设计对象本身也能按标准 JSON 序列化，而不
+    # 只是文件写入时被 _json_safe 兜底。
+    power = _json_safe(power)
+    if pilot_evidence is not None:
+        pilot_evidence = _json_safe(pilot_evidence)
     seeds = [
         int(seed)
         for seed in (getattr(args, "seeds", None) or [])

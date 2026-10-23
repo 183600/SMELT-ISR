@@ -3048,6 +3048,64 @@ class DesignPreparationTests(unittest.TestCase):
             evidence["pairs"][0]["second"],
         )
 
+    def test_design_return_value_is_standard_json_safe(self):
+        # power 中的非有限声明值会被 _apply 复制进 pilot_evidence
+        # 的 adjusted_power_inputs；返回给调用方的设计对象也必须
+        # 能按 allow_nan=False 序列化，而不能只在写文件时清洗。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 4)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, 1.0 + index * 0.001
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "A", seed, 0.99 + index * 0.001
+                    ))
+                )
+            args = argparse.Namespace(
+                seeds=[1, 2, 3],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                primary_metric="val_loss",
+                common_step=100,
+                design_pilot_runs=paths,
+                preregistration_record={
+                    "power": {
+                        "expected_seed_sd_relative": float("inf"),
+                        "expected_attrition_rate": -1.0,
+                        "planned_comparisons": 1,
+                        "planned_contrasts": ["pairwise"],
+                        "planned_seeds": 3,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "adequate": True,
+                    },
+                },
+            )
+            plan = [
+                {
+                    "order_index": index + 1,
+                    "block": seed,
+                    "position_in_block": 1,
+                    "label": f"smelt_seed{seed}",
+                    "mode": "smelt",
+                    "seed": seed,
+                    "balance_coef": 0.01,
+                }
+                for index, seed in enumerate(range(1, 4))
+            ]
+            design = experiment.write_design_plan(
+                root / "plan", plan, "randomized", 0, args
+            )
+        json.dumps(design, allow_nan=False)
+        json.dumps(design["pilot_evidence"], allow_nan=False)
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
