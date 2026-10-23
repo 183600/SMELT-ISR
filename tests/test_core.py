@@ -7551,6 +7551,68 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertFalse(result["paired_differences_finite"])
         json.dumps(result, allow_nan=False)
 
+    def test_bad_case_report_sanitizes_nonfinite_shares_and_rates(self):
+        def row(name, share, wrong, tokens=1, position_tokens=1):
+            return {
+                "run": name,
+                "mode": "A",
+                "seed": 1,
+                "bad_case_available": True,
+                "bad_case_tokens_evaluated": tokens,
+                "bad_case_wrong_tokens": wrong,
+                "bad_case_error_category_counts": {
+                    "ambiguous": wrong,
+                },
+                "bad_case_error_category_shares": {
+                    "ambiguous": share,
+                },
+                "bad_case_error_rate_by_position": [
+                    {
+                        "name": "position_0",
+                        "tokens": position_tokens,
+                        "wrong": 1.0e308,
+                    }
+                ],
+                "bad_case_error_rate_by_train_frequency": [],
+                "bad_case_error_frequency_basis": "train_share",
+                "bad_case_token_accuracy": float("inf"),
+            }
+
+        # 两个合法但极大的错误计数相加后越过 float 上限；
+        # 错误率无法表示时必须是 None。非有限占比与准确率也
+        # 不能原样进入报告。
+        report = experiment.bad_case_comparison_report([
+            row("r1", float("inf"), 1.0e308, tokens=1),
+            row(
+                "r2",
+                -1.0e308,
+                1.0e308,
+                tokens=0,
+                position_tokens=0,
+            ),
+        ])
+        self.assertIsNone(report["runs"][0]["token_accuracy"])
+        self.assertIsNone(
+            report["runs"][0]["error_category_shares"][
+                "ambiguous"
+            ]
+        )
+        self.assertIsNone(
+            report["error_rate_by_position"][0]["error_rate"]
+        )
+        json.dumps(report, allow_nan=False)
+
+        # 两个有限但符号相反的极大占比，其极差越过 float
+        # 上限：没有可表示的跨运行极差。
+        spread = experiment.bad_case_comparison_report([
+            row("r1", 1.0e308, 1.0),
+            row("r2", -1.0e308, 1.0),
+        ])
+        self.assertIsNone(
+            spread["category_share_ranges"]["ambiguous"]
+        )
+        json.dumps(spread, allow_nan=False)
+
     def test_environment_identity_falls_back_for_minimal_snapshots(self):
         expected = {
             "schema": experiment._ENVIRONMENT_SCHEMA,

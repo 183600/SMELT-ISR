@@ -21531,13 +21531,17 @@ def bad_case_comparison_report(
             "seed": row.get("seed"),
             "tokens_evaluated": tokens,
             "wrong_tokens": wrong,
-            "token_accuracy": row.get("bad_case_token_accuracy"),
+            "token_accuracy": _finite_float(
+                row.get("bad_case_token_accuracy")
+            ),
             "error_category_counts": {
                 name: _safe_count(counts.get(name))
                 for name in category_names
             },
+            # 旧/损坏记录的占比可能是 NaN/Inf/超范围整数；
+            # 不能把这些值原样写进报告。
             "error_category_shares": {
-                name: shares.get(name)
+                name: _finite_float(shares.get(name))
                 for name in category_names
             },
             "top_confusion": next(
@@ -21551,14 +21555,19 @@ def bad_case_comparison_report(
             ),
         })
 
-    category_shares = {
-        name: (
-            round(count / total_wrong, 6)
-            if total_wrong > 0
-            else None
-        )
-        for name, count in category_counts.items()
-    }
+    category_shares: Dict[str, Optional[float]] = {}
+    for name, count in category_counts.items():
+        share = None
+        if total_wrong > 0:
+            try:
+                ratio = count / total_wrong
+            except OverflowError:
+                # 损坏记录可能让单类计数远大于错误总数；真除法
+                # 越过 float 上限时按缺失处理，而不是中断报告。
+                ratio = None
+            if ratio is not None and math.isfinite(ratio):
+                share = round(ratio, 6)
+        category_shares[name] = share
     n_runs = len(available)
     min_pair_runs = (
         1 if n_runs == 1 else max(2, (n_runs + 1) // 2)
@@ -21587,15 +21596,21 @@ def bad_case_comparison_report(
     ) -> List[Dict[str, object]]:
         rows_out = []
         for name, (tokens, wrong) in buckets.items():
+            error_rate = None
+            if tokens > 0:
+                try:
+                    ratio = wrong / tokens
+                except OverflowError:
+                    # 损坏记录可能让 wrong 远大于 tokens；无法
+                    # 表示的错误率按缺失处理。
+                    ratio = None
+                if ratio is not None and math.isfinite(ratio):
+                    error_rate = round(ratio, 6)
             rows_out.append({
                 "name": name,
                 "tokens": tokens,
                 "wrong": wrong,
-                "error_rate": (
-                    round(wrong / tokens, 6)
-                    if tokens > 0
-                    else None
-                ),
+                "error_rate": error_rate,
             })
         return rows_out
 
@@ -21606,9 +21621,13 @@ def bad_case_comparison_report(
             if len(values) < 2:
                 continue
             spread = max(values) - min(values)
-            category_share_ranges[name] = round(spread, 6)
-            if spread >= 0.20:
-                unstable_categories.append(name)
+            if math.isfinite(spread):
+                category_share_ranges[name] = round(spread, 6)
+                if spread >= 0.20:
+                    unstable_categories.append(name)
+            else:
+                # 正负极大占比相减会溢出；没有可表示的极差。
+                category_share_ranges[name] = None
 
     return {
         "n_runs_with_bad_cases": n_runs,
