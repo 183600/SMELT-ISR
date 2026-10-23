@@ -66973,6 +66973,14 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 f"（{sd_check.get('n_evaluable_pairs')} 个可评估"
                 "单元对）"
             )
+        elif sd_check.get("status") == "not_declared":
+            print(
+                "[design][pilot][warn] 预注册未声明 "
+                "expected_seed_sd_relative：试点证据已估计 "
+                f"sd≈{_format_finite(sd_check.get('observed'), 'g')}"
+                "，但没有可对照的先验声明；请在新一轮预注册中"
+                "显式填写后重新生成设计计划"
+            )
         else:
             print(
                 "[design][pilot][warn] 试点证据无法估计配对差值 "
@@ -66999,6 +67007,14 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 f"{_format_finite(attrition_check.get('declared'), '.1%')}"
                 " 不低于试点观测 "
                 f"{_format_finite(attrition_check.get('observed'), '.1%')}"
+            )
+        elif attrition_check.get("status") == "not_declared":
+            print(
+                "[design][pilot][warn] 预注册未声明 "
+                "expected_attrition_rate：试点证据已估计脱落率≈"
+                f"{_format_finite(attrition_check.get('observed'), '.1%')}"
+                "，但没有可对照的先验声明；请在新一轮预注册中"
+                "显式填写后重新生成设计计划"
             )
         for warning in list(pilot.get("warnings") or [])[:4]:
             print(f"[design][pilot][warn] {warning}")

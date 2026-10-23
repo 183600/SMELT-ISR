@@ -2919,6 +2919,50 @@ class DesignPreparationTests(unittest.TestCase):
         )
         json.dumps(evidence, allow_nan=False)
 
+    def test_design_summary_distinguishes_undeclared_pilot(self):
+        design = {
+            "planned_runs": 2,
+            "order_scheme": "randomized",
+            "order_seed": 0,
+            "plan_id": "x" * 20,
+            "path": "design.json",
+            "power": {
+                "adequate": True,
+                "planned_seeds": 6,
+                "required_seeds_with_attrition": 6,
+                "required_seeds_for_t": 3,
+                "required_seeds_for_robust_sign_flip": 6,
+                "expected_attrition_rate": 0.0,
+                "planned_usable_seeds": 6,
+            },
+            "pilot_evidence": {
+                "source_run_count": 6,
+                "cell_count": 2,
+                "pair_count": 1,
+                "metric": "val_loss",
+                "metric_annotation": {
+                    "kind": "recorded_metric",
+                    "target_step": None,
+                },
+                "sd_check": {
+                    "status": "not_declared",
+                    "observed": 0.01,
+                    "min_pairs": 3,
+                },
+                "attrition_check": {
+                    "status": "not_declared",
+                    "observed": 0.0,
+                },
+                "warnings": [],
+            },
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_design_summary(design)
+        text = output.getvalue()
+        self.assertIn("未声明", text)
+        self.assertNotIn("无法估计配对差值", text)
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
