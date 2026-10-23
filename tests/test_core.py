@@ -7236,6 +7236,16 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(contrast["hedges_g"])
         json.dumps(contrast, allow_nan=False)
 
+        reference = experiment.compare_cells_to_baseline(
+            [cell("A", 0.0, 1.0e-154), cell("B", 1.0e308, 1.0e-154)],
+            "A",
+            "val_loss",
+        )[0]
+        self.assertEqual(reference["delta"], 1.0e308)
+        self.assertIsNone(reference["delta_over_noise"])
+        self.assertIsNone(reference["hedges_g"])
+        json.dumps(reference, allow_nan=False)
+
     def test_window_analysis_cross_seed_mean_does_not_overflow(self):
         def payload(loss_sum):
             return {

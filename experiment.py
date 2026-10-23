@@ -32799,16 +32799,19 @@ def compare_cells_to_baseline(
             ) / 2.0
             if math.isfinite(pooled_squared):
                 pooled_std = math.sqrt(pooled_squared)
-        noise_ratio = (
-            abs(delta) / pooled_std
-            if delta is not None and pooled_std
-            else None
-        )
+        noise_ratio = None
+        if delta is not None and pooled_std:
+            candidate = abs(delta) / pooled_std
+            if math.isfinite(candidate):
+                noise_ratio = candidate
         hedges_correction = _hedges_g_correction(result.get("df"))
         hedges_g = (
             noise_ratio * hedges_correction
             if noise_ratio is not None
             and hedges_correction is not None
+            and math.isfinite(
+                noise_ratio * hedges_correction
+            )
             else None
         )
         paired_effect_size = _paired_effect_size(delta, result)
