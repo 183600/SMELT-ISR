@@ -28922,6 +28922,7 @@ def _cost_verdict_from_ratios(
     verdict: str,
     significant: bool,
     noisy_timing_fields: Optional[Sequence[str]] = None,
+    ratio_overflow_fields: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     """
     由效率倍率与显著性给出权衡判定，供对比创建时与多重比较
@@ -28944,7 +28945,10 @@ def _cost_verdict_from_ratios(
       严格劣于基线；
     - ``neutral``：其余（持平/缺失效率数据等）。
     """
-    if not cost_ratios or verdict == "missing_metric":
+    if (
+        not cost_ratios
+        and not ratio_overflow_fields
+    ) or verdict == "missing_metric":
         return None
 
     ignored = set(noisy_timing_fields or ())
@@ -28953,12 +28957,31 @@ def _cost_verdict_from_ratios(
         for field, ratio in cost_ratios.items()
         if field not in ignored
     }
-    if not considered:
+    # 真实倍率可以越过 float 上限：它没有可表示的有限值，但
+    # 「变体成本远高于基线」这一事实仍然成立，不能因为溢出就
+    # 把材料成本当成 0/缺失。
+    overflow = {
+        field
+        for field in (ratio_overflow_fields or ())
+        if field not in ignored
+    }
+    if not considered and not overflow:
         considered = cost_ratios
 
-    most_expensive = max(considered.values())
-    expensive = most_expensive >= _COST_RATIO_MATERIAL
-    if verdict == "regression" and most_expensive > 1.0:
+    most_expensive = (
+        max(considered.values()) if considered else None
+    )
+    expensive = bool(overflow) or (
+        most_expensive is not None
+        and most_expensive >= _COST_RATIO_MATERIAL
+    )
+    if verdict == "regression" and (
+        bool(overflow)
+        or (
+            most_expensive is not None
+            and most_expensive > 1.0
+        )
+    ):
         return "dominated_regression"
     if verdict == "improvement" and significant:
         return "gain_with_cost" if expensive else "gain_balanced"
@@ -28983,6 +29006,7 @@ def _cost_comparison(
     cost_uncertainty: Dict[str, Dict[str, object]] = {}
     timing_noise_fields: List[str] = []
     unverifiable_timing_fields: List[str] = []
+    ratio_overflow_fields: List[str] = []
 
     for field in _COST_FIELDS:
         cost_a = _cell_cost_mean(cell_a, field)
@@ -28994,7 +29018,12 @@ def _cost_comparison(
         if cost_a <= 0.0:
             continue
         ratio = cost_b / cost_a
-        cost_ratios[field] = ratio
+        if not math.isfinite(ratio):
+            # 两个成本均值都有限，但真实倍率越过 float 上限。
+            # 不写入 inf；单独记录溢出字段，供权衡判定使用。
+            ratio_overflow_fields.append(field)
+        else:
+            cost_ratios[field] = ratio
 
         std_a = _cell_cost_std(cell_a, field)
         std_b = _cell_cost_std(cell_b, field)
@@ -29139,6 +29168,7 @@ def _cost_comparison(
         verdict,
         significant,
         noisy_timing_fields=low_confidence_timing_fields,
+        ratio_overflow_fields=ratio_overflow_fields,
     )
 
     # 记录哪些「效率字段」缺失：涨点/变差结论无法做精度与
@@ -29148,6 +29178,9 @@ def _cost_comparison(
             "baseline": baseline_costs,
             "variant": variant_costs,
             "ratios": cost_ratios,
+            # 倍率溢出（真实比值 > float 上限）的字段：没有有限
+            # 倍率可写，但权衡判定仍把它们视为材料成本。
+            "ratio_overflow_fields": ratio_overflow_fields,
             "uncertainty": cost_uncertainty,
             "timing_noise_fields": timing_noise_fields,
             "material_cost_fields": [
@@ -29155,6 +29188,11 @@ def _cost_comparison(
                 for field, ratio in cost_ratios.items()
                 if field not in set(low_confidence_timing_fields)
                 and ratio >= _COST_RATIO_MATERIAL
+            ]
+            + [
+                field
+                for field in ratio_overflow_fields
+                if field not in set(low_confidence_timing_fields)
             ],
             "unverifiable_timing_fields": (
                 unverifiable_timing_fields
@@ -29244,6 +29282,7 @@ def _apply_multiple_comparison_correction(
                 fields = cost.get(key)
                 if isinstance(fields, list):
                     low_confidence_timing.extend(fields)
+            overflow_fields = cost.get("ratio_overflow_fields")
             contrast["cost_verdict"] = _cost_verdict_from_ratios(
                 ratios if isinstance(ratios, dict) else {},
                 str(contrast.get("verdict")),
@@ -29251,6 +29290,11 @@ def _apply_multiple_comparison_correction(
                 noisy_timing_fields=(
                     low_confidence_timing
                     if low_confidence_timing
+                    else None
+                ),
+                ratio_overflow_fields=(
+                    overflow_fields
+                    if isinstance(overflow_fields, list)
                     else None
                 ),
             )

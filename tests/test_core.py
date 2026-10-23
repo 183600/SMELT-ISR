@@ -6909,6 +6909,45 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertNotIn("ci95_high", aggregate["costs"]["n_params"])
         json.dumps(aggregate, allow_nan=False)
 
+    def test_cost_ratio_overflow_is_not_written(self):
+        # 两个成本均值都有限，但真实倍率越过 float 上限：报告
+        # 不能写 inf，同时权衡判定仍应把该字段视为材料成本。
+        def cell(mean):
+            return {
+                "costs": {
+                    "n_params": {
+                        "mean": mean,
+                        "std": 1.0,
+                        "n": 3,
+                    }
+                }
+            }
+
+        cost, verdict = experiment._cost_comparison(
+            cell(1.0e-308),
+            cell(1.0e308),
+            "improvement",
+            True,
+        )
+        self.assertNotIn("n_params", cost["ratios"])
+        self.assertEqual(
+            cost["ratio_overflow_fields"], ["n_params"]
+        )
+        self.assertIn("n_params", cost["material_cost_fields"])
+        self.assertEqual(verdict, "gain_with_cost")
+        json.dumps(cost, allow_nan=False)
+        # 溢出倍率在判定函数里也必须等价于「远高于基线」，且
+        # 回归 + 成本溢出仍是严格劣于基线。
+        self.assertEqual(
+            experiment._cost_verdict_from_ratios(
+                {},
+                "regression",
+                True,
+                ratio_overflow_fields=["n_params"],
+            ),
+            "dominated_regression",
+        )
+
     def test_contrast_intervals_omit_unrepresentable_bounds(self):
         test = {
             "effect": -1.0e308,
