@@ -2744,6 +2744,80 @@ class DesignPreparationTests(unittest.TestCase):
             )
         )
 
+    def test_pilot_recompute_failure_is_not_reported_as_success(self):
+        smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998, 1.0001]
+        variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947, 0.9952]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 7)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, smelt[index]
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "A", seed, variant[index]
+                    ))
+                )
+            # 旧/手工 power 记录缺少 min_effect_relative 等
+            # 重算字段：试点输入仍会被上调，但功效无法重算。
+            args = argparse.Namespace(
+                seeds=[1, 2, 3, 4, 5, 6],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                primary_metric="val_loss",
+                common_step=100,
+                design_pilot_runs=paths,
+                preregistration_record={
+                    "power": {
+                        "expected_seed_sd_relative": 1e-6,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "planned_comparisons": 1,
+                        "planned_contrasts": ["pairwise"],
+                        "planned_seeds": 6,
+                        "expected_attrition_rate": 0.0,
+                        "adequate": True,
+                    },
+                },
+            )
+            plan = [
+                {
+                    "order_index": index + 1,
+                    "block": seed,
+                    "position_in_block": 1,
+                    "label": f"smelt_seed{seed}",
+                    "mode": "smelt",
+                    "seed": seed,
+                    "balance_coef": 0.01,
+                }
+                for index, seed in enumerate(range(1, 7))
+            ]
+            design = experiment.write_design_plan(
+                root / "plan", plan, "randomized", 0, args
+            )
+        self.assertTrue(
+            design["pilot_evidence"]["applied_to_power"]
+        )
+        self.assertFalse(
+            design["pilot_evidence"]["power_recompute_ok"]
+        )
+        self.assertFalse(
+            design["power"]["power_recomputed_for_pilot"]
+        )
+        self.assertIn(
+            "power_recompute_error",
+            design["pilot_evidence"],
+        )
+        gate = experiment.design_power_gate_error(design)
+        self.assertIsNotNone(gate)
+        self.assertIn("无法", gate)
+        self.assertNotIn("None 个启动种子", gate)
+
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

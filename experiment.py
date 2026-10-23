@@ -63304,13 +63304,26 @@ def _pilot_gate_note(evidence: object) -> str:
         parts.append("至少一个处理单元的全部试点运行都不可用")
     if not parts:
         return ""
+    # ``applied_to_power`` 只表示输入被上调；旧/手工 power
+    # 记录可能缺少重算字段，此时必须明确写成重算失败，而不是
+    # 沿用「已重算」的说法。
     applied = bool(evidence.get("applied_to_power"))
+    recompute_ok = evidence.get("power_recompute_ok")
+    recomputed = (
+        bool(recompute_ok)
+        if recompute_ok is not None
+        else applied
+    )
     return (
         "；".join(parts)
         + (
             "；设计计划已按试点观测值重算功效"
-            if applied
-            else "；设计计划未能按试点观测值重算功效"
+            if recomputed
+            else (
+                "；设计计划未能按试点观测值重算功效"
+                if applied
+                else "；试点证据未改变设计功效输入"
+            )
         )
         + "。"
     )
@@ -63589,7 +63602,14 @@ def write_design_plan(
         force=pilot_adjusted,
     )
     if pilot_adjusted and isinstance(power, dict):
-        power["power_recomputed_for_pilot"] = True
+        # 输入被上调不等于重算成功：旧/手工 power 记录可能缺少
+        # min_effect 等重算字段，此时 _design_power_for_family
+        # 会把 adequate 置空并标记 adequacy_recomputed=False。
+        # 不能再宣称「已按试点观测值重算功效」，否则报告与
+        # 启动门会给出错误结论。
+        recompute_failed = power.get("adequacy_recomputed") is False
+        power["power_recomputed_for_pilot"] = not recompute_failed
+        pilot_evidence["power_recompute_ok"] = not recompute_failed
         pilot_inputs = _as_dict(
             pilot_evidence.get("adjusted_power_inputs")
         )
@@ -63615,7 +63635,7 @@ def write_design_plan(
                     "effective_expected_attrition_rate"
                 )
             )
-        if power.get("adequacy_recomputed") is False:
+        if recompute_failed:
             pilot_evidence["power_recompute_error"] = power.get(
                 "adequacy_recompute_error"
             )
@@ -66848,6 +66868,9 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 "共同步数后重算"
             )
         sd_check = _as_dict(pilot.get("sd_check"))
+        pilot_recompute_ok = pilot.get("power_recompute_ok")
+        if pilot_recompute_ok is None:
+            pilot_recompute_ok = bool(pilot.get("applied_to_power"))
         if sd_check.get("status") == "declared_below_observed":
             print(
                 "[design][pilot][warn] 试点配对差值 sd≈"
@@ -66856,7 +66879,7 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 f"{_format_finite(sd_check.get('declared'), 'g')}"
                 + (
                     "；设计功效已按试点观测值重算"
-                    if pilot.get("applied_to_power")
+                    if pilot_recompute_ok
                     else "；设计功效未能按试点观测值重算"
                 )
             )
@@ -66885,7 +66908,7 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 f"{_format_finite(attrition_check.get('declared'), '.1%')}"
                 + (
                     "；所需启动种子已按观测脱落率重算"
-                    if pilot.get("applied_to_power")
+                    if pilot_recompute_ok
                     else "；所需启动种子未能按观测脱落率重算"
                 )
             )
@@ -66951,6 +66974,18 @@ def design_power_gate_error(
         return None
     if power.get("adequate"):
         return None
+    if power.get("adequacy_recomputed") is False:
+        reason = power.get("adequacy_recompute_error")
+        return (
+            pilot_note
+            + "设计计划无法按实际家族/对比类型或试点观测值"
+            "重算先验功效"
+            + (f"（{reason}）" if reason else "")
+            + "：不能沿用旧记录里的 adequacy；请补全预注册 "
+            "power 的 min_effect/planned_seeds 等重算字段后重新"
+            "生成设计计划，或显式设置 "
+            "underpowered_acknowledged=true 并写明 justification"
+        )
     if (
         power.get("plan_equivalence")
         and not power.get("equivalence_adequate")
