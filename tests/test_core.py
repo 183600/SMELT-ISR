@@ -6472,6 +6472,99 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             sys.argv = previous
 
 
+    def test_bad_case_comparison_skips_corrupt_payload(self):
+        # metrics.jsonl 可能被手工编辑或由崩溃进程留下半条记录：
+        # 计数/混淆对/分层错误率的损坏值不能中断整份对比报告。
+        rows = [
+            {
+                "run": "corrupt",
+                "mode": "A",
+                "seed": 1,
+                "bad_case_available": True,
+                "bad_case_tokens_evaluated": float("nan"),
+                "bad_case_wrong_tokens": "bad",
+                "bad_case_error_category_counts": {
+                    "ambiguous": float("inf"),
+                },
+                "bad_case_error_category_shares": {
+                    "ambiguous": float("nan"),
+                },
+                "bad_case_top_confusions": float("nan"),
+                "bad_case_error_rate_by_position": {"x": 1},
+                "bad_case_error_rate_by_train_frequency": [
+                    {"name": "b", "tokens": float("inf"), "wrong": []},
+                    "bad",
+                ],
+                "bad_case_error_frequency_basis": ["x"],
+                "bad_case_token_accuracy": float("nan"),
+            },
+            {
+                "run": "valid",
+                "mode": "A",
+                "seed": 2,
+                "bad_case_available": True,
+                "bad_case_tokens_evaluated": 10,
+                "bad_case_wrong_tokens": 4,
+                "bad_case_error_category_counts": {
+                    "ambiguous": 3,
+                    "systematic_confusion": 1,
+                },
+                "bad_case_error_category_shares": {
+                    "ambiguous": 0.75,
+                    "systematic_confusion": 0.25,
+                },
+                "bad_case_top_confusions": [[65, 66, 2]],
+                "bad_case_error_rate_by_position": [
+                    {"name": "position_0", "tokens": 10, "wrong": 4},
+                ],
+                "bad_case_error_rate_by_train_frequency": [
+                    {"name": "ge_5pct", "tokens": 10, "wrong": 4},
+                ],
+                "bad_case_error_frequency_basis": "train_share",
+                "bad_case_token_accuracy": 0.6,
+            },
+        ]
+        report = experiment.bad_case_comparison_report(rows)
+        self.assertEqual(report["tokens_evaluated"], 10)
+        self.assertEqual(report["wrong_tokens"], 4)
+        self.assertEqual(
+            report["error_category_counts"]["ambiguous"], 3
+        )
+        self.assertAlmostEqual(
+            report["error_category_shares"]["ambiguous"], 0.75
+        )
+        self.assertIsNone(report["runs"][0]["top_confusion"])
+        self.assertEqual(
+            report["runs"][1]["top_confusion"], [65, 66, 2]
+        )
+        self.assertEqual(
+            report["runs"][0]["error_category_counts"]["ambiguous"],
+            0,
+        )
+        self.assertEqual(
+            report["error_rate_by_position"][0]["error_rate"], 0.4
+        )
+
+    def test_protocol_mode_fallback_tolerates_unhashable_mode(self):
+        # 损坏的 config.mode 不应让 loop_count 的集合成员判断
+        # 抛 TypeError；无法确认时保持 None（未核对）。
+        protocol = experiment.experiment_protocol_from_payload({
+            "config": {"mode": [1, 2]},
+            "args": {"lr": 3e-4, "steps": 1, "batch_size": 2},
+        })
+        self.assertIsNone(protocol["loop_count"])
+
+    def test_periodic_auc_tolerates_unhashable_selection_metric(self):
+        self.assertFalse(
+            experiment._periodic_auc_enabled(False, [1, 2])
+        )
+        self.assertTrue(
+            experiment._periodic_auc_enabled(
+                False, "val_pr_auc_macro"
+            )
+        )
+
+
 class NumericalScaleTests(unittest.TestCase):
     def test_aggregate_interval_omits_unrepresentable_bounds(self):
         # 合法但极大的有限均值/标准差会让 t 区间端点越过 float

@@ -20622,9 +20622,26 @@ def bad_case_comparison_report(
     frequency_bases = set()
     runs = []
 
+    def _safe_count(value: object) -> int:
+        """把来自旧/损坏记录的计数转成非负整数，坏值按 0。
+
+        bad_cases 记录是 metrics.jsonl 中的普通 JSON；手工编辑、
+        旧版本或崩溃留下的半条记录可能把计数字段写成 NaN/
+        Infinity/字符串/列表。对比报告必须跳过这些值而不是让
+        整份 `--compare` 抛 ValueError/TypeError。
+        """
+        number = _finite_float(value)
+        if number is None or number < 0.0:
+            return 0
+        return int(number)
+
     for row in available:
-        tokens = int(row.get("bad_case_tokens_evaluated") or 0)
-        wrong = int(row.get("bad_case_wrong_tokens") or 0)
+        tokens = _safe_count(
+            row.get("bad_case_tokens_evaluated")
+        )
+        wrong = _safe_count(
+            row.get("bad_case_wrong_tokens")
+        )
         total_tokens += tokens
         total_wrong += wrong
         counts = _as_dict(
@@ -20634,13 +20651,18 @@ def bad_case_comparison_report(
             row.get("bad_case_error_category_shares")
         )
         for name in category_names:
-            count = int(counts.get(name) or 0)
+            count = _safe_count(counts.get(name))
             category_counts[name] += count
             share = _finite_float(shares.get(name))
             if share is not None:
                 category_share_by_run[name].append(share)
 
-        pairs = row.get("bad_case_top_confusions") or []
+        raw_pairs = row.get("bad_case_top_confusions")
+        pairs = (
+            raw_pairs
+            if isinstance(raw_pairs, (list, tuple))
+            else []
+        )
         seen_pairs = set()
         for pair in pairs:
             if not isinstance(pair, (list, tuple)) or len(pair) < 3:
@@ -20665,15 +20687,21 @@ def bad_case_comparison_report(
                 frequency_totals,
             ),
         ):
-            for entry in row.get(field) or []:
+            raw_entries = row.get(field)
+            entries = (
+                raw_entries
+                if isinstance(raw_entries, (list, tuple))
+                else []
+            )
+            for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 name = entry.get("name")
                 if name is None:
                     continue
                 bucket = sink.setdefault(str(name), [0, 0])
-                bucket[0] += int(entry.get("tokens") or 0)
-                bucket[1] += int(entry.get("wrong") or 0)
+                bucket[0] += _safe_count(entry.get("tokens"))
+                bucket[1] += _safe_count(entry.get("wrong"))
         basis = row.get("bad_case_error_frequency_basis")
         if basis is not None:
             frequency_bases.add(str(basis))
@@ -20686,15 +20714,21 @@ def bad_case_comparison_report(
             "wrong_tokens": wrong,
             "token_accuracy": row.get("bad_case_token_accuracy"),
             "error_category_counts": {
-                name: int(counts.get(name) or 0)
+                name: _safe_count(counts.get(name))
                 for name in category_names
             },
             "error_category_shares": {
                 name: shares.get(name)
                 for name in category_names
             },
-            "top_confusion": (
-                pairs[0] if pairs else None
+            "top_confusion": next(
+                (
+                    pair
+                    for pair in pairs
+                    if isinstance(pair, (list, tuple))
+                    and len(pair) >= 3
+                ),
+                None,
             ),
         })
 
@@ -21938,7 +21972,10 @@ def _periodic_auc_enabled(
     AUC 选型会自动启用周期 AUC，与显式 ``--periodic-auc``
     等价；协议记录生效值，避免两种等价配置被误报为不同口径。
     """
-    return bool(periodic_auc) or selection_metric in _AUC_METRIC_KEYS
+    return bool(periodic_auc) or (
+        isinstance(selection_metric, str)
+        and selection_metric in _AUC_METRIC_KEYS
+    )
 
 
 # 简单基线调参可用的目标指标：与对比指标同口径（含最终评估
@@ -22581,6 +22618,9 @@ def experiment_protocol_from_payload(
 
     if not isinstance(cfg, dict):
         cfg = {}
+    # 记录过的模式值可能来自手工编辑/旧版本的 JSON，类型不保证
+    # 是字符串；后面的集合成员判断必须先确认可哈希。
+    mode_value = cfg.get("mode")
     if not isinstance(run_args, dict):
         run_args = {}
     if not isinstance(data, dict):
@@ -22754,10 +22794,11 @@ def experiment_protocol_from_payload(
             cfg.get("loop_count"),
             (
                 1
-                if cfg.get("mode") in {"base", "dense"}
+                if isinstance(mode_value, str)
+                and mode_value in {"base", "dense"}
                 else 2
             )
-            if has_training and cfg.get("mode") is not None
+            if has_training and isinstance(mode_value, str)
             else None,
         ),
         "val_fraction": _pick(
