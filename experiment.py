@@ -7743,8 +7743,13 @@ def _interval_byte_counts(
         position = span_start
         while position < span_end:
             stop = min(position + step_bytes, span_end)
+            block_view = raw[position:stop]
+            # 只读 memoryview（如 memoryview(bytes)）不能安全传给
+            # torch.frombuffer：PyTorch 会警告它无法阻止写入。
             block = torch.frombuffer(
-                raw[position:stop],
+                bytearray(block_view)
+                if block_view.readonly
+                else block_view,
                 dtype=torch.uint8,
             )
             if block.numel() > 0:
@@ -7785,8 +7790,11 @@ def _interval_bigram_counts(
         position = span_start
         while position < span_end - 1:
             stop = min(position + step_bytes, span_end)
+            block_view = raw[position:stop]
             block = torch.frombuffer(
-                raw[position:stop],
+                bytearray(block_view)
+                if block_view.readonly
+                else block_view,
                 dtype=torch.uint8,
             )
             left = block[:-1].to(torch.int64)

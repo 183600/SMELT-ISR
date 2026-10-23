@@ -4471,6 +4471,23 @@ class ProcessTests(unittest.TestCase):
                 int(bigram_counts.sum()), expected_bigrams
             )
 
+    def test_interval_counts_accept_readonly_memoryview(self):
+        raw = memoryview(b"abracadabra")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            byte_counts = experiment._interval_byte_counts(
+                raw,
+                [(0, 11)],
+                chunk_bytes=3,
+            )
+            bigram_counts = experiment._interval_bigram_counts(
+                raw,
+                [(0, 11)],
+                chunk_bytes=3,
+            )
+        self.assertEqual(int(byte_counts.sum()), 11)
+        self.assertEqual(int(bigram_counts.sum()), 10)
+
     def test_include_test_in_cleaning_alias_is_effective(self):
         groups = [
             b"DUPAAAAA" if index == 0 else
