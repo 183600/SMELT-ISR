@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -8130,6 +8131,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             mode="dense",
             dense_fnn_hidden=32,
         ).validate()
+
+    def test_group_top_byte_share_avoids_readonly_buffer_warning(self):
+        # torch.frombuffer 不接受只读缓冲区：原实现先 bytes(...)
+        # 再 frombuffer，在 -W error 下会因 UserWarning 失败。
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            top, share = experiment._group_top_byte_share(
+                memoryview(b"aab"),
+                0,
+                3,
+            )
+        self.assertEqual(top, ord("a"))
+        self.assertAlmostEqual(share, 2.0 / 3.0)
 
 
 class NumericalScaleTests(unittest.TestCase):

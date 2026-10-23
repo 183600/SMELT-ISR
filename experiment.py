@@ -8670,7 +8670,11 @@ def _group_top_byte_share(
     if length <= 0:
         return 0, 0.0
 
-    content = bytes(raw[start:end])
+    # ``torch.frombuffer`` 不能安全承载只读缓冲区：PyTorch 会
+    # 发出 UserWarning（``-W error`` 下直接失败），因为它无法
+    # 阻止写入。这里用可写的 bytearray 复制切片，代价与原来的
+    # ``bytes(...)`` 复制相同。
+    content = bytearray(raw[start:end])
     counts = torch.bincount(
         torch.frombuffer(content, dtype=torch.uint8),
         minlength=256,
