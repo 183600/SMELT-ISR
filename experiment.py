@@ -63548,6 +63548,12 @@ def _design_power_for_family(
     """
     if not isinstance(power, dict):
         return power
+    try:
+        family_size = max(1, int(family_size))
+    except (TypeError, ValueError, OverflowError):
+        # 损坏/手工记录的家族规模不可转换时按单对比处理，
+        # 让后续重算走“缺字段”失败路径而不是抛原生异常。
+        family_size = 1
     declared = power.get("planned_comparisons")
     try:
         declared_contrasts = _normalize_contrast_types(

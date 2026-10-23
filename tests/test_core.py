@@ -6661,6 +6661,22 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNotNone(
             experiment.design_power_gate_error(design)
         )
+        # 家族规模本身损坏（inf/NaN）也不能在 int() 处抛异常。
+        guarded = experiment._design_power_for_family(
+            {
+                "expected_seed_sd_relative": 0.01,
+                "min_effect_relative": 0.01,
+                "target_power": 0.8,
+                "alpha": 0.05,
+                "planned_seeds": 6,
+                "planned_comparisons": 1,
+                "planned_contrasts": ["pairwise"],
+            },
+            float("inf"),
+            ["pairwise"],
+            force=True,
+        )
+        self.assertIsInstance(guarded, dict)
 
     def test_design_gate_handles_uncomputable_required_seeds(self):
         design = {
