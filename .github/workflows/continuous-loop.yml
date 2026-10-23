@@ -215,45 +215,17 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu \
             || echo "[warn] requirements-ci.txt 安装失败，跳过（不影响后续步骤）"
 
-      - name: Install AI harnesses (dsh primary, opencode fallback)
+      - name: Install opencode
         run: |
           set +e
-          npm i -g @deepseek-ai/dsh@0.2.1-rc.2
-          if command -v dsh >/dev/null 2>&1; then
-            dsh --version
-          else
-            echo "[warn] dsh 安装失败，将使用 opencode 兜底"
-          fi
           npm i -g opencode-ai
           if command -v opencode >/dev/null 2>&1; then
             opencode --version
           else
-            echo "[warn] opencode 安装失败"
-          fi
-          if ! command -v dsh >/dev/null 2>&1 && ! command -v opencode >/dev/null 2>&1; then
-            echo "[error] dsh 与 opencode 均不可用" >&2
+            echo "[error] opencode 安装失败" >&2
             exit 1
           fi
-
-      - name: Configure AI harnesses (dsh primary, opencode fallback)
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: |
-          set +e
-          mkdir -p ~/.config/opencode
-          if [ -n "$DEEPSEEK_API_KEY" ]; then
-            echo "[info] DEEPSEEK_API_KEY 已配置（dsh 使用）"
-          else
-            echo "[warn] DEEPSEEK_API_KEY 未配置：dsh 不可用，将走 opencode 免费模型"
-          fi
-          if command -v dsh >/dev/null 2>&1; then
-            echo "[info] dsh $(dsh --version) | provider=deepseek-official | model=deepseek-flash"
-          fi
-          if command -v opencode >/dev/null 2>&1; then
-            echo "[info] opencode $(opencode --version) | fallback ready"
-          fi
-
-      - name: Configure opencode permissions (fallback)
+      - name: Configure opencode permissions
         run: |
           mkdir -p ~/.config/opencode
           cat > ~/.config/opencode/opencode.json <<'EOF'
@@ -295,11 +267,10 @@ jobs:
           git config i18n.commitEncoding utf-8
           git config core.quotepath false
 
-      - name: Run dsh for ~3 hours (phases per iteration)
+      - name: Run opencode for ~3 hours (phases per iteration)
         if: steps.freeze.outputs.frozen != 'true'
         timeout-minutes: 180
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           set +e
@@ -336,31 +307,20 @@ jobs:
           CLEAN_TIMEOUT=$((3*3600))    # 3h
           APPLY_TIMEOUT=$((3*3600))    # 3h
 
-          # ================= 模型策略：独立双家族（失效只在家族内级联，不跨家族） =================
-          # NVIDIA 家族：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
-          #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1，
-          #             需要仓库 secret NVIDIA_API_KEY）。
-          # opencode 家族：opencode 自带的免费 deepseek（Zen 网关
-          #             deepseek-v4.1-flash-free，客户端内免鉴权，支持 tool call 与
-          #             reasoning effort）→ big-pickle。
-          # 候选顺序由 detect_provider 在 run 开始时按 NVIDIA_PROB 掷一次骰子决定，
-          # 选定后整个 run 固定（不再逐阶段探测/切换）。
-          # harness 固定为 DeepSeek Harness（dsh）：所有阶段一律通过 `dsh --profile headless ...` 调用。
-          # 实测：连续 13/13 个 NVIDIA 阶段全部被阶段预算杀掉，一次都没在预算内返回；
-          # 单个工具调用延迟约 121s，5 分钟只走 2~3 步；历史提交里 NVIDIA 只占约 4%。
-          # 默认关闭，需要时再打开。
-          NVIDIA_PROB=0
+          # ================= 模型策略：只用 opencode + Zen 免费模型 =================
+          # 已移除 DeepSeek Harness 与 DeepSeek 官方 API 接入：
+          #   - 不安装、不调用任何额外 harness，一律只用 opencode；
+          #   - 不读取 DeepSeek 官方 key，不访问 DeepSeek 官方端点；
+          #   - 所有阶段都通过 `opencode run -m <model> [--variant ...] "$prompt"` 调用。
+          # 主力：Zen 网关免费 deepseek-v4.1-flash-free（免鉴权，支持 tool call 与 reasoning effort）；
+          # 兜底：同为 Zen 网关免费的 big-pickle（Big Pickle）。
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
-          # opencode 家族内兜底：免费 deepseek 不可用（限流/下线/调用失败）时，
-          #           切换同为 Zen 网关免费的 big-pickle（Big Pickle）。
           PICKLE_MODEL="opencode/big-pickle"
-          NVIDIA_MODEL=""
-          NVIDIA_FLASH_MODEL=""
           CURRENT_PROVIDER=""
           BROKEN_PROVIDERS=""
-          # 本次 run 内选定的模型（探测只在 run 开始时做一次，见 detect_provider）
           SELECTED_MODEL=""
           SELECTED_PROVIDER=""
+          SELECTED_VARIANT=""
 
           mark_broken() {
             case ",$BROKEN_PROVIDERS," in *",$1,"*) ;; *) BROKEN_PROVIDERS="$BROKEN_PROVIDERS${BROKEN_PROVIDERS:+,}$1" ;; esac
@@ -369,169 +329,38 @@ jobs:
             case ",$BROKEN_PROVIDERS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
           }
 
-          # ---------- NVIDIA GLM 探测（NVIDIA 家族内两级：glm-5.3 → glm-5.3-flash） ----------
-          # 用法: probe_nvidia.py <primary|flash> —— primary 探测 glm-5.3（非 flash 版，
-          # 目录中不存在时输出 NOMODEL，由调用方在 NVIDIA 家族内降级 flash）；
-          # flash 探测 glm-5.3-flash。探测成功分别把 provider 配置写入
-          # opencode.nvidia.json / opencode.nvidia-flash.json
-          # （可选合并 $2 指定的基准配置，保留其中已有字段，如权限锁定）。
-          cat > /tmp/probe_nvidia.py <<'PYEOF'
-          import json, os, sys, urllib.request
-
-          def emit(status, model=''):
-              print((status + ' ' + model).strip())
-              sys.exit(0)
-
-          def norm(s):
-              return s.lower().replace('.', '-').replace('_', '-')
-
-          mode = sys.argv[1] if len(sys.argv) > 1 else 'primary'
-
-          key = os.environ.get('NVIDIA_API_KEY', '').strip()
-          if not key:
-              emit('DOWN')
-          try:
-              req = urllib.request.Request(
-                  'https://integrate.api.nvidia.com/v1/models',
-                  headers={'Authorization': 'Bearer ' + key})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  d = json.load(r)
-          except Exception:
-              emit('DOWN')
-
-          ids = [m.get('id', '') for m in (d.get('data') or []) if m.get('id')]
-
-          def pick(cands, target):
-              if not cands:
-                  return ''
-              def keyf(x):
-                  return (0 if norm(x.rsplit('/', 1)[-1]) == target else 1, len(x))
-              return sorted(cands, key=keyf)[0]
-
-          if mode == 'flash':
-              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)], 'glm-5-3-flash')
-          else:
-              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)], 'glm-5-3')
-          if not mid:
-              emit('NOMODEL')
-
-          cfg = {}
-          base = sys.argv[2] if len(sys.argv) > 2 else ''
-          if base and os.path.exists(base):
-              try:
-                  with open(base) as f:
-                      cfg = json.load(f)
-              except Exception:
-                  cfg = {}
-          cfg['$schema'] = 'https://opencode.ai/config.json'
-          cfg.setdefault('provider', {})
-          cfg['provider']['nvidia'] = {
-              'npm': '@ai-sdk/openai-compatible',
-              'name': 'NVIDIA',
-              'options': {
-                  'baseURL': 'https://integrate.api.nvidia.com/v1',
-                  'apiKey': '{env:NVIDIA_API_KEY}',
-              },
-              'models': {mid: {'name': mid}},
-          }
-          cfg['model'] = 'nvidia/' + mid
-          cfg_path = os.path.expanduser(
-              '~/.config/opencode/opencode.nvidia-flash.json' if mode == 'flash'
-              else '~/.config/opencode/opencode.nvidia.json')
-          try:
-              os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-              with open(cfg_path, 'w') as f:
-                  json.dump(cfg, f, indent=2, ensure_ascii=False)
-          except Exception:
-              pass
-          emit('OK', mid)
-          PYEOF
-
-          probe_nvidia() {
-            # $1: primary|flash —— 分别探测 glm-5.3 / glm-5.3-flash
-            local out st mid
-            out="$(python3 /tmp/probe_nvidia.py "$1" 2>/dev/null)" || out="DOWN"
-            st="${out%% *}"; mid="${out#* }"
-            if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
-              if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL="$mid"; else NVIDIA_MODEL="$mid"; fi
-              return 0
-            fi
-            if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL=""; else NVIDIA_MODEL=""; fi
-            return 1
-          }
-
-          # ---------- 切换 provider（每次调用都重写/清理配置，防 agent 篡改） ----------
-          switch_provider() {
-            case "$1" in
-              free|pickle)
-                rm -f "$HOME/.config/opencode/opencode.json" \
-                      "$HOME/.config/opencode/opencode.jsonc" \
-                      "$HOME/.config/opencode/config.json" 2>/dev/null
-                ;;
-              nvidia)
-                cp -f "$HOME/.config/opencode/opencode.nvidia.json" \
-                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
-                ;;
-              nvidia_flash)
-                cp -f "$HOME/.config/opencode/opencode.nvidia-flash.json" \
-                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
-                ;;
-            esac
-            CURRENT_PROVIDER="$1"
-          }
-
           # ---------- 一次性模型探测（每个 run 只做一次） ----------
           # run 开始时探测一次，选定 SELECTED_MODEL；之后所有阶段直接
-          #   dsh --profile headless "$prompt"
+          #   opencode run -m "$SELECTED_MODEL" "$prompt"
           # 只有收到 429 / 5xx / 连接失败 / 非零退出时，才重新探测并跳过已判定失效的候选。
-          # 候选顺序：按 NVIDIA_PROB 掷一次骰子决定 NVIDIA 家族是否优先，否则 opencode 家族优先。
-          # 注意：只看模型目录不够——必须真跑一次冒烟调用，否则会选中“连得上但永远跑不完”的
-          # 端点（实测 NVIDIA glm-5.3 单步 121s，13/13 个阶段全部被预算杀掉）。
+          # 注意：只看 /models 目录不够——必须真跑一次冒烟调用，否则会选中
+          # “连得上但永远跑不完”的端点。
           smoke_test() {
             local m="$1" extra=""
             case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
             # shellcheck disable=SC2086
-            timeout --kill-after=30 120 dsh --profile headless "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
           }
 
           detect_provider() {
-            local pass cand model order
+            local pass cand model
             for pass in 1 2; do
-              if [ "$NVIDIA_PROB" -gt 0 ] && [ $((RANDOM % 100)) -lt "$NVIDIA_PROB" ]; then
-                order="nvidia nvidia_flash free pickle"
-              else
-                order="free pickle nvidia nvidia_flash"
-              fi
-              for cand in $order; do
-                case "$cand" in
-                  nvidia|nvidia_flash) [ "$NVIDIA_PROB" -gt 0 ] || continue ;;
-                esac
+              for cand in free pickle; do
                 is_broken "$cand" && continue
                 case "$cand" in
-                  nvidia)
-                    probe_nvidia primary || { mark_broken nvidia; continue; }
-                    switch_provider nvidia
-                    model="nvidia/$NVIDIA_MODEL"
-                    ;;
-                  nvidia_flash)
-                    probe_nvidia flash || { mark_broken nvidia_flash; continue; }
-                    switch_provider nvidia_flash
-                    model="nvidia/$NVIDIA_FLASH_MODEL"
-                    ;;
-                  free)
-                    switch_provider free
-                    model="$FREE_MODEL"
-                    ;;
-                  pickle)
-                    switch_provider pickle
-                    model="$PICKLE_MODEL"
-                    ;;
+                  free)   model="$FREE_MODEL" ;;
+                  pickle) model="$PICKLE_MODEL" ;;
                 esac
                 if smoke_test "$model"; then
                   SELECTED_MODEL="$model"
                   SELECTED_PROVIDER="$cand"
-                  export SELECTED_MODEL
-                  echo "[provider] 选定 $model（$cand），本次 run 内固定使用，不再逐阶段探测"
+                  # 只有免费 deepseek 支持 reasoning effort 档位
+                  SELECTED_VARIANT=""
+                  [ "$cand" = "free" ] && SELECTED_VARIANT="${VARIANT:-}"
+                  CURRENT_MODEL="$SELECTED_MODEL"
+                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
+                  echo "[provider] 选定 $model（$cand）${SELECTED_VARIANT:+ variant=$SELECTED_VARIANT}，本次 run 内固定使用，不再逐阶段探测"
                   return 0
                 fi
                 echo "[warn] $model 冒烟测试失败/超时，换下一个候选"
@@ -542,11 +371,22 @@ jobs:
             done
             SELECTED_MODEL=""
             SELECTED_PROVIDER=""
+            SELECTED_VARIANT=""
+            CURRENT_MODEL=""
+            CURRENT_PROVIDER=""
+            export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
             return 1
           }
 
+          # 兼容两类调用点：旧代码叫 detect_provider，新代码叫 select_harness_model。
+          select_harness_model() {
+            detect_provider
+          }
+          oc_mark_broken() {
+            mark_broken "$1"
+          }
+
           # ---------- 思考强度（仅免费 deepseek 路径）：有 max 选 max，没有 max 选 high，否则不设置 ----------
-          # NVIDIA 家族（glm-5.3 / glm-5.3-flash）走 openai-compatible 端点，不设置思考强度。
           # 先刷新 opencode 的模型目录缓存（models.dev），再解析该模型支持的
           # reasoning effort 档位。检测失败时兜底 max（无效 variant 会被
           # opencode 静默忽略，不会导致调用失败）。
@@ -578,137 +418,9 @@ jobs:
             NONE)     VARIANT="" ;;
             *)        VARIANT="max" ;;
           esac
-          echo "[info] 候选顺序：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% 优先 / opencode(免费deepseek→big-pickle) 优先；免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] 免费池模型=$FREE_MODEL | 思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
           # run 开始时探测一次；失败也不阻塞，run_phase 需要时会再试
-          # ================= harness: dsh 主用，opencode 兜底 =================
-          # 首选 DeepSeek Harness（dsh + DeepSeek 官方 API）；当 dsh 无法安装、
-          # 无法执行、启动冒烟失败或阶段调用失败时，自动切换到 opencode。
-          # opencode 的调用方式与 2026-10-22 备份中的旧 workflow 完全一致：
-          #     opencode run -m "$SELECTED_MODEL" [--variant ...] "$prompt"
-          DSH_MODEL="deepseek-official/deepseek-flash"
-          HARNESS=""
-          SELECTED_MODEL=""
-          SELECTED_PROVIDER=""
-          SELECTED_VARIANT=""
-          CURRENT_MODEL=""
-          CURRENT_PROVIDER=""
-          OC_BROKEN=""
-
-          oc_mark_broken() {
-            [ -n "$1" ] || return 0
-            case ",$OC_BROKEN," in *",$1,"*) ;; *) OC_BROKEN="$OC_BROKEN${OC_BROKEN:+,}$1" ;; esac
-          }
-          oc_is_broken() {
-            case ",$OC_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
-          }
-
-          opencode_smoke() {
-            local m="$1" v="$2" extra=""
-            [ -n "$v" ] && extra="--variant $v"
-            # shellcheck disable=SC2086
-            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/oc_smoke_test.log 2>&1
-          }
-
-          opencode_detect() {
-            local cand v
-            # 与备份一致：优先 DeepSeek 官方 API（若该仓库原本支持），
-            # 然后走 opencode Zen 免费池 deepseek-v4.1-flash-free → big-pickle。
-            if declare -F probe_deepseek >/dev/null 2>&1 \
-               && declare -F switch_provider >/dev/null 2>&1 \
-               && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
-              if probe_deepseek; then
-                switch_provider deepseek
-                if opencode_smoke "deepseek/$DEEPSEEK_MODEL" ""; then
-                  SELECTED_MODEL="deepseek/$DEEPSEEK_MODEL"
-                  SELECTED_PROVIDER="deepseek"
-                  SELECTED_VARIANT=""
-                  CURRENT_MODEL="$SELECTED_MODEL"
-                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
-                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-                  echo "[provider] opencode 兜底选定 $SELECTED_MODEL（DeepSeek 官方 API）"
-                  return 0
-                fi
-              fi
-            fi
-            for cand in opencode/deepseek-v4.1-flash-free opencode/big-pickle; do
-              oc_is_broken "$cand" && continue
-              if [ "$cand" = "opencode/big-pickle" ]; then
-                if opencode_smoke "$cand" ""; then
-                  SELECTED_MODEL="$cand"
-                  SELECTED_PROVIDER="$cand"
-                  SELECTED_VARIANT=""
-                  CURRENT_MODEL="$SELECTED_MODEL"
-                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
-                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-                  echo "[provider] opencode 兜底选定 $cand"
-                  return 0
-                fi
-              else
-                for v in max high ""; do
-                  if opencode_smoke "$cand" "$v"; then
-                    SELECTED_MODEL="$cand"
-                    SELECTED_PROVIDER="$cand"
-                    SELECTED_VARIANT="$v"
-                    CURRENT_MODEL="$SELECTED_MODEL"
-                    CURRENT_PROVIDER="$SELECTED_PROVIDER"
-                    export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-                    echo "[provider] opencode 兜底选定 $cand${v:+ (variant=$v)}"
-                    return 0
-                  fi
-                done
-              fi
-              oc_mark_broken "$cand"
-            done
-            SELECTED_MODEL=""
-            SELECTED_PROVIDER=""
-            SELECTED_VARIANT=""
-            CURRENT_MODEL=""
-            CURRENT_PROVIDER=""
-            export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-            return 1
-          }
-
-          use_dsh() {
-            HARNESS="dsh"
-            SELECTED_MODEL="$DSH_MODEL"
-            SELECTED_PROVIDER="deepseek-official"
-            SELECTED_VARIANT=""
-            CURRENT_MODEL="$SELECTED_MODEL"
-            CURRENT_PROVIDER="$SELECTED_PROVIDER"
-            export HARNESS SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-            echo "[provider] 主 harness=dsh，模型=$SELECTED_MODEL"
-          }
-
-          switch_to_opencode() {
-            HARNESS="opencode"
-            SELECTED_MODEL=""
-            SELECTED_PROVIDER=""
-            SELECTED_VARIANT=""
-            CURRENT_MODEL=""
-            CURRENT_PROVIDER=""
-            export HARNESS
-            echo "[warn] dsh 不可用，切换到 opencode 兜底（调用方式与 2026-10-22 备份一致）"
-            opencode_detect
-          }
-
-          select_harness_model() {
-            if [ "$HARNESS" = "opencode" ]; then
-              opencode_detect
-              return $?
-            fi
-            if command -v dsh >/dev/null 2>&1; then
-              use_dsh
-              if timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1; then
-                return 0
-              fi
-              echo "[warn] dsh 冒烟测试失败（API key / 网络 / 配额 / 安装）"
-            else
-              echo "[warn] dsh 未安装"
-            fi
-            switch_to_opencode
-          }
-
-          if select_harness_model; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
+          if detect_provider; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
 
 
           i=0
@@ -826,14 +538,10 @@ jobs:
               record_model "$SELECTED_MODEL"
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$SELECTED_MODEL ==========="
               # shellcheck disable=SC2086
-              if [ "$HARNESS" = "dsh" ]; then
-                timeout --kill-after=180 "$budget_now" dsh --profile headless "$prompt" 2>&1 | tee "$OUT"
-              else
-                local oc_extra=""
-                [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
-                # shellcheck disable=SC2086
-                timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
-              fi
+              local oc_extra=""
+              [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
+              # shellcheck disable=SC2086
+              timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -847,17 +555,8 @@ jobs:
                 return $EC
               fi
 
-              # dsh 调用失败（非超时）→ 自动切到 opencode 兜底
-              if [ "$HARNESS" = "dsh" ]; then
-                echo "[warn] phase=$phase dsh 调用失败 (exit=$EC)，切换 opencode 兜底"
-                if switch_to_opencode; then
-                  continue
-                fi
-                SELECTED_MODEL=""
-                sleep 60
-                continue
-              fi
-              [ "$HARNESS" = "opencode" ] && oc_mark_broken "$SELECTED_MODEL"
+              # 调用失败（非超时）→ 标记该模型失效，下一轮重新探测
+              oc_mark_broken "$SELECTED_MODEL"
 
               # 429 限流 / 5xx / 连接失败：丢弃当前模型，下一次循环重新探测（并跳过它）
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
@@ -892,7 +591,7 @@ jobs:
           # 在写代码阶段（bug / sci）的 opencode 调用提交之后触发（调用点见主循环的
           # case "$phase" in bug|sci）。
           # 不再掷骰抽样——每次都跑一遍本仓库的测试；
-          # 跑不通 → 调用 dsh 修复 → 修复结果按本仓库既有提交路径落到 main。
+          # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main。
           maybe_run_tests() {
             local iter="$1"
             # 测试门 = 全量语法检查 + tests/ 下的快速回归（几十秒），
@@ -937,7 +636,7 @@ jobs:
               echo "[test-gate] 测试超时/被中断 (exit=$TG_EC)，结果不确定，本轮不修复"
               return 0
             fi
-            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 dsh 修复"
+            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 opencode 修复"
             local TG_FIX_BUDGET=$(( DEADLINE - $(date +%s) - 900 ))
             if [ "$TG_FIX_BUDGET" -lt 900 ]; then
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
