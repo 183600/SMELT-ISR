@@ -36627,6 +36627,20 @@ def preregistration_schema_error(
             return error
         if float(equivalence_margin) <= 0.0:  # type: ignore[arg-type]
             return "equivalence_margin 必须是正数"
+        # 等价界是「视为可忽略的最大差异」，min_effect 是「最小
+        # 有意义差异」。若前者大于后者，就存在一个既被本研究
+        # 称为有意义、又被等价性主张称为可忽略的效应区间，两个
+        # 结论会互相矛盾。边界相等可以接受（只是边界点重合）。
+        if float(equivalence_margin) > float(min_effect):  # type: ignore[arg-type]
+            return (
+                "equivalence_margin 大于 min_effect：等价界"
+                f"（{float(equivalence_margin):g}）比本研究声明的"
+                f"最小有意义效应（{float(min_effect):g}）还宽，"
+                "会存在同时被判定为「有意义」和「可忽略」的效应"
+                "区间。等价界应小于或等于 min_effect，并在训练前"
+                "固定；不能为了提高 TOST 功效而放宽到超过"
+                "min_effect"
+            )
 
     steps = payload.get("steps", _PREREGISTRATION_MISSING)
     if steps is not _PREREGISTRATION_MISSING:
@@ -44262,6 +44276,10 @@ def environment_mode_error(args) -> Optional[str]:
                 bool(getattr(args, "plan_design", False)),
             ),
             (
+                "--design-pilot-runs",
+                getattr(args, "design_pilot_runs", None) is not None,
+            ),
+            (
                 "--suite-modes",
                 getattr(args, "suite_modes", None) is not None,
             ),
@@ -45203,6 +45221,10 @@ def manifest_mode_error(args) -> Optional[str]:
             (
                 "--preregistration",
                 getattr(args, "preregistration", None) is not None,
+            ),
+            (
+                "--design-pilot-runs",
+                getattr(args, "design_pilot_runs", None) is not None,
             ),
             ("--data", getattr(args, "data", None) is not None),
             ("--out", getattr(args, "out", None) is not None),
@@ -61917,6 +61939,7 @@ _SWEEP_SINGLE_VALUE_FLAGS = (
 _SWEEP_MULTI_VALUE_FLAGS = (
     "--seeds",
     "--suite-modes",
+    "--design-pilot-runs",
     "--baseline-tuning-lrs",
     "--baseline-tuning-dense-hiddens",
     "--baseline-tuning-weight-decays",
@@ -62714,6 +62737,573 @@ def planned_contrast_types_for_plan(
     return ["pairwise"]
 
 
+_DESIGN_PILOT_SCHEMA_VERSION = 1
+# 试点证据只为「两格配对差值」的 sd 提供校准；少于 3 个配对
+# 种子时样本 sd 太不稳定，不作为硬门依据（仍报告点估计）。
+_DESIGN_PILOT_MIN_PAIRS = _MIN_SEEDS_FOR_STATS
+_PILOT_TREATMENT_FIELDS = (
+    "mode",
+    "balance_coef",
+    "k1",
+    "k2",
+    "top_k",
+    "dense_fnn_hidden",
+    "n_experts",
+    "expert_hidden",
+)
+
+
+def _pilot_treatment_key(row: Dict[str, object]) -> tuple:
+    """试点运行的处理单元身份：结构/处理轴，不含 seed/路径。"""
+    return tuple(
+        _stable_factor_key(row.get(field))
+        for field in _PILOT_TREATMENT_FIELDS
+    )
+
+
+def _pilot_cell_label(cell: Dict[str, object]) -> str:
+    """处理单元的可读标签（mode + 均衡系数）。"""
+    mode = cell.get("mode")
+    label = "?" if mode is None else str(mode)
+    balance = _finite_float(cell.get("balance_coef"))
+    if balance is not None:
+        label += f"@bal={balance:g}"
+    return label
+
+
+def _pilot_declared_check(
+    declared: Optional[float],
+    observed: Optional[float],
+) -> str:
+    """声明值 vs 试点观测值的判定（相对容差避免浮点边界误判）。"""
+    if declared is None:
+        return "not_declared"
+    if observed is None:
+        return "not_evaluable"
+    tolerance = 1e-12 + abs(float(declared)) * 1e-9
+    if float(observed) <= float(declared) + tolerance:
+        return "declared_at_least_observed"
+    return "declared_below_observed"
+
+
+def build_pilot_power_evidence(
+    pilot_runs: Sequence[object],
+    metric: str,
+    target_step: Optional[float] = None,
+    declared_sd: Optional[float] = None,
+    declared_attrition: Optional[float] = None,
+    planned_modes: Optional[Sequence[object]] = None,
+) -> Dict[str, object]:
+    """从试点/先前运行估计配对差值 sd 与脱落率，并对照声明值。
+
+    先验功效最薄弱的输入是 ``expected_seed_sd_relative`` 与
+    ``expected_attrition_rate``：二者若只凭研究者声明，看到结果
+    后把 sd 写小、把脱落率写低，就能让任何种子数「通过」设计门。
+    这里读取**已经完成的**试点/先前运行目录（含失败目录），按
+    相同 seed 配对估计两格差值的样本 sd，并按处理单元统计失败/
+    缺指标比例，作为设计计划的一部分冻结。
+
+    约束与口径：
+
+    - 只使用 val 口径指标；``*_at_common_step`` 与
+      ``val_loss_curve_mean_to_common_step`` 走与正式分析相同的
+      派生逻辑，其它指标直接读运行记录；
+    - 只把数值失败或缺失该指标的种子视为不可用；同一处理的
+      重复 seed 按一个独立观测折叠并显式告警；
+    - 配对 sd 取**所有可配对处理单元对**的最大值（保守上界），
+      相对化时用两单元均值中较小者作分母（同样偏保守）；
+    - 脱落率取各处理单元的最大值，而不是总体平均：某个臂更
+      容易崩掉时，总体平均会把它稀释；
+    - 这不是因果效应估计，也不保证试点协议与正式协议完全
+      可比；它只回答「声明的先验噪声/脱落是否至少与已观测
+      的运行一致」。
+    """
+    paths = [str(path) for path in pilot_runs]
+    rows = compare_runs(paths)
+
+    annotation_report: Optional[Dict[str, object]] = None
+    if metric in _COMMON_STEP_METRICS:
+        annotation_kind = "common_step"
+        annotation_report = annotate_common_step_metrics(
+            rows, target_step=target_step
+        )
+    elif metric == _CURVE_MEAN_METRIC:
+        annotation_kind = "curve_mean"
+        annotation_report = annotate_curve_metrics(
+            rows, target_step=target_step
+        )
+    elif metric == _COMPUTE_MATCHED_METRIC:
+        annotation_kind = "matched_flops"
+        annotation_report = annotate_compute_matched_metrics(rows)
+    else:
+        annotation_kind = "recorded_metric"
+
+    annotation: Dict[str, object] = {
+        "kind": annotation_kind,
+        "target_step": target_step,
+        "target_step_rule": None,
+        "target_step_data_dependent": None,
+    }
+    if isinstance(annotation_report, dict):
+        if annotation_kind == "curve_mean":
+            annotation["target_step"] = annotation_report.get(
+                "end_step", target_step
+            )
+            annotation["target_step_rule"] = annotation_report.get(
+                "end_rule"
+            )
+            annotation["target_step_data_dependent"] = (
+                annotation_report.get("end_data_dependent")
+            )
+        elif annotation_kind == "matched_flops":
+            annotation["target_step"] = annotation_report.get(
+                "target_flops"
+            )
+            annotation["target_step_rule"] = (
+                "min_last_curve_flops"
+            )
+            annotation["target_step_data_dependent"] = True
+        else:
+            annotation["target_step"] = annotation_report.get(
+                "target_step", target_step
+            )
+            annotation["target_step_rule"] = annotation_report.get(
+                "target_step_rule"
+            )
+            annotation["target_step_data_dependent"] = (
+                annotation_report.get(
+                    "target_step_data_dependent"
+                )
+            )
+        if annotation_report.get("advisories"):
+            annotation["advisories"] = list(
+                annotation_report["advisories"]
+            )
+
+    warnings: List[str] = []
+    source_runs: List[Dict[str, object]] = []
+    unassigned: List[str] = []
+    cells: Dict[tuple, Dict[str, object]] = {}
+
+    for row in rows:
+        mode = row.get("mode")
+        seed = row.get("seed")
+        run_name = str(row.get("run"))
+        value = _finite_float(row.get(metric))
+        status = row.get("numerical_status")
+        source_runs.append({
+            "run": run_name,
+            "path": row.get("path"),
+            "mode": mode,
+            "balance_coef": row.get("balance_coef"),
+            "seed": seed,
+            "numerical_status": status,
+            "value": value,
+        })
+        if (
+            mode is None
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+        ):
+            unassigned.append(run_name)
+            continue
+        key = _pilot_treatment_key(row)
+        cell = cells.setdefault(
+            key,
+            {
+                "mode": mode,
+                "balance_coef": row.get("balance_coef"),
+                "k1": row.get("k1"),
+                "k2": row.get("k2"),
+                "top_k": row.get("top_k"),
+                "dense_fnn_hidden": row.get("dense_fnn_hidden"),
+                "n_experts": row.get("n_experts"),
+                "expert_hidden": row.get("expert_hidden"),
+                "label": None,
+                "_seeds": {},
+            },
+        )
+        entry = cell["_seeds"].setdefault(
+            int(seed),
+            {"values": [], "failed": False, "duplicate": False},
+        )
+        if entry["values"] or entry["failed"]:
+            entry["duplicate"] = True
+        if status == "failed" or value is None:
+            entry["failed"] = True
+        else:
+            entry["values"].append(value)
+            entry["failed"] = False
+
+    finalized_cells: List[Dict[str, object]] = []
+    duplicate_seeds: List[str] = []
+    for key in sorted(cells, key=repr):
+        cell = cells[key]
+        cell["label"] = _pilot_cell_label(cell)
+        seed_entries = cell.pop("_seeds")
+        values_by_seed: Dict[int, float] = {}
+        duplicates = []
+        for seed, entry in seed_entries.items():
+            if entry["duplicate"]:
+                duplicates.append(seed)
+            if entry["values"]:
+                mean_value = _mean(entry["values"])
+                if mean_value is not None:
+                    values_by_seed[seed] = mean_value
+        n_attempted = len(seed_entries)
+        n_usable = len(values_by_seed)
+        n_failed = max(0, n_attempted - n_usable)
+        if duplicates:
+            duplicate_seeds.append(
+                f"{cell['label']} seed={sorted(duplicates)}"
+            )
+        cell["n_attempted"] = n_attempted
+        cell["n_usable"] = n_usable
+        cell["n_failed"] = n_failed
+        cell["attrition_rate"] = (
+            n_failed / n_attempted if n_attempted else None
+        )
+        cell["seed_values"] = {
+            str(seed): value
+            for seed, value in sorted(values_by_seed.items())
+        }
+        cell["seed_sd_abs"] = _sample_std(
+            list(values_by_seed.values())
+        )
+        cell_mean = _mean(list(values_by_seed.values()))
+        cell["mean"] = cell_mean
+        cell["seed_sd_relative"] = (
+            cell["seed_sd_abs"] / abs(cell_mean)
+            if cell["seed_sd_abs"] is not None
+            and cell_mean is not None
+            and cell_mean != 0.0
+            else None
+        )
+        finalized_cells.append(cell)
+
+    pairs: List[Dict[str, object]] = []
+    for index, first in enumerate(finalized_cells):
+        for second in finalized_cells[index + 1:]:
+            first_values = first["seed_values"]
+            second_values = second["seed_values"]
+            common = sorted(
+                set(first_values) & set(second_values), key=str
+            )
+            differences = [
+                float(second_values[seed])
+                - float(first_values[seed])
+                for seed in common
+            ]
+            paired_sd = _sample_std(differences)
+            first_mean = _mean(
+                [float(first_values[seed]) for seed in common]
+            )
+            second_mean = _mean(
+                [float(second_values[seed]) for seed in common]
+            )
+            denominator = None
+            if first_mean is not None and second_mean is not None:
+                denominator = min(
+                    abs(first_mean), abs(second_mean)
+                )
+            paired_sd_relative = (
+                paired_sd / denominator
+                if paired_sd is not None
+                and denominator is not None
+                and denominator > 0.0
+                else None
+            )
+            pairs.append({
+                "first": first["label"],
+                "second": second["label"],
+                "n_pairs": len(common),
+                "seeds": [int(seed) for seed in common],
+                "paired_sd_abs": paired_sd,
+                "paired_sd_relative": paired_sd_relative,
+                "relative_denominator": denominator,
+                "evaluable": bool(
+                    len(common) >= _DESIGN_PILOT_MIN_PAIRS
+                    and paired_sd is not None
+                ),
+            })
+
+    evaluable_pairs = [
+        pair for pair in pairs if pair.get("evaluable")
+    ]
+    observed_sd_abs = None
+    observed_sd_relative = None
+    absolute_values = [
+        float(pair["paired_sd_abs"])
+        for pair in evaluable_pairs
+        if _finite_float(pair.get("paired_sd_abs")) is not None
+    ]
+    relative_values = [
+        float(pair["paired_sd_relative"])
+        for pair in evaluable_pairs
+        if _finite_float(pair.get("paired_sd_relative")) is not None
+    ]
+    if absolute_values:
+        observed_sd_abs = max(absolute_values)
+    if relative_values:
+        observed_sd_relative = max(relative_values)
+
+    attempted = [
+        int(cell["n_attempted"])
+        for cell in finalized_cells
+        if cell.get("n_attempted")
+    ]
+    failed = [
+        int(cell["n_failed"])
+        for cell in finalized_cells
+        if cell.get("n_attempted")
+    ]
+    observed_attrition = None
+    cell_attrition = [
+        float(cell["attrition_rate"])
+        for cell in finalized_cells
+        if _finite_float(cell.get("attrition_rate")) is not None
+    ]
+    if cell_attrition:
+        observed_attrition = max(cell_attrition)
+    overall_attrition = (
+        sum(failed) / sum(attempted) if sum(attempted) else None
+    )
+
+    if unassigned:
+        warnings.append(
+            "以下试点运行缺少 mode/整数 seed，无法归入处理单元: "
+            + ", ".join(unassigned[:5])
+        )
+    if duplicate_seeds:
+        warnings.append(
+            "试点运行存在同一处理内重复 seed，已按一个独立"
+            "观测折叠: " + "; ".join(duplicate_seeds[:5])
+        )
+    insufficient = [
+        pair for pair in pairs if not pair.get("evaluable")
+    ]
+    if insufficient:
+        warnings.append(
+            f"{len(insufficient)} 个处理单元对的共同 seed 少于 "
+            f"{_DESIGN_PILOT_MIN_PAIRS} 个或 sd 不可计算，未参与"
+            "试点 sd 上界"
+        )
+    if len(paths) < 6:
+        warnings.append(
+            "试点运行少于 6 个，配对 sd 的点估计很不稳定；"
+            "这里只能作为下界预警，不能当作精确方差"
+        )
+    pilot_modes = {
+        str(cell.get("mode"))
+        for cell in finalized_cells
+        if cell.get("mode") is not None
+    }
+    planned_mode_set = {
+        str(mode)
+        for mode in (planned_modes or [])
+        if mode is not None
+    }
+    missing_modes = sorted(planned_mode_set - pilot_modes)
+    extra_modes = sorted(pilot_modes - planned_mode_set)
+    if missing_modes:
+        warnings.append(
+            "试点运行未覆盖计划中的模式，sd 估计不能代表这些臂: "
+            + ", ".join(missing_modes)
+        )
+    if extra_modes:
+        warnings.append(
+            "试点运行包含计划外的模式（只作参考，不改变计划）: "
+            + ", ".join(extra_modes)
+        )
+    if observed_attrition is not None and observed_attrition >= 1.0:
+        warnings.append(
+            "至少一个处理单元的全部试点运行都不可用："
+            "该臂在当前口径下没有可估计的脱落率与方差"
+        )
+
+    sd_status = _pilot_declared_check(
+        declared_sd, observed_sd_relative
+    )
+    attrition_status = _pilot_declared_check(
+        declared_attrition, observed_attrition
+    )
+    sd_check = {
+        "declared": declared_sd,
+        "observed": observed_sd_relative,
+        "observed_absolute": observed_sd_abs,
+        "ratio_observed_over_declared": (
+            observed_sd_relative / declared_sd
+            if observed_sd_relative is not None
+            and declared_sd
+            and declared_sd > 0.0
+            else None
+        ),
+        "status": sd_status,
+        "min_pairs": _DESIGN_PILOT_MIN_PAIRS,
+        "n_evaluable_pairs": len(evaluable_pairs),
+        "note": (
+            "observed 取各可评估处理单元对配对差值样本 sd 的"
+            "最大值；相对化分母取两单元均值中较小者"
+        ),
+    }
+    attrition_check = {
+        "declared": declared_attrition,
+        "observed": observed_attrition,
+        "observed_overall": overall_attrition,
+        "status": attrition_status,
+        "unusable": bool(
+            observed_attrition is not None
+            and observed_attrition >= 1.0
+        ),
+        "note": (
+            "observed 取各处理单元脱落率的最大值；失败包括"
+            "数值失败与缺失该指标，pilot 目录必须包含失败运行"
+        ),
+    }
+
+    return {
+        "schema": f"smelt-isr/design-pilot/v{_DESIGN_PILOT_SCHEMA_VERSION}",
+        "metric": metric,
+        "metric_annotation": annotation,
+        "source_run_count": len(paths),
+        "parsed_run_count": len(rows),
+        "cell_count": len(finalized_cells),
+        "pair_count": len(pairs),
+        "cells": finalized_cells,
+        "pairs": pairs,
+        "source_runs": source_runs,
+        "observed_paired_sd_abs": observed_sd_abs,
+        "observed_paired_sd_relative": observed_sd_relative,
+        "observed_attrition_rate": observed_attrition,
+        "observed_overall_attrition_rate": overall_attrition,
+        "declared_expected_seed_sd_relative": declared_sd,
+        "declared_expected_attrition_rate": declared_attrition,
+        "sd_check": sd_check,
+        "attrition_check": attrition_check,
+        "arm_coverage": {
+            "planned_modes": sorted(planned_mode_set),
+            "pilot_modes": sorted(pilot_modes),
+            "missing_modes": missing_modes,
+            "extra_modes": extra_modes,
+        },
+        "warnings": warnings,
+        "applied_to_power": False,
+        "note": (
+            "试点证据只校准先验 sd 与脱落率，不替代正式运行的"
+            "实测方差/失败率；试点协议与正式协议不可比时不能"
+            "把观测值直接当作目标设计的真实 sigma"
+        ),
+    }
+
+
+def _apply_pilot_evidence_to_power(
+    power: Optional[Dict[str, object]],
+    evidence: Optional[Dict[str, object]],
+) -> Tuple[Optional[Dict[str, object]], bool]:
+    """把试点观测到的更大 sd/脱落率上调进设计功效输入。
+
+    若声明值低于试点观测值，设计计划不能继续沿用「按较小 sd
+    算出来」的 adequate；这里用观测值替换后强制重算。替换是
+    **单向**的：试点观测更小不会把声明值调小，避免用一次小
+    样本试点反向放宽预注册的保守假设。
+    """
+    if not isinstance(power, dict) or not isinstance(evidence, dict):
+        return power, False
+    adjusted = dict(power)
+    changed = False
+    sd_adjusted = False
+    attrition_adjusted = False
+    sd_check = _as_dict(evidence.get("sd_check"))
+    if sd_check.get("status") == "declared_below_observed":
+        observed = _finite_float(
+            evidence.get("observed_paired_sd_relative")
+        )
+        if observed is not None and observed > 0.0:
+            adjusted["pilot_declared_expected_seed_sd_relative"] = (
+                power.get("expected_seed_sd_relative")
+            )
+            adjusted["expected_seed_sd_relative"] = observed
+            adjusted["pilot_adjusted_expected_seed_sd_relative"] = (
+                observed
+            )
+            sd_adjusted = True
+            changed = True
+    attrition_check = _as_dict(evidence.get("attrition_check"))
+    if attrition_check.get("status") == "declared_below_observed":
+        observed = _finite_float(
+            evidence.get("observed_attrition_rate")
+        )
+        if observed is not None and 0.0 <= observed < 1.0:
+            adjusted["pilot_declared_expected_attrition_rate"] = (
+                power.get("expected_attrition_rate")
+            )
+            adjusted["expected_attrition_rate"] = observed
+            adjusted["pilot_adjusted_expected_attrition_rate"] = (
+                observed
+            )
+            attrition_adjusted = True
+            changed = True
+    evidence["applied_to_power"] = changed
+    evidence["adjusted_power_inputs"] = (
+        {
+            "sd_adjusted": sd_adjusted,
+            "attrition_adjusted": attrition_adjusted,
+            "declared_expected_seed_sd_relative": power.get(
+                "expected_seed_sd_relative"
+            ),
+            "effective_expected_seed_sd_relative": adjusted.get(
+                "expected_seed_sd_relative"
+            ),
+            "declared_expected_attrition_rate": power.get(
+                "expected_attrition_rate"
+            ),
+            "effective_expected_attrition_rate": adjusted.get(
+                "expected_attrition_rate"
+            ),
+        }
+        if changed
+        else None
+    )
+    return adjusted, changed
+
+
+def _pilot_gate_note(evidence: object) -> str:
+    """把试点证据里「声明被观测超过」的项写成硬门说明。"""
+    if not isinstance(evidence, dict):
+        return ""
+    parts: List[str] = []
+    sd_check = _as_dict(evidence.get("sd_check"))
+    if sd_check.get("status") == "declared_below_observed":
+        parts.append(
+            "试点观测的配对差值 sd≈"
+            f"{_format_finite(sd_check.get('observed'), 'g')}"
+            " 高于预注册 "
+            f"{_format_finite(sd_check.get('declared'), 'g')}"
+        )
+    attrition_check = _as_dict(evidence.get("attrition_check"))
+    if attrition_check.get("status") == "declared_below_observed":
+        parts.append(
+            "试点观测的脱落率≈"
+            f"{_format_finite(attrition_check.get('observed'), '.1%')}"
+            " 高于预注册 "
+            f"{_format_finite(attrition_check.get('declared'), '.1%')}"
+        )
+    if attrition_check.get("unusable"):
+        parts.append("至少一个处理单元的全部试点运行都不可用")
+    if not parts:
+        return ""
+    applied = bool(evidence.get("applied_to_power"))
+    return (
+        "；".join(parts)
+        + (
+            "；设计计划已按试点观测值重算功效"
+            if applied
+            else "；设计计划未能按试点观测值重算功效"
+        )
+        + "。"
+    )
+
+
 def _training_budget_summary(
     args: argparse.Namespace,
     n_runs: int,
@@ -62764,6 +63354,8 @@ def _design_power_for_family(
     power: Optional[Dict[str, object]],
     family_size: int,
     contrast_types: Optional[List[str]] = None,
+    *,
+    force: bool = False,
 ) -> Optional[Dict[str, object]]:
     """把先验功效记录对齐到计划实际展开的家族规模与对比类型。
 
@@ -62772,6 +63364,11 @@ def _design_power_for_family(
     也可能只声明了两两对比，而消融实际还会估计主效应/交互/简单
     效应。设计计划必须按更大的实际家族与更吃种子的对比类型重新
     计算所需种子数，否则会在功效不足的设计上宣称稳健主张可行。
+
+    ``force=True`` 用于试点证据把 ``expected_seed_sd_relative``
+    或 ``expected_attrition_rate`` 上调后强制重算：此时家族规模
+    与对比类型可能没有变化，但功效输入已经变了，不能沿用旧的
+    ``adequate``。
     """
     if not isinstance(power, dict):
         return power
@@ -62801,7 +63398,7 @@ def _design_power_for_family(
     contrasts_grew = set(effective_contrasts) != set(
         declared_contrasts
     )
-    if not family_grew and not contrasts_grew:
+    if not family_grew and not contrasts_grew and not force:
         return power
 
     adjusted = dict(power)
@@ -62935,12 +63532,81 @@ def write_design_plan(
     # 计划实际会估计的对比类型（消融含主效应/交互/简单效应）。
     # 先验功效必须按最吃种子的类型判定，不能只按两两对比。
     planned_contrasts = planned_contrast_types_for_plan(plan)
+    pilot_evidence: Optional[Dict[str, object]] = None
+    pilot_runs = getattr(args, "design_pilot_runs", None)
+    if pilot_runs:
+        declared_sd = None
+        declared_attrition = None
+        if power is not None:
+            declared_sd = _finite_float(
+                power.get("expected_seed_sd_relative")
+            )
+            declared_attrition = _finite_float(
+                power.get("expected_attrition_rate")
+            )
+        metric = (
+            getattr(args, "primary_metric", None)
+            or prereg.get("primary_metric")
+            or "val_loss"
+        )
+        pilot_evidence = build_pilot_power_evidence(
+            list(pilot_runs),
+            str(metric),
+            target_step=getattr(args, "common_step", None),
+            declared_sd=declared_sd,
+            declared_attrition=declared_attrition,
+            planned_modes=[
+                item.get("mode")
+                for item in plan
+                if item.get("mode") is not None
+            ],
+        )
+        power, pilot_adjusted = _apply_pilot_evidence_to_power(
+            power, pilot_evidence
+        )
+    else:
+        pilot_adjusted = False
     # 内嵌的 power 记录必须与计划实际家族/对比类型同口径，否则
     # 设计文件一边按实际计划算 seed_plan，一边保留低估的
-    # required_seeds。
+    # required_seeds。试点证据把 sd/脱落率上调后必须强制重算，
+    # 即使家族规模与对比类型没有变化。
     power = _design_power_for_family(
-        power, planned_comparisons, planned_contrasts
+        power,
+        planned_comparisons,
+        planned_contrasts,
+        force=pilot_adjusted,
     )
+    if pilot_adjusted and isinstance(power, dict):
+        power["power_recomputed_for_pilot"] = True
+        pilot_inputs = _as_dict(
+            pilot_evidence.get("adjusted_power_inputs")
+        )
+        if pilot_inputs.get("sd_adjusted"):
+            power["pilot_declared_expected_seed_sd_relative"] = (
+                pilot_inputs.get(
+                    "declared_expected_seed_sd_relative"
+                )
+            )
+            power["pilot_adjusted_expected_seed_sd_relative"] = (
+                pilot_inputs.get(
+                    "effective_expected_seed_sd_relative"
+                )
+            )
+        if pilot_inputs.get("attrition_adjusted"):
+            power["pilot_declared_expected_attrition_rate"] = (
+                pilot_inputs.get(
+                    "declared_expected_attrition_rate"
+                )
+            )
+            power["pilot_adjusted_expected_attrition_rate"] = (
+                pilot_inputs.get(
+                    "effective_expected_attrition_rate"
+                )
+            )
+        if power.get("adequacy_recomputed") is False:
+            pilot_evidence["power_recompute_error"] = power.get(
+                "adequacy_recompute_error"
+            )
     seeds = [
         int(seed)
         for seed in (getattr(args, "seeds", None) or [])
@@ -62996,6 +63662,11 @@ def write_design_plan(
         "seed_plan": seed_plan,
         "training_budget": budget,
     }
+    if pilot_evidence is not None:
+        # 只有实际提供试点运行时才写入该键：旧计划的 plan_id
+        # 不含此字段，不能在重新生成时因「多了一个 null」而
+        # 被误判成另一份设计、拒绝覆盖。
+        core["pilot_evidence"] = pilot_evidence
     plan_id = _design_plan_id(core)
     payload = dict(core)
     payload["plan_id"] = plan_id
@@ -63051,6 +63722,7 @@ def write_design_plan(
         "planned_comparisons": int(planned_comparisons),
         "planned_contrasts": list(planned_contrasts),
         "power": power,
+        "pilot_evidence": pilot_evidence,
         "seed_plan": seed_plan,
         "training_budget": budget,
     }
@@ -66144,6 +66816,76 @@ def print_design_summary(design: Dict[str, object]) -> None:
             "可算，不保证能检出预注册的最小效应；建议在 "
             "preregistration.json 中声明 expected_seed_sd_relative"
         )
+    pilot = design.get("pilot_evidence")
+    if isinstance(pilot, dict):
+        annotation = _as_dict(pilot.get("metric_annotation"))
+        print(
+            "[design][pilot] 试点证据："
+            f"{pilot.get('source_run_count')} 个运行、"
+            f"{pilot.get('cell_count')} 个处理单元、"
+            f"{pilot.get('pair_count')} 个可配对单元对；指标="
+            f"{pilot.get('metric')}（"
+            f"{annotation.get('kind')}，target_step="
+            f"{_format_finite(annotation.get('target_step'), 'g')}）"
+        )
+        if annotation.get("target_step_data_dependent"):
+            print(
+                "[design][pilot][warn] 试点指标的共同步数由"
+                "观测端点决定（未固定 --common-step）："
+                "sd 估计依赖这批试点曲线的长度，正式设计应固定"
+                "共同步数后重算"
+            )
+        sd_check = _as_dict(pilot.get("sd_check"))
+        if sd_check.get("status") == "declared_below_observed":
+            print(
+                "[design][pilot][warn] 试点配对差值 sd≈"
+                f"{_format_finite(sd_check.get('observed'), 'g')}"
+                " 高于预注册 "
+                f"{_format_finite(sd_check.get('declared'), 'g')}"
+                + (
+                    "；设计功效已按试点观测值重算"
+                    if pilot.get("applied_to_power")
+                    else "；设计功效未能按试点观测值重算"
+                )
+            )
+        elif sd_check.get("status") == "declared_at_least_observed":
+            print(
+                "[design][pilot] 预注册 sd≈"
+                f"{_format_finite(sd_check.get('declared'), 'g')}"
+                " 不低于试点观测 "
+                f"{_format_finite(sd_check.get('observed'), 'g')}"
+                f"（{sd_check.get('n_evaluable_pairs')} 个可评估"
+                "单元对）"
+            )
+        else:
+            print(
+                "[design][pilot][warn] 试点证据无法估计配对差值 "
+                "sd（共同 seed 少于 "
+                f"{sd_check.get('min_pairs')} 个或指标不可用）："
+                "不能据此核对预注册 sd"
+            )
+        attrition_check = _as_dict(pilot.get("attrition_check"))
+        if attrition_check.get("status") == "declared_below_observed":
+            print(
+                "[design][pilot][warn] 试点脱落率≈"
+                f"{_format_finite(attrition_check.get('observed'), '.1%')}"
+                " 高于预注册 "
+                f"{_format_finite(attrition_check.get('declared'), '.1%')}"
+                + (
+                    "；所需启动种子已按观测脱落率重算"
+                    if pilot.get("applied_to_power")
+                    else "；所需启动种子未能按观测脱落率重算"
+                )
+            )
+        elif attrition_check.get("status") == "declared_at_least_observed":
+            print(
+                "[design][pilot] 预注册脱落率 "
+                f"{_format_finite(attrition_check.get('declared'), '.1%')}"
+                " 不低于试点观测 "
+                f"{_format_finite(attrition_check.get('observed'), '.1%')}"
+            )
+        for warning in list(pilot.get("warnings") or [])[:4]:
+            print(f"[design][pilot][warn] {warning}")
     print(
         f"[design] 设计计划已写入 {design['path']}"
         "（子进程开跑前会重新核对指纹与自己的分配）"
@@ -66160,15 +66902,42 @@ def design_power_gate_error(
     检查；套件真正展开的家族可能更大（全部臂两两对比），消融还
     会估计方差更大的交互。设计计划重算后仍不足时，必须在开跑前
     拒绝，而不是等分析时再说「交互不显著」。
+
+    ``pilot_evidence`` 存在时还检查试点运行是否至少留下一个可用
+    单元；某个臂的全部试点运行都失败/缺指标时，声明 sd 与脱落率
+    都无从核对，不能当作「功效足够」放行。
     """
     power = design.get("power")
-    if not isinstance(power, dict):
+    pilot_evidence = design.get("pilot_evidence")
+    pilot_note = _pilot_gate_note(pilot_evidence)
+    acknowledged = (
+        isinstance(power, dict)
+        and (
+            power.get("underpowered_acknowledged")
+            or allow_underpowered
+        )
+    )
+    if acknowledged:
         return None
     if (
-        power.get("adequate")
-        or power.get("underpowered_acknowledged")
-        or allow_underpowered
+        isinstance(pilot_evidence, dict)
+        and _as_dict(
+            pilot_evidence.get("attrition_check")
+        ).get("unusable")
     ):
+        return (
+            "设计计划显示试点运行证据不可用："
+            + pilot_note
+            + "至少一个处理单元的全部试点运行都因数值失败/缺"
+            "指标而不可用；这不是「功效不足」，而是该臂在当前"
+            "口径下没有可估计的方差与脱落率。请先修复该臂或"
+            "补齐试点运行，再用新的 --out 重新生成设计计划；"
+            "确需在不足设计中探索，请显式设置 "
+            "underpowered_acknowledged=true 并写明 justification"
+        )
+    if not isinstance(power, dict):
+        return None
+    if power.get("adequate"):
         return None
     if (
         power.get("plan_equivalence")
@@ -66190,7 +66959,8 @@ def design_power_gate_error(
         if margin_relative is None:
             margin_relative = 0.0
         return (
-            "设计计划显示等价性（TOST）功效不足：等价界 ±"
+            pilot_note
+            + "设计计划显示等价性（TOST）功效不足：等价界 ±"
             f"{_format_finite(margin_relative, 'g')}、"
             "真实差异为零、目标功效 "
             f"{power.get('target_power')}、家族规模 "
@@ -66221,7 +66991,8 @@ def design_power_gate_error(
     )
     planned = power.get("planned_seeds")
     return (
-        "设计计划显示先验功效不足：计划实际展开的最吃种子对比"
+        pilot_note
+        + "设计计划显示先验功效不足：计划实际展开的最吃种子对比"
         f"类型是 {binding}（{binding_label}），至少需要 "
         f"{required} 个启动种子，计划只有 {planned} 个；"
         f"家族规模 {power.get('planned_comparisons')}、目标功效 "
@@ -67419,6 +68190,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--design-pilot-runs",
+        nargs="+",
+        default=None,
+        metavar="RUN",
+        help=(
+            "试点/先前运行目录（必须包含失败目录）：从相同 seed"
+            " 的配对差值估计实际种子间 sd，并按处理单元估计"
+            "脱落率，与预注册 power 的 expected_seed_sd_relative /"
+            " expected_attrition_rate 对照。观测值更大时设计计划"
+            "按观测值强制重算功效并写入 pilot_evidence；仍不足"
+            "则在第一个子进程前拒绝。需配合 --preregistration 与"
+            " --seeds/--plan-design"
+        ),
+    )
+    parser.add_argument(
         "--run-order",
         type=str,
         default=None,
@@ -67871,6 +68657,74 @@ def main():
                 else "；命令行与预注册逐项一致"
             )
         )
+
+    # 试点证据必须与预注册的 power 一起使用：没有声明值就没有
+    # 可核对的「先验 sd/脱落率」，读取试点运行只会变成另一份
+    # 未冻结的描述性统计。
+    if args.design_pilot_runs is not None:
+        pilot_conflicts = [
+            flag
+            for flag, active in (
+                ("--compare", args.compare is not None),
+                (
+                    "--final-test-comparison",
+                    args.final_test_comparison is not None,
+                ),
+                ("--evaluate-test", bool(args.evaluate_test)),
+                ("--resume", args.resume is not None),
+                ("--sanity-only", bool(args.sanity_only)),
+                (
+                    "--statistical-baseline",
+                    bool(args.statistical_baseline),
+                ),
+                (
+                    "--suite-baseline-tuning",
+                    bool(args.suite_baseline_tuning),
+                ),
+            )
+            if active
+        ]
+        if pilot_conflicts:
+            parser.error(
+                "--design-pilot-runs 只用于训练前的设计校准，"
+                "不能与以下只读/评估/恢复入口同时使用: "
+                + ", ".join(pilot_conflicts)
+            )
+        if args.preregistration is None:
+            parser.error(
+                "--design-pilot-runs 需要 --preregistration："
+                "试点证据必须对照预注册 power 中声明的 "
+                "expected_seed_sd_relative 与 "
+                "expected_attrition_rate，不能只生成一份未冻结的"
+                "描述性统计"
+            )
+        if args.seeds is None:
+            parser.error(
+                "--design-pilot-runs 需要 --seeds（或由预注册文件"
+                "补齐 seeds）：试点证据用于设计计划，单次训练"
+                "没有计划可校准"
+            )
+        prereg_power = None
+        if isinstance(
+            getattr(args, "preregistration_record", None), dict
+        ):
+            prereg_power = args.preregistration_record.get("power")
+        if not isinstance(prereg_power, dict):
+            parser.error(
+                "--design-pilot-runs 需要预注册文件包含 power 块："
+                "没有 expected_seed_sd_relative / "
+                "expected_attrition_rate 就没有可对照的先验声明"
+            )
+        missing_pilot = [
+            path
+            for path in args.design_pilot_runs
+            if not Path(path).is_dir()
+        ]
+        if missing_pilot:
+            parser.error(
+                "--design-pilot-runs 的试点运行目录不存在: "
+                + ", ".join(missing_pilot)
+            )
 
     if (
         args.wsd_stable_steps is not None
@@ -68397,6 +69251,10 @@ def main():
                     bool(args.suite_baseline_tuning),
                 ),
                 ("--plan-design", bool(args.plan_design)),
+                (
+                    "--design-pilot-runs",
+                    args.design_pilot_runs is not None,
+                ),
             )
             if active
         ]

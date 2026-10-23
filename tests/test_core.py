@@ -2267,6 +2267,27 @@ class DesignPreparationTests(unittest.TestCase):
             record["power"]["underpowered_acknowledged"]
         )
 
+    def test_preregistration_rejects_equivalence_margin_above_min_effect(self):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 62))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "plan_equivalence": True,
+        }
+        # min_effect=0.01；等价界比「最小有意义效应」还宽，
+        # 会让同一效应既算有意义又算可忽略。边界相等可接受。
+        payload["equivalence_margin"] = 0.011
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("equivalence_margin", error)
+        self.assertIn("min_effect", error)
+        payload["equivalence_margin"] = 0.01
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+
     def test_design_power_recomputes_equivalence_for_larger_family(self):
         power = {
             "expected_seed_sd_relative": 0.005,
@@ -2530,6 +2551,241 @@ class DesignPreparationTests(unittest.TestCase):
             self.assertIsNone(
                 experiment.design_power_gate_error(acknowledged)
             )
+
+    def _write_pilot_run(
+        self,
+        root: Path,
+        mode: str,
+        seed: int,
+        value: float,
+        *,
+        failed: bool = False,
+        balance_coef: float = 0.01,
+    ) -> Path:
+        run_dir = root / f"{mode}_seed{seed}"
+        run_dir.mkdir()
+        (run_dir / "config.json").write_text(
+            json.dumps({
+                "config": {
+                    "mode": mode,
+                    "balance_coef": balance_coef,
+                },
+                "args": {"seed": seed},
+            }),
+            encoding="utf-8",
+        )
+        final = {
+            "step": "final",
+            "val_loss": value,
+            "numerical_integrity_ok": True,
+        }
+        if failed:
+            final["numerical_stop"] = True
+        (run_dir / "metrics.jsonl").write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"step": 100, "val_loss": value},
+                    final,
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return run_dir
+
+    def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
+        smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
+        variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 6)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, smelt[index]
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root,
+                        "A",
+                        seed,
+                        variant[index],
+                        failed=(seed == 5),
+                    ))
+                )
+            evidence = (
+                experiment.build_pilot_power_evidence(
+                    paths,
+                    "val_loss",
+                    target_step=100,
+                    declared_sd=0.0001,
+                    declared_attrition=0.0,
+                    planned_modes=["smelt", "A", "B"],
+                )
+            )
+
+        self.assertEqual(evidence["cell_count"], 2)
+        self.assertEqual(evidence["pair_count"], 1)
+        pair = evidence["pairs"][0]
+        # A 的第 5 个种子数值失败，不能进入配对差值。
+        self.assertEqual(pair["n_pairs"], 4)
+        self.assertTrue(pair["evaluable"])
+        self.assertIsNotNone(pair["paired_sd_abs"])
+        self.assertGreater(
+            evidence["observed_paired_sd_relative"], 0.0001
+        )
+        self.assertEqual(
+            evidence["sd_check"]["status"],
+            "declared_below_observed",
+        )
+        self.assertAlmostEqual(
+            evidence["attrition_check"]["observed"], 0.2
+        )
+        self.assertEqual(
+            evidence["attrition_check"]["status"],
+            "declared_below_observed",
+        )
+        self.assertEqual(
+            evidence["arm_coverage"]["missing_modes"], ["B"]
+        )
+        self.assertTrue(
+            any(
+                "未覆盖计划中的模式" in warning
+                for warning in evidence["warnings"]
+            )
+        )
+
+    def test_design_plan_recomputes_power_from_pilot_runs(self):
+        smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998, 1.0001]
+        variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947, 0.9952]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 7)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, smelt[index]
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root,
+                        "A",
+                        seed,
+                        variant[index],
+                        failed=(seed == 6),
+                    ))
+                )
+            args = argparse.Namespace(
+                seeds=[1, 2, 3, 4, 5, 6],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                suite_modes=["smelt", "A"],
+                suite_ablation=False,
+                ablation_modes=None,
+                balance_coef=0.01,
+                mode="A",
+                primary_metric="val_loss",
+                common_step=100,
+                run_order="randomized",
+                run_order_seed=5,
+                design_pilot_runs=paths,
+                preregistration_record={
+                    "study_id": "pilot-power-test",
+                    "primary_metric": "val_loss",
+                    "power": {
+                        "expected_seed_sd_relative": 0.0001,
+                        "min_effect_relative": 0.0005,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "planned_comparisons": 1,
+                        "planned_contrasts": ["pairwise"],
+                        "planned_seeds": 6,
+                        "expected_attrition_rate": 0.0,
+                        "underpowered_acknowledged": False,
+                        "adequate": True,
+                    },
+                },
+            )
+            _, design, _ = experiment.build_sweep_execution(
+                args, root / "plan"
+            )
+
+        power = design["power"]
+        self.assertTrue(power["power_recomputed_for_pilot"])
+        self.assertGreater(
+            power["expected_seed_sd_relative"], 0.0001
+        )
+        self.assertAlmostEqual(
+            power["expected_attrition_rate"], 1.0 / 6.0
+        )
+        self.assertEqual(
+            design["pilot_evidence"]["sd_check"]["status"],
+            "declared_below_observed",
+        )
+        self.assertEqual(
+            design["pilot_evidence"]["attrition_check"]["status"],
+            "declared_below_observed",
+        )
+        self.assertTrue(
+            design["pilot_evidence"]["applied_to_power"]
+        )
+        self.assertFalse(power["adequate"])
+        gate = experiment.design_power_gate_error(design)
+        self.assertIsNotNone(gate)
+        self.assertIn("试点观测", gate)
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                design, allow_underpowered=True
+            )
+        )
+
+    def test_pilot_evidence_all_runs_failed_blocks_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for seed in (1, 2, 3):
+                paths.append(str(self._write_pilot_run(
+                    root, "smelt", seed, 1.0 - seed * 0.001
+                )))
+                paths.append(str(self._write_pilot_run(
+                    root,
+                    "A",
+                    seed,
+                    0.99 - seed * 0.001,
+                    failed=True,
+                )))
+            evidence = experiment.build_pilot_power_evidence(
+                paths,
+                "val_loss",
+                target_step=100,
+                declared_sd=0.01,
+                declared_attrition=0.0,
+            )
+        self.assertEqual(
+            evidence["attrition_check"]["observed"], 1.0
+        )
+        self.assertTrue(evidence["attrition_check"]["unusable"])
+        design = {
+            "power": {
+                "adequate": True,
+                "planned_seeds": 6,
+                "planned_comparisons": 1,
+            },
+            "pilot_evidence": evidence,
+        }
+        gate = experiment.design_power_gate_error(design)
+        self.assertIsNotNone(gate)
+        self.assertIn("不可用", gate)
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                design, allow_underpowered=True
+            )
+        )
 
 
 class RoutingTests(unittest.TestCase):

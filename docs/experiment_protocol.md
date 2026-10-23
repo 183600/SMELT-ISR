@@ -121,7 +121,10 @@
   为 true，还按真实差异为零计算 TOST 在预注册
   `equivalence_margin` 内的功效、所需启动种子与当前精度能
   支持的最小界；等价性功效不足同样在开跑前拒绝，不能用
-  命令行默认界代替训练前声明，也不能事后放宽界。确需在
+  命令行默认界代替训练前声明，也不能事后放宽界。顶层
+  `equivalence_margin` 还必须小于或等于 `min_effect`：等价界
+  比「最小有意义效应」还宽时，会存在同时被判为有意义与可
+  忽略的效应区间，显著性与等价性主张互相矛盾。确需在
   功效不足的设计上探索时，必须写
   `underpowered_acknowledged: true` 并给出非空
   `justification`，承认会随 `config.json` 的
@@ -208,6 +211,18 @@ python experiment.py --data corpus.txt --out runs/confirm-design \
 再冻结代码并正式运行；正式运行会用同一 `--run-order-seed`
 重建同一顺序，子进程逐项核对计划指纹与自己的分配。详见
 [design_preparation.md](design_preparation.md)。
+
+若已有试点/先前运行目录，再加 `--design-pilot-runs RUN...`：
+工具按共同 seed 计算每对处理单元的配对差值 sd，并按处理单元
+计算数值失败/缺指标比例；观测值高于预注册
+`expected_seed_sd_relative` / `expected_attrition_rate` 时，
+设计计划把功效输入单向上调到观测值并强制重算
+`required_seeds_with_attrition`，证据写入
+`design_plan.json` 的 `pilot_evidence` 并纳入 `plan_id`。
+因此正式运行前不能通过「声明一个更小的 sd」绕过功效门，也
+不能用事后挑选的安静试点替换证据。失败运行目录必须一并传入；
+没有固定 `--common-step` 时 sd 会依赖观测端点，只应作预警。
+详见 [design_preparation.md](design_preparation.md) 第 2.3 节。
 
 运行入口：
 

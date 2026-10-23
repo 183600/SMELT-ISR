@@ -6,16 +6,17 @@
    预期数据脱落率，在训练前判断计划种子数是否足够，并同时
    报告计划可用种子数下的实际功效与 MDE；若研究要主张
    「无实质差异」，还要检查 TOST 在预注册等价界内的功效
-   （2.2 节）；
+   （2.2 节）；若已有试点/先前运行，还要用观测到的配对
+   差值 sd 与脱落率校准声明值（2.3 节）；
 2. **随机化/平衡完整区组**：把「哪个臂先跑」从便利顺序变成
    预先声明的顺序，避免机器热漂移/负载漂移与处理效应混杂；
-3. **设计计划冻结**：把运行清单、顺序、位置平衡、功效与预算
-   写成 `design_plan.json`，子进程开跑前逐项核对。
+3. **设计计划冻结**：把运行清单、顺序、位置平衡、功效、试点
+   证据与预算写成 `design_plan.json`，子进程开跑前逐项核对。
 
 这三项都属于**准备阶段**，与训练后的显著性检验、等价性检验和
 脆弱性分析互补。它们不能替研究者保证结论正确，但能避免几类
-常见、无法在分析阶段补救的设计错误：功效不足、顺序混杂与
-运行脱落造成的有效样本量不足。
+常见、无法在分析阶段补救的设计错误：功效不足、顺序混杂、
+先验噪声被低估与运行脱落造成的有效样本量不足。
 
 ## 1. 先做设计预检，不烧算力
 
@@ -175,6 +176,12 @@ true` 与 `justification`；该承认会随 `config.json` 的
 
 - `equivalence_margin` 必须在**预注册顶层**显式给出；
   `--equivalence-margin` 的命令行默认值不能代替训练前声明。
+- `equivalence_margin` 不能大于 `min_effect`：等价界是「视为
+  可忽略的最大差异」，`min_effect` 是「最小有意义差异」；若前者
+  更宽，就存在一个同时被判定为「有意义」和「可忽略」的效应
+  区间，显著性与等价性两种主张会互相矛盾。边界相等可以接受
+  （只是边界点重合），但训练前就应固定，不能为了提高 TOST
+  功效把等价界放宽到超过 `min_effect`。
 - `plan_equivalence=true` 时，`adequate` 同时要求：
   1）在声明的最小效应下有目标显著性功效；2）若真实差异
   为零，在声明界内有目标 TOST 功效。任一不足且未显式
@@ -206,6 +213,84 @@ true` 与 `justification`；该承认会随 `config.json` 的
 能否在界内主张等价」的概率；它不保证真实差异为零，也不
 替代分析阶段的 TOST 与 `equivalence_margin_needed`。若真实
 差异非零但仍在界内，TOST 功效通常低于该规划值，应留余量。
+
+### 2.3 用试点运行校准先验 sd 与脱落率
+
+`power.expected_seed_sd_relative` 与
+`power.expected_attrition_rate` 都是**研究者声明值**。声明得
+太小会让任何种子数看起来都「足够」，这是先验功效率最容易
+被事后反向拟合的入口。若已经有试点、预实验或先前研究留下的
+运行目录，应在冻结前用它们校准，而不是只凭直觉填写：
+
+```bash
+python experiment.py \
+  --data corpus.txt --out runs/confirm-design \
+  --preregistration preregistration.json \
+  --seeds 42 43 44 45 46 47 48 \
+  --suite-modes smelt local_base local_base_k2 A B B_early \
+  --common-step 20000 \
+  --design-pilot-runs runs/pilot_* \
+  --plan-design
+```
+
+`--design-pilot-runs` 接受一个或多个**已完成的运行目录**，
+读取其 `config.json` 与 `metrics.jsonl`（不读取 test），并：
+
+1. **按处理单元分组**：结构轴（mode、balance_coef、k1、k2、
+   top_k、dense_fnn_hidden 等）相同、seed 不同的运行属于同一
+   单元；同一单元内重复 seed 按一个独立观测折叠并告警。
+2. **估计配对差值 sd**：对每一对处理单元，取共同 seed 上的
+   指标差值，计算样本 sd（ddof=1）。只有共同 seed 不少于
+   3 个的单元对才进入「可评估」集合；`observed` 取所有可
+   评估单元对的最大值，相对化时分母取两单元均值中较小者
+   （都取保守方向）。因此交互等方差更大的对比不会被两两
+   对比的较小 sd 掩盖。
+3. **估计脱落率**：数值失败或缺少该指标的 seed 记为不可用；
+   按处理单元分别计算 `n_failed / n_attempted`，`observed`
+   取各单元最大值，而不是总体平均——某个臂更容易崩掉时，
+   总体平均会把它稀释。
+4. **对照声明值**：若观测 sd/脱落率高于预注册声明，设计计划
+   会把有效功效输入**单向上调**到观测值并强制重算
+   `required_seeds_with_attrition`、实际功效与 MDE；不会因为
+   一次小样本试点观测更小就反过来放宽预注册假设。
+5. **仍不足则拒跑**：重算后功效仍不足且没有
+   `underpowered_acknowledged` / `--allow-underpowered` 时，
+   正式套件在第一个子进程前拒绝启动；`--plan-design` 会打印
+   `[design][pilot]` 摘要与 `[warn]`，完整证据写入
+   `design_plan.json`，供冻结前调整种子数或重新设计。
+
+证据写入 `design_plan.json` 的 `pilot_evidence`（schema
+`smelt-isr/design-pilot/v1`），并被 `plan_id` 覆盖：字段包括
+`metric`、`metric_annotation`（共同步数、是否数据依赖）、
+`cells`（各单元 seed 值、均值、单元内 sd、脱落率）、`pairs`
+（各单元对的共同 seed、配对 sd、相对 sd）、`sd_check`、
+`attrition_check`、`arm_coverage`（试点是否覆盖计划中的模式）
+与 `warnings`。正式运行后再改试点证据会改变 `plan_id`，不能
+把「换一批更安静的试点」伪装成同一份设计。
+
+口径与限制：
+
+- 试点指标必须与正式预注册主指标同口径。`*_at_common_step`、
+  `val_loss_curve_mean_to_common_step` 与
+  `val_loss_at_matched_flops` 会走与正式分析相同的派生逻辑；
+  其它指标直接读运行记录。**没有固定 `--common-step` 时，
+  共同步数由观测端点决定**，sd 估计会依赖试点曲线长度；正式
+  设计应固定步数后重算。
+- 失败运行目录必须一并传入。只传成功运行会把脱落率系统性
+  低估为 0，这比不传更危险；工具无法从「只给成功目录」的
+  输入判断是否漏传。
+- 工具不自动核对试点与正式实验的数据指纹、训练预算或代码
+  版本是否可比；这些仍由研究者负责。协议不可比时，观测值
+  只能作为「下界预警」，不能直接当作目标设计的真实 sigma。
+- 试点样本通常很小（每单元 3~6 个 seed），配对 sd 的点估计
+  很不稳定；`pilot_evidence` 会明确报告可评估单元对数并提示
+  「少于 6 个试点运行」。它不是精确方差估计，也不替代正式
+  运行后的 MDE/TOST/脆弱性分析。
+- 试点证据只校准**噪声与脱落**，不校准真实效应大小；不能
+  因为试点里观测到更大/更小的效应就改预注册 `min_effect`。
+- 单向上调只发生在观测值更大时。若试点 sd 明显更小，说明
+  你原来的声明可能过于保守；是否调小应由研究者在新一轮
+  预注册中显式决定，工具不会自动放宽。
 
 ## 3. 运行顺序：随机化/平衡完整区组
 
@@ -301,7 +386,10 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
 ## 5. 推荐的确证准备流程
 
 1. 用试点/先前运行估计**两格配对差值**的种子间标准差与预期
-   脱落率，写出 `power` 块；消融设计还要声明 `planned_contrasts`
+   脱落率，写出 `power` 块；若有试点运行目录，用
+   `--design-pilot-runs` 让设计计划按实际配对的共同 seed 与
+   失败目录重算观测 sd/脱落率，观测值更大时会被单向上调并
+   强制重算；消融设计还要声明 `planned_contrasts`
    （至少含 `interaction`），并查看 `contrast_power`、
    `power_sensitivity`、实际功效与 MDE；若研究要主张「无实质
    差异」，在顶层写 `equivalence_margin` 并设
@@ -309,8 +397,8 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
    `equivalence.required_seeds_with_attrition` 与
    `equivalence.margin_for_target_power`；
 2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置平衡、
-   对比类型功效（`binding_contrast` 通常是交互）与 token 预算；
-   调整种子数或最小效应后再冻结；
+   对比类型功效（`binding_contrast` 通常是交互）、
+   `pilot_evidence` 与 token 预算；调整种子数或最小效应后再冻结；
 3. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
    放入同一只读目录；
 4. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；
@@ -326,7 +414,10 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
 
 - `docs/experiment_protocol.md` 的冻结 → 预注册 → 运行 → 统一
   解封流程不变；本文件补上「预注册前如何判断设计可执行」；
-- `docs/methodology_audit.md` 第 29、33 节记录设计与等价性
-  功效修正；
+- `docs/methodology_audit.md` 第 29、33、37 节记录设计、等价性
+  功效与试点校准修正；
 - 设计计划不替代 `artifact_manifest.json`：前者是训练前设计，
   后者是训练后归档内容完整性；两者都应随最终报告保存。
+  `pilot_evidence` 不是预注册 schema 字段：它由工具从运行目录
+  计算后写入设计计划，因此必须与预注册文件、`design_plan.json`
+  一起冻结；只保留预注册文件、丢掉设计计划会失去试点校准证据。

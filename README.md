@@ -361,6 +361,13 @@ python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
   相同，只把合并位置提前，因此 B 的优势不能再归因于额外计算/多轨迹。
 - **完整预算**：`--budget-match smelt` + `budget_match_report` 同时报告
   解析与实测 FLOPs，不只匹配 `k1·k2`。
+- **试点校准先验噪声**：若已有试点/先前运行目录，用
+  `--design-pilot-runs RUN...` 按共同 seed 估计配对差值 sd 与各臂
+  脱落率；观测值高于预注册 `power` 声明时，设计计划单向上调并强制
+  重算所需种子，证据写入 `design_plan.json` 的 `pilot_evidence`
+  （纳入 `plan_id`），仍不足则在第一个子进程前拒绝。失败目录必须
+  一并传入，不能只拿成功运行估计脱落率。详见
+  [docs/design_preparation.md](docs/design_preparation.md) 第 2.3 节。
 - **确证流程**：冻结代码（`EXPERIMENT_FREEZE`）→ 预注册主指标、方向、
   最小效应与 `--common-step` → 至少 6 个种子 → 失败率与成功条件指标
   一起报告 → 冻结候选后用共享 `--test-ledger` 统一解封 test →
