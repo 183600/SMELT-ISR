@@ -26422,7 +26422,9 @@ def _leave_one_out_effect_stability(
     ]
     if len(leave_one_out) != n:
         return {}
-    tolerance = 1e-12 * max(1.0, abs(full_effect))
+    # 容差必须随效应量缩放：固定 1e-12 会把 1e-13 量级的
+    # 真实方向差异当成零效应，从而把方向翻转误报为稳定。
+    tolerance = 1e-12 * abs(full_effect)
     if abs(full_effect) <= tolerance:
         stable = all(
             abs(value) <= tolerance

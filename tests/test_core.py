@@ -7714,6 +7714,17 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(tiny["variance_of_mean"])
         json.dumps(tiny, allow_nan=False)
 
+    def test_leave_one_out_stability_scales_with_effect(self):
+        stable = experiment._leave_one_out_effect_stability(
+            [1.0e-13, 2.0e-13, 3.0e-13]
+        )
+        self.assertTrue(stable["leave_one_out_sign_stable"])
+        mixed = experiment._leave_one_out_effect_stability(
+            [1.0e-13, 2.0e-13, -3.0e-13]
+        )
+        self.assertFalse(mixed["leave_one_out_sign_stable"])
+        json.dumps(mixed, allow_nan=False)
+
     def test_ngram_one_se_tolerance_scales_with_metric(self):
         # 极小但非零的 loss 差异不能被固定 1e-12 容差当成并列：
         # 否则更简单的候选配置会因为一条恒定的微小劣化被误选。
