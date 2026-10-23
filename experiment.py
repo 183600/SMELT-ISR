@@ -12021,6 +12021,11 @@ _EVAL_BOOTSTRAP_CI_LEVEL = 0.95
 # 不收窄，负相关不用于把区间做窄。
 _EVAL_WINDOW_AUTOCORRELATION = 0.3
 
+# 评估窗口 bootstrap 的重采样次数。该常量必须在使用它的
+# 函数默认参数之前定义（模块导入时即求值），因此放在评估
+# 不确定性工具区的开头。
+_EVAL_WINDOW_BOOTSTRAP_REPLICATES = 2000
+
 
 def _eval_bootstrap_seed(
     data_sha256: str,
@@ -26713,8 +26718,6 @@ _EVAL_WINDOW_FINGERPRINT_KEYS = (
     "batch_size",
     "batches",
 )
-
-_EVAL_WINDOW_BOOTSTRAP_REPLICATES = 2000
 
 
 def _eval_window_fingerprint(
