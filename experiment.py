@@ -38487,7 +38487,16 @@ def _balance_width_profile(
             parsed = int(value)
         except (TypeError, ValueError, OverflowError):
             return None
-        return parsed if parsed > 0 else None
+        if parsed <= 0:
+            return None
+        # 协议里的计数可能被手工/旧记录写成 10**400；int() 本身
+        # 可以接受，但后续转成 float 计算强度会溢出。这里提前
+        # 拒绝不可表示的计数，让该运行按「缺少可核对协议」跳过。
+        try:
+            numeric = float(parsed)
+        except (OverflowError, ValueError):
+            return None
+        return parsed if math.isfinite(numeric) else None
 
     if mode == "smelt":
         top_k = _as_int("top_k")
@@ -38506,7 +38515,9 @@ def _balance_width_profile(
         return None
 
     if mode in {"A", "B"}:
-        width = 0.5 * (k1 + k2)
+        # 各自折半后再相加：k1+k2 可以先越过 float 上限，而
+        # 真实平均宽度仍可能可表示。
+        width = 0.5 * float(k1) + 0.5 * float(k2)
         normalization = "not_applicable"
     else:
         normalization = str(
@@ -38520,7 +38531,9 @@ def _balance_width_profile(
             if n_experts is None:
                 return None
             second_width = min(n_experts, k1 * k2)
-        width = 0.5 * (k1 + second_width)
+        width = 0.5 * float(k1) + 0.5 * float(second_width)
+    if not math.isfinite(width):
+        return None
 
     return {
         "mode": mode,
@@ -38569,6 +38582,15 @@ def balance_strength_report(
             float(profile["balance_coef"])
             * float(profile["effective_width"])
         )
+        if not math.isfinite(strength):
+            # 合法但极大的 coef/width 相乘会越过 float 上限；
+            # 无法参与强度比较，记录后跳过，不能写 inf。
+            report.setdefault("invalid_profiles", []).append({
+                "run": str(row.get("run")),
+                "mode": profile["mode"],
+                "reason": "balance_strength_not_finite",
+            })
+            continue
         report["profiles"].append({
             "run": str(row.get("run")),
             "mode": profile["mode"],
@@ -38639,7 +38661,8 @@ def balance_strength_report(
         if float(lowest["balance_strength"]) > 0.0
         else None
     )
-    report["strength_ratio"] = ratio
+    if ratio is not None and math.isfinite(ratio):
+        report["strength_ratio"] = ratio
     report["advisories"].append(
         "均衡强度随路由宽度变化但未被抵消："
         f"{lowest['run']}（mode={lowest['mode']}, "

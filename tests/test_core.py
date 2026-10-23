@@ -7613,6 +7613,88 @@ class NumericalScaleTests(unittest.TestCase):
         )
         json.dumps(spread, allow_nan=False)
 
+    def test_balance_strength_rejects_oversized_int_parameters(self):
+        huge = 10**400
+        # 协议计数可以写成超出 float 范围的 JSON 整数；不能
+        # 在转 float 时崩溃，也不能把 inf 写进报告。
+        self.assertIsNone(
+            experiment._balance_width_profile({
+                "mode": "smelt",
+                "top_k": huge,
+                "balance_coef": 0.01,
+            })
+        )
+        self.assertIsNone(
+            experiment._balance_width_profile({
+                "mode": "A",
+                "k1": huge,
+                "k2": 2,
+                "balance_coef": 0.01,
+            })
+        )
+        report = experiment.balance_strength_report([
+            {
+                "run": "huge",
+                "protocol": {
+                    "mode": "smelt",
+                    "top_k": huge,
+                    "balance_coef": 0.01,
+                },
+            }
+        ])
+        json.dumps(report, allow_nan=False)
+
+    def test_balance_strength_omits_overflowing_strength_and_ratio(self):
+        # coef × width 越过 float 上限：该运行无法参与强度比较，
+        # 必须显式记录并跳过，而不是写 inf。
+        report = experiment.balance_strength_report([
+            {
+                "run": "overflow",
+                "protocol": {
+                    "mode": "smelt",
+                    "top_k": 2,
+                    "balance_coef": 1.0e308,
+                },
+            },
+            {
+                "run": "normal",
+                "protocol": {
+                    "mode": "smelt",
+                    "top_k": 2,
+                    "balance_coef": 0.01,
+                },
+            },
+        ])
+        self.assertEqual(len(report["profiles"]), 1)
+        self.assertEqual(
+            report["invalid_profiles"][0]["run"], "overflow"
+        )
+        json.dumps(report, allow_nan=False)
+
+        # 最高/最低强度之比越过 float 上限：不能写 inf。
+        ratio = experiment.balance_strength_report([
+            {
+                "run": "low",
+                "protocol": {
+                    "mode": "smelt",
+                    "top_k": 2,
+                    "balance_coef": 5.0e-324,
+                },
+            },
+            {
+                "run": "high",
+                "protocol": {
+                    "mode": "A",
+                    "k1": 1,
+                    "k2": 2,
+                    "balance_coef": 1.0e308,
+                },
+            },
+        ])
+        self.assertTrue(ratio["confounded"])
+        self.assertNotIn("strength_ratio", ratio)
+        json.dumps(ratio, allow_nan=False)
+
     def test_environment_identity_falls_back_for_minimal_snapshots(self):
         expected = {
             "schema": experiment._ENVIRONMENT_SCHEMA,
