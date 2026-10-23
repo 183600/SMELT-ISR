@@ -253,6 +253,14 @@ class Config:
                 "提供了 document_separator 但未启用 document_masks；"
                 "请同时设置 document_masks=True 或清空分隔符"
             )
+        if self.dense_fnn_hidden is not None and (
+            isinstance(self.dense_fnn_hidden, bool)
+            or not isinstance(self.dense_fnn_hidden, int)
+            or self.dense_fnn_hidden <= 0
+        ):
+            raise ValueError(
+                "dense_fnn_hidden 必须是正整数或 None"
+            )
         if self.mode == "dense":
             hidden = self.effective_dense_fnn_hidden
             if hidden <= 0:
@@ -260,13 +268,6 @@ class Config:
                     "dense 模式的 FFN 隐藏宽度必须为正整数"
                     f"（当前解析为 {hidden}）"
                 )
-        if self.dense_fnn_hidden is not None and (
-            not isinstance(self.dense_fnn_hidden, int)
-            or self.dense_fnn_hidden <= 0
-        ):
-            raise ValueError(
-                "dense_fnn_hidden 必须是正整数或 None"
-            )
         if self.init_scheme not in self.INIT_SCHEMES:
             raise ValueError(
                 "init_scheme 必须是 "

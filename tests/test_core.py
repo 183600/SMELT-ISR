@@ -8105,6 +8105,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_dense_fnn_hidden_type_is_validated_before_use(self):
+        # 非整数会被 effective_dense_fnn_hidden 直接返回，随后
+        # 在比较时抛 TypeError；必须先做类型校验并给出明确的
+        # ValueError。bool 是 int 的子类，但 True/False 不是
+        # 合法的宽度配置。
+        for value in ("32", True, False, 0, -1, 3.5, []):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _tiny_config(
+                        mode="dense",
+                        dense_fnn_hidden=value,
+                    ).validate()
+                with self.assertRaises(ValueError):
+                    _tiny_config(
+                        mode="smelt",
+                        dense_fnn_hidden=value,
+                    ).validate()
+        _tiny_config(
+            mode="dense",
+            dense_fnn_hidden=None,
+        ).validate()
+        _tiny_config(
+            mode="dense",
+            dense_fnn_hidden=32,
+        ).validate()
+
 
 class NumericalScaleTests(unittest.TestCase):
     def test_aggregate_interval_omits_unrepresentable_bounds(self):
