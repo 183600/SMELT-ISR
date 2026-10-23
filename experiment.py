@@ -28440,19 +28440,21 @@ def _tost_margin_for_power(
     if se_value <= 0.0:
         return 0.0
 
+    # 功效只取决于 margin/se 的比值；直接在比值尺度上二分，
+    # 避免极小 se 下固定区间 [0, 1] 的绝对分辨率不足。
     low = 0.0
-    high = max(1.0, se_value * 10.0)
-    for _ in range(8):
-        power = _tost_power(0.0, se_value, df_value, high, alpha_value)
+    high = 1.0
+    for _ in range(64):
+        power = _tost_power(0.0, 1.0, df_value, high, alpha_value)
         if power is not None and power >= target:
             break
         high *= 2.0
     else:
         return None
-    for _ in range(80):
+    for _ in range(200):
         mid = (low + high) / 2.0
         power = _tost_power(
-            0.0, se_value, df_value, mid, alpha_value
+            0.0, 1.0, df_value, mid, alpha_value
         )
         if power is None:
             return None
@@ -28460,7 +28462,8 @@ def _tost_margin_for_power(
             low = mid
         else:
             high = mid
-    return (low + high) / 2.0
+    margin = ((low + high) / 2.0) * se_value
+    return margin if math.isfinite(margin) else None
 
 
 def _attach_sd_uncertainty_note(

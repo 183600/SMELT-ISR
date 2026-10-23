@@ -7841,6 +7841,21 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_tost_margin_for_power_preserves_tiny_scale(self):
+        normal = experiment._tost_margin_for_power(1.0, 10.0)
+        self.assertIsNotNone(normal)
+        for scale in (1.0e-300, 1.0e-200, 1.0e200):
+            tiny = experiment._tost_margin_for_power(
+                scale, 10.0
+            )
+            self.assertIsNotNone(tiny)
+            self.assertAlmostEqual(
+                tiny / scale, normal, places=12
+            )
+        self.assertIsNone(
+            experiment._tost_margin_for_power(1.0e308, 2.0)
+        )
+
     def test_welch_test_preserves_tiny_scale(self):
         base_a = [1.0, 2.0, 3.0, 4.0, 5.0]
         base_b = [1.1, 2.1, 3.1, 4.1, 5.1]
