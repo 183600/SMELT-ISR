@@ -6707,6 +6707,59 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(contrast["verdict"], "missing_metric")
         json.dumps(contrast, allow_nan=False)
 
+    def test_window_analysis_cross_seed_mean_does_not_overflow(self):
+        def payload(loss_sum):
+            return {
+                "split": "val",
+                "data_sha256": "d",
+                "split_sha256": "s",
+                "seq_len": 4,
+                "batch_size": 1,
+                "batches": 2,
+                "windows": [
+                    {
+                        "tokens": 1,
+                        "loss_sum": loss_sum,
+                        "correct": 0,
+                    },
+                    {
+                        "tokens": 1,
+                        "loss_sum": loss_sum,
+                        "correct": 0,
+                    },
+                ],
+            }
+
+        def cell(losses):
+            return {
+                "window_payloads": [
+                    {
+                        "seed": seed,
+                        "payload": payload(loss),
+                    }
+                    for seed, loss in enumerate(losses, 1)
+                ],
+            }
+
+        result = experiment._cell_window_paired_analysis(
+            cell([0.0, 0.0, 0.0]),
+            cell([1.0e308, 1.0e308, 1.0e308]),
+        )
+        self.assertTrue(result["available"])
+        self.assertTrue(
+            math.isfinite(result["mean_loss_diff"])
+        )
+        self.assertEqual(result["mean_loss_diff"], 1.0e308)
+        self.assertEqual(result["mean_loss_diff_spread"], 0.0)
+
+        spread = experiment._cell_window_paired_analysis(
+            cell([0.0, 1.0e308, -1.0e308]),
+            cell([1.0e308, 0.0, 0.0]),
+        )
+        self.assertTrue(spread["available"])
+        self.assertIsNone(spread["mean_loss_diff_spread"])
+        json.dumps(spread, allow_nan=False)
+
     def test_window_payload_scalar_is_not_iterated(self):
         # 损坏的旧聚合记录可能把 window_payloads 写成标量；
         # 逐窗口分析必须按「无逐窗口记录」处理，而不是抛

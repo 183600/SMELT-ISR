@@ -24972,7 +24972,14 @@ def _cell_window_paired_analysis(
     mean_diffs = [
         float(entry["mean_loss_diff"]) for entry in usable
     ]
-    overall_mean = sum(mean_diffs) / len(mean_diffs)
+    # 每个种子的窗口均值各自有限（如 1e308）时，跨种子直接
+    # 求和仍可能溢出成 inf；用带缩放的均值保留真实点估计。
+    overall_mean = _mean(mean_diffs)
+    spread = max(mean_diffs) - min(mean_diffs)
+    if not math.isfinite(spread):
+        # 正负极大值相减会溢出：无法给出有限离散度时按缺失
+        # 处理，不能把 inf 写进报告。
+        spread = None
     favoring = sum(1 for value in mean_diffs if value < 0.0)
     against = sum(1 for value in mean_diffs if value > 0.0)
     # 两层不确定性：逐窗口 bootstrap（现有字段）只覆盖一个种子
@@ -25020,9 +25027,7 @@ def _cell_window_paired_analysis(
         "per_seed": per_seed,
         "mean_loss_diff": overall_mean,
         "mean_loss_diff_spread": (
-            max(mean_diffs) - min(mean_diffs)
-            if len(mean_diffs) > 1
-            else 0.0
+            spread if len(mean_diffs) > 1 else 0.0
         ),
         "n_seeds_favoring_variant": favoring,
         "n_seeds_favoring_baseline": against,
