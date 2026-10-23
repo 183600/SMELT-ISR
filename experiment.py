@@ -25210,14 +25210,14 @@ def _paired_sign_flip_test(
     if values is None:
         return {"test": "invalid_values"}
 
-    # 符号翻转统计量对公共尺度不变：先按最大绝对值缩放到
-    # [-1, 1]，避免合法的大浮点数在求和时溢出，也避免极小但非零
-    # 的差值被绝对容差 1e-12 误判成退化。容差本身按缩放后的
-    # 观测均值取相对值，因此对任何公共尺度都给出同一 p 值。
-    # 随机化种子仍用原始值，保证结果可复现。
+    # 符号翻转统计量对公共尺度不变：大数值先按最大绝对值缩放到
+    # [-1, 1]，避免合法的大浮点数在求和时溢出。正常/极小量级
+    # 保持原值（不改变历史点估计的末位），但容差必须按观测均值
+    # 取相对值，否则 1e-13 量级的真实差值会被固定 1e-12 误判
+    # 成退化。随机化种子仍用原始值，保证结果可复现。
     raw_values = values
     max_abs = max(abs(value) for value in values)
-    scale = max_abs if max_abs > 0.0 else 1.0
+    scale = max_abs if max_abs > 1.0e150 else 1.0
     if scale != 1.0:
         values = [value / scale for value in values]
     mean_scaled = sum(values) / n
