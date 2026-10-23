@@ -3151,6 +3151,19 @@ class DesignPreparationTests(unittest.TestCase):
                 design, allow_underpowered=True
             )
         )
+        # 即使没有 power 块，零可用单元的试点证据也不能静默
+        # 放行；--allow-underpowered 仍是显式逃生口。
+        self.assertIsNotNone(
+            experiment.design_power_gate_error(
+                {"pilot_evidence": evidence}
+            )
+        )
+        self.assertIsNone(
+            experiment.design_power_gate_error(
+                {"pilot_evidence": evidence},
+                allow_underpowered=True,
+            )
+        )
 
     def test_pilot_evidence_all_runs_failed_blocks_start(self):
         with tempfile.TemporaryDirectory() as tmp:
