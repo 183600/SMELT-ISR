@@ -7458,6 +7458,60 @@ class NumericalScaleTests(unittest.TestCase):
         )
         json.dumps(family, allow_nan=False)
 
+    def test_paired_effect_size_omits_unrepresentable_ratio(self):
+        # 差值标准差可以合法地极小；|Δ|/sd 越过 float 上限时
+        # 没有可表示的有限效应量，必须按缺失处理而不是写 inf。
+        result = experiment._paired_effect_size(
+            1.0e308,
+            {
+                "test": "paired_t",
+                "n_pairs": 3,
+                "se": 1.0e-300,
+                "df": 2.0,
+            },
+        )
+        self.assertEqual(result, {})
+        json.dumps(result, allow_nan=False)
+
+    def test_relative_mde_omits_unrepresentable_ratio(self):
+        # 基线均值可以合法地极小：绝对 MDE 有限但相对值越过
+        # float 上限时省略该字段，不能把 inf 写进对比记录。
+        contrast = {
+            "mean_baseline": 1.0e-300,
+            "delta": 1.0,
+            "n_pairs": 3,
+            "n_baseline": 3,
+            "n_variant": 3,
+            "test": "paired_t",
+        }
+        experiment._attach_power_equivalence(
+            contrast,
+            1.0,
+            {"se": 1.0e300, "df": 2.0},
+            None,
+        )
+        self.assertIsNotNone(contrast.get("mde_80"))
+        self.assertNotIn("mde_80_relative", contrast)
+        json.dumps(contrast, allow_nan=False)
+
+    def test_contrast_test_marks_overflowing_differences_missing(self):
+        # 两端指标各自有限时，配对差值仍可能溢出成 ±inf；
+        # 不能把非有限差值写进报告，也不能让下游脆弱性分析
+        # 把它当成有效观测。
+        samples_a = [
+            {"seed": seed, "run": f"a{seed}", "value": 1.0e308}
+            for seed in (1, 2, 3)
+        ]
+        samples_b = [
+            {"seed": seed, "run": f"b{seed}", "value": -1.0e308}
+            for seed in (1, 2, 3)
+        ]
+        result = experiment._contrast_test(samples_a, samples_b)
+        self.assertEqual(result["test"], "invalid_values")
+        self.assertIsNone(result["paired_differences"])
+        self.assertFalse(result["paired_differences_finite"])
+        json.dumps(result, allow_nan=False)
+
     def test_environment_identity_falls_back_for_minimal_snapshots(self):
         expected = {
             "schema": experiment._ENVIRONMENT_SCHEMA,

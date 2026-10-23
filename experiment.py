@@ -27337,6 +27337,11 @@ def _paired_effect_size(
     if sd_difference <= 0.0 or not math.isfinite(sd_difference):
         return {}
     dz = delta_value / sd_difference
+    # 差值标准差可以合法地极小（如 1e-300），此时 |Δ|/sd 会越过
+    # float 上限。效应量没有可表示的有限值时按缺失处理，不能把
+    # inf 写进报告（JSON 无法严格解析）。
+    if not math.isfinite(dz):
+        return {}
     result: Dict[str, object] = {"cohens_dz": dz}
     correction = _hedges_g_correction(test.get("df"))
     if correction is not None:
@@ -27544,7 +27549,11 @@ def _attach_power_equivalence(
     if mde is not None:
         contrast["mde_80"] = mde
         if baseline_abs is not None:
-            contrast["mde_80_relative"] = mde / baseline_abs
+            mde_relative = mde / baseline_abs
+            # |基线均值| 可以合法地极小：相对 MDE 会越过 float
+            # 上限。无法表示的相对量按缺失处理，不能写 inf。
+            if math.isfinite(mde_relative):
+                contrast["mde_80_relative"] = mde_relative
 
     if delta is not None and math.isfinite(float(delta)):
         delta_value = float(delta)
@@ -28314,7 +28323,16 @@ def _contrast_test(
         result["duplicate_seeds"] = bool(duplicate_seeds)
         # 保留逐种子配对差值与种子标签：结果分析要能复核
         # 「哪些种子驱动了显著性」，而不是只相信汇总 p 值。
-        result["paired_differences"] = list(differences)
+        # 两端指标各自有限时，差值仍可能溢出（如 1e308 与
+        # -1e308）；这样的配对差值不是可落盘的有限数值，也不能
+        # 参与脆弱性重算。保留逐种子标签，但把差值标记为不可用，
+        # 而不是写 ±inf。
+        if _finite_values(differences) is not None:
+            result["paired_differences"] = list(differences)
+            result["paired_differences_finite"] = True
+        else:
+            result["paired_differences"] = None
+            result["paired_differences_finite"] = False
         result["paired_seeds"] = list(common_seeds)
         result.update(
             _leave_one_out_effect_stability(differences)
@@ -29834,9 +29852,20 @@ def _paired_linear_effect(
             effect,
             effect_test,
         )
+        finite_effect_values = _finite_values(effect_values)
         return {
             "effect": effect,
-            "paired_differences": list(effect_values),
+            # 线性组合本身可能超出 float 范围；此时检验已按
+            # invalid_values 处理，逐种子差值也必须标记为不可用，
+            # 不能把 inf 写进报告或交给脆弱性重算。
+            "paired_differences": (
+                list(effect_values)
+                if finite_effect_values is not None
+                else None
+            ),
+            "paired_differences_finite": (
+                finite_effect_values is not None
+            ),
             "paired_seeds": list(raw_seeds),
             "cohens_dz": paired_effect_size.get("cohens_dz"),
             "hedges_gz": paired_effect_size.get("hedges_gz"),
@@ -33844,9 +33873,13 @@ def baseline_adequacy(
             if mde is not None:
                 ngram_comparison["mde_80"] = mde
                 if abs(float(baseline_mean)) > 0.0:
-                    ngram_comparison["mde_80_relative"] = (
-                        mde / abs(float(baseline_mean))
-                    )
+                    mde_relative = mde / abs(float(baseline_mean))
+                    # 基线均值可以合法地极小：相对 MDE 会越过
+                    # float 上限，无法表示时按缺失处理。
+                    if math.isfinite(mde_relative):
+                        ngram_comparison["mde_80_relative"] = (
+                            mde_relative
+                        )
         if abs(float(ngram_comparison["delta"])) > 0.0:
             baseline_sd = ngram_comparison["baseline_std"]
             if isinstance(baseline_sd, (int, float)):
