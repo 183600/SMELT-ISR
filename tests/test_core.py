@@ -7841,6 +7841,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_welch_test_preserves_tiny_scale(self):
+        base_a = [1.0, 2.0, 3.0, 4.0, 5.0]
+        base_b = [1.1, 2.1, 3.1, 4.1, 5.1]
+        normal = experiment._welch_t_test(base_a, base_b)
+        tiny_scale = 1.0e-300
+        tiny = experiment._welch_t_test(
+            [value * tiny_scale for value in base_a],
+            [value * tiny_scale for value in base_b],
+        )
+        self.assertEqual(tiny["test"], "welch_t")
+        self.assertAlmostEqual(tiny["t"], normal["t"], places=12)
+        self.assertAlmostEqual(
+            tiny["p_value"], normal["p_value"], places=12
+        )
+        self.assertAlmostEqual(tiny["df"], normal["df"], places=12)
+        self.assertAlmostEqual(
+            tiny["effect"] / tiny_scale,
+            normal["effect"],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            tiny["se"] / tiny_scale,
+            normal["se"],
+            places=12,
+        )
+
     def test_bad_case_ignores_invalid_confusion_pairs(self):
         report = experiment.bad_case_comparison_report([{
             "run": "damaged",

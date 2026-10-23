@@ -27546,6 +27546,25 @@ def _welch_t_test(
         return {"test": "invalid_values"}
     values_a = numeric_a
     values_b = numeric_b
+    max_abs = max(
+        (abs(value) for value in values_a + values_b),
+        default=0.0,
+    )
+    if 0.0 < max_abs < 1.0e-150:
+        # 极小尺度下方差会下溢成 0，被误判成零方差/无噪声
+        # 分离；先按公共尺度归一化再还原效应与标准误。
+        scaled = _welch_t_test(
+            [value / max_abs for value in values_a],
+            [value / max_abs for value in values_b],
+        )
+        if scaled.get("test") == "welch_t":
+            effect = _finite_float(scaled.get("effect"))
+            se = _finite_float(scaled.get("se"))
+            if effect is not None:
+                scaled["effect"] = effect * max_abs
+            if se is not None:
+                scaled["se"] = se * max_abs
+        return scaled
     mean_a = _mean(values_a)
     mean_b = _mean(values_b)
     if mean_a is None or mean_b is None:
