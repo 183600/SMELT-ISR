@@ -10534,6 +10534,31 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )["available"]
         )
 
+    def test_group_reports_stay_json_safe_with_extreme_tokens(self):
+        token_count = 1.0e308
+        stats = self._stats([
+            [0, token_count, 1.0, 0.0],
+            [1, token_count, 1.0, 0.0],
+        ])
+        intervals = experiment._group_cluster_eval_intervals(
+            stats, replicates=50, seed=1
+        )
+        self.assertTrue(intervals["available"])
+        self.assertIsNone(intervals["tokens"])
+        json.dumps(intervals, allow_nan=False)
+        paired = experiment._group_cluster_paired_comparison(
+            {"group_stats": stats},
+            {
+                "group_stats": self._stats([
+                    [0, token_count, 2.0, 0.0],
+                    [1, token_count, 2.0, 0.0],
+                ])
+            },
+        )
+        self.assertTrue(paired["available"])
+        self.assertIsNone(paired["tokens"])
+        json.dumps(paired, allow_nan=False)
+
     def test_hierarchical_group_bootstrap_normalizes_extreme_tokens(self):
         for token_count in (1.0e308, 1.0e-308):
             differences = {

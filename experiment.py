@@ -12291,6 +12291,9 @@ def _finalize_group_stats(
             float(loss_sum[index].item()),
             float(correct[index].item()),
         ])
+    observed_tokens = float(
+        sum(float(record[1]) for record in records)
+    )
     return {
         "schema": _GROUP_STATS_SCHEMA,
         "assignment": _GROUP_ASSIGNMENT,
@@ -12298,8 +12301,10 @@ def _finalize_group_stats(
         "group_separator_sha256": group_separator_sha256,
         "n_groups_total": int(tokens.numel()),
         "n_groups_observed": len(records),
-        "tokens_observed": float(
-            sum(float(record[1]) for record in records)
+        "tokens_observed": (
+            observed_tokens
+            if math.isfinite(observed_tokens)
+            else None
         ),
         "groups": records,
         "note": (
@@ -12498,16 +12503,19 @@ def _group_cluster_eval_intervals(
             "reason": "unrepresentable_bounds",
             "n_groups": len(group_ids),
         }
+    token_total = float(tokens.sum().item())
     result: Dict[str, object] = {
         "available": True,
         "n_groups": len(group_ids),
-        "tokens": float(tokens.sum().item()),
+        "tokens": (
+            token_total if math.isfinite(token_total) else None
+        ),
         "bootstrap_replicates": int(replicates),
         "bootstrap_unit": "document_group",
         "loss_ci95_low": max(0.0, low),
         "loss_ci95_high": max(0.0, high),
         "ppl_ci95_low": math.exp(min(80.0, max(0.0, low))),
-        "ppl_ci95_high": math.exp(min(80.0, high)),
+        "ppl_ci95_high": math.exp(min(80.0, max(0.0, high))),
         "method": "group_cluster_percentile_bootstrap",
         "note": (
             "以文档/群组为重采样单位的 token 加权区间；"
@@ -12663,10 +12671,13 @@ def _group_cluster_paired_comparison(
             _randomization_seed(accuracy_differences)
         ),
     )
+    token_total = float(weight_tensor.sum().item())
     result: Dict[str, object] = {
         "available": True,
         "n_groups": len(common),
-        "tokens": float(weight_tensor.sum().item()),
+        "tokens": (
+            token_total if math.isfinite(token_total) else None
+        ),
         "group_separator_sha256": (
             parsed_a["group_separator_sha256"]
         ),
