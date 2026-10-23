@@ -594,6 +594,29 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(summary["not_robust"], [])
         self.assertIn("有缺测", summary["advisories"][0])
 
+    def test_attrition_summary_flags_nonrobust_sign_with_missing(self):
+        contrast = {
+            "baseline": "A",
+            "variant": "B",
+            "attrition_bounds": {
+                "applicable": True,
+                "verdict": "bounded_same_sign",
+                "sign_robust": False,
+                "complete_cases": False,
+                "missing_runs": 1,
+                "attempted_runs": 6,
+                "observed_runs": 5,
+                "observed_effect": 1.0,
+                "effect_min": -2.0,
+                "effect_max": -1.0,
+                "zero_within_bounds": False,
+                "observed_effect_within_bounds": False,
+            },
+        }
+        summary = experiment._attrition_bounds_summary([contrast])
+        self.assertEqual(len(summary["not_robust"]), 1)
+        self.assertIn("效应方向可能反转", summary["advisories"][0])
+
     def test_component_summary_downgrades_attrition_crossing(self):
         effect = {
             "effect_name": "delayed_merge_main",

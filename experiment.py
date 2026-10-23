@@ -29318,6 +29318,10 @@ def _attrition_bounds_summary(
     not_robust = [
         entry for entry in entries
         if entry.get("verdict") in {"crosses_zero", "unbounded"}
+        or (
+            int(entry.get("missing_runs") or 0) > 0
+            and entry.get("sign_robust") is False
+        )
     ]
     advisories: List[str] = []
     if not_robust:
