@@ -20543,6 +20543,19 @@ def _as_dict(value: object) -> Dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _path_is_dir(value: object) -> bool:
+    """Path.is_dir 的容错版本：损坏/超长路径不能中断分析。
+
+    ``Path.exists()/is_dir()`` 在文件名过长（ENAMETOOLONG）、
+    权限或 IO 错误时会抛 OSError；来自手工编辑的 config 或
+    命令行路径不应让整份对比/设计报告崩溃，按「不存在」处理。
+    """
+    try:
+        return Path(value).is_dir()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _val_curve_points(
     run_dir: Path,
     flops_per_forward: float,
@@ -22126,7 +22139,11 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
 
         config_payload: Dict[str, object] = {}
         config_path = run_dir / "config.json"
-        if config_path.exists():
+        try:
+            config_exists = config_path.exists()
+        except OSError:
+            config_exists = False
+        if config_exists:
             try:
                 with open(
                     config_path,
@@ -22143,7 +22160,11 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         # 「在这批固定评估窗口上」的配对证据。缺失（旧运行）时
         # 保持 None，窗口级分析整体跳过而不是静默当成没有差异。
         windows_path = run_dir / "eval_windows.json"
-        if windows_path.exists():
+        try:
+            windows_exists = windows_path.exists()
+        except OSError:
+            windows_exists = False
+        if windows_exists:
             try:
                 with open(
                     windows_path,
@@ -68937,7 +68958,7 @@ def main():
         missing_pilot = [
             path
             for path in args.design_pilot_runs
-            if not Path(path).is_dir()
+            if not _path_is_dir(path)
         ]
         if missing_pilot:
             parser.error(
@@ -69423,7 +69444,7 @@ def main():
         invalid = [
             path
             for path in args.final_test_comparison
-            if not Path(path).is_dir()
+            if not _path_is_dir(path)
         ]
         if invalid:
             parser.error(
@@ -69491,7 +69512,7 @@ def main():
         invalid_compare_paths = [
             path
             for path in args.compare
-            if not Path(path).is_dir()
+            if not _path_is_dir(path)
         ]
         if invalid_compare_paths:
             parser.error(

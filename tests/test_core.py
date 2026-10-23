@@ -7376,6 +7376,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             [],
         )
 
+    def test_compare_and_pilot_tolerate_unreadable_run_path(self):
+        # 与 metrics 读取一致：损坏/超长运行路径不能让
+        # --compare 或 --design-pilot-runs 整份崩溃。
+        long_path = "x" * 10000
+        self.assertFalse(experiment._path_is_dir(long_path))
+        rows = experiment.compare_runs([long_path])
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["val_loss"])
+        evidence = experiment.build_pilot_power_evidence(
+            [long_path], "val_loss"
+        )
+        self.assertEqual(evidence["source_run_count"], 1)
+        self.assertTrue(
+            evidence["attrition_check"]["unusable"]
+        )
+        json.dumps(evidence, allow_nan=False)
+
     def test_resume_truncation_drops_stale_terminal_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "metrics.jsonl"
