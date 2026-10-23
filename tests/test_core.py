@@ -10445,5 +10445,31 @@ class CurveMeanMetricTests(unittest.TestCase):
         self.assertFalse(report["applicable"])
 
 
+class GroupClusterRegressionTests(unittest.TestCase):
+    """文档/群组 cluster bootstrap 的边界条件回归。"""
+
+    def _stats(self, groups, separator="separator-sha"):
+        return {
+            "schema": experiment._GROUP_STATS_SCHEMA,
+            "assignment": experiment._GROUP_ASSIGNMENT,
+            "unit": "document_group",
+            "group_separator_sha256": separator,
+            "groups": groups,
+        }
+
+    def test_group_stats_reject_negative_loss(self):
+        stats = self._stats([
+            [0, 10.0, -1.0, 5.0],
+            [1, 10.0, 20.0, 5.0],
+        ])
+        self.assertIsNone(
+            experiment._parse_group_stats({"group_stats": stats})
+        )
+        report = experiment._group_cluster_eval_intervals(
+            stats, replicates=50, seed=1
+        )
+        self.assertFalse(report["available"])
+
+
 if __name__ == "__main__":
     unittest.main()

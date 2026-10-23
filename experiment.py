@@ -12353,6 +12353,7 @@ def _parse_group_stats(
             or loss_sum is None
             or correct is None
             or tokens <= 0.0
+            or loss_sum < 0.0
             or correct < 0.0
             or correct > tokens + 1e-9
         ):
