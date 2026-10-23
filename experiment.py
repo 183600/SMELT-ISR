@@ -14557,9 +14557,10 @@ def _select_ngram_candidate_one_se(
         mean_diff = _mean(differences)
         if mean_diff is None:
             continue
-        se = _sample_std(differences) / math.sqrt(n_windows)
-        if se is None:
+        std = _sample_std(differences)
+        if std is None:
             continue
+        se = std / math.sqrt(n_windows)
         rho1 = _lag1_autocorrelation(
             torch.tensor(differences, dtype=torch.float64)
         )

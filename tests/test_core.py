@@ -9150,6 +9150,41 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(len(report["tied"]), 1)
         json.dumps(report, allow_nan=False)
 
+    def test_ngram_one_se_skips_unrepresentable_paired_se(self):
+        point = {
+            "order": 1,
+            "alpha": 0.1,
+            "val_loss": 0.0,
+        }
+        candidates = [
+            point,
+            {
+                "order": 2,
+                "alpha": 0.2,
+                "val_loss": 0.0,
+            },
+        ]
+        window_values = {
+            (1, 0.1): [0.0, 0.0, 0.0],
+            (2, 0.2): [1.7e308, -1.7e308, 1.7e308],
+        }
+        report = experiment._select_ngram_candidate_one_se(
+            point,
+            candidates,
+            window_values,
+            "val_loss",
+        )
+        self.assertTrue(report["available"])
+        self.assertEqual(
+            report["selected"],
+            {"order": 1, "alpha": 0.1},
+        )
+        self.assertEqual(
+            [row["order"] for row in report["tied"]],
+            [1],
+        )
+        json.dumps(report, allow_nan=False)
+
     def test_paired_window_bootstrap_is_scale_stable(self):
         small = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]
         large = [value * 1.0e300 for value in small]
