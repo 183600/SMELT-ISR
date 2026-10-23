@@ -24941,7 +24941,17 @@ def _sample_std(values: List[float]) -> Optional[float]:
         direct = math.sqrt(max(0.0, variance))
     except OverflowError:
         direct = None
-    if direct is not None and math.isfinite(direct):
+    # direct == 0 只有在观测完全相等时才是真零标准差：极小但
+    # 非零的差值在平方时会下溢为 0，必须同样回退到缩放计算，
+    # 否则 1e-200 量级的种子间波动会被报告成零方差。
+    if (
+        direct is not None
+        and math.isfinite(direct)
+        and (
+            direct > 0.0
+            or all(value == numeric[0] for value in numeric)
+        )
+    ):
         return direct
 
     scale = max(abs(value) for value in numeric)
@@ -25114,14 +25124,31 @@ def _paired_t_test(
             "se": 0.0,
         }
 
-    t = mean / (std / math.sqrt(n))
+    # 先算 mean/std 再乘 √n：极小尺度下 std/√n 可能下溢为 0，
+    # 直接做 mean / se 会抛 ZeroDivisionError；该写法对公共尺度
+    # 不变，也不改变正常量级的逐位结果。
+    try:
+        t = (mean / std) * math.sqrt(n)
+    except (OverflowError, ZeroDivisionError):
+        t = None
+    se = std / math.sqrt(n)
+    if t is None or not math.isfinite(t):
+        return {
+            "test": "paired_t",
+            "t": None,
+            "df": float(n - 1),
+            "p_value": 0.0,
+            "note": "extreme_separation",
+            "effect": mean,
+            "se": se,
+        }
     return {
         "test": "paired_t",
         "t": t,
         "df": float(n - 1),
         "p_value": _two_sided_t_p_value(abs(t), float(n - 1)),
         "effect": mean,
-        "se": std / math.sqrt(n),
+        "se": se,
     }
 
 
@@ -25167,19 +25194,20 @@ def _paired_sign_flip_test(
     if values is None:
         return {"test": "invalid_values"}
 
-    # 符号翻转统计量对公共尺度不变：大数值时先缩放到 [-1, 1]，
-    # 避免合法的大浮点数在求和/平方时溢出成 inf 或抛
-    # OverflowError。正常量级保持原值，避免改变历史 p 值的最低位
-    # 舍入。随机化种子仍用原始值，保证结果可复现。
+    # 符号翻转统计量对公共尺度不变：先按最大绝对值缩放到
+    # [-1, 1]，避免合法的大浮点数在求和时溢出，也避免极小但非零
+    # 的差值被绝对容差 1e-12 误判成退化。容差本身按缩放后的
+    # 观测均值取相对值，因此对任何公共尺度都给出同一 p 值。
+    # 随机化种子仍用原始值，保证结果可复现。
     raw_values = values
     max_abs = max(abs(value) for value in values)
-    scale = max_abs if max_abs > 1.0e150 else 1.0
+    scale = max_abs if max_abs > 0.0 else 1.0
     if scale != 1.0:
         values = [value / scale for value in values]
     mean_scaled = sum(values) / n
     mean = mean_scaled * scale
     observed = abs(mean_scaled)
-    tolerance = 1e-12 * max(1.0, observed)
+    tolerance = 1e-12 * observed
 
     if observed <= tolerance:
         return {

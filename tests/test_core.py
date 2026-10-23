@@ -6315,6 +6315,34 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
 
+    def test_paired_stats_keep_tiny_nonzero_scale(self):
+        # 极小但非零的差值在平方时下溢为 0；标准差不能被报告成
+        # 0，配对 t 也不能因此变成「零方差/精确分离」。
+        tiny = [1.0e-200, 2.0e-200, 3.0e-200]
+        self.assertTrue(
+            math.isclose(
+                experiment._sample_std(tiny),
+                1.0e-200,
+                rel_tol=1e-12,
+            )
+        )
+        test = experiment._paired_t_test(tiny)
+        self.assertEqual(test["test"], "paired_t")
+        self.assertTrue(math.isfinite(test["t"]))
+        self.assertAlmostEqual(
+            test["t"],
+            experiment._paired_t_test([1.0, 2.0, 3.0])["t"],
+        )
+        # 符号翻转统计量本身对公共尺度不变；固定绝对容差会让
+        # 1e-13 量级的差值被误判成退化（p=1）。
+        for scale in (1.0e-13, 1.0e-200, 1.0e-300):
+            sign = experiment._paired_sign_flip_test(
+                [scale, 2.0 * scale, 3.0 * scale]
+            )
+            self.assertEqual(sign["method"], "exact")
+            self.assertEqual(sign["p_value"], 0.25)
+            json.dumps(sign, allow_nan=False)
+
     def test_counterbalanced_empty_blocks_do_not_divide_by_zero(self):
         self.assertEqual(
             experiment._counterbalanced_order({1: []}, 0), []
