@@ -7841,6 +7841,30 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_t_power_uses_normal_limit_for_large_df(self):
+        expected = 0.17007504575308752
+        for df in (1.0e6, 1.0e9, 1.0e16, float("inf")):
+            self.assertAlmostEqual(
+                experiment._t_power(1.0, 1.0, df),
+                expected,
+                delta=1e-12,
+            )
+        mde = experiment._minimum_detectable_effect(
+            1.0, float("inf")
+        )
+        self.assertIsNotNone(mde)
+        self.assertAlmostEqual(
+            experiment._t_power(mde, 1.0, float("inf")),
+            experiment._TARGET_POWER,
+            delta=1e-9,
+        )
+        self.assertIsNone(
+            experiment._t_power(1.0, 1.0, float("nan"))
+        )
+        self.assertIsNone(
+            experiment._t_power(1.0, 1.0, float("-inf"))
+        )
+
     def test_curve_diagnostics_sanitizes_nonfinite_metrics(self):
         report = experiment.curve_diagnostics_report([{
             "run": "damaged",

@@ -24029,6 +24029,9 @@ _HYPOTHESIS_MIN_EFFECT_ABS_FLOOR = 1.0e-12
 _T_POWER_TAIL = 12.0
 _T_POWER_MIN_INTERVALS = 800
 _T_POWER_MAX_INTERVALS = 4000
+# df 达到该量级时，固定 u 网格上的 Simpson 会因 chi 密度
+# 宽约 1/√2 而节点不足；非中心 t 也已充分接近正态极限。
+_T_POWER_NORMAL_DF = 1.0e6
 
 
 def _build_seed_plan(
@@ -27946,7 +27949,7 @@ def _t_power(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
-        or not math.isfinite(df_value)
+        or math.isnan(df_value)
         or not (0.0 < alpha_value < 0.5)
     ):
         return None
@@ -27960,11 +27963,27 @@ def _t_power(
         # 截断而偏离 alpha；这是可精确知道的值，直接返回。
         return alpha_value
 
+    noncentrality = effect_value / se_value
+    if (
+        not math.isfinite(df_value)
+        or df_value >= _T_POWER_NORMAL_DF
+    ):
+        # 自由度趋于无穷时非中心 t 退化为均值 δ 的正态分布；
+        # 同时避开大 df 下固定 u 网格漏掉 chi 密度尖峰的问题。
+        critical = _t_critical(float("inf"), alpha_value)
+        if critical is None:
+            return None
+        power = (
+            _normal_cdf(-critical - noncentrality)
+            + 1.0
+            - _normal_cdf(critical - noncentrality)
+        )
+        return min(1.0, max(0.0, power))
+
     critical = _t_critical(df_value, alpha_value)
     if critical is None:
         return None
 
-    noncentrality = effect_value / se_value
     scale = critical / math.sqrt(df_value)
 
     if scale > 10.0 and df_value >= 3.0:
@@ -28075,7 +28094,7 @@ def _minimum_detectable_effect(
 
     if (
         not math.isfinite(se_value)
-        or not math.isfinite(df_value)
+        or math.isnan(df_value)
         or not math.isfinite(target)
         or df_value <= 0.0
         or not (0.0 < target < 1.0)
