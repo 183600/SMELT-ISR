@@ -12382,6 +12382,17 @@ def _group_stats_bootstrap_ci(
     n_groups = int(point_values.numel())
     if n_groups < 2 or replicates <= 1:
         return None
+    if (
+        int(weights.numel()) != n_groups
+        or not bool(torch.isfinite(point_values).all())
+        or not bool(torch.isfinite(weights).all())
+    ):
+        return None
+    max_weight = float(weights.abs().max().item())
+    if max_weight <= 0.0:
+        return None
+    if max_weight > 1.0e150 or max_weight < 1.0e-150:
+        weights = weights / max_weight
     indices = torch.randint(
         low=0,
         high=n_groups,
@@ -12617,17 +12628,21 @@ def _group_cluster_paired_comparison(
         }
     low = interval[0] * scale
     high = interval[1] * scale
-    weighted_mean = (
-        float(
-            (
-                difference_tensor * weight_tensor
-            ).sum().item()
-        )
-        / float(weight_tensor.sum().item())
-    )
-    unweighted_mean = sum(loss_differences) / len(
-        loss_differences
-    )
+    weight_scale = float(weight_tensor.abs().max().item())
+    if (
+        weight_scale > 1.0e150
+        or 0.0 < weight_scale < 1.0e-150
+    ):
+        mean_weights = weight_tensor / weight_scale
+    else:
+        mean_weights = weight_tensor
+    weighted_mean = float(
+        (
+            scaled_differences * mean_weights
+        ).sum().item()
+        / float(mean_weights.sum().item())
+    ) * scale
+    unweighted_mean = _mean(loss_differences)
     accuracy_weights = weight_tensor
     accuracy_tensor = torch.tensor(
         accuracy_differences,
@@ -12680,10 +12695,10 @@ def _group_cluster_paired_comparison(
         result["mean_accuracy_diff"] = (
             float(
                 (
-                    accuracy_tensor * weight_tensor
+                    accuracy_tensor * mean_weights
                 ).sum().item()
             )
-            / float(weight_tensor.sum().item())
+            / float(mean_weights.sum().item())
         )
         result["accuracy_bootstrap_ci95"] = {
             "low": max(-1.0, accuracy_interval[0]),

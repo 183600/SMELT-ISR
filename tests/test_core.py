@@ -10492,6 +10492,27 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertEqual(interval["high"], -0.9)
         self.assertLessEqual(interval["low"], interval["high"])
 
+    def test_paired_group_means_do_not_overflow(self):
+        before = self._stats([
+            [0, 1.0, 0.0, 0.0],
+            [1, 1.0, 0.0, 0.0],
+        ])
+        after = self._stats([
+            [0, 1.0, 1.0e308, 0.0],
+            [1, 1.0, 1.0e308, 0.0],
+        ])
+        report = experiment._group_cluster_paired_comparison(
+            {"group_stats": before},
+            {"group_stats": after},
+        )
+        self.assertTrue(report["available"])
+        self.assertTrue(math.isfinite(report["mean_loss_diff"]))
+        self.assertTrue(
+            math.isfinite(report["unweighted_mean_loss_diff"])
+        )
+        self.assertEqual(report["mean_loss_diff"], 1.0e308)
+        json.dumps(report, allow_nan=False)
+
 
 if __name__ == "__main__":
     unittest.main()
