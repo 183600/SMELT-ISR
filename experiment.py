@@ -12736,6 +12736,26 @@ def _hierarchical_group_bootstrap_ci(
     对交叉重采样后的 token 加权差值取种子平均。区间反映
     「换一批训练种子 + 换一批同分布文档」的联合不确定性。
     """
+    if not isinstance(per_seed_group_differences, dict):
+        return {
+            "available": False,
+            "reason": "invalid_seed_group_differences",
+        }
+    try:
+        replicate_count = int(replicates)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": replicates,
+        }
+    if replicate_count <= 1:
+        return {
+            "available": False,
+            "reason": "insufficient_bootstrap_replicates",
+            "replicates": replicate_count,
+        }
+    replicates = replicate_count
     cleaned: Dict[int, Dict[int, Tuple[float, float]]] = {}
     for seed, mapping in per_seed_group_differences.items():
         if (

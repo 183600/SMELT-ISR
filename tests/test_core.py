@@ -10513,6 +10513,22 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertEqual(report["mean_loss_diff"], 1.0e308)
         json.dumps(report, allow_nan=False)
 
+    def test_hierarchical_group_bootstrap_handles_bad_replicates(self):
+        differences = {
+            1: {0: (1.0, 10.0), 1: (2.0, 10.0)},
+            2: {0: (2.0, 10.0), 1: (3.0, 10.0)},
+        }
+        for replicates in (0, 1, -5):
+            report = experiment._hierarchical_group_bootstrap_ci(
+                differences, replicates=replicates
+            )
+            self.assertFalse(report["available"])
+        self.assertFalse(
+            experiment._hierarchical_group_bootstrap_ci(
+                [], replicates=10
+            )["available"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
