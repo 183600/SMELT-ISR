@@ -14617,8 +14617,12 @@ def analyze_training_curve(
             pending = []
             continue
 
+        # 用带缩放的均值而不是直接 sum：两个各自有限的大损失
+        # （如 1e308）相加会溢出成 inf，让 eval 点的 train_loss
+        # 以及由它派生的 gap/发散判据全部失真。正常量级下
+        # _mean 仍走原来的直接求和路径，历史数值不变。
         train_at_eval = (
-            sum(pending) / len(pending)
+            _mean(pending)
             if pending
             else (train_points[-1][1] if train_points else None)
         )
@@ -14671,13 +14675,19 @@ def analyze_training_curve(
         )
         grad_prior_median = _median(prior_values)
         if grad_prior_median > 0.0:
-            grad_spike_ratio = (
+            ratio = (
                 grad_spike_recent_max / grad_prior_median
             )
-            grad_spike = (
-                grad_spike_ratio
-                >= _CURVE_GRAD_SPIKE_RATIO
-            )
+            if math.isfinite(ratio):
+                grad_spike_ratio = ratio
+                grad_spike = (
+                    ratio >= _CURVE_GRAD_SPIKE_RATIO
+                )
+            else:
+                # 中位数极小、近期最大值极大时比值会溢出成 inf；
+                # 尖峰仍然真实存在，但报告字段必须是有限数或
+                # None，不能把 inf 写进 metrics/config。
+                grad_spike = True
 
     analysis: Dict[str, object] = {
         "n_train_steps": len(train_points),
@@ -14727,11 +14737,16 @@ def analyze_training_curve(
         )
 
     if grad_spike:
+        ratio_text = (
+            f"{grad_spike_ratio:.1f} 倍"
+            if grad_spike_ratio is not None
+            else "超出可表示的倍数范围"
+        )
         warnings.append(
             "近期梯度范数最大值 "
             f"{grad_spike_recent_max:.4g} 是此前中位数 "
             f"{grad_prior_median:.4g} 的 "
-            f"{grad_spike_ratio:.1f} 倍：即使损失尚未变成 "
+            f"{ratio_text}：即使损失尚未变成 "
             "NaN，也可能是梯度爆炸/学习率过大的前兆。"
             "建议降低学习率、收紧 --grad-clip，并检查是否"
             "已出现参数/优化器状态污染。"

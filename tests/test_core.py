@@ -6879,6 +6879,63 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertEqual(rows[0]["n_params"], 10 ** 400)
         json.dumps(rows, allow_nan=False)
 
+    def test_curve_analysis_does_not_overflow_finite_losses(self):
+        # 两次各自有限的 1e308 训练损失在求验证点均值时不能
+        # 溢出成 inf；否则派生 gap/状态与落盘 JSON 都会失真。
+        records = []
+        for index in range(1, 6):
+            for offset in (0, 1):
+                records.append({
+                    "step": index * 2 - 1 + offset,
+                    "train_loss": 1.0e308,
+                    "grad_norm": 1.0e-300,
+                    "lr": 1.0e-3,
+                })
+            records.append({
+                "step": index * 2,
+                "val_loss": 5.0 + index * 0.01,
+            })
+        analysis = experiment.analyze_training_curve(
+            records, baseline_loss=5.5
+        )
+        self.assertTrue(
+            math.isfinite(analysis["last_train_loss"])
+        )
+        json.dumps(analysis, allow_nan=False)
+
+    def test_curve_analysis_gradient_ratio_overflow_is_none(self):
+        # 中位数极小、近期最大值极大时尖峰倍率会溢出；尖峰
+        # 警告仍应触发，但字段必须是 None 而不是 inf。
+        records = []
+        for step in range(1, 41):
+            records.append({
+                "step": step,
+                "train_loss": 5.0,
+                "grad_norm": 1.0e-300,
+                "lr": 1.0e-3,
+            })
+        records.append({
+            "step": 41,
+            "train_loss": 5.0,
+            "grad_norm": 1.0e308,
+            "lr": 1.0e-3,
+        })
+        for step in range(42, 47):
+            records.append({
+                "step": step,
+                "train_loss": 5.0,
+                "grad_norm": 1.0,
+                "lr": 1.0e-3,
+            })
+            records.append({
+                "step": step,
+                "val_loss": 5.0 - step * 1.0e-4,
+            })
+        analysis = experiment.analyze_training_curve(records)
+        self.assertTrue(analysis["grad_norm_spike_warning"])
+        self.assertIsNone(analysis["grad_norm_spike_ratio"])
+        json.dumps(analysis, allow_nan=False)
+
     def test_lag1_autocorrelation_is_scale_stable(self):
         small = torch.tensor(
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
