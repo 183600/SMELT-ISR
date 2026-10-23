@@ -15968,18 +15968,21 @@ def print_curve_analysis(analysis: Dict[str, object]) -> None:
         # 与其它字段一致按缺失值打印。
         last_train_loss = analysis.get("last_train_loss")
         last_train_text = (
-            f"{float(last_train_loss):.4f}"
+            _format_finite(last_train_loss)
             if last_train_loss is not None
             else "-"
         )
+        regression = analysis.get("val_regression_from_best")
+        if regression is None:
+            regression = 0.0
         print(
             "[curve] 最优验证损失 "
-            f"{float(analysis['best_val_loss']):.4f} @ step "
+            f"{_format_finite(analysis.get('best_val_loss'))} @ step "
             f"{analysis.get('best_val_step')}，"
             "最终验证损失 "
-            f"{float(analysis['last_val_loss']):.4f}"
+            f"{_format_finite(analysis.get('last_val_loss'))}"
             "（相对最优回升 "
-            f"{float(analysis.get('val_regression_from_best') or 0.0) * 100:.1f}%），"
+            f"{_format_finite(regression, '.1f', 100.0)}%），"
             "最终训练损失 "
             f"{last_train_text}"
         )

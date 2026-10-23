@@ -8085,6 +8085,22 @@ class NumericalScaleTests(unittest.TestCase):
             )
         self.assertNotIn("10" * 50, output.getvalue())
 
+    def test_curve_print_tolerates_huge_numbers(self):
+        analysis = {
+            "status": "healthy",
+            "n_eval_points": 2,
+            "n_nonfinite_events": 0,
+            "best_val_loss": 10 ** 400,
+            "last_train_loss": 10 ** 400,
+            "last_val_loss": 10 ** 400,
+            "val_regression_from_best": 10 ** 400,
+            "best_val_step": 1,
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_curve_analysis(analysis)
+        self.assertIn("[curve]", output.getvalue())
+
     def test_efficiency_and_design_print_tolerate_huge_numbers(self):
         efficiency = {
             "n_params_total": 10 ** 400,
