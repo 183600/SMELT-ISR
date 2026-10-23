@@ -64391,11 +64391,14 @@ def _axis_value_equal(left: object, right: object) -> bool:
     left_number = _finite_float(left)
     right_number = _finite_float(right)
     if left_number is not None and right_number is not None:
+        # 只用相对容差：固定 1e-12 绝对容差会把 1e-13 量级的
+        # 两个不同学习率/超参判成同一个轴取值，从而静默合并
+        # 候选配置。正常量级下相对容差与原行为一致。
         return math.isclose(
             left_number,
             right_number,
             rel_tol=1e-9,
-            abs_tol=1e-12,
+            abs_tol=0.0,
         )
     # 超出 float 范围的整数仍可精确相等比较；不能因为无法转成
     # float 就把两个完全相同的合法 JSON 大整数判成不一致。

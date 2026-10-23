@@ -7714,6 +7714,20 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsNone(tiny["variance_of_mean"])
         json.dumps(tiny, allow_nan=False)
 
+    def test_axis_value_equality_scales_with_tiny_values(self):
+        self.assertFalse(
+            experiment._axis_value_equal(0.0, 1.0e-13)
+        )
+        self.assertFalse(
+            experiment._axis_value_equal(1.0e-13, 2.0e-13)
+        )
+        self.assertTrue(
+            experiment._axis_value_equal(
+                1.0e-13, 1.0e-13 * (1.0 + 1.0e-10)
+            )
+        )
+        self.assertTrue(experiment._axis_value_equal(7, 7.0))
+
     def test_attrition_bounds_scale_with_tiny_effect(self):
         cell = {
             "label": "a",
