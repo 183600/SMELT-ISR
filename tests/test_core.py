@@ -8139,6 +8139,109 @@ class NumericalScaleTests(unittest.TestCase):
             )
         self.assertNotIn("10" * 50, output.getvalue())
 
+    def test_diagnostic_prints_tolerate_huge_numbers(self):
+        huge = 10 ** 400
+        with contextlib.redirect_stdout(io.StringIO()):
+            experiment.print_bad_cases({
+                "split": "val",
+                "tokens_evaluated": 1,
+                "token_accuracy": 1.0,
+                "top_cases": [{
+                    "rank": 1,
+                    "loss": huge,
+                    "confidence": huge,
+                    "margin": huge,
+                    "target_text": "a",
+                    "predicted_text": "b",
+                    "category": "c",
+                    "context": "d",
+                }],
+                "top_cases_concentration_warning": True,
+                "top_cases_window_concentration": huge,
+                "error_rate_by_position": [{
+                    "name": "p",
+                    "error_rate": huge,
+                    "wrong": 1,
+                    "tokens": 1,
+                }],
+                "calibration": {
+                    "ece": huge,
+                    "mean_confidence": huge,
+                    "accuracy": huge,
+                    "overconfidence": huge,
+                },
+                "error_category_counts": {"a": 1},
+                "error_category_shares": {"a": huge},
+            })
+            experiment.print_routing_analysis({
+                "mode": "x",
+                "split": "val",
+                "tokens_evaluated": 1,
+                "middle_blocks": 1,
+                "rq4_load_and_entropy": {
+                    "summary": {"round1": {
+                        "load_entropy": huge,
+                        "load_max_share": huge,
+                        "dead_experts": 0,
+                        "router_entropy_mean": huge,
+                    }}
+                },
+                "rq3_expert_overlap": {"summary": {
+                    "second_round_jaccard_mean": huge,
+                    "second_round_exact_match_share": huge,
+                    "second_round_slot_reuse_mean": huge,
+                    "token_second_round_jaccard_mean": huge,
+                    "token_second_round_exact_match_share": huge,
+                    "branch_self_reuse_share": huge,
+                    "jaccard_chance_uniform": huge,
+                    "jaccard_chance_marginal": huge,
+                    "jaccard_lift_over_uniform": huge,
+                    "jaccard_lift_over_marginal": huge,
+                    "jaccard_adjusted_marginal": huge,
+                }},
+                "branch_divergence": {"summary": {
+                    "branch_cosine_mean": huge,
+                    "blocks_with_branches": 1,
+                }},
+            })
+            experiment.print_routing_interventions({
+                "mode": "x",
+                "baseline": {"loss": huge},
+                "interventions": {
+                    "routing_shuffle": {
+                        "loss_delta": huge,
+                        "loss_ratio": huge,
+                        "accuracy_delta": huge,
+                    },
+                    "expert_drop": {
+                        "max_expert": 0,
+                        "max_loss_delta": huge,
+                        "min_expert": 1,
+                        "min_loss_delta": huge,
+                        "mean_loss_delta": huge,
+                        "std_loss_delta": huge,
+                        "importance_cv": huge,
+                    },
+                },
+            })
+            experiment.print_baseline_tuning_report({
+                "metric": "val_loss",
+                "higher_is_better": False,
+                "training_config": {},
+                "mode": "local_base",
+                "candidates": [{
+                    "lr": huge,
+                    "n_runs": 1,
+                    "metric_mean": huge,
+                    "metric_std": huge,
+                }],
+                "winner": {
+                    "lr": huge,
+                    "n_runs": 1,
+                    "metric_mean": huge,
+                },
+            }, Path("/tmp"))
+
     def test_safe_ratio_keeps_representable_huge_int_ratio(self):
         self.assertEqual(
             experiment._safe_ratio(10 ** 400, 10 ** 399),

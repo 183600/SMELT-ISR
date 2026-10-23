@@ -17608,9 +17608,9 @@ def print_bad_cases(report: Dict[str, object]) -> None:
     for case in report.get("top_cases", []):
         print(
             f"[bad-case]   #{case['rank']} "
-            f"loss={case['loss']:.4f} "
-            f"conf={case['confidence']:.3f} "
-            f"margin={case['margin']:.3f} "
+            f"loss={_format_finite(case.get('loss'), '.4f')} "
+            f"conf={_format_finite(case.get('confidence'), '.3f')} "
+            f"margin={_format_finite(case.get('margin'), '.3f')} "
             f"target='{case['target_text']}' "
             f"pred='{case['predicted_text']}' "
             f"category={case['category']} | "
@@ -17621,8 +17621,8 @@ def print_bad_cases(report: Dict[str, object]) -> None:
         print(
             "[bad-case] top-N 案例集中在少数窗口："
             f"唯一窗口 {report.get('top_cases_unique_windows')} 个，"
-            f"单一窗口最高占比 "
-            f"{float(report['top_cases_window_concentration']) * 100:.1f}%"
+            "单一窗口最高占比 "
+            f"{_format_finite(report.get('top_cases_window_concentration'), '.1f', 100.0)}%"
             "；这些案例不是彼此独立的失败模式"
         )
 
@@ -17639,8 +17639,8 @@ def print_bad_cases(report: Dict[str, object]) -> None:
     def _stratified_text(rows) -> str:
         return " ".join(
             f"{row['name']}="
-            f"{float(row['error_rate']) * 100:.1f}%"
-            f"({row['wrong']}/{row['tokens']})"
+            f"{_format_finite(row.get('error_rate'), '.1f', 100.0)}%"
+            f"({row.get('wrong')}/{row.get('tokens')})"
             for row in rows
         )
 
@@ -17681,11 +17681,13 @@ def print_bad_cases(report: Dict[str, object]) -> None:
     ) is not None:
         print(
             "[bad-case] 置信度校准: "
-            f"ECE={calibration['ece']:.4f} "
-            f"平均置信度={calibration['mean_confidence']:.4f} "
-            f"实际准确率={calibration['accuracy']:.4f} "
+            f"ECE={_format_finite(calibration.get('ece'))} "
+            "平均置信度="
+            f"{_format_finite(calibration.get('mean_confidence'))} "
+            "实际准确率="
+            f"{_format_finite(calibration.get('accuracy'))} "
             "过度自信="
-            f"{calibration['overconfidence']:+.4f} "
+            f"{_format_finite(calibration.get('overconfidence'), '+.4f')} "
             "（高置信度错误 "
             f"{calibration.get('high_confidence_error_count', 0)}"
             " 个）"
@@ -17711,7 +17713,7 @@ def print_bad_cases(report: Dict[str, object]) -> None:
         detail = ", ".join(
             f"{name}={count}"
             + (
-                f"({float(shares[name]) * 100:.1f}%)"
+                f"({_format_finite(shares.get(name), '.1f', 100.0)}%)"
                 if shares.get(name) is not None
                 else ""
             )
@@ -18848,13 +18850,13 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
             continue
         print(
             f"[routing] {round_name} 专家负载: "
-            f"load_entropy="
-            f"{summary.get('load_entropy', float('nan')):.4f} "
-            f"max_share="
-            f"{summary.get('load_max_share', float('nan')):.4f} "
+            "load_entropy="
+            f"{_format_finite(summary.get('load_entropy'))} "
+            "max_share="
+            f"{_format_finite(summary.get('load_max_share'))} "
             f"dead={summary.get('dead_experts')} "
-            f"router_entropy="
-            f"{summary.get('router_entropy_mean', float('nan')):.4f}"
+            "router_entropy="
+            f"{_format_finite(summary.get('router_entropy_mean'))}"
         )
 
     rq3 = (report.get("rq3_expert_overlap") or {}).get(
@@ -18863,7 +18865,9 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
     if rq3:
         def _show(name: str) -> str:
             value = rq3.get(name)
-            return "n/a" if value is None else f"{float(value):.4f}"
+            if value is None:
+                return "n/a"
+            return _format_finite(value)
 
         print(
             "[routing] RQ3 两轮专家重合（branch 级）："
@@ -18880,7 +18884,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         if rq3.get("branch_self_reuse_share") is not None:
             print(
                 "[routing] 分支自身专家在第二轮复现比例（A/B）: "
-                f"{float(rq3['branch_self_reuse_share']):.4f}"
+                f"{_format_finite(rq3.get('branch_self_reuse_share'))}"
             )
         # 机会水平校正：不同 k1/k2 与负载分布下 Jaccard 的
         # 零点不同，必须并列展示。
@@ -18900,7 +18904,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
     if divergence.get("branch_cosine_mean") is not None:
         print(
             "[routing] 跨分支表示平均余弦相似度: "
-            f"{float(divergence['branch_cosine_mean']):.4f}"
+            f"{_format_finite(divergence.get('branch_cosine_mean'))}"
             f"（blocks_with_branches="
             f"{divergence.get('blocks_with_branches')}）"
         )
@@ -19221,7 +19225,7 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
     print(
         "[routing-intervention] mode="
         f"{report.get('mode')} baseline_loss="
-        f"{float(baseline['loss']):.6f}"
+        f"{_format_finite(baseline.get('loss'), '.6f')}"
     )
     shuffle = (report.get("interventions") or {}).get(
         "routing_shuffle"
@@ -19229,9 +19233,11 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
     if shuffle.get("loss_delta") is not None:
         print(
             "[routing-intervention] 路由打乱："
-            f"Δloss={float(shuffle['loss_delta']):+.6f} "
+            "Δloss="
+            f"{_format_finite(shuffle.get('loss_delta'), '+.6f')} "
             f"ratio={shuffle.get('loss_ratio')} "
-            f"Δacc={float(shuffle['accuracy_delta']):+.4f}"
+            "Δacc="
+            f"{_format_finite(shuffle.get('accuracy_delta'), '+.4f')}"
         )
     drop = (report.get("interventions") or {}).get(
         "expert_drop"
@@ -19240,11 +19246,14 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
         print(
             "[routing-intervention] 专家屏蔽："
             f"max_expert={drop.get('max_expert')} "
-            f"Δloss={float(drop.get('max_loss_delta')):+.6f}；"
+            "Δloss="
+            f"{_format_finite(drop.get('max_loss_delta'), '+.6f')}；"
             f"min_expert={drop.get('min_expert')} "
-            f"Δloss={float(drop.get('min_loss_delta')):+.6f}；"
-            f"mean={float(drop.get('mean_loss_delta')):+.6f}"
-            f"±{float(drop.get('std_loss_delta')):.6f} "
+            "Δloss="
+            f"{_format_finite(drop.get('min_loss_delta'), '+.6f')}；"
+            "mean="
+            f"{_format_finite(drop.get('mean_loss_delta'), '+.6f')}"
+            f"±{_format_finite(drop.get('std_loss_delta'), '.6f')} "
             f"CV={drop.get('importance_cv')}"
         )
 
@@ -39824,7 +39833,7 @@ def print_comparison_analysis(
         rate_text = (
             "n/a"
             if rate is None
-            else f"{float(rate):.1%}"
+            else _format_finite(rate, ".1%")
         )
         print(
             f"  {arm['mode']}: planned={arm['planned_runs']} "
@@ -39887,7 +39896,7 @@ def print_comparison_analysis(
         for check in alignment["checks"]:
             delta = check.get("delta")
             delta_text = (
-                f"Δ={float(delta):+.4f}"
+                f"Δ={_format_finite(delta, '+.4f')}"
                 if isinstance(delta, (int, float))
                 else "Δ=NA"
             )
@@ -39899,7 +39908,7 @@ def print_comparison_analysis(
             )
             p_holm = check.get("p_value_holm")
             p_text = (
-                f"Holm p={float(p_holm):.4f}"
+                f"Holm p={_format_finite(p_holm)}"
                 if isinstance(p_holm, (int, float))
                 else "Holm p=NA"
             )
@@ -39989,9 +39998,12 @@ def print_comparison_analysis(
                 return "-"
             std = aggregate.get(f"{base_metric}_std")
             text = (
-                f"{float(mean):.4f}"
+                f"{_format_finite(mean)}"
                 if std is None
-                else f"{float(mean):.4f}±{float(std):.4f}"
+                else (
+                    f"{_format_finite(mean)}"
+                    f"±{_format_finite(std)}"
+                )
             )
             # 均值的 95% CI 与 std 是两件事：std 描述种子间
             # 离散度，CI 描述均值本身的不确定度。n 很小时区间
@@ -39999,8 +40011,9 @@ def print_comparison_analysis(
             ci = (aggregate.get("ci95") or {}).get(base_metric)
             if ci:
                 text += (
-                    f" CI[{float(ci['low']):.4f},"
-                    f"{float(ci['high']):.4f}]"
+                    " CI["
+                    f"{_format_finite(ci.get('low'))},"
+                    f"{_format_finite(ci.get('high'))}]"
                 )
             return text
 
@@ -40191,7 +40204,9 @@ def print_comparison_analysis(
             entry = aggregate["costs"].get(key)
             if not entry or entry.get("mean") is None:
                 return "-"
-            return format(float(entry["mean"]) * scale, spec)
+            return _format_finite(
+                entry.get("mean"), spec, scale
+            )
 
         for aggregate in cost_rows:
             print(
@@ -40227,8 +40242,10 @@ def print_comparison_analysis(
                 ):
                     continue
                 parts.append(
-                    f"{short} {float(mean):.3f} "
-                    f"[{float(low):.3f},{float(high):.3f}]"
+                    f"{short} {_format_finite(mean, '.3f')} "
+                    "["
+                    f"{_format_finite(low, '.3f')},"
+                    f"{_format_finite(high, '.3f')}]"
                 )
             if parts:
                 timing_ci_lines.append(
@@ -40272,19 +40289,20 @@ def print_comparison_analysis(
     else:
         print(
             "  共同计算量 FLOPs="
-            f"{float(compute_matched['target_flops']):.3e}"
+            f"{_format_finite(compute_matched.get('target_flops'), '.3e')}"
         )
         for item in compute_matched["runs"]:
             ratio = item.get("compute_ratio")
             ratio_text = (
-                f"（用自身计算量的 {float(ratio):.1%}）"
+                "（用自身计算量的 "
+                f"{_format_finite(ratio, '.1%')}）"
                 if isinstance(ratio, (int, float))
                 else ""
             )
             print(
                 f"  {str(item.get('run'))[:36]:<37} "
                 f"mode={str(item.get('mode')):<10} "
-                f"loss={float(item['value']):.4f}"
+                f"loss={_format_finite(item.get('value'))}"
                 f"{ratio_text}"
                 f" [{item['interpolation']}]"
             )
@@ -40309,19 +40327,20 @@ def print_comparison_analysis(
     else:
         print(
             "  共同训练步数="
-            f"{float(common_step['target_step']):.0f}"
+            f"{_format_finite(common_step.get('target_step'), '.0f')}"
         )
         for item in common_step["runs"]:
             ratio = item.get("step_ratio")
             ratio_text = (
-                f"（占自身验证范围 {float(ratio):.1%}）"
+                "（占自身验证范围 "
+                f"{_format_finite(ratio, '.1%')}）"
                 if isinstance(ratio, (int, float))
                 else ""
             )
             print(
                 f"  {str(item.get('run'))[:36]:<37} "
                 f"mode={str(item.get('mode')):<10} "
-                f"loss={float(item['value']):.4f}"
+                f"loss={_format_finite(item.get('value'))}"
                 f"{ratio_text}"
                 f" [{item['interpolation']}]"
             )
@@ -40346,7 +40365,7 @@ def print_comparison_analysis(
                 print(
                     f"  {str(item.get('run'))[:36]:<37} "
                     f"mode={str(item.get('mode')):<10} "
-                    f"value={float(item['value']):.4f}"
+                    f"value={_format_finite(item.get('value'))}"
                     f" [{item['interpolation']}]"
                 )
         print(
@@ -40524,9 +40543,10 @@ def print_comparison_analysis(
             ):
                 detail = (
                     f"删除 {deleted} 个种子后 "
-                    f"p={float(deleted_p):.4f}"
+                    f"p={_format_finite(deleted_p)}"
                     + (
-                        f" > alpha={float(alpha_value):.4f}"
+                        " > alpha="
+                        f"{_format_finite(alpha_value)}"
                         if isinstance(
                             alpha_value, (int, float)
                         )
@@ -40690,7 +40710,7 @@ def print_comparison_analysis(
     else:
         print(
             "[equivalence] 等价性与统计功效（等价界 = 基线均值的 "
-            f"±{float(equivalence_margin) * 100:.1f}%；"
+            f"±{_format_finite(equivalence_margin, '.1f', 100.0)}%；"
             "不显著 ≠ 等价）"
         )
         margin_status = margin_preregistration.get("status")
@@ -40730,13 +40750,14 @@ def print_comparison_analysis(
             for entry in equivalent_entries:
                 holm = entry.get("tost_p_value_holm")
                 holm_text = (
-                    f"Holm p={float(holm):.3f}"
+                    f"Holm p={_format_finite(holm, '.3f')}"
                     if isinstance(holm, (int, float))
                     else "p=NA"
                 )
                 margin_abs = entry.get("equivalence_margin_abs")
                 margin_text = (
-                    f"（等价界 ±{float(margin_abs):.4f}）"
+                    "（等价界 ±"
+                    f"{_format_finite(margin_abs)}）"
                     if isinstance(margin_abs, (int, float))
                     else ""
                 )
@@ -40747,7 +40768,7 @@ def print_comparison_analysis(
                 )
                 delta = entry.get("delta")
                 delta_text = (
-                    f"Δ={float(delta):+.4f}"
+                    f"Δ={_format_finite(delta, '+.4f')}"
                     if isinstance(delta, (int, float))
                     else "Δ=NA"
                 )
@@ -40760,13 +40781,17 @@ def print_comparison_analysis(
             for entry in inconclusive_entries:
                 mde = entry.get("mde_80")
                 mde_text = (
-                    f"80% 功效 MDE={float(mde):.4f}"
+                    "80% 功效 MDE="
+                    f"{_format_finite(mde)}"
                     if isinstance(mde, (int, float))
                     else "MDE=NA"
                 )
                 mde_relative = entry.get("mde_80_relative")
                 if isinstance(mde_relative, (int, float)):
-                    mde_text += f"（相对 {float(mde_relative) * 100:.2f}%）"
+                    mde_text += (
+                        "（相对 "
+                        f"{_format_finite(mde_relative, '.2f', 100.0)}%）"
+                    )
                 seeds_needed = entry.get("seeds_to_detect")
                 seeds_text = ""
                 current_seeds = _current_seed_count(entry)
@@ -40789,7 +40814,7 @@ def print_comparison_analysis(
                     needed_text = (
                         "（点估计在界内但噪声半宽越界：把界至少"
                         "放宽到 ±"
-                        f"{float(entry['equivalence_margin_needed']):.4f}"
+                        f"{_format_finite(entry.get('equivalence_margin_needed'))}"
                         " 才可能主张等价"
                     )
                     seeds_to_achieve = entry.get(
@@ -40805,7 +40830,7 @@ def print_comparison_analysis(
                     needed_text = ""
                 delta = entry.get("delta")
                 delta_text = (
-                    f"Δ={float(delta):+.4f}"
+                    f"Δ={_format_finite(delta, '+.4f')}"
                     if isinstance(delta, (int, float))
                     else "Δ=NA"
                 )
@@ -40908,7 +40933,7 @@ def print_comparison_analysis(
             f"  基线 mode={adequacy['baseline_mode']}"
             f"（{adequacy['n_baseline_runs']} 个运行）"
             + (
-                f"，{metric} 均值 {float(baseline_mean):.4f}"
+                f"，{metric} 均值 {_format_finite(baseline_mean)}"
                 if baseline_mean is not None
                 else ""
             )
@@ -40976,7 +41001,7 @@ def print_comparison_analysis(
             print(
                 "  [tuning-parity] 基线调参 winner lr="
                 + ", ".join(
-                    format(float(lr), "g")
+                    _format_finite(lr, "g")
                     for lr in parity["baseline_winner_lrs"]
                 )
                 + f"；复用同一 lr 的挑战臂 "
@@ -40993,9 +41018,9 @@ def print_comparison_analysis(
             for item in parity_mismatches:
                 print(
                     f"    {item['run']}（{item['mode']}, lr="
-                    f"{format(float(item['lr']), 'g')} vs 基线 "
-                    f"winner lr="
-                    f"{format(float(item['baseline_tuned_lr']), 'g')}）"
+                    f"{_format_finite(item.get('lr'), 'g')} vs 基线 "
+                    "winner lr="
+                    f"{_format_finite(item.get('baseline_tuned_lr'), 'g')}）"
                 )
 
     print()
@@ -41118,7 +41143,7 @@ def print_comparison_analysis(
             "  [confounded] 计算量不匹配: "
             f"{entry['delayed_mode']} 的 {entry['field']} 是 "
             "local_base 的 "
-            f"{float(entry['ratio']):.2f} 倍，"
+            f"{_format_finite(entry.get('ratio'), '.2f')} 倍，"
             "该方案的主效应混入计算量；请用 "
             "--compare-metric val_loss_at_matched_flops "
             "在等训练计算量点复核"
@@ -41130,7 +41155,7 @@ def print_comparison_analysis(
             "  [confounded] 参数量不匹配: "
             f"{entry['delayed_mode']} 的 n_params 是 "
             "local_base 的 "
-            f"{float(entry['ratio']):.2f} 倍，"
+            f"{_format_finite(entry.get('ratio'), '.2f')} 倍，"
             "即使 FLOPs 对齐，多出的容量也可能带来收益，"
             "主效应不能归因到延迟合并"
         )
@@ -41577,7 +41602,7 @@ def print_comparison_analysis(
                 "  [bad-case] [warn] 错误类别占比跨运行极差 ≥20pp: "
                 + ", ".join(
                     f"{name}="
-                    f"{float(ranges.get(name, 0.0)) * 100:.1f}pp"
+                    f"{_format_finite(ranges.get(name, 0.0), '.1f', 100.0)}pp"
                     for name in bad_case_comparison[
                         "unstable_categories"
                     ]
@@ -41623,12 +41648,12 @@ def print_comparison_analysis(
         rho = order_audit.get("detrended_spearman")
         p_value = order_audit.get("detrended_p_value")
         rho_text = (
-            f"{float(rho):+.2f}"
+            f"{_format_finite(rho, '+.2f')}"
             if isinstance(rho, (int, float))
             else "NA"
         )
         p_text = (
-            f"{float(p_value):.3f}"
+            f"{_format_finite(p_value, '.3f')}"
             if isinstance(p_value, (int, float))
             else "NA"
         )
@@ -64531,9 +64556,7 @@ def print_baseline_tuning_report(
     config = report.get("training_config") or {}
 
     def _fmt(value) -> str:
-        if value is None:
-            return "-"
-        return f"{float(value):.6f}"
+        return _format_finite(value, ".6f")
 
     # 多轴（坐标式）调参：逐轴打印候选与 winner，再打印组合出的
     # 推荐配置。
@@ -64565,7 +64588,7 @@ def print_baseline_tuning_report(
                 print(
                     f"  {_axis_value_text(candidate['value']):>12} "
                     f"{'是' if candidate.get('is_base') else '-':>6} "
-                    f"{int(candidate['n_runs']):>3} "
+                    f"{_nonnegative_int(candidate.get('n_runs')):>3} "
                     f"{_fmt(candidate.get('metric_mean')):>12} "
                     f"{_fmt(candidate.get('metric_std')):>12}"
                 )
@@ -64626,8 +64649,8 @@ def print_baseline_tuning_report(
 
     for candidate in report.get("candidates", []):
         print(
-            f"  {format(float(candidate['lr']), 'g'):>10} "
-            f"{int(candidate['n_runs']):>3} "
+            f"  {_format_finite(candidate.get('lr'), 'g'):>10} "
+            f"{_nonnegative_int(candidate.get('n_runs')):>3} "
             f"{_fmt(candidate.get('metric_mean')):>12} "
             f"{_fmt(candidate.get('metric_std')):>12}"
         )
@@ -64635,7 +64658,7 @@ def print_baseline_tuning_report(
     winner = report.get("winner")
     if isinstance(winner, dict):
         print(
-            f"  [winner] lr={format(float(winner['lr']), 'g')}, "
+            f"  [winner] lr={_format_finite(winner.get('lr'), 'g')}, "
             f"mean={_fmt(winner.get('metric_mean'))} "
             f"(n={winner.get('n_runs')}, "
             f"{metric}, {direction})"
@@ -64647,7 +64670,9 @@ def print_baseline_tuning_report(
                 "  [winner-selection] 最优均值候选与更小 lr 的"
                 "差距落在种子波动内，按 selection_rule 取保守"
                 "解；并列候选: "
-                + ", ".join(format(float(lr), "g") for lr in tied)
+                + ", ".join(
+                    _format_finite(lr, "g") for lr in tied
+                )
             )
         else:
             print(
@@ -64657,7 +64682,7 @@ def print_baseline_tuning_report(
         print(
             "  下一步：用 --suite-modes "
             f"{report['mode']} --seeds ... --lr "
-            f"{format(float(winner['lr']), 'g')} 训练最终基线，"
+            f"{_format_finite(winner.get('lr'), 'g')} 训练最终基线，"
             "并加 --baseline-tuning-from "
             f"{out_root / _BASELINE_TUNING_FILENAME} 记录调参来源；"
             "复杂模型必须战胜这条调过参的基线"
