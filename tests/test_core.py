@@ -10597,6 +10597,38 @@ class GroupClusterRegressionTests(unittest.TestCase):
         self.assertTrue(report["available"])
         json.dumps(report, allow_nan=False)
 
+    def test_group_bootstrap_is_scale_stable(self):
+        weights = torch.ones(3, dtype=torch.float64)
+        small = torch.tensor(
+            [1.0, 2.0, 3.0],
+            dtype=torch.float64,
+        )
+        large = small * 1.0e300
+        small_interval = experiment._group_stats_bootstrap_ci(
+            small,
+            weights,
+            64,
+            torch.Generator().manual_seed(7),
+        )
+        large_interval = experiment._group_stats_bootstrap_ci(
+            large,
+            weights,
+            64,
+            torch.Generator().manual_seed(7),
+        )
+        self.assertIsNotNone(small_interval)
+        self.assertIsNotNone(large_interval)
+        self.assertAlmostEqual(
+            large_interval[0] / 1.0e300,
+            small_interval[0],
+            places=12,
+        )
+        self.assertAlmostEqual(
+            large_interval[1] / 1.0e300,
+            small_interval[1],
+            places=12,
+        )
+
     def test_group_bootstrap_rejects_negative_or_2d_weights(self):
         generator = torch.Generator().manual_seed(0)
         values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)

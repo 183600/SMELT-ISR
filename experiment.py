@@ -12409,6 +12409,11 @@ def _group_stats_bootstrap_ci(
         or bool((weights < 0.0).any())
     ):
         return None
+    value_scale = float(point_values.abs().max().item())
+    if value_scale > 1.0e150 or 0.0 < value_scale < 1.0e-150:
+        point_values = point_values / value_scale
+    else:
+        value_scale = 1.0
     max_weight = float(weights.abs().max().item())
     if max_weight <= 0.0:
         return None
@@ -12432,6 +12437,8 @@ def _group_stats_bootstrap_ci(
     if sampled.numel() == 0:
         return None
     low, high = _percentile_interval(sampled, ci_level)
+    low *= value_scale
+    high *= value_scale
     if not (math.isfinite(low) and math.isfinite(high)):
         return None
     return low, high
