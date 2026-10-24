@@ -2611,6 +2611,31 @@ class DesignPreparationTests(unittest.TestCase):
         )
         return run_dir
 
+    def test_pilot_missing_expected_protocol_is_unverified(self):
+        # 正式计划无法唯一确定的协议项必须标记为未核对；
+        # 试点运行彼此一致不能替代与正式计划的比对。
+        rows = [{
+            "run": "pilot_a",
+            "protocol": {"lr": 0.01},
+            "protocol_recorded_keys": ["lr"],
+        }]
+        report = experiment._pilot_comparability_report(
+            rows, {}, {}
+        )
+        item = next(
+            item
+            for item in report["items"]
+            if item["key"] == "lr"
+        )
+        self.assertFalse(item["expected_recorded"])
+        self.assertEqual(item["status"], "not_recorded")
+        self.assertIn(
+            "lr",
+            [entry["key"] for entry in report["unverified_keys"]],
+        )
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["status"], "unverified")
+
     def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]

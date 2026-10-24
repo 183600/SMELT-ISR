@@ -66323,7 +66323,11 @@ def _pilot_comparability_item(
         status = "not_recorded"
     elif len(distinct) > 1:
         status = "mismatch"
-    elif key in expected:
+    elif key not in expected:
+        # 期望值缺失表示正式计划无法唯一确定该协议项；即使
+        # 所有试点值彼此一致，也不能据此声称已与正式计划核对。
+        status = "not_recorded"
+    else:
         expected_key = repr(
             _stable_factor_key(expected.get(key))
         )
@@ -66333,10 +66337,6 @@ def _pilot_comparability_item(
             status = "partial"
         else:
             status = "match"
-    elif missing_runs:
-        status = "partial"
-    else:
-        status = "consistent"
     return {
         "key": key,
         "group": group,
