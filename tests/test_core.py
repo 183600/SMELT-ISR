@@ -4011,6 +4011,21 @@ class RunAuditTests(unittest.TestCase):
                 )
             )
         )
+        for name, value in (
+            ("plan_design", True),
+            ("suite_modes", "smelt,A"),
+            ("suite_ablation", True),
+            ("paper_cell", "smelt-200M"),
+        ):
+            with self.subTest(conflict=name):
+                self.assertIsNotNone(
+                    experiment.audit_mode_error(
+                        argparse.Namespace(
+                            audit_run="run",
+                            **{name: value},
+                        )
+                    )
+                )
         self.assertIsNone(
             experiment.audit_mode_error(
                 argparse.Namespace(audit_run="run")

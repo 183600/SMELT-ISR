@@ -47948,8 +47948,20 @@ def audit_mode_error(args) -> Optional[str]:
                 getattr(args, "preregistration", None) is not None,
             ),
             (
+                "--plan-design",
+                bool(getattr(args, "plan_design", False)),
+            ),
+            (
                 "--design-pilot-runs",
                 getattr(args, "design_pilot_runs", None) is not None,
+            ),
+            (
+                "--suite-modes",
+                getattr(args, "suite_modes", None) is not None,
+            ),
+            (
+                "--suite-ablation",
+                bool(getattr(args, "suite_ablation", False)),
             ),
             ("--data", getattr(args, "data", None) is not None),
             ("--out", getattr(args, "out", None) is not None),
@@ -47958,6 +47970,10 @@ def audit_mode_error(args) -> Optional[str]:
             (
                 "--evaluate-test",
                 bool(getattr(args, "evaluate_test", False)),
+            ),
+            (
+                "--paper-cell",
+                getattr(args, "paper_cell", None) is not None,
             ),
         )
         if active
