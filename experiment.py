@@ -47513,6 +47513,19 @@ def audit_run_directory(
             "reference_baselines",
             require_fields=True,
         )
+        if len(headers) > 1:
+            add_error(
+                "multiple_reference_baselines",
+                "metrics.jsonl 含多条 reference_baselines 首行记录："
+                "日志可能由多次运行拼接，不能当作一次连续运行",
+                count=len(headers),
+            )
+        if records and records[0] is not headers[0]:
+            add_error(
+                "metrics_header_not_first",
+                "reference_baselines 不是 metrics.jsonl 的首条记录："
+                "首行之前存在其他记录，日志可能被拼接或篡改",
+            )
 
     final_records = [
         record
