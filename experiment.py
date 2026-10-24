@@ -66094,11 +66094,15 @@ def _pilot_expected_comparability_protocol(
     「一致」。显式 null（如未启用群组分隔符）在预注册 data
     块中确实出现时仍作为已知期望值参与比较。
     """
+    prereg = _as_dict(prereg)
     data_block = _as_dict(prereg.get("data"))
     cleaning = _as_dict(data_block.get("cleaning"))
     expected: Dict[str, object] = {}
     planned_seeds: List[int] = []
-    for seed in getattr(args, "seeds", None) or []:
+    seed_plan = getattr(args, "seeds", None)
+    if not seed_plan:
+        seed_plan = prereg.get("seeds")
+    for seed in seed_plan or []:
         number = _finite_float(seed)
         if number is not None and number.is_integer():
             planned_seeds.append(int(number))
@@ -66369,6 +66373,7 @@ def _pilot_seed_overlap(
             planned.add(number)
     reused_cells: List[Dict[str, object]] = []
     reused_total = 0
+    pilot_evidence = _as_dict(pilot_evidence)
     for cell in pilot_evidence.get("cells") or []:
         if not isinstance(cell, dict):
             continue
@@ -66404,7 +66409,7 @@ def _pilot_comparability_report(
     expected: Optional[Dict[str, object]],
     pilot_evidence: Dict[str, object],
 ) -> Dict[str, object]:
-    expected = expected or {}
+    expected = _as_dict(expected)
     items: List[Dict[str, object]] = []
     for group, keys, severity in _PILOT_COMPARABILITY_GROUPS:
         for key in keys:
