@@ -5018,6 +5018,17 @@ class ProcessTests(unittest.TestCase):
                 ledger, key, Path(tmp) / "a"
             )
             self.assertFalse(check_same["repeat_access"])
+            self.assertEqual(check_same["matching_accesses"], 1)
+            self.assertEqual(
+                len(check_same["same_candidates"]), 1
+            )
+            self.assertTrue(
+                experiment._test_access_repeat_blocked(check_same)
+            )
+            self.assertIn(
+                "本目录已登记过",
+                experiment._repeat_test_access_error(check_same),
+            )
 
     def test_test_ledger_repeat_detection_normalizes_path_spelling(self):
         with tempfile.TemporaryDirectory() as tmp:

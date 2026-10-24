@@ -16362,13 +16362,12 @@ def run_statistical_baseline(
                     access_key,
                     out_dir,
                 )
-                if (
-                    access_check["repeat_access"]
-                    and not getattr(
-                        args,
-                        "allow_repeat_test_access",
-                        False,
-                    )
+                if _test_access_repeat_blocked(
+                    access_check
+                ) and not getattr(
+                    args,
+                    "allow_repeat_test_access",
+                    False,
                 ):
                     raise SystemExit(
                         _repeat_test_access_error(access_check)
@@ -49316,17 +49315,31 @@ def _repeat_test_access_error(
             + "），无法核对同一测试集是否已被其它候选解封"
         )
     else:
+        other_candidates = (
+            access_check.get("other_candidates") or []
+        )
+        same_candidates = (
+            access_check.get("same_candidates") or []
+        )
         candidates = ", ".join(
             str(item.get("out_dir"))
-            for item in (
-                access_check.get("other_candidates") or []
-            )[:5]
+            for item in (other_candidates or same_candidates)[:5]
         )
-        reason = (
-            "访问账本显示同一测试集已被其它候选解封（"
-            + candidates
-            + "）"
-        )
+        if other_candidates:
+            reason = (
+                "访问账本显示同一测试集已被其它候选解封（"
+                + candidates
+                + "）"
+            )
+        elif same_candidates:
+            reason = (
+                "访问账本显示本目录已登记过同一测试集的访问（"
+                + candidates
+                + "）；即使本地封条或 test 记录缺失，也不能"
+                "再次解封"
+            )
+        else:
+            reason = "访问账本显示同一测试集已有历史访问"
     return (
         "[test] 拒绝解封：" + reason
         + "。最终确认应冻结候选后统一解封；"
@@ -49354,14 +49367,13 @@ def check_test_access_ledger(
         for entry in entries
         if all(entry.get(field) == value for field, value in key.items())
     ]
-    other_candidates = [
-        entry
-        for entry in matching
-        if not _run_paths_match(
-            entry.get("out_dir"),
-            out_dir,
-        )
-    ]
+    same_candidates: List[Dict[str, object]] = []
+    other_candidates: List[Dict[str, object]] = []
+    for entry in matching:
+        if _run_paths_match(entry.get("out_dir"), out_dir):
+            same_candidates.append(entry)
+        else:
+            other_candidates.append(entry)
     if read_error is not None:
         # 账本不可读时无法核对该测试集是否已被访问过；尘封
         # 协议宁可保守拒绝一次，也不能把「读不出来」当成
@@ -49369,6 +49381,7 @@ def check_test_access_ledger(
         return {
             "ledger": str(ledger_path),
             "matching_accesses": len(matching),
+            "same_candidates": same_candidates,
             "other_candidates": other_candidates,
             "repeat_access": True,
             "ledger_unreadable": read_error,
@@ -49382,14 +49395,25 @@ def check_test_access_ledger(
     return {
         "ledger": str(ledger_path),
         "matching_accesses": len(matching),
+        "same_candidates": same_candidates,
         "other_candidates": other_candidates,
         "repeat_access": bool(other_candidates),
+        "already_accessed": bool(matching),
         "note": (
             "同一测试集被多个目录/候选访问时，测试集已不再"
             "只服务于一次最终确认；最终报告必须列出全部访问"
             "与预注册比较，不能只展示最好的候选"
         ),
     }
+
+
+def _test_access_repeat_blocked(
+    access_check: Dict[str, object],
+) -> bool:
+    """账本中已有本测试集访问（含同一目录）时是否拒绝解封。"""
+    return bool(access_check.get("repeat_access")) or bool(
+        access_check.get("matching_accesses")
+    )
 
 
 def print_final_test_comparison(
@@ -76843,10 +76867,9 @@ def main():
                     access_key,
                     out_dir,
                 )
-                if (
-                    access_check["repeat_access"]
-                    and not args.allow_repeat_test_access
-                ):
+                if _test_access_repeat_blocked(
+                    access_check
+                ) and not args.allow_repeat_test_access:
                     raise SystemExit(
                         _repeat_test_access_error(access_check)
                     )
