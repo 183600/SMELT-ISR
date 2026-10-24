@@ -47630,36 +47630,11 @@ def audit_run_directory(
         or test_started_records
         or test_bad_case_records
     )
-    # 访问账本先于 test_started/封条写入；若进程在这之间崩溃，
-    # 运行目录里的账本文件是唯一解封证据。运行审计必须与
-    # test_evaluation_sealed 一样把它计入，否则会把中途崩溃的
-    # 候选误判成「从未解封」。
-    local_ledger_evidence = _path_exists(
-        root / "test_access_ledger.jsonl"
-    )
-    test_evidence = bool(
-        test_log_evidence
-        or seal_exists
-        or local_ledger_evidence
-    )
-    if test_evidence and not seal_exists:
-        add_warning(
-            "test_seal_missing",
-            "存在测试访问证据（test 记录、开始标记或访问账本）"
-            "但没有持久封条：旧运行可能未写封条；不能仅凭"
-            " metrics.jsonl 证明测试集只解封一次",
-        )
-    if test_evidence and not test_records:
-        add_warning(
-            "test_started_without_summary",
-            "测试集已开始解封（封条、test_started/坏案例记录"
-            "或访问账本存在）但没有 test 汇总记录：该候选"
-            "不能作为最终确认结果",
-        )
     # 访问账本可能写在全局路径（--test-ledger），不一定在运行
     # 目录内；配置里的相对路径按运行时的 cwd 还原，避免把
     # 合法的全局账本误报为缺失。
-    ledger_candidates = [root / "test_access_ledger.jsonl"]
+    local_ledger_path = root / "test_access_ledger.jsonl"
+    ledger_candidates = [local_ledger_path]
     configured_ledger = args.get("test_ledger")
     if isinstance(configured_ledger, str) and configured_ledger.strip():
         configured_path = Path(configured_ledger)
@@ -47682,6 +47657,58 @@ def audit_run_directory(
         if exists and key not in seen_ledger_paths:
             seen_ledger_paths.add(key)
             existing_ledger_paths.append(ledger_path)
+    entries: List[Dict[str, object]] = []
+    ledger_read_errors: List[str] = []
+    for ledger_path in existing_ledger_paths:
+        ledger_entries, ledger_error = (
+            _read_test_access_ledger_entries(ledger_path)
+        )
+        entries.extend(ledger_entries)
+        if ledger_error is not None:
+            ledger_read_errors.append(
+                f"{ledger_path}: {ledger_error}"
+            )
+    metadata_cwd = metadata.get("cwd")
+    if not isinstance(metadata_cwd, str) or not metadata_cwd.strip():
+        metadata_cwd = None
+    matching = [
+        entry
+        for entry in entries
+        if _run_paths_match(
+            entry.get("out_dir"),
+            root,
+            left_base=metadata_cwd,
+        )
+        or _run_paths_match(
+            entry.get("out_dir"),
+            root,
+        )
+    ]
+    # 访问账本先于 test_started/封条写入；若进程在这之间崩溃，
+    # 账本条目是唯一解封证据。账本既可能在运行目录，也可能是
+    # --test-ledger 指向的全局文件；两者都必须计入，否则会把
+    # 中途崩溃的候选误判成「从未解封」。
+    local_ledger_evidence = _path_exists(local_ledger_path)
+    test_evidence = bool(
+        test_log_evidence
+        or seal_exists
+        or local_ledger_evidence
+        or matching
+    )
+    if test_evidence and not seal_exists:
+        add_warning(
+            "test_seal_missing",
+            "存在测试访问证据（test 记录、开始标记或访问账本）"
+            "但没有持久封条：旧运行可能未写封条；不能仅凭"
+            " metrics.jsonl 证明测试集只解封一次",
+        )
+    if test_evidence and not test_records:
+        add_warning(
+            "test_started_without_summary",
+            "测试集已开始解封（封条、test_started/坏案例记录"
+            "或访问账本存在）但没有 test 汇总记录：该候选"
+            "不能作为最终确认结果",
+        )
     if test_evidence:
         if not existing_ledger_paths:
             add_warning(
@@ -47690,17 +47717,6 @@ def audit_run_directory(
                 "没有访问账本：无法核对这次解封是否已登记",
             )
         else:
-            entries = []
-            ledger_read_errors: List[str] = []
-            for ledger_path in existing_ledger_paths:
-                ledger_entries, ledger_error = (
-                    _read_test_access_ledger_entries(ledger_path)
-                )
-                entries.extend(ledger_entries)
-                if ledger_error is not None:
-                    ledger_read_errors.append(
-                        f"{ledger_path}: {ledger_error}"
-                    )
             if ledger_read_errors:
                 add_warning(
                     "test_ledger_unreadable",
@@ -47708,22 +47724,6 @@ def audit_run_directory(
                     "是否已登记",
                     errors=ledger_read_errors,
                 )
-            metadata_cwd = metadata.get("cwd")
-            if not isinstance(metadata_cwd, str) or not metadata_cwd.strip():
-                metadata_cwd = None
-            matching = [
-                entry
-                for entry in entries
-                if _run_paths_match(
-                    entry.get("out_dir"),
-                    root,
-                    left_base=metadata_cwd,
-                )
-                or _run_paths_match(
-                    entry.get("out_dir"),
-                    root,
-                )
-            ]
             if not matching and not ledger_read_errors:
                 add_warning(
                     "test_ledger_entry_missing",

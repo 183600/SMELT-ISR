@@ -4058,6 +4058,60 @@ class RunAuditTests(unittest.TestCase):
                 "test_ledger_missing", warning_codes
             )
 
+    def test_audit_detects_crash_in_global_test_ledger(self):
+        # 全局 --test-ledger 同样先于 test_started/封条写入；
+        # 进程在这之间崩溃时运行目录里没有本地账本，审计必须
+        # 从全局账本里找到本目录的条目，而不是当成从未解封。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            config, _, _ = self._build_run(root)
+            global_ledger = Path(tmp) / "global_test_ledger.jsonl"
+            global_ledger.write_text(
+                json.dumps(
+                    {"out_dir": str(root.resolve())}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config["args"]["test_ledger"] = str(global_ledger)
+            (root / "config.json").write_text(
+                json.dumps(
+                    config, ensure_ascii=False, indent=2
+                ),
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertIn("test_seal_missing", warning_codes)
+            self.assertIn(
+                "test_started_without_summary",
+                warning_codes,
+            )
+            self.assertNotIn(
+                "test_ledger_missing", warning_codes
+            )
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
+            # 账本里只有其它候选的访问时，不能把本目录误判成
+            # 已解封；但既然配置了全局账本且可读，仍应指出本
+            # 目录没有对应访问记录。
+            global_ledger.write_text(
+                json.dumps(
+                    {"out_dir": str(Path(tmp) / "other")}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertNotIn("test_seal_missing", warning_codes)
+            self.assertNotIn(
+                "test_started_without_summary",
+                warning_codes,
+            )
+
     def test_audit_flags_unreadable_test_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
