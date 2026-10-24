@@ -3559,6 +3559,29 @@ class ReproducibilityTests(unittest.TestCase):
                 )
             )
 
+    def test_fresh_out_dir_guard_refuses_unreadable_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            with mock.patch.object(
+                Path,
+                "iterdir",
+                side_effect=PermissionError("denied"),
+            ):
+                error = experiment.fresh_out_dir_error(
+                    out_dir,
+                    resume_path=None,
+                    allow_overwrite=False,
+                )
+            self.assertIsNotNone(error)
+            self.assertIn("无法读取", error)
+            self.assertIsNone(
+                experiment.fresh_out_dir_error(
+                    out_dir,
+                    resume_path=None,
+                    allow_overwrite=True,
+                )
+            )
+
     def test_tracking_header_fields_are_self_contained(self):
         class _Dataset:
             data_sha256 = "data-sha"

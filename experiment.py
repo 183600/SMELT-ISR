@@ -49130,9 +49130,17 @@ def fresh_out_dir_error(
     if not out_dir.is_dir():
         return None
 
-    existing_entries = sorted(
-        entry.name for entry in out_dir.iterdir()
-    )
+    try:
+        existing_entries = sorted(
+            entry.name for entry in out_dir.iterdir()
+        )
+    except OSError as error:
+        # 目录存在但无法枚举时不能当作空目录放行：训练随后
+        # 可能覆盖看不见的旧追踪文件。
+        return (
+            f"--out 目录存在但无法读取（{error}）：无法确认是否为"
+            "空目录；请修复权限或换用全新的 --out 目录。"
+        )
     if not existing_entries:
         return None
 
