@@ -6429,6 +6429,23 @@ class ArtifactManifestTests(unittest.TestCase):
         )
         self.assertIn("--compare", conflict)
 
+        for name, value in (
+            ("plan_design", True),
+            ("suite_modes", "smelt,A"),
+            ("suite_ablation", True),
+            ("paper_cell", "smelt-200M"),
+        ):
+            with self.subTest(conflict=name):
+                error = experiment.manifest_mode_error(
+                    argparse.Namespace(
+                        write_manifest="run",
+                        verify_manifest=None,
+                        verify_manifest_strict=False,
+                        **{name: value},
+                    )
+                )
+                self.assertIn("不能与", error)
+
         ok = experiment.manifest_mode_error(
             argparse.Namespace(
                 write_manifest="run",
