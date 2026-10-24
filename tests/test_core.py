@@ -10476,6 +10476,32 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
 
+    def test_fixed_eval_group_ids_handles_invalid_batch_counts(self):
+        separator = b"<|doc|>"
+        payload = (b"aaaa" + separator) * 20 + b"bbbb"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(payload)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.3,
+                test_fraction=0.3,
+                group_separator=separator,
+            )
+            for batches, batch_size in (
+                (float("nan"), 1),
+                (float("inf"), 1),
+                ("x", 1),
+                (1, None),
+                (0, float("inf")),
+            ):
+                self.assertIsNone(
+                    dataset.fixed_eval_group_ids(
+                        "val", batches, batch_size
+                    )
+                )
+
     def test_group_eval_bootstrap_handles_extreme_seeds(self):
         stats = {
             "schema": experiment._GROUP_STATS_SCHEMA,
@@ -10515,6 +10541,11 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(torch.equal(first, resized))
         self.assertLess(int(resized.max().item()), 20)
+        for invalid in (float("nan"), float("inf"), None, "bad"):
+            empty = experiment.ByteDataset._ensure_fixed_starts(
+                dataset, "val", invalid, 10
+            )
+            self.assertEqual(empty.numel(), 0)
         clamped = experiment.ByteDataset._ensure_fixed_starts(
             dataset, "val", 8, 4
         )

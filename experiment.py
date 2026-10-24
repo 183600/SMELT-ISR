@@ -6694,9 +6694,15 @@ class ByteDataset:
             split,
             {"total": None, "num_starts": None, "starts": None},
         )
-        total_batches = max(
-            0, min(int(total_batches), int(num_starts))
-        )
+        try:
+            requested = int(total_batches)
+        except (TypeError, ValueError, OverflowError):
+            requested = 0
+        try:
+            available = int(num_starts)
+        except (TypeError, ValueError, OverflowError):
+            available = 0
+        total_batches = max(0, min(requested, available))
 
         if (
             cache["total"] != total_batches
@@ -6822,7 +6828,11 @@ class ByteDataset:
         windows, data = self._eval_windows(split)
         _ = windows
         num_starts = len(data) - self.seq_len
-        total_batches = min(batches * batch_size, num_starts)
+        try:
+            requested = int(batches * batch_size)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        total_batches = max(0, min(requested, num_starts))
         starts = self._ensure_fixed_starts(
             split,
             total_batches,
