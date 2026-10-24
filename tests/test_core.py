@@ -3904,6 +3904,78 @@ class RunAuditTests(unittest.TestCase):
                 self._codes(report, "errors"),
             )
 
+    def test_audit_discloses_missing_test_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            config, identity, _ = self._build_run(root)
+            metrics_path = root / "metrics.jsonl"
+            records = [
+                json.loads(line)
+                for line in metrics_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            records.append(
+                {"step": "test", **identity, "test_loss": 1.0}
+            )
+            metrics_path.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertIn(
+                "test_ledger_missing", warning_codes
+            )
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
+            local_ledger = root / "test_access_ledger.jsonl"
+            local_ledger.write_text(
+                json.dumps(
+                    {"out_dir": str(root.resolve())}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertNotIn(
+                "test_ledger_missing", warning_codes
+            )
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
+            local_ledger.unlink()
+            global_ledger = Path(tmp) / "global_test_ledger.jsonl"
+            global_ledger.write_text(
+                json.dumps(
+                    {"out_dir": str(root.resolve())}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config["args"]["test_ledger"] = str(global_ledger)
+            (root / "config.json").write_text(
+                json.dumps(
+                    config, ensure_ascii=False, indent=2
+                ),
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertNotIn(
+                "test_ledger_missing", warning_codes
+            )
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
     def test_audit_detects_sanity_repeat_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"

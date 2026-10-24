@@ -47580,29 +47580,65 @@ def audit_run_directory(
             "测试集已开始解封（封条存在）但没有 test 汇总记录："
             "该候选不能作为最终确认结果",
         )
-    ledger_path = root / "test_access_ledger.jsonl"
-    if test_records and ledger_path.is_file():
-        entries = read_test_access_ledger(ledger_path)
+    # 访问账本可能写在全局路径（--test-ledger），不一定在运行
+    # 目录内；配置里的相对路径按运行时的 cwd 还原，避免把
+    # 合法的全局账本误报为缺失。
+    ledger_candidates = [root / "test_access_ledger.jsonl"]
+    configured_ledger = args.get("test_ledger")
+    if isinstance(configured_ledger, str) and configured_ledger.strip():
+        configured_path = Path(configured_ledger)
+        ledger_candidates.insert(0, configured_path)
+        cwd = metadata.get("cwd")
+        if (
+            not configured_path.is_absolute()
+            and isinstance(cwd, str)
+            and cwd.strip()
+        ):
+            ledger_candidates.insert(0, Path(cwd) / configured_path)
+    existing_ledger_paths: List[Path] = []
+    seen_ledger_paths = set()
+    for ledger_path in ledger_candidates:
         try:
-            root_key = str(root.resolve())
-        except (OSError, RuntimeError):
-            root_key = str(root)
-        matching = [
-            entry
-            for entry in entries
-            if str(entry.get("out_dir")) == root_key
-            or str(entry.get("out_dir")) == str(root)
-        ]
-        if not matching:
+            exists = ledger_path.is_file()
+        except OSError:
+            exists = False
+        key = str(ledger_path)
+        if exists and key not in seen_ledger_paths:
+            seen_ledger_paths.add(key)
+            existing_ledger_paths.append(ledger_path)
+    if test_records:
+        if not existing_ledger_paths:
             add_warning(
-                "test_ledger_entry_missing",
-                "本目录有 test 记录，但访问账本中没有对应条目："
-                "无法核对这次解封是否已登记",
+                "test_ledger_missing",
+                "存在 test 记录但没有访问账本：无法核对这次"
+                "解封是否已登记",
             )
+        else:
+            entries = []
+            for ledger_path in existing_ledger_paths:
+                entries.extend(
+                    read_test_access_ledger(ledger_path)
+                )
+            try:
+                root_key = str(root.resolve())
+            except (OSError, RuntimeError):
+                root_key = str(root)
+            matching = [
+                entry
+                for entry in entries
+                if str(entry.get("out_dir")) == root_key
+                or str(entry.get("out_dir")) == str(root)
+            ]
+            if not matching:
+                add_warning(
+                    "test_ledger_entry_missing",
+                    "本目录有 test 记录，但访问账本中没有对应条目："
+                    "无法核对这次解封是否已登记",
+                )
     checks["test_seal"] = {
         "seal_exists": seal_exists,
         "test_records": len(test_records),
-        "ledger_exists": ledger_path.is_file(),
+        "ledger_exists": bool(existing_ledger_paths),
     }
 
     # ---------- sanity 重复运行 ----------
