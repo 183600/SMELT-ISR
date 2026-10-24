@@ -49348,6 +49348,19 @@ def _repeat_test_access_error(
     )
 
 
+def _test_access_entry_matches_key(
+    entry: Dict[str, object],
+    key: Dict[str, object],
+) -> bool:
+    """账本条目是否属于给定测试集；缺失指纹按无法核对保守匹配。"""
+    for field, value in key.items():
+        if value is None:
+            continue
+        if field in entry and entry.get(field) != value:
+            return False
+    return True
+
+
 def check_test_access_ledger(
     ledger_path: Path,
     key: Dict[str, object],
@@ -49365,7 +49378,7 @@ def check_test_access_ledger(
     matching = [
         entry
         for entry in entries
-        if all(entry.get(field) == value for field, value in key.items())
+        if _test_access_entry_matches_key(entry, key)
     ]
     same_candidates: List[Dict[str, object]] = []
     other_candidates: List[Dict[str, object]] = []

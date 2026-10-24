@@ -5030,6 +5030,33 @@ class ProcessTests(unittest.TestCase):
                 experiment._repeat_test_access_error(check_same),
             )
 
+    def test_test_ledger_missing_key_is_conservative(self):
+        # 账本条目缺少测试集指纹时无法证明它属于别的测试集；
+        # 不能因此放行重复解封。
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            candidate = Path(tmp) / "a"
+            ledger.write_text(
+                json.dumps({"out_dir": str(candidate)}) + "\n",
+                encoding="utf-8",
+            )
+            key = {
+                "data_sha256": "d",
+                "test_split_sha256": "s",
+                "test_fraction": 0.05,
+            }
+            check_same = experiment.check_test_access_ledger(
+                ledger, key, candidate
+            )
+            self.assertEqual(check_same["matching_accesses"], 1)
+            self.assertTrue(
+                experiment._test_access_repeat_blocked(check_same)
+            )
+            check_other = experiment.check_test_access_ledger(
+                ledger, key, Path(tmp) / "b"
+            )
+            self.assertTrue(check_other["repeat_access"])
+
     def test_test_ledger_repeat_detection_normalizes_path_spelling(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "ledger.jsonl"
