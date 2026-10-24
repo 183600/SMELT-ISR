@@ -407,6 +407,25 @@ python experiment.py --verify-manifest runs/final/A \
 「清单未被替换」也纳入审计链：只校验清单内文件无法发现
 一份内容自洽、但整体被替换的清单。
 
+归档前再执行运行级复现审计，核对 `config.json`、
+`environment.json`、`metrics.jsonl`、test 封条/访问账本、
+sanity 重复运行与预注册是否仍指向同一次运行。正式归档使用
+`--audit-strict`，把未固定 `PYTHONHASHSEED`、非确定性算子、
+脏工作区与缺少清单都当作失败：
+
+```bash
+python experiment.py --audit-run runs/final/A --audit-strict \
+  --audit-source archive/experiment.py \
+  --audit-data archive/corpus.txt \
+  --audit-preregistration archive/preregistration.json \
+  --audit-report archive/runs/final/A/reproducibility_audit.json
+```
+
+`--audit-run` 只读，不训练也不修改运行目录；非零退出码表示
+证据链不一致，不能把该运行作为最终可复现证据。审计报告放在
+运行目录之外，或在写入后重新执行 `--write-manifest`，避免
+报告本身成为清单外文件。
+
 仓库内只保留代码与文档；结果放外部归档，避免仓库体积与
 「清理脚本删除审计记录」的冲突。
 

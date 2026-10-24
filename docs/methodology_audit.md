@@ -1283,6 +1283,53 @@ val 选型通过近似内容间接看到 test，使「测试集只解封一次�
   膨胀与种子×窗口方差分解；它提供的是「独立单位被高估」的
   证据，修正口径仍需在分析阶段显式选择并报告。
 
+## 39. 可复现性与工程规范：运行级复现审计（本轮补充）
+
+**判断**：清单校验证明「目录里的字节没变」，环境核对证明
+「当前机器/依赖接近产出环境」，但都不证明「同一目录里的
+config / environment / metrics / 预注册记录属于同一次运行」。
+一份被整体替换且内部自洽的 `config.json` 仍可通过清单校验；
+`metrics.jsonl` 也可能从另一次运行复制过来，或只改了首行种子。
+只看单个文件哈希无法发现「日志与配置拼接」这类常见错误。
+
+**修复**：新增只读入口 `--audit-run RUN_DIR`，逐项核对：
+
+1. `config.json` 的 schema、`script_sha256`、数据/切分指纹、
+   `comparison_protocol_sha256` 与 `environment_id` 格式；
+2. `environment.json` 的 `environment_id` 是否与其内容重算值
+   一致，并与 `config.run_metadata` 及 `config.environment`
+   摘要一致；摘要指向的 `file_sha256` 是否匹配；
+3. `metrics.jsonl` 首行 `reference_baselines` 及 `final`/`test`
+   记录中的种子、代码、数据、环境、协议指纹是否仍等于
+   config；多条 test 记录直接判失败；
+4. test 封条与访问账本是否互相矛盾（有 test 记录但无封条、
+   解封后无汇总、账本无登记）；
+5. `sanity_check.reproducibility.identical=false` 直接判失败；
+   未做重复运行只告警；
+6. `artifact_manifest.json` 存在时重新执行完整性校验；缺失
+   清单只告警，`--audit-strict` 下判失败；
+7. 可选 `--audit-source` / `--audit-data` /
+   `--audit-preregistration` 对外部归档源码、语料与预注册
+   文件做 SHA-256 与关键字段比对，发现「运行后编辑预注册」。
+
+```bash
+python experiment.py --audit-run runs/final/A --audit-strict \
+  --audit-source archive/experiment.py \
+  --audit-data archive/corpus.txt \
+  --audit-preregistration archive/preregistration.json \
+  --audit-report archive/runs/final/A/audit.json
+```
+
+退出码 0 表示证据一致；非零表示不一致或（strict 下）证据不足。
+报告写入 `--audit-report` 时不自动加入 `artifact_manifest.json`；
+若报告放在运行目录内，归档前需重新生成清单。
+
+**局限**：审计不重新训练，也不验证统计结论；它只能确认
+记录之间是否自洽。`metrics.jsonl` 若被整体伪造且所有指纹同步
+改写，仍可能通过；外部源码/语料/预注册哈希与不可变归档锚点
+才是最终防线。`sanity_check` 只证明训练前探针可重复，不等于
+完整训练逐位可重复；跨设备复现仍需固定环境或做容差分析。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1339,4 +1386,8 @@ val 选型通过近似内容间接看到 test，使「测试集只解封一次�
    上传到不可变存储，记录 DOI/校验和。归档前对每个最终运行
    目录执行 `--write-manifest`，上传/解压后再执行
    `--verify-manifest --verify-manifest-strict`；清单是快照，
-   续跑或补测后必须重新生成。
+   续跑或补测后必须重新生成。最后对每个最终运行目录执行
+   `--audit-run --audit-strict`（可附 `--audit-source`、
+   `--audit-data`、`--audit-preregistration`），确认 config /
+   environment / metrics / test 封条 / 预注册确实属于同一次
+   运行；退出码非零的运行不能作为最终可复现证据。
