@@ -47537,6 +47537,17 @@ def audit_run_directory(
         for record in records
         if record.get("step") == "test"
     ]
+    test_started_records = [
+        record
+        for record in records
+        if record.get("step") == "test_started"
+    ]
+    test_bad_case_records = [
+        record
+        for record in records
+        if record.get("step") == "bad_cases"
+        and record.get("split") == "test"
+    ]
     for record in final_records:
         check_record_identity(
             record,
@@ -47568,17 +47579,25 @@ def audit_run_directory(
     # ---------- test 封条与访问账本 ----------
     seal_path = _test_seal_path(root)
     seal_exists = seal_path.is_file()
-    if test_records and not seal_exists:
+    test_log_evidence = bool(
+        test_records
+        or test_started_records
+        or test_bad_case_records
+    )
+    test_evidence = bool(test_log_evidence or seal_exists)
+    if test_log_evidence and not seal_exists:
         add_warning(
             "test_seal_missing",
-            "存在 test 记录但没有持久封条：旧运行可能未写封条；"
-            "不能仅凭 metrics.jsonl 证明测试集只解封一次",
+            "存在 test 记录或开始标记但没有持久封条：旧运行可能"
+            "未写封条；不能仅凭 metrics.jsonl 证明测试集只解封"
+            "一次",
         )
-    if seal_exists and not test_records:
+    if test_evidence and not test_records:
         add_warning(
             "test_started_without_summary",
-            "测试集已开始解封（封条存在）但没有 test 汇总记录："
-            "该候选不能作为最终确认结果",
+            "测试集已开始解封（封条或 test_started/坏案例记录"
+            "存在）但没有 test 汇总记录：该候选不能作为最终"
+            "确认结果",
         )
     # 访问账本可能写在全局路径（--test-ledger），不一定在运行
     # 目录内；配置里的相对路径按运行时的 cwd 还原，避免把
@@ -47606,12 +47625,12 @@ def audit_run_directory(
         if exists and key not in seen_ledger_paths:
             seen_ledger_paths.add(key)
             existing_ledger_paths.append(ledger_path)
-    if test_records:
+    if test_evidence:
         if not existing_ledger_paths:
             add_warning(
                 "test_ledger_missing",
-                "存在 test 记录但没有访问账本：无法核对这次"
-                "解封是否已登记",
+                "存在测试集访问证据（test/test_started/封条）但"
+                "没有访问账本：无法核对这次解封是否已登记",
             )
         else:
             entries = []
@@ -47638,6 +47657,8 @@ def audit_run_directory(
     checks["test_seal"] = {
         "seal_exists": seal_exists,
         "test_records": len(test_records),
+        "test_started": len(test_started_records),
+        "test_bad_cases": len(test_bad_case_records),
         "ledger_exists": bool(existing_ledger_paths),
     }
 

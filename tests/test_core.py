@@ -3976,6 +3976,49 @@ class RunAuditTests(unittest.TestCase):
                 "test_ledger_entry_missing", warning_codes
             )
 
+    def test_audit_detects_started_without_summary(self):
+        for step_record in (
+            {"step": "test_started", "split": "test"},
+            {
+                "step": "bad_cases",
+                "split": "test",
+                "wrong_tokens": 1,
+            },
+        ):
+            with self.subTest(step=step_record["step"]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "run"
+                    self._build_run(root)
+                    metrics_path = root / "metrics.jsonl"
+                    records = [
+                        json.loads(line)
+                        for line in metrics_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+                    ]
+                    records.append(step_record)
+                    metrics_path.write_text(
+                        "".join(
+                            json.dumps(record) + "\n"
+                            for record in records
+                        ),
+                        encoding="utf-8",
+                    )
+                    report = experiment.audit_run_directory(root)
+                    warning_codes = self._codes(
+                        report, "warnings"
+                    )
+                    self.assertIn(
+                        "test_seal_missing", warning_codes
+                    )
+                    self.assertIn(
+                        "test_started_without_summary",
+                        warning_codes,
+                    )
+                    self.assertIn(
+                        "test_ledger_missing", warning_codes
+                    )
+
     def test_audit_detects_sanity_repeat_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
