@@ -39406,6 +39406,7 @@ def preregistration_record(
         # 足够」以及「执行顺序是否按预注册的区组随机化」。
         "power": power_record,
         "run_order": payload.get("run_order"),
+        "data": payload.get("data"),
         "applied_fields": list(applied_fields),
         "run_mode": getattr(args, "mode", None),
         "run_seed": getattr(args, "seed", None),
@@ -65962,6 +65963,504 @@ def _pilot_declared_check(
     return "declared_below_observed"
 
 
+_PILOT_COMPARABILITY_SCHEMA_VERSION = 1
+_PILOT_PROVENANCE_KEYS = frozenset(_REPRODUCIBILITY_HARD_KEYS)
+_PILOT_CLEANING_KEYS = (
+    "deduplicate_train_groups",
+    "drop_train_shared_chunks",
+    "drop_train_near_duplicate_groups",
+    "near_duplicate_threshold",
+    "near_duplicate_shingle_bytes",
+    "clean_train_against_test",
+    "drop_train_corrupt_groups",
+    "drop_train_corrupt_bytes",
+    "drop_train_degenerate_groups",
+    "drop_train_degenerate_runs",
+    "allow_eval_content_for_cleaning",
+    "allow_entity_overlap",
+    "allow_data_leakage",
+    "allow_corrupt_test_labels",
+    "allow_eval_duplicates",
+)
+_PILOT_COMPARABILITY_GROUPS: Tuple[
+    Tuple[str, Tuple[str, ...], str], ...
+] = (
+    ("code", ("script_sha256",), "blocking"),
+    (
+        "data",
+        (
+            "data_sha256",
+            "split_sha256",
+            "effective_train_sha256",
+            "val_fraction",
+            "test_fraction",
+            "split_policy",
+            "group_separator",
+            "split_isolation",
+            *_PILOT_CLEANING_KEYS,
+        ),
+        "blocking",
+    ),
+    (
+        "structure",
+        (
+            "init_scheme",
+            "seq_len",
+            "d_model",
+            "n_heads",
+            "n_kv_heads",
+            "n_layers",
+            "residual_scale",
+            "residual_scaling",
+        ),
+        "blocking",
+    ),
+    (
+        "training",
+        (
+            "optimizer",
+            "optimizer_betas",
+            "optimizer_eps",
+            "lr",
+            "lr_schedule",
+            "wsd_stable_steps",
+            "wsd_final_lr_ratio",
+            "warmup_steps",
+            "total_steps",
+            "weight_decay",
+            "grad_clip",
+            "batch_size",
+            "document_masks",
+            "data_augmentation",
+            "early_stop_patience",
+            "early_stop_min_delta",
+            "grad_checkpoint",
+            "compile",
+        ),
+        "blocking",
+    ),
+    (
+        "evaluation",
+        (
+            "eval_interval",
+            "eval_batches",
+            "eval_bootstrap",
+            "eval_bootstrap_block",
+            "selection_metric",
+        ),
+        "blocking",
+    ),
+    (
+        "environment",
+        (
+            "device_type",
+            "amp_dtype",
+            "allow_tf32",
+            "environment_id",
+            "python_version",
+            "torch_version",
+            "cuda_version",
+            "cudnn_version",
+            "platform",
+            "device_name",
+            "device_uuid",
+            "deterministic_algorithms",
+            "deterministic_algorithms_warn_only",
+            "torch_num_threads",
+            "torch_num_interop_threads",
+            "cudnn_deterministic",
+            "cudnn_benchmark",
+            "cublas_workspace_config",
+            "allow_tf32_matmul",
+            "allow_tf32_cudnn",
+            "allow_fp16_reduced_precision_reduction",
+            "allow_bf16_reduced_precision_reduction",
+        ),
+        "advisory",
+    ),
+)
+
+
+def _pilot_expected_comparability_protocol(
+    args: argparse.Namespace,
+    prereg: Dict[str, object],
+    metric: str,
+    target_step: Optional[float],
+) -> Dict[str, object]:
+    """构造正式运行的可比协议快照，供试点证据逐项核对。
+
+    只放入能从预注册或本次命令行唯一确定的值；无法确定的值
+    保持缺失，由比较器标为 ``not_recorded``，而不是默认为
+    「一致」。显式 null（如未启用群组分隔符）在预注册 data
+    块中确实出现时仍作为已知期望值参与比较。
+    """
+    data_block = _as_dict(prereg.get("data"))
+    cleaning = _as_dict(data_block.get("cleaning"))
+    expected: Dict[str, object] = {}
+    planned_seeds: List[int] = []
+    for seed in getattr(args, "seeds", None) or []:
+        number = _finite_float(seed)
+        if number is not None and number.is_integer():
+            planned_seeds.append(int(number))
+
+    script_sha = prereg.get("frozen_script_sha256")
+    if not _preregistration_sha256_text(script_sha):
+        script_sha = _script_sha256()
+    if isinstance(script_sha, str):
+        expected["script_sha256"] = script_sha.lower()
+
+    data_values = {
+        "data_sha256": (
+            getattr(args, "data_sha256", None)
+            or data_block.get("sha256")
+            or prereg.get("data_sha256")
+        ),
+        "split_sha256": getattr(
+            args, "data_split_sha256", None
+        ),
+        "effective_train_sha256": getattr(
+            args, "data_effective_train_sha256", None
+        ),
+        "split_isolation": getattr(
+            args, "data_split_isolation", None
+        ),
+    }
+    for key, value in data_values.items():
+        if value is not None:
+            expected[key] = value
+    for key in (
+        "val_fraction",
+        "test_fraction",
+        "split_policy",
+        "group_separator",
+    ):
+        if key in data_block:
+            expected[key] = data_block.get(key)
+        else:
+            value = getattr(args, key, None)
+            if value is not None:
+                expected[key] = value
+    for key in _PILOT_CLEANING_KEYS:
+        if key in cleaning:
+            expected[key] = cleaning.get(key)
+        else:
+            value = getattr(args, key, None)
+            if value is not None:
+                expected[key] = value
+
+    protocol_attrs = (
+        "init_scheme",
+        "lr",
+        "lr_schedule",
+        "wsd_stable_steps",
+        "wsd_final_lr_ratio",
+        "warmup_steps",
+        "weight_decay",
+        "grad_clip",
+        "batch_size",
+        "document_masks",
+        "early_stop_patience",
+        "early_stop_min_delta",
+        "grad_checkpoint",
+        "compile",
+        "residual_scale",
+        "residual_scaling",
+        "seq_len",
+        "d_model",
+        "n_heads",
+        "n_layers",
+        "eval_interval",
+        "eval_batches",
+        "eval_bootstrap",
+        "eval_bootstrap_block",
+        "selection_metric",
+        "amp_dtype",
+        "allow_tf32",
+    )
+    for key in protocol_attrs:
+        value = getattr(args, key, None)
+        if value is not None:
+            expected[key] = value
+    n_kv_heads = getattr(args, "n_kv_heads", None)
+    if n_kv_heads is None:
+        n_kv_heads = getattr(args, "n_heads", None)
+    if n_kv_heads is not None:
+        expected["n_kv_heads"] = n_kv_heads
+    steps = getattr(args, "steps", None)
+    if steps is None:
+        steps = prereg.get("steps")
+    if steps is not None:
+        expected["total_steps"] = steps
+    device = getattr(args, "device", None)
+    if device is not None:
+        expected["device_type"] = _device_type_of(device)
+    if getattr(args, "lr", None) is not None:
+        expected["optimizer"] = "AdamW"
+        expected["optimizer_betas"] = [0.9, 0.999]
+        expected["optimizer_eps"] = 1e-8
+        expected["data_augmentation"] = "none"
+    expected["primary_metric"] = metric
+    expected["target_step"] = target_step
+    expected["planned_seeds"] = planned_seeds
+    return expected
+
+
+def _pilot_row_protocol_value(
+    row: Dict[str, object],
+    key: str,
+) -> Tuple[object, bool]:
+    """读取试点运行的一个协议值及「是否确有记录」。
+
+    旧运行的 comparison_protocol 可能缺键；回退补齐出的非空
+    值仍可作为实际值，但显式 null 只有在原始记录中确实出现
+    时才算已知，避免把「未记录」当成「没有启用」。
+    """
+    if key in _PILOT_PROVENANCE_KEYS:
+        source = _as_dict(row.get("provenance"))
+        recorded_keys = row.get("provenance_recorded_keys")
+        value = source.get(key)
+        if recorded_keys is None:
+            return value, key in source
+        recorded = {
+            str(item) for item in recorded_keys
+        } if isinstance(
+            recorded_keys, (list, tuple, set, frozenset)
+        ) else set()
+        return value, key in recorded or value is not None
+    protocol = _as_dict(row.get("protocol"))
+    recorded_keys = row.get("protocol_recorded_keys")
+    value = protocol.get(key)
+    if recorded_keys is None:
+        return value, value is not None
+    recorded = {
+        str(item) for item in recorded_keys
+    } if isinstance(
+        recorded_keys, (list, tuple, set, frozenset)
+    ) else set()
+    return value, key in recorded or value is not None
+
+
+def _pilot_comparability_item(
+    key: str,
+    group: str,
+    severity: str,
+    expected: Dict[str, object],
+    rows: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    values: Dict[str, object] = {}
+    missing_runs: List[str] = []
+    for row in rows:
+        name = str(row.get("run"))
+        value, recorded = _pilot_row_protocol_value(row, key)
+        values[name] = value
+        if not recorded:
+            missing_runs.append(name)
+    present = [
+        (name, value)
+        for name, value in values.items()
+        if name not in set(missing_runs)
+    ]
+    distinct = {
+        repr(_stable_factor_key(value))
+        for _, value in present
+    }
+    if not present:
+        status = "not_recorded"
+    elif len(distinct) > 1:
+        status = "mismatch"
+    elif key in expected:
+        expected_key = repr(
+            _stable_factor_key(expected.get(key))
+        )
+        if expected_key not in distinct:
+            status = "mismatch"
+        elif missing_runs:
+            status = "partial"
+        else:
+            status = "match"
+    elif missing_runs:
+        status = "partial"
+    else:
+        status = "consistent"
+    return {
+        "key": key,
+        "group": group,
+        "severity": severity,
+        "expected": expected.get(key) if key in expected else None,
+        "expected_recorded": key in expected,
+        "values": values,
+        "missing_runs": missing_runs,
+        "status": status,
+    }
+
+
+def _pilot_seed_overlap(
+    pilot_evidence: Dict[str, object],
+    planned_seeds: Sequence[object],
+) -> Dict[str, object]:
+    planned: set = set()
+    for seed in planned_seeds:
+        number = _finite_float(seed)
+        if number is not None and number.is_integer():
+            planned.add(int(number))
+    reused_cells: List[Dict[str, object]] = []
+    reused_total = 0
+    for cell in pilot_evidence.get("cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        seed_values = _as_dict(cell.get("seed_values"))
+        pilot_seeds = set()
+        for seed in seed_values:
+            number = _finite_float(seed)
+            if number is not None and number.is_integer():
+                pilot_seeds.add(int(number))
+        reused = sorted(pilot_seeds & planned)
+        if reused:
+            reused_total += len(reused)
+            reused_cells.append({
+                "cell": cell.get("label"),
+                "reused_seeds": reused,
+            })
+    return {
+        "planned_seed_count": len(planned),
+        "reused_seed_count": reused_total,
+        "reused_cells": reused_cells,
+        "independent_from_confirmatory_runs": reused_total == 0,
+        "note": (
+            "试点 seed 同时出现在正式计划中时，试点与确证运行"
+            "不是独立证据；若只在试点上做工程管道检查可以接受，"
+            "但必须在报告中披露，不能把同一批运行既当调参/"
+            "设计依据又当独立确认"
+        ),
+    }
+
+
+def _pilot_comparability_report(
+    rows: Sequence[Dict[str, object]],
+    expected: Optional[Dict[str, object]],
+    pilot_evidence: Dict[str, object],
+) -> Dict[str, object]:
+    expected = expected or {}
+    items: List[Dict[str, object]] = []
+    for group, keys, severity in _PILOT_COMPARABILITY_GROUPS:
+        for key in keys:
+            items.append(
+                _pilot_comparability_item(
+                    key, group, severity, expected, rows
+                )
+            )
+    blocking_mismatches = [
+        item for item in items
+        if item["severity"] == "blocking"
+        and item["status"] == "mismatch"
+    ]
+    advisory_mismatches = [
+        item for item in items
+        if item["severity"] == "advisory"
+        and item["status"] == "mismatch"
+    ]
+    unverified = [
+        item for item in items
+        if item["severity"] == "blocking"
+        and item["status"] in ("not_recorded", "partial")
+    ]
+    seed_overlap = _pilot_seed_overlap(
+        pilot_evidence,
+        expected.get("planned_seeds") or [],
+    )
+    warnings: List[str] = []
+    for item in blocking_mismatches:
+        warnings.append(
+            "试点协议与正式计划不可比："
+            f"{item['group']}.{item['key']} "
+            f"期望 {item['expected']!r}，"
+            "试点值 " + ", ".join(
+                f"{name}={value!r}"
+                for name, value in list(
+                    item["values"].items()
+                )[:4]
+            )
+        )
+    for item in advisory_mismatches:
+        warnings.append(
+            "试点与正式环境/数值条件不同："
+            f"{item['group']}.{item['key']} "
+            f"期望 {item['expected']!r}，"
+            "试点值 " + ", ".join(
+                f"{name}={value!r}"
+                for name, value in list(
+                    item["values"].items()
+                )[:4]
+            )
+        )
+    if unverified:
+        warnings.append(
+            f"{len(unverified)} 个关键协议项在试点运行中缺记录"
+            "或只有部分运行可核对；本次校准应标记为 unverified，"
+            "正式确证前建议用同一协议重跑试点"
+        )
+    if seed_overlap["reused_seed_count"]:
+        warnings.append(
+            "试点运行的 seed 与正式计划重叠 "
+            f"{seed_overlap['reused_seed_count']} 个；"
+            "试点与确证运行不是完全独立的证据"
+        )
+    if blocking_mismatches:
+        status = "incomparable"
+        comparable: Optional[bool] = False
+        usable = False
+    elif unverified:
+        status = "unverified"
+        comparable = None
+        usable = True
+    elif advisory_mismatches:
+        status = "comparable_with_cautions"
+        comparable = True
+        usable = True
+    else:
+        status = "comparable"
+        comparable = True
+        usable = True
+    return {
+        "schema": (
+            "smelt-isr/design-pilot-comparability/"
+            f"v{_PILOT_COMPARABILITY_SCHEMA_VERSION}"
+        ),
+        "status": status,
+        "comparable": comparable,
+        "usable_for_calibration": usable,
+        "verified": status in (
+            "comparable",
+            "comparable_with_cautions",
+        ),
+        "checked_keys": len(items),
+        "blocking_mismatch_count": len(blocking_mismatches),
+        "advisory_mismatch_count": len(advisory_mismatches),
+        "unverified_key_count": len(unverified),
+        "blocking_mismatches": blocking_mismatches,
+        "advisory_mismatches": advisory_mismatches,
+        "unverified_keys": [
+            {
+                "group": item["group"],
+                "key": item["key"],
+                "status": item["status"],
+                "missing_runs": item["missing_runs"],
+            }
+            for item in unverified
+        ],
+        "items": items,
+        "seed_overlap": seed_overlap,
+        "warnings": warnings,
+        "note": (
+            "只有 blocking mismatch 会阻止把试点 sd/脱落率用于"
+            "正式设计；unverified 表示旧运行缺少代码/数据/训练/"
+            "评估协议记录，不能声称已核对一致。环境/数值条件"
+            "差异只作 caution，因为同一代码在不同设备上仍可能"
+            "改变种子间波动"
+        ),
+    }
+
+
 def build_pilot_power_evidence(
     pilot_runs: Sequence[object],
     metric: str,
@@ -65969,6 +66468,7 @@ def build_pilot_power_evidence(
     declared_sd: Optional[float] = None,
     declared_attrition: Optional[float] = None,
     planned_modes: Optional[Sequence[object]] = None,
+    expected_protocol: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """从试点/先前运行估计配对差值 sd 与脱落率，并对照声明值。
 
@@ -66454,10 +66954,7 @@ def build_pilot_power_evidence(
         ),
     }
 
-    # 配置字段可能来自手工编辑/旧运行的 JSON（含 NaN/Inf），
-    # 直接回传会让 pilot_evidence 无法按标准 JSON 写出。这里
-    # 统一把非有限浮点降级为 None，保留字段本身。
-    return _json_safe({
+    evidence: Dict[str, object] = {
         "schema": f"smelt-isr/design-pilot/v{_DESIGN_PILOT_SCHEMA_VERSION}",
         "metric": metric,
         "metric_annotation": annotation,
@@ -66489,7 +66986,21 @@ def build_pilot_power_evidence(
             "实测方差/失败率；试点协议与正式协议不可比时不能"
             "把观测值直接当作目标设计的真实 sigma"
         ),
-    })
+    }
+    comparability = _pilot_comparability_report(
+        rows,
+        expected_protocol,
+        evidence,
+    )
+    evidence["comparability"] = comparability
+    warnings.extend(
+        str(item)
+        for item in comparability.get("warnings") or []
+    )
+    # 配置字段可能来自手工编辑/旧运行的 JSON（含 NaN/Inf），
+    # 直接回传会让 pilot_evidence 无法按标准 JSON 写出。这里
+    # 统一把非有限浮点降级为 None，保留字段本身。
+    return _json_safe(evidence)
 
 
 def _apply_pilot_evidence_to_power(
@@ -66504,6 +67015,14 @@ def _apply_pilot_evidence_to_power(
     样本试点反向放宽预注册的保守假设。
     """
     if not isinstance(power, dict) or not isinstance(evidence, dict):
+        return power, False
+    comparability = _as_dict(evidence.get("comparability"))
+    if comparability.get("usable_for_calibration") is False:
+        evidence["applied_to_power"] = False
+        evidence["adjusted_power_inputs"] = None
+        evidence["not_applied_reason"] = (
+            "pilot_protocol_incomparable"
+        )
         return power, False
     adjusted = dict(power)
     changed = False
@@ -66567,6 +67086,20 @@ def _pilot_gate_note(evidence: object) -> str:
     """把试点证据里「声明被观测超过」的项写成硬门说明。"""
     if not isinstance(evidence, dict):
         return ""
+    comparability = _as_dict(evidence.get("comparability"))
+    if comparability.get("usable_for_calibration") is False:
+        keys = ", ".join(
+            f"{item.get('group')}.{item.get('key')}"
+            for item in (
+                comparability.get("blocking_mismatches") or []
+            )[:4]
+            if isinstance(item, dict)
+        )
+        return (
+            "试点运行与正式计划的代码/数据/训练/评估协议不可比"
+            + (f"（{keys}）" if keys else "")
+            + "；不能把试点 sd/脱落率当作正式设计的校准依据。"
+        )
     parts: List[str] = []
     sd_check = _as_dict(evidence.get("sd_check"))
     if sd_check.get("status") == "declared_below_observed":
@@ -66897,6 +67430,14 @@ def write_design_plan(
         pilot_target_step = getattr(args, "common_step", None)
         if pilot_target_step is None:
             pilot_target_step = prereg.get("common_step")
+        expected_protocol = (
+            _pilot_expected_comparability_protocol(
+                args,
+                prereg,
+                str(metric),
+                pilot_target_step,
+            )
+        )
         pilot_evidence = build_pilot_power_evidence(
             list(pilot_runs),
             str(metric),
@@ -66908,7 +67449,33 @@ def write_design_plan(
                 for item in plan
                 if item.get("mode") is not None
             ],
+            expected_protocol=expected_protocol,
         )
+        comparability = _as_dict(
+            pilot_evidence.get("comparability")
+        )
+        if comparability.get("usable_for_calibration") is False:
+            mismatches = [
+                item
+                for item in (
+                    comparability.get("blocking_mismatches") or []
+                )
+                if isinstance(item, dict)
+            ]
+            details = "; ".join(
+                f"{item.get('group')}.{item.get('key')} "
+                f"期望 {item.get('expected')!r}"
+                for item in mismatches[:4]
+            )
+            raise ValueError(
+                "试点运行与本次正式计划的代码/数据/训练/评估协议"
+                "不可比"
+                + (f"（{details}）" if details else "")
+                + "：不能把其配对 sd/脱落率用于正式设计的功效"
+                "校准。请改用与正式运行同代码、同数据切分、同"
+                "训练预算与同评估调度完成的试点；或去掉 "
+                "--design-pilot-runs，只使用预注册声明的先验值"
+            )
         power, pilot_adjusted = _apply_pilot_evidence_to_power(
             power, pilot_evidence
         )
@@ -70228,6 +70795,39 @@ def print_design_summary(design: Dict[str, object]) -> None:
             f"{annotation.get('kind')}，target_step="
             f"{_format_finite(annotation.get('target_step'), 'g')}）"
         )
+        comparability = _as_dict(
+            pilot.get("comparability")
+        )
+        if comparability:
+            status = comparability.get("status")
+            print(
+                "[design][pilot][compat] 协议可比性="
+                f"{status}"
+                + (
+                    "（已核对）"
+                    if comparability.get("verified")
+                    else (
+                        "（不可比：禁止用于功效校准）"
+                        if comparability.get("status")
+                        == "incomparable"
+                        else "（缺少记录，未核实）"
+                    )
+                )
+                + f"；不可比项 "
+                f"{comparability.get('blocking_mismatch_count')}、"
+                "未核对项 "
+                f"{comparability.get('unverified_key_count')}"
+            )
+            seed_overlap = _as_dict(
+                comparability.get("seed_overlap")
+            )
+            if seed_overlap.get("reused_seed_count"):
+                print(
+                    "[design][pilot][warn] 试点 seed 与正式计划"
+                    "重叠 "
+                    f"{seed_overlap.get('reused_seed_count')} 个："
+                    "同一批运行不能同时充当设计校准与独立确认"
+                )
         if annotation.get("target_step_data_dependent"):
             print(
                 "[design][pilot][warn] 试点指标的共同步数由"
@@ -70335,6 +70935,21 @@ def design_power_gate_error(
     # 且与错误信息里「或加 --allow-underpowered」矛盾。
     if allow_underpowered:
         return None
+    if isinstance(pilot_evidence, dict):
+        comparability = _as_dict(
+            pilot_evidence.get("comparability")
+        )
+        if (
+            comparability.get("usable_for_calibration") is False
+            and pilot_evidence.get("applied_to_power")
+        ):
+            return (
+                pilot_note
+                + "设计计划把不可比的试点证据用于功效校准："
+                "同一份设计不能再声称 adequate。请用可比试点"
+                "重算，或去掉 --design-pilot-runs 只使用预注册"
+                "声明的先验值，并用新的 --out 重新生成计划"
+            )
     acknowledged = (
         isinstance(power, dict)
         and bool(power.get("underpowered_acknowledged"))
