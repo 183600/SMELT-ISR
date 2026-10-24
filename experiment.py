@@ -47556,6 +47556,21 @@ def audit_run_directory(
             "重复解封，不能当作一次最终确认",
             count=len(test_records),
         )
+    if len(test_started_records) > 1:
+        add_error(
+            "multiple_test_started",
+            "metrics.jsonl 含多条 test_started 标记：测试集可能"
+            "被重复解封（每次解封都会先写该标记），不能当作"
+            "一次最终确认",
+            count=len(test_started_records),
+        )
+    if len(test_bad_case_records) > 1:
+        add_error(
+            "multiple_test_bad_cases",
+            "metrics.jsonl 含多条 test 坏案例记录：测试集可能"
+            "被重复评估，不能当作一次最终确认",
+            count=len(test_bad_case_records),
+        )
 
     checks["metrics"] = {
         "path": str(metrics_path),

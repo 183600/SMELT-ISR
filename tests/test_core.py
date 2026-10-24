@@ -4068,6 +4068,47 @@ class RunAuditTests(unittest.TestCase):
                         "test_ledger_missing", warning_codes
                     )
 
+    def test_audit_detects_repeated_test_unsealing(self):
+        for step_record, expected_code in (
+            (
+                {"step": "test_started", "split": "test"},
+                "multiple_test_started",
+            ),
+            (
+                {
+                    "step": "bad_cases",
+                    "split": "test",
+                    "wrong_tokens": 1,
+                },
+                "multiple_test_bad_cases",
+            ),
+        ):
+            with self.subTest(step=step_record["step"]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "run"
+                    self._build_run(root)
+                    metrics_path = root / "metrics.jsonl"
+                    records = [
+                        json.loads(line)
+                        for line in metrics_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+                    ]
+                    records.extend([step_record, step_record])
+                    metrics_path.write_text(
+                        "".join(
+                            json.dumps(record) + "\n"
+                            for record in records
+                        ),
+                        encoding="utf-8",
+                    )
+                    report = experiment.audit_run_directory(root)
+                    self.assertFalse(report["ok"])
+                    self.assertIn(
+                        expected_code,
+                        self._codes(report, "errors"),
+                    )
+
     def test_audit_detects_sanity_repeat_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
