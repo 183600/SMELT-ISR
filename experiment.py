@@ -12402,11 +12402,16 @@ def _group_stats_bootstrap_ci(
         replicate_count = int(replicates)
     except (TypeError, ValueError, OverflowError):
         return None
-    if not (
-        isinstance(ci_level, (int, float))
-        and not isinstance(ci_level, bool)
-        and 0.0 < float(ci_level) < 1.0
+    if (
+        isinstance(ci_level, bool)
+        or not isinstance(ci_level, (int, float))
     ):
+        return None
+    try:
+        level = float(ci_level)
+    except OverflowError:
+        return None
+    if not 0.0 < level < 1.0:
         return None
     n_groups = int(point_values.numel())
     if (
@@ -12451,7 +12456,7 @@ def _group_stats_bootstrap_ci(
     sampled = sampled[valid]
     if sampled.numel() == 0:
         return None
-    low, high = _percentile_interval(sampled, ci_level)
+    low, high = _percentile_interval(sampled, level)
     low *= value_scale
     high *= value_scale
     if not (math.isfinite(low) and math.isfinite(high)):

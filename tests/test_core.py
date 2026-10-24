@@ -10755,6 +10755,31 @@ class GroupClusterRegressionTests(unittest.TestCase):
             places=12,
         )
 
+    def test_group_bootstrap_rejects_extreme_ci_levels(self):
+        values = torch.tensor(
+            [1.0, 2.0, 3.0],
+            dtype=torch.float64,
+        )
+        weights = torch.ones(3, dtype=torch.float64)
+        for ci_level in (
+            10 ** 400,
+            float("inf"),
+            float("nan"),
+            0.0,
+            1.0,
+            True,
+            "bad",
+        ):
+            self.assertIsNone(
+                experiment._group_stats_bootstrap_ci(
+                    values,
+                    weights,
+                    32,
+                    torch.Generator().manual_seed(0),
+                    ci_level,
+                )
+            )
+
     def test_group_bootstrap_rejects_negative_or_2d_weights(self):
         generator = torch.Generator().manual_seed(0)
         values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
