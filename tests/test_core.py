@@ -3976,6 +3976,55 @@ class RunAuditTests(unittest.TestCase):
                 "test_ledger_entry_missing", warning_codes
             )
 
+    def test_audit_flags_unreadable_test_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            _, identity, _ = self._build_run(root)
+            metrics_path = root / "metrics.jsonl"
+            records = [
+                json.loads(line)
+                for line in metrics_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            records.append(
+                {"step": "test", **identity, "test_loss": 1.0}
+            )
+            metrics_path.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            local_ledger = root / "test_access_ledger.jsonl"
+            local_ledger.write_text(
+                json.dumps(
+                    {"out_dir": str(root.resolve())}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            real_open = open
+            ledger_key = str(local_ledger)
+
+            def _selective_open(path, *args, **kwargs):
+                if str(path) == ledger_key:
+                    raise PermissionError("denied")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch(
+                "builtins.open", new=_selective_open
+            ):
+                report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertIn(
+                "test_ledger_unreadable", warning_codes
+            )
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
     def test_audit_detects_started_without_summary(self):
         for step_record in (
             {"step": "test_started", "split": "test"},
@@ -8648,6 +8697,47 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(
             experiment.read_test_access_ledger(long_path), []
         )
+
+    def test_test_access_ledger_tolerates_unreadable_file(self):
+        # 账本存在但读不出来（权限/IO）时读取器不能整份崩溃；
+        # 但门控必须把「读不出来」当作无法核对，而不是当作
+        # 空账本放行重复解封。
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            ledger.write_text(
+                json.dumps({"out_dir": str(Path(tmp) / "a")})
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "builtins.open",
+                side_effect=PermissionError("denied"),
+            ):
+                entries, error = (
+                    experiment._read_test_access_ledger_entries(
+                        ledger
+                    )
+                )
+                self.assertEqual(entries, [])
+                self.assertIsNotNone(error)
+                self.assertEqual(
+                    experiment.read_test_access_ledger(ledger),
+                    [],
+                )
+                key = {
+                    "data_sha256": "d",
+                    "test_split_sha256": "s",
+                    "test_fraction": 0.05,
+                }
+                check = experiment.check_test_access_ledger(
+                    ledger, key, Path(tmp) / "out"
+                )
+            self.assertTrue(check["repeat_access"])
+            self.assertIsNotNone(check["ledger_unreadable"])
+            self.assertEqual(check["other_candidates"], [])
+            self.assertIn("无法读取", check["note"])
+            message = experiment._repeat_test_access_error(check)
+            self.assertIn("访问账本不可读", message)
 
     def test_compare_and_pilot_tolerate_unreadable_run_path(self):
         # 与 metrics 读取一致：损坏/超长运行路径不能让

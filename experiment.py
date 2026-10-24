@@ -16329,18 +16329,7 @@ def run_statistical_baseline(
                     )
                 ):
                     raise SystemExit(
-                        "[test] 拒绝解封：访问账本显示同一测试集"
-                        "已被其它候选解封（"
-                        + ", ".join(
-                            str(item.get("out_dir"))
-                            for item in access_check[
-                                "other_candidates"
-                            ][:5]
-                        )
-                        + "）。最终确认应冻结候选后统一解封；"
-                        "如确需重复访问，显式加 "
-                        "--allow-repeat-test-access，最终报告"
-                        "必须列出全部访问"
+                        _repeat_test_access_error(access_check)
                     )
                 append_test_access_ledger(
                     ledger_path,
@@ -47634,9 +47623,22 @@ def audit_run_directory(
             )
         else:
             entries = []
+            ledger_read_errors: List[str] = []
             for ledger_path in existing_ledger_paths:
-                entries.extend(
-                    read_test_access_ledger(ledger_path)
+                ledger_entries, ledger_error = (
+                    _read_test_access_ledger_entries(ledger_path)
+                )
+                entries.extend(ledger_entries)
+                if ledger_error is not None:
+                    ledger_read_errors.append(
+                        f"{ledger_path}: {ledger_error}"
+                    )
+            if ledger_read_errors:
+                add_warning(
+                    "test_ledger_unreadable",
+                    "访问账本存在但无法读取：无法核对这次解封"
+                    "是否已登记",
+                    errors=ledger_read_errors,
                 )
             try:
                 root_key = str(root.resolve())
@@ -47648,7 +47650,7 @@ def audit_run_directory(
                 if str(entry.get("out_dir")) == root_key
                 or str(entry.get("out_dir")) == str(root)
             ]
-            if not matching:
+            if not matching and not ledger_read_errors:
                 add_warning(
                     "test_ledger_entry_missing",
                     "本目录有 test 记录，但访问账本中没有对应条目："
@@ -49119,28 +49121,47 @@ def _read_test_records(run_dir: Path) -> Dict[str, object]:
     return {"run": str(run_dir), "available": True, **record}
 
 
-def read_test_access_ledger(path: Path) -> List[Dict[str, object]]:
-    """读取测试集访问账本（JSONL，只追加）。"""
+def _read_test_access_ledger_entries(
+    path: Path,
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    """读取账本并返回 ``(条目, 读取错误)``。
+
+    账本可能由崩溃中的追加写入留下半行/非法 UTF-8；损坏的
+    行应跳过，不能让最终对比因一条坏记录整份读不出来。文件
+    权限/IO 导致的读取失败与「账本为空」不同：这里返回已解析
+    出的完整条目与错误说明，调用方据账本做门控时必须把非 None
+    的错误当作「无法核对」并按保守值处理，而不是当作空账本
+    放行。
+    """
     path = Path(path)
     if not _path_exists(path):
-        return []
+        return [], None
     entries: List[Dict[str, object]] = []
-    # 账本可能由崩溃中的追加写入留下半行/非法 UTF-8；损坏的
-    # 行应跳过，不能让最终对比因一条坏记录整份读不出来。
-    with open(path, "rb") as handle:
-        for raw_line in handle:
-            try:
-                line = raw_line.decode("utf-8").strip()
-            except UnicodeDecodeError:
-                continue
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                entries.append(item)
+    try:
+        with open(path, "rb") as handle:
+            for raw_line in handle:
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    entries.append(item)
+    except OSError as error:
+        # 读取中途失败时保留已经解析出的完整记录；错误随条目
+        # 一起返回，供调用方判断账本是否可信。
+        return entries, str(error)
+    return entries, None
+
+
+def read_test_access_ledger(path: Path) -> List[Dict[str, object]]:
+    """读取测试集访问账本（JSONL，只追加；读失败返回部分条目）。"""
+    entries, _error = _read_test_access_ledger_entries(path)
     return entries
 
 
@@ -49176,6 +49197,36 @@ def _test_access_key(
     }
 
 
+def _repeat_test_access_error(
+    access_check: Dict[str, object],
+) -> str:
+    """测试集重复解封/账本不可读时的拒绝消息。"""
+    if access_check.get("ledger_unreadable"):
+        reason = (
+            "访问账本不可读（"
+            + str(access_check.get("ledger_unreadable"))
+            + "），无法核对同一测试集是否已被其它候选解封"
+        )
+    else:
+        candidates = ", ".join(
+            str(item.get("out_dir"))
+            for item in (
+                access_check.get("other_candidates") or []
+            )[:5]
+        )
+        reason = (
+            "访问账本显示同一测试集已被其它候选解封（"
+            + candidates
+            + "）"
+        )
+    return (
+        "[test] 拒绝解封：" + reason
+        + "。最终确认应冻结候选后统一解封；"
+        "如确需重复访问，显式加 "
+        "--allow-repeat-test-access，最终报告必须列出全部访问"
+    )
+
+
 def check_test_access_ledger(
     ledger_path: Path,
     key: Dict[str, object],
@@ -49189,7 +49240,7 @@ def check_test_access_ledger(
     「同一测试集」，列出全部历史访问，供研究级流程核对候选
     冻结与预注册比较是否完整。
     """
-    entries = read_test_access_ledger(ledger_path)
+    entries, read_error = _read_test_access_ledger_entries(ledger_path)
     matching = [
         entry
         for entry in entries
@@ -49200,6 +49251,23 @@ def check_test_access_ledger(
         for entry in matching
         if str(entry.get("out_dir")) != str(Path(out_dir))
     ]
+    if read_error is not None:
+        # 账本不可读时无法核对该测试集是否已被访问过；尘封
+        # 协议宁可保守拒绝一次，也不能把「读不出来」当成
+        # 「没有历史访问」而放行重复解封。
+        return {
+            "ledger": str(ledger_path),
+            "matching_accesses": len(matching),
+            "other_candidates": other_candidates,
+            "repeat_access": True,
+            "ledger_unreadable": read_error,
+            "note": (
+                "访问账本无法读取（" + read_error + "）："
+                "无法核对是否已重复解封，按保守值拒绝；"
+                "修复账本权限/IO 后重试，或显式使用"
+                "--allow-repeat-test-access 并留痕"
+            ),
+        }
     return {
         "ledger": str(ledger_path),
         "matching_accesses": len(matching),
@@ -49275,7 +49343,9 @@ def print_final_test_comparison(
         )
     ledger_info = None
     if ledger_path:
-        entries = read_test_access_ledger(Path(ledger_path))
+        entries, ledger_error = _read_test_access_ledger_entries(
+            Path(ledger_path)
+        )
         counts: Dict[str, int] = {}
         for entry in entries:
             counts[str(entry.get("out_dir"))] = (
@@ -49285,6 +49355,7 @@ def print_final_test_comparison(
             "ledger": ledger_path,
             "accesses": len(entries),
             "per_candidate": counts,
+            "unreadable": ledger_error,
         }
         repeated = [
             name for name, count in counts.items() if count > 1
@@ -49293,6 +49364,13 @@ def print_final_test_comparison(
             print(
                 "  [warn] 以下候选被账本记录为重复解封测试集: "
                 + ", ".join(repeated)
+            )
+        if ledger_error is not None:
+            print(
+                "  [warn] 访问账本无法读取（"
+                + ledger_error
+                + "）：无法核对重复解封，报告中的访问"
+                "汇总不完整"
             )
     return {
         "candidates": rows,
@@ -76647,18 +76725,7 @@ def main():
                     and not args.allow_repeat_test_access
                 ):
                     raise SystemExit(
-                        "[test] 拒绝解封：访问账本显示同一测试集"
-                        "已被其它候选解封（"
-                        + ", ".join(
-                            str(item.get("out_dir"))
-                            for item in access_check[
-                                "other_candidates"
-                            ][:5]
-                        )
-                        + "）。最终确认应冻结候选后统一解封；"
-                        "如确需重复访问，显式加 "
-                        "--allow-repeat-test-access，最终报告"
-                        "必须列出全部访问"
+                        _repeat_test_access_error(access_check)
                     )
                 config_sha256 = None
                 try:
