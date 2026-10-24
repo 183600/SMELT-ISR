@@ -3976,6 +3976,41 @@ class RunAuditTests(unittest.TestCase):
                 "test_ledger_entry_missing", warning_codes
             )
 
+    def test_audit_matches_relative_test_ledger_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            root = base / "run"
+            _, identity, _ = self._build_run(
+                root,
+                metadata_overrides={"cwd": str(base)},
+            )
+            metrics_path = root / "metrics.jsonl"
+            records = [
+                json.loads(line)
+                for line in metrics_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            records.append(
+                {"step": "test", **identity, "test_loss": 1.0}
+            )
+            metrics_path.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            (root / "test_access_ledger.jsonl").write_text(
+                json.dumps({"out_dir": "run"}) + "\n",
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertNotIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+
     def test_audit_flags_unreadable_test_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
@@ -4882,6 +4917,31 @@ class ProcessTests(unittest.TestCase):
                 ledger, key, Path(tmp) / "a"
             )
             self.assertFalse(check_same["repeat_access"])
+
+    def test_test_ledger_repeat_detection_normalizes_path_spelling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.jsonl"
+            key = {
+                "data_sha256": "d",
+                "test_split_sha256": "s",
+                "test_fraction": 0.05,
+            }
+            candidate = Path(tmp) / "a"
+            relative_candidate = os.path.relpath(
+                candidate, Path.cwd()
+            )
+            experiment.append_test_access_ledger(
+                ledger,
+                {**key, "out_dir": relative_candidate},
+            )
+            check = experiment.check_test_access_ledger(
+                ledger, key, candidate.resolve()
+            )
+            self.assertFalse(check["repeat_access"], check)
+            check = experiment.check_test_access_ledger(
+                ledger, key, Path(tmp) / "b"
+            )
+            self.assertTrue(check["repeat_access"], check)
 
     def test_entity_manifest_audit_runs_with_group_separator(self):
         with tempfile.TemporaryDirectory() as directory:

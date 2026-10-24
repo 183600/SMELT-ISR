@@ -47685,15 +47685,21 @@ def audit_run_directory(
                     "是否已登记",
                     errors=ledger_read_errors,
                 )
-            try:
-                root_key = str(root.resolve())
-            except (OSError, RuntimeError):
-                root_key = str(root)
+            metadata_cwd = metadata.get("cwd")
+            if not isinstance(metadata_cwd, str) or not metadata_cwd.strip():
+                metadata_cwd = None
             matching = [
                 entry
                 for entry in entries
-                if str(entry.get("out_dir")) == root_key
-                or str(entry.get("out_dir")) == str(root)
+                if _run_paths_match(
+                    entry.get("out_dir"),
+                    root,
+                    left_base=metadata_cwd,
+                )
+                or _run_paths_match(
+                    entry.get("out_dir"),
+                    root,
+                )
             ]
             if not matching and not ledger_read_errors:
                 add_warning(
@@ -49226,6 +49232,40 @@ def append_test_access_ledger(
         os.fsync(handle.fileno())
 
 
+def _run_path_key(
+    value: object,
+    base: object = None,
+) -> Optional[str]:
+    """把运行目录路径规范化为可比较的键。
+
+    账本记录可能来自相对路径、绝对路径或带 ``./``/符号链接的
+    写法；纯字符串比较会把同一目录误判成另一个候选。相对路径
+    先按给定基准目录（运行元数据里的 cwd）还原，再解析。
+    """
+    if value is None:
+        return None
+    try:
+        path = Path(os.fspath(value))
+        if not path.is_absolute() and base is not None:
+            path = Path(os.fspath(base)) / path
+        return os.path.normcase(str(path.resolve(strict=False)))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _run_paths_match(
+    left: object,
+    right: object,
+    left_base: object = None,
+) -> bool:
+    """比较两个运行目录；无法解析时退回原字符串比较。"""
+    left_key = _run_path_key(left, left_base)
+    right_key = _run_path_key(right)
+    if left_key is not None and right_key is not None:
+        return left_key == right_key
+    return str(left) == str(right)
+
+
 def _test_access_key(
     data_sha256: object,
     split_sha256: object,
@@ -49294,7 +49334,10 @@ def check_test_access_ledger(
     other_candidates = [
         entry
         for entry in matching
-        if str(entry.get("out_dir")) != str(Path(out_dir))
+        if not _run_paths_match(
+            entry.get("out_dir"),
+            out_dir,
+        )
     ]
     if read_error is not None:
         # 账本不可读时无法核对该测试集是否已被访问过；尘封
