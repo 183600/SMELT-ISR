@@ -12497,6 +12497,28 @@ def _group_cluster_eval_intervals(
             "available": False,
             "reason": "missing_or_invalid_group_stats",
         }
+    if isinstance(ci_level, bool) or not isinstance(
+        ci_level, (int, float)
+    ):
+        return {
+            "available": False,
+            "reason": "invalid_ci_level",
+            "ci_level": _finite_float(ci_level),
+        }
+    try:
+        level = float(ci_level)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "available": False,
+            "reason": "invalid_ci_level",
+            "ci_level": _finite_float(ci_level),
+        }
+    if not 0.0 < level < 1.0:
+        return {
+            "available": False,
+            "reason": "invalid_ci_level",
+            "ci_level": _finite_float(ci_level),
+        }
     try:
         replicate_count = int(replicates)
     except (TypeError, ValueError, OverflowError):
@@ -12568,12 +12590,14 @@ def _group_cluster_eval_intervals(
         tokens,
         replicate_count,
         generator,
+        level,
     )
     accuracy_interval = _group_stats_bootstrap_ci(
         accuracy_point,
         tokens,
         replicate_count,
         generator,
+        level,
     )
     if loss_interval is None:
         return {
@@ -12597,6 +12621,7 @@ def _group_cluster_eval_intervals(
             token_total if math.isfinite(token_total) else None
         ),
         "bootstrap_replicates": replicate_count,
+        "bootstrap_ci_level": level,
         "bootstrap_unit": "document_group",
         "loss_ci95_low": max(0.0, low),
         "loss_ci95_high": max(0.0, high),

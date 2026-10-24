@@ -10854,6 +10854,45 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
 
+    def test_group_cluster_ci_level_is_applied(self):
+        stats = self._stats([
+            [0, 10.0, 10.0, 5.0],
+            [1, 10.0, 20.0, 5.0],
+            [2, 10.0, 100.0, 5.0],
+        ])
+        narrow = experiment._group_cluster_eval_intervals(
+            stats,
+            replicates=500,
+            seed=7,
+            ci_level=0.80,
+        )
+        wide = experiment._group_cluster_eval_intervals(
+            stats,
+            replicates=500,
+            seed=7,
+            ci_level=0.95,
+        )
+        self.assertTrue(narrow["available"], narrow)
+        self.assertTrue(wide["available"], wide)
+        self.assertEqual(narrow["bootstrap_ci_level"], 0.80)
+        self.assertEqual(wide["bootstrap_ci_level"], 0.95)
+        self.assertLess(
+            narrow["loss_ci95_high"] - narrow["loss_ci95_low"],
+            wide["loss_ci95_high"] - wide["loss_ci95_low"],
+        )
+        for level in (0.0, 1.0, float("nan"), "0.95", True, None):
+            with self.subTest(ci_level=level):
+                report = experiment._group_cluster_eval_intervals(
+                    stats,
+                    replicates=50,
+                    seed=1,
+                    ci_level=level,
+                )
+                self.assertFalse(report["available"])
+                self.assertEqual(
+                    report["reason"], "invalid_ci_level"
+                )
+
     def test_fixed_eval_group_ids_handles_invalid_batch_counts(self):
         separator = b"<|doc|>"
         payload = (b"aaaa" + separator) * 20 + b"bbbb"
