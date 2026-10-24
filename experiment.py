@@ -66133,8 +66133,24 @@ def _pilot_expected_comparability_protocol(
         ),
     }
     for key, value in data_values.items():
-        if value is not None:
-            expected[key] = value
+        if value is None:
+            continue
+        # SHA-256 十六进制大小写不影响内容同一性；预注册
+        # 校验按不区分大小写比较，试点协议核对也必须一致，
+        # 否则合法的大写指纹会被误报为不可比。
+        if key in ("data_sha256", "effective_train_sha256"):
+            if isinstance(value, str):
+                value = value.lower()
+        elif key == "split_sha256" and isinstance(value, dict):
+            value = {
+                name: (
+                    digest.lower()
+                    if isinstance(digest, str)
+                    else digest
+                )
+                for name, digest in value.items()
+            }
+        expected[key] = value
     # 显式 null 也是已知的正式协议值（例如未启用群组分隔符）；
     # 只有 args 中根本没有该字段时才保持缺失。不能用「值是否为
     # None」区分这两者，否则正式计划不使用分隔符时，试点用了

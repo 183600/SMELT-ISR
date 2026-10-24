@@ -2701,6 +2701,47 @@ class DesignPreparationTests(unittest.TestCase):
         )
         self.assertEqual(item["status"], "match")
 
+    def test_pilot_expected_hashes_are_case_insensitive(self):
+        upper_data = "A" * 64
+        upper_split = {"train": "B" * 64}
+        args = argparse.Namespace(
+            seeds=[1],
+            data_split_sha256=upper_split,
+        )
+        expected = (
+            experiment._pilot_expected_comparability_protocol(
+                args,
+                {"data": {"sha256": upper_data}},
+                "val_loss",
+                None,
+            )
+        )
+        self.assertEqual(
+            expected["data_sha256"], upper_data.lower()
+        )
+        self.assertEqual(
+            expected["split_sha256"],
+            {"train": upper_split["train"].lower()},
+        )
+        rows = [{
+            "run": "pilot",
+            "protocol": {
+                "data_sha256": upper_data.lower(),
+                "split_sha256": {
+                    "train": upper_split["train"].lower()
+                },
+            },
+            "protocol_recorded_keys": [
+                "data_sha256",
+                "split_sha256",
+            ],
+        }]
+        for key in ("data_sha256", "split_sha256"):
+            item = experiment._pilot_comparability_item(
+                key, "data", "blocking", expected, rows
+            )
+            self.assertEqual(item["status"], "match")
+
     def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]
