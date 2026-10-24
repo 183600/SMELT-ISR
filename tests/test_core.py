@@ -2663,6 +2663,44 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertEqual(item["status"], "mismatch")
         self.assertIn(item, report["blocking_mismatches"])
 
+    def test_pilot_expected_cleaning_flags_use_bool_encoding(self):
+        # comparison_protocol 把清洗开关统一写成 bool；直接
+        # 调用方传入 1/0 时，期望值不能保留整数类型。
+        args = argparse.Namespace(
+            deduplicate_train_groups=1,
+            drop_train_shared_chunks=0,
+        )
+        expected = (
+            experiment._pilot_expected_comparability_protocol(
+                args, {}, "val_loss", None
+            )
+        )
+        self.assertIs(
+            expected["deduplicate_train_groups"], True
+        )
+        self.assertIs(
+            expected["drop_train_shared_chunks"], False
+        )
+        rows = [{
+            "run": "pilot",
+            "protocol": {
+                "deduplicate_train_groups": True,
+                "drop_train_shared_chunks": False,
+            },
+            "protocol_recorded_keys": [
+                "deduplicate_train_groups",
+                "drop_train_shared_chunks",
+            ],
+        }]
+        item = experiment._pilot_comparability_item(
+            "deduplicate_train_groups",
+            "data",
+            "blocking",
+            expected,
+            rows,
+        )
+        self.assertEqual(item["status"], "match")
+
     def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]

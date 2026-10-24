@@ -66152,13 +66152,28 @@ def _pilot_expected_comparability_protocol(
             value = getattr(args, key, missing)
             if value is not missing:
                 expected[key] = value
+    cleaning_bool_keys = set(
+        _PREREGISTRATION_CLEANING_BOOL_KEYS
+    ) | {
+        "allow_entity_overlap",
+        "allow_data_leakage",
+        "allow_corrupt_test_labels",
+        "allow_eval_duplicates",
+    }
     for key in _PILOT_CLEANING_KEYS:
         if key in cleaning:
-            expected[key] = cleaning.get(key)
+            value = cleaning.get(key)
         else:
             value = getattr(args, key, missing)
-            if value is not missing:
-                expected[key] = value
+            if value is missing:
+                continue
+        # 清洗开关在 comparison_protocol 中统一写成 bool；
+        # 直接调用方传入 0/1/None 时也必须用同一口径。
+        expected[key] = (
+            bool(value)
+            if key in cleaning_bool_keys
+            else value
+        )
     # 两个同义清洗开关在 comparison_protocol 中按 OR 归一化；
     # 直接构造 args 时可能只设置了其中一个，期望值必须使用同一
     # 口径，否则合法的试点会被误报为协议不一致。
