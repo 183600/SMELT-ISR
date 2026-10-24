@@ -11498,6 +11498,81 @@ class GroupClusterRegressionTests(unittest.TestCase):
             places=12,
         )
 
+    def test_eval_bootstrap_intervals_avoid_overflowing_ar_bounds(self):
+        # 极小 token 数使逐窗口 loss 合法但接近 float 上限。
+        # AR(1) 膨胀若用 (low + high) / 2 会先溢出，把区间写成
+        # 非标准 JSON 的 inf；端点必须保持有限。
+        n = 10
+        tokens = torch.full(
+            (n,), 1.0e-300, dtype=torch.float64
+        )
+        per_window_loss = torch.full(
+            (n,), 9.0e307, dtype=torch.float64
+        ) * (
+            1.0
+            + torch.arange(n, dtype=torch.float64) * 1.0e-3
+        )
+        loss_sums = per_window_loss * tokens
+        zeros = torch.zeros((n, 3), dtype=torch.float64)
+        report = experiment._bootstrap_eval_intervals(
+            loss_sums,
+            tokens,
+            zeros,
+            zeros,
+            zeros,
+            100,
+            seed=1,
+        )
+        self.assertGreater(report["window_ci_inflation"], 1.0)
+        self.assertIn("loss_ci95_low", report)
+        self.assertTrue(
+            math.isfinite(report["loss_ci95_low"])
+        )
+        self.assertTrue(
+            math.isfinite(report["loss_ci95_high"])
+        )
+        self.assertLessEqual(
+            report["loss_ci95_low"],
+            report["loss_ci95_high"],
+        )
+        for value in report.values():
+            if isinstance(value, float):
+                self.assertTrue(math.isfinite(value), value)
+
+    def test_bootstrap_block_size_is_clamped_to_window_count(self):
+        # 块长大于窗口数时只有前 n 个循环偏移参与抽样；不先
+        # 截断会对合法的超大 --eval-bootstrap-block 分配巨量
+        # 内存，但结果本应与 block=n 相同。
+        small = experiment._bootstrap_window_indices(
+            5,
+            8,
+            torch.Generator().manual_seed(11),
+            block_size=5,
+        )
+        huge = experiment._bootstrap_window_indices(
+            5,
+            8,
+            torch.Generator().manual_seed(11),
+            block_size=10 ** 18,
+        )
+        self.assertTrue(torch.equal(small, huge))
+
+    def test_eval_bootstrap_rejects_excessive_replicates(self):
+        values = torch.ones(4, dtype=torch.float64)
+        zeros = torch.zeros((4, 2), dtype=torch.float64)
+        self.assertEqual(
+            experiment._bootstrap_eval_intervals(
+                values,
+                values,
+                zeros,
+                zeros,
+                zeros,
+                experiment._MAX_BOOTSTRAP_REPLICATES + 1,
+                seed=0,
+            ),
+            {},
+        )
+
     def test_group_bootstrap_rejects_extreme_ci_levels(self):
         values = torch.tensor(
             [1.0, 2.0, 3.0],

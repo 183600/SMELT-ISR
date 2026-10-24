@@ -13123,14 +13123,22 @@ def _bootstrap_window_indices(
     """
     n = int(n_windows)
     reps = int(replicates)
-    if block_size <= 1:
+    try:
+        requested_block = int(block_size)
+    except (TypeError, ValueError, OverflowError):
+        requested_block = 1
+    if requested_block <= 1:
         return torch.randint(
             low=0,
             high=n,
             size=(reps, n),
             generator=generator,
         )
-    block = max(1, int(block_size))
+    # 块长超过窗口数时，前 n 个循环偏移量本来就恰好是 0..n-1
+    # 的一个排列；按 n 截断只改变中间分配大小，不改变抽样结果。
+    # 不截断会让 --eval-bootstrap-block 的合法超大整数先分配
+    # arange(block) 并耗尽内存。
+    block = max(1, min(n, requested_block))
     n_blocks = int(math.ceil(n / block))
     starts = torch.randint(
         low=0,
@@ -13188,20 +13196,30 @@ def _bootstrap_eval_intervals(
     返回的键不带 split 前缀，由 ``evaluate`` 统一加前缀。
     """
     n_windows = int(window_tokens.numel())
+    try:
+        replicate_count = int(replicates)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    try:
+        requested_block = int(block_size)
+    except (TypeError, ValueError, OverflowError):
+        requested_block = 1
     if (
-        replicates <= 1
+        replicate_count <= 1
+        or replicate_count > _MAX_BOOTSTRAP_REPLICATES
         or n_windows <= 0
         or ci_level <= 0.0
         or ci_level >= 1.0
     ):
         return {}
+    block = max(1, min(n_windows, requested_block))
 
     generator = torch.Generator().manual_seed(int(seed))
     indices = _bootstrap_window_indices(
         n_windows,
-        int(replicates),
+        replicate_count,
         generator,
-        block_size=block_size,
+        block_size=block,
     )
 
     loss_sums = window_loss_sums.to(torch.float64)
@@ -13372,10 +13390,22 @@ def _bootstrap_eval_intervals(
             result[f"{name}_bootstrap_degenerate"] = degenerate
         low, high = _percentile_interval(finite, ci_level)
         if inflation > 1.0:
-            midpoint = (low + high) / 2.0
+            # 所有纳入区间的指标都非负，用 low + (high - low)/2
+            # 而不是 (low + high)/2：后者在端点都接近 float
+            # 上限时会先溢出成 inf，把合法区间变成 ±inf。
+            midpoint = low + (high - low) / 2.0
             half_width = (high - low) / 2.0 * inflation
             low = midpoint - half_width
             high = midpoint + half_width
+            if not (
+                math.isfinite(low) and math.isfinite(high)
+            ):
+                # 膨胀后的区间超出 float 可表示范围：不写出
+                # inf/NaN 端点，保留点估计与诊断量。
+                result[f"{name}_bootstrap_unavailable"] = (
+                    "unrepresentable_bounds"
+                )
+                continue
         lower_bound, upper_bound = metric_bounds[name]
         if lower_bound is not None:
             low = max(low, lower_bound)
@@ -13385,9 +13415,9 @@ def _bootstrap_eval_intervals(
         result[f"{name}_ci95_high"] = high
 
     result["bootstrap_unit"] = (
-        "moving_block" if int(block_size) > 1 else "window_iid"
+        "moving_block" if block > 1 else "window_iid"
     )
-    result["bootstrap_block_size"] = int(max(1, block_size))
+    result["bootstrap_block_size"] = int(block)
     result["bootstrap_note"] = (
         "窗口级重采样只近似评估不确定性；连续/重叠窗口应按"
         "文档/来源做 cluster bootstrap，块 bootstrap 仅部分"
