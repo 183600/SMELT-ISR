@@ -12540,7 +12540,14 @@ def _group_cluster_eval_intervals(
         scale = 1.0
         loss_scaled = loss_point
     accuracy_point = correct / tokens
-    generator = torch.Generator().manual_seed(int(seed))
+    try:
+        seed_value = int(seed) % (2 ** 64)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_seed",
+        }
+    generator = torch.Generator().manual_seed(seed_value)
     loss_interval = _group_stats_bootstrap_ci(
         loss_scaled,
         tokens,

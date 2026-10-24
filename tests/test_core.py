@@ -10476,6 +10476,31 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
 
+    def test_group_eval_bootstrap_handles_extreme_seeds(self):
+        stats = {
+            "schema": experiment._GROUP_STATS_SCHEMA,
+            "assignment": experiment._GROUP_ASSIGNMENT,
+            "unit": "document_group",
+            "group_separator_sha256": "x",
+            "groups": [
+                [0, 10.0, 1.0, 10.0],
+                [1, 10.0, 2.0, 9.0],
+            ],
+        }
+        huge = experiment._group_cluster_eval_intervals(
+            stats, replicates=50, seed=10 ** 400
+        )
+        self.assertTrue(huge["available"])
+        json.dumps(huge, allow_nan=False)
+        invalid = experiment._group_cluster_eval_intervals(
+            stats, replicates=50, seed=float("inf")
+        )
+        self.assertFalse(invalid["available"])
+        self.assertEqual(
+            invalid["reason"], "invalid_bootstrap_seed"
+        )
+        json.dumps(invalid, allow_nan=False)
+
     def test_fixed_starts_cache_tracks_start_count_and_clamps(self):
         dataset = types.SimpleNamespace(_fixed_starts={})
         first = experiment.ByteDataset._ensure_fixed_starts(
