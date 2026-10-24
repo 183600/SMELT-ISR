@@ -47630,20 +47630,31 @@ def audit_run_directory(
         or test_started_records
         or test_bad_case_records
     )
-    test_evidence = bool(test_log_evidence or seal_exists)
-    if test_log_evidence and not seal_exists:
+    # 访问账本先于 test_started/封条写入；若进程在这之间崩溃，
+    # 运行目录里的账本文件是唯一解封证据。运行审计必须与
+    # test_evaluation_sealed 一样把它计入，否则会把中途崩溃的
+    # 候选误判成「从未解封」。
+    local_ledger_evidence = _path_exists(
+        root / "test_access_ledger.jsonl"
+    )
+    test_evidence = bool(
+        test_log_evidence
+        or seal_exists
+        or local_ledger_evidence
+    )
+    if test_evidence and not seal_exists:
         add_warning(
             "test_seal_missing",
-            "存在 test 记录或开始标记但没有持久封条：旧运行可能"
-            "未写封条；不能仅凭 metrics.jsonl 证明测试集只解封"
-            "一次",
+            "存在测试访问证据（test 记录、开始标记或访问账本）"
+            "但没有持久封条：旧运行可能未写封条；不能仅凭"
+            " metrics.jsonl 证明测试集只解封一次",
         )
     if test_evidence and not test_records:
         add_warning(
             "test_started_without_summary",
-            "测试集已开始解封（封条或 test_started/坏案例记录"
-            "存在）但没有 test 汇总记录：该候选不能作为最终"
-            "确认结果",
+            "测试集已开始解封（封条、test_started/坏案例记录"
+            "或访问账本存在）但没有 test 汇总记录：该候选"
+            "不能作为最终确认结果",
         )
     # 访问账本可能写在全局路径（--test-ledger），不一定在运行
     # 目录内；配置里的相对路径按运行时的 cwd 还原，避免把

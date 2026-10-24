@@ -4034,6 +4034,30 @@ class RunAuditTests(unittest.TestCase):
             self.assertEqual(list(counts.values()), [2])
             self.assertIn("重复解封", output.getvalue())
 
+    def test_audit_detects_crash_between_ledger_and_seal(self):
+        # 访问账本在 test_started/封条之前写入；进程若在这之间
+        # 崩溃，只有账本文件能证明测试集已解封。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            self._build_run(root)
+            (root / "test_access_ledger.jsonl").write_text(
+                json.dumps(
+                    {"out_dir": str(root.resolve())}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertIn("test_seal_missing", warning_codes)
+            self.assertIn(
+                "test_started_without_summary",
+                warning_codes,
+            )
+            self.assertNotIn(
+                "test_ledger_missing", warning_codes
+            )
+
     def test_audit_flags_unreadable_test_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
