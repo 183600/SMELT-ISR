@@ -7535,6 +7535,29 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 experiment.test_evaluation_sealed(run_dir)
             )
 
+    def test_global_test_ledger_counts_as_sealed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            ledger = Path(tmp) / "ledger.jsonl"
+            ledger.write_text(
+                json.dumps({"out_dir": str(run_dir)}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                experiment.test_evaluation_sealed(run_dir)
+            )
+            self.assertTrue(
+                experiment.test_evaluation_sealed(
+                    run_dir, ledger
+                )
+            )
+            self.assertFalse(
+                experiment.test_evaluation_sealed(
+                    run_dir, Path(tmp) / "other.jsonl"
+                )
+            )
+
     def test_resume_split_error_detects_missing_current_split(self):
         error = experiment.resume_split_change_error(
             {"train": "a", "test": "b"},

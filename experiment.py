@@ -16253,7 +16253,10 @@ def run_statistical_baseline(
                 "请设置正的 --test-fraction 且语料足够长"
             )
 
-        if test_evaluation_sealed(out_dir):
+        if test_evaluation_sealed(
+            out_dir,
+            getattr(args, "test_ledger", None),
+        ):
             raise SystemExit(
                 "[test] 输出目录已有测试集评估记录/封条；"
                 "统计基线也遵守唯一一次解封协议，请使用全新的 "
@@ -49056,7 +49059,10 @@ def _test_seal_path(out_dir: Path) -> Path:
     return Path(out_dir) / _TEST_SEAL_FILENAME
 
 
-def test_evaluation_sealed(out_dir: Path) -> bool:
+def test_evaluation_sealed(
+    out_dir: Path,
+    ledger_path: Optional[object] = None,
+) -> bool:
     """
     测试集是否已在输出目录解封过。
 
@@ -49064,6 +49070,10 @@ def test_evaluation_sealed(out_dir: Path) -> bool:
     持久封条文件：metrics.jsonl 被截断、重写或误删时，仅靠
     记录检查会让同一目录再次解封测试集，测试集因此退化为
     隐式验证集。封条与记录任一存在都视为已解封。
+
+    ``ledger_path`` 给出 ``--test-ledger`` 全局账本时，也检查
+    账本中是否已有本目录的访问记录：账本先于封条写入，进程在
+    两者之间崩溃时本地目录里没有任何证据，不能只查本地文件。
     """
     out_dir = Path(out_dir)
 
@@ -49077,7 +49087,26 @@ def test_evaluation_sealed(out_dir: Path) -> bool:
     # 崩溃，前两项都看不到解封事实，但本目录的账本已经记录了
     # 一次测试访问。存在即视为已解封，宁可保守拒绝也不能让
     # 同一目录在 resume 后再次消耗测试集。
-    return (out_dir / "test_access_ledger.jsonl").exists()
+    if (out_dir / "test_access_ledger.jsonl").exists():
+        return True
+
+    if not ledger_path:
+        return False
+    try:
+        ledger_file = Path(os.fspath(ledger_path))
+    except (TypeError, ValueError):
+        # 路径不可解释时按无法核对处理，保守视为已解封。
+        return True
+    entries, read_error = _read_test_access_ledger_entries(
+        ledger_file
+    )
+    if read_error is not None:
+        # 无法核对全局账本时按已解封处理，避免重复消耗测试集。
+        return True
+    return any(
+        _run_paths_match(entry.get("out_dir"), out_dir)
+        for entry in entries
+    )
 
 
 def fresh_out_dir_error(
@@ -72992,7 +73021,10 @@ def main():
     # 解封（旧记录被抹掉，之后可再次 --evaluate-test）；resume
     # 则会让新训练/新选型继承旧 test 记录，test 指标对应的
     # 不再是最终模型。两种情况都必须直接拒绝复用该目录。
-    if test_evaluation_sealed(out_dir):
+    if test_evaluation_sealed(
+        out_dir,
+        getattr(args, "test_ledger", None),
+    ):
         if args.resume is None:
             parser.error(
                 "输出目录已有测试集评估记录/封条："
@@ -76796,7 +76828,10 @@ def main():
             "稳定性后，再显式 --evaluate-test。"
         )
     elif args.evaluate_test:
-        if test_evaluation_sealed(out_dir):
+        if test_evaluation_sealed(
+            out_dir,
+            getattr(args, "test_ledger", None),
+        ):
             print(
                 "[test] 输出目录已有测试集评估记录/封条；"
                 "测试集在该目录的运行中已解封过一次，拒绝重复评估。"
