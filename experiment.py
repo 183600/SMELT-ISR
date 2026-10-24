@@ -66207,10 +66207,23 @@ def _pilot_expected_comparability_protocol(
         "amp_dtype",
         "allow_tf32",
     )
+    bool_protocol_attrs = {
+        "document_masks",
+        "grad_checkpoint",
+        "compile",
+        "allow_tf32",
+    }
     for key in protocol_attrs:
         value = getattr(args, key, missing)
         if value is not missing:
-            expected[key] = value
+            # 这些开关在 comparison_protocol 中统一写成 bool；
+            # 直接调用方传入 0/1/None 时也要用同一口径，否则
+            # 合法运行会被误报为协议不一致。
+            expected[key] = (
+                bool(value)
+                if key in bool_protocol_attrs
+                else value
+            )
     # comparison_protocol 把 --lr-schedule 的历史取值 cosine 归一化
     # 成描述性的 linear_warmup_cosine_to_10pct；试点核对必须用同一
     # 口径，否则默认 cosine 运行会被误判为与正式计划不可比。
