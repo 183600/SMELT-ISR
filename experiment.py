@@ -66115,9 +66115,12 @@ def _pilot_expected_comparability_protocol(
             or data_block.get("sha256")
             or prereg.get("data_sha256")
         ),
-        "split_sha256": getattr(
-            args, "data_split_sha256", None
-        ),
+        "split_sha256": (
+            dict(getattr(args, "data_split_sha256", None) or {})
+            or None
+        )
+        if getattr(args, "data_split_sha256", None) is not None
+        else None,
         "effective_train_sha256": getattr(
             args, "data_effective_train_sha256", None
         ),
@@ -66128,6 +66131,11 @@ def _pilot_expected_comparability_protocol(
     for key, value in data_values.items():
         if value is not None:
             expected[key] = value
+    # 显式 null 也是已知的正式协议值（例如未启用群组分隔符）；
+    # 只有 args 中根本没有该字段时才保持缺失。不能用「值是否为
+    # None」区分这两者，否则正式计划不使用分隔符时，试点用了
+    # 分隔符也不会被判为不可比。
+    missing = object()
     for key in (
         "val_fraction",
         "test_fraction",
@@ -66137,21 +66145,39 @@ def _pilot_expected_comparability_protocol(
         if key in data_block:
             expected[key] = data_block.get(key)
         else:
-            value = getattr(args, key, None)
-            if value is not None:
+            value = getattr(args, key, missing)
+            if value is not missing:
                 expected[key] = value
     for key in _PILOT_CLEANING_KEYS:
         if key in cleaning:
             expected[key] = cleaning.get(key)
         else:
-            value = getattr(args, key, None)
-            if value is not None:
+            value = getattr(args, key, missing)
+            if value is not missing:
                 expected[key] = value
+    # 两个同义清洗开关在 comparison_protocol 中按 OR 归一化；
+    # 直接构造 args 时可能只设置了其中一个，期望值必须使用同一
+    # 口径，否则合法的试点会被误报为协议不一致。
+    alias_keys = (
+        "clean_train_against_test",
+        "allow_eval_content_for_cleaning",
+    )
+    alias_present = [
+        key
+        for key in alias_keys
+        if key in cleaning or hasattr(args, key)
+    ]
+    if alias_present:
+        alias_value = bool(
+            _clean_against_test_effective(args)
+            or any(bool(cleaning.get(key)) for key in alias_keys)
+        )
+        for key in alias_keys:
+            expected[key] = alias_value
 
     protocol_attrs = (
         "init_scheme",
         "lr",
-        "lr_schedule",
         "wsd_stable_steps",
         "wsd_final_lr_ratio",
         "warmup_steps",
@@ -66178,9 +66204,18 @@ def _pilot_expected_comparability_protocol(
         "allow_tf32",
     )
     for key in protocol_attrs:
-        value = getattr(args, key, None)
-        if value is not None:
+        value = getattr(args, key, missing)
+        if value is not missing:
             expected[key] = value
+    # comparison_protocol 把 --lr-schedule 的历史取值 cosine 归一化
+    # 成描述性的 linear_warmup_cosine_to_10pct；试点核对必须用同一
+    # 口径，否则默认 cosine 运行会被误判为与正式计划不可比。
+    schedule = str(getattr(args, "lr_schedule", "cosine"))
+    expected["lr_schedule"] = (
+        "linear_warmup_cosine_to_10pct"
+        if schedule == "cosine"
+        else "wsd"
+    )
     n_kv_heads = getattr(args, "n_kv_heads", None)
     if n_kv_heads is None:
         n_kv_heads = getattr(args, "n_heads", None)
@@ -66191,8 +66226,8 @@ def _pilot_expected_comparability_protocol(
         steps = prereg.get("steps")
     if steps is not None:
         expected["total_steps"] = steps
-    device = getattr(args, "device", None)
-    if device is not None:
+    device = getattr(args, "device", missing)
+    if device is not missing:
         expected["device_type"] = _device_type_of(device)
     if getattr(args, "lr", None) is not None:
         expected["optimizer"] = "AdamW"
@@ -66226,7 +66261,10 @@ def _pilot_row_protocol_value(
         } if isinstance(
             recorded_keys, (list, tuple, set, frozenset)
         ) else set()
-        return value, key in recorded or value is not None
+        # provenance 没有「按 args 回退补齐」这条路径：值非空
+        # 但原始 run_metadata 未记录该键时仍属未核对，不能和
+        # 受控变量协议的回退口径混用。
+        return value, key in recorded
     protocol = _as_dict(row.get("protocol"))
     recorded_keys = row.get("protocol_recorded_keys")
     value = protocol.get(key)
@@ -66294,15 +66332,41 @@ def _pilot_comparability_item(
     }
 
 
+def _pilot_seed_int(value: object) -> Optional[int]:
+    """把计划/证据里的 seed 归一化成正整数。
+
+    ``cells[].seed_values`` 按 JSON 对象保存时键一定是字符串；
+    直接交给只接受数值的 ``_finite_float`` 会让重叠检测永远为
+    0。旧/手工记录也可能把 seed 存成数值字符串，这里一并兼容。
+    """
+    number = _finite_float(value)
+    if number is not None:
+        return int(number) if number.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                numeric = float(text)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if math.isfinite(numeric) and numeric.is_integer():
+                return int(numeric)
+    return None
+
+
 def _pilot_seed_overlap(
     pilot_evidence: Dict[str, object],
     planned_seeds: Sequence[object],
 ) -> Dict[str, object]:
     planned: set = set()
     for seed in planned_seeds:
-        number = _finite_float(seed)
-        if number is not None and number.is_integer():
-            planned.add(int(number))
+        number = _pilot_seed_int(seed)
+        if number is not None:
+            planned.add(number)
     reused_cells: List[Dict[str, object]] = []
     reused_total = 0
     for cell in pilot_evidence.get("cells") or []:
@@ -66311,9 +66375,9 @@ def _pilot_seed_overlap(
         seed_values = _as_dict(cell.get("seed_values"))
         pilot_seeds = set()
         for seed in seed_values:
-            number = _finite_float(seed)
-            if number is not None and number.is_integer():
-                pilot_seeds.add(int(number))
+            number = _pilot_seed_int(seed)
+            if number is not None:
+                pilot_seeds.add(number)
         reused = sorted(pilot_seeds & planned)
         if reused:
             reused_total += len(reused)
@@ -70929,12 +70993,9 @@ def design_power_gate_error(
     power = design.get("power")
     pilot_evidence = design.get("pilot_evidence")
     pilot_note = _pilot_gate_note(pilot_evidence)
-    # --allow-underpowered 必须独立于 power 记录生效：即使设计
-    # 计划没有（或损坏了）power 块，冒烟/探索运行也应能显式
-    # 绕过启动门；否则会在试点证据不可用时比旧行为更严格，
-    # 且与错误信息里「或加 --allow-underpowered」矛盾。
-    if allow_underpowered:
-        return None
+    # 协议不可比与「功效不足」是两类问题：--allow-underpowered
+    # 只承认后者，不能把错误数据来源变成可用校准证据，因此该
+    # 检查必须放在 allow_underpowered 的早退之前。
     if isinstance(pilot_evidence, dict):
         comparability = _as_dict(
             pilot_evidence.get("comparability")
@@ -70950,6 +71011,12 @@ def design_power_gate_error(
                 "重算，或去掉 --design-pilot-runs 只使用预注册"
                 "声明的先验值，并用新的 --out 重新生成计划"
             )
+    # --allow-underpowered 必须独立于 power 记录生效：即使设计
+    # 计划没有（或损坏了）power 块，冒烟/探索运行也应能显式
+    # 绕过启动门；否则会在试点证据不可用时比旧行为更严格，
+    # 且与错误信息里「或加 --allow-underpowered」矛盾。
+    if allow_underpowered:
+        return None
     acknowledged = (
         isinstance(power, dict)
         and bool(power.get("underpowered_acknowledged"))
