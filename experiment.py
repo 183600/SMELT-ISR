@@ -66295,6 +66295,37 @@ def _pilot_row_protocol_value(
     return value, key in recorded or value is not None
 
 
+def _pilot_comparability_run_labels(
+    rows: Sequence[Dict[str, object]],
+) -> List[str]:
+    """给每个试点行生成唯一标签，避免同名运行在 values 中折叠。"""
+    counts: Dict[str, int] = {}
+    for row in rows:
+        name = str(row.get("run"))
+        counts[name] = counts.get(name, 0) + 1
+    seen: Dict[str, int] = {}
+    used: set = set()
+    labels: List[str] = []
+    for row in rows:
+        base = str(row.get("run"))
+        if counts.get(base) == 1 and base not in used:
+            label = base
+        else:
+            ordinal = seen.get(base, 0) + 1
+            label = (
+                base
+                if ordinal == 1 and base not in used
+                else f"{base}#{ordinal}"
+            )
+            while label in used:
+                ordinal += 1
+                label = f"{base}#{ordinal}"
+            seen[base] = ordinal
+        used.add(label)
+        labels.append(label)
+    return labels
+
+
 def _pilot_comparability_item(
     key: str,
     group: str,
@@ -66304,8 +66335,9 @@ def _pilot_comparability_item(
 ) -> Dict[str, object]:
     values: Dict[str, object] = {}
     missing_runs: List[str] = []
-    for row in rows:
-        name = str(row.get("run"))
+    for row, name in zip(
+        rows, _pilot_comparability_run_labels(rows)
+    ):
         value, recorded = _pilot_row_protocol_value(row, key)
         values[name] = value
         if not recorded:

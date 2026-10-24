@@ -2636,6 +2636,33 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertFalse(report["verified"])
         self.assertEqual(report["status"], "unverified")
 
+    def test_pilot_comparability_keeps_duplicate_run_names(self):
+        # 不同目录可能使用相同 basename；按 run 名索引会把
+        # 后一个运行覆盖前一个，从而漏掉真实的协议差异。
+        rows = [
+            {
+                "run": "pilot",
+                "protocol": {"lr": 0.001},
+                "protocol_recorded_keys": ["lr"],
+            },
+            {
+                "run": "pilot",
+                "protocol": {"lr": 0.01},
+                "protocol_recorded_keys": ["lr"],
+            },
+        ]
+        report = experiment._pilot_comparability_report(
+            rows, {"lr": 0.01}, {}
+        )
+        item = next(
+            item
+            for item in report["items"]
+            if item["key"] == "lr"
+        )
+        self.assertEqual(len(item["values"]), 2)
+        self.assertEqual(item["status"], "mismatch")
+        self.assertIn(item, report["blocking_mismatches"])
+
     def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]
