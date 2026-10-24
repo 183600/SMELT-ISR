@@ -10475,6 +10475,38 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["available"])
 
+    def test_accuracy_intervals_are_bounded_near_one(self):
+        stats = self._stats([
+            [0, 10.0, 5.0, 10.0 + 5.0e-10],
+            [1, 10.0, 5.0, 10.0 + 5.0e-10],
+        ])
+        intervals = experiment._group_cluster_eval_intervals(
+            stats, replicates=50, seed=1
+        )
+        self.assertTrue(intervals["available"])
+        self.assertLessEqual(
+            intervals["token_accuracy_ci95_low"],
+            intervals["token_accuracy_ci95_high"],
+        )
+        self.assertLessEqual(
+            intervals["token_accuracy_ci95_high"],
+            1.0,
+        )
+        before = self._stats([
+            [0, 10.0, 5.0, 0.0],
+            [1, 10.0, 5.0, 0.0],
+        ])
+        paired = experiment._group_cluster_paired_comparison(
+            {"group_stats": before},
+            {"group_stats": stats},
+        )
+        self.assertTrue(paired["available"])
+        accuracy = paired["accuracy_bootstrap_ci95"]
+        self.assertLessEqual(
+            accuracy["low"], accuracy["high"]
+        )
+        self.assertLessEqual(accuracy["high"], 1.0)
+
     def test_paired_accuracy_interval_keeps_negative_differences(self):
         before = self._stats([
             [0, 10.0, 20.0, 9.0],

@@ -12581,11 +12581,11 @@ def _group_cluster_eval_intervals(
         ),
     }
     if accuracy_interval is not None:
-        result["token_accuracy_ci95_low"] = max(
-            0.0, accuracy_interval[0]
+        result["token_accuracy_ci95_low"] = min(
+            1.0, max(0.0, accuracy_interval[0])
         )
         result["token_accuracy_ci95_high"] = min(
-            1.0, accuracy_interval[1]
+            1.0, max(0.0, accuracy_interval[1])
         )
     return result
 
@@ -12792,8 +12792,12 @@ def _group_cluster_paired_comparison(
             / float(mean_weights.sum().item())
         )
         result["accuracy_bootstrap_ci95"] = {
-            "low": max(-1.0, accuracy_interval[0]),
-            "high": min(1.0, accuracy_interval[1]),
+            "low": min(
+                1.0, max(-1.0, accuracy_interval[0])
+            ),
+            "high": min(
+                1.0, max(-1.0, accuracy_interval[1])
+            ),
             "replicates": _EVAL_WINDOW_BOOTSTRAP_REPLICATES,
         }
     if include_differences:
