@@ -11622,6 +11622,44 @@ class GroupClusterRegressionTests(unittest.TestCase):
             if isinstance(value, float):
                 self.assertTrue(math.isfinite(value), value)
 
+    def test_eval_bootstrap_rejects_invalid_ci_and_seed(self):
+        values = torch.ones(4, dtype=torch.float64)
+        zeros = torch.zeros((4, 2), dtype=torch.float64)
+        for level in (
+            float("nan"),
+            float("inf"),
+            None,
+            "0.95",
+            0.0,
+            1.0,
+        ):
+            with self.subTest(level=level):
+                self.assertEqual(
+                    experiment._bootstrap_eval_intervals(
+                        values,
+                        values,
+                        zeros,
+                        zeros,
+                        zeros,
+                        10,
+                        seed=0,
+                        ci_level=level,
+                    ),
+                    {},
+                )
+        for seed in (-1, 2 ** 64, 2 ** 65 + 7):
+            with self.subTest(seed=seed):
+                report = experiment._bootstrap_eval_intervals(
+                    values,
+                    values,
+                    zeros,
+                    zeros,
+                    zeros,
+                    10,
+                    seed=seed,
+                )
+                self.assertTrue(report)
+
     def test_bootstrap_block_size_is_clamped_to_window_count(self):
         # 块长大于窗口数时只有前 n 个循环偏移参与抽样；不先
         # 截断会对合法的超大 --eval-bootstrap-block 分配巨量

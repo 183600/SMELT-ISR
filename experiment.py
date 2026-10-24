@@ -13204,17 +13204,29 @@ def _bootstrap_eval_intervals(
         requested_block = int(block_size)
     except (TypeError, ValueError, OverflowError):
         requested_block = 1
+    if isinstance(ci_level, bool) or not isinstance(
+        ci_level, (int, float)
+    ):
+        return {}
+    try:
+        level = float(ci_level)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    try:
+        seed_value = int(seed) % (2 ** 64)
+    except (TypeError, ValueError, OverflowError):
+        return {}
     if (
         replicate_count <= 1
         or replicate_count > _MAX_BOOTSTRAP_REPLICATES
         or n_windows <= 0
-        or ci_level <= 0.0
-        or ci_level >= 1.0
+        or not math.isfinite(level)
+        or not 0.0 < level < 1.0
     ):
         return {}
     block = max(1, min(n_windows, requested_block))
 
-    generator = torch.Generator().manual_seed(int(seed))
+    generator = torch.Generator().manual_seed(seed_value)
     indices = _bootstrap_window_indices(
         n_windows,
         replicate_count,
@@ -13341,7 +13353,7 @@ def _bootstrap_eval_intervals(
     result: Dict[str, object] = {
         "bootstrap_replicates": int(replicates),
         "bootstrap_windows": n_windows,
-        "bootstrap_ci_level": float(ci_level),
+        "bootstrap_ci_level": level,
         "window_lag1_autocorrelation": rho1,
         "window_effective_windows": effective_windows,
         "window_ci_inflation": inflation,
@@ -13388,7 +13400,7 @@ def _bootstrap_eval_intervals(
         degenerate = int(values.numel() - finite.numel())
         if degenerate > 0:
             result[f"{name}_bootstrap_degenerate"] = degenerate
-        low, high = _percentile_interval(finite, ci_level)
+        low, high = _percentile_interval(finite, level)
         if inflation > 1.0:
             # 所有纳入区间的指标都非负，用 low + (high - low)/2
             # 而不是 (low + high)/2：后者在端点都接近 float
