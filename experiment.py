@@ -47652,9 +47652,12 @@ def audit_run_directory(
             exists = ledger_path.is_file()
         except OSError:
             exists = False
-        key = str(ledger_path)
-        if exists and key not in seen_ledger_paths:
-            seen_ledger_paths.add(key)
+        try:
+            path_key = str(ledger_path.resolve())
+        except OSError:
+            path_key = str(ledger_path)
+        if exists and path_key not in seen_ledger_paths:
+            seen_ledger_paths.add(path_key)
             existing_ledger_paths.append(ledger_path)
     entries: List[Dict[str, object]] = []
     ledger_read_errors: List[str] = []
@@ -47670,17 +47673,27 @@ def audit_run_directory(
     metadata_cwd = metadata.get("cwd")
     if not isinstance(metadata_cwd, str) or not metadata_cwd.strip():
         metadata_cwd = None
+    audit_access_key = _test_access_key(
+        data_sha,
+        split_sha,
+        data.get("test_fraction"),
+    )
     matching = [
         entry
         for entry in entries
-        if _run_paths_match(
-            entry.get("out_dir"),
-            root,
-            left_base=metadata_cwd,
+        if _test_access_entry_matches_key(
+            entry, audit_access_key
         )
-        or _run_paths_match(
-            entry.get("out_dir"),
-            root,
+        and (
+            _run_paths_match(
+                entry.get("out_dir"),
+                root,
+                left_base=metadata_cwd,
+            )
+            or _run_paths_match(
+                entry.get("out_dir"),
+                root,
+            )
         )
     ]
     # 访问账本先于 test_started/封条写入；若进程在这之间崩溃，
@@ -47729,12 +47742,34 @@ def audit_run_directory(
                     "本目录有 test 记录，但访问账本中没有对应条目："
                     "无法核对这次解封是否已登记",
                 )
+    if len(matching) > 1:
+        details = {
+            "count": len(matching),
+            "out_dirs": [
+                str(entry.get("out_dir")) for entry in matching[:5]
+            ],
+        }
+        if args.get("allow_repeat_test_access") is True:
+            add_warning(
+                "test_ledger_repeated_access",
+                "访问账本含多条本目录的测试集访问记录；"
+                "已显式允许重复解封，最终报告必须列出全部访问",
+                **details,
+            )
+        else:
+            add_error(
+                "multiple_test_ledger_entries",
+                "访问账本含多条本目录的测试集访问记录：测试集"
+                "可能被重复解封，不能当作一次最终确认",
+                **details,
+            )
     checks["test_seal"] = {
         "seal_exists": seal_exists,
         "test_records": len(test_records),
         "test_started": len(test_started_records),
         "test_bad_cases": len(test_bad_case_records),
         "ledger_exists": bool(existing_ledger_paths),
+        "ledger_matches": len(matching),
     }
 
     # ---------- sanity 重复运行 ----------

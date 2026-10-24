@@ -4245,6 +4245,93 @@ class RunAuditTests(unittest.TestCase):
                         self._codes(report, "errors"),
                     )
 
+    def test_audit_detects_duplicate_test_ledger_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            self._build_run(root)
+            entries = (
+                json.dumps({"out_dir": str(root.resolve())})
+                + "\n"
+            ) * 2
+            (root / "test_access_ledger.jsonl").write_text(
+                entries, encoding="utf-8"
+            )
+            report = experiment.audit_run_directory(root)
+            self.assertFalse(report["ok"])
+            self.assertIn(
+                "multiple_test_ledger_entries",
+                self._codes(report, "errors"),
+            )
+
+            config, _, _ = self._build_run(
+                Path(tmp) / "allowed",
+                config_overrides={
+                    "args": {
+                        "seed": 7,
+                        "mode": "smelt",
+                        "allow_repeat_test_access": True,
+                    }
+                },
+            )
+            allowed_root = Path(tmp) / "allowed"
+            (allowed_root / "test_access_ledger.jsonl").write_text(
+                (
+                    json.dumps(
+                        {"out_dir": str(allowed_root.resolve())}
+                    )
+                    + "\n"
+                ) * 2,
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(allowed_root)
+            self.assertTrue(report["ok"], report)
+            self.assertIn(
+                "test_ledger_repeated_access",
+                self._codes(report, "warnings"),
+            )
+
+    def test_audit_ignores_ledger_entries_for_other_test_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            _, identity, _ = self._build_run(root)
+            metrics_path = root / "metrics.jsonl"
+            records = [
+                json.loads(line)
+                for line in metrics_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            records.append(
+                {"step": "test", **identity, "test_loss": 1.0}
+            )
+            metrics_path.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            (root / "test_access_ledger.jsonl").write_text(
+                json.dumps(
+                    {
+                        "out_dir": str(root.resolve()),
+                        "data_sha256": "e" * 64,
+                        "test_split_sha256": "3" * 64,
+                        "test_fraction": 0.05,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = experiment.audit_run_directory(root)
+            warning_codes = self._codes(report, "warnings")
+            self.assertIn(
+                "test_ledger_entry_missing", warning_codes
+            )
+            self.assertEqual(
+                report["checks"]["test_seal"]["ledger_matches"], 0
+            )
+
     def test_audit_detects_sanity_repeat_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
