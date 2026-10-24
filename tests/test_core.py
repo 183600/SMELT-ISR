@@ -9025,6 +9025,20 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment.read_test_access_ledger(long_path), []
         )
 
+    def test_test_record_reader_skips_invalid_utf8_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            metrics = run_dir / "metrics.jsonl"
+            metrics.write_bytes(
+                json.dumps(
+                    {"step": "test", "test_loss": 1.0}
+                ).encode("utf-8")
+                + b"\n\xff\xfe\n"
+            )
+            record = experiment._read_test_records(run_dir)
+            self.assertTrue(record["available"])
+            self.assertEqual(record["test_loss"], 1.0)
+
     def test_test_access_ledger_tolerates_unreadable_file(self):
         # 账本存在但读不出来（权限/IO）时读取器不能整份崩溃；
         # 但门控必须把「读不出来」当作无法核对，而不是当作

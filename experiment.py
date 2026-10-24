@@ -49214,15 +49214,23 @@ def _read_test_records(run_dir: Path) -> Dict[str, object]:
     if not _path_exists(path):
         return {"run": str(run_dir), "available": False}
     try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
+        # 逐行按字节解码：崩溃可能只在文件末尾留下半行/非法
+        # UTF-8；不能因此丢掉前面已经完整写出的 test 汇总。
+        with open(path, "rb") as handle:
+            for raw_line in handle:
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
+                if not line:
+                    continue
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(item, dict) and item.get("step") == "test":
                     record = item
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return {"run": str(run_dir), "available": False}
     if record is None:
         return {"run": str(run_dir), "available": False}
