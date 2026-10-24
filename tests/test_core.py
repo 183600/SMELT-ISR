@@ -13,6 +13,7 @@ import math
 import os
 import sys
 import tempfile
+import types
 import unittest
 import warnings
 from pathlib import Path
@@ -10474,6 +10475,29 @@ class GroupClusterRegressionTests(unittest.TestCase):
             stats, replicates=50, seed=1
         )
         self.assertFalse(report["available"])
+
+    def test_fixed_starts_cache_tracks_start_count_and_clamps(self):
+        dataset = types.SimpleNamespace(_fixed_starts={})
+        first = experiment.ByteDataset._ensure_fixed_starts(
+            dataset, "val", 3, 10
+        )
+        repeated = experiment.ByteDataset._ensure_fixed_starts(
+            dataset, "val", 3, 10
+        )
+        self.assertIs(first, repeated)
+        resized = experiment.ByteDataset._ensure_fixed_starts(
+            dataset, "val", 3, 20
+        )
+        self.assertFalse(torch.equal(first, resized))
+        self.assertLess(int(resized.max().item()), 20)
+        clamped = experiment.ByteDataset._ensure_fixed_starts(
+            dataset, "val", 8, 4
+        )
+        self.assertEqual(clamped.numel(), 4)
+        self.assertEqual(
+            clamped.tolist(),
+            sorted(set(clamped.tolist())),
+        )
 
     def test_accuracy_intervals_are_bounded_near_one(self):
         stats = self._stats([

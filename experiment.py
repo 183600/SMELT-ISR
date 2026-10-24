@@ -6692,10 +6692,16 @@ class ByteDataset:
         """生成（或复用）固定评估窗口起点。"""
         cache = self._fixed_starts.setdefault(
             split,
-            {"total": None, "starts": None},
+            {"total": None, "num_starts": None, "starts": None},
+        )
+        total_batches = max(
+            0, min(int(total_batches), int(num_starts))
         )
 
-        if cache["total"] != total_batches:
+        if (
+            cache["total"] != total_batches
+            or cache["num_starts"] != num_starts
+        ):
             # 均匀覆盖整个评估流。total_batches <= num_starts，
             # linspace 的间距不小于 1，round 后不会重复。
             cache["starts"] = torch.linspace(
@@ -6705,6 +6711,7 @@ class ByteDataset:
                 dtype=torch.float64,
             ).round().long()
             cache["total"] = total_batches
+            cache["num_starts"] = num_starts
         starts = cache["starts"]
         assert isinstance(starts, torch.Tensor)
         return starts
