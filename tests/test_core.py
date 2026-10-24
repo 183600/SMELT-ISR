@@ -10622,6 +10622,19 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 {1: [1.0, 2.0], 2: [2.0, 3.0]},
                 float("inf"),
             ),
+            experiment._group_cluster_eval_intervals(
+                group_stats,
+                10 ** 400,
+                0,
+            ),
+            experiment._hierarchical_group_bootstrap_ci(
+                {1: {0: (1.0, 10.0), 1: (2.0, 10.0)}},
+                10 ** 400,
+            ),
+            experiment._hierarchical_window_bootstrap_ci(
+                {1: [1.0, 2.0], 2: [2.0, 3.0]},
+                10 ** 400,
+            ),
         ):
             self.assertEqual(
                 result["reason"],

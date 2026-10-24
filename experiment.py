@@ -12026,6 +12026,10 @@ _EVAL_WINDOW_AUTOCORRELATION = 0.3
 # 不确定性工具区的开头。
 _EVAL_WINDOW_BOOTSTRAP_REPLICATES = 2000
 
+# 防御损坏/伪造报告里的超大重采样次数：再大既没有实际
+# 统计收益，也无法在有限内存内完成。正常配置远低于该上限。
+_MAX_BOOTSTRAP_REPLICATES = 10_000_000
+
 
 def _eval_bootstrap_seed(
     data_sha256: str,
@@ -12398,7 +12402,11 @@ def _group_stats_bootstrap_ci(
     ):
         return None
     n_groups = int(point_values.numel())
-    if n_groups < 2 or replicate_count <= 1:
+    if (
+        n_groups < 2
+        or replicate_count <= 1
+        or replicate_count > _MAX_BOOTSTRAP_REPLICATES
+    ):
         return None
     if (
         point_values.dim() != 1
@@ -12480,6 +12488,12 @@ def _group_cluster_eval_intervals(
             "available": False,
             "reason": "insufficient_bootstrap_replicates",
             "replicates": replicate_count,
+        }
+    if replicate_count > _MAX_BOOTSTRAP_REPLICATES:
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": None,
         }
     if parsed["unit"] not in (None, "document_group"):
         return {
@@ -12831,6 +12845,12 @@ def _hierarchical_group_bootstrap_ci(
             "available": False,
             "reason": "insufficient_bootstrap_replicates",
             "replicates": replicate_count,
+        }
+    if replicate_count > _MAX_BOOTSTRAP_REPLICATES:
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": None,
         }
     replicates = replicate_count
     cleaned: Dict[int, Dict[int, Tuple[float, float]]] = {}
@@ -27305,6 +27325,12 @@ def _hierarchical_window_bootstrap_ci(
             "available": False,
             "reason": "insufficient_bootstrap_replicates",
             "replicates": replicate_count,
+        }
+    if replicate_count > _MAX_BOOTSTRAP_REPLICATES:
+        return {
+            "available": False,
+            "reason": "invalid_bootstrap_replicates",
+            "replicates": None,
         }
     replicates = replicate_count
     cleaned = _clean_window_differences(per_seed_differences)
