@@ -4011,6 +4011,29 @@ class RunAuditTests(unittest.TestCase):
                 "test_ledger_entry_missing", warning_codes
             )
 
+    def test_final_comparison_normalizes_ledger_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "run"
+            ledger = Path(tmp) / "ledger.jsonl"
+            ledger.write_text(
+                json.dumps({"out_dir": str(candidate)}) + "\n"
+                + json.dumps({
+                    "out_dir": os.path.relpath(
+                        candidate, Path.cwd()
+                    )
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                report = experiment.print_final_test_comparison(
+                    [], str(ledger)
+                )
+            counts = report["ledger"]["per_candidate"]
+            self.assertEqual(list(counts.values()), [2])
+            self.assertIn("重复解封", output.getvalue())
+
     def test_audit_flags_unreadable_test_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"

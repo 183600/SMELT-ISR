@@ -49435,18 +49435,30 @@ def print_final_test_comparison(
             Path(ledger_path)
         )
         counts: Dict[str, int] = {}
+        display_names: Dict[str, str] = {}
         for entry in entries:
-            counts[str(entry.get("out_dir"))] = (
-                counts.get(str(entry.get("out_dir")), 0) + 1
-            )
+            raw_name = str(entry.get("out_dir"))
+            # 同一目录可能以相对/绝对/带符号链接等不同写法
+            # 记入账本；按规范化路径计数，才能发现重复解封。
+            path_key = _run_path_key(entry.get("out_dir"))
+            if path_key is None:
+                path_key = raw_name
+            display_names.setdefault(path_key, raw_name)
+            counts[path_key] = counts.get(path_key, 0) + 1
+        per_candidate = {
+            display_names[path_key]: count
+            for path_key, count in counts.items()
+        }
         ledger_info = {
             "ledger": ledger_path,
             "accesses": len(entries),
-            "per_candidate": counts,
+            "per_candidate": per_candidate,
             "unreadable": ledger_error,
         }
         repeated = [
-            name for name, count in counts.items() if count > 1
+            display_names[path_key]
+            for path_key, count in counts.items()
+            if count > 1
         ]
         if repeated:
             print(
