@@ -39402,8 +39402,9 @@ def preregistration_record(
     """生成写入 config.json 的预注册核对记录。"""
     power_record: Optional[Dict[str, object]] = None
     if isinstance(payload.get("power"), dict):
+        declared_power = payload["power"]
         power_record = preregistration_power_plan(
-            payload["power"],  # type: ignore[arg-type]
+            declared_power,  # type: ignore[arg-type]
             float(payload["min_effect"]),  # type: ignore[arg-type]
             len(payload["seeds"]),  # type: ignore[arg-type]
             len(payload["comparisons"]),  # type: ignore[arg-type]
@@ -39411,6 +39412,12 @@ def preregistration_record(
                 "equivalence_margin"
             ),
         )
+        # 重算只覆盖功效数值；试点校准策略和置信水平也是
+        # 预注册声明，必须随记录落盘，否则后续设计计划会退回
+        # 默认的点估计，悄悄丢掉冻结的策略。
+        for key in ("pilot_calibration", "pilot_confidence"):
+            if key in declared_power:
+                power_record[key] = declared_power[key]
     return {
         "source": str(source),
         "file_sha256": file_sha256,

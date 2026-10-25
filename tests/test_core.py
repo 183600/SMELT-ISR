@@ -1303,6 +1303,18 @@ class DesignPreparationTests(unittest.TestCase):
             ),
             ("upper_confidence_bound", 0.9),
         )
+        record = experiment.preregistration_record(
+            payload,
+            "prereg.json",
+            "c" * 64,
+            [],
+            self._args(),
+        )
+        self.assertEqual(
+            record["power"]["pilot_calibration"],
+            "upper_confidence_bound",
+        )
+        self.assertEqual(record["power"]["pilot_confidence"], 0.9)
 
     def test_preregistration_power_rejects_invalid_pilot_calibration(
         self,
