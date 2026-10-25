@@ -67311,6 +67311,14 @@ def build_pilot_power_evidence(
             relative_upper_values
         )
 
+    # 缺少 mode/seed 的运行无法归入处理单元，但如果它本身是
+    # 数值失败或缺指标，静默丢掉就会把脱落率低估为 0。把它
+    # 当作一个不可配对的保守单元计入脱落率上界，并显式告警。
+    unassigned_unusable = [
+        item for item in unassigned_rows
+        if item.get("numerical_status") == "failed"
+        or item.get("value") is None
+    ]
     # 置信水平不是「越高越好」：95% 上界在 3~6 个试点配对上
     # 可能宽到无法支持任何设计。把 0.8/0.9/0.95/0.99 的结果
     # 一起落盘，研究者必须在冻结前看到设计对置信水平的敏感度，
@@ -67384,14 +67392,6 @@ def build_pilot_power_evidence(
         int(cell["n_failed"])
         for cell in finalized_cells
         if cell.get("n_attempted")
-    ]
-    # 缺少 mode/seed 的运行无法归入处理单元，但如果它本身是
-    # 数值失败或缺指标，静默丢掉就会把脱落率低估为 0。把它
-    # 当作一个不可配对的保守单元计入脱落率上界，并显式告警。
-    unassigned_unusable = [
-        item for item in unassigned_rows
-        if item.get("numerical_status") == "failed"
-        or item.get("value") is None
     ]
     unassigned_attrition = (
         len(unassigned_unusable) / len(unassigned_rows)
