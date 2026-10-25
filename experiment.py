@@ -68265,6 +68265,7 @@ def write_design_plan(
                 pilot_target_step,
             )
         )
+        _, pilot_confidence = _pilot_calibration_setting(power)
         pilot_evidence = build_pilot_power_evidence(
             list(pilot_runs),
             str(metric),
@@ -68277,6 +68278,7 @@ def write_design_plan(
                 if item.get("mode") is not None
             ],
             expected_protocol=expected_protocol,
+            calibration_confidence=pilot_confidence,
         )
         comparability = _as_dict(
             pilot_evidence.get("comparability")

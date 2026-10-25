@@ -3053,6 +3053,78 @@ class DesignPreparationTests(unittest.TestCase):
             )
         )
 
+    def test_design_plan_uses_declared_pilot_confidence(self):
+        smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998, 1.0001]
+        variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947, 0.9952]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            for index, seed in enumerate(range(1, 7)):
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "smelt", seed, smelt[index]
+                    ))
+                )
+                paths.append(
+                    str(self._write_pilot_run(
+                        root, "A", seed, variant[index]
+                    ))
+                )
+            args = argparse.Namespace(
+                seeds=[1, 2, 3, 4, 5, 6],
+                allow_underpowered=False,
+                steps=10,
+                batch_size=2,
+                seq_len=8,
+                suite_modes=["smelt", "A"],
+                suite_ablation=False,
+                ablation_modes=None,
+                balance_coef=0.01,
+                mode="A",
+                primary_metric="val_loss",
+                common_step=100,
+                run_order="randomized",
+                run_order_seed=5,
+                design_pilot_runs=paths,
+                preregistration_record={
+                    "study_id": "pilot-confidence-test",
+                    "primary_metric": "val_loss",
+                    "power": {
+                        "expected_seed_sd_relative": 0.0001,
+                        "min_effect_relative": 0.0005,
+                        "target_power": 0.8,
+                        "alpha": 0.05,
+                        "planned_comparisons": 1,
+                        "planned_contrasts": ["pairwise"],
+                        "planned_seeds": 6,
+                        "expected_attrition_rate": 0.0,
+                        "pilot_calibration": (
+                            "upper_confidence_bound"
+                        ),
+                        "pilot_confidence": 0.8,
+                    },
+                },
+            )
+            _, design, _ = experiment.build_sweep_execution(
+                args, root / "plan"
+            )
+
+        evidence = design["pilot_evidence"]
+        self.assertEqual(
+            evidence["uncertainty"]["confidence_level"], 0.8
+        )
+        self.assertEqual(
+            evidence["calibration"]["confidence_level"], 0.8
+        )
+        self.assertEqual(
+            evidence["calibration"]["sd_basis"],
+            "upper_confidence_bound",
+        )
+        self.assertGreater(
+            evidence["calibration"]["sd_effective_input"],
+            evidence["calibration"]["sd_point_estimate"],
+        )
+
     def test_pilot_recompute_failure_is_not_reported_as_success(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998, 1.0001]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947, 0.9952]
