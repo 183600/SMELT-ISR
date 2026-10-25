@@ -2726,10 +2726,8 @@ class DesignPreparationTests(unittest.TestCase):
         rows = [{
             "run": "pilot",
             "protocol": {
-                "data_sha256": upper_data.lower(),
-                "split_sha256": {
-                    "train": upper_split["train"].lower()
-                },
+                "data_sha256": upper_data,
+                "split_sha256": upper_split,
             },
             "protocol_recorded_keys": [
                 "data_sha256",

@@ -65965,6 +65965,13 @@ def _pilot_declared_check(
 
 _PILOT_COMPARABILITY_SCHEMA_VERSION = 1
 _PILOT_PROVENANCE_KEYS = frozenset(_REPRODUCIBILITY_HARD_KEYS)
+_PILOT_SHA256_KEYS = frozenset({
+    "script_sha256",
+    "data_sha256",
+    "split_sha256",
+    "effective_train_sha256",
+    "environment_id",
+})
 _PILOT_CLEANING_KEYS = (
     "deduplicate_train_groups",
     "drop_train_shared_chunks",
@@ -66357,6 +66364,26 @@ def _pilot_comparability_run_labels(
     return labels
 
 
+def _pilot_comparability_factor_key(
+    key: str,
+    value: object,
+):
+    """协议值比较键：SHA-256 指纹按大小写不敏感归一化。"""
+    if key in _PILOT_SHA256_KEYS:
+        if isinstance(value, str):
+            value = value.lower()
+        elif key == "split_sha256" and isinstance(value, dict):
+            value = {
+                name: (
+                    digest.lower()
+                    if isinstance(digest, str)
+                    else digest
+                )
+                for name, digest in value.items()
+            }
+    return _stable_factor_key(value)
+
+
 def _pilot_comparability_item(
     key: str,
     group: str,
@@ -66379,7 +66406,7 @@ def _pilot_comparability_item(
         if name not in set(missing_runs)
     ]
     distinct = {
-        repr(_stable_factor_key(value))
+        repr(_pilot_comparability_factor_key(key, value))
         for _, value in present
     }
     if not present:
@@ -66392,7 +66419,9 @@ def _pilot_comparability_item(
         status = "not_recorded"
     else:
         expected_key = repr(
-            _stable_factor_key(expected.get(key))
+            _pilot_comparability_factor_key(
+                key, expected.get(key)
+            )
         )
         if expected_key not in distinct:
             status = "mismatch"
