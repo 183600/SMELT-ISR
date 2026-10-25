@@ -29365,6 +29365,39 @@ def _t_cdf(t: float, df: float) -> Optional[float]:
     return two_sided / 2.0
 
 
+def _noncentral_t_cdf(
+    value: float,
+    df: float,
+    noncentrality: float,
+) -> Optional[float]:
+    """
+    非中心 t 分布 CDF：T' = (Z + δ) / sqrt(V/df)。
+
+    给定 V=u²（u 服从 chi_df）时 T' 条件于正态分布
+    N(δ, 1)/sqrt(V/df)；对 u 的 chi 密度积分，与 ``_t_power``
+    使用同一组 Simpson 节点。δ=0 时退化为中心 t，直接复用
+    ``_t_cdf`` 以保持中心情形的数值路径不变；df 趋于无穷时
+    退化为 N(δ, 1)。
+    """
+    if noncentrality == 0.0:
+        return _t_cdf(value, df)
+    if not math.isfinite(df) or df >= _T_POWER_NORMAL_DF:
+        return _normal_cdf(value - noncentrality)
+    if df <= 0.0:
+        return None
+
+    u_values, weighted = _t_power_nodes(df)
+    scale = 1.0 / math.sqrt(df)
+    total = 0.0
+    for u, weight in zip(u_values, weighted):
+        if weight == 0.0:
+            continue
+        total += weight * _normal_cdf(
+            value * u * scale - noncentrality
+        )
+    return min(1.0, max(0.0, total))
+
+
 def _tost_test(
     effect: float,
     se: float,
@@ -29450,13 +29483,15 @@ def _tost_power(
     TOST 的两个单侧检验同时通过，等价于标准化后的观测差值
     落在 ``±(margin - t_{1-alpha,df}·se)`` 内：
 
-        P(TOST 通过) = F_t(upper; df) - F_t(lower; df)
+        P(TOST 通过) = F_nct(upper; df, δ)
+                       - F_nct(lower; df, δ)
 
-    其中 ``lower = (-(margin - c·se) - effect) / se``、
-    ``upper = ((margin - c·se) - effect) / se``，
-    ``c = t_{1-alpha,df}``。``effect=0``（真实差异为零）是
-    等价性设计最常用的规划情形；``margin`` 相对基线均值时，
-    ``effect`` 与 ``se`` 也必须用同一相对尺度。
+    其中 ``upper = (margin - c·se) / se``、
+    ``lower = -upper``、``δ = effect / se``、
+    ``c = t_{1-alpha,df}``。真实差异非零时观测差值服从非中心
+    t 分布；只有 ``effect=0`` 时才退化为中心 t。``margin``
+    相对基线均值时，``effect`` 与 ``se`` 也必须用同一相对
+    尺度。
 
     ``margin <= c·se`` 时区间为空，功效为 0。返回 None 表示
     输入不可用，而不是「功效为零」。
@@ -29491,10 +29526,15 @@ def _tost_power(
     if half_width <= 0.0:
         return 0.0
 
-    lower = (-half_width - effect_value) / se_value
-    upper = (half_width - effect_value) / se_value
-    cdf_upper = _t_cdf(upper, df_value)
-    cdf_lower = _t_cdf(lower, df_value)
+    lower = -half_width / se_value
+    upper = half_width / se_value
+    noncentrality = effect_value / se_value
+    cdf_upper = _noncentral_t_cdf(
+        upper, df_value, noncentrality
+    )
+    cdf_lower = _noncentral_t_cdf(
+        lower, df_value, noncentrality
+    )
     if cdf_upper is None or cdf_lower is None:
         return None
     return min(1.0, max(0.0, cdf_upper - cdf_lower))
