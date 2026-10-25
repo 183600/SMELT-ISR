@@ -31406,13 +31406,13 @@ def _attrition_bounds_summary(
         )
     with_missing = [
         entry for entry in entries
-        if int(entry.get("missing_runs") or 0) > 0
+        if _nonnegative_int(entry.get("missing_runs")) > 0
     ]
     not_robust = [
         entry for entry in entries
         if entry.get("verdict") in {"crosses_zero", "unbounded"}
         or (
-            int(entry.get("missing_runs") or 0) > 0
+            _nonnegative_int(entry.get("missing_runs")) > 0
             and entry.get("sign_robust") is False
         )
     ]

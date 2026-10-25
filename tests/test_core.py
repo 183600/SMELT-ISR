@@ -644,6 +644,22 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(len(summary["not_robust"]), 1)
         self.assertIn("效应方向可能反转", summary["advisories"][0])
 
+    def test_attrition_summary_tolerates_invalid_missing_counts(self):
+        for bad_count in ("bad", float("inf"), float("nan"), []):
+            with self.subTest(bad_count=bad_count):
+                summary = experiment._attrition_bounds_summary([{
+                    "baseline": "A",
+                    "variant": "B",
+                    "attrition_bounds": {
+                        "applicable": True,
+                        "verdict": "bounded_same_sign",
+                        "sign_robust": False,
+                        "missing_runs": bad_count,
+                    },
+                }])
+                self.assertEqual(summary["with_missing"], [])
+                self.assertEqual(summary["not_robust"], [])
+
     def test_component_summary_downgrades_attrition_crossing(self):
         effect = {
             "effect_name": "delayed_merge_main",
