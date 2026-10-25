@@ -65957,10 +65957,12 @@ def _pilot_declared_check(
     """声明值 vs 试点观测值的判定（相对容差避免浮点边界误判）。"""
     if declared is None:
         return "not_declared"
-    if observed is None:
+    declared_value = _finite_float(declared)
+    observed_value = _finite_float(observed)
+    if declared_value is None or observed_value is None:
         return "not_evaluable"
-    tolerance = 1e-12 + abs(float(declared)) * 1e-9
-    if float(observed) <= float(declared) + tolerance:
+    tolerance = 1e-12 + abs(declared_value) * 1e-9
+    if observed_value <= declared_value + tolerance:
         return "declared_at_least_observed"
     return "declared_below_observed"
 

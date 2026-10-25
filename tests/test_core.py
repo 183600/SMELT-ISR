@@ -2740,6 +2740,26 @@ class DesignPreparationTests(unittest.TestCase):
             )
             self.assertEqual(item["status"], "match")
 
+    def test_pilot_declared_check_rejects_nonfinite_values(self):
+        self.assertEqual(
+            experiment._pilot_declared_check(10**400, 0.1),
+            "not_evaluable",
+        )
+        self.assertEqual(
+            experiment._pilot_declared_check(0.1, 10**400),
+            "not_evaluable",
+        )
+        self.assertEqual(
+            experiment._pilot_declared_check(
+                float("nan"), 0.1
+            ),
+            "not_evaluable",
+        )
+        self.assertEqual(
+            experiment._pilot_declared_check(0.2, 0.1),
+            "declared_at_least_observed",
+        )
+
     def test_pilot_expected_planned_seeds_normalize_strings(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(
