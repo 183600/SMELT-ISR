@@ -2864,6 +2864,43 @@ class DesignPreparationTests(unittest.TestCase):
         )
         self.assertIsNone(protocol["split_sha256"])
 
+    def test_pilot_gate_note_only_flags_upper_when_above_declared(
+        self,
+    ):
+        calibration = {
+            "sd_basis": "upper_confidence_bound",
+            "confidence_level": 0.8,
+            "sd_effective_input": 0.01,
+            "attrition_basis": "upper_confidence_bound",
+            "attrition_effective_input": 0.1,
+        }
+        evidence = {
+            "calibration": calibration,
+            "sd_check": {
+                "declared": 0.02,
+                "status": "declared_at_least_observed",
+                "upper_confidence_bound_status": (
+                    "declared_at_least_observed"
+                ),
+            },
+            "attrition_check": {
+                "declared": 0.2,
+                "status": "declared_at_least_observed",
+                "upper_confidence_bound_status": (
+                    "declared_at_least_observed"
+                ),
+            },
+        }
+        self.assertEqual(
+            experiment._pilot_gate_note(evidence), ""
+        )
+        evidence["sd_check"][
+            "upper_confidence_bound_status"
+        ] = "declared_below_observed"
+        note = experiment._pilot_gate_note(evidence)
+        self.assertIn("单侧置信上界", note)
+        self.assertIn("高于预注册", note)
+
     def test_pilot_seed_overlap_tolerates_scalar_evidence(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(

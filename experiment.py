@@ -67904,7 +67904,11 @@ def _pilot_gate_note(evidence: object) -> str:
     parts: List[str] = []
     calibration = _as_dict(evidence.get("calibration"))
     sd_check = _as_dict(evidence.get("sd_check"))
-    if calibration.get("sd_basis") == "upper_confidence_bound":
+    if (
+        calibration.get("sd_basis") == "upper_confidence_bound"
+        and sd_check.get("upper_confidence_bound_status")
+        == "declared_below_observed"
+    ):
         parts.append(
             "试点配对差值 sd 的 "
             f"{_format_finite(calibration.get('confidence_level'), '.0%')}"
@@ -67921,8 +67925,12 @@ def _pilot_gate_note(evidence: object) -> str:
             f"{_format_finite(sd_check.get('declared'), 'g')}"
         )
     attrition_check = _as_dict(evidence.get("attrition_check"))
-    if calibration.get("attrition_basis") == (
-        "upper_confidence_bound"
+    if (
+        calibration.get("attrition_basis") == (
+            "upper_confidence_bound"
+        )
+        and attrition_check.get("upper_confidence_bound_status")
+        == "declared_below_observed"
     ):
         parts.append(
             "试点脱落率的 "
