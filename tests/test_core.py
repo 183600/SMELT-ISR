@@ -9395,6 +9395,49 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(1.0, 1.0, float("-inf"))
         )
 
+    def test_minimum_detectable_effect_handles_tiny_alpha_and_large_se(
+        self,
+    ):
+        # 家族校正后 alpha 可能很小，MDE 的非中心参数会超过
+        # 固定的 100 上界；必须在临界值之上继续扩展。
+        tiny_alpha = experiment._minimum_detectable_effect(
+            1.0e-6, 1.0, alpha=1.0e-6
+        )
+        self.assertIsNotNone(tiny_alpha)
+        self.assertAlmostEqual(
+            experiment._t_power(
+                tiny_alpha, 1.0e-6, 1.0, 1.0e-6
+            ),
+            experiment._TARGET_POWER,
+            delta=1e-6,
+        )
+        # se 很大时 effect=mid*se 会先溢出，但 MDE 本身仍可表示；
+        # 功效按 δ 的尺度计算即可避免假 None。
+        large_se = experiment._minimum_detectable_effect(
+            1.0e307, 4.0
+        )
+        self.assertIsNotNone(large_se)
+        self.assertAlmostEqual(
+            experiment._t_power(large_se, 1.0e307, 4.0),
+            experiment._TARGET_POWER,
+            delta=1e-9,
+        )
+        # 真正的 MDE 超过 float 上限时才返回 None。
+        self.assertIsNone(
+            experiment._minimum_detectable_effect(1.0e308, 4.0)
+        )
+
+    def test_sign_flip_required_seeds_is_global_minimum(self):
+        # 6 是 2/2^n <= 0.05 的最小 n；当前样本量更大时不能
+        # 把「所需种子数」误报成当前 n。
+        for n in (6, 7, 12):
+            result = experiment._paired_sign_flip_test(
+                [float(index + 1) for index in range(n)]
+            )
+            self.assertEqual(
+                result["required_seeds_for_alpha"], 6
+            )
+
     def test_curve_diagnostics_sanitizes_nonfinite_metrics(self):
         report = experiment.curve_diagnostics_report([{
             "run": "damaged",

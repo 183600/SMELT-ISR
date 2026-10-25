@@ -26957,14 +26957,10 @@ def _paired_sign_flip_test(
         min_attainable_p = (
             2.0 / permutations if permutations > 0 else None
         )
-        required_seeds = next(
-            (
-                candidate
-                for candidate in range(n, 65)
-                if 2.0 / (2 ** candidate)
-                <= _SIGNIFICANCE_LEVEL
-            ),
-            None,
+        # 所需种子数是全局最小值，与当前 n 无关：n 已超过
+        # 6 时仍应报告 6，而不是把当前样本量误报成「所需量」。
+        required_seeds = _sign_flip_required_seeds(
+            _SIGNIFICANCE_LEVEL
         )
     else:
         min_attainable_p = (
@@ -29215,8 +29211,9 @@ def _t_power(
     return min(1.0, max(0.0, total))
 
 
-# 求解最小可检出效应时的非中心参数上限：δ=100 时双侧
-# alpha=0.05 的功效已 > 1-1e-10，任何实际设置都远达不到。
+# 求解最小可检出效应时的初始非中心参数上界。alpha 经家族
+# 校正后可能很小，δ=100 未必足够（如 df=1、alpha=1e-6 时
+# 临界值本身约 6.4e5），因此还会按临界值扩大并继续倍增。
 _MDE_MAX_NONCENTRALITY = 100.0
 
 
@@ -29254,27 +29251,39 @@ def _minimum_detectable_effect(
         # 零标准误：任意非零效应都以功效 1 被检出。
         return 0.0
 
-    low = 0.0
-    high = _MDE_MAX_NONCENTRALITY
-    power_high = _t_power(high * se_value, se_value, df_value, alpha)
-    if power_high is None or power_high < target:
+    critical = _t_critical(df_value, alpha)
+    if critical is None:
         return None
+
+    # 功效只取决于 δ=effect/se，统一在 se=1 的尺度上计算，
+    # 避免 effect=mid·se 在大 se 下先溢出成 inf。初始上界取
+    # 临界值的两倍；目标功效更高时再倍增到足够大。
+    low = 0.0
+    high = max(_MDE_MAX_NONCENTRALITY, 2.0 * critical)
+    if not math.isfinite(high):
+        return None
+    while True:
+        power_high = _t_power(high, 1.0, df_value, alpha)
+        if power_high is None:
+            return None
+        if power_high >= target:
+            break
+        low = high
+        high *= 2.0
+        if not math.isfinite(high) or high > 1.0e300:
+            return None
 
     for _ in range(80):
         mid = (low + high) / 2.0
-        power_mid = _t_power(
-            mid * se_value,
-            se_value,
-            df_value,
-            alpha,
-        )
+        power_mid = _t_power(mid, 1.0, df_value, alpha)
         if power_mid is None:
             return None
         if power_mid < target:
             low = mid
         else:
             high = mid
-    return ((low + high) / 2.0) * se_value
+    mde = ((low + high) / 2.0) * se_value
+    return mde if math.isfinite(mde) else None
 
 
 def _seeds_to_detect(
