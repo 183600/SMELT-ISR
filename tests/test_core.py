@@ -9255,6 +9255,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             self.assertIsNotNone(power)
             self.assertAlmostEqual(power, expected, delta=5e-5)
 
+    def test_t_power_resolves_tiny_alpha_for_small_df(self):
+        # alpha 极小时 critical/√df 可达 1e19 以上，固定 u 网格
+        # 会漏掉 u<1/scale 的全部概率质量并返回 0。
+        for df, alpha, expected in (
+            (0.5, 1.0e-10, 1.222065580725563e-10),
+            (0.5, 1.0e-20, 1.2220655807292234e-20),
+            (1.0, 1.0e-10, 1.4621550516047826e-10),
+            (1.0, 1.0e-20, 1.4621550516047845e-20),
+            (2.9, 1.0e-20, 2.5549713688518368e-20),
+        ):
+            power = experiment._t_power(1.0, 1.0, df, alpha)
+            self.assertIsNotNone(power)
+            self.assertGreater(power, alpha)
+            self.assertAlmostEqual(
+                power,
+                expected,
+                delta=expected * 1.0e-6,
+            )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

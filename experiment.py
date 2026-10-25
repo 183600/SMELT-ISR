@@ -29070,6 +29070,116 @@ def _t_power_nodes(
     return tuple(u_values), tuple(weighted)
 
 
+def _t_power_small_df_large_scale(
+    df_value: float,
+    scale: float,
+    noncentrality: float,
+) -> float:
+    """
+    df<3 且 scale=critical/√df>10 时的功效积分。
+
+    固定 u 网格的分辨率是 u_max/N；alpha 极小时 critical 可达
+    1e19 以上，被积函数的质量集中在 u<1/scale，固定网格会直接
+    漏掉整段概率质量并返回 0。这里换到 w=scale·u：先对
+    w∈[0,1] 用 w=t^p 吸收 chi 密度在 0 附近的弱奇异项，再对
+    w∈[1,w_max] 用等距网格解析正态尾概率的转折。
+    """
+    if not math.isfinite(noncentrality):
+        return 1.0
+
+    exponent = max(5, min(1000, int(math.ceil(3.0 / df_value))))
+    log_const = (
+        (1.0 - df_value / 2.0) * math.log(2.0)
+        - math.lgamma(df_value / 2.0)
+    )
+    log_scale = math.log(scale)
+
+    def _power_factor(w: float) -> float:
+        return (
+            _normal_cdf(-w - noncentrality)
+            + 1.0
+            - _normal_cdf(w - noncentrality)
+        )
+
+    total = 0.0
+    intervals = _T_POWER_MIN_INTERVALS
+    step = 1.0 / intervals
+    for index in range(intervals + 1):
+        t = index * step
+        if index == 0 or index == intervals:
+            simpson = step / 3.0
+        elif index % 2 == 0:
+            simpson = 2.0 * step / 3.0
+        else:
+            simpson = 4.0 * step / 3.0
+        if t <= 0.0:
+            continue
+        log_w = exponent * math.log(t)
+        log_u = log_w - log_scale
+        w = math.exp(log_w) if log_w >= -745.0 else 0.0
+        factor = _power_factor(w)
+        if factor <= 0.0:
+            continue
+        log_weight = (
+            math.log(simpson)
+            + log_const
+            + (df_value - 1.0) * log_u
+            - math.exp(2.0 * log_u) / 2.0
+            - log_scale
+            + math.log(exponent)
+            + (exponent - 1.0) * math.log(t)
+            + math.log(factor)
+        )
+        if log_weight > -745.0:
+            total += math.exp(log_weight)
+
+    u_max = (
+        math.sqrt(df_value - 1.0) + _T_POWER_TAIL
+        if df_value > 1.0
+        else _T_POWER_TAIL
+    )
+    w_max = min(
+        scale * u_max,
+        noncentrality + _T_POWER_TAIL,
+    )
+    if not math.isfinite(w_max):
+        return 1.0
+    if w_max > 1.0:
+        intervals = max(
+            200,
+            int(math.ceil((w_max - 1.0) / 0.02)),
+        )
+        intervals = min(intervals, 20000)
+        if intervals % 2:
+            intervals += 1
+        step = (w_max - 1.0) / intervals
+        for index in range(intervals + 1):
+            w = 1.0 + index * step
+            if index == 0 or index == intervals:
+                simpson = step / 3.0
+            elif index % 2 == 0:
+                simpson = 2.0 * step / 3.0
+            else:
+                simpson = 4.0 * step / 3.0
+            u = w / scale
+            if u <= 0.0:
+                continue
+            factor = _power_factor(w)
+            if factor <= 0.0:
+                continue
+            log_weight = (
+                math.log(simpson)
+                + log_const
+                + (df_value - 1.0) * math.log(u)
+                - u * u / 2.0
+                - log_scale
+                + math.log(factor)
+            )
+            if log_weight > -745.0:
+                total += math.exp(log_weight)
+    return min(1.0, max(0.0, total))
+
+
 def _t_power(
     effect: float,
     se: float,
@@ -29197,6 +29307,13 @@ def _t_power(
                 / scale
             )
         return min(1.0, max(0.0, total))
+
+    if scale > 10.0:
+        return _t_power_small_df_large_scale(
+            df_value,
+            scale,
+            noncentrality,
+        )
 
     u_values, weighted = _t_power_nodes(df_value)
     total = 0.0
