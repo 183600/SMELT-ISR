@@ -9240,6 +9240,21 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=1e-8,
             )
 
+    def test_t_power_handles_small_df_without_overflow(self):
+        u_values, weights = experiment._t_power_nodes(0.01)
+        self.assertEqual(len(u_values), len(weights))
+        self.assertTrue(
+            all(math.isfinite(weight) for weight in weights)
+        )
+        self.assertAlmostEqual(sum(weights), 1.0, delta=5e-5)
+        for effect, expected in (
+            (1.0e-6, 0.05),
+            (1.0, 0.05021351447305985),
+        ):
+            power = experiment._t_power(effect, 1.0, 0.01, 0.05)
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(power, expected, delta=5e-5)
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

@@ -29006,7 +29006,8 @@ def _t_power_nodes(
         weighted: List[float] = []
         for index in range(intervals + 1):
             t = index * step
-            u = t ** exponent
+            log_u = exponent * math.log(t) if t > 0.0 else float("-inf")
+            u = math.exp(log_u) if log_u >= -745.0 else 0.0
             if index == 0 or index == intervals:
                 simpson = step / 3.0
             elif index % 2 == 0:
@@ -29014,26 +29015,25 @@ def _t_power_nodes(
             else:
                 simpson = 4.0 * step / 3.0
 
-            if u <= 0.0:
-                # df==1 时 g(0)=sqrt(2/π)；df>1 时 u^(df-1)=0。
-                density = (
-                    math.sqrt(2.0 / math.pi)
-                    if df == 1.0
-                    else 0.0
-                )
+            if t <= 0.0:
+                weight = 0.0
             else:
-                density = math.exp(
-                    log_const
-                    + (df - 1.0) * math.log(u)
+                log_weight = (
+                    math.log(simpson)
+                    + log_const
+                    + (df - 1.0) * log_u
                     - u * u / 2.0
+                    + math.log(exponent)
+                    + (exponent - 1.0) * math.log(t)
                 )
-            jacobian = (
-                exponent * t ** (exponent - 1)
-                if t > 0.0
-                else 0.0
-            )
+                if log_weight <= -745.0:
+                    weight = 0.0
+                elif log_weight >= 709.0:
+                    weight = float("inf")
+                else:
+                    weight = math.exp(log_weight)
             u_values.append(u)
-            weighted.append(simpson * density * jacobian)
+            weighted.append(weight)
 
         return tuple(u_values), tuple(weighted)
 
