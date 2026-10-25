@@ -3111,6 +3111,11 @@ class DesignPreparationTests(unittest.TestCase):
 
         evidence = design["pilot_evidence"]
         self.assertEqual(
+            design["power"]["pilot_calibration"],
+            "upper_confidence_bound",
+        )
+        self.assertEqual(design["power"]["pilot_confidence"], 0.8)
+        self.assertEqual(
             evidence["uncertainty"]["confidence_level"], 0.8
         )
         self.assertEqual(

@@ -68143,6 +68143,16 @@ def _design_power_for_family(
     recomputed["contrasts_adjusted_for_plan"] = bool(
         contrasts_grew
     )
+    # 试点校准策略是预注册输入，不属于功效公式的重算结果；
+    # 重算时不能把它丢掉，否则设计计划正文与 pilot_evidence
+    # 会记录不一致的置信口径。
+    for key in (
+        "pilot_calibration",
+        "pilot_confidence",
+        "pilot_calibration_unusable",
+    ):
+        if key in power:
+            recomputed[key] = power[key]
     return recomputed
 
 
