@@ -66054,7 +66054,12 @@ def _chi_square_quantile(
             return None
     else:
         return None
-    for _ in range(200):
+    # 每一步二分只增加 1 bit 分辨率；双精度浮点的指数跨度约
+    # 2100 bit（从最大有限值到最小次正规数）。固定 200 步会把
+    # 下侧分位数的分辨率卡在 2^-200 左右：p=1e-100、df=2 时
+    # 会把 2e-100 算成 6.2e-61。迭代上限按完整指数范围设置，
+    # 相对容差仍会让常规概率在几十步内提前收敛。
+    for _ in range(4096):
         middle = (low + high) / 2.0
         cdf = _chi_square_cdf(middle, df)
         if cdf is None:

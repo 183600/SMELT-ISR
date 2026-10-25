@@ -2847,8 +2847,16 @@ class DesignPreparationTests(unittest.TestCase):
         # df=2 时 CDF=1-exp(-x/2)，下侧分位数有
         # 解析解 -2*log(1-p)。极端置信水平（如
         # confidence=1-1e-15）会产生远小于 1e-12 的分位数，
-        # 二分不能再用绝对容差提前停止。
-        for probability in (1.0e-12, 1.0e-15):
+        # 二分不能再用绝对容差提前停止；固定 200 步还会把
+        # p=1e-100 的分位数卡在 2^-200 附近（约 1e-61），
+        # 因此必须覆盖到双精度指数范围的更小概率。
+        for probability in (
+            1.0e-12,
+            1.0e-15,
+            1.0e-100,
+            1.0e-200,
+            1.0e-300,
+        ):
             quantile = experiment._chi_square_quantile(
                 probability, 2.0
             )
@@ -2857,6 +2865,25 @@ class DesignPreparationTests(unittest.TestCase):
             self.assertAlmostEqual(
                 quantile / expected, 1.0, places=12
             )
+
+    def test_chi_square_quantile_handles_small_df(self):
+        # df=0.5（a=0.25）的小 x 展开为
+        # P(a,x)=x^a/(a*Gamma(a))*(1+O(x))，因此分位数约为
+        # 2*(p*a*Gamma(a))^(1/a)。p=1e-15 时修正项在 1e-60
+        # 量级，远低于断言精度；固定 200 步二分会高估约 15%。
+        probability = 1.0e-15
+        df = 0.5
+        a = df / 2.0
+        quantile = experiment._chi_square_quantile(
+            probability, df
+        )
+        expected = 2.0 * (
+            probability * a * math.gamma(a)
+        ) ** (1.0 / a)
+        self.assertIsNotNone(quantile)
+        self.assertAlmostEqual(
+            quantile / expected, 1.0, places=12
+        )
 
     def test_pilot_expected_planned_seeds_normalize_strings(self):
         expected = (
