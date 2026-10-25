@@ -9428,6 +9428,41 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertIsNone(experiment._t_critical(float("nan")))
 
+    def test_t_critical_handles_small_df_and_alpha(self):
+        # df=1 是 Cauchy 分布：双侧临界值有解析解
+        # t = 1/tan(pi*alpha/2)=636619.77...；旧实现在
+        # doubling 到 1048576 后、算 p 值前就撞上 1e6 上限，
+        # 把合法的有限临界值误报为 None。
+        alpha = 1.0e-6
+        expected = 1.0 / math.tan(math.pi * alpha / 2.0)
+        critical = experiment._t_critical(1.0, alpha)
+        self.assertIsNotNone(critical)
+        self.assertAlmostEqual(
+            critical / expected, 1.0, places=12
+        )
+        # df=2 的双侧 p=1-t/sqrt(t^2+2)，反解得到
+        # t=(1-alpha)*sqrt(2/(alpha*(2-alpha)))≈1e6。
+        alpha = 1.0e-12
+        expected = (1.0 - alpha) * math.sqrt(
+            2.0 / (alpha * (2.0 - alpha))
+        )
+        critical = experiment._t_critical(2.0, alpha)
+        self.assertIsNotNone(critical)
+        self.assertAlmostEqual(
+            critical / expected, 1.0, places=12
+        )
+        # df=0.5、alpha=1e-100 的临界值约 4e199，远超旧上限；
+        # 用双侧 p 值自洽验证二分结果。
+        critical = experiment._t_critical(0.5, 1.0e-100)
+        self.assertIsNotNone(critical)
+        self.assertGreater(critical, 1.0e40)
+        p_value = experiment._two_sided_t_p_value(
+            critical, 0.5
+        )
+        self.assertAlmostEqual(
+            p_value / 1.0e-100, 1.0, places=10
+        )
+
     def test_seed_plan_and_aggregation_collapse_pseudoreplication(self):
         plan = experiment._build_seed_plan(
             [1, 1, 1, 1, 1, 1], False

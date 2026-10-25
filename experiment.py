@@ -26746,6 +26746,30 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         )
         return min(1.0, normal_tail + correction)
 
+    if not math.isfinite(t * t):
+        # t 的平方溢出时 x=df/(df+t²) 会被舍入成 0，直接走
+        # 不完全 Beta 会返回 0，把仍然可表示的 p 值（如
+        # df=1、t=1e200 时约 6e-201）误报成 0。这里在
+        # x 的对数域使用小 x 展开：
+        #   I_x(a, 1/2) ≈ x^a (1-x)^(1/2) / (a·B(a, 1/2))
+        # 该分支的 x < 1e-300，级数修正可忽略；结果按
+        # float 可表示范围下溢为 0 或截断到 1。
+        a = df / 2.0
+        if a <= 0.0:
+            return 0.0
+        log_x = math.log(df) - 2.0 * math.log(abs(t))
+        log_beta = (
+            math.lgamma(a + 0.5)
+            - math.lgamma(a)
+            - math.lgamma(0.5)
+        )
+        log_p = log_beta + a * log_x - math.log(a)
+        if log_p >= 0.0:
+            return 1.0
+        if log_p < -745.0:
+            return 0.0
+        return math.exp(log_p)
+
     x = df / (df + t * t)
     return _regularized_incomplete_beta(x, df / 2.0, 0.5)
 
@@ -28781,7 +28805,13 @@ def _t_critical(
         if p_high <= alpha_value:
             break
         high *= 2.0
-        if high > 1.0e6:
+        # 临界值可以合法地远大于 1e6（如 df=0.5、
+        # alpha=1e-100 时约 4e199），旧的 1e6 上限会让这些
+        # 输入直接变成 None；而且旧代码在扩大后不先算 p 值
+        # 就返回，连临界值仍小于 1e6 的 df=1、alpha=1e-6
+        # 也会被误判为不可用。按 double 可表示范围设上限，
+        # 下一轮先比较 p 值再决定是否继续。
+        if not math.isfinite(high) or high > 1.0e300:
             return None
 
     for _ in range(200):
