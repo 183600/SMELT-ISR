@@ -66112,9 +66112,9 @@ def _pilot_expected_comparability_protocol(
     if not seed_plan:
         seed_plan = prereg.get("seeds")
     for seed in _pilot_seed_values(seed_plan):
-        number = _finite_float(seed)
-        if number is not None and number.is_integer():
-            planned_seeds.append(int(number))
+        number = _pilot_seed_int(seed)
+        if number is not None:
+            planned_seeds.append(number)
 
     script_sha = prereg.get("frozen_script_sha256")
     if not _preregistration_sha256_text(script_sha):

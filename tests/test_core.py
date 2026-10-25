@@ -2740,6 +2740,17 @@ class DesignPreparationTests(unittest.TestCase):
             )
             self.assertEqual(item["status"], "match")
 
+    def test_pilot_expected_planned_seeds_normalize_strings(self):
+        expected = (
+            experiment._pilot_expected_comparability_protocol(
+                argparse.Namespace(seeds=["1", "2"]),
+                {},
+                "val_loss",
+                None,
+            )
+        )
+        self.assertEqual(expected["planned_seeds"], [1, 2])
+
     def test_pilot_expected_split_hash_rejects_non_mapping(self):
         args = argparse.Namespace(
             seeds=[1],
