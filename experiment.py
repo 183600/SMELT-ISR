@@ -25499,7 +25499,9 @@ def build_comparison_protocol(
         # 逐 split 内容指纹：同源文件但不同群组吸附/清洗/切分
         # 结果的运行不能算同一数据协议。
         "split_sha256": (
-            dict(getattr(args, "data_split_sha256", {}) or {})
+            dict(_as_dict(
+                getattr(args, "data_split_sha256", None)
+            ))
             or None
         ),
         # 清洗后的有效训练集内容指纹：split 与开关相同仍可能
@@ -66127,11 +66129,11 @@ def _pilot_expected_comparability_protocol(
             or prereg.get("data_sha256")
         ),
         "split_sha256": (
-            dict(getattr(args, "data_split_sha256", None) or {})
+            dict(_as_dict(
+                getattr(args, "data_split_sha256", None)
+            ))
             or None
-        )
-        if getattr(args, "data_split_sha256", None) is not None
-        else None,
+        ),
         "effective_train_sha256": getattr(
             args, "data_effective_train_sha256", None
         ),

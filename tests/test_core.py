@@ -2740,6 +2740,28 @@ class DesignPreparationTests(unittest.TestCase):
             )
             self.assertEqual(item["status"], "match")
 
+    def test_pilot_expected_split_hash_rejects_non_mapping(self):
+        args = argparse.Namespace(
+            seeds=[1],
+            data_split_sha256=["not", "a", "mapping"],
+            lr=1e-3,
+            warmup_steps=1,
+            steps=2,
+            weight_decay=0.0,
+            grad_clip=1.0,
+            batch_size=1,
+        )
+        expected = (
+            experiment._pilot_expected_comparability_protocol(
+                args, {}, "val_loss", None
+            )
+        )
+        self.assertNotIn("split_sha256", expected)
+        protocol = experiment.build_comparison_protocol(
+            _tiny_config(), args
+        )
+        self.assertIsNone(protocol["split_sha256"])
+
     def test_pilot_seed_overlap_tolerates_scalar_evidence(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(
