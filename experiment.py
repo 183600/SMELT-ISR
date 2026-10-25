@@ -66063,7 +66063,12 @@ def _chi_square_quantile(
             low = middle
         else:
             high = middle
-        if high - low <= max(1.0e-12, high * 1.0e-12):
+        # 只用相对容差：下侧分位数可能远小于 1e-12
+        # （例如 confidence=1-1e-15、df=1 时约 1e-30），
+        # 绝对容差会在这里提前停止并高估几个数量级。
+        if high - low <= max(
+            math.ulp(high) * 4.0, high * 1.0e-12
+        ):
             break
     return (low + high) / 2.0
 

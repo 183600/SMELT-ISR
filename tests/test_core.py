@@ -2843,6 +2843,21 @@ class DesignPreparationTests(unittest.TestCase):
             "declared_at_least_observed",
         )
 
+    def test_chi_square_quantile_handles_small_probability(self):
+        # df=2 时 CDF=1-exp(-x/2)，下侧分位数有
+        # 解析解 -2*log(1-p)。极端置信水平（如
+        # confidence=1-1e-15）会产生远小于 1e-12 的分位数，
+        # 二分不能再用绝对容差提前停止。
+        for probability in (1.0e-12, 1.0e-15):
+            quantile = experiment._chi_square_quantile(
+                probability, 2.0
+            )
+            expected = -2.0 * math.log1p(-probability)
+            self.assertIsNotNone(quantile)
+            self.assertAlmostEqual(
+                quantile / expected, 1.0, places=12
+            )
+
     def test_pilot_expected_planned_seeds_normalize_strings(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(
