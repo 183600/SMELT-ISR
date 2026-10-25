@@ -66109,7 +66109,7 @@ def _pilot_expected_comparability_protocol(
     seed_plan = getattr(args, "seeds", None)
     if not seed_plan:
         seed_plan = prereg.get("seeds")
-    for seed in seed_plan or []:
+    for seed in _pilot_seed_values(seed_plan):
         number = _finite_float(seed)
         if number is not None and number.is_integer():
             planned_seeds.append(int(number))
@@ -66441,6 +66441,18 @@ def _pilot_comparability_item(
     }
 
 
+def _pilot_seed_values(value: object) -> Tuple[object, ...]:
+    """把 seed/证据容器归一化为可迭代元组，损坏标量不崩溃。"""
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes, bytearray)):
+        return (value,)
+    try:
+        return tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        return (value,)
+
+
 def _pilot_seed_int(value: object) -> Optional[int]:
     """把计划/证据里的 seed 归一化成正整数。
 
@@ -66472,19 +66484,23 @@ def _pilot_seed_overlap(
     planned_seeds: Sequence[object],
 ) -> Dict[str, object]:
     planned: set = set()
-    for seed in planned_seeds:
+    for seed in _pilot_seed_values(planned_seeds):
         number = _pilot_seed_int(seed)
         if number is not None:
             planned.add(number)
     reused_cells: List[Dict[str, object]] = []
     reused_total = 0
     pilot_evidence = _as_dict(pilot_evidence)
-    for cell in pilot_evidence.get("cells") or []:
+    for cell in _pilot_seed_values(
+        pilot_evidence.get("cells")
+    ):
         if not isinstance(cell, dict):
             continue
-        seed_values = _as_dict(cell.get("seed_values"))
+        seed_values = cell.get("seed_values")
+        if isinstance(seed_values, dict):
+            seed_values = tuple(seed_values)
         pilot_seeds = set()
-        for seed in seed_values:
+        for seed in _pilot_seed_values(seed_values):
             number = _pilot_seed_int(seed)
             if number is not None:
                 pilot_seeds.add(number)

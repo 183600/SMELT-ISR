@@ -2740,6 +2740,36 @@ class DesignPreparationTests(unittest.TestCase):
             )
             self.assertEqual(item["status"], "match")
 
+    def test_pilot_seed_overlap_tolerates_scalar_evidence(self):
+        expected = (
+            experiment._pilot_expected_comparability_protocol(
+                argparse.Namespace(seeds=7),
+                {},
+                "val_loss",
+                None,
+            )
+        )
+        self.assertEqual(expected["planned_seeds"], [7])
+        report = experiment._pilot_comparability_report(
+            [], {"planned_seeds": 7}, {"cells": 7}
+        )
+        self.assertEqual(
+            report["seed_overlap"]["planned_seed_count"], 1
+        )
+        self.assertEqual(
+            report["seed_overlap"]["reused_seed_count"], 0
+        )
+        overlap = experiment._pilot_seed_overlap(
+            {
+                "cells": [{
+                    "label": "pilot",
+                    "seed_values": [7],
+                }],
+            },
+            [7],
+        )
+        self.assertEqual(overlap["reused_seed_count"], 1)
+
     def test_pilot_evidence_estimates_paired_sd_and_attrition(self):
         smelt = [1.0, 1.0005, 0.9995, 1.0002, 0.9998]
         variant = [0.995, 0.9945, 0.9948, 0.9951, 0.9947]
