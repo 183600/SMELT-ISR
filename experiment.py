@@ -65920,6 +65920,236 @@ _DESIGN_PILOT_SCHEMA_VERSION = 1
 # 试点证据只为「两格配对差值」的 sd 提供校准；少于 3 个配对
 # 种子时样本 sd 太不稳定，不作为硬门依据（仍报告点估计）。
 _DESIGN_PILOT_MIN_PAIRS = _MIN_SEEDS_FOR_STATS
+# 试点校准的默认单侧置信水平只用于报告上界；是否按上界做设计
+# 必须由预注册的 power.pilot_calibration 声明，不能看到试点后
+# 再在 point / upper_confidence_bound 之间挑选。
+_PILOT_DEFAULT_CONFIDENCE = 0.95
+_PILOT_CALIBRATION_POLICIES = (
+    "point",
+    "upper_confidence_bound",
+)
+_PILOT_UCB_SENSITIVITY_LEVELS = (0.8, 0.9, 0.95, 0.99)
+
+
+def _regularized_incomplete_gamma(
+    a: float,
+    x: float,
+) -> Optional[float]:
+    """正则化下不完全 Gamma 函数 P(a, x)，无 SciPy 依赖。
+
+    用于由卡方分布计算试点 sd 的单侧置信上界。x < a+1 时用
+    级数，否则用连分式计算 Q(a, x) 再取补；两者都在对数域
+    计算前因子，避免大自由度下溢出。
+    """
+    if (
+        not math.isfinite(a)
+        or not math.isfinite(x)
+        or a <= 0.0
+        or x < 0.0
+    ):
+        return None
+    if x == 0.0:
+        return 0.0
+    log_prefactor = -x + a * math.log(x) - math.lgamma(a)
+    if x < a + 1.0:
+        term = 1.0 / a
+        total = term
+        for index in range(1, 10000):
+            term *= x / (a + index)
+            total += term
+            if abs(term) <= abs(total) * 1.0e-15:
+                break
+        value = total * math.exp(log_prefactor)
+    else:
+        # Lentz 连分式计算 Q(a, x)。
+        fpmin = 1.0e-300
+        b = x + 1.0 - a
+        c = 1.0 / fpmin
+        d = 1.0 / b
+        h = d
+        for index in range(1, 10000):
+            numerator = -index * (index - a)
+            b += 2.0
+            d = numerator * d + b
+            if abs(d) < fpmin:
+                d = fpmin
+            c = b + numerator / c
+            if abs(c) < fpmin:
+                c = fpmin
+            d = 1.0 / d
+            delta = d * c
+            h *= delta
+            if abs(delta - 1.0) <= 1.0e-15:
+                break
+        value = 1.0 - math.exp(log_prefactor) * h
+    if not math.isfinite(value):
+        return None
+    return min(1.0, max(0.0, value))
+
+
+def _chi_square_cdf(value: float, df: float) -> Optional[float]:
+    if (
+        not math.isfinite(value)
+        or not math.isfinite(df)
+        or value < 0.0
+        or df <= 0.0
+    ):
+        return None
+    return _regularized_incomplete_gamma(df / 2.0, value / 2.0)
+
+
+def _chi_square_quantile(
+    probability: float,
+    df: float,
+) -> Optional[float]:
+    """卡方分布的下侧分位数（0 < p < 1），二分求逆。"""
+    if (
+        not math.isfinite(probability)
+        or not math.isfinite(df)
+        or not 0.0 < probability < 1.0
+        or df <= 0.0
+    ):
+        return None
+    low = 0.0
+    high = max(1.0, df)
+    for _ in range(100):
+        cdf = _chi_square_cdf(high, df)
+        if cdf is None:
+            return None
+        if cdf >= probability:
+            break
+        high *= 2.0
+        if high > 1.0e300:
+            return None
+    else:
+        return None
+    for _ in range(200):
+        middle = (low + high) / 2.0
+        cdf = _chi_square_cdf(middle, df)
+        if cdf is None:
+            return None
+        if cdf < probability:
+            low = middle
+        else:
+            high = middle
+        if high - low <= max(1.0e-12, high * 1.0e-12):
+            break
+    return (low + high) / 2.0
+
+
+def _sd_upper_confidence_bound(
+    sd: Optional[float],
+    n: int,
+    confidence: float,
+) -> Optional[float]:
+    """正态配对差值的 sd 单侧置信上界。
+
+    ``sd`` 为样本 sd（ddof=1），``n`` 为配对数。按
+    ``sigma <= s * sqrt((n-1) / chi2_{1-confidence, n-1})``
+    计算；小试点时上界会很宽，这正是需要披露的抽样不确定性。
+    """
+    value = _finite_float(sd)
+    confidence_value = _finite_float(confidence)
+    if (
+        value is None
+        or value < 0.0
+        or isinstance(n, bool)
+        or not isinstance(n, int)
+        or n < 2
+        or confidence_value is None
+        or not 0.0 < confidence_value < 1.0
+    ):
+        return None
+    quantile = _chi_square_quantile(
+        1.0 - confidence_value,
+        float(n - 1),
+    )
+    if quantile is None or quantile <= 0.0:
+        return None
+    try:
+        upper = value * math.sqrt(float(n - 1) / quantile)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(upper):
+        return None
+    return max(0.0, upper)
+
+
+def _binomial_upper_confidence_bound(
+    failures: int,
+    trials: int,
+    confidence: float,
+) -> Optional[float]:
+    """二项比例的单侧 Clopper-Pearson 精确置信上界。
+
+    解 ``P(X <= failures; trials, p) = 1-confidence``。全部
+    运行失败时上界为 1；该单元本身已由 ``unusable`` 标记处理。
+    """
+    confidence_value = _finite_float(confidence)
+    if (
+        isinstance(failures, bool)
+        or not isinstance(failures, int)
+        or isinstance(trials, bool)
+        or not isinstance(trials, int)
+        or trials <= 0
+        or failures < 0
+        or failures > trials
+        or confidence_value is None
+        or not 0.0 < confidence_value < 1.0
+    ):
+        return None
+    if failures >= trials:
+        return 1.0
+    alpha = 1.0 - confidence_value
+    if failures == 0:
+        try:
+            return 1.0 - alpha ** (1.0 / float(trials))
+        except (OverflowError, ValueError):
+            return None
+    low = 0.0
+    high = 1.0
+    for _ in range(200):
+        middle = (low + high) / 2.0
+        cdf = _regularized_incomplete_beta(
+            1.0 - middle,
+            float(trials - failures),
+            float(failures + 1),
+        )
+        if cdf is None or not math.isfinite(cdf):
+            return None
+        if cdf > alpha:
+            low = middle
+        else:
+            high = middle
+        if high - low <= 1.0e-12:
+            break
+    return (low + high) / 2.0
+
+
+def _pilot_calibration_setting(
+    power: Optional[Dict[str, object]],
+) -> Tuple[str, float]:
+    """读取预注册的试点校准策略，损坏值退回 point/0.95。
+
+    结构错误由 ``preregistration_schema_error`` 在入口拒绝；
+    这里保底是为了让旧/手工 power 记录不会让设计计划崩溃。
+    """
+    if not isinstance(power, dict):
+        return "point", _PILOT_DEFAULT_CONFIDENCE
+    policy = power.get("pilot_calibration", "point")
+    if policy not in _PILOT_CALIBRATION_POLICIES:
+        policy = "point"
+    confidence = _finite_float(
+        power.get("pilot_confidence", _PILOT_DEFAULT_CONFIDENCE)
+    )
+    if (
+        confidence is None
+        or not 0.5 < confidence < 1.0
+    ):
+        confidence = _PILOT_DEFAULT_CONFIDENCE
+    return str(policy), confidence
+
+
 _PILOT_TREATMENT_FIELDS = (
     "mode",
     "balance_coef",
@@ -66680,6 +66910,7 @@ def build_pilot_power_evidence(
     declared_attrition: Optional[float] = None,
     planned_modes: Optional[Sequence[object]] = None,
     expected_protocol: Optional[Dict[str, object]] = None,
+    calibration_confidence: float = _PILOT_DEFAULT_CONFIDENCE,
 ) -> Dict[str, object]:
     """从试点/先前运行估计配对差值 sd 与脱落率，并对照声明值。
 
@@ -66701,10 +66932,17 @@ def build_pilot_power_evidence(
       相对化时用两单元均值中较小者作分母（同样偏保守）；
     - 脱落率取各处理单元的最大值，而不是总体平均：某个臂更
       容易崩掉时，总体平均会把它稀释；
+    - 点估计之外同时报告单侧置信上界（配对 sd 用正态/卡方
+      上界，脱落率用 Clopper-Pearson 精确上界）；小试点的
+      上界会很宽，是否按上界做设计由预注册
+      ``power.pilot_calibration`` 决定，不能看到试点后再选；
     - 这不是因果效应估计，也不保证试点协议与正式协议完全
       可比；它只回答「声明的先验噪声/脱落是否至少与已观测
       的运行一致」。
     """
+    confidence = _finite_float(calibration_confidence)
+    if confidence is None or not 0.5 < confidence < 1.0:
+        confidence = _PILOT_DEFAULT_CONFIDENCE
     paths = [str(path) for path in pilot_runs]
     rows = compare_runs(paths)
 
@@ -66869,6 +67107,13 @@ def build_pilot_power_evidence(
         cell["attrition_rate"] = (
             n_failed / n_attempted if n_attempted else None
         )
+        cell["attrition_upper_confidence_bound"] = (
+            _binomial_upper_confidence_bound(
+                n_failed, n_attempted, confidence
+            )
+            if n_attempted
+            else None
+        )
         cell["seed_values"] = {
             str(seed): value
             for seed, value in sorted(values_by_seed.items())
@@ -66974,6 +67219,28 @@ def build_pilot_power_evidence(
                     and not math.isfinite(paired_sd_relative)
                 ):
                     paired_sd_relative = None
+            paired_sd_upper = _sd_upper_confidence_bound(
+                paired_sd, len(common), confidence
+            )
+            paired_sd_relative_upper = None
+            if (
+                paired_sd_upper is not None
+                and denominator is not None
+                and denominator > 0.0
+            ):
+                try:
+                    paired_sd_relative_upper = (
+                        paired_sd_upper / denominator
+                    )
+                except OverflowError:
+                    paired_sd_relative_upper = None
+                if (
+                    paired_sd_relative_upper is not None
+                    and not math.isfinite(
+                        paired_sd_relative_upper
+                    )
+                ):
+                    paired_sd_relative_upper = None
             pairs.append({
                 "first": first["label"],
                 "second": second["label"],
@@ -66981,6 +67248,12 @@ def build_pilot_power_evidence(
                 "seeds": [int(seed) for seed in common],
                 "paired_sd_abs": paired_sd,
                 "paired_sd_relative": paired_sd_relative,
+                "paired_sd_abs_upper_confidence_bound": (
+                    paired_sd_upper
+                ),
+                "paired_sd_relative_upper_confidence_bound": (
+                    paired_sd_relative_upper
+                ),
                 "relative_denominator": denominator,
                 "evaluable": bool(
                     len(common) >= _DESIGN_PILOT_MIN_PAIRS
@@ -67007,6 +67280,100 @@ def build_pilot_power_evidence(
         observed_sd_abs = max(absolute_values)
     if relative_values:
         observed_sd_relative = max(relative_values)
+    observed_sd_abs_upper = None
+    observed_sd_relative_upper = None
+    absolute_upper_values = [
+        float(pair["paired_sd_abs_upper_confidence_bound"])
+        for pair in evaluable_pairs
+        if _finite_float(
+            pair.get("paired_sd_abs_upper_confidence_bound")
+        )
+        is not None
+    ]
+    relative_upper_values = [
+        float(
+            pair[
+                "paired_sd_relative_upper_confidence_bound"
+            ]
+        )
+        for pair in evaluable_pairs
+        if _finite_float(
+            pair.get(
+                "paired_sd_relative_upper_confidence_bound"
+            )
+        )
+        is not None
+    ]
+    if absolute_upper_values:
+        observed_sd_abs_upper = max(absolute_upper_values)
+    if relative_upper_values:
+        observed_sd_relative_upper = max(
+            relative_upper_values
+        )
+
+    # 置信水平不是「越高越好」：95% 上界在 3~6 个试点配对上
+    # 可能宽到无法支持任何设计。把 0.8/0.9/0.95/0.99 的结果
+    # 一起落盘，研究者必须在冻结前看到设计对置信水平的敏感度，
+    # 而不是只看到默认 95% 的一个数。
+    ucb_sensitivity: Dict[str, Dict[str, object]] = {}
+    for level in _PILOT_UCB_SENSITIVITY_LEVELS:
+        level_sd_values = [
+            _sd_upper_confidence_bound(
+                _finite_float(pair.get("paired_sd_abs")),
+                int(pair.get("n_pairs") or 0),
+                level,
+            )
+            for pair in evaluable_pairs
+        ]
+        level_relative_values = []
+        for pair, upper in zip(
+            evaluable_pairs, level_sd_values
+        ):
+            denominator = _finite_float(
+                pair.get("relative_denominator")
+            )
+            if (
+                upper is not None
+                and denominator is not None
+                and denominator > 0.0
+            ):
+                level_relative_values.append(
+                    upper / denominator
+                )
+        level_attrition_values = [
+            _binomial_upper_confidence_bound(
+                int(cell.get("n_failed") or 0),
+                int(cell.get("n_attempted") or 0),
+                level,
+            )
+            for cell in finalized_cells
+            if cell.get("n_attempted")
+        ]
+        if unassigned_rows:
+            level_attrition_values.append(
+                _binomial_upper_confidence_bound(
+                    len(unassigned_unusable),
+                    len(unassigned_rows),
+                    level,
+                )
+            )
+        finite_attrition = [
+            float(value)
+            for value in level_attrition_values
+            if _finite_float(value) is not None
+        ]
+        ucb_sensitivity[f"{level:g}"] = {
+            "paired_sd_relative": (
+                max(level_relative_values)
+                if level_relative_values
+                else None
+            ),
+            "attrition_rate": (
+                max(finite_attrition)
+                if finite_attrition
+                else None
+            ),
+        }
 
     attempted = [
         int(cell["n_attempted"])
@@ -67044,6 +67411,28 @@ def build_pilot_power_evidence(
             observed_attrition or 0.0,
             unassigned_attrition,
         )
+    observed_attrition_upper = None
+    cell_attrition_upper = [
+        float(cell["attrition_upper_confidence_bound"])
+        for cell in finalized_cells
+        if _finite_float(
+            cell.get("attrition_upper_confidence_bound")
+        )
+        is not None
+    ]
+    if cell_attrition_upper:
+        observed_attrition_upper = max(cell_attrition_upper)
+    if unassigned_rows:
+        unassigned_upper = _binomial_upper_confidence_bound(
+            len(unassigned_unusable),
+            len(unassigned_rows),
+            confidence,
+        )
+        if unassigned_upper is not None:
+            observed_attrition_upper = max(
+                observed_attrition_upper or 0.0,
+                unassigned_upper,
+            )
     total_attempted = sum(attempted) + len(unassigned_rows)
     total_failed = sum(failed) + len(unassigned_unusable)
     overall_attrition = (
@@ -67117,6 +67506,34 @@ def build_pilot_power_evidence(
     attrition_status = _pilot_declared_check(
         declared_attrition, observed_attrition
     )
+    sd_upper_status = _pilot_declared_check(
+        declared_sd, observed_sd_relative_upper
+    )
+    attrition_upper_status = _pilot_declared_check(
+        declared_attrition, observed_attrition_upper
+    )
+    if (
+        sd_upper_status == "declared_below_observed"
+        and sd_status != "declared_below_observed"
+    ):
+        warnings.append(
+            "试点配对 sd 的点估计不高于预注册值，但 "
+            f"{confidence:.0%} 单侧置信上界高于预注册值："
+            "小样本点估计可能低估噪声。若设计要按上界准备，"
+            "须在预注册 power 中把 pilot_calibration 设为 "
+            "upper_confidence_bound，不能看到试点后再选"
+        )
+    if (
+        attrition_upper_status == "declared_below_observed"
+        and attrition_status != "declared_below_observed"
+    ):
+        warnings.append(
+            "试点脱落率的点估计不高于预注册值，但 "
+            f"{confidence:.0%} 单侧置信上界高于预注册值："
+            "少量试点运行不足以排除更高的真实脱落率。若设计"
+            "要按上界准备，须在预注册 power 中把 "
+            "pilot_calibration 设为 upper_confidence_bound"
+        )
     observed_over_declared = None
     if (
         observed_sd_relative is not None
@@ -67138,18 +67555,48 @@ def build_pilot_power_evidence(
         "declared": declared_sd,
         "observed": observed_sd_relative,
         "observed_absolute": observed_sd_abs,
+        "observed_upper_confidence_bound": (
+            observed_sd_relative_upper
+        ),
+        "observed_absolute_upper_confidence_bound": (
+            observed_sd_abs_upper
+        ),
+        "upper_confidence_level": confidence,
+        "upper_confidence_bound_method": (
+            "chi_square_normal_paired_differences"
+        ),
+        "upper_confidence_bound_status": sd_upper_status,
+        "declared_below_upper_confidence_bound": bool(
+            sd_upper_status == "declared_below_observed"
+        ),
         "ratio_observed_over_declared": observed_over_declared,
         "status": sd_status,
         "min_pairs": _DESIGN_PILOT_MIN_PAIRS,
         "n_evaluable_pairs": len(evaluable_pairs),
         "note": (
             "observed 取各可评估处理单元对配对差值样本 sd 的"
-            "最大值；相对化分母取两单元均值中较小者"
+            "最大值；相对化分母取两单元均值中较小者。"
+            "observed_upper_confidence_bound 是同一最大点估计"
+            "对应的单侧置信上界；小试点时它通常远大于点估计"
         ),
     }
     attrition_check = {
         "declared": declared_attrition,
         "observed": observed_attrition,
+        "observed_upper_confidence_bound": (
+            observed_attrition_upper
+        ),
+        "upper_confidence_level": confidence,
+        "upper_confidence_bound_method": (
+            "clopper_pearson_exact_binomial"
+        ),
+        "upper_confidence_bound_status": (
+            attrition_upper_status
+        ),
+        "declared_below_upper_confidence_bound": bool(
+            attrition_upper_status
+            == "declared_below_observed"
+        ),
         "observed_overall": overall_attrition,
         "status": attrition_status,
         "unusable": bool(
@@ -67178,8 +67625,34 @@ def build_pilot_power_evidence(
         "source_runs": source_runs,
         "observed_paired_sd_abs": observed_sd_abs,
         "observed_paired_sd_relative": observed_sd_relative,
+        "observed_paired_sd_abs_upper_confidence_bound": (
+            observed_sd_abs_upper
+        ),
+        "observed_paired_sd_relative_upper_confidence_bound": (
+            observed_sd_relative_upper
+        ),
         "observed_attrition_rate": observed_attrition,
+        "observed_attrition_rate_upper_confidence_bound": (
+            observed_attrition_upper
+        ),
         "observed_overall_attrition_rate": overall_attrition,
+        "uncertainty": {
+            "confidence_level": confidence,
+            "sd_method": (
+                "chi_square_upper_bound_normal_paired_differences"
+            ),
+            "attrition_method": (
+                "clopper_pearson_exact_binomial"
+            ),
+            "by_confidence_level": ucb_sensitivity,
+            "note": (
+                "上界只描述「若试点是固定样本、配对差值近似"
+                "正态」时真实 sd/脱落率的抽样不确定性；它不"
+                "修正试点与正式协议的差异，也不保证新一批"
+                "运行的脱落率不超过上界。置信水平越高上界越"
+                "宽，必须与预注册策略一起解读"
+            ),
+        },
         "declared_expected_seed_sd_relative": declared_sd,
         "declared_expected_attrition_rate": declared_attrition,
         "sd_check": sd_check,
@@ -67235,45 +67708,138 @@ def _apply_pilot_evidence_to_power(
             "pilot_protocol_incomparable"
         )
         return power, False
+    policy, confidence = _pilot_calibration_setting(power)
     adjusted = dict(power)
+    adjusted["pilot_calibration"] = policy
+    adjusted["pilot_confidence"] = confidence
     changed = False
     sd_adjusted = False
     attrition_adjusted = False
-    sd_check = _as_dict(evidence.get("sd_check"))
-    if sd_check.get("status") == "declared_below_observed":
-        observed = _finite_float(
-            evidence.get("observed_paired_sd_relative")
+    sd_point = _finite_float(
+        evidence.get("observed_paired_sd_relative")
+    )
+    sd_upper = _finite_float(
+        evidence.get(
+            "observed_paired_sd_relative_upper_confidence_bound"
         )
-        if observed is not None and observed > 0.0:
-            adjusted["pilot_declared_expected_seed_sd_relative"] = (
-                power.get("expected_seed_sd_relative")
-            )
-            adjusted["expected_seed_sd_relative"] = observed
-            adjusted["pilot_adjusted_expected_seed_sd_relative"] = (
-                observed
-            )
-            sd_adjusted = True
-            changed = True
-    attrition_check = _as_dict(evidence.get("attrition_check"))
-    if attrition_check.get("status") == "declared_below_observed":
-        observed = _finite_float(
-            evidence.get("observed_attrition_rate")
+    )
+    if policy == "upper_confidence_bound" and sd_upper is not None:
+        sd_effective = sd_upper
+        sd_basis = "upper_confidence_bound"
+    else:
+        sd_effective = sd_point
+        sd_basis = "point"
+        if (
+            policy == "upper_confidence_bound"
+            and sd_point is not None
+        ):
+            sd_basis = "point_fallback_no_upper_bound"
+    declared_sd = _finite_float(
+        power.get("expected_seed_sd_relative")
+    )
+    if (
+        sd_effective is not None
+        and sd_effective > 0.0
+        and _pilot_declared_check(declared_sd, sd_effective)
+        == "declared_below_observed"
+    ):
+        adjusted["pilot_declared_expected_seed_sd_relative"] = (
+            power.get("expected_seed_sd_relative")
         )
-        if observed is not None and 0.0 <= observed < 1.0:
-            adjusted["pilot_declared_expected_attrition_rate"] = (
-                power.get("expected_attrition_rate")
+        adjusted["expected_seed_sd_relative"] = sd_effective
+        adjusted["pilot_adjusted_expected_seed_sd_relative"] = (
+            sd_effective
+        )
+        sd_adjusted = True
+        changed = True
+    attrition_point = _finite_float(
+        evidence.get("observed_attrition_rate")
+    )
+    attrition_upper = _finite_float(
+        evidence.get(
+            "observed_attrition_rate_upper_confidence_bound"
+        )
+    )
+    calibration_unusable = None
+    if (
+        policy == "upper_confidence_bound"
+        and attrition_upper is not None
+        and attrition_upper >= 1.0
+    ):
+        calibration_unusable = (
+            "attrition_upper_confidence_bound_reaches_one"
+        )
+        adjusted["pilot_calibration_unusable"] = (
+            calibration_unusable
+        )
+    else:
+        adjusted.pop("pilot_calibration_unusable", None)
+    if policy == "upper_confidence_bound" and attrition_upper is not None:
+        attrition_effective = attrition_upper
+        attrition_basis = "upper_confidence_bound"
+    else:
+        attrition_effective = attrition_point
+        attrition_basis = "point"
+        if (
+            policy == "upper_confidence_bound"
+            and attrition_point is not None
+        ):
+            attrition_basis = (
+                "point_fallback_no_upper_bound"
             )
-            adjusted["expected_attrition_rate"] = observed
-            adjusted["pilot_adjusted_expected_attrition_rate"] = (
-                observed
-            )
-            attrition_adjusted = True
-            changed = True
+    declared_attrition = _finite_float(
+        power.get("expected_attrition_rate")
+    )
+    if (
+        attrition_effective is not None
+        and 0.0 <= attrition_effective < 1.0
+        and _pilot_declared_check(
+            declared_attrition, attrition_effective
+        )
+        == "declared_below_observed"
+    ):
+        adjusted["pilot_declared_expected_attrition_rate"] = (
+            power.get("expected_attrition_rate")
+        )
+        adjusted["expected_attrition_rate"] = (
+            attrition_effective
+        )
+        adjusted["pilot_adjusted_expected_attrition_rate"] = (
+            attrition_effective
+        )
+        attrition_adjusted = True
+        changed = True
+    evidence["calibration"] = {
+        "policy": policy,
+        "confidence_level": confidence,
+        "sd_basis": sd_basis,
+        "sd_point_estimate": sd_point,
+        "sd_upper_confidence_bound": sd_upper,
+        "sd_effective_input": sd_effective,
+        "attrition_basis": attrition_basis,
+        "attrition_point_estimate": attrition_point,
+        "attrition_upper_confidence_bound": attrition_upper,
+        "attrition_effective_input": attrition_effective,
+        "upper_bound_unavailable": bool(
+            policy == "upper_confidence_bound"
+            and (sd_upper is None or attrition_upper is None)
+        ),
+        "unusable": calibration_unusable,
+        "note": (
+            "point 策略使用试点点估计；upper_confidence_bound "
+            "策略使用预注册置信水平的单侧上界。两者都只向"
+            "上调，不会因试点更小放宽预注册声明"
+        ),
+    }
     evidence["applied_to_power"] = changed
     evidence["adjusted_power_inputs"] = (
         {
             "sd_adjusted": sd_adjusted,
             "attrition_adjusted": attrition_adjusted,
+            "calibration_policy": policy,
+            "calibration_confidence": confidence,
+            "sd_basis": sd_basis,
+            "attrition_basis": attrition_basis,
             "declared_expected_seed_sd_relative": power.get(
                 "expected_seed_sd_relative"
             ),
@@ -67312,8 +67878,18 @@ def _pilot_gate_note(evidence: object) -> str:
             + "；不能把试点 sd/脱落率当作正式设计的校准依据。"
         )
     parts: List[str] = []
+    calibration = _as_dict(evidence.get("calibration"))
     sd_check = _as_dict(evidence.get("sd_check"))
-    if sd_check.get("status") == "declared_below_observed":
+    if calibration.get("sd_basis") == "upper_confidence_bound":
+        parts.append(
+            "试点配对差值 sd 的 "
+            f"{_format_finite(calibration.get('confidence_level'), '.0%')}"
+            " 单侧置信上界≈"
+            f"{_format_finite(calibration.get('sd_effective_input'), 'g')}"
+            " 高于预注册 "
+            f"{_format_finite(sd_check.get('declared'), 'g')}"
+        )
+    elif sd_check.get("status") == "declared_below_observed":
         parts.append(
             "试点观测的配对差值 sd≈"
             f"{_format_finite(sd_check.get('observed'), 'g')}"
@@ -67321,7 +67897,18 @@ def _pilot_gate_note(evidence: object) -> str:
             f"{_format_finite(sd_check.get('declared'), 'g')}"
         )
     attrition_check = _as_dict(evidence.get("attrition_check"))
-    if attrition_check.get("status") == "declared_below_observed":
+    if calibration.get("attrition_basis") == (
+        "upper_confidence_bound"
+    ):
+        parts.append(
+            "试点脱落率的 "
+            f"{_format_finite(calibration.get('confidence_level'), '.0%')}"
+            " 单侧置信上界≈"
+            f"{_format_finite(calibration.get('attrition_effective_input'), '.1%')}"
+            " 高于预注册 "
+            f"{_format_finite(attrition_check.get('declared'), '.1%')}"
+        )
+    elif attrition_check.get("status") == "declared_below_observed":
         parts.append(
             "试点观测的脱落率≈"
             f"{_format_finite(attrition_check.get('observed'), '.1%')}"
@@ -67330,6 +67917,11 @@ def _pilot_gate_note(evidence: object) -> str:
         )
     if attrition_check.get("unusable"):
         parts.append("至少一个处理单元的全部试点运行都不可用")
+    if calibration.get("unusable"):
+        parts.append(
+            "试点校准不可用："
+            + str(calibration.get("unusable"))
+        )
     if not parts:
         return ""
     # ``applied_to_power`` 只表示输入被上调；旧/手工 power
