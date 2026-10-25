@@ -2866,6 +2866,26 @@ class DesignPreparationTests(unittest.TestCase):
                 quantile / expected, 1.0, places=12
             )
 
+    def test_chi_square_quantile_handles_upper_tail(self):
+        # df=2 时上侧概率 Q=exp(-x/2)，因此分位数解析解为
+        # -2*log(1-p)。若通过 1-P 计算 Q，p 接近 1 时会把
+        # Q 的绝对舍入误差放大成分位数误差。
+        for probability in (
+            0.6,
+            0.9,
+            1.0 - 1.0e-8,
+            1.0 - 1.0e-12,
+            1.0 - 1.0e-15,
+        ):
+            quantile = experiment._chi_square_quantile(
+                probability, 2.0
+            )
+            expected = -2.0 * math.log1p(-probability)
+            self.assertIsNotNone(quantile)
+            self.assertAlmostEqual(
+                quantile / expected, 1.0, places=12
+            )
+
     def test_chi_square_quantile_handles_small_df(self):
         # df=0.5（a=0.25）的小 x 展开为
         # P(a,x)=x^a/(a*Gamma(a))*(1+O(x))，因此分位数约为

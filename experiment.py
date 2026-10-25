@@ -66001,15 +66001,15 @@ _PILOT_CALIBRATION_POLICIES = (
 _PILOT_UCB_SENSITIVITY_LEVELS = (0.8, 0.9, 0.95, 0.99)
 
 
-def _regularized_incomplete_gamma(
+def _regularized_incomplete_gamma_parts(
     a: float,
     x: float,
-) -> Optional[float]:
-    """正则化下不完全 Gamma 函数 P(a, x)，无 SciPy 依赖。
+) -> Optional[Tuple[float, float]]:
+    """同时返回正则化不完全 Gamma 的下尾 P(a,x) 与上尾 Q(a,x)。
 
-    用于由卡方分布计算试点 sd 的单侧置信上界。x < a+1 时用
-    级数，否则用连分式计算 Q(a, x) 再取补；两者都在对数域
-    计算前因子，避免大自由度下溢出。
+    P 与 Q 互补，但靠近 1 的一侧若用 ``1 - 另一侧`` 计算会发生
+    灾难性抵消。这里在小 x 时由级数直接得到 P、在大 x 时由连
+    分式直接得到 Q，只把远离 1 的一侧取补。
     """
     if (
         not math.isfinite(a)
@@ -66019,7 +66019,7 @@ def _regularized_incomplete_gamma(
     ):
         return None
     if x == 0.0:
-        return 0.0
+        return 0.0, 1.0
     log_prefactor = -x + a * math.log(x) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
@@ -66029,7 +66029,8 @@ def _regularized_incomplete_gamma(
             total += term
             if abs(term) <= abs(total) * 1.0e-15:
                 break
-        value = total * math.exp(log_prefactor)
+        lower = total * math.exp(log_prefactor)
+        upper = 1.0 - lower
     else:
         # Lentz 连分式计算 Q(a, x)。
         fpmin = 1.0e-300
@@ -66051,10 +66052,32 @@ def _regularized_incomplete_gamma(
             h *= delta
             if abs(delta - 1.0) <= 1.0e-15:
                 break
-        value = 1.0 - math.exp(log_prefactor) * h
-    if not math.isfinite(value):
+        upper = math.exp(log_prefactor) * h
+        lower = 1.0 - upper
+    if not math.isfinite(lower) or not math.isfinite(upper):
         return None
-    return min(1.0, max(0.0, value))
+    return (
+        min(1.0, max(0.0, lower)),
+        min(1.0, max(0.0, upper)),
+    )
+
+
+def _regularized_incomplete_gamma(
+    a: float,
+    x: float,
+) -> Optional[float]:
+    """正则化下不完全 Gamma 函数 P(a, x)，无 SciPy 依赖。"""
+    parts = _regularized_incomplete_gamma_parts(a, x)
+    return None if parts is None else parts[0]
+
+
+def _regularized_incomplete_gamma_upper(
+    a: float,
+    x: float,
+) -> Optional[float]:
+    """正则化上不完全 Gamma 函数 Q(a, x)，无 SciPy 依赖。"""
+    parts = _regularized_incomplete_gamma_parts(a, x)
+    return None if parts is None else parts[1]
 
 
 def _chi_square_cdf(value: float, df: float) -> Optional[float]:
@@ -66066,6 +66089,24 @@ def _chi_square_cdf(value: float, df: float) -> Optional[float]:
     ):
         return None
     return _regularized_incomplete_gamma(df / 2.0, value / 2.0)
+
+
+def _chi_square_survival(
+    value: float,
+    df: float,
+) -> Optional[float]:
+    """卡方分布的上尾概率 P(X > value)。"""
+    if (
+        not math.isfinite(value)
+        or not math.isfinite(df)
+        or value < 0.0
+        or df <= 0.0
+    ):
+        return None
+    return _regularized_incomplete_gamma_upper(
+        df / 2.0,
+        value / 2.0,
+    )
 
 
 def _chi_square_quantile(
@@ -66080,13 +66121,28 @@ def _chi_square_quantile(
         or df <= 0.0
     ):
         return None
+    # 上侧概率直接由 Q(a,x) 计算；若仍用 1-P(a,x)，p 接近 1
+    # 时会把 Q 的绝对舍入误差放大成相对误差，使高分位数偏移
+    # （df=2、p=1-1e-15 时约 0.16%）。
+    upper_tail = probability > 0.5
+    target = 1.0 - probability if upper_tail else probability
+
+    def tail(value: float) -> Optional[float]:
+        if upper_tail:
+            survival = _chi_square_survival(value, df)
+            return survival
+        return _chi_square_cdf(value, df)
+
     low = 0.0
     high = max(1.0, df)
     for _ in range(100):
-        cdf = _chi_square_cdf(high, df)
-        if cdf is None:
+        value = tail(high)
+        if value is None:
             return None
-        if cdf >= probability:
+        reached = (
+            value <= target if upper_tail else value >= target
+        )
+        if reached:
             break
         high *= 2.0
         if high > 1.0e300:
@@ -66100,13 +66156,19 @@ def _chi_square_quantile(
     # 相对容差仍会让常规概率在几十步内提前收敛。
     for _ in range(4096):
         middle = (low + high) / 2.0
-        cdf = _chi_square_cdf(middle, df)
-        if cdf is None:
+        value = tail(middle)
+        if value is None:
             return None
-        if cdf < probability:
-            low = middle
+        if upper_tail:
+            if value > target:
+                low = middle
+            else:
+                high = middle
         else:
-            high = middle
+            if value < target:
+                low = middle
+            else:
+                high = middle
         # 只用相对容差：下侧分位数可能远小于 1e-12
         # （例如 confidence=1-1e-15、df=1 时约 1e-30），
         # 绝对容差会在这里提前停止并高估几个数量级。
