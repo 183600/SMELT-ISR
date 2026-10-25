@@ -31141,7 +31141,7 @@ def _attrition_bounds(
     report["observed_runs"] = total_observed
     report["missing_runs"] = total_missing
     report["observed_fraction"] = (
-        float(total_observed) / float(total_attempted)
+        total_observed / total_attempted
         if total_attempted > 0
         else None
     )
@@ -31204,9 +31204,7 @@ def _attrition_bounds(
             # 先求总和：极大有限值直接相加可能溢出，比例写法
             # 在极端量级下仍不会抛异常（非有限结果由下方统一
             # 标成 unbounded）。
-            observed_share = (
-                float(observed) / float(attempted)
-            )
+            observed_share = observed / attempted
             missing_share = 1.0 - observed_share
             mean_low = (
                 observed_share * observed_mean

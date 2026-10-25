@@ -516,6 +516,31 @@ class StatisticsTests(unittest.TestCase):
         self.assertAlmostEqual(bounds["effect_max"], -1.0)
         self.assertTrue(bounds["sign_robust"])
 
+    def test_attrition_bounds_tolerates_out_of_float_range_counts(self):
+        huge = 10**400
+        bounds = experiment._attrition_bounds(
+            {
+                "variant": {
+                    "label": "A",
+                    "n_runs": huge,
+                    "samples": {
+                        "val_loss": [
+                            {"seed": 1, "run": "A1", "value": 1.0}
+                        ]
+                    },
+                    "numerical_failures": [],
+                }
+            },
+            {"variant": 1.0},
+            "val_loss",
+            1.0,
+        )
+        self.assertTrue(bounds["applicable"])
+        self.assertEqual(bounds["observed_fraction"], 0.0)
+        self.assertEqual(bounds["missing_runs"], huge - 1)
+        self.assertAlmostEqual(bounds["effect_min"], 1.0)
+        self.assertAlmostEqual(bounds["effect_max"], 1.0)
+
     def test_attrition_bounds_extreme_missing_can_cross_zero(self):
         # 两臂观测范围 [0, 10]；A 有 2 个失败运行。完整案例
         # 差值为 +0.1，但把 A 的缺失运行放到 0、baseline 的
