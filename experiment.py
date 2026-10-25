@@ -66409,6 +66409,7 @@ def _pilot_comparability_item(
     expected: Dict[str, object],
     rows: Sequence[Dict[str, object]],
 ) -> Dict[str, object]:
+    expected = _as_dict(expected)
     rows = _pilot_row_dicts(rows)
     values: Dict[str, object] = {}
     missing_runs: List[str] = []

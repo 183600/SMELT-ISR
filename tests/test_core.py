@@ -2757,6 +2757,14 @@ class DesignPreparationTests(unittest.TestCase):
         )
         self.assertEqual(item["status"], "match")
         self.assertEqual(item["values"], {"pilot": 0.01})
+        unverified = experiment._pilot_comparability_item(
+            "lr", "training", "blocking", None, [{
+                "run": "pilot",
+                "protocol": {"lr": 0.01},
+                "protocol_recorded_keys": ["lr"],
+            }]
+        )
+        self.assertEqual(unverified["status"], "not_recorded")
 
     def test_pilot_declared_check_rejects_nonfinite_values(self):
         self.assertEqual(
