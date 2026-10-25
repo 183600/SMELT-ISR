@@ -1284,6 +1284,51 @@ class DesignPreparationTests(unittest.TestCase):
         )
         self.assertEqual(plan["required_seeds"], 7)
 
+    def test_preregistration_power_accepts_pilot_calibration(self):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 62))
+        payload["power"] = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+            "pilot_calibration": "upper_confidence_bound",
+            "pilot_confidence": 0.9,
+        }
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        self.assertEqual(
+            experiment._pilot_calibration_setting(
+                payload["power"]
+            ),
+            ("upper_confidence_bound", 0.9),
+        )
+
+    def test_preregistration_power_rejects_invalid_pilot_calibration(
+        self,
+    ):
+        payload = self._payload()
+        payload["seeds"] = list(range(42, 62))
+        power = {
+            "expected_seed_sd_relative": 0.002,
+            "target_power": 0.8,
+            "alpha": 0.05,
+        }
+        payload["power"] = dict(
+            power, pilot_calibration="after_the_fact"
+        )
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("pilot_calibration", error)
+        payload["power"] = dict(power, pilot_confidence=0.5)
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("pilot_confidence", error)
+        payload["power"] = dict(power, pilot_confidence=True)
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("pilot_confidence", error)
+
     def test_preregistration_power_cannot_understate_family(self):
         payload = self._payload()
         payload["power"] = {

@@ -37408,6 +37408,8 @@ _POWER_KEYS = (
     "planned_comparisons",
     "planned_contrasts",
     "expected_attrition_rate",
+    "pilot_calibration",
+    "pilot_confidence",
     "plan_equivalence",
     "underpowered_acknowledged",
     "justification",
@@ -38254,6 +38256,28 @@ def preregistration_schema_error(
                 "（预期因数值失败/数据问题而不可用的运行比例；"
                 "1 表示全部运行都会脱落，无法设计）"
             )
+        pilot_calibration = power.get(
+            "pilot_calibration", "point"
+        )
+        if pilot_calibration not in _PILOT_CALIBRATION_POLICIES:
+            return (
+                "power.pilot_calibration 必须是 "
+                + " / ".join(_PILOT_CALIBRATION_POLICIES)
+                + " 之一"
+            )
+        if "pilot_confidence" in power:
+            error = _preregistration_finite_number(
+                power["pilot_confidence"],
+                "power.pilot_confidence",
+                minimum=0.0,
+                maximum=1.0,
+            )
+            if error is not None:
+                return error
+            if not 0.5 < float(power["pilot_confidence"]) < 1.0:
+                return (
+                    "power.pilot_confidence 必须在 (0.5, 1) 内"
+                )
         plan_equivalence = power.get(
             "plan_equivalence", False
         )
