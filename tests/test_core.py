@@ -2740,6 +2740,24 @@ class DesignPreparationTests(unittest.TestCase):
             )
             self.assertEqual(item["status"], "match")
 
+    def test_pilot_comparability_accepts_single_row(self):
+        report = experiment._pilot_comparability_report(
+            {
+                "run": "pilot",
+                "protocol": {"lr": 0.01},
+                "protocol_recorded_keys": ["lr"],
+            },
+            {"lr": 0.01},
+            {},
+        )
+        item = next(
+            item
+            for item in report["items"]
+            if item["key"] == "lr"
+        )
+        self.assertEqual(item["status"], "match")
+        self.assertEqual(item["values"], {"pilot": 0.01})
+
     def test_pilot_declared_check_rejects_nonfinite_values(self):
         self.assertEqual(
             experiment._pilot_declared_check(10**400, 0.1),

@@ -66337,10 +66337,24 @@ def _pilot_row_protocol_value(
     return value, key in recorded or value is not None
 
 
+def _pilot_row_dicts(value: object) -> List[Dict[str, object]]:
+    """把试点行容器归一化为 dict 列表，损坏标量不崩溃。"""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, (str, bytes, bytearray)):
+        return []
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
 def _pilot_comparability_run_labels(
     rows: Sequence[Dict[str, object]],
 ) -> List[str]:
     """给每个试点行生成唯一标签，避免同名运行在 values 中折叠。"""
+    rows = _pilot_row_dicts(rows)
     counts: Dict[str, int] = {}
     for row in rows:
         name = str(row.get("run"))
@@ -66395,6 +66409,7 @@ def _pilot_comparability_item(
     expected: Dict[str, object],
     rows: Sequence[Dict[str, object]],
 ) -> Dict[str, object]:
+    rows = _pilot_row_dicts(rows)
     values: Dict[str, object] = {}
     missing_runs: List[str] = []
     for row, name in zip(
@@ -66535,6 +66550,7 @@ def _pilot_comparability_report(
     pilot_evidence: Dict[str, object],
 ) -> Dict[str, object]:
     expected = _as_dict(expected)
+    rows = _pilot_row_dicts(rows)
     items: List[Dict[str, object]] = []
     for group, keys, severity in _PILOT_COMPARABILITY_GROUPS:
         for key in keys:
