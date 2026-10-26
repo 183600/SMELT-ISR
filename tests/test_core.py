@@ -9510,6 +9510,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         for df, alpha, effect, expected in (
             (0.1, 0.01, 100000.0, 0.03350029910411294),
             (0.5, 1.0e-8, 100000.0, 3.846215750003292e-06),
+            (4.0, 1.0e-20, 100000.0, 0.19714960547528733),
         ):
             power = experiment._t_power(
                 effect, 1.0, df, alpha

@@ -29108,7 +29108,7 @@ def _t_power_nodes(
     return tuple(u_values), tuple(weighted)
 
 
-def _t_power_small_df_normal_mix(
+def _t_power_large_shift_normal_mix(
     df_value: float,
     scale: float,
     noncentrality: float,
@@ -29198,11 +29198,6 @@ def _t_power_small_df_large_scale(
     """
     if not math.isfinite(noncentrality):
         return 1.0
-    if noncentrality > 16.0:
-        return _t_power_small_df_normal_mix(
-            df_value, scale, noncentrality
-        )
-
     exponent = max(5, min(1000, int(math.ceil(3.0 / df_value))))
     log_const = (
         (1.0 - df_value / 2.0) * math.log(2.0)
@@ -29355,6 +29350,11 @@ def _t_power(
         return None
 
     scale = critical / math.sqrt(df_value)
+
+    if scale > 10.0 and noncentrality > 16.0:
+        return _t_power_large_shift_normal_mix(
+            df_value, scale, noncentrality
+        )
 
     if scale > 10.0 and df_value >= 3.0:
         # alpha 很小 / df 较小时临界值巨大，固定 u 网格在
