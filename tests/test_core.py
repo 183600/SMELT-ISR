@@ -9470,6 +9470,31 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_t_p_value_keeps_upper_tail_near_one(self):
+        for df, t in (
+            (1.0e7, 1.0e-5),
+            (1.0e8, 1.0e-4),
+            (2.0e8, 1.0e-4),
+        ):
+            p_value = experiment._two_sided_t_p_value(t, df)
+            self.assertIsNotNone(p_value)
+            self.assertAlmostEqual(
+                p_value,
+                math.erfc(t / math.sqrt(2.0)),
+                delta=1.0e-9,
+            )
+            self.assertLess(p_value, 1.0)
+
+    def test_t_critical_inverts_upper_tail_near_one(self):
+        for df in (1.0e5, 1.0e8):
+            critical = experiment._t_critical(df, 0.999999)
+            self.assertIsNotNone(critical)
+            self.assertAlmostEqual(
+                experiment._two_sided_t_p_value(critical, df),
+                0.999999,
+                places=12,
+            )
+
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

@@ -26791,6 +26791,15 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         return math.exp(log_p)
 
     x = df / (df + t * t)
+    complement_x = t * t / (df + t * t)
+    if complement_x <= 1.0e-9:
+        complement = _regularized_incomplete_beta(
+            complement_x,
+            0.5,
+            df / 2.0,
+        )
+        if complement is not None:
+            return max(0.0, min(1.0, 1.0 - complement))
     return _regularized_incomplete_beta(x, df / 2.0, 0.5)
 
 
