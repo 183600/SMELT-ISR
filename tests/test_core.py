@@ -9355,6 +9355,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
 
+    def test_tost_power_handles_overflowing_noncentrality(self):
+        # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
+        # 由卡方尾概率精确表示，不能误报为 0 功效。
+        tiny_se = 5.0e-324
+        self.assertAlmostEqual(
+            experiment._tost_power(
+                0.005, tiny_se, 10.0, 0.01, 0.05
+            ),
+            0.9908757207816047,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            experiment._tost_power(
+                0.02, tiny_se, 10.0, 0.01, 0.05
+            ),
+            1.694474393006736e-05,
+            delta=1e-17,
+        )
+
     def test_tost_margin_for_power_preserves_tiny_scale(self):
         normal = experiment._tost_margin_for_power(1.0, 10.0)
         self.assertIsNotNone(normal)

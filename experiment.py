@@ -29654,6 +29654,22 @@ def _tost_power(
     lower = -half_width / se_value
     upper = half_width / se_value
     noncentrality = effect_value / se_value
+    if not math.isfinite(noncentrality):
+        # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
+        # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；
+        # 除以 δ 后只剩 sqrt(V/df) ≥ 1/r（r=U/δ），
+        # 即 V ≥ df·(effect/half_width)²。忽略下界（极限为 0）。
+        try:
+            threshold = (
+                df_value
+                * (effect_value / half_width) ** 2
+            )
+        except OverflowError:
+            return 0.0
+        if not math.isfinite(threshold):
+            return 0.0
+        survival = _chi_square_survival(threshold, df_value)
+        return survival if survival is not None else 0.0
     cdf_upper = _noncentral_t_cdf(
         upper, df_value, noncentrality
     )
