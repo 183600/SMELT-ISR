@@ -9525,6 +9525,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 places=12,
             )
 
+    def test_tost_test_keeps_small_upper_tail(self):
+        result = experiment._tost_test(
+            -5.0,
+            1.0,
+            100.0,
+            15.0,
+            alpha=1.0e-20,
+        )
+        expected = experiment._two_sided_t_p_value(10.0, 100.0)
+        self.assertIsNotNone(expected)
+        self.assertAlmostEqual(
+            float(result["tost_p_lower"]) / (expected / 2.0),
+            1.0,
+            places=12,
+        )
+        self.assertGreater(float(result["tost_p_value"]), 1.0e-20)
+
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

@@ -29608,12 +29608,22 @@ def _tost_test(
     t_lower = (effect_value + margin_value) / se_value
 
     cdf_upper = _t_cdf(t_upper, df_value)
-    cdf_lower = _t_cdf(t_lower, df_value)
-    if cdf_upper is None or cdf_lower is None:
+    if cdf_upper is None:
         return {}
 
     p_upper = cdf_upper
-    p_lower = 1.0 - cdf_lower
+    if t_lower >= 0.0:
+        two_sided_lower = _two_sided_t_p_value(
+            t_lower, df_value
+        )
+        if two_sided_lower is None:
+            return {}
+        p_lower = two_sided_lower / 2.0
+    else:
+        cdf_lower = _t_cdf(t_lower, df_value)
+        if cdf_lower is None:
+            return {}
+        p_lower = 1.0 - cdf_lower
     return {
         "tost_p_lower": p_lower,
         "tost_p_upper": p_upper,
