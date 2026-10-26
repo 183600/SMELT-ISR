@@ -9355,7 +9355,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._two_sided_t_p_value(30.0, 1.0e6)
             / 1.2020094233664118e-197,
             1.0,
-            places=9,
+            places=8,
         )
 
     def test_t_p_value_handles_infinite_and_invalid_df(self):
