@@ -29108,6 +29108,76 @@ def _t_power_nodes(
     return tuple(u_values), tuple(weighted)
 
 
+def _t_power_small_df_normal_mix(
+    df_value: float,
+    scale: float,
+    noncentrality: float,
+) -> float:
+    """
+    小自由度、大非中心参数下的功效：对正态位移积分 chi CDF。
+
+    令 T'=(Z+δ)/sqrt(V/df)、w=scale·u 且 u=sqrt(V)，则
+    |T'|>critical 等价于 u<|Z+δ|/scale。因此
+
+        power = E_Z[F_chi2_df((|Z+δ|/scale)^2)]。
+
+    这比对 w 做等距 Simpson 更适合 δ 很大（如 1e5）的情形：
+    w 积分的转折宽度约为 1，而区间长度约为 δ；固定 20000
+    个区间时步长可达数个单位，会把 δ 附近的概率质量积错。
+    这里对 Z 在 ±12 内积分，转折宽度不变，步长始终为 0.01。
+    """
+    log_scale = math.log(scale)
+    shape = df_value / 2.0
+    log_gamma_plus_one = math.lgamma(shape + 1.0)
+
+    def _chi_square_cdf_at_log(log_u: float) -> float:
+        if not math.isfinite(log_u):
+            return 0.0
+        log_x = 2.0 * log_u - math.log(2.0)
+        if log_x < -700.0:
+            # u 极小，u² 可能下溢为 0；用 x^a/Γ(a+1) 的
+            # 对数形式保留仍可表示的概率。
+            log_probability = (
+                -math.exp(log_x)
+                + shape * log_x
+                - log_gamma_plus_one
+            )
+            return (
+                math.exp(log_probability)
+                if log_probability > -745.0
+                else 0.0
+            )
+        value = _chi_square_cdf(
+            2.0 * math.exp(log_x), df_value
+        )
+        return 0.0 if value is None else value
+
+    total = 0.0
+    intervals = 2400
+    low = -12.0
+    high = 12.0
+    step = (high - low) / intervals
+    for index in range(intervals + 1):
+        t = low + index * step
+        if index == 0 or index == intervals:
+            simpson = step / 3.0
+        elif index % 2 == 0:
+            simpson = 2.0 * step / 3.0
+        else:
+            simpson = 4.0 * step / 3.0
+        y = noncentrality + t
+        if y == 0.0:
+            continue
+        log_u = math.log(abs(y)) - log_scale
+        density = math.exp(-0.5 * t * t) / math.sqrt(
+            2.0 * math.pi
+        )
+        total += (
+            simpson * density * _chi_square_cdf_at_log(log_u)
+        )
+    return min(1.0, max(0.0, total))
+
+
 def _t_power_small_df_large_scale(
     df_value: float,
     scale: float,
@@ -29121,9 +29191,17 @@ def _t_power_small_df_large_scale(
     漏掉整段概率质量并返回 0。这里换到 w=scale·u：先对
     w∈[0,1] 用 w=t^p 吸收 chi 密度在 0 附近的弱奇异项，再对
     w∈[1,w_max] 用等距网格解析正态尾概率的转折。
+
+    δ 很大时 w 积分在 δ 附近的转折会被 20000 个区间的上限
+    稀释（区间长度约 δ，步长可达数个 w 单位）；此时改用对
+    正态位移的 chi-CDF 积分。
     """
     if not math.isfinite(noncentrality):
         return 1.0
+    if noncentrality > 16.0:
+        return _t_power_small_df_normal_mix(
+            df_value, scale, noncentrality
+        )
 
     exponent = max(5, min(1000, int(math.ceil(3.0 / df_value))))
     log_const = (

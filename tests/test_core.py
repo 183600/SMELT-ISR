@@ -9502,6 +9502,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=expected * 1.0e-6,
             )
 
+    def test_t_power_large_noncentrality_small_df(self):
+        # df<3 且 δ 很大时，w=scale·u 的转折宽度约为 1，而
+        # 积分区间长度约为 δ；固定 20000 个区间会把转折稀释，
+        # 例如 df=0.1、δ=1e5 时高估约 1.5%。参考值由高精度
+        # chi-CDF 正态混合积分得到。
+        for df, alpha, effect, expected in (
+            (0.1, 0.01, 100000.0, 0.03350029910411294),
+            (0.5, 1.0e-8, 100000.0, 3.846215750003292e-06),
+        ):
+            power = experiment._t_power(
+                effect, 1.0, df, alpha
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(
+                power,
+                expected,
+                delta=expected * 1.0e-8,
+            )
+
     def test_t_p_value_uses_exact_beta_before_normal_limit(self):
         # df=1e6、t=30 时一阶正态尾修正仍有约 2% 误差；
         # 不完全 Beta 在此自由度下精度约 5e-10，应优先使用。
