@@ -29751,11 +29751,16 @@ def _tost_margin_for_power(
     # 避免极小 se 下固定区间 [0, 1] 的绝对分辨率不足。
     low = 0.0
     high = 1.0
-    for _ in range(64):
+    # alpha 极小时所需界约为 t 临界值，可能远大于 2^64；按
+    # double 的完整指数范围扩展，而不是固定 64 次倍增后误报
+    # 「不可计算」。
+    for _ in range(2048):
         power = _tost_power(0.0, 1.0, df_value, high, alpha_value)
         if power is not None and power >= target:
             break
         high *= 2.0
+        if not math.isfinite(high):
+            return None
     else:
         return None
     for _ in range(200):
@@ -29769,7 +29774,10 @@ def _tost_margin_for_power(
             low = mid
         else:
             high = mid
-    margin = ((low + high) / 2.0) * se_value
+    # 返回二分上界：极小 alpha 下临界值本身已达 1e60 量级，
+    # 中点可能因舍入落回 critical 而给出功效 0 的界；上界始终
+    # 满足目标功效，代价只是至多一个 ulp 的保守性。
+    margin = high * se_value
     return margin if math.isfinite(margin) else None
 
 

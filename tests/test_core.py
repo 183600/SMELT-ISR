@@ -9369,6 +9369,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(
             experiment._tost_margin_for_power(1.0e308, 2.0)
         )
+        # alpha 极小所需界远超 2^64；必须继续扩展且返回的界
+        # 确实达到目标功效。
+        for alpha in (1.0e-30, 1.0e-100, 1.0e-300):
+            margin = experiment._tost_margin_for_power(
+                1.0, 5.0, 0.8, alpha
+            )
+            self.assertIsNotNone(margin)
+            self.assertGreaterEqual(
+                experiment._tost_power(
+                    0.0, 1.0, 5.0, margin, alpha
+                ),
+                0.8,
+            )
 
     def test_welch_test_preserves_tiny_scale(self):
         base_a = [1.0, 2.0, 3.0, 4.0, 5.0]
