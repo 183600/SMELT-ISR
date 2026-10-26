@@ -29820,7 +29820,7 @@ def _tost_test(
     }
 
 
-def _tost_power_small_df_normal_mix(
+def _tost_power_normal_mix(
     df_value: float,
     noncentrality: float,
     upper: float,
@@ -29928,14 +29928,6 @@ def _tost_power(
     lower = -half_width / se_value
     upper = half_width / se_value
     noncentrality = effect_value / se_value
-    if (
-        df_value < 3.0
-        and math.isfinite(noncentrality)
-        and abs(noncentrality) > 16.0
-    ):
-        return _tost_power_small_df_normal_mix(
-            df_value, noncentrality, upper
-        )
     if not math.isfinite(noncentrality):
         # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
         # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；
@@ -29952,6 +29944,13 @@ def _tost_power(
             return 0.0
         survival = _chi_square_survival(threshold, df_value)
         return survival if survival is not None else 0.0
+    if (
+        abs(noncentrality) > 16.0
+        or (df_value >= 2.0 and upper < 10.0)
+    ):
+        return _tost_power_normal_mix(
+            df_value, noncentrality, upper
+        )
     cdf_upper = _noncentral_t_cdf(
         upper, df_value, noncentrality
     )

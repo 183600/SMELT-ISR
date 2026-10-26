@@ -9630,6 +9630,16 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 expected,
                 delta=expected * 1.0e-9,
             )
+        # df>=2 时两个非中心 t CDF 都接近 1，直接相减会把
+        # 极小的 TOST 功效抵消成 0；正态混合积分保留该尾概率。
+        expected = 9.814390514141384e-23
+        power = experiment._tost_power(
+            -1.0e-3, 1.0e-4, 10.0, 1.0e-3, 1.0e-6
+        )
+        self.assertIsNotNone(power)
+        self.assertAlmostEqual(
+            power, expected, delta=expected * 1.0e-9
+        )
 
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
