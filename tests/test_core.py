@@ -4371,6 +4371,32 @@ class RunAuditTests(unittest.TestCase):
             self.assertEqual(strict["errors"], [])
             self.assertEqual(strict["warnings"], [])
 
+    def test_audit_accepts_complete_final_line_without_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            self._build_run(root)
+            metrics_path = root / "metrics.jsonl"
+            raw = metrics_path.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            metrics_path.write_bytes(raw[:-1])
+            experiment.write_artifact_manifest(root)
+            report = experiment.audit_run_directory(
+                root, strict=True
+            )
+            self.assertTrue(report["ok"], report)
+            self.assertNotIn(
+                "metrics_trailing_partial",
+                self._codes(report, "warnings"),
+            )
+
+    def test_audit_still_flags_incomplete_final_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.jsonl"
+            path.write_bytes(b'{"step": 1}\n{"step": 2')
+            audit = experiment._audit_metrics_log(path)
+            self.assertTrue(audit["trailing_partial"])
+            self.assertEqual(audit["malformed_lines"], [2])
+
     def test_audit_does_not_require_full_identity_on_final(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"

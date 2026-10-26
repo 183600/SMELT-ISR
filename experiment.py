@@ -47564,9 +47564,11 @@ def _audit_metrics_log(path: Path) -> Dict[str, object]:
     records: List[Dict[str, object]] = []
     record_lines: List[int] = []
     parsed: List[tuple[int, Dict[str, object]]] = []
+    last_line_had_error = False
     for line_number, raw_line in enumerate(
         raw.splitlines(keepends=True), start=1
     ):
+        last_line_had_error = False
         if not raw_line.strip():
             result["blank_lines"].append(line_number)  # type: ignore[union-attr]
             continue
@@ -47574,20 +47576,30 @@ def _audit_metrics_log(path: Path) -> Dict[str, object]:
             text = raw_line.decode("utf-8")
         except UnicodeDecodeError:
             result["invalid_utf8_lines"].append(line_number)  # type: ignore[union-attr]
+            last_line_had_error = True
             continue
         try:
             loaded = json.loads(text)
         except json.JSONDecodeError:
             result["malformed_lines"].append(line_number)  # type: ignore[union-attr]
+            last_line_had_error = True
             continue
         if not isinstance(loaded, dict):
             result["malformed_lines"].append(line_number)  # type: ignore[union-attr]
+            last_line_had_error = True
             continue
         records.append(loaded)
         record_lines.append(line_number)
         parsed.append((line_number, loaded))
 
-    if raw and not raw.endswith((b"\n", b"\r")):
+    # 只把「末尾无换行且该行无法解析」视为半行。完整的 JSON
+    # 对象即使缺少末尾换行也已被完整写入（read_metrics_records
+    # 同样接受），不能据此宣称最后一条记录不可信。
+    if (
+        raw
+        and not raw.endswith((b"\n", b"\r"))
+        and last_line_had_error
+    ):
         result["trailing_partial"] = True
     result["lines"] = len(raw.splitlines())
     result["records"] = records
