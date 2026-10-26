@@ -29517,6 +29517,110 @@ def _t_cdf(t: float, df: float) -> Optional[float]:
     return two_sided / 2.0
 
 
+def _noncentral_t_cdf_large_shift(
+    value: float,
+    df: float,
+    noncentrality: float,
+) -> float:
+    """大 ``|value|/sqrt(df)`` 下按正态参数积分非中心 t CDF。"""
+    a = value / math.sqrt(df)
+    u_max = math.sqrt(df - 1.0) + _T_POWER_TAIL
+    log_const = (
+        (1.0 - df / 2.0) * math.log(2.0)
+        - math.lgamma(df / 2.0)
+    )
+
+    def density(u: float) -> float:
+        if u <= 0.0:
+            return 0.0
+        log_density = (
+            log_const
+            + (df - 1.0) * math.log(u)
+            - u * u / 2.0
+        )
+        return (
+            math.exp(log_density)
+            if log_density > -745.0
+            else 0.0
+        )
+
+    def normal_cdf(argument: float) -> float:
+        return 0.5 * math.erfc(-argument / math.sqrt(2.0))
+
+    total = 0.0
+    if a > 0.0:
+        low = max(-noncentrality, -40.0)
+        high = min(a * u_max - noncentrality, 40.0)
+        if high > low:
+            width = high - low
+            step = min(0.02, a / 50.0)
+            intervals = max(2, math.ceil(width / step))
+            if intervals % 2:
+                intervals += 1
+            step = width / intervals
+            for index in range(intervals + 1):
+                argument = low + index * step
+                u = (argument + noncentrality) / a
+                integrand = (
+                    density(u) / a * normal_cdf(argument)
+                )
+                if index == 0 or index == intervals:
+                    total += step / 3.0 * integrand
+                elif index % 2 == 0:
+                    total += 2.0 * step / 3.0 * integrand
+                else:
+                    total += 4.0 * step / 3.0 * integrand
+
+        cutoff = (40.0 + noncentrality) / a
+        if cutoff < u_max:
+            if cutoff <= 0.0:
+                total += 1.0
+            else:
+                survival = _chi_square_survival(
+                    cutoff * cutoff,
+                    df,
+                )
+                if survival is not None:
+                    total += survival
+    else:
+        scale = -a
+        low = max(
+            -scale * u_max - noncentrality,
+            -40.0,
+        )
+        high = min(-noncentrality, 40.0)
+        if high > low:
+            width = high - low
+            step = min(0.02, scale / 50.0)
+            intervals = max(2, math.ceil(width / step))
+            if intervals % 2:
+                intervals += 1
+            step = width / intervals
+            for index in range(intervals + 1):
+                argument = low + index * step
+                u = (argument + noncentrality) / a
+                integrand = (
+                    density(u) / scale
+                    * normal_cdf(argument)
+                )
+                if index == 0 or index == intervals:
+                    total += step / 3.0 * integrand
+                elif index % 2 == 0:
+                    total += 2.0 * step / 3.0 * integrand
+                else:
+                    total += 4.0 * step / 3.0 * integrand
+
+        cutoff = (-40.0 - noncentrality) / scale
+        if cutoff > 0.0:
+            lower = _chi_square_cdf(
+                min(cutoff, u_max) ** 2,
+                df,
+            )
+            if lower is not None:
+                total += lower
+    return min(1.0, max(0.0, total))
+
+
 def _noncentral_t_cdf(
     value: float,
     df: float,
@@ -29537,6 +29641,12 @@ def _noncentral_t_cdf(
         return _normal_cdf(value - noncentrality)
     if df <= 0.0:
         return None
+    if df >= 3.0 and abs(value) / math.sqrt(df) >= 0.05:
+        return _noncentral_t_cdf_large_shift(
+            value,
+            df,
+            noncentrality,
+        )
 
     u_values, weighted = _t_power_nodes(df)
     scale = 1.0 / math.sqrt(df)

@@ -9448,6 +9448,26 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=1e-8,
             )
 
+    def test_noncentral_t_cdf_keeps_extreme_negative_tail(self):
+        # df>=3 的固定 u 网格在 |t| 很大时只有一两个节点落在
+        # 正态尾的窄峰内，df=3、t=-100 的相对误差约 11%。
+        # 参考值由 scipy.stats.nct.cdf 核对。
+        for df, value, reference in (
+            (3.0, -100.0, 4.0172758868251233e-07),
+            (5.0, -100.0, 2.737192949747577e-10),
+            (10.0, -30.0, 3.692727448008916e-12),
+            (100.0, -30.0, 3.347625324326119e-54),
+        ):
+            cdf = experiment._noncentral_t_cdf(
+                value, df, 0.5
+            )
+            self.assertIsNotNone(cdf)
+            self.assertAlmostEqual(
+                cdf,
+                reference,
+                delta=reference * 1.0e-6,
+            )
+
     def test_t_power_handles_small_df_without_overflow(self):
         u_values, weights = experiment._t_power_nodes(0.01)
         self.assertEqual(len(u_values), len(weights))
