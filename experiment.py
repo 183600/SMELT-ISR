@@ -37921,13 +37921,30 @@ def preregistration_power_plan(
     改变显著性功效的判定。等价界必须在预注册顶层显式给出
     （``--equivalence-margin`` 的默认值不能代替事先声明）。
     """
-    sd = float(power["expected_seed_sd_relative"])
-    target = float(power.get("target_power", _TARGET_POWER))
-    alpha = float(power.get("alpha", _SIGNIFICANCE_LEVEL))
-    planned_comparisons = int(
-        power.get("planned_comparisons", comparisons_count)
+    # 入口 schema 会拒绝损坏的 power 块；直接调用时也必须
+    # 可判定：超范围整数不能让 float()/int() 抛异常，也不能
+    # 把 inf/nan 写进最终 JSON。sd 无有限上界可用时取一个
+    # 足够大的有限值，使功效判定为「不可达」而不是乐观通过。
+    raw_sd = _finite_float(power.get("expected_seed_sd_relative"))
+    sd = raw_sd if raw_sd is not None and raw_sd >= 0.0 else 1.0e300
+    target = _finite_float(
+        power.get("target_power", _TARGET_POWER)
     )
+    if target is None or not (0.0 < target < 1.0):
+        target = _TARGET_POWER
+    alpha = _finite_float(power.get("alpha", _SIGNIFICANCE_LEVEL))
+    if alpha is None or not (0.0 < alpha < 0.5):
+        alpha = _SIGNIFICANCE_LEVEL
+    try:
+        planned_comparisons = int(
+            power.get("planned_comparisons", comparisons_count)
+        )
+    except (TypeError, ValueError, OverflowError):
+        planned_comparisons = int(comparisons_count)
     family_size = max(1, planned_comparisons)
+    min_effect_value = _finite_float(min_effect)
+    if min_effect_value is None or min_effect_value < 0.0:
+        min_effect_value = 0.0
     if contrast_types is None:
         raw_contrasts = power.get(
             "planned_contrasts", ["pairwise"]
@@ -38012,7 +38029,7 @@ def preregistration_power_plan(
     contrast_power = {
         contrast: _contrast_power_entry(
             contrast,
-            float(min_effect),
+            min_effect_value,
             sd,
             raw_n_seeds,
             usable_seeds,
@@ -38117,7 +38134,7 @@ def preregistration_power_plan(
         scaled_entries = {
             contrast: _contrast_power_entry(
                 contrast,
-                float(min_effect),
+                min_effect_value,
                 scaled_sd,
                 raw_n_seeds,
                 usable_seeds,
@@ -38172,7 +38189,7 @@ def preregistration_power_plan(
 
     return {
         "expected_seed_sd_relative": sd,
-        "min_effect_relative": float(min_effect),
+        "min_effect_relative": min_effect_value,
         "target_power": target,
         "alpha": alpha,
         "planned_comparisons": family_size,

@@ -2083,6 +2083,39 @@ class DesignPreparationTests(unittest.TestCase):
         self.assertEqual(plan["planned_seeds"], 10**400)
         json.dumps(plan, allow_nan=False)
 
+        # 损坏的 sd/target/alpha/min_effect 也不能在直接调用
+        # 时抛 OverflowError 或把 inf/nan 写进报告。
+        for power in (
+            {
+                "expected_seed_sd_relative": 10**400,
+                "target_power": 0.8,
+                "alpha": 0.05,
+                "planned_comparisons": 1,
+            },
+            {
+                "expected_seed_sd_relative": 0.01,
+                "target_power": 10**400,
+                "alpha": 10**400,
+                "planned_comparisons": 1,
+            },
+            {
+                "expected_seed_sd_relative": -1,
+                "target_power": float("nan"),
+                "alpha": float("inf"),
+                "planned_comparisons": 1,
+            },
+        ):
+            plan = experiment.preregistration_power_plan(
+                power, 0.01, 6, 1
+            )
+            self.assertTrue(
+                math.isfinite(plan["expected_seed_sd_relative"])
+            )
+            self.assertTrue(math.isfinite(plan["target_power"]))
+            self.assertTrue(math.isfinite(plan["alpha"]))
+            self.assertFalse(plan["adequate"])
+            json.dumps(plan, allow_nan=False)
+
 
     def test_counterbalanced_order_balances_positions(self):
         plan = experiment.build_sweep_plan(
