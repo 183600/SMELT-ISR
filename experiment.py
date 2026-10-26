@@ -66772,13 +66772,17 @@ def _regularized_incomplete_gamma_parts(
     灾难性抵消。这里在小 x 时由级数直接得到 P、在大 x 时由连
     分式直接得到 Q，只把远离 1 的一侧取补。
     """
+    a_value = _finite_float(a)
+    x_value = _finite_float(x)
     if (
-        not math.isfinite(a)
-        or not math.isfinite(x)
-        or a <= 0.0
-        or x < 0.0
+        a_value is None
+        or x_value is None
+        or a_value <= 0.0
+        or x_value < 0.0
     ):
         return None
+    a = a_value
+    x = x_value
     if x == 0.0:
         return 0.0, 1.0
     if a >= _GAMMA_TEMME_MIN_A:
@@ -66844,14 +66848,19 @@ def _regularized_incomplete_gamma_upper(
 
 
 def _chi_square_cdf(value: float, df: float) -> Optional[float]:
+    value_value = _finite_float(value)
+    df_value = _finite_float(df)
     if (
-        not math.isfinite(value)
-        or not math.isfinite(df)
-        or value < 0.0
-        or df <= 0.0
+        value_value is None
+        or df_value is None
+        or value_value < 0.0
+        or df_value <= 0.0
     ):
         return None
-    return _regularized_incomplete_gamma(df / 2.0, value / 2.0)
+    return _regularized_incomplete_gamma(
+        df_value / 2.0,
+        value_value / 2.0,
+    )
 
 
 def _chi_square_survival(
@@ -66859,16 +66868,18 @@ def _chi_square_survival(
     df: float,
 ) -> Optional[float]:
     """卡方分布的上尾概率 P(X > value)。"""
+    value_value = _finite_float(value)
+    df_value = _finite_float(df)
     if (
-        not math.isfinite(value)
-        or not math.isfinite(df)
-        or value < 0.0
-        or df <= 0.0
+        value_value is None
+        or df_value is None
+        or value_value < 0.0
+        or df_value <= 0.0
     ):
         return None
     return _regularized_incomplete_gamma_upper(
-        df / 2.0,
-        value / 2.0,
+        df_value / 2.0,
+        value_value / 2.0,
     )
 
 
@@ -66877,13 +66888,17 @@ def _chi_square_quantile(
     df: float,
 ) -> Optional[float]:
     """卡方分布的下侧分位数（0 < p < 1），二分求逆。"""
+    probability_value = _finite_float(probability)
+    df_value = _finite_float(df)
     if (
-        not math.isfinite(probability)
-        or not math.isfinite(df)
-        or not 0.0 < probability < 1.0
-        or df <= 0.0
+        probability_value is None
+        or df_value is None
+        or not 0.0 < probability_value < 1.0
+        or df_value <= 0.0
     ):
         return None
+    probability = probability_value
+    df = df_value
     # 上侧概率直接由 Q(a,x) 计算；若仍用 1-P(a,x)，p 接近 1
     # 时会把 Q 的绝对舍入误差放大成相对误差，使高分位数偏移
     # （df=2、p=1-1e-15 时约 0.16%）。
@@ -66965,14 +66980,17 @@ def _sd_upper_confidence_bound(
         or not 0.0 < confidence_value < 1.0
     ):
         return None
+    degrees = _finite_float(n - 1)
+    if degrees is None:
+        return None
     quantile = _chi_square_quantile(
         1.0 - confidence_value,
-        float(n - 1),
+        degrees,
     )
     if quantile is None or quantile <= 0.0:
         return None
     try:
-        upper = value * math.sqrt(float(n - 1) / quantile)
+        upper = value * math.sqrt(degrees / quantile)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(upper):
@@ -67011,14 +67029,18 @@ def _binomial_upper_confidence_bound(
             return 1.0 - alpha ** (1.0 / float(trials))
         except (OverflowError, ValueError):
             return None
+    remaining = _finite_float(trials - failures)
+    successes = _finite_float(failures + 1)
+    if remaining is None or successes is None:
+        return None
     low = 0.0
     high = 1.0
     for _ in range(200):
         middle = (low + high) / 2.0
         cdf = _regularized_incomplete_beta(
             1.0 - middle,
-            float(trials - failures),
-            float(failures + 1),
+            remaining,
+            successes,
         )
         if cdf is None or not math.isfinite(cdf):
             return None

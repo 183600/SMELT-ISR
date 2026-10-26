@@ -3009,6 +3009,38 @@ class DesignPreparationTests(unittest.TestCase):
             experiment._chi_square_quantile(0.5, 1.0e12)
         )
 
+    def test_chi_square_and_gamma_reject_huge_integer_inputs(self):
+        huge = 10 ** 400
+        self.assertIsNone(
+            experiment._regularized_incomplete_gamma_parts(
+                huge, 1.0
+            )
+        )
+        self.assertIsNone(
+            experiment._regularized_incomplete_gamma_parts(
+                1.0, huge
+            )
+        )
+        self.assertIsNone(
+            experiment._chi_square_cdf(1.0, huge)
+        )
+        self.assertIsNone(
+            experiment._chi_square_survival(huge, 1.0)
+        )
+        self.assertIsNone(
+            experiment._chi_square_quantile(0.5, huge)
+        )
+        self.assertIsNone(
+            experiment._sd_upper_confidence_bound(
+                1.0, huge, 0.95
+            )
+        )
+        self.assertIsNone(
+            experiment._binomial_upper_confidence_bound(
+                1, huge, 0.95
+            )
+        )
+
     def test_pilot_expected_planned_seeds_normalize_strings(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(
