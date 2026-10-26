@@ -2979,6 +2979,36 @@ class DesignPreparationTests(unittest.TestCase):
             quantile / expected, 1.0, places=12
         )
 
+    def test_chi_square_large_df_handles_transition_and_overflow(self):
+        a = 5.0e11
+        expected = 0.5 + 1.0 / (
+            3.0 * math.sqrt(2.0 * math.pi * a)
+        )
+        cdf = experiment._chi_square_cdf(1.0e12, 1.0e12)
+        survival = experiment._chi_square_survival(
+            1.0e12, 1.0e12
+        )
+        self.assertIsNotNone(cdf)
+        self.assertIsNotNone(survival)
+        self.assertAlmostEqual(cdf, expected, places=14)
+        self.assertAlmostEqual(cdf + survival, 1.0, places=15)
+
+        huge_cdf = experiment._chi_square_cdf(1.0e20, 1.0e20)
+        huge_survival = experiment._chi_square_survival(
+            1.0e20, 1.0e20
+        )
+        self.assertIsNotNone(huge_cdf)
+        self.assertIsNotNone(huge_survival)
+        self.assertAlmostEqual(
+            huge_cdf + huge_survival, 1.0, places=15
+        )
+        self.assertIsNotNone(
+            experiment._chi_square_cdf(1.0e308, 1.0e308)
+        )
+        self.assertIsNotNone(
+            experiment._chi_square_quantile(0.5, 1.0e12)
+        )
+
     def test_pilot_expected_planned_seeds_normalize_strings(self):
         expected = (
             experiment._pilot_expected_comparability_protocol(

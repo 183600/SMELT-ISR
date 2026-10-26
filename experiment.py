@@ -66649,6 +66649,109 @@ _PILOT_CALIBRATION_POLICIES = (
 _PILOT_UCB_SENSITIVITY_LEVELS = (0.8, 0.9, 0.95, 0.99)
 
 
+_GAMMA_TEMME_MIN_A = 1.0e5
+_GAMMA_TEMME_ETA_TERMS = (
+    1.0 / 2.0,
+    -1.0 / 3.0,
+    1.0 / 4.0,
+    -1.0 / 5.0,
+    1.0 / 6.0,
+    -1.0 / 7.0,
+    1.0 / 8.0,
+    -1.0 / 9.0,
+    1.0 / 10.0,
+    -1.0 / 11.0,
+    1.0 / 12.0,
+    -1.0 / 13.0,
+    1.0 / 14.0,
+    -1.0 / 15.0,
+)
+_GAMMA_TEMME_C0 = (
+    474671.0 / 493807104000.0,
+    -33113.0 / 17635968000.0,
+    -571.0 / 235146240.0,
+    1.0 / 25515.0,
+    -139.0 / 777600.0,
+    1.0 / 2835.0,
+    1.0 / 864.0,
+    -2.0 / 135.0,
+    1.0 / 12.0,
+    -1.0 / 3.0,
+)
+_GAMMA_TEMME_C1 = (
+    33113.0 / 211631616000.0,
+    1092991.0 / 123451776000.0,
+    -5759.0 / 314928000.0,
+    -353.0 / 167961600.0,
+    1.0 / 4860.0,
+    -77.0 / 77760.0,
+    1.0 / 378.0,
+    -1.0 / 288.0,
+    -1.0 / 540.0,
+)
+
+
+def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
+    delta = x - a
+    if delta == 0.0:
+        eta = 0.0
+    else:
+        mu = delta / a
+        if abs(mu) < 1.0e-3:
+            series = 0.0
+            for coefficient in reversed(
+                _GAMMA_TEMME_ETA_TERMS
+            ):
+                series = series * mu + coefficient
+            eta_squared = 2.0 * mu * mu * series
+        else:
+            ratio = x / a
+            if ratio == 0.0:
+                return 0.0, 1.0
+            eta_squared = 2.0 * (
+                ratio - 1.0 - math.log(ratio)
+            )
+        if eta_squared < 0.0:
+            eta_squared = 0.0
+        eta = math.copysign(math.sqrt(eta_squared), delta)
+
+    if abs(eta) < 1.0:
+        c0 = 0.0
+        for coefficient in _GAMMA_TEMME_C0:
+            c0 = c0 * eta + coefficient
+        c1 = 0.0
+        for coefficient in _GAMMA_TEMME_C1:
+            c1 = c1 * eta + coefficient
+    else:
+        mu = delta / a
+        inverse_mu = 1.0 / mu
+        inverse_eta = 1.0 / eta
+        c0 = inverse_mu - inverse_eta
+        c1 = (
+            inverse_eta ** 3
+            - inverse_mu ** 3
+            - inverse_mu ** 2
+            - inverse_mu / 12.0
+        )
+
+    z = eta * math.sqrt(a / 2.0)
+    if z > 40.0:
+        return 1.0, 0.0
+    if z < -40.0:
+        return 0.0, 1.0
+    correction = (
+        math.exp(-0.5 * a * eta * eta)
+        / (math.sqrt(2.0 * math.pi) * math.sqrt(a))
+        * (c0 + c1 / a)
+    )
+    lower = 0.5 * math.erfc(-z) - correction
+    upper = 0.5 * math.erfc(z) + correction
+    return (
+        min(1.0, max(0.0, lower)),
+        min(1.0, max(0.0, upper)),
+    )
+
+
 def _regularized_incomplete_gamma_parts(
     a: float,
     x: float,
@@ -66668,6 +66771,8 @@ def _regularized_incomplete_gamma_parts(
         return None
     if x == 0.0:
         return 0.0, 1.0
+    if a >= _GAMMA_TEMME_MIN_A:
+        return _gamma_parts_temme(a, x)
     log_prefactor = -x + a * math.log(x) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
