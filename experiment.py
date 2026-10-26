@@ -46561,11 +46561,13 @@ def write_run_environment_end_record(
     )
     if start is None and original is None:
         return None
-    reference = original if original is not None else start
-    if reference is None:
+    current_source = start if start is not None else original
+    if current_source is None:
         return None
 
-    current = build_environment_snapshot(_snapshot_device(reference))
+    current = build_environment_snapshot(
+        _snapshot_device(current_source)
+    )
     path = Path(out_dir) / _ENVIRONMENT_END_FILENAME
     _atomic_write_json(path, current)
 

@@ -7818,6 +7818,52 @@ class EnvironmentSnapshotTests(unittest.TestCase):
                 ),
             )
 
+    def test_environment_end_snapshot_uses_current_run_device(self):
+        start = {
+            "environment_id": "start-environment",
+            "device": {"type": "cuda", "index": 1},
+        }
+        original = {
+            "environment_id": "original-environment",
+            "device": {"type": "cuda", "index": 0},
+        }
+        current = {
+            "schema": experiment._ENVIRONMENT_SCHEMA,
+            "environment_id": "current-environment",
+            "captured_utc": "2026-01-01T00:00:00+00:00",
+            "device": {"type": "cuda", "index": 1},
+        }
+        calls = []
+
+        def fake_build(device=None):
+            calls.append(device)
+            return json.loads(json.dumps(current))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(
+                experiment,
+                "build_environment_snapshot",
+                side_effect=fake_build,
+            ):
+                record = (
+                    experiment.write_run_environment_end_record(
+                        root,
+                        {"environment": start},
+                        original,
+                    )
+                )
+            self.assertEqual(
+                calls, [torch.device("cuda", 1)]
+            )
+            self.assertEqual(
+                record["environment_id"],
+                "current-environment",
+            )
+            self.assertTrue(
+                (root / "environment_end.json").is_file()
+            )
+
     def test_environment_mode_rejects_training_arguments(self):
         strict_only = experiment.environment_mode_error(
             argparse.Namespace(
