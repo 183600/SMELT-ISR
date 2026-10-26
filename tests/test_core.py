@@ -9613,6 +9613,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertGreater(float(result["tost_p_value"]), 1.0e-20)
 
+    def test_tost_power_large_noncentrality_small_df(self):
+        # df<3、δ 很大时，非中心 t CDF 的固定 u 网格会错过
+        # 条件正态尾的窄转折；改为对正态位移积分卡方尾概率。
+        for df, expected in (
+            (2.0, 0.3678579568413044),
+            (0.5, 0.25619706631310957),
+        ):
+            power = experiment._tost_power(
+                1.0, 1.0e-5, df, 1.0, 0.05
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(
+                power,
+                expected,
+                delta=expected * 1.0e-9,
+            )
+
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

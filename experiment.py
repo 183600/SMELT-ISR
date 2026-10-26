@@ -29820,6 +29820,55 @@ def _tost_test(
     }
 
 
+def _tost_power_small_df_normal_mix(
+    df_value: float,
+    noncentrality: float,
+    upper: float,
+) -> float:
+    """
+    小自由度、大非中心参数下的 TOST 功效。
+
+    令 T'=(Z+δ)/sqrt(V/df)、Y=Z+δ，则 |T'|≤U 等价于
+    u=sqrt(V)≥|Y|·sqrt(df)/U。因此
+
+        power = E_Y[Q_chi2_df(df·(|Y|/U)^2)]。
+
+    直接对 Y 积分避开了非中心 t CDF 的固定 u 网格：δ 很大时
+    条件正态尾的转折在 u 上非常窄，固定节点会系统性高估。
+    """
+    if math.isinf(upper):
+        return 1.0
+    total = 0.0
+    intervals = 2400
+    low = -12.0
+    high = 12.0
+    step = (high - low) / intervals
+    for index in range(intervals + 1):
+        t = low + index * step
+        if index == 0 or index == intervals:
+            simpson = step / 3.0
+        elif index % 2 == 0:
+            simpson = 2.0 * step / 3.0
+        else:
+            simpson = 4.0 * step / 3.0
+        y = noncentrality + t
+        ratio = abs(y) / upper
+        threshold = df_value * ratio * ratio
+        if not math.isfinite(threshold):
+            survival = 0.0
+        else:
+            survival = _chi_square_survival(
+                threshold, df_value
+            )
+            if survival is None:
+                survival = 0.0
+        density = math.exp(-0.5 * t * t) / math.sqrt(
+            2.0 * math.pi
+        )
+        total += simpson * density * survival
+    return min(1.0, max(0.0, total))
+
+
 def _tost_power(
     effect: float,
     se: float,
@@ -29879,6 +29928,14 @@ def _tost_power(
     lower = -half_width / se_value
     upper = half_width / se_value
     noncentrality = effect_value / se_value
+    if (
+        df_value < 3.0
+        and math.isfinite(noncentrality)
+        and abs(noncentrality) > 16.0
+    ):
+        return _tost_power_small_df_normal_mix(
+            df_value, noncentrality, upper
+        )
     if not math.isfinite(noncentrality):
         # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
         # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；
