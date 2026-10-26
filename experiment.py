@@ -16490,6 +16490,18 @@ def run_statistical_baseline(
 
     metrics_file.close()
 
+    try:
+        environment_end = write_run_environment_end_record(
+            out_dir,
+            ngram_run_metadata,
+        )
+    except (OSError, ValueError) as error:
+        environment_end = None
+        print(
+            "[env][warn] 无法写入运行结束环境快照: "
+            f"{error}"
+        )
+
     # ---- config.json：与训练运行相同结构，可直接 --compare ----
     payload = {
         # 与 write_run_config 使用同一配置 schema；统计基线也是
@@ -16742,6 +16754,8 @@ def run_statistical_baseline(
     )
     if environment_record is not None:
         payload["environment"] = environment_record
+    if environment_end is not None:
+        payload["environment_end"] = environment_end
     payload["comparison_protocol_sha256"] = _sha256_text(
         json.dumps(
             _json_safe(payload["comparison_protocol"]),
@@ -46484,6 +46498,107 @@ def write_run_environment_record(
     return record
 
 
+_ENVIRONMENT_END_SCHEMA = "smelt-isr/environment-end/v1"
+_ENVIRONMENT_END_FILENAME = "environment_end.json"
+
+
+def _metadata_environment_snapshot(
+    metadata: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    if not isinstance(metadata, dict):
+        return None
+    snapshot = metadata.get("environment")
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _snapshot_environment_id(
+    snapshot: Optional[Dict[str, object]],
+) -> Optional[str]:
+    if not isinstance(snapshot, dict):
+        return None
+    value = snapshot.get("environment_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _environment_comparison_summary(
+    expected: Optional[Dict[str, object]],
+    current: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if expected is None:
+        return None
+    comparison = compare_environment_snapshots(expected, current)
+    return {
+        "environment_id": _snapshot_environment_id(expected),
+        "changed": not bool(comparison.get("ok")),
+        "critical_package_differences": (
+            comparison.get("critical_package_differences") or []
+        ),
+        "runtime_differences": (
+            comparison.get("runtime_differences") or []
+        ),
+    }
+
+
+def write_run_environment_end_record(
+    out_dir: Path,
+    start_metadata: Optional[Dict[str, object]] = None,
+    original_snapshot: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, object]]:
+    """
+    在运行正常结束时再次采集环境，并把结束快照与运行开始/
+    最初运行的环境逐项比较。
+
+    `environment.json` 只回答「原始结果在哪套环境下产生」，
+    无法发现运行期间升级依赖、切换驱动或改动线程数；本记录
+    把结束环境固定为文件，并在 config.json 摘要中保存哈希与
+    漂移标志。无法采集时返回 None，由调用方决定是否提示。
+    """
+    start = _metadata_environment_snapshot(start_metadata)
+    original = (
+        original_snapshot
+        if isinstance(original_snapshot, dict)
+        else start
+    )
+    if start is None and original is None:
+        return None
+    reference = original if original is not None else start
+    if reference is None:
+        return None
+
+    current = build_environment_snapshot(_snapshot_device(reference))
+    path = Path(out_dir) / _ENVIRONMENT_END_FILENAME
+    _atomic_write_json(path, current)
+
+    start_summary = _environment_comparison_summary(start, current)
+    original_summary = _environment_comparison_summary(
+        original, current
+    )
+    record: Dict[str, object] = {
+        "schema": _ENVIRONMENT_END_SCHEMA,
+        "captured_utc": current.get("captured_utc"),
+        "environment_id": _snapshot_environment_id(current),
+        "file": _ENVIRONMENT_END_FILENAME,
+        "file_sha256": _sha256_file(path),
+        "start": start_summary,
+        "original": original_summary,
+        "changed_since_start": (
+            None
+            if start_summary is None
+            else bool(start_summary.get("changed"))
+        ),
+        "changed_since_original": (
+            None
+            if original_summary is None
+            else bool(original_summary.get("changed"))
+        ),
+        "note": (
+            "结束环境快照；changed_* 为 true 表示运行结束时与"
+            "启动/最初快照在关键依赖、运行时或确定性开关上不同"
+        ),
+    }
+    return record
+
+
 def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     """
     收集本轮实验的代码版本与运行环境信息，写入 config.json，
@@ -47417,6 +47532,97 @@ def _audit_same(left: object, right: object) -> bool:
     return _stable_factor_key(left) == _stable_factor_key(right)
 
 
+def _audit_metrics_log(path: Path) -> Dict[str, object]:
+    """
+    逐行解析 metrics.jsonl，保留结构完整性证据。
+
+    read_metrics_records 为兼容旧日志会跳过坏行；审计不能静默
+    跳过，否则截断/拼接的日志会看起来仍然「可解析」。这里同时
+    检查坏行、非法 UTF-8、空行、末尾半行、重复训练步与回退步。
+    """
+    result: Dict[str, object] = {
+        "available": False,
+        "records": [],
+        "record_lines": [],
+        "lines": 0,
+        "malformed_lines": [],
+        "invalid_utf8_lines": [],
+        "blank_lines": [],
+        "trailing_partial": False,
+        "duplicate_steps": [],
+        "nonmonotonic_steps": [],
+    }
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as error:
+        result["error"] = str(error)
+        return result
+    result["available"] = True
+
+    records: List[Dict[str, object]] = []
+    record_lines: List[int] = []
+    parsed: List[tuple[int, Dict[str, object]]] = []
+    for line_number, raw_line in enumerate(
+        raw.splitlines(keepends=True), start=1
+    ):
+        if not raw_line.strip():
+            result["blank_lines"].append(line_number)  # type: ignore[union-attr]
+            continue
+        try:
+            text = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            result["invalid_utf8_lines"].append(line_number)  # type: ignore[union-attr]
+            continue
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError:
+            result["malformed_lines"].append(line_number)  # type: ignore[union-attr]
+            continue
+        if not isinstance(loaded, dict):
+            result["malformed_lines"].append(line_number)  # type: ignore[union-attr]
+            continue
+        records.append(loaded)
+        record_lines.append(line_number)
+        parsed.append((line_number, loaded))
+
+    if raw and not raw.endswith((b"\n", b"\r")):
+        result["trailing_partial"] = True
+    result["lines"] = len(raw.splitlines())
+    result["records"] = records
+    result["record_lines"] = record_lines
+
+    seen_steps: Dict[int, int] = {}
+    previous_step: Optional[int] = None
+    duplicate_steps: List[Dict[str, int]] = []
+    nonmonotonic_steps: List[Dict[str, object]] = []
+    for line_number, record in parsed:
+        step = record.get("step")
+        if not isinstance(step, int) or isinstance(step, bool):
+            continue
+        if step in seen_steps:
+            duplicate_steps.append(
+                {
+                    "step": step,
+                    "first_line": seen_steps[step],
+                    "duplicate_line": line_number,
+                }
+            )
+        else:
+            seen_steps[step] = line_number
+        if previous_step is not None and step <= previous_step:
+            nonmonotonic_steps.append(
+                {
+                    "previous_step": previous_step,
+                    "step": step,
+                    "line": line_number,
+                }
+            )
+        previous_step = step
+    result["duplicate_steps"] = duplicate_steps
+    result["nonmonotonic_steps"] = nonmonotonic_steps
+    return result
+
+
 def audit_run_directory(
     root: Path,
     *,
@@ -47760,17 +47966,74 @@ def audit_run_directory(
     # ---------- metrics.jsonl 与跨文件身份 ----------
     metrics_path = root / "metrics.jsonl"
     records: List[Dict[str, object]] = []
+    metrics_log: Dict[str, object] = {}
     if not metrics_path.is_file():
         add_error(
             "metrics_missing",
             "缺少 metrics.jsonl：运行曲线与终态记录不可核对",
         )
     else:
-        records = read_metrics_records(metrics_path)
+        metrics_log = _audit_metrics_log(metrics_path)
+        if metrics_log.get("error"):
+            add_error(
+                "metrics_unreadable",
+                "无法读取 metrics.jsonl: "
+                f"{metrics_log.get('error')}",
+            )
+        loaded_records = metrics_log.get("records")
+        if isinstance(loaded_records, list):
+            records = [
+                record
+                for record in loaded_records
+                if isinstance(record, dict)
+            ]
         if not records:
             add_error(
                 "metrics_empty",
                 "metrics.jsonl 没有可解析的记录",
+            )
+        malformed_lines = metrics_log.get("malformed_lines") or []
+        invalid_utf8_lines = (
+            metrics_log.get("invalid_utf8_lines") or []
+        )
+        blank_lines = metrics_log.get("blank_lines") or []
+        if malformed_lines or invalid_utf8_lines:
+            add_error(
+                "metrics_malformed_lines",
+                "metrics.jsonl 含无法解析或非 UTF-8 的行：日志"
+                "可能被截断、拼接或手工编辑",
+                malformed_lines=malformed_lines,
+                invalid_utf8_lines=invalid_utf8_lines,
+            )
+        if metrics_log.get("trailing_partial"):
+            add_warning(
+                "metrics_trailing_partial",
+                "metrics.jsonl 末尾是没有换行的半行：进程可能在"
+                "写记录时崩溃，最后一条记录不可信",
+            )
+        if blank_lines:
+            add_warning(
+                "metrics_blank_lines",
+                "metrics.jsonl 含空行：日志可能被人工插入内容",
+                lines=blank_lines,
+            )
+        duplicate_steps = metrics_log.get("duplicate_steps") or []
+        nonmonotonic_steps = (
+            metrics_log.get("nonmonotonic_steps") or []
+        )
+        if duplicate_steps:
+            add_error(
+                "metrics_duplicate_steps",
+                "metrics.jsonl 含重复的训练步记录：日志可能由两次"
+                "运行拼接或写入了重复评估",
+                duplicates=duplicate_steps,
+            )
+        if nonmonotonic_steps:
+            add_error(
+                "metrics_nonmonotonic_steps",
+                "metrics.jsonl 的训练步不是严格递增：日志可能"
+                "被拼接、重排或来自恢复点之前",
+                transitions=nonmonotonic_steps,
             )
 
     def check_record_identity(
@@ -47798,6 +48061,37 @@ def audit_run_directory(
                         record=label,
                         field=key,
                     )
+                continue
+            if not _audit_same(record.get(key), value):
+                add_error(
+                    "record_identity_mismatch",
+                    f"{label} 的 {key} 与 config 不一致"
+                    "（日志与配置可能来自不同运行）",
+                    record=label,
+                    field=key,
+                    expected=value,
+                    actual=record.get(key),
+                )
+        # 这些字段只在记录存在时核对：旧格式日志/运行可能没有
+        # 它们，缺失本身不新增警告（保持旧运行可审计），但一旦
+        # 写入就必须与 config 指向同一次运行。
+        optional_expected = {
+            "git_commit": metadata.get("git_commit"),
+            "git_dirty": metadata.get("git_dirty"),
+            "pythonhashseed_at_start": metadata.get(
+                "pythonhashseed_at_start"
+            ),
+            "deterministic_algorithms": metadata.get(
+                "deterministic_algorithms"
+            ),
+            "rng_seed_manifest": metadata.get("rng_seed_manifest"),
+            "data_effective_train_sha256": data.get(
+                "effective_train_sha256"
+            ),
+            "run_started_utc": metadata.get("timestamp_utc"),
+        }
+        for key, value in optional_expected.items():
+            if value is None or key not in record:
                 continue
             if not _audit_same(record.get(key), value):
                 add_error(
@@ -47840,6 +48134,37 @@ def audit_run_directory(
                 "reference_baselines 不是 metrics.jsonl 的首条记录："
                 "首行之前存在其他记录，日志可能被拼接或篡改",
             )
+        config_reference = config.get("reference_baselines")
+        if isinstance(config_reference, dict) and config_reference:
+            missing = [
+                key
+                for key in config_reference
+                if key not in headers[0]
+            ]
+            mismatched = {
+                key: {
+                    "expected": value,
+                    "actual": headers[0].get(key),
+                }
+                for key, value in config_reference.items()
+                if key in headers[0]
+                and not _audit_same(headers[0].get(key), value)
+            }
+            if missing:
+                add_warning(
+                    "metrics_reference_baseline_missing",
+                    "metrics.jsonl 首行缺少 config.reference_baselines "
+                    "中的部分基线：无法用日志核对评估窗口",
+                    fields=missing,
+                )
+            if mismatched:
+                add_error(
+                    "metrics_reference_baseline_mismatch",
+                    "metrics.jsonl 首行的参考基线与 config."
+                    "reference_baselines 不一致：日志与配置可能"
+                    "使用了不同的评估窗口",
+                    fields=mismatched,
+                )
 
     final_records = [
         record
@@ -47862,6 +48187,83 @@ def audit_run_directory(
         if record.get("step") == "bad_cases"
         and record.get("split") == "test"
     ]
+    final_indices = [
+        index
+        for index, record in enumerate(records)
+        if record.get("step") == "final"
+    ]
+    test_indices = [
+        index
+        for index, record in enumerate(records)
+        if record.get("step") == "test"
+    ]
+    test_started_indices = [
+        index
+        for index, record in enumerate(records)
+        if record.get("step") == "test_started"
+    ]
+    if len(final_records) > 1:
+        add_error(
+            "multiple_final_records",
+            "metrics.jsonl 含多条 final 记录：日志可能由多次"
+            "运行拼接，终态结果不唯一",
+            count=len(final_records),
+        )
+    if final_indices and test_indices:
+        if min(test_indices) < max(final_indices):
+            add_error(
+                "test_before_final",
+                "metrics.jsonl 的 test 记录早于 final 记录：测试集"
+                "可能在最终模型选定前就被解封，终态证据链失效",
+            )
+    if test_indices and test_started_indices:
+        first_test = min(test_indices)
+        if min(test_started_indices) > first_test:
+            add_error(
+                "test_started_after_test",
+                "test_started 标记出现在 test 汇总之后：解封顺序"
+                "不成立，日志可能被重排",
+            )
+    elif test_indices and not test_started_indices:
+        add_warning(
+            "test_started_missing",
+            "存在 test 汇总但没有 test_started 标记：无法从日志"
+            "确认解封前已登记访问",
+        )
+    if test_indices:
+        last_test = max(test_indices)
+        trailing = [
+            {
+                "index": index,
+                "step": records[index].get("step"),
+            }
+            for index in range(last_test + 1, len(records))
+        ]
+        if trailing:
+            add_error(
+                "records_after_test",
+                "test 汇总之后仍有 metrics 记录：测试集解封后不应"
+                "再追加结果或调参记录",
+                records=trailing,
+            )
+    if final_indices:
+        last_final = max(final_indices)
+        numeric_after_final = [
+            {
+                "index": index,
+                "step": records[index].get("step"),
+            }
+            for index in range(last_final + 1, len(records))
+            if isinstance(records[index].get("step"), int)
+            and not isinstance(records[index].get("step"), bool)
+        ]
+        if numeric_after_final:
+            add_error(
+                "metrics_numeric_records_after_final",
+                "final 记录之后仍有训练步记录：终态汇总早于最后"
+                "一次评估，日志可能被截断或拼接",
+                records=numeric_after_final,
+            )
     for record in final_records:
         check_record_identity(
             record,
@@ -47899,10 +48301,25 @@ def audit_run_directory(
 
     checks["metrics"] = {
         "path": str(metrics_path),
+        "lines": metrics_log.get("lines", 0),
         "records": len(records),
         "reference_baselines": len(headers),
         "final": len(final_records),
         "test": len(test_records),
+        "malformed_lines": metrics_log.get("malformed_lines", []),
+        "invalid_utf8_lines": metrics_log.get(
+            "invalid_utf8_lines", []
+        ),
+        "blank_lines": metrics_log.get("blank_lines", []),
+        "trailing_partial": metrics_log.get(
+            "trailing_partial", False
+        ),
+        "duplicate_steps": metrics_log.get(
+            "duplicate_steps", []
+        ),
+        "nonmonotonic_steps": metrics_log.get(
+            "nonmonotonic_steps", []
+        ),
     }
 
     # ---------- test 封条与访问账本 ----------
@@ -79028,6 +79445,41 @@ def main():
             )
 
     metrics_file.close()
+
+    # 结束环境快照：运行期间若升级依赖、切换驱动或改动确定性
+    # 开关，开始时的 environment.json 无法发现。把结束快照作为
+    # 独立文件固定，并在 config.json 中登记哈希与漂移标志。
+    try:
+        original_snapshot = None
+        try:
+            original_snapshot, _ = load_environment_snapshot(
+                out_dir
+            )
+        except (OSError, ValueError):
+            original_snapshot = None
+        environment_end = write_run_environment_end_record(
+            out_dir,
+            run_metadata,
+            original_snapshot,
+        )
+    except (OSError, ValueError) as error:
+        environment_end = None
+        print(
+            "[env][warn] 无法写入运行结束环境快照: "
+            f"{error}"
+        )
+    if environment_end is not None:
+        try:
+            update_run_config(
+                out_dir,
+                "environment_end",
+                environment_end,
+            )
+        except (OSError, ValueError) as error:
+            print(
+                "[env][warn] 无法把结束环境摘要写入 config.json: "
+                f"{error}"
+            )
 
     # 所有评估（最终验证、坏案例、效率、路由诊断与可选的测试集）
     # 都已结束，显式释放固定评估批与 MoE 推理填充缓冲的设备侧缓存。
