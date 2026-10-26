@@ -9490,6 +9490,39 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(1.0, 1.0, float("-inf"))
         )
 
+    def test_t_power_keeps_extreme_normal_tails(self):
+        # 1-CDF 在大 z 处会抵消成 0，导致极小 alpha 下的功效
+        # 被严重低估；负半轴必须直接用 erfc 计算。
+        self.assertAlmostEqual(
+            experiment._normal_cdf(-10.0),
+            7.619853024160593e-24,
+            delta=1e-36,
+        )
+        expected = 1.692381826523976e-30
+        self.assertAlmostEqual(
+            experiment._t_power(
+                0.1, 1.0, 1000.0, 1.0e-30
+            ),
+            expected,
+            delta=expected * 1e-9,
+        )
+        expected = 1.7443821172130487e-30
+        self.assertAlmostEqual(
+            experiment._t_power(
+                0.1, 1.0, float("inf"), 1.0e-30
+            ),
+            expected,
+            delta=expected * 1e-9,
+        )
+        expected = 1.2244731336713435e-28
+        self.assertAlmostEqual(
+            experiment._t_power(
+                0.5, 1.0, 1000.0, 1.0e-30
+            ),
+            expected,
+            delta=expected * 1e-9,
+        )
+
     def test_minimum_detectable_effect_handles_tiny_alpha_and_large_se(
         self,
     ):

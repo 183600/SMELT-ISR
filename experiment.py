@@ -28953,8 +28953,17 @@ def _attach_family_adjusted_intervals(
 
 
 def _normal_cdf(value: float) -> float:
-    """标准正态分布 CDF（math.erf 实现，无 SciPy 依赖）。"""
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+    """标准正态分布 CDF（math.erfc 实现，无 SciPy 依赖）。
+
+    负半轴直接用 erfc 计算左尾：``0.5 * (1 + erf(z))`` 在
+    z 略小于 -6 时会把 1 + erf(z) 抵消成 0，把仍然可表示的
+    尾概率（如 z=-10 时约 7.6e-24）误报为 0。功效积分在极小
+    alpha 或大非中心参数下正依赖这一尾概率，必须保留。
+    """
+    scaled = value / math.sqrt(2.0)
+    if scaled < 0.0:
+        return 0.5 * math.erfc(-scaled)
+    return 1.0 - 0.5 * math.erfc(scaled)
 
 
 @functools.lru_cache(maxsize=64)
@@ -29097,8 +29106,7 @@ def _t_power_small_df_large_scale(
     def _power_factor(w: float) -> float:
         return (
             _normal_cdf(-w - noncentrality)
-            + 1.0
-            - _normal_cdf(w - noncentrality)
+            + _normal_cdf(noncentrality - w)
         )
 
     total = 0.0
@@ -29231,8 +29239,7 @@ def _t_power(
             return None
         power = (
             _normal_cdf(-critical - noncentrality)
-            + 1.0
-            - _normal_cdf(critical - noncentrality)
+            + _normal_cdf(noncentrality - critical)
         )
         return min(1.0, max(0.0, power))
 
@@ -29301,8 +29308,7 @@ def _t_power(
                 * density
                 * (
                     _normal_cdf(-w - noncentrality)
-                    + 1.0
-                    - _normal_cdf(w - noncentrality)
+                    + _normal_cdf(noncentrality - w)
                 )
                 / scale
             )
@@ -29323,7 +29329,7 @@ def _t_power(
         shift = scale * u
         total += weight * (
             _normal_cdf(-shift - noncentrality)
-            + 1.0 - _normal_cdf(shift - noncentrality)
+            + _normal_cdf(noncentrality - shift)
         )
     return min(1.0, max(0.0, total))
 
