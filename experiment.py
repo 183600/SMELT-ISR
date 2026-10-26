@@ -29330,6 +29330,11 @@ def _t_power(
         return alpha_value
 
     noncentrality = effect_value / se_value
+    if math.isinf(noncentrality):
+        # se 小到 δ 溢出：非中心参数趋于无穷，任何有限临界值
+        # 都必然被超过。不能把 inf 带进正态混合积分（那里的
+        # chi CDF 在 inf 处会返回 0，反而给出零功效）。
+        return 1.0
     if (
         not math.isfinite(df_value)
         or df_value >= _T_POWER_NORMAL_DF

@@ -9808,6 +9808,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(1.0, 1.0, float("-inf"))
         )
 
+    def test_t_power_handles_overflowing_noncentrality(self):
+        # se 小到 effect/se 溢出为 inf 时，非中心参数趋于无穷，
+        # 功效应为 1；不能把 inf 带进正态混合积分而得到 0。
+        for df in (0.5, 2.0, 10.0, float("inf")):
+            self.assertEqual(
+                experiment._t_power(1.0, 5.0e-324, df),
+                1.0,
+            )
+
     def test_t_power_keeps_extreme_normal_tails(self):
         # 1-CDF 在大 z 处会抵消成 0，导致极小 alpha 下的功效
         # 被严重低估；负半轴必须直接用 erfc 计算。
