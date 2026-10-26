@@ -11400,6 +11400,13 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertIsInstance(error, str)
         self.assertIn("near_duplicate_threshold", error)
 
+    def test_finite_gap_tolerates_huge_ints(self):
+        self.assertIsNone(experiment._finite_gap(10 ** 400, 1.0))
+        self.assertIsNone(experiment._finite_gap(1.0, 10 ** 400))
+        self.assertEqual(
+            experiment._finite_gap(1.5, 0.25), 1.25
+        )
+
     def test_extreme_int_reports_do_not_overflow(self):
         self.assertIsNone(experiment._t_critical(10 ** 400))
         self.assertIsNone(

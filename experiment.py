@@ -16895,9 +16895,11 @@ def _finite_gap(
     val_loss: Optional[float],
 ) -> Optional[float]:
     """训练/验证损失之差；任一端缺失或差值溢出时返回 None。"""
-    if train_loss is None or val_loss is None:
+    train_value = _finite_float(train_loss)
+    val_value = _finite_float(val_loss)
+    if train_value is None or val_value is None:
         return None
-    difference = float(train_loss) - float(val_loss)
+    difference = train_value - val_value
     if not math.isfinite(difference):
         return None
     return round(difference, 6)
