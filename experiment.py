@@ -26732,7 +26732,11 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
     if not math.isfinite(t):
         return 0.0
 
-    if df >= 1.0e6:
+    # 大自由度下不完全 Beta 的 lgamma 差分仍足够精确，直到
+    # 约 1e9 才出现 1e-6 量级的舍入误差；而一阶正态尾修正
+    # 在 df=1e6、t=30 时误差近 2%。取两者误差交叉点附近
+    # 2.5e8 为界：其下走不完全 Beta，其上走正态极限。
+    if df >= 2.5e8:
         magnitude = abs(t)
         if magnitude > 40.0:
             return 0.0

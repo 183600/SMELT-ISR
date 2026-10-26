@@ -9348,6 +9348,16 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=expected * 1.0e-6,
             )
 
+    def test_t_p_value_uses_exact_beta_before_normal_limit(self):
+        # df=1e6、t=30 时一阶正态尾修正仍有约 2% 误差；
+        # 不完全 Beta 在此自由度下精度约 5e-10，应优先使用。
+        self.assertAlmostEqual(
+            experiment._two_sided_t_p_value(30.0, 1.0e6)
+            / 1.2020094233664118e-197,
+            1.0,
+            places=9,
+        )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None
