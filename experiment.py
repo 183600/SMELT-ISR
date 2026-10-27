@@ -29843,6 +29843,26 @@ def _tost_power_normal_mix(
     """
     if math.isinf(upper):
         return 1.0
+    # 等价界相对 sqrt(df) 很小时，Q_chi2(df·(|Y|/U)²) 在 Y=±U
+    # 附近的转折宽度约为 U/sqrt(df)。原来的固定 0.01 网格会
+    # 跨过整段转折（df=3026、U≈0.027 时约 0.0005 宽），
+    # Simpson 严重低估功效（相对误差可达 14%）。此时改在
+    # u=sqrt(V) 的 chi 节点上积分条件正态区间概率：
+    #   P(|T'|≤U) = E_u[Φ(U·u/√df - δ) - Φ(-U·u/√df - δ)]，
+    # 被积函数对 u 平滑，节点权重已按 chi 密度归一。
+    if upper < math.sqrt(df_value):
+        a = upper / math.sqrt(df_value)
+        u_values, weighted = _t_power_nodes(df_value)
+        total = 0.0
+        for u, weight in zip(u_values, weighted):
+            if weight == 0.0:
+                continue
+            total += weight * (
+                _normal_cdf(a * u - noncentrality)
+                - _normal_cdf(-a * u - noncentrality)
+            )
+        return min(1.0, max(0.0, total))
+
     total = 0.0
     intervals = 2400
     low = -12.0

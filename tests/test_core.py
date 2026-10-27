@@ -389,6 +389,43 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(with_zero["n_zero"], 2)
         self.assertEqual(with_zero["n_nonzero"], 3)
 
+    def test_tost_power_resolves_narrow_equivalence_boundary(self):
+        # 大 df、大 margin/临界值比时，正常功效表达式的转折宽度
+        # 只有 upper/sqrt(df)（本例约 5e-4），固定 0.01 网格
+        # 会把这一段整体跨过并低估功效。参考值由 SciPy 非中心 t
+        # CDF 差（upper = margin - t_{1-alpha,df}）高精度复核。
+        cases = (
+            (
+                3026.1544367406605,
+                2.638701447487692,
+                0.8863036119918171,
+                0.1951440750942129,
+                0.0006652944300069687,
+            ),
+            (
+                160.86216210361707,
+                1.6523599113942893,
+                3.7796112570198046,
+                0.00012166870603104297,
+                0.005347019781185125,
+            ),
+            (
+                69809.78603112319,
+                -0.586314062797227,
+                5.207860576274624,
+                1.4092235790709054e-07,
+                0.04845356607606455,
+            ),
+        )
+        for df, effect, margin, alpha, expected in cases:
+            power = experiment._tost_power(
+                effect, 1.0, df, margin, alpha
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(
+                power / expected, 1.0, places=9
+            )
+
     def test_fragility_detects_single_seed_dependence(self):
         # 5 个种子里 4 个差值约 1、1 个 3：整体显著，但删掉
         # 任意一个「1」后只剩 4 个观测，p 值回到 0.09。
