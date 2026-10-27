@@ -29010,6 +29010,7 @@ def _normal_interval_probability(low: float, high: float) -> float:
 @functools.lru_cache(maxsize=64)
 def _t_power_nodes(
     df: float,
+    u_max: Optional[float] = None,
 ) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     """
     t 分布功效积分的 Simpson 节点与权重（按 df 缓存）。
@@ -29019,9 +29020,12 @@ def _t_power_nodes(
     g(u) = 2^(1-df/2) u^(df-1) exp(-u^2/2) / Γ(df/2)，
     且 P(|T| > c | u) = Φ(-c·u/√df - δ) + 1 - Φ(c·u/√df - δ)。
 
-    积分区间上界取 chi 分布众数 sqrt(df-1) 加 _T_POWER_TAIL
-    （chi 分布的宽度约 1/√2，右尾可安全截断）；节点数随区间
-    长度自适应，保证 df 从 0.5 到数千都足够精确。
+    默认积分区间上界取 chi 分布众数 sqrt(df-1) 加
+    _T_POWER_TAIL（chi 分布的宽度约 1/√2，右尾可安全截断）；
+    节点数随区间长度自适应，保证 df 从 0.5 到数千都足够精确。
+    ``u_max`` 可显式扩展上界：低自由度、大非中心参数的非中心 t
+    CDF 其正态尾转折可能落在默认截断之外，需要按转折位置扩界
+    而不是误把整段概率质量截掉。
 
     对 df<3，chi 密度在 u=0 附近以 u^(df-1) 变化；df 接近 1
     时导数无界，固定 u 网格上的 Simpson 会少积概率质量
@@ -29034,7 +29038,8 @@ def _t_power_nodes(
     df 较大时也不会溢出。
     """
     mode = math.sqrt(df - 1.0) if df > 1.0 else 0.0
-    u_max = mode + _T_POWER_TAIL
+    if u_max is None:
+        u_max = mode + _T_POWER_TAIL
     log_gamma = math.lgamma(df / 2.0)
     log_const = (1.0 - df / 2.0) * math.log(2.0) - log_gamma
 
@@ -29736,6 +29741,10 @@ def _noncentral_t_cdf(
         return _normal_cdf(value - noncentrality)
     if df <= 0.0:
         return None
+    if value == 0.0:
+        # T'=0 当且仅当 Z+δ<=0，与 V 无关；直接由正态 CDF 给出，
+        # 避免低自由度截断积分少算 chi 尾部概率。
+        return _normal_cdf(-noncentrality)
     if df >= 3.0 and abs(value) / math.sqrt(df) >= 0.05:
         return _noncentral_t_cdf_large_shift(
             value,
@@ -29743,8 +29752,35 @@ def _noncentral_t_cdf(
             noncentrality,
         )
 
-    u_values, weighted = _t_power_nodes(df)
     scale = 1.0 / math.sqrt(df)
+    if df < 3.0 and value > 0.0 and noncentrality > 0.0:
+        # 正态尾在 u 轴的转折位置约为
+        # a*δ/(1+a²)（a=value/√df）。df<3 时默认 u 上界只有
+        # √(df-1)+12，δ 较大而 value 较小时转折会落在截断之外，
+        # 从而丢掉整个可表示的正尾概率。
+        a = value * scale
+        peak_u = a * noncentrality / (1.0 + a * a)
+        default_u_max = (
+            math.sqrt(df - 1.0) + _T_POWER_TAIL
+            if df > 1.0
+            else _T_POWER_TAIL
+        )
+        if peak_u > default_u_max - 2.0:
+            extended_u_max = peak_u + _T_POWER_TAIL
+            if math.isfinite(extended_u_max):
+                u_values, weighted = _t_power_nodes(
+                    df, extended_u_max
+                )
+                total = 0.0
+                for u, weight in zip(u_values, weighted):
+                    if weight == 0.0:
+                        continue
+                    total += weight * _normal_cdf(
+                        value * u * scale - noncentrality
+                    )
+                return min(1.0, max(0.0, total))
+
+    u_values, weighted = _t_power_nodes(df)
     total = 0.0
     for u, weight in zip(u_values, weighted):
         if weight == 0.0:

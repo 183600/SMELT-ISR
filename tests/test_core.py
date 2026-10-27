@@ -9505,6 +9505,37 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=reference * 1.0e-6,
             )
 
+    def test_noncentral_t_cdf_keeps_extreme_positive_tail_small_df(self):
+        # df<3 时默认 u 上界只到 sqrt(df-1)+12；δ 很大而
+        # t 较小时正态尾转折落在截断之外，固定节点会漏掉
+        # 整段仍可表示的正尾概率（如 df=1、δ=30、t=1 时
+        # 修复前约少 34 个数量级）。参考值由高精度非中心 t
+        # 积分/scipy.stats.nct 核对。
+        for df, value, noncentrality, reference in (
+            (
+                1.0015698948012253,
+                3.5197953216011717,
+                58.69935129607124,
+                5.4144106824582216e-58,
+            ),
+            (1.0, 1.0, 30.0, 7.212994172451246e-100),
+            (2.0, 1.0, 30.0, 2.972314784251633e-131),
+        ):
+            cdf = experiment._noncentral_t_cdf(
+                value, df, noncentrality
+            )
+            self.assertIsNotNone(cdf)
+            self.assertAlmostEqual(
+                cdf,
+                reference,
+                delta=reference * 1.0e-8,
+            )
+        self.assertAlmostEqual(
+            experiment._noncentral_t_cdf(0.0, 1.0, 30.0),
+            experiment._normal_cdf(-30.0),
+            delta=0.0,
+        )
+
     def test_t_power_handles_small_df_without_overflow(self):
         u_values, weights = experiment._t_power_nodes(0.01)
         self.assertEqual(len(u_values), len(weights))
