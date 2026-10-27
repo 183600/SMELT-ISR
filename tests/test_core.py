@@ -9885,27 +9885,33 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         base_a = [1.0, 2.0, 3.0, 4.0, 5.0]
         base_b = [1.1, 2.1, 3.1, 4.1, 5.1]
         normal = experiment._welch_t_test(base_a, base_b)
-        tiny_scale = 1.0e-300
-        tiny = experiment._welch_t_test(
-            [value * tiny_scale for value in base_a],
-            [value * tiny_scale for value in base_b],
-        )
-        self.assertEqual(tiny["test"], "welch_t")
-        self.assertAlmostEqual(tiny["t"], normal["t"], places=12)
-        self.assertAlmostEqual(
-            tiny["p_value"], normal["p_value"], places=12
-        )
-        self.assertAlmostEqual(tiny["df"], normal["df"], places=12)
-        self.assertAlmostEqual(
-            tiny["effect"] / tiny_scale,
-            normal["effect"],
-            places=12,
-        )
-        self.assertAlmostEqual(
-            tiny["se"] / tiny_scale,
-            normal["se"],
-            places=12,
-        )
+        # 1e-80 落在旧缩放阈值（1e-150）之上，但 vari/n 的平方
+        # 已进入次正规数范围；必须仍与正常量级给出同一 df。
+        for tiny_scale in (1.0e-80, 1.0e-100, 1.0e-300):
+            tiny = experiment._welch_t_test(
+                [value * tiny_scale for value in base_a],
+                [value * tiny_scale for value in base_b],
+            )
+            self.assertEqual(tiny["test"], "welch_t")
+            self.assertAlmostEqual(
+                tiny["t"], normal["t"], places=12
+            )
+            self.assertAlmostEqual(
+                tiny["p_value"], normal["p_value"], places=12
+            )
+            self.assertAlmostEqual(
+                tiny["df"], normal["df"], places=12
+            )
+            self.assertAlmostEqual(
+                tiny["effect"] / tiny_scale,
+                normal["effect"],
+                places=12,
+            )
+            self.assertAlmostEqual(
+                tiny["se"] / tiny_scale,
+                normal["se"],
+                places=12,
+            )
 
     def test_welch_test_preserves_large_scale(self):
         base_a = [1.0, 2.0, 3.0, 4.0, 5.0]

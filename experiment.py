@@ -28807,8 +28807,11 @@ def _welch_t_test(
         }
 
     # Welch-Satterthwaite 自由度：正常量级沿用历史公式，保持
-    # 逐位一致；只有 (var/n)**2 可能溢出时才改用相对方差计算，
-    # 公共缩放因子在分子分母中会抵消。
+    # 逐位一致；平方项可能溢出 **或下溢** 时才改用相对方差计算，
+    # 公共缩放因子在分子分母中会抵消。下溢同样会破坏精度：
+    # term≈1e-161、se²≈1e-160 时平方落到次正规数，直接相除会
+    # 给出错误的 df（如真实 df=4 被算成 4.018），进而污染 p 值/
+    # 置信区间；这里在平方可能进入次正规范围前就切到缩放路径。
     df = None
     try:
         old_denominator = (
@@ -28818,6 +28821,8 @@ def _welch_t_test(
         if (
             old_denominator > 0.0
             and math.isfinite(old_denominator)
+            and old_denominator >= sys.float_info.min
+            and se_squared >= math.sqrt(sys.float_info.min)
         ):
             candidate = (
                 se_squared * se_squared / old_denominator
