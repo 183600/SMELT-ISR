@@ -9971,6 +9971,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 1.0,
             )
 
+    def test_t_power_handles_finite_huge_noncentrality(self):
+        # effect/se 仍可表示为有限 float，但在正态混合积分中
+        # log_x=2*log_u-log(2) 已超出 math.exp 的范围；这里
+        # 必须直接取 chi-square CDF 的极限 1，不能抛
+        # OverflowError 中断功效/等价性报告。
+        for df in (0.1, 0.5, 1.0):
+            for se in (1.0e-200, 1.0e-300):
+                self.assertAlmostEqual(
+                    experiment._t_power(1.0, se, df),
+                    1.0,
+                    delta=1.0e-12,
+                )
+
     def test_t_power_keeps_extreme_normal_tails(self):
         # 1-CDF 在大 z 处会抵消成 0，导致极小 alpha 下的功效
         # 被严重低估；负半轴必须直接用 erfc 计算。

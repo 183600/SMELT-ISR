@@ -29178,6 +29178,12 @@ def _t_power_large_shift_normal_mix(
         if not math.isfinite(log_u):
             return 0.0
         log_x = 2.0 * log_u - math.log(2.0)
+        if log_x >= 700.0:
+            # x = exp(log_x) 已经大到超出 float 范围；对任何
+            # 正自由度，chi-square CDF 在该点都等于 1 到双精度。
+            # 不能继续做 math.exp(log_x)（会抛 OverflowError
+            # 中断整份功效/等价性报告）。
+            return 1.0
         if log_x < -700.0:
             # u 极小，u² 可能下溢为 0；用 x^a/Γ(a+1) 的
             # 对数形式保留仍可表示的概率。
