@@ -9000,6 +9000,35 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 123, "abc"
             ),
         )
+        # 当前数据新加载，缺字段只会是 None；其余损坏值同样
+        # 不能静默放行。
+        self.assertIsNone(
+            experiment.resume_split_change_error(
+                {"train": "a"}, None
+            )
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error(
+                {"train": "a"}, []
+            ),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error(
+                {"train": "a"}, 123
+            ),
+        )
+        self.assertIsNone(
+            experiment.resume_effective_train_change_error("abc", None)
+        )
+        self.assertIsNone(
+            experiment.resume_effective_train_change_error("abc", "")
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_effective_train_change_error("abc", 123),
+        )
 
     def test_degenerate_run_cleaning_handles_partial_exclusions(self):
         # 一个被其他清洗剔除的字节把长退化段切成两段；两个

@@ -1699,8 +1699,17 @@ def resume_split_change_error(
             "无法核对检查点与当前数据是否同一划分，拒绝续跑；"
             "请修复检查点或换用全新的 --out 目录从头训练。"
         )
-    if not isinstance(current_split_sha256, dict):
+    if current_split_sha256 is None:
         return None
+    if not isinstance(current_split_sha256, dict):
+        # 当前数据是新加载的；旧数据集只会缺字段（None）。
+        # 其余非对象取值只可能来自损坏的数据/缓存，不能把
+        # 「无法核对」当成「没有变化」放行续跑。
+        return (
+            "resume 当前数据划分内容指纹记录格式损坏（不是对象）："
+            "无法核对检查点与当前数据是否同一划分，拒绝续跑；"
+            "请重建数据缓存或换用全新的 --out 目录从头训练。"
+        )
 
     mismatched = []
     invalid = []
@@ -1768,8 +1777,17 @@ def resume_effective_train_change_error(
             "无法核对检查点与当前清洗后的训练内容，拒绝续跑；"
             "请修复检查点或换用全新的 --out 目录从头训练。"
         )
-    if not isinstance(current_sha256, str) or not current_sha256:
+    if current_sha256 is None or current_sha256 == "":
         return None
+    if not isinstance(current_sha256, str):
+        # 当前数据是新加载的；旧数据集只会缺字段（None/空串）。
+        # 其余非字符串取值只可能来自损坏的数据/缓存，不能把
+        # 「无法核对」当成「没有变化」放行续跑。
+        return (
+            "resume 当前有效训练集指纹记录格式损坏（不是字符串）："
+            "无法核对检查点与当前清洗后的训练内容，拒绝续跑；"
+            "请重建数据缓存或换用全新的 --out 目录从头训练。"
+        )
     if saved_sha256 == current_sha256:
         return None
 
