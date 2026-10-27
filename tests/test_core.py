@@ -8933,6 +8933,16 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "格式损坏",
             experiment.resume_data_change_error(123, "abc"),
         )
+        # 损坏的保存指纹不能因为当前指纹缺失/为空而绕过格式
+        # 检查，否则无法核对时会被静默放行。
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_data_change_error(123, None),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_data_change_error(123, ""),
+        )
         self.assertIsNone(
             experiment.resume_data_change_error("", "abc")
         )

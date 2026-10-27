@@ -1653,13 +1653,18 @@ def resume_data_change_error(
     """
     if saved_sha256 is None or saved_sha256 == "":
         return None
+    if not isinstance(saved_sha256, str):
+        # 非字符串只可能来自损坏的检查点/config；不能因为
+        # 当前指纹缺失（None/空串）就当成「没有变化」继续
+        # 续跑，格式检查必须先于「无法核对」的兼容放行。
+        return (
+            "resume 数据指纹记录格式损坏（不是字符串）："
+            "无法核对检查点与当前数据是否同一份，拒绝续跑；"
+            "请修复检查点或换用全新的 --out 目录从头训练。"
+        )
     if current_sha256 is None or current_sha256 == "":
         return None
-    if not isinstance(saved_sha256, str) or not isinstance(
-        current_sha256, str
-    ):
-        # 非字符串只可能来自损坏的检查点/config；不能因为
-        # 无法切片比较就当成「没有变化」继续续跑。
+    if not isinstance(current_sha256, str):
         return (
             "resume 数据指纹记录格式损坏（不是字符串）："
             "无法核对检查点与当前数据是否同一份，拒绝续跑；"
