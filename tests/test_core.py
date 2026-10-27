@@ -9001,6 +9001,36 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             ),
         )
 
+    def test_degenerate_run_cleaning_handles_partial_exclusions(self):
+        # 一个被其他清洗剔除的字节把长退化段切成两段；两个
+        # 剩余片段都仍达到阈值，不能因为原段与排除区间重叠就
+        # 整段跳过，否则 post-clean 训练流仍含退化段。
+        raw = bytearray(b"a" * 100)
+        spans, stats = (
+            experiment._plan_train_degenerate_run_cleaning(
+                raw,
+                len(raw),
+                32,
+                [(50, 51)],
+            )
+        )
+        self.assertEqual(spans, [(0, 50), (51, 100)])
+        self.assertEqual(stats["runs_dropped"], 2)
+        self.assertEqual(stats["dropped_bytes"], 99)
+        self.assertEqual(stats["max_run_bytes"], 50)
+        self.assertEqual(stats["post_clean_train_bytes"], 0)
+        # 排除区间若把剩余两侧都压到阈值以下，则不清洗。
+        spans, stats = (
+            experiment._plan_train_degenerate_run_cleaning(
+                raw,
+                len(raw),
+                32,
+                [(20, 80)],
+            )
+        )
+        self.assertEqual(spans, [])
+        self.assertEqual(stats["runs_dropped"], 0)
+
     def test_statistics_tolerate_large_finite_floats(self):
         huge = 1.0e308
         self.assertEqual(experiment._mean([huge, huge]), huge)

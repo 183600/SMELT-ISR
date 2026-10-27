@@ -8991,8 +8991,10 @@ def _plan_train_degenerate_run_cleaning(
     常见形态），绝不修补字节，也绝不动 val/test。
 
     与群组版异常值清洗同一防御目标；连续流没有群组边界，
-    只能按退化段本身剔除。与已经被其他清洗剔除的区间重叠的
-    段不重复统计，避免组合清洗区间重叠。
+    只能按退化段本身剔除。已经在其他清洗中被剔除的区间不再
+    扫描，但同一条原始退化段被排除区间切成两段时，两个剩余
+    片段仍分别接受阈值检查：否则单个被排除字节就能让整条退化
+    段逃过清洗，清洗审计反而会继续报告残留退化段。
     """
     merged_excluded = _merge_byte_intervals(
         list(already_excluded)
@@ -9012,31 +9014,30 @@ def _plan_train_degenerate_run_cleaning(
         "examples": [],
     }
 
-    for start, end, value in _degenerate_run_spans(
-        memoryview(raw),
+    for interval_start, interval_end in _subtract_byte_intervals(
         0,
         train_end,
-        min_bytes,
+        merged_excluded,
     ):
-        if any(
-            start < excluded_end and end > excluded_start
-            for excluded_start, excluded_end in merged_excluded
+        for start, end, value in _degenerate_run_spans(
+            memoryview(raw),
+            interval_start,
+            interval_end,
+            min_bytes,
         ):
-            continue
-
-        stats["runs_dropped"] += 1
-        stats["dropped_bytes"] += end - start
-        stats["max_run_bytes"] = max(
-            int(stats["max_run_bytes"]),
-            end - start,
-        )
-        excluded.append((start, end))
-        if len(stats["examples"]) < 5:
-            stats["examples"].append([
-                start,
-                end,
-                value,
-            ])
+            stats["runs_dropped"] += 1
+            stats["dropped_bytes"] += end - start
+            stats["max_run_bytes"] = max(
+                int(stats["max_run_bytes"]),
+                end - start,
+            )
+            excluded.append((start, end))
+            if len(stats["examples"]) < 5:
+                stats["examples"].append([
+                    start,
+                    end,
+                    value,
+                ])
 
     stats["post_clean_train_bytes"] = (
         train_end
