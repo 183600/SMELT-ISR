@@ -8964,6 +8964,43 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_resume_checks_reject_corrupt_top_level_fingerprints(self):
+        # None 只代表旧检查点缺字段；列表/数字等损坏值不能被
+        # 当成「没有记录」而静默放行续跑。
+        self.assertIsNone(
+            experiment.resume_split_change_error(None, {})
+        )
+        self.assertIsNone(
+            experiment.resume_split_isolation_change_error(
+                None, {}
+            )
+        )
+        self.assertIsNone(
+            experiment.resume_effective_train_change_error(
+                None, "abc"
+            )
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error([], {}),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error("abc", {}),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_isolation_change_error(
+                123, {}
+            ),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_effective_train_change_error(
+                123, "abc"
+            ),
+        )
+
     def test_statistics_tolerate_large_finite_floats(self):
         huge = 1.0e308
         self.assertEqual(experiment._mean([huge, huge]), huge)

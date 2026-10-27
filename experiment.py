@@ -1689,8 +1689,16 @@ def resume_split_change_error(
     不同意味着检查点的 RNG/优化器状态对应另一批训练样本，必须
     拒绝续跑而不是把两套划分混成一条轨迹。
     """
-    if not isinstance(saved_split_sha256, dict):
+    if saved_split_sha256 is None:
         return None
+    if not isinstance(saved_split_sha256, dict):
+        # 旧检查点缺字段是 None；其余非对象取值只可能来自损坏
+        # 的检查点。不能把「无法核对」当成「没有变化」放行。
+        return (
+            "resume 数据划分内容指纹记录格式损坏（不是对象）："
+            "无法核对检查点与当前数据是否同一划分，拒绝续跑；"
+            "请修复检查点或换用全新的 --out 目录从头训练。"
+        )
     if not isinstance(current_split_sha256, dict):
         return None
 
@@ -1752,8 +1760,14 @@ def resume_effective_train_change_error(
     计数与数据采样的有效范围都会变。此时续跑等于把旧检查点的
     优化器/RNG 轨迹接到另一套训练样本上，必须拒绝。
     """
-    if not isinstance(saved_sha256, str) or not saved_sha256:
+    if saved_sha256 is None or saved_sha256 == "":
         return None
+    if not isinstance(saved_sha256, str):
+        return (
+            "resume 有效训练集指纹记录格式损坏（不是字符串）："
+            "无法核对检查点与当前清洗后的训练内容，拒绝续跑；"
+            "请修复检查点或换用全新的 --out 目录从头训练。"
+        )
     if not isinstance(current_sha256, str) or not current_sha256:
         return None
     if saved_sha256 == current_sha256:
@@ -1781,10 +1795,16 @@ def resume_split_isolation_change_error(
     记录一起核对，避免续跑接到另一套时间切分上。旧检查点
     没有该字段时返回 None，由调用方给出兼容提示。
     """
+    if saved_isolation is None:
+        return None
     if not isinstance(saved_isolation, dict) or not isinstance(
         current_isolation, dict
     ):
-        return None
+        return (
+            "resume 时序隔离记录格式损坏（不是对象）：无法核对"
+            "检查点与当前 train/val/test 边界，拒绝续跑；请修复"
+            "检查点或换用全新的 --out 目录从头训练。"
+        )
 
     def canonical(value):
         """把记录转成键类型安全的可比较结构。
