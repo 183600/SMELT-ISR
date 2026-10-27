@@ -28196,8 +28196,12 @@ def _leave_one_out_effect_stability(
             for value in leave_one_out
         )
     else:
+        # 直接比较符号，而不是 value * full_effect > 0：两个
+        # 极小但同向的效应相乘会下溢成 0，把方向稳定误报成
+        # 翻转。零效应仍按不稳定处理（与乘积口径一致）。
         stable = all(
-            value * full_effect > 0.0
+            value != 0.0
+            and (value > 0.0) == (full_effect > 0.0)
             for value in leave_one_out
         )
 
@@ -28406,7 +28410,9 @@ def _paired_result_fragility(
         for entry in leave_one_out
         if isinstance(entry.get("effect"), (int, float))
         and not isinstance(entry.get("effect"), bool)
-        and float(entry["effect"]) * mean < 0.0
+        and float(entry["effect"]) != 0.0
+        and mean != 0.0
+        and (float(entry["effect"]) > 0.0) != (mean > 0.0)
     ]
 
     # 最少删除几个种子会失去显著性。只在剩余样本仍满足最小
