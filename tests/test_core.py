@@ -9678,6 +9678,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             power, expected, delta=expected * 1.0e-9
         )
 
+    def test_tost_power_large_df_matches_normal_limit(self):
+        # df 很大时 chi 密度宽度仍约为 1，而 u 轴长度约为
+        # sqrt(df)；_tost_power_normal_mix 的固定节点上限会跨过
+        # 整段密度，把很低的功效误报为 1。参考值由 SciPy 的
+        # t 临界值与正态 CDF 差独立计算。
+        for df, margin, effect, expected in (
+            (1.0e6, 5.0, 1.0, 0.9907356077143294),
+            (1.0e6, 2.0, 0.5, 0.2461771369824705),
+            (1.0e9, 5.0, 1.0, 0.9907356456869842),
+            (1.0e9, 2.0, 0.5, 0.24617815924233505),
+        ):
+            power = experiment._tost_power(
+                effect, 1.0, df, margin, 0.05
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(
+                power, expected, delta=1.0e-8
+            )
+
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

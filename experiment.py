@@ -28995,6 +28995,18 @@ def _normal_cdf(value: float) -> float:
     return 1.0 - 0.5 * math.erfc(scaled)
 
 
+def _normal_interval_probability(low: float, high: float) -> float:
+    """P(low < N(0,1) <= high)，在两端同为正值时避免相减抵消。"""
+    if low >= high:
+        return 0.0
+    if low > 0.0:
+        return (
+            0.5 * math.erfc(low / math.sqrt(2.0))
+            - 0.5 * math.erfc(high / math.sqrt(2.0))
+        )
+    return _normal_cdf(high) - _normal_cdf(low)
+
+
 @functools.lru_cache(maxsize=64)
 def _t_power_nodes(
     df: float,
@@ -29857,9 +29869,9 @@ def _tost_power_normal_mix(
         for u, weight in zip(u_values, weighted):
             if weight == 0.0:
                 continue
-            total += weight * (
-                _normal_cdf(a * u - noncentrality)
-                - _normal_cdf(-a * u - noncentrality)
+            total += weight * _normal_interval_probability(
+                -a * u - noncentrality,
+                a * u - noncentrality,
             )
         return min(1.0, max(0.0, total))
 
@@ -29969,6 +29981,16 @@ def _tost_power(
             return 0.0
         survival = _chi_square_survival(threshold, df_value)
         return survival if survival is not None else 0.0
+    if df_value >= _T_POWER_NORMAL_DF:
+        # 自由度趋于无穷时非中心 t 退化为 N(δ, 1)。不能继续
+        # 走 _tost_power_normal_mix：df 很大时 chi 密度宽度仍
+        # 约为 1，而 u 轴长度约为 sqrt(df)，固定节点上限会把
+        # 整段密度跨过，甚至在小效应下返回 1。
+        power = _normal_interval_probability(
+            -upper - noncentrality,
+            upper - noncentrality,
+        )
+        return min(1.0, max(0.0, power))
     if (
         abs(noncentrality) > 16.0
         or (df_value >= 2.0 and upper < 10.0)
