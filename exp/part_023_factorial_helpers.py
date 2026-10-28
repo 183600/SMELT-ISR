@@ -717,6 +717,39 @@ def _log_gamma_ratio_half(z: float) -> float:
 
 
 
+def _stirling_log_gamma_correction(z: float) -> float:
+    """log Γ(z) 的 Stirling 级数修正项（z 足够大时）。"""
+    inverse = 1.0 / z
+    squared = inverse * inverse
+    return inverse * (
+        1.0 / 12.0
+        - squared * (
+            1.0 / 360.0
+            - squared * (
+                1.0 / 1260.0
+                - squared * (
+                    1.0 / 1680.0
+                    - squared * (
+                        1.0 / 1188.0
+                        - squared * (691.0 / 360360.0)
+                    )
+                )
+            )
+        )
+    )
+
+
+def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
+    """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
+    return (
+        (z + delta - 0.5) * math.log1p(delta / z)
+        + delta * math.log(z)
+        - delta
+        + _stirling_log_gamma_correction(z + delta)
+        - _stirling_log_gamma_correction(z)
+    )
+
+
 def _log_beta_front(a: float, b: float) -> float:
     """
     返回 log(1/B(a, b))，即不完全 Beta 前因子中的常数项。
@@ -743,7 +776,7 @@ def _log_beta_front(a: float, b: float) -> float:
     # 很小、trials≈1e12 的情形，直接相减会让上界偏差几个
     # 百分点（b=2 时约 5%）。
     if math.isfinite(a) and math.isfinite(b):
-        if b == int(b) and 1 <= b <= 1024:
+        if 1 <= b <= 1024.0 and b == int(b):
             return (
                 math.fsum(
                     math.log(a + index)
@@ -751,12 +784,25 @@ def _log_beta_front(a: float, b: float) -> float:
                 )
                 - math.lgamma(b)
             )
-        if a == int(a) and 1 <= a <= 1024:
+        if 1 <= a <= 1024.0 and a == int(a):
             return (
                 math.fsum(
                     math.log(b + index)
                     for index in range(int(a))
                 )
+                - math.lgamma(a)
+            )
+        # 两个参数都很大时，前两类都不适用，lgamma 相减仍会
+        # 丢掉约一个 double ulp 的绝对精度（a+b、b≈1e15 时
+        # 可达数个单位），必须用 Stirling 比值直接计算。
+        if a >= b and a >= 8.0:
+            return (
+                _log_gamma_ratio_stirling(a, b)
+                - math.lgamma(b)
+            )
+        if b > a and b >= 8.0:
+            return (
+                _log_gamma_ratio_stirling(b, a)
                 - math.lgamma(a)
             )
     return (
