@@ -25137,6 +25137,11 @@ _HYPOTHESIS_MIN_EFFECT_ABS_FLOOR = 1.0e-12
 # 也不会把全部质量丢在积分区间之外。
 _T_POWER_TAIL = 12.0
 _T_POWER_MIN_INTERVALS = 800
+# df<1 时 t=u^(1/p) 的幂次至少为 3，800 个区间在 df=0.5、
+# δ=100 的转折处仍只有几个节点，非中心 t CDF 会偏高约
+# 4.8e-5；这些低自由度单独提高到 1600，避免拖慢 df>=1 的
+# 常用功效计算。
+_T_POWER_SMALL_DF_MIN_INTERVALS = 1600
 _T_POWER_MAX_INTERVALS = 4000
 # df 达到该量级时，固定 u 网格上的 Simpson 会因 chi 密度
 # 宽约 1/√2 而节点不足；非中心 t 也已充分接近正态极限。
@@ -29168,8 +29173,13 @@ def _t_power_nodes(
             5, min(1000, int(math.ceil(3.0 / df)))
         )
         t_max = u_max ** (1.0 / exponent)
+        minimum_intervals = (
+            _T_POWER_SMALL_DF_MIN_INTERVALS
+            if df < 1.0
+            else _T_POWER_MIN_INTERVALS
+        )
         intervals = max(
-            _T_POWER_MIN_INTERVALS,
+            minimum_intervals,
             math.ceil(t_max * 24.0),
         )
         intervals = min(intervals, _T_POWER_MAX_INTERVALS)

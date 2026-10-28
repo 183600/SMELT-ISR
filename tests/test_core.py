@@ -9611,6 +9611,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=reference * 1.0e-6,
             )
 
+    def test_noncentral_t_cdf_resolves_small_df_moderate_shift(self):
+        # df=0.5、t=50、δ=100 时正态尾转折落在 u≈1.4，
+        # t=u^(1/6) 网格上 800 个区间只有几个节点，CDF 会偏高
+        # 约 4.8e-5；提高默认节点数后应达到双精度精度。
+        reference = 0.06794650010173649
+        cdf = experiment._noncentral_t_cdf(50.0, 0.5, 100.0)
+        self.assertIsNotNone(cdf)
+        self.assertAlmostEqual(
+            cdf,
+            reference,
+            delta=reference * 1.0e-8,
+        )
+
     def test_noncentral_t_cdf_keeps_extreme_positive_tail_small_df(self):
         # df<3 时默认 u 上界只到 sqrt(df-1)+12；δ 很大而
         # t 较小时正态尾转折落在截断之外，固定节点会漏掉
