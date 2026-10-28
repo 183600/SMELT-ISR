@@ -384,7 +384,8 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 **完整实现一致性：部分修复/部分限制。**
 
 - 位置编码：仍是可学习绝对位置编码，不是 RoPE；4096 packed
-  context 与文档级 attention mask 未实现。
+  context 与文档级 attention mask 已实现（`--paper-protocol` /
+  `--document-masks`，见 [paper_reproduction.md](paper_reproduction.md)）。
 - 分支 Attention：隔离语义正确（自测验证）。
 - checkpoint 重算：数值等价（自测）；没有随机算子，因此当前
   无需保存 RNG 状态。
@@ -523,7 +524,7 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 - 新增 `--plan-design`：不加载数据、不训练，只生成/打印
   `design_plan.json`——运行清单、随机化区组顺序、先验功效与
   解析 token 预算，供冻结前检查。
-- 新增 `--run-order {grouped,blocked,randomized}` 与
+- 新增 `--run-order {grouped,blocked,randomized,counterbalanced}` 与
   `--run-order-seed`，默认 `randomized`：每个种子是完整区组，
   区组内臂顺序确定性随机化；`grouped` 仅保留用于兼容旧运行。
   预注册可用 `run_order` 冻结方案与种子，命令行冲突拒绝启动。
@@ -1077,9 +1078,10 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
 - bottom-k 草图只负责候选生成，候选可能漏掉「长度差异极大但短
   文档被完整包含」的群组：这类关系的 Jaccard 本身很低，应该用
   单独的 containment 指标或实体清单处理，而不是偷偷降低阈值。
-- 近重复审计回答的是「train 是否与 val/test 或更早 train 近似」，
-  不扫描 val/test 内部的近重复；评估集内部近重复仍由精确群组
-  审计与 `--allow-eval-duplicates` 处理，二者的检测对象不同。
+- 近重复审计的 train 部分回答「train 是否与 val/test 或更早
+  train 近似」；val/test 内部与 val↔test 的群组近重复由第 38 节
+  的 `data_audit.evaluation_near_duplicates` 单独报告（默认只读
+  val，解封 test 后才含 test），二者检测对象不同。
 - 超过 4 MiB 的群组跳过，避免完整 shingle 集合内存不可控；大文档
   应先在文档内分块/按小节定义群组，再运行近重复审计。
 

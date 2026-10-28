@@ -18,7 +18,7 @@ This structure explores whether delayed merging improves the expressiveness of e
 
 ## 🚀 Key features
 
-- **Four model modes**:
+- **Model modes**:
   - `smelt`: the original SMELT architecture (middle layers loop twice, merged immediately each round).
   - `A`: local delayed merge (expert branches stay independent only within the same MoE layer, merged after phase two).
   - `B`: global delayed merge (after round 1 creates independent branches, the entire middle Transformer block — attention and MoE — stays branch-independent, merging only after round 2).
@@ -26,6 +26,7 @@ This structure explores whether delayed merging improves the expressiveness of e
   - `local_base_k2`: an immediate-merge control with the **same second-round width k2** (isolates merge timing).
   - `local_base`: an immediate-merge control with the **same expert count** min(E,k1·k2) (performance control).
   - `B_early`: a B-specific iso-compute merge-position control (same branch count and Attention/MoE executions, merge moved to the end of the first pass).
+  - `dense`: a dense baseline without MoE or looping; with `dense_fnn_hidden=None` its FFN width resolves to `top_k × expert_hidden` (equal activated compute), and `--dense-fnn-hidden n_experts × expert_hidden` gives an equal-parameter control.
 - **Rigorous self-test module**: verifies gradient flow, autoregressive causality, information isolation between branches, and mathematical equivalence at boundary conditions (e.g., scheme B equals SMELT when $k=1$).
 - **Complete training foundation**: resume from checkpoints, gradient clipping, load-balancing loss, LR scheduling, and detailed experiment metrics.
 - **Controlled comparisons and statistical reliability**: every run records a comparison protocol (optimizer, LR schedule, training steps, data augmentation, data fingerprint, early-stop/AMP/device numerics, ...); `--compare` verifies that everything except the declared experimental factors is identical and detects duplicate-seed pseudo-replication; `--seeds` runs multiple random seeds and reports Mean ± Std with significance tests; `--suite-ablation` runs the (1+N)×2 full-factorial ablation (covering schemes A and B by default) and checks coverage automatically.
@@ -96,8 +97,11 @@ The pipeline is strictly leakage-safe: **split first, then process**. The corpus
 
 **Training-set deduplication**: `--deduplicate-train-groups` (requires a
 group separator) removes whole training groups whose content is identical
-to a val/test group or to an earlier training group; val/test bytes and
-split positions are left untouched. Removed content enters neither neural
+to a val group (or, when explicitly enabled, a test group) or to an earlier
+training group. By default test content is not read; pass
+`--clean-train-against-test` (or its alias
+`--allow-eval-content-for-cleaning`) to let test participate. val/test bytes
+and split positions are left untouched. Removed content enters neither neural
 training windows nor the unigram / n-gram statistical baselines or the
 distribution audit. `data_audit` records `effective_bytes` /
 `effective_windows`, and `config.data` records the actual split fractions
@@ -106,7 +110,7 @@ from split bounds only (without reading test content); before unsealing,
 the fixed test windows are independently verified for bit-exact input/target
 alignment.
 
-**Cross-split shared-chunk cleaning**: `--drop-train-shared-chunks` (requires `--group-separator`) uses the same content-defined chunk fingerprint as the audit to drop any whole training group that shares a contiguous byte chunk with val/test; val/test bytes, split positions and content fingerprints stay bit-identical, and the same audit must go back to zero afterwards. It closes the gap where exact group fingerprints miss embedded fragments, and composes with `--deduplicate-train-groups`.
+**Cross-split shared-chunk cleaning**: `--drop-train-shared-chunks` (requires `--group-separator`) uses the same content-defined chunk fingerprint as the audit to drop any whole training group that shares a contiguous byte chunk with val (or, when explicitly enabled, test); val/test bytes, split positions and content fingerprints stay bit-identical, and the same audit must go back to zero afterwards. Test content is not read unless `--clean-train-against-test` / `--allow-eval-content-for-cleaning` is passed. It closes the gap where exact group fingerprints miss embedded fragments, and composes with `--deduplicate-train-groups`.
 
 **Label-noise cleaning for ungrouped byte streams**: without a group separator, `--drop-train-corrupt-bytes` removes only the exact bytes that cannot be UTF-8 decoded and NUL bytes from `train` (no byte patching); val/test bytes and split positions are unchanged. Removed bytes enter neither training windows nor unigram / n-gram counts or the distribution audit, and `data_audit.effective_bytes` plus `config.data.train_cleaning` record the effective training basis. With `--group-separator`, use `--drop-train-corrupt-groups` instead to preserve group integrity.
 
@@ -279,7 +283,10 @@ runs/<exp_name>/
 ├── config.json      # full config, parameter count, seeds, data fingerprint, data audit, model-selection policy, code/env info, sanity-check result
 ├── metrics.jsonl    # per-line train/val metrics and final eval (loss, ppl, lr, grad_norm, ...); includes the single {"step": "test", ...} record when --evaluate-test is used
 ├── best.pt          # validation-selected weights used by final/test evaluation (atomic write)
-└── last.pt          # weights, optimizer, LR scheduler and RNG states for resume (atomic write)
+├── last.pt          # weights, optimizer, LR scheduler and RNG states for resume (atomic write)
+├── routing.json     # RQ3/RQ4 routing diagnostics (chance levels and branch semantics)
+├── routing_interventions.json  # optional routing-shuffle/expert-mask interventions (--routing-interventions)
+└── test_access_ledger.jsonl    # optional test-access ledger (--test-ledger)
 ```
 
 ## 📝 Notes and disclaimer

@@ -13,8 +13,9 @@
 
    ```bash
    git rev-parse HEAD
-   sha256sum experiment.py
-   git status --porcelain   # 必须为空
+   sha256sum experiment.py        # 入口脚本指纹（frozen_script_sha256）
+   git archive --format=tar HEAD | sha256sum  # 完整源码包指纹
+   git status --porcelain         # 必须为空
    ```
 
 3. 把 `git archive HEAD`、`requirements-ci.txt`、数据清单（SHA-256、
@@ -30,7 +31,7 @@
 {
   "study_id": "smelt-isr-confirm-001",
   "frozen_commit": "<git sha>",
-  "frozen_script_sha256": "<可选：experiment.py 的 SHA-256>",
+  "frozen_script_sha256": "<可选：入口 experiment.py 的 SHA-256>",
   "primary_metric": "val_loss_at_common_step",
   "common_step": 20000,
   "steps": 20000,
@@ -82,7 +83,11 @@
   `git diff frozen_commit..HEAD -- experiment.py` 必须为空——
   冻结后改代码必须开始新研究阶段。工作区有未提交修改、或
   提供了 `frozen_script_sha256` 而脚本内容不同，同样拒绝
-  启动。没有 git 时必须提供 `frozen_script_sha256`。
+  启动。没有 git 时必须提供 `frozen_script_sha256`。**当前入口
+  只对 `experiment.py` 做差异/脚本指纹核对，不逐个遍历 `exp/`；
+  因此还必须在冻结后用 `git archive` 保存完整源码、保持工作区
+  干净，并在归档/复核时核对 `exp/` 未变（入口本身不会拦截只改
+  `exp/` 的后继提交）。**
 - `primary_metric` 必须是评估管线真正计算的指标；`common_step`
   必须是正整数且不超过 `steps`；`min_effect` 是相对
   `baseline_mode` 均值的比例；`direction` 为 `decrease` 或

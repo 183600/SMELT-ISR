@@ -4,9 +4,9 @@
 Transformers*（arXiv:2609.01343v1），以及哪些量**不能**用公开实现逐位复现。
 代码入口：
 
-- 网格与预设：`experiment.py` 的 `PAPER_CELLS` / `paper_preset()`；
+- 网格与预设：`exp/part_000_config.py` 的 `PAPER_CELLS` / `paper_preset()`（经 `experiment.py` 兼容入口重新导出）；
 - 命令行：`--paper-cell`、`--paper-arch`、`--paper-protocol`；
-- 审计：`paper_fidelity_report()`（写入 `config.json` 的
+- 审计：`exp/part_001_paper.py` 的 `paper_fidelity_report()`（写入 `config.json` 的
   `paper_fidelity`，每次运行开始时也在标准输出打印摘要）。
 
 ## 1. 论文披露的网格（附录 A）

@@ -14,6 +14,9 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
 ## 运行模式
 
 - `base`：论文的未循环 MoE 基线。中间区域只执行一次。
+- `dense`：无 MoE、无循环的稠密基线；`dense_fnn_hidden=None`
+  时 FFN 宽度解析为 `top_k × expert_hidden`（等激活计算），
+  需要等参数容量时用 `--dense-fnn-hidden n_experts × expert_hidden`。
 - `smelt`：原始 SMELT。中间区域循环两次，每轮独立路由；
   `residual_scaling=paper`（默认）时循环区域子层残差按 1/r 缩放。
 - `A`：局部延迟合并。中间层每个 Block 的第一轮 MoE 保留 `k1` 个分支，
@@ -1039,9 +1042,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `metrics.jsonl`，全程自动记录。代码版本是三层记录：
   git commit（仓库可用时）、`git_diff_sha256`（工作区脏时对
   `git diff HEAD` 的指纹，区分同一 commit 的不同未提交状态）与
-  `script_sha256`（实验脚本自身的 SHA-256，单文件代码库下即完整
-  实验代码的指纹，不依赖 git，覆盖压缩包运行与脏工作区两种
-  commit 无法定位代码的场景）。
+  `script_sha256`（入口文件 `experiment.py` 的 SHA-256；它不覆盖
+  `exp/` 包内实现，完整源码需另行用 `git archive` 与
+  `artifact_manifest.json` 锁定，不依赖 git 的只有该入口指纹，
+  覆盖压缩包运行与脏工作区两种 commit 无法定位代码的场景）。
 - 归档完整性不依赖人工 `sha256sum`：`--write-manifest RUN_DIR`
   在目录内原子写入 `artifact_manifest.json`，逐文件记录相对
   路径、大小、SHA-256 与符号链接目标，并附生成时的
