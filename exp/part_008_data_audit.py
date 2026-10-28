@@ -344,15 +344,17 @@ def _scan_text_integrity(
     nul_bytes = 0
     position = offset
     end = offset + length
+    cursor = offset
 
-    while position < end:
-        stop = min(position + chunk, end)
-        block = bytes(raw[position:stop])
-        text = decoder.decode(
-            block,
-            final=final and stop >= end,
-        )
+    def consume(text: str, limit: int) -> None:
+        nonlocal replacements, nul_bytes, cursor
+        nonlocal pre_offset_pending
         for character in text:
+            encoded = character.encode(
+                "utf-8",
+                "surrogateescape",
+            )
+            size = len(encoded)
             codepoint = ord(character)
             if 0xDC80 <= codepoint <= 0xDCFF:
                 # 前 pre_offset_pending 个代理码点对应 offset
@@ -362,12 +364,37 @@ def _scan_text_integrity(
                 if pre_offset_pending > 0:
                     pre_offset_pending -= 1
                     continue
-                replacements += 1
+                if cursor < limit:
+                    replacements += 1
+            elif size > pre_offset_pending and pre_offset_pending > 0:
+                cursor += size - pre_offset_pending
+                pre_offset_pending = 0
+                continue
             else:
                 pre_offset_pending = 0
-                if character == "\x00":
+                if character == "\x00" and cursor < limit:
                     nul_bytes += 1
+            cursor += size
+
+    while position < end:
+        stop = min(position + chunk, end)
+        block = bytes(raw[position:stop])
+        text = decoder.decode(
+            block,
+            final=final and stop >= end,
+        )
+        consume(text, end)
         position = stop
+
+    if not final and end < len(raw) and decoder.getstate()[0]:
+        lookahead_end = min(len(raw), end + 3)
+        consume(
+            decoder.decode(
+                bytes(raw[end:lookahead_end]),
+                final=lookahead_end >= len(raw),
+            ),
+            end,
+        )
 
     return {
         "utf8_replacements": replacements,
@@ -418,14 +445,8 @@ def _invalid_utf8_nul_spans(
     cursor = offset
     skip_prefix = pre_offset_pending
 
-    while position < end:
-        stop = min(position + chunk, end)
-        block = bytes(raw[position:stop])
-        text = decoder.decode(
-            block,
-            final=final and stop >= end,
-        )
-
+    def consume(text: str, limit: int) -> None:
+        nonlocal cursor, skip_prefix
         for character in text:
             encoded = character.encode(
                 "utf-8",
@@ -443,16 +464,17 @@ def _invalid_utf8_nul_spans(
                 if skip_prefix > 0:
                     skip_prefix -= 1
                     continue
-                spans.append(
-                    (cursor, cursor + 1, "invalid_utf8")
-                )
+                if cursor < limit:
+                    spans.append(
+                        (cursor, cursor + 1, "invalid_utf8")
+                    )
             elif size > skip_prefix and skip_prefix > 0:
                 # 合法的跨边界字符：只把 offset 之后的字节数
                 # 推进 cursor，跳过整个字符的统计。
                 cursor += size - skip_prefix
                 skip_prefix = 0
                 continue
-            elif character == "\x00":
+            elif character == "\x00" and cursor < limit:
                 spans.append((cursor, cursor + 1, "nul"))
 
             if skip_prefix > 0:
@@ -462,7 +484,25 @@ def _invalid_utf8_nul_spans(
                 continue
             cursor += size
 
+    while position < end:
+        stop = min(position + chunk, end)
+        block = bytes(raw[position:stop])
+        text = decoder.decode(
+            block,
+            final=final and stop >= end,
+        )
+        consume(text, end)
         position = stop
+
+    if not final and end < len(raw) and decoder.getstate()[0]:
+        lookahead_end = min(len(raw), end + 3)
+        consume(
+            decoder.decode(
+                bytes(raw[end:lookahead_end]),
+                final=lookahead_end >= len(raw),
+            ),
+            end,
+        )
 
     return spans
 

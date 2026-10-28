@@ -219,6 +219,50 @@ class ProcessTests(unittest.TestCase):
             ],
         )
 
+    def test_invalid_span_scanner_resolves_trailing_segment_byte(self):
+        # final=False 的段尾非法 lead byte 必须在本段判定，不能
+        # 留给下一段预热后丢掉；lookahead 也不得把下一段的 NUL
+        # 记到本段。
+        data = b"A" * 10 + b"\xc3" + b"\x00" * 5
+        self.assertEqual(
+            experiment._invalid_utf8_nul_spans(
+                memoryview(data), 0, 11, False
+            ),
+            [(10, 11, "invalid_utf8")],
+        )
+        self.assertEqual(
+            experiment._scan_text_integrity(
+                memoryview(data), 0, 11, final=False
+            ),
+            {"utf8_replacements": 1, "nul_bytes": 0},
+        )
+        self.assertEqual(
+            experiment._invalid_utf8_nul_spans(
+                memoryview(data), 11, 5, True
+            ),
+            [
+                (11, 12, "nul"),
+                (12, 13, "nul"),
+                (13, 14, "nul"),
+                (14, 15, "nul"),
+                (15, 16, "nul"),
+            ],
+        )
+        # 段尾的合法 lead byte 由 lookahead 补全，不能误报。
+        valid = b"A" * 10 + b"\xc3\xa9" + b"B" * 5
+        self.assertEqual(
+            experiment._invalid_utf8_nul_spans(
+                memoryview(valid), 0, 11, False
+            ),
+            [],
+        )
+        self.assertEqual(
+            experiment._scan_text_integrity(
+                memoryview(valid), 0, 11, final=False
+            ),
+            {"utf8_replacements": 0, "nul_bytes": 0},
+        )
+
     def test_drop_corrupt_bytes_catches_trailing_lead_byte(self):
         # train 末尾的非法 lead byte 需要后继字节才能判定，
         # 但清洗范围仍必须把它删掉，不能留给训练窗口。
