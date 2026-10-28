@@ -9732,6 +9732,34 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=expected * 1.0e-8,
             )
 
+    def test_t_power_uses_normal_mix_for_small_df_default_grid(self):
+        # df=3–4 时默认 u 网格只有 800 个 Simpson 区间，
+        # 对 alpha 很小、非中心参数接近 0 的功效可低估约
+        # 2e-5；改用正态位移的 chi-CDF 混合积分。
+        for effect, df, alpha, expected in (
+            (
+                0.14002715713472244,
+                3.7321698113324584,
+                0.00021201218199043572,
+                0.00021967586829116905,
+            ),
+            (
+                -0.003972075556613209,
+                4.228971419082644,
+                2.5110661961583918e-05,
+                2.5111492140108046e-05,
+            ),
+        ):
+            power = experiment._t_power(
+                effect, 1.0, df, alpha
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(
+                power,
+                expected,
+                delta=expected * 1.0e-8,
+            )
+
     def test_t_p_value_uses_exact_beta_before_normal_limit(self):
         # df=1e6、t=30 时一阶正态尾修正仍有约 2% 误差；
         # 不完全 Beta 在此自由度下精度约 5e-10，应优先使用。

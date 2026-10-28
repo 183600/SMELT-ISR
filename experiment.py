@@ -29233,9 +29233,10 @@ def _t_power_large_shift_normal_mix(
     df_value: float,
     scale: float,
     noncentrality: float,
+    intervals: int = 2400,
 ) -> float:
     """
-    小自由度、大非中心参数下的功效：对正态位移积分 chi CDF。
+    小自由度下的功效：对正态位移积分 chi CDF。
 
     令 T'=(Z+δ)/sqrt(V/df)、w=scale·u 且 u=sqrt(V)，则
     |T'|>critical 等价于 u<|Z+δ|/scale。因此
@@ -29246,6 +29247,8 @@ def _t_power_large_shift_normal_mix(
     w 积分的转折宽度约为 1，而区间长度约为 δ；固定 20000
     个区间时步长可达数个单位，会把 δ 附近的概率质量积错。
     这里对 Z 在 ±12 内积分，转折宽度不变，步长始终为 0.01。
+    df 在 3–10 且 scale 不大时也走这里：u 网格在 0 附近受
+    u^(df-1) 曲率影响，固定 Simpson 节点的误差可达 1e-5。
     """
     log_scale = math.log(scale)
     shape = df_value / 2.0
@@ -29280,7 +29283,6 @@ def _t_power_large_shift_normal_mix(
         return 0.0 if value is None else value
 
     total = 0.0
-    intervals = 2400
     low = -12.0
     high = 12.0
     step = (high - low) / intervals
@@ -29486,6 +29488,21 @@ def _t_power(
     if scale > 10.0 and noncentrality > 16.0:
         return _t_power_large_shift_normal_mix(
             df_value, scale, noncentrality
+        )
+
+    if (
+        3.0 <= df_value < 10.0
+        and 2.0 < scale <= 10.0
+    ):
+        # df 在 3–10、临界值较大时，u 网格上的正态转折宽度
+        # 约为 1/scale，800–4000 个 Simpson 节点只能把功效
+        # 算到约 1e-5 相对误差。改对正态位移积分 chi CDF，
+        # 1200 个区间即可稳定到约 1e-9。
+        return _t_power_large_shift_normal_mix(
+            df_value,
+            scale,
+            noncentrality,
+            intervals=1200,
         )
 
     if scale > 10.0 and df_value >= 3.0:
