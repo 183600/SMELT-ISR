@@ -29685,7 +29685,27 @@ def _noncentral_t_cdf_large_shift(
 ) -> float:
     """大 ``|value|/sqrt(df)`` 下按正态参数积分非中心 t CDF。"""
     a = value / math.sqrt(df)
+    # 积分变量换成 x=a*u-δ 后，正态 CDF 只在 x∈[-40,40] 内
+    # 有可表示的质量；对应 u 的上界是 (40+δ)/a（a>0）或
+    # (40-δ)/(-a)（a<0）。默认 u_max=众数+12 只覆盖 chi 密度
+    # 本身，非中心参数很大时转折点会落在更远的 chi 尾部：
+    # 例如 df=766、δ≈97、t≈52.6 时主导区间在 u≈44，而默认
+    # 上界仅 39.7，会把 CDF 低估十几个数量级。按转折点上界
+    # 扩界后再做 x 积分，剩余尾部仍由下面的 chi CDF/生存函数
+    # 精确补上。
     u_max = math.sqrt(df - 1.0) + _T_POWER_TAIL
+    if a > 0.0:
+        tail_cutoff = (40.0 + noncentrality) / a
+    elif a < 0.0:
+        tail_cutoff = (40.0 - noncentrality) / (-a)
+    else:
+        tail_cutoff = None
+    if (
+        tail_cutoff is not None
+        and math.isfinite(tail_cutoff)
+        and tail_cutoff > u_max
+    ):
+        u_max = tail_cutoff
     log_const = (
         (1.0 - df / 2.0) * math.log(2.0)
         - math.lgamma(df / 2.0)
@@ -29736,6 +29756,10 @@ def _noncentral_t_cdf_large_shift(
         if cutoff < u_max:
             if cutoff <= 0.0:
                 total += 1.0
+            elif cutoff >= math.sqrt(sys.float_info.max):
+                # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF
+                # 时 chi-square 在该点的上尾已远低于可表示范围。
+                total += 0.0
             else:
                 survival = _chi_square_survival(
                     cutoff * cutoff,
@@ -29773,12 +29797,17 @@ def _noncentral_t_cdf_large_shift(
 
         cutoff = (-40.0 - noncentrality) / scale
         if cutoff > 0.0:
-            lower = _chi_square_cdf(
-                min(cutoff, u_max) ** 2,
-                df,
-            )
-            if lower is not None:
-                total += lower
+            if cutoff >= math.sqrt(sys.float_info.max):
+                # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF
+                # 时该点以下的 chi-square 概率在双精度下为 1。
+                total += 1.0
+            else:
+                lower = _chi_square_cdf(
+                    min(cutoff, u_max) ** 2,
+                    df,
+                )
+                if lower is not None:
+                    total += lower
     return min(1.0, max(0.0, total))
 
 

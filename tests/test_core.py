@@ -9642,6 +9642,42 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             delta=0.0,
         )
 
+    def test_noncentral_t_cdf_extends_chi_tail_for_large_shift(self):
+        # df>=3 时默认 u 上界 sqrt(df-1)+12 只按 chi 众数附近
+        # 取界；δ 很大时正态 CDF 的转折点会落在更远的 chi 尾部，
+        # 例如 df≈766、δ≈97、t≈52.6 时主导区间在 u≈44，而默认
+        # 上界仅 39.7，修复前会把 CDF 低估约 20 个数量级。
+        # 参考值由 mpmath 分区间积分与 scipy.stats.nct 交叉核对。
+        for df, value, noncentrality, reference in (
+            (
+                765.9433863028157,
+                52.56226389840401,
+                97.07556923763332,
+                4.131299637815571e-142,
+            ),
+            (
+                935.935103087207,
+                26.934708243729347,
+                63.62909882746632,
+                1.2755489939161262e-206,
+            ),
+            (
+                640.5084742335358,
+                91.23876824784116,
+                148.90803192290394,
+                1.221547687472e-87,
+            ),
+        ):
+            cdf = experiment._noncentral_t_cdf(
+                value, df, noncentrality
+            )
+            self.assertIsNotNone(cdf)
+            self.assertAlmostEqual(
+                cdf,
+                reference,
+                delta=reference * 1.0e-6,
+            )
+
     def test_t_power_handles_small_df_without_overflow(self):
         u_values, weights = experiment._t_power_nodes(0.01)
         self.assertEqual(len(u_values), len(weights))
