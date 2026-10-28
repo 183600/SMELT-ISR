@@ -16,12 +16,29 @@ def _noncentral_t_cdf(
     ``_t_cdf`` 以保持中心情形的数值路径不变；df 趋于无穷时
     退化为 N(δ, 1)。
     """
-    if noncentrality == 0.0:
-        return _t_cdf(value, df)
-    if not math.isfinite(df) or df >= _T_POWER_NORMAL_DF:
-        return _normal_cdf(value - noncentrality)
+    # 先排除未定义输入：NaN 自由度/非中心参数/取值都没有 CDF。
+    # 原实现把 df=NaN/-inf 误送进「大 df 正态极限」分支，返回
+    # 一个看似合法的正态 CDF，调用方会把无效结果当成证据。
+    if (
+        math.isnan(value)
+        or math.isnan(df)
+        or math.isnan(noncentrality)
+    ):
+        return None
     if df <= 0.0:
         return None
+    if noncentrality == 0.0:
+        return _t_cdf(value, df)
+    if math.isinf(noncentrality):
+        # δ→±∞ 时 T' 几乎必然同号发散；两端都无定义时返回
+        # None，避免把 +inf-+inf 之类的未定式猜成 1 或 0。
+        if math.isinf(value):
+            return None
+        return 1.0 if noncentrality > 0.0 else 0.0
+    if not math.isfinite(df) or df >= _T_POWER_NORMAL_DF:
+        return _normal_cdf(value - noncentrality)
+    if math.isinf(value):
+        return 1.0 if value > 0.0 else 0.0
     if value == 0.0:
         # T'=0 当且仅当 Z+δ<=0，与 V 无关；直接由正态 CDF 给出，
         # 避免低自由度截断积分少算 chi 尾部概率。

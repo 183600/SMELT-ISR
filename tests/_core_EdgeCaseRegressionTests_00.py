@@ -1456,6 +1456,44 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 reference,
                 delta=reference * 1.0e-6,
             )
+    def test_noncentral_t_cdf_rejects_undefined_inputs(self):
+        # NaN/负自由度没有定义；原实现先走「df 非有限 -> 正态
+        # 极限」分支，把 df=NaN/-inf 误报成正态 CDF。NaN 的
+        # 取值与非中心参数也必须返回 None，不能静默变成 0。
+        for df in (float("nan"), float("-inf"), -1.0, 0.0):
+            self.assertIsNone(
+                experiment._noncentral_t_cdf(1.0, df, 0.5),
+                df,
+            )
+        self.assertIsNone(
+            experiment._noncentral_t_cdf(
+                float("nan"), 5.0, 0.5
+            )
+        )
+        self.assertIsNone(
+            experiment._noncentral_t_cdf(
+                1.0, 5.0, float("nan")
+            )
+        )
+        # δ=±inf 的极限仍可用：CDF 分别趋于 1/0。
+        self.assertEqual(
+            experiment._noncentral_t_cdf(
+                1.0, 5.0, float("inf")
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            experiment._noncentral_t_cdf(
+                1.0, 5.0, float("-inf")
+            ),
+            0.0,
+        )
+        self.assertIsNone(
+            experiment._noncentral_t_cdf(
+                float("inf"), 5.0, float("inf")
+            )
+        )
+
     def test_t_power_handles_small_df_without_overflow(self):
         u_values, weights = experiment._t_power_nodes(0.01)
         self.assertEqual(len(u_values), len(weights))
