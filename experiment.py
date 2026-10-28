@@ -26880,10 +26880,22 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         return math.exp(log_p)
 
     x = df / (df + t * t)
+    # 上尾等于 I_x(df/2, 1/2)，也可用对称性写成
+    # 1 - I_complement_x(1/2, df/2)。哪种口径更稳取决于 x：
+    # x<=1/2 时直接分支只用到 x，精度不受影响；x>1/2 时
+    # complement_x<1/2，1-complement_x 也能精确还原 x。
+    #
+    # 反过来在 x 很小时（t 很大）先算 complement_x 再取
+    # 1-complement_x 会踩到表示误差：例如 df=1/2、
+    # t=4.24e7 时 x≈2.78e-16，而 complement_x 舍入后
+    # 1-complement_x≈3.33e-16（相对偏大 20%），上尾因此
+    # 被高估约 5%。这里按 x 的大小选择稳定的那一侧，而不是
+    # 等到上尾低于固定阈值才回退。
+    if x <= 0.5:
+        tail = _regularized_incomplete_beta(x, df / 2.0, 0.5)
+        return None if tail is None else max(0.0, min(1.0, tail))
+
     complement_x = t * t / (df + t * t)
-    # 优先从较小的 complement_x 计算上尾，避免 x 接近 1 时
-    # 1-x 的舍入误差被放大。只有上尾小到与 1.0 相减会严重
-    # 损失精度时，才回退到直接计算较小的 I_x。
     complement = _regularized_incomplete_beta(
         complement_x,
         0.5,

@@ -9789,6 +9789,30 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             delta=1.0e-8,
         )
 
+    def test_t_p_value_avoids_complement_rounding_for_small_tail(self):
+        # df=0.5、t≈4.24e7 时 x=df/(df+t²)≈2.78e-16；若先算
+        # complement_x 再取 1-complement_x，表示误差会让
+        # 1-complement_x 变成 3.33e-16，上尾被高估约 5%。
+        # 直接计算 I_x 应保留约 1e-16 的相对精度。
+        p_value = experiment._two_sided_t_p_value(
+            42443372.28529559,
+            0.5,
+        )
+        self.assertIsNotNone(p_value)
+        self.assertAlmostEqual(
+            p_value / 9.845217954535378e-05,
+            1.0,
+            places=12,
+        )
+        critical = experiment._t_critical(0.5, 1.0e-4)
+        self.assertIsNotNone(critical)
+        self.assertAlmostEqual(
+            experiment._two_sided_t_p_value(critical, 0.5)
+            / 1.0e-4,
+            1.0,
+            places=12,
+        )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None
