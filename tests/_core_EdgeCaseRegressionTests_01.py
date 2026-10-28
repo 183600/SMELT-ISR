@@ -45,6 +45,49 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
             self.assertAlmostEqual(
                 power, expected, delta=1.0e-8
             )
+    def test_tost_power_treats_infinite_df_as_normal_limit(self):
+        # df=inf 与 _t_power 的大 df 分支一致，应退化为正态。
+        for effect, margin, expected in (
+            (0.0, 5.0, 0.9992067699909475),
+            (0.5, 2.0, 0.246178160265617),
+            (1.0, 5.0, 0.9907356457249948),
+        ):
+            power = experiment._tost_power(
+                effect,
+                1.0,
+                float("inf"),
+                margin,
+                0.05,
+            )
+            self.assertIsNotNone(power)
+            self.assertAlmostEqual(power, expected, delta=1.0e-14)
+        margin = experiment._tost_margin_for_power(
+            1.0,
+            float("inf"),
+            0.8,
+            0.05,
+        )
+        self.assertIsNotNone(margin)
+        self.assertAlmostEqual(
+            margin,
+            2.9264051924960726,
+            delta=1.0e-12,
+        )
+        self.assertIsNone(
+            experiment._tost_power(
+                0.0, 1.0, float("nan"), 5.0, 0.05
+            )
+        )
+        self.assertIsNone(
+            experiment._tost_power(
+                0.0, 1.0, float("-inf"), 5.0, 0.05
+            )
+        )
+        self.assertIsNone(
+            experiment._tost_margin_for_power(
+                1.0, float("nan"), 0.8, 0.05
+            )
+        )
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

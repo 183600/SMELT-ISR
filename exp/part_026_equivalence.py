@@ -281,7 +281,7 @@ def _tost_power(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
-        or not math.isfinite(df_value)
+        or math.isnan(df_value)
         or not math.isfinite(margin_value)
         or not (0.0 < alpha_value < 0.5)
         or df_value <= 0.0
@@ -420,7 +420,7 @@ def _tost_margin_for_power(
         return None
     if (
         not math.isfinite(se_value)
-        or not math.isfinite(df_value)
+        or math.isnan(df_value)
         or not math.isfinite(target)
         or not (0.0 < target < 1.0)
         or not (0.0 < alpha_value < 0.5)
