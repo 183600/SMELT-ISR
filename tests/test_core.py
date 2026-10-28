@@ -9813,6 +9813,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             places=12,
         )
 
+    def test_incomplete_beta_converges_for_large_parameters(self):
+        # 连分式步数上限为 200 时，a=b=1e6、x=0.5 只能算到
+        # 0.499687；提高上限后应恢复对称值 0.5，并让大样本
+        # 二项分布 Clopper-Pearson 上界与 beta 分位数一致。
+        for a in (1.0e6, 1.0e7):
+            self.assertAlmostEqual(
+                experiment._regularized_incomplete_beta(
+                    0.5,
+                    a,
+                    a,
+                ),
+                0.5,
+                delta=5.0e-8,
+            )
+        bound = experiment._binomial_upper_confidence_bound(
+            500000000,
+            1000000000,
+            0.95,
+        )
+        self.assertIsNotNone(bound)
+        self.assertAlmostEqual(
+            bound / 0.5000260079193697,
+            1.0,
+            places=9,
+        )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

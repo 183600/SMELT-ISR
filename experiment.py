@@ -26688,7 +26688,11 @@ def _betacf(a: float, b: float, x: float) -> float:
     正则化不完全 Beta 函数的连分式（Lentz 算法），
     用于无 SciPy 依赖地计算 t 分布 p 值。
     """
-    max_iterations = 200
+    # 连分式的收敛步数随 sqrt(a+b) 增长：a=b=1e6 时需要约
+    # 460 步，200 步会在 x≈1/2 处把 I_x 算成 0.4997，并让
+    # 二项分布上置信界偏移数万分之一。正常量级仍在前几十步
+    # 收敛，提高上限不会拖慢常见路径。
+    max_iterations = 20000
     epsilon = 3.0e-12
     fpmin = 1.0e-300
 
