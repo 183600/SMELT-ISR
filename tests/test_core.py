@@ -9742,6 +9742,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             places=8,
         )
 
+    def test_t_p_value_avoids_lgamma_cancellation_at_large_df(self):
+        # df~1.5e8 时 lgamma(a+b)-lgamma(a) 的相消会让 p 值
+        # 产生约 1e-6 的相对误差；x 接近 1 时也不能依赖 1-x。
+        self.assertAlmostEqual(
+            experiment._two_sided_t_p_value(1.7, 1.5e8)
+            / 0.08913092759024125,
+            1.0,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            experiment._two_sided_t_p_value(
+                30.0,
+                2.0e8,
+            )
+            / 9.8233910423912479e-198,
+            1.0,
+            delta=1.0e-8,
+        )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

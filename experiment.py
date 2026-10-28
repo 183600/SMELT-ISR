@@ -26743,6 +26743,55 @@ def _betacf(a: float, b: float, x: float) -> float:
     return h
 
 
+_LOG_BETA_ASYMPTOTIC_MIN = 1.0e4
+
+
+def _log_gamma_ratio_half(z: float) -> float:
+    """
+    计算 log(Γ(z+1/2)/Γ(z))，避免大 z 下两个 lgamma 相减。
+    """
+    inverse = 1.0 / z
+    series = inverse * (
+        -1.0 / 8.0
+        + inverse * (
+            1.0 / 128.0
+            + inverse * (
+                5.0 / 1024.0
+                - inverse * (21.0 / 32768.0)
+            )
+        )
+    )
+    return 0.5 * math.log(z) + math.log1p(series)
+
+
+def _log_beta_front(a: float, b: float) -> float:
+    """
+    返回 log(1/B(a, b))，即不完全 Beta 前因子中的常数项。
+
+    大参数下直接做 lgamma(a+b)-lgamma(a)-lgamma(b) 会发生
+    灾难性相消：例如 a=1.5e8、b=0.5 时两项都约为 2.5e9，
+    相减后只剩约 1e-7 的相对精度，足以让 t 分布尾概率产生
+    1e-6 量级的误差。这里利用
+        Γ(z+1/2)/Γ(z) ~ z^(1/2) (1 - 1/(8z) + ...)
+    精确计算 b=1/2 的情形。
+    """
+    if a == 0.5 and b >= _LOG_BETA_ASYMPTOTIC_MIN:
+        return (
+            _log_gamma_ratio_half(b)
+            - math.lgamma(0.5)
+        )
+    if b == 0.5 and a >= _LOG_BETA_ASYMPTOTIC_MIN:
+        return (
+            _log_gamma_ratio_half(a)
+            - math.lgamma(0.5)
+        )
+    return (
+        math.lgamma(a + b)
+        - math.lgamma(a)
+        - math.lgamma(b)
+    )
+
+
 def _regularized_incomplete_beta(
     x: float,
     a: float,
@@ -26756,11 +26805,7 @@ def _regularized_incomplete_beta(
     if x >= 1.0:
         return 1.0
 
-    log_beta = (
-        math.lgamma(a + b)
-        - math.lgamma(a)
-        - math.lgamma(b)
-    )
+    log_beta = _log_beta_front(a, b)
     front = math.exp(
         log_beta + a * math.log(x) + b * math.log1p(-x)
     )
@@ -26836,14 +26881,18 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
 
     x = df / (df + t * t)
     complement_x = t * t / (df + t * t)
-    if complement_x <= 1.0e-9:
-        complement = _regularized_incomplete_beta(
-            complement_x,
-            0.5,
-            df / 2.0,
-        )
-        if complement is not None:
-            return max(0.0, min(1.0, 1.0 - complement))
+    # 优先从较小的 complement_x 计算上尾，避免 x 接近 1 时
+    # 1-x 的舍入误差被放大。只有上尾小到与 1.0 相减会严重
+    # 损失精度时，才回退到直接计算较小的 I_x。
+    complement = _regularized_incomplete_beta(
+        complement_x,
+        0.5,
+        df / 2.0,
+    )
+    if complement is not None:
+        upper_tail = 1.0 - complement
+        if upper_tail >= 1.0e-6:
+            return max(0.0, min(1.0, upper_tail))
     return _regularized_incomplete_beta(x, df / 2.0, 0.5)
 
 
