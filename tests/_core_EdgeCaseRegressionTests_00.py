@@ -1647,6 +1647,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             1.0,
             places=9,
         )
+    def test_binomial_upper_bound_resolves_confidence_near_one(self):
+        # failures>4096 时若按 I_p(k+1,n-k)=confidence 二分，
+        # confidence=1-1e-15 与计算值在双精度下无法区分，
+        # 上界会提前停在偏小约 9e-5 的位置。改用互补尾
+        # I_{1-p}(n-k,k+1)=alpha 后应满足精确定义。
+        confidence = 1.0 - 1.0e-15
+        alpha = 1.0 - confidence
+        bound = experiment._binomial_upper_confidence_bound(
+            5000,
+            1000000,
+            confidence,
+        )
+        self.assertIsNotNone(bound)
+        cdf = experiment._binomial_lower_tail_probability(
+            5000,
+            1000000,
+            bound,
+        )
+        self.assertAlmostEqual(cdf / alpha, 1.0, places=9)
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

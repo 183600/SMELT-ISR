@@ -775,10 +775,20 @@ def _binomial_upper_confidence_bound(
         return (low + high) / 2.0
     for _ in range(200):
         middle = (low + high) / 2.0
-        if middle <= 0.5:
-            # I_p(successes, remaining) = 1-alpha 等价于
-            # I_{1-p}(remaining, successes) = alpha。用 p 侧
-            # 计算可避免 p 很小时 1-p 的舍入误差。
+        complement = 1.0 - middle
+        if middle > 0.5 or complement < 1.0:
+            cdf = _regularized_incomplete_beta(
+                complement,
+                remaining,
+                successes,
+            )
+            if cdf is None or not math.isfinite(cdf):
+                return None
+            if cdf > alpha:
+                low = middle
+            else:
+                high = middle
+        else:
             cdf = _regularized_incomplete_beta(
                 middle,
                 successes,
@@ -787,18 +797,6 @@ def _binomial_upper_confidence_bound(
             if cdf is None or not math.isfinite(cdf):
                 return None
             if cdf < confidence_value:
-                low = middle
-            else:
-                high = middle
-        else:
-            cdf = _regularized_incomplete_beta(
-                1.0 - middle,
-                remaining,
-                successes,
-            )
-            if cdf is None or not math.isfinite(cdf):
-                return None
-            if cdf > alpha:
                 low = middle
             else:
                 high = middle
