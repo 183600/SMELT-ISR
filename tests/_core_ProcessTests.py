@@ -263,6 +263,40 @@ class ProcessTests(unittest.TestCase):
             {"utf8_replacements": 0, "nul_bytes": 0},
         )
 
+    def test_integrity_scanners_clamp_nonpositive_chunk(self):
+        # chunk=0 时 position + chunk 不前进，原实现会无限循环。
+        # 非正 chunk 应按单字节步进，并保持与 chunk=1 一致。
+        data = b"A\xff\x00B" * 10
+        expected_counts = {
+            "utf8_replacements": 10,
+            "nul_bytes": 10,
+        }
+        expected_spans = experiment._invalid_utf8_nul_spans(
+            memoryview(data), 0, len(data), True, chunk=1
+        )
+        self.assertEqual(len(expected_spans), 20)
+        for chunk in (0, -5):
+            self.assertEqual(
+                experiment._scan_text_integrity(
+                    memoryview(data),
+                    0,
+                    len(data),
+                    chunk=chunk,
+                    final=True,
+                ),
+                expected_counts,
+            )
+            self.assertEqual(
+                experiment._invalid_utf8_nul_spans(
+                    memoryview(data),
+                    0,
+                    len(data),
+                    True,
+                    chunk=chunk,
+                ),
+                expected_spans,
+            )
+
     def test_drop_corrupt_bytes_catches_trailing_lead_byte(self):
         # train 末尾的非法 lead byte 需要后继字节才能判定，
         # 但清洗范围仍必须把它删掉，不能留给训练窗口。

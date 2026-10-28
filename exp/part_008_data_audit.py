@@ -324,6 +324,9 @@ def _scan_text_integrity(
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="surrogateescape"
     )
+    # chunk 来自审计配置；0/负数会让 position + chunk 不前进，
+    # 扫描陷入死循环。按单字节步进处理，保持正数行为不变。
+    chunk = max(1, int(chunk))
 
     # 预热：把解码器带到「从 offset 前几个字节开始」的状态。
     # 预热输出（可能包含边界前的字符或无效序列）全部丢弃，
@@ -424,6 +427,9 @@ def _invalid_utf8_nul_spans(
     decoder = codecs.getincrementaldecoder("utf-8")(
         errors="surrogateescape"
     )
+    # 与 _scan_text_integrity 相同：非正 chunk 必须钳制为 1，
+    # 否则分段循环永远无法推进。
+    chunk = max(1, int(chunk))
 
     # 预热：offset 可能落在一个合法的多字节字符中间（split 边界
     # 不保证在字符边界上）。先把 offset 前最多 3 个字节喂给
