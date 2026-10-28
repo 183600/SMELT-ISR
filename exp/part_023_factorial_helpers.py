@@ -738,6 +738,27 @@ def _log_beta_front(a: float, b: float) -> float:
             _log_gamma_ratio_half(a)
             - math.lgamma(0.5)
         )
+    # 小整数参数用乘积形式，避免 lgamma(a+b)-lgamma(a) 在
+    # a 很大时相消。Clopper-Pearson 上界常出现 b=failures+1
+    # 很小、trials≈1e12 的情形，直接相减会让上界偏差几个
+    # 百分点（b=2 时约 5%）。
+    if math.isfinite(a) and math.isfinite(b):
+        if b == int(b) and 1 <= b <= 1024:
+            return (
+                math.fsum(
+                    math.log(a + index)
+                    for index in range(int(b))
+                )
+                - math.lgamma(b)
+            )
+        if a == int(a) and 1 <= a <= 1024:
+            return (
+                math.fsum(
+                    math.log(b + index)
+                    for index in range(int(a))
+                )
+                - math.lgamma(a)
+            )
     return (
         math.lgamma(a + b)
         - math.lgamma(a)

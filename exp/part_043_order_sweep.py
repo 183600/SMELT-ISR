@@ -681,6 +681,37 @@ def _sd_upper_confidence_bound(
 
 
 
+def _binomial_lower_tail_probability(
+    failures: int,
+    trials: int,
+    probability: float,
+) -> float:
+    """P(X <= failures) for X~Binomial(trials, probability)。
+
+    只用于 failures 很小的情形：逐项累加对数 PMF，避免
+    Clopper-Pearson 在 p 极小时走不完全 Beta 互补分支的
+    舍入误差。项数由调用方限制。
+    """
+    if probability <= 0.0:
+        return 1.0
+    if probability >= 1.0:
+        return 0.0 if failures < trials else 1.0
+    log_p = math.log(probability)
+    log_q = math.log1p(-probability)
+    log_term = trials * log_q
+    total = math.exp(log_term) if log_term > -745.0 else 0.0
+    for successes in range(1, failures + 1):
+        log_term += (
+            math.log((trials - successes + 1) / successes)
+            + log_p
+            - log_q
+        )
+        if log_term > -745.0:
+            total += math.exp(log_term)
+    return min(1.0, max(0.0, total))
+
+
+
 def _binomial_upper_confidence_bound(
     failures: int,
     trials: int,
@@ -718,20 +749,64 @@ def _binomial_upper_confidence_bound(
         return None
     low = 0.0
     high = 1.0
+    # failures 很小时根在 p≈1e-12 量级，不完全 Beta 的互补
+    # 分支会被 1-p 的舍入放大；直接累加二项下尾更稳。
+    if failures <= 4096:
+        for _ in range(200):
+            middle = (low + high) / 2.0
+            cdf = _binomial_lower_tail_probability(
+                failures,
+                trials,
+                middle,
+            )
+            if cdf > alpha:
+                low = middle
+            else:
+                high = middle
+            tolerance = max(
+                math.ulp(middle) * 4.0,
+                middle * 1.0e-12,
+            )
+            if high - low <= tolerance:
+                break
+        return (low + high) / 2.0
     for _ in range(200):
         middle = (low + high) / 2.0
-        cdf = _regularized_incomplete_beta(
-            1.0 - middle,
-            remaining,
-            successes,
-        )
-        if cdf is None or not math.isfinite(cdf):
-            return None
-        if cdf > alpha:
-            low = middle
+        if middle <= 0.5:
+            # I_p(successes, remaining) = 1-alpha 等价于
+            # I_{1-p}(remaining, successes) = alpha。用 p 侧
+            # 计算可避免 p 很小时 1-p 的舍入误差。
+            cdf = _regularized_incomplete_beta(
+                middle,
+                successes,
+                remaining,
+            )
+            if cdf is None or not math.isfinite(cdf):
+                return None
+            if cdf < confidence_value:
+                low = middle
+            else:
+                high = middle
         else:
-            high = middle
-        if high - low <= 1.0e-12:
+            cdf = _regularized_incomplete_beta(
+                1.0 - middle,
+                remaining,
+                successes,
+            )
+            if cdf is None or not math.isfinite(cdf):
+                return None
+            if cdf > alpha:
+                low = middle
+            else:
+                high = middle
+        # 上界本身可能远小于 1e-12（如 trials=1e12、failures=1
+        # 时约 5e-12）。固定绝对容差会在量级相当的位置提前
+        # 停止，产生数个百分点误差；按估计值取相对容差。
+        tolerance = max(
+            math.ulp(middle) * 4.0,
+            middle * 1.0e-12,
+        )
+        if high - low <= tolerance:
             break
     return (low + high) / 2.0
 
