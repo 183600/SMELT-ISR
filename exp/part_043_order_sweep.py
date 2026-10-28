@@ -740,7 +740,10 @@ def _binomial_upper_confidence_bound(
     alpha = 1.0 - confidence_value
     if failures == 0:
         try:
-            return 1.0 - alpha ** (1.0 / float(trials))
+            # 1 - α^(1/n) 在 n 很大时会被 1 的舍入吞掉
+            # （n=1e12 时相对误差约 3e-5，n=1e16 时约 31%）；
+            # 用 expm1 直接保留小量。
+            return -math.expm1(math.log(alpha) / float(trials))
         except (OverflowError, ValueError):
             return None
     remaining = _finite_float(trials - failures)
