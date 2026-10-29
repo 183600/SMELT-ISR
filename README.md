@@ -38,6 +38,8 @@ SMELT-ISR 是基于 [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Tra
 
 ```bash
 pip install "torch>=2.2"
+# 或安装本仓库（开发模式，自动安装 numpy/torch 运行依赖）
+pip install -e .
 ```
 
 ## 📦 代码使用说明

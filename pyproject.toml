@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smelt_isr"
+version = "0.1.0"
+description = "Delayed-merge routing experiments on the SMELT sparse MoE Transformer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.2",
+]
+
+[tool.setuptools]
+packages = ["exp", "selfcheck"]
+py-modules = ["experiment"]
+
+[tool.setuptools.package-data]
+exp = ["mainflow/*.py", "analysisflow/*.py"]

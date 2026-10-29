@@ -76,6 +76,9 @@ python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
 
 ```bash
 pip install "torch>=2.2"
+# or install this repository in development mode (numpy/torch dependencies are
+# declared in pyproject.toml)
+pip install -e .
 ```
 
 ## 📦 Usage

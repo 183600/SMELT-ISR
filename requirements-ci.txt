@@ -1,9 +1,10 @@
 # CI-only dependency set (CPU, Python 3.12).
 #
-# 本仓库根目录没有 requirements.txt / pyproject.toml，experiment.py 的第三方依赖只有
+# 运行依赖已在根目录 pyproject.toml 中声明为 numpy>=1.24、torch>=2.2；
+# experiment.py 的第三方依赖只有
 #   - torch（torch / torch.nn / torch.nn.functional，训练与自测都靠它）
 #   - numpy（随机种子状态存档、--self-test 的逐位复现校验会用到）
-# 因此这里只固定这两个包，不引入仓库里没有用到的依赖。
+# 因此这里只固定这两个包（CI 保留精确 pin），不引入仓库里没有用到的依赖。
 #
 # 该文件的两个用途：
 #   1. continuous-loop.yml 里 actions/setup-python 的 pip 缓存键
