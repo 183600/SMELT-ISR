@@ -609,8 +609,10 @@ aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
 可能宽到没有实际信息量；两层 bootstrap 在 3~6 个种子时种子
 重采样很粗，百分位区间可能偏窄或不稳定，只作描述性证据，不能
 替代增加独立种子。方差分解与预测区间都条件于**这批固定评估
-窗口**，不覆盖换文档/来源的外推；按文档/来源的 cluster
-bootstrap 仍未实现。交叉 bootstrap 把窗口当可交换单位，未做
+窗口**，不覆盖换文档/来源的外推；按文档/群组的 cluster
+bootstrap 的处理见第 40 节，但它仍依赖显式的
+`--group-separator`，群组数很少时区间同样很粗。交叉 bootstrap
+把窗口当可交换单位，未做
 AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都会
 偏小，应同时查看逐种子 `window_lag1_autocorrelation`。预测
 区间是频率派 t 近似，不是贝叶斯后验预测。
@@ -1331,6 +1333,52 @@ python experiment.py --audit-run runs/final/A --audit-strict \
 改写，仍可能通过；外部源码/语料/预注册哈希与不可变归档锚点
 才是最终防线。`sanity_check` 只证明训练前探针可重复，不等于
 完整训练逐位可重复；跨设备复现仍需固定环境或做容差分析。
+
+## 40. 结果分析：文档/群组 cluster bootstrap 接入（本轮补充）
+
+**判断**：仓库此前已有 `_group_cluster_eval_intervals`、
+`_group_cluster_paired_comparison` 与
+`_hierarchical_group_bootstrap_ci`，也有边界测试，但评估与对比
+流程从未调用它们，实际上是不可达代码；`eval_windows.json` 也
+没有群组级充分统计量。因此报告仍只能按窗口/种子重采样，无法
+回答「换一批同分布文档」时结论是否稳定。尤其在同一文档被切成
+多个重叠窗口时，把窗口当独立单位会系统性低估评估不确定性。
+
+**修复**：
+
+1. `evaluate(..., group_sink=...)` 在最终评估且数据由
+   `--group-separator` 定义文档边界时，用
+   `ByteDataset.fixed_eval_group_ids` 把每个目标 token 映射到
+   文档群组，累加群组内损失和、token 数与命中数；没有分隔符
+   时不写入，绝不把窗口伪装成文档簇。
+2. 新增 `_build_eval_group_stats`，输出带
+   `schema=smelt-isr/eval-group-stats/v1`、
+   `assignment=split_group_starts_gaps_to_preceding_v1`、
+   `unit=document_group` 与分隔符 SHA-256 的 `group_stats`，
+   并写入 `eval_windows.json`。非有限值、负损失、正确数超过
+   token 数、重复群组 id 等异常会使整份记录不可用，避免只保留
+   「看起来正常」的群组。
+3. 评估指标在启用 bootstrap 时追加文档/群组级
+   `loss`、`ppl`、token accuracy 的 95% 区间及
+   `*_group_cluster_n_groups`，与窗口级区间并列报告。
+4. 跨运行窗口分析对每个共同 seed 调用
+   `_group_cluster_paired_comparison`，再以
+   `_hierarchical_group_bootstrap_ci` 做「种子 × 文档群组」
+   两层重采样；只对群组定义指纹一致、共同群组 token 数逐项
+   相同的运行配对；展示层同时打印「种子×文档群组 bootstrap
+   95%CI」。没有群组记录的旧运行不参与群组分析，但仍保留
+   原有窗口/种子分析。
+5. 回归测试覆盖：评估期群组统计生成、无分隔符时不伪造群组、
+   跨 seed 的群组配对与两层区间，以及逐群组明细不落进
+   `per_seed` 报告明细。
+
+**局限**：群组边界完全取决于 `--group-separator`；没有显式
+分隔符的数据只能继续使用窗口/种子证据。群组数少于约 10 个时
+百分位区间很粗，应视为描述性证据而不是高精度置信区间。它覆盖
+的是「换一批同分布文档」，不覆盖换来源/换标注体系/时间外推；
+群组内仍可能有近重复或同源段落，需配合第 38 节的评估集近重复
+审计。群组分析与种子级检验来自同一批运行，不是两次独立验证；
+报告仍不得把不显著读成等价。
 
 ## 推荐的确证流程（优先级）
 

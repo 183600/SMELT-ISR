@@ -867,6 +867,7 @@ def _cell_window_paired_analysis(
 
     per_seed: List[Dict[str, object]] = []
     seed_loss_differences: Dict[int, List[float]] = {}
+    seed_group_differences: Dict[int, Dict[int, Tuple[float, float]]] = {}
     for seed in common_seeds:
         comparison = paired_window_comparison(
             payloads_a[seed],
@@ -881,6 +882,48 @@ def _cell_window_paired_analysis(
             seed_loss_differences[int(seed)] = [
                 float(value) for value in differences
             ]
+        group_comparison = _group_cluster_paired_comparison(
+            payloads_a[seed],
+            payloads_b[seed],
+            include_differences=True,
+        )
+        if isinstance(group_comparison, dict):
+            group_differences = group_comparison.pop(
+                "group_differences",
+                None,
+            )
+            if (
+                group_comparison.get("available")
+                and isinstance(group_differences, list)
+            ):
+                mapping: Dict[int, Tuple[float, float]] = {}
+                valid_groups = True
+                for item in group_differences:
+                    if (
+                        not isinstance(item, (list, tuple))
+                        or len(item) < 3
+                        or isinstance(item[0], bool)
+                        or not isinstance(item[0], int)
+                        or item[0] < 0
+                    ):
+                        valid_groups = False
+                        break
+                    group_difference = _finite_float(item[1])
+                    group_tokens = _finite_float(item[2])
+                    if (
+                        group_difference is None
+                        or group_tokens is None
+                        or group_tokens <= 0.0
+                    ):
+                        valid_groups = False
+                        break
+                    mapping[int(item[0])] = (
+                        float(group_difference),
+                        float(group_tokens),
+                    )
+                if valid_groups and len(mapping) >= 2:
+                    seed_group_differences[int(seed)] = mapping
+            comparison["group_cluster"] = group_comparison
         per_seed.append({"seed": seed, **comparison})
 
     usable = [
@@ -921,6 +964,9 @@ def _cell_window_paired_analysis(
     hierarchical = _hierarchical_window_bootstrap_ci(
         seed_loss_differences
     )
+    hierarchical_group = _hierarchical_group_bootstrap_ci(
+        seed_group_differences
+    )
     variance_components = _window_variance_components(
         seed_loss_differences
     )
@@ -946,6 +992,12 @@ def _cell_window_paired_analysis(
             "检验先把同一 seed 折叠为一个观测，再做配对，"
             "复制运行不增加 n"
         )
+    if seed_group_differences:
+        notes.append(
+            "文档/群组级配对以 --group-separator 定义的文档为"
+            "重采样单位；没有群组记录的运行不参与该分析，"
+            "群组数很少时区间仅作描述性证据"
+        )
     notes.append(
         "窗口级结果与种子级检验来自同一批运行，不是两次独立验证"
     )
@@ -955,7 +1007,9 @@ def _cell_window_paired_analysis(
     return {
         "available": True,
         "n_seeds": len(usable),
+        "n_group_paired_seeds": len(seed_group_differences),
         "hierarchical_bootstrap_ci95": hierarchical,
+        "hierarchical_group_bootstrap_ci95": hierarchical_group,
         "variance_components": variance_components,
         "seeds": [int(entry["seed"]) for entry in usable],
         "per_seed": per_seed,

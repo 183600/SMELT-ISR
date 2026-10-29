@@ -904,6 +904,74 @@ def _group_stats_bootstrap_ci(
 
 
 
+def _build_eval_group_stats(
+    dataset: "ByteDataset",
+    records: object,
+) -> Optional[Dict[str, object]]:
+    """
+    把评估期逐群组充分统计量整理成可归档的 ``group_stats``。
+
+    每条记录为 ``[group_id, tokens, loss_sum, correct]``，由
+    ``evaluate`` 按目标 token 所属的文档/群组累加得到。群组
+    定义必须来自 ``--group-separator``；没有群组边界时返回
+    ``None``，不把窗口伪装成独立文档簇。任何非有限值、负损失、
+    正确数超过 token 数或重复 id 都使整份记录不可用，避免
+    只保留「看起来正常」的群组而产生选择性偏差。
+    """
+    if not isinstance(records, list) or not records:
+        return None
+    try:
+        fingerprint = dataset.group_assignment_fingerprint()
+    except AttributeError:
+        return None
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    groups: List[List[float]] = []
+    seen: set = set()
+    for record in records:
+        if not isinstance(record, (list, tuple)) or len(record) < 4:
+            return None
+        group_id, tokens, loss_sum, correct = record[:4]
+        if (
+            not isinstance(group_id, int)
+            or isinstance(group_id, bool)
+            or group_id < 0
+            or group_id in seen
+        ):
+            return None
+        tokens_value = _finite_float(tokens)
+        loss_value = _finite_float(loss_sum)
+        correct_value = _finite_float(correct)
+        if (
+            tokens_value is None
+            or loss_value is None
+            or correct_value is None
+            or tokens_value <= 0.0
+            or loss_value < 0.0
+            or correct_value < 0.0
+            or correct_value > tokens_value + 1e-9
+        ):
+            return None
+        seen.add(group_id)
+        groups.append([
+            int(group_id),
+            float(tokens_value),
+            float(loss_value),
+            float(correct_value),
+        ])
+    if not groups:
+        return None
+    groups.sort(key=lambda item: item[0])
+    return {
+        "schema": _GROUP_STATS_SCHEMA,
+        "assignment": _GROUP_ASSIGNMENT,
+        "unit": "document_group",
+        "group_separator_sha256": fingerprint,
+        "groups": groups,
+    }
+
+
+
 def _group_cluster_eval_intervals(
     group_stats: Dict[str, object],
     replicates: int,

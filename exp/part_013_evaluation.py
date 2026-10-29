@@ -22,6 +22,7 @@ def evaluate(
     bootstrap_replicates: int = 0,
     window_sink: Optional[List[Dict[str, float]]] = None,
     bootstrap_block: int = 1,
+    group_sink: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, float]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
@@ -80,6 +81,13 @@ def evaluate(
     逐位相同，因此两个运行可以按窗口配对比较——这给出
     「在这批固定评估窗口上」的配对证据，与种子级检验
     （训练随机性）互补。
+
+    group_sink 非 None 且数据由 ``--group-separator`` 定义了
+    文档/群组边界时，按目标 token 所属群组累加损失和、token
+    数与命中数，并把一份 ``group_stats`` 追加到该列表。它用于
+    以文档为重采样单位的 cluster bootstrap：同一文档的多个
+    窗口不是独立样本，按窗口 bootstrap 会系统性低估评估
+    不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
     model.eval()
@@ -132,6 +140,46 @@ def evaluate(
     window_predicted: List[torch.Tensor] = []
     window_support: List[torch.Tensor] = []
     window_class_loss_sums: List[torch.Tensor] = []
+
+    # 文档/群组级充分统计量：只有显式要求 group_sink 且数据带
+    # --group-separator 时收集。窗口不是独立样本，同一文档可能
+    # 贡献多个重叠窗口；按群组重采样才是评估集层面的正确单位。
+    group_ids_all: Optional[torch.Tensor] = None
+    group_tokens_acc: Optional[torch.Tensor] = None
+    group_loss_acc: Optional[torch.Tensor] = None
+    group_correct_acc: Optional[torch.Tensor] = None
+    group_count = 0
+    if (
+        group_sink is not None
+        and getattr(dataset, "group_separator", None) is not None
+    ):
+        group_ids_all = dataset.fixed_eval_group_ids(
+            split,
+            batches,
+            batch_size,
+        )
+        if (
+            group_ids_all is not None
+            and group_ids_all.numel() > 0
+        ):
+            group_count = int(group_ids_all.max().item()) + 1
+            if group_count > 0:
+                group_tokens_acc = torch.zeros(
+                    group_count,
+                    dtype=torch.float64,
+                )
+                group_loss_acc = torch.zeros(
+                    group_count,
+                    dtype=torch.float64,
+                )
+                group_correct_acc = torch.zeros(
+                    group_count,
+                    dtype=torch.float64,
+                )
+            else:
+                group_ids_all = None
+        else:
+            group_ids_all = None
 
     # 类平衡似然（macro NLL）的逐类充分统计量：按目标类累计
     # 损失和与 token 数。它与频率加权的 total 累加共用同一次
@@ -263,6 +311,52 @@ def evaluate(
                         dtype=torch.float64,
                     ),
                 )
+
+                if group_ids_all is not None:
+                    group_offset = batch_index * batch_size
+                    batch_group_ids = group_ids_all[
+                        group_offset:group_offset + y.size(0)
+                    ]
+                    if batch_group_ids.size(0) != y.size(0):
+                        # 窗口记录与群组下标错位时不产出可归档的
+                        # 群组统计，避免把部分批次伪装成完整评估。
+                        group_ids_all = None
+                        group_tokens_acc = None
+                        group_loss_acc = None
+                        group_correct_acc = None
+                    else:
+                        assert group_tokens_acc is not None
+                        assert group_loss_acc is not None
+                        assert group_correct_acc is not None
+                        flat_group_ids = batch_group_ids.reshape(-1)
+                        group_tokens_acc.index_add_(
+                            0,
+                            flat_group_ids,
+                            torch.ones(
+                                flat_group_ids.numel(),
+                                dtype=torch.float64,
+                            ),
+                        )
+                        group_loss_acc.index_add_(
+                            0,
+                            flat_group_ids,
+                            token_losses.detach()
+                            .reshape(-1)
+                            .to(torch.float64)
+                            .cpu(),
+                        )
+                        group_correct_acc.index_add_(
+                            0,
+                            flat_group_ids,
+                            (
+                                predicted.reshape(-1).to(
+                                    torch.int64
+                                )
+                                == flat_target
+                            )
+                            .to(torch.float64)
+                            .cpu(),
+                        )
 
                 if window_sink is not None:
                     # 逐窗口统计：与整批口径同一份 logits 与
@@ -460,6 +554,33 @@ def evaluate(
     for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
 
+    group_stats_payload: Optional[Dict[str, object]] = None
+    if (
+        group_tokens_acc is not None
+        and group_loss_acc is not None
+        and group_correct_acc is not None
+    ):
+        group_records: List[List[float]] = []
+        token_values = group_tokens_acc.tolist()
+        loss_values = group_loss_acc.tolist()
+        correct_values = group_correct_acc.tolist()
+        for group_id in range(group_count):
+            tokens_seen = float(token_values[group_id])
+            if tokens_seen <= 0.0:
+                continue
+            group_records.append([
+                int(group_id),
+                tokens_seen,
+                float(loss_values[group_id]),
+                float(correct_values[group_id]),
+            ])
+        group_stats_payload = _build_eval_group_stats(
+            dataset,
+            group_records,
+        )
+        if group_stats_payload is not None and group_sink is not None:
+            group_sink.append(group_stats_payload)
+
     if bootstrap_enabled and window_loss_sums:
         bootstrap_metrics = _bootstrap_eval_intervals(
             torch.cat(window_loss_sums),
@@ -498,6 +619,45 @@ def evaluate(
             metrics[f"{split}_eval_window_overlap_fraction"] = (
                 overlap_count / (len(starts) - 1)
             )
+
+    # 文档/群组级区间：与窗口级区间回答不同问题——同一
+    # 文档的多个窗口不是独立样本，窗口 bootstrap 会偏窄；
+    # 群组 bootstrap 以文档为重采样单位。没有群组记录时
+    # 显式标记不可用，不能把缺失当成「没有额外不确定性」。
+    if bootstrap_enabled and group_stats_payload is not None:
+        group_intervals = _group_cluster_eval_intervals(
+            group_stats_payload,
+            int(bootstrap_replicates),
+            _eval_bootstrap_seed(
+                dataset.data_sha256,
+                split,
+                batches,
+                batch_size,
+                dataset.seq_len,
+            ),
+        )
+        if group_intervals.get("available"):
+            metrics[f"{split}_group_cluster_available"] = 1.0
+            metrics[f"{split}_group_cluster_n_groups"] = float(
+                group_intervals.get("n_groups", 0)
+            )
+            for group_key in (
+                "loss_ci95_low",
+                "loss_ci95_high",
+                "ppl_ci95_low",
+                "ppl_ci95_high",
+                "token_accuracy_ci95_low",
+                "token_accuracy_ci95_high",
+            ):
+                value = group_intervals.get(group_key)
+                if isinstance(value, (int, float)) and math.isfinite(
+                    float(value)
+                ):
+                    metrics[
+                        f"{split}_group_cluster_{group_key}"
+                    ] = float(value)
+        else:
+            metrics[f"{split}_group_cluster_available"] = 0.0
 
     if compute_auc:
         # 读取 CPU 收集缓冲前统一等待。

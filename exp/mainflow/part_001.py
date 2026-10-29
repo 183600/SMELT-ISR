@@ -233,7 +233,8 @@ def _MAIN_part_005():
     if args.bad_cases > 0 and (not numerical_polluted):
         val_bad_case_collector = _BadCaseCollector(dataset, 'val', args.batch_size, args.eval_batches, args.bad_cases, device=device)
     val_window_records = []
-    final_metrics = evaluate(model, dataset, args.batch_size, args.eval_batches, device, amp_dtype=amp_dtype, compute_auc=True, routing_probe=routing_probe, bad_case_collector=val_bad_case_collector, bootstrap_replicates=getattr(args, 'eval_bootstrap', 0), window_sink=val_window_records, bootstrap_block=getattr(args, 'eval_bootstrap_block', 1))
+    val_group_stats_records = []
+    final_metrics = evaluate(model, dataset, args.batch_size, args.eval_batches, device, amp_dtype=amp_dtype, compute_auc=True, routing_probe=routing_probe, bad_case_collector=val_bad_case_collector, bootstrap_replicates=getattr(args, 'eval_bootstrap', 0), window_sink=val_window_records, bootstrap_block=getattr(args, 'eval_bootstrap_block', 1), group_sink=val_group_stats_records)
     if val_window_records:
         overlap_fraction = None
         starts = dataset._fixed_starts.get('val', {}).get('starts')
@@ -241,7 +242,7 @@ def _MAIN_part_005():
             gaps = starts[1:] - starts[:-1]
             overlap_count = int((gaps < dataset.seq_len).sum().item())
             overlap_fraction = overlap_count / (len(starts) - 1)
-        eval_windows_payload = {'split': 'val', 'data_sha256': dataset.data_sha256, 'split_sha256': dataset.split_sha256.get('val'), 'seq_len': int(dataset.seq_len), 'batch_size': int(args.batch_size), 'batches': int(args.eval_batches), 'n_windows': len(val_window_records), 'overlap_fraction': overlap_fraction, 'windows': val_window_records}
+        eval_windows_payload = {'split': 'val', 'data_sha256': dataset.data_sha256, 'split_sha256': dataset.split_sha256.get('val'), 'seq_len': int(dataset.seq_len), 'batch_size': int(args.batch_size), 'batches': int(args.eval_batches), 'n_windows': len(val_window_records), 'overlap_fraction': overlap_fraction, 'windows': val_window_records, 'group_stats': val_group_stats_records[0] if val_group_stats_records else None}
         with open(out_dir / 'eval_windows.json', 'w', encoding='utf-8') as f:
             json.dump(_json_safe(eval_windows_payload), f, ensure_ascii=False)
     min_val_loss, min_val_loss_step, _ = early_stop_state_from_records(read_metrics_records(metrics_path), 0.0, metric='val_loss')

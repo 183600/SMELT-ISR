@@ -327,6 +327,20 @@ def _format_window_paired(
             f"（种子 {hierarchical.get('n_seeds')} × 窗口，"
             f"{hierarchical.get('replicates')} 次）"
         )
+    hierarchical_group = window_paired.get(
+        "hierarchical_group_bootstrap_ci95"
+    )
+    if isinstance(hierarchical_group, dict) and hierarchical_group.get(
+        "available"
+    ):
+        parts.append(
+            "种子×文档群组 bootstrap 95%CI=["
+            f"{_format_finite(hierarchical_group.get('low'), '+.4f')},"
+            f"{_format_finite(hierarchical_group.get('high'), '+.4f')}]"
+            f"（种子 {_display_count(hierarchical_group.get('n_seeds', 0))}"
+            f" × 群组 {_display_count(hierarchical_group.get('n_groups', 0))}，"
+            f"{hierarchical_group.get('replicates')} 次）"
+        )
     variance = window_paired.get("variance_components")
     if isinstance(variance, dict) and variance.get("available"):
         share_seed = variance.get("variance_share_seed")

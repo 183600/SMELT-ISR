@@ -684,3 +684,141 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 {"group_stats": invalid}
             )
         )
+
+    def test_evaluate_emits_group_stats_with_explicit_separator(self):
+        separator = b"<|doc|>"
+        payload = (b"abcd" + separator) * 20 + b"wxyz"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(payload)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.25,
+                test_fraction=0.25,
+                group_separator=separator,
+            )
+            model = experiment.LanguageModel(
+                _tiny_config(seq_len=4)
+            ).eval()
+            group_sink = []
+            metrics = experiment.evaluate(
+                model,
+                dataset,
+                8,
+                1,
+                torch.device("cpu"),
+                bootstrap_replicates=20,
+                group_sink=group_sink,
+            )
+        self.assertEqual(len(group_sink), 1, group_sink)
+        parsed = experiment._parse_group_stats(
+            {"group_stats": group_sink[0]}
+        )
+        self.assertIsNotNone(parsed, group_sink[0])
+        self.assertEqual(
+            parsed["unit"], "document_group"
+        )
+        self.assertEqual(
+            metrics["val_group_cluster_available"], 1.0
+        )
+        self.assertGreaterEqual(
+            metrics["val_group_cluster_n_groups"], 2.0
+        )
+
+    def test_evaluate_skips_group_stats_without_separator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.bin"
+            path.write_bytes(b"abcdefgh" * 16)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.25,
+                test_fraction=0.25,
+            )
+            model = experiment.LanguageModel(
+                _tiny_config(seq_len=4)
+            ).eval()
+            group_sink = []
+            experiment.evaluate(
+                model,
+                dataset,
+                4,
+                1,
+                torch.device("cpu"),
+                group_sink=group_sink,
+            )
+        self.assertEqual(group_sink, [])
+
+    def test_cell_window_analysis_pairs_group_stats_across_seeds(self):
+        def payload(offset):
+            windows = [
+                {
+                    "loss_sum": 40.0 + offset * 10.0,
+                    "tokens": 10,
+                    "correct": 5,
+                },
+                {
+                    "loss_sum": 50.0 + offset * 10.0,
+                    "tokens": 10,
+                    "correct": 5,
+                },
+            ]
+            groups = [
+                [0, 10.0, 40.0 + offset * 10.0, 5.0],
+                [1, 10.0, 50.0 + offset * 10.0, 5.0],
+                [2, 10.0, 60.0 + offset * 10.0, 5.0],
+            ]
+            return {
+                "split": "val",
+                "data_sha256": "deadbeef",
+                "split_sha256": "cafebabe",
+                "seq_len": 8,
+                "batch_size": 2,
+                "batches": 1,
+                "n_windows": 2,
+                "overlap_fraction": 0.0,
+                "windows": windows,
+                "group_stats": self._stats(groups),
+            }
+
+        cell_a = {
+            "window_payloads": [
+                {"seed": seed, "payload": payload(0.0)}
+                for seed in (1, 2, 3)
+            ]
+        }
+        cell_b = {
+            "window_payloads": [
+                {"seed": seed, "payload": payload(-0.5)}
+                for seed in (1, 2, 3)
+            ]
+        }
+        report = experiment._cell_window_paired_analysis(
+            cell_a, cell_b
+        )
+        self.assertTrue(report["available"], report)
+        self.assertEqual(report["n_group_paired_seeds"], 3)
+        hierarchical = report[
+            "hierarchical_group_bootstrap_ci95"
+        ]
+        self.assertTrue(hierarchical["available"], hierarchical)
+        self.assertEqual(hierarchical["n_seeds"], 3)
+        self.assertEqual(hierarchical["n_groups"], 3)
+        self.assertAlmostEqual(
+            hierarchical["low"], -0.5, places=12
+        )
+        self.assertAlmostEqual(
+            hierarchical["high"], -0.5, places=12
+        )
+        for entry in report["per_seed"]:
+            group_cluster = entry.get("group_cluster")
+            self.assertIsInstance(group_cluster, dict)
+            self.assertTrue(group_cluster["available"])
+            self.assertNotIn(
+                "group_differences", group_cluster
+            )
+        display = experiment._format_window_paired(
+            {"window_paired": report}
+        )
+        self.assertIn("种子×文档群组 bootstrap", display)
