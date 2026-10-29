@@ -1188,7 +1188,7 @@ def _noncentral_t_cdf_large_shift(
     # 上界仅 39.7，会把 CDF 低估十几个数量级。按转折点上界
     # 扩界后再做 x 积分，剩余尾部仍由下面的 chi CDF/生存函数
     # 精确补上。
-    u_max = math.sqrt(df - 1.0) + _T_POWER_TAIL
+    u_max = math.sqrt(max(df - 1.0, 0.0)) + _T_POWER_TAIL
     if a > 0.0:
         tail_cutoff = (40.0 + noncentrality) / a
     elif a < 0.0:

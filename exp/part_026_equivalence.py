@@ -43,7 +43,16 @@ def _noncentral_t_cdf(
         # T'=0 当且仅当 Z+δ<=0，与 V 无关；直接由正态 CDF 给出，
         # 避免低自由度截断积分少算 chi 尾部概率。
         return _normal_cdf(-noncentrality)
-    if df >= 3.0 and abs(value) / math.sqrt(df) >= 0.05:
+    shift_scale = abs(value) / math.sqrt(df)
+    if df < 3.0 and (
+        (value > 0.0) == (noncentrality > 0.0)
+    ) and shift_scale >= 0.05 and abs(noncentrality) >= 50.0:
+        return _noncentral_t_cdf_large_shift(
+            value,
+            df,
+            noncentrality,
+        )
+    if df >= 3.0 and shift_scale >= 0.05:
         return _noncentral_t_cdf_large_shift(
             value,
             df,

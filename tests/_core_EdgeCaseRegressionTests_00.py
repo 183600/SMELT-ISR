@@ -1391,6 +1391,32 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             reference,
             delta=reference * 1.0e-8,
         )
+    def test_noncentral_t_cdf_resolves_low_df_large_shift_mid_probability(self):
+        for value, df, noncentrality, reference in (
+            (
+                -414.365302954112,
+                2.742178716728686,
+                -414.8347694809105,
+                0.614268703372459,
+            ),
+            (
+                587.9124223396504,
+                2.4048060366158457,
+                585.1505959671964,
+                0.3830503109564495,
+            ),
+            (
+                -644.4558026691412,
+                0.322465036162037,
+                -644.1345102442252,
+                0.7843830493770758,
+            ),
+        ):
+            cdf = experiment._noncentral_t_cdf(
+                value, df, noncentrality
+            )
+            self.assertIsNotNone(cdf)
+            self.assertAlmostEqual(cdf, reference, delta=1.0e-9)
     def test_noncentral_t_cdf_keeps_extreme_positive_tail_small_df(self):
         # df<3 时默认 u 上界只到 sqrt(df-1)+12；δ 很大而
         # t 较小时正态尾转折落在截断之外，固定节点会漏掉
