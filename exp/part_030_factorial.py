@@ -888,6 +888,7 @@ def compare_cells_to_baseline(
     baseline_mode: Optional[str],
     metric: str,
     equivalence_margin: Optional[float] = None,
+    controlled_variables: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     """
     指定基线模式（--compare-baseline），把每个实验单元与
@@ -898,6 +899,10 @@ def compare_cells_to_baseline(
     自己的检验家族，同样做多重比较校正并附效应量 95% CI，
     以及 80% 功效 MDE 与 TOST 等价性口径
     （``equivalence_margin`` 给定时）。
+
+    ``controlled_variables`` 给定时，声明因子之外仍实际不同的
+    协议项会让该直接对比成为混杂对比：只保留双方身份与差异
+    键，不再产出可被误读为「只改 mode」的统计显著性。
     """
     if not baseline_mode:
         return []
@@ -960,6 +965,34 @@ def compare_cells_to_baseline(
             str(aggregate["keys"].get("mode"))
             == str(reference["keys"].get("mode"))
         ):
+            continue
+        controlled_confounds = _controlled_confound_keys_for_cells(
+            reference,
+            aggregate,
+            controlled_variables,
+        )
+        if controlled_confounds:
+            contrasts.append({
+                "cells": [
+                    reference["label"],
+                    aggregate["label"],
+                ],
+                "factor": "mode",
+                "baseline": reference["label"],
+                "variant": aggregate["label"],
+                "baseline_value": baseline_mode,
+                "variant_value": aggregate["keys"].get("mode"),
+                "differing_factors": ["mode"] + [
+                    key
+                    for key in controlled_confounds
+                    if key != "mode"
+                ],
+                "confounded": True,
+                "controlled_variables_ok": False,
+                "controlled_confound_keys": list(
+                    controlled_confounds
+                ),
+            })
             continue
         samples_reference = _as_dict(
             reference.get("samples")

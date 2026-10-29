@@ -16,8 +16,9 @@ def _PA_part_000():
     curve_mean = annotate_curve_metrics(rows, target_step=common_step.get('target_step') if not common_step.get('target_step_data_dependent') else None)
     selection_bias = selection_bias_report(rows, metric, common_step)
     controlled = check_controlled_variables(rows, factors)
-    single_factor_design = {'design_keys': list(SINGLE_FACTOR_DESIGN_KEYS), 'violations': [violation['key'] for violation in controlled['violations'] if violation['key'] in SINGLE_FACTOR_DESIGN_KEYS], 'unchecked_keys': [key for key in SINGLE_FACTOR_DESIGN_KEYS if key in controlled.get('unchecked_keys', [])], 'ok': not any((violation['key'] in SINGLE_FACTOR_DESIGN_KEYS for violation in controlled['violations']))}
-    single_factor_design['advisory'] = '模型结构/数据口径在运行间不一致：这些运行不是同一个实验单元，不能作为单因子对比；请统一设置重跑，或把该键显式声明为实验因子后按多水平单因子分析' if not single_factor_design['ok'] else '单因子设计所需的模型结构/数据口径键均已核对一致' if not single_factor_design['unchecked_keys'] else '部分单因子设计键在所有运行中未记录，无法核对一致'
+    controlled_violation_keys = [violation['key'] for violation in controlled['violations']]
+    single_factor_design = {'design_keys': list(SINGLE_FACTOR_DESIGN_KEYS), 'design_violations': [key for key in controlled_violation_keys if key in SINGLE_FACTOR_DESIGN_KEYS], 'violations': controlled_violation_keys, 'design_unchecked_keys': [key for key in SINGLE_FACTOR_DESIGN_KEYS if key in controlled.get('unchecked_keys', [])], 'unchecked_keys': list(controlled.get('unchecked_keys', [])), 'ok': bool(controlled.get('ok'))}
+    single_factor_design['advisory'] = '模型结构/数据口径/训练协议在运行间不一致：这些运行不是同一个实验单元，不能作为单因子对比；请统一设置重跑，或把该键显式声明为实验因子后按多水平单因子分析' if not single_factor_design['ok'] else '单因子设计所需的受控协议键均已核对一致' if not single_factor_design['design_unchecked_keys'] else '部分单因子设计键在所有运行中未记录，无法核对一致'
     group_keys = []
     for key in factors:
         if key == 'seed':
@@ -26,8 +27,8 @@ def _PA_part_000():
         if len(distinct) > 1:
             group_keys.append(key)
     aggregates = aggregate_runs(rows, group_keys)
-    contrasts = factor_contrasts(aggregates, group_keys, metric, equivalence_margin=equivalence_margin)
-    reference = compare_cells_to_baseline(aggregates, baseline_mode, metric, equivalence_margin=equivalence_margin)
+    contrasts = factor_contrasts(aggregates, group_keys, metric, equivalence_margin=equivalence_margin, controlled_variables=controlled)
+    reference = compare_cells_to_baseline(aggregates, baseline_mode, metric, equivalence_margin=equivalence_margin, controlled_variables=controlled)
     coverage = ablation_coverage(rows, factors, ablation_modes, allow_partial=allow_partial_ablation)
     balance_scale = balance_strength_report(rows)
     factorial_balance_scale = factorial_balance_strength(rows)
@@ -89,7 +90,7 @@ def _PA_part_000():
         print('  以上差异会使对比结论无法归因到待验证模块；请统一这些设置后重跑，或在 --compare-factors 中显式声明为因子')
         design_violations = single_factor_design['violations']
         if design_violations:
-            print('  [single-factor] 差异涉及模型结构/数据口径（' + ', '.join(design_violations) + '）：这些运行不是同一个实验单元，不能把它们当作「只改一个因子」的对比；请分别重跑以保持其余设置一致，或显式声明该键为实验因子后按多水平单因子分析')
+            print('  [single-factor] 差异涉及模型结构/数据口径/训练协议（' + ', '.join(design_violations) + '）：这些运行不是同一个实验单元，不能把它们当作「只改一个因子」的对比；请分别重跑以保持其余设置一致，或显式声明该键为实验因子后按多水平单因子分析')
     if controlled.get('unchecked_keys'):
         print('  [warn] 以下协议项所有运行都未记录，无法核对一致性: ' + ', '.join(controlled['unchecked_keys']))
     cross_violations = controlled.get('cross_family_violations') or []
@@ -431,6 +432,9 @@ def _PA_part_001():
         if not reference:
             print(f'    未找到 mode={baseline_mode} 的运行')
         for contrast in reference:
+            if contrast.get('confounded'):
+                print(f'    [confounded] {contrast['baseline']} vs {contrast['variant']}: 同时改变了 ' + ', '.join(contrast['differing_factors']) + '，结论无法归因')
+                continue
             print('    ' + _contrast_display(contrast, metric))
             window_line = _format_window_paired(contrast)
             if window_line:

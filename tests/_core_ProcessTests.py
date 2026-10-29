@@ -701,6 +701,125 @@ class ProcessTests(unittest.TestCase):
         self.assertIn("n_kv_heads", audit["violations"])
         self.assertIn("[single-factor]", output.getvalue())
 
+    def test_single_factor_contrast_rejects_undeclared_protocol_change(
+        self,
+    ):
+        # 模式对比声称只改 mode，但两臂学习率不同。lr 即使没有
+        # 写进 --compare-factors，也属于受控变量：不能继续产出
+        # 「单因子」显著性结论。
+        rows = []
+        for mode, lr in (("A", 1e-4), ("B", 2e-4)):
+            for seed in (41, 42, 43):
+                rows.append({
+                    "run": f"{mode}{seed}",
+                    "mode": mode,
+                    "seed": seed,
+                    "val_loss": 3.0 + (0.1 if mode == "B" else 0.0),
+                    "protocol": {
+                        "comparison_family": "neural",
+                        "lr": lr,
+                    },
+                    "protocol_recorded_keys": ["lr"],
+                })
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode"],
+                metric="val_loss",
+            )
+        audit = report["single_factor_design"]
+        self.assertFalse(audit["ok"])
+        self.assertIn("lr", audit["violations"])
+        self.assertEqual(len(report["contrasts"]), 1)
+        contrast = report["contrasts"][0]
+        self.assertTrue(contrast["confounded"])
+        self.assertIn("lr", contrast["differing_factors"])
+        self.assertEqual(
+            contrast["controlled_confound_keys"], ["lr"]
+        )
+        self.assertNotIn("p_value", contrast)
+        self.assertNotIn("significant", contrast)
+        rendered = output.getvalue()
+        self.assertIn("[single-factor]", rendered)
+        self.assertIn("[confounded]", rendered)
+
+    def test_factor_contrasts_only_confound_affected_cells(self):
+        # 学习率违规只发生在 B 单元：A→C 仍是合法的单因子对比，
+        # 不能被无关违规一起判成混杂。
+        def cell(label, runs, mean):
+            return {
+                "label": label,
+                "keys": {"mode": label},
+                "runs": list(runs),
+                "n_runs": len(runs),
+                "samples": {},
+                "val_loss_mean": mean,
+                "val_loss_std": 0.1,
+                "costs": {},
+            }
+
+        aggregates = [
+            cell("A", ["a1", "a2"], 3.0),
+            cell("B", ["b1", "b2"], 3.2),
+            cell("C", ["c1", "c2"], 2.9),
+        ]
+        controlled = {
+            "ok": False,
+            "violations": [{
+                "key": "lr",
+                "values": {
+                    "a1": 1e-4,
+                    "a2": 1e-4,
+                    "b1": 2e-4,
+                    "b2": 2e-4,
+                    "c1": 1e-4,
+                    "c2": 1e-4,
+                },
+                "missing_runs": [],
+            }],
+        }
+        contrasts = experiment.factor_contrasts(
+            aggregates,
+            ["mode"],
+            "val_loss",
+            controlled_variables=controlled,
+        )
+        by_cells = {
+            frozenset(contrast["cells"]): contrast
+            for contrast in contrasts
+        }
+        ac = by_cells[frozenset(("A", "C"))]
+        ab = by_cells[frozenset(("A", "B"))]
+        bc = by_cells[frozenset(("B", "C"))]
+        self.assertFalse(ac["confounded"])
+        self.assertIn("p_value", ac)
+        for contrast in (ab, bc):
+            self.assertTrue(contrast["confounded"])
+            self.assertIn("lr", contrast["differing_factors"])
+            self.assertNotIn("p_value", contrast) 
+
+        reference = experiment.compare_cells_to_baseline(
+            aggregates,
+            "A",
+            "val_loss",
+            controlled_variables=controlled,
+        )
+        reference_by_cells = {
+            frozenset(contrast["cells"]): contrast
+            for contrast in reference
+        }
+        self.assertFalse(
+            reference_by_cells[frozenset(("A", "C"))][
+                "confounded"
+            ]
+        )
+        self.assertTrue(
+            reference_by_cells[frozenset(("A", "B"))][
+                "confounded"
+            ]
+        )
+
     def test_ngram_bootstrap_honours_block_size(self):
         data = torch.tensor(
             [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],

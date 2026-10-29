@@ -454,11 +454,103 @@ def _apply_multiple_comparison_correction(
 
 
 
+def _controlled_confound_keys_for_cells(
+    cell_a: Dict[str, object],
+    cell_b: Dict[str, object],
+    controlled_variables: Optional[Dict[str, object]],
+) -> List[str]:
+    """
+    列出两个实验单元之间实际不同的受控变量。
+
+    ``check_controlled_variables`` 只给出全局违规：某条违规可能
+    只发生在同一单元内部（例如同一 mode 的两个种子换了优化器），
+    也可能只涉及本次对比之外的两条运行。单因子结论必须按**参与
+    该对比的运行**判定，不能把无关违规误伤到所有对比，也不能
+    因为违规项不在 ``--compare-factors`` 里就继续把对比当成
+    「只改一个因子」。
+
+    对每条违规，取两侧单元各自的协议取值集合：任一侧内部出现
+    多个取值、或两侧取值不同、或缺失记录落在参与对比的运行上，
+    该键都使对比混杂。没有违规时返回空列表，不改变历史行为。
+    """
+    if not isinstance(controlled_variables, dict):
+        return []
+    violations = controlled_variables.get("violations")
+    if not isinstance(violations, (list, tuple)):
+        violations = []
+    cross_family = controlled_variables.get(
+        "cross_family_violations"
+    )
+    if not isinstance(cross_family, (list, tuple)):
+        cross_family = []
+    all_violations = list(violations) + list(cross_family)
+    if not all_violations:
+        return []
+
+    def _run_names(cell: Dict[str, object]) -> set:
+        runs = cell.get("runs")
+        if not isinstance(runs, (list, tuple, set, frozenset)):
+            return set()
+        return {str(run) for run in runs}
+
+    runs_a = _run_names(cell_a)
+    runs_b = _run_names(cell_b)
+    involved_runs = runs_a | runs_b
+    if not involved_runs:
+        # 合成/旧聚合记录没有 runs 清单时无法做逐单元核对；
+        # 保守地沿用全局违规，避免把单因子结论建立在未知之上。
+        keys: List[str] = []
+        for violation in all_violations:
+            key = violation.get("key") if isinstance(violation, dict) else None
+            if key is not None and str(key) not in keys:
+                keys.append(str(key))
+        return keys
+
+    confound_keys: List[str] = []
+    for violation in all_violations:
+        if not isinstance(violation, dict):
+            continue
+        key = violation.get("key")
+        if key is None:
+            continue
+        key = str(key)
+        values = violation.get("values")
+        if not isinstance(values, dict):
+            values = {}
+        missing = violation.get("missing_runs")
+        missing_runs = (
+            {str(run) for run in missing}
+            if isinstance(missing, (list, tuple, set, frozenset))
+            else set()
+        )
+        values_a = {
+            _stable_factor_key(values[run])
+            for run in runs_a
+            if run in values
+        }
+        values_b = {
+            _stable_factor_key(values[run])
+            for run in runs_b
+            if run in values
+        }
+        confounded = (
+            len(values_a) > 1
+            or len(values_b) > 1
+            or values_a != values_b
+            or bool(involved_runs & missing_runs)
+        )
+        if confounded and key not in confound_keys:
+            confound_keys.append(key)
+    return confound_keys
+
+
+
 def factor_contrasts(
     aggregates: List[Dict[str, object]],
     group_keys: List[str],
     metric: str,
     equivalence_margin: Optional[float] = None,
+    controlled_variables: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     """
     单因子对比：只有恰好一个因子取值不同的两个实验单元之间
@@ -466,6 +558,13 @@ def factor_contrasts(
     若干这样的单因子对比给出；一次变化多个因子的组合被标记
     为混杂对比，结论无法归因。返回前对家族内全部检验做
     Holm（FWER）/ BH（FDR）多重比较校正并附效应量 95% CI。
+
+    ``controlled_variables`` 是 ``check_controlled_variables``
+    的结果。声明因子之外只要还有实际不同的协议项，这两个单元
+    就不是单因子对比：即使违规项没有写进 ``--compare-factors``，
+    也会与声明因子一起列进 ``differing_factors`` 并标为
+    ``confounded``，不再产出 p 值/显著性等可被误读为单因子
+    证据的字段。
 
     ``equivalence_margin`` 给定时（相对基线均值的比例，见
     ``--equivalence-margin``），每个对比额外附带 80% 功效的
@@ -494,13 +593,28 @@ def factor_contrasts(
             if not differing:
                 continue
 
+            controlled_confounds = _controlled_confound_keys_for_cells(
+                cell_a,
+                cell_b,
+                controlled_variables,
+            )
+            differing_with_controls = list(differing)
+            for key in controlled_confounds:
+                if key not in differing_with_controls:
+                    differing_with_controls.append(key)
+
             contrast: Dict[str, object] = {
                 "cells": [cell_a["label"], cell_b["label"]],
-                "differing_factors": differing,
-                "confounded": len(differing) > 1,
+                "differing_factors": differing_with_controls,
+                "confounded": len(differing_with_controls) > 1,
             }
+            if controlled_confounds:
+                contrast["controlled_variables_ok"] = False
+                contrast["controlled_confound_keys"] = list(
+                    controlled_confounds
+                )
 
-            if len(differing) != 1:
+            if len(differing_with_controls) != 1:
                 contrasts.append(contrast)
                 continue
 
