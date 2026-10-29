@@ -223,7 +223,10 @@ class Config:
         return self.top_k * self.expert_hidden
 
     def validate(self):
-        if self.mode not in self.ALL_MODES:
+        if (
+            not isinstance(self.mode, str)
+            or self.mode not in self.ALL_MODES
+        ):
             raise ValueError(f"未知 mode: {self.mode}")
 
         def _positive_int(name: str, value: object) -> None:
@@ -275,23 +278,43 @@ class Config:
             raise ValueError("k1 必须满足 1 <= k1 <= n_experts")
         if not 1 <= self.k2 <= self.n_experts:
             raise ValueError("k2 必须满足 1 <= k2 <= n_experts")
-        if not math.isfinite(self.balance_coef) or self.balance_coef < 0.0:
-            raise ValueError("balance_coef 必须是有限非负数")
-        if not math.isfinite(self.residual_scale) or self.residual_scale < 0.0:
-            raise ValueError("residual_scale 必须是有限非负数")
-        if self.residual_scaling not in self.RESIDUAL_SCALINGS:
+        def _finite_nonnegative(name: str, value: object) -> None:
+            if isinstance(value, bool):
+                raise ValueError(f"{name} 必须是有限非负数")
+            try:
+                finite = math.isfinite(value)
+                negative = value < 0.0
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{name} 必须是有限非负数"
+                ) from None
+            if not finite or negative:
+                raise ValueError(f"{name} 必须是有限非负数")
+
+        _finite_nonnegative("balance_coef", self.balance_coef)
+        _finite_nonnegative("residual_scale", self.residual_scale)
+        if (
+            not isinstance(self.residual_scaling, str)
+            or self.residual_scaling not in self.RESIDUAL_SCALINGS
+        ):
             raise ValueError(
                 "residual_scaling 必须是 "
                 + " / ".join(sorted(self.RESIDUAL_SCALINGS))
             )
+        if not isinstance(self.document_masks, bool):
+            raise ValueError("document_masks 必须是布尔值")
         if self.document_masks:
             if not self.document_separator:
                 raise ValueError(
                     "document_masks 需要非空的 document_separator"
                     "（文档边界字节串），否则无法构造 segment mask"
                 )
-            if any(
-                not isinstance(byte, int)
+            if not isinstance(
+                self.document_separator,
+                (list, tuple),
+            ) or any(
+                isinstance(byte, bool)
+                or not isinstance(byte, int)
                 or not 0 <= byte <= 255
                 for byte in self.document_separator
             ):
@@ -318,7 +341,10 @@ class Config:
                     "dense 模式的 FFN 隐藏宽度必须为正整数"
                     f"（当前解析为 {hidden}）"
                 )
-        if self.init_scheme not in self.INIT_SCHEMES:
+        if (
+            not isinstance(self.init_scheme, str)
+            or self.init_scheme not in self.INIT_SCHEMES
+        ):
             raise ValueError(
                 "init_scheme 必须是 "
                 + " / ".join(sorted(self.INIT_SCHEMES))

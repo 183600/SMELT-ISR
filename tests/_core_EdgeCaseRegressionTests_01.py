@@ -875,6 +875,32 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         _tiny_config(**{field: value}).validate()
         _tiny_config(n_kv_heads=None).validate()
+    def test_config_numeric_and_enum_fields_are_type_checked(self):
+        for field in ("balance_coef", "residual_scale"):
+            for value in (True, "0.01", None, float("nan"), -0.1):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        _tiny_config(**{field: value}).validate()
+        for field in ("mode", "residual_scaling", "init_scheme"):
+            for value in ([], 1, None):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        _tiny_config(**{field: value}).validate()
+        for value in ("yes", 1, None):
+            with self.subTest(document_masks=value):
+                with self.assertRaises(ValueError):
+                    _tiny_config(document_masks=value).validate()
+        for separator in (b"\n", 10, [True], [256], [1.5]):
+            with self.subTest(document_separator=separator):
+                with self.assertRaises(ValueError):
+                    _tiny_config(
+                        document_masks=True,
+                        document_separator=separator,
+                    ).validate()
+        _tiny_config(
+            document_masks=True,
+            document_separator=[10, 0],
+        ).validate()
     def test_group_top_byte_share_avoids_readonly_buffer_warning(self):
         # torch.frombuffer 不接受只读缓冲区：原实现先 bytes(...)
         # 再 frombuffer，在 -W error 下会因 UserWarning 失败。
