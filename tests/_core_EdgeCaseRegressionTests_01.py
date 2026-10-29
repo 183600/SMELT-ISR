@@ -856,6 +856,25 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
             mode="dense",
             dense_fnn_hidden=32,
         ).validate()
+    def test_structural_config_integers_are_type_checked(self):
+        for field in (
+            "vocab_size",
+            "seq_len",
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "n_experts",
+            "expert_hidden",
+            "top_k",
+            "k1",
+            "k2",
+            "n_kv_heads",
+        ):
+            for value in (True, 3.5, "4"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        _tiny_config(**{field: value}).validate()
+        _tiny_config(n_kv_heads=None).validate()
     def test_group_top_byte_share_avoids_readonly_buffer_warning(self):
         # torch.frombuffer 不接受只读缓冲区：原实现先 bytes(...)
         # 再 frombuffer，在 -W error 下会因 UserWarning 失败。

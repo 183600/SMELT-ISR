@@ -225,18 +225,34 @@ class Config:
     def validate(self):
         if self.mode not in self.ALL_MODES:
             raise ValueError(f"未知 mode: {self.mode}")
-        if self.vocab_size <= 0:
-            raise ValueError("vocab_size 必须为正整数")
-        if self.seq_len <= 0:
-            raise ValueError("seq_len 必须为正整数")
-        if self.d_model <= 0:
-            raise ValueError("d_model 必须为正整数")
-        if self.expert_hidden <= 0:
-            raise ValueError("expert_hidden 必须为正整数")
-        if self.n_heads <= 0 or self.d_model % self.n_heads != 0:
-            raise ValueError("d_model 必须能被正的 n_heads 整除")
-        if self.effective_n_kv_heads <= 0:
-            raise ValueError("n_kv_heads 必须为正整数")
+
+        def _positive_int(name: str, value: object) -> None:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} 必须为正整数")
+
+        for _name, _value in (
+            ("vocab_size", self.vocab_size),
+            ("seq_len", self.seq_len),
+            ("d_model", self.d_model),
+            ("n_heads", self.n_heads),
+            ("n_layers", self.n_layers),
+            ("n_experts", self.n_experts),
+            ("expert_hidden", self.expert_hidden),
+            ("top_k", self.top_k),
+            ("k1", self.k1),
+            ("k2", self.k2),
+        ):
+            _positive_int(_name, _value)
+        _positive_int(
+            "n_kv_heads",
+            self.effective_n_kv_heads,
+        )
+        if self.d_model % self.n_heads != 0:
+            raise ValueError("d_model 必须能被 n_heads 整除")
         if self.effective_n_kv_heads > self.n_heads:
             raise ValueError(
                 "n_kv_heads 必须小于等于 n_heads"
