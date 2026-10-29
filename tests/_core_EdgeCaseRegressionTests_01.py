@@ -88,6 +88,40 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
                 1.0, float("nan"), 0.8, 0.05
             )
         )
+    def test_tost_test_treats_infinite_df_as_normal_limit(self):
+        # _tost_test 与 _tost_power/_t_cdf 同一口径：df=inf
+        # 应退化为正态极限，而不是返回缺失结果。
+        result = experiment._tost_test(
+            0.0, 1.0, float("inf"), 2.0, 0.05
+        )
+        expected = 0.5 * math.erfc(2.0 / math.sqrt(2.0))
+        self.assertAlmostEqual(
+            float(result["tost_p_upper"]),
+            expected,
+            delta=1.0e-15,
+        )
+        self.assertAlmostEqual(
+            float(result["tost_p_lower"]),
+            expected,
+            delta=1.0e-15,
+        )
+        self.assertAlmostEqual(
+            float(result["tost_p_value"]),
+            expected,
+            delta=1.0e-15,
+        )
+        self.assertEqual(
+            experiment._tost_test(
+                0.0, 1.0, float("nan"), 2.0, 0.05
+            ),
+            {},
+        )
+        self.assertEqual(
+            experiment._tost_test(
+                0.0, 1.0, float("-inf"), 2.0, 0.05
+            ),
+            {},
+        )
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

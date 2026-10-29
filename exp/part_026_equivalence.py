@@ -124,7 +124,7 @@ def _tost_test(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
-        or not math.isfinite(df_value)
+        or math.isnan(df_value)
         or not math.isfinite(margin_value)
         or not (0.0 < alpha_value < 0.5)
     ):
