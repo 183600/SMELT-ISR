@@ -122,6 +122,33 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
             ),
             {},
         )
+    def test_power_helpers_reject_negative_standard_error(self):
+        # 负标准误不是“零方差”的另一种写法；不能把它当成
+        # 精确已知的零噪声，从而给出功效 1 或所需种子数 1。
+        self.assertIsNone(
+            experiment._t_power(1.0, -1.0, 10.0)
+        )
+        self.assertIsNone(
+            experiment._tost_power(0.0, -1.0, 10.0, 2.0)
+        )
+        self.assertEqual(
+            experiment._tost_test(
+                0.0, -1.0, 10.0, 2.0
+            ),
+            {},
+        )
+        self.assertIsNone(
+            experiment._minimum_detectable_effect(-1.0, 10.0)
+        )
+        self.assertIsNone(
+            experiment._seeds_to_detect(1.0, -1.0)
+        )
+        self.assertIsNone(
+            experiment._seeds_for_tost(-1.0, 2.0)
+        )
+        self.assertIsNone(
+            experiment._tost_margin_for_power(-1.0, 10.0)
+        )
     def test_tost_power_handles_overflowing_noncentrality(self):
         # se 小到 effect/se 溢出为 inf 时，δ→∞ 的极限仍可
         # 由卡方尾概率精确表示，不能误报为 0 功效。

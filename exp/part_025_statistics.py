@@ -865,6 +865,7 @@ def _t_power(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
+        or se_value < 0.0
         or math.isnan(df_value)
         or not (0.0 < alpha_value < 0.5)
     ):
@@ -1043,6 +1044,7 @@ def _minimum_detectable_effect(
 
     if (
         not math.isfinite(se_value)
+        or se_value < 0.0
         or math.isnan(df_value)
         or not math.isfinite(target)
         or df_value <= 0.0
@@ -1122,6 +1124,7 @@ def _seeds_to_detect(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(sd_value)
+        or sd_value < 0.0
         or not math.isfinite(target)
         or not (0.0 < target < 1.0)
     ):

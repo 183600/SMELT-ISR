@@ -124,6 +124,7 @@ def _tost_test(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
+        or se_value < 0.0
         or math.isnan(df_value)
         or not math.isfinite(margin_value)
         or not (0.0 < alpha_value < 0.5)
@@ -281,6 +282,7 @@ def _tost_power(
     if (
         not math.isfinite(effect_value)
         or not math.isfinite(se_value)
+        or se_value < 0.0
         or math.isnan(df_value)
         or not math.isfinite(margin_value)
         or not (0.0 < alpha_value < 0.5)
@@ -373,6 +375,7 @@ def _seeds_for_tost(
         return None
     if (
         not math.isfinite(sd_value)
+        or sd_value < 0.0
         or not math.isfinite(margin_value)
         or not math.isfinite(target)
         or not math.isfinite(factor)
@@ -420,6 +423,7 @@ def _tost_margin_for_power(
         return None
     if (
         not math.isfinite(se_value)
+        or se_value < 0.0
         or math.isnan(df_value)
         or not math.isfinite(target)
         or not (0.0 < target < 1.0)
