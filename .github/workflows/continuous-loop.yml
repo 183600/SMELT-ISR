@@ -329,8 +329,10 @@ jobs:
           #   - 不读取 DeepSeek 官方 key，不访问 DeepSeek 官方端点；
           #   - 所有阶段都通过 `opencode run -m <model> [--variant ...] "$prompt"` 调用。
           # 主力：Zen 网关免费 deepseek-v4.1-flash-free（免鉴权，支持 tool call 与 reasoning effort）；
+          # 次选：Zen 网关免费 glm-5.3-flash-free（主力不可用时优先切换，偶发 429）；
           # 兜底：同为 Zen 网关免费的 big-pickle（Big Pickle）。
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
+          GLM_MODEL="opencode/glm-5.3-flash-free"
           PICKLE_MODEL="opencode/big-pickle"
           CURRENT_PROVIDER=""
           BROKEN_PROVIDERS=""
@@ -361,10 +363,11 @@ jobs:
           detect_provider() {
             local pass cand model
             for pass in 1 2; do
-              for cand in free pickle; do
+              for cand in free glm pickle; do
                 is_broken "$cand" && continue
                 case "$cand" in
                   free)   model="$FREE_MODEL" ;;
+                  glm)    model="$GLM_MODEL" ;;
                   pickle) model="$PICKLE_MODEL" ;;
                 esac
                 if smoke_test "$model"; then
