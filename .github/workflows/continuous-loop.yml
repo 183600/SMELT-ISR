@@ -272,6 +272,9 @@ jobs:
         timeout-minutes: 180
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          # DeepSeek 官方 API 兜底：opencode 内置 provider 直接读取该环境变量；
+          # 免费池全部不可用时接管，secret 未配置/无效时自动跳过，不影响免费池链路。
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -323,17 +326,21 @@ jobs:
           DOCS_TIMEOUT=$((3*3600))    # 3h（docs 阶段：优化代码与文档，1/10 概率执行）
 
 
-          # ================= 模型策略：只用 opencode + Zen 免费模型 =================
-          # 已移除 DeepSeek Harness 与 DeepSeek 官方 API 接入：
-          #   - 不安装、不调用任何额外 harness，一律只用 opencode；
-          #   - 不读取 DeepSeek 官方 key，不访问 DeepSeek 官方端点；
-          #   - 所有阶段都通过 `opencode run -m <model> [--variant ...] "$prompt"` 调用。
+          # ================= 模型策略：只用 opencode（Zen 免费池 → DeepSeek 官方兜底） =================
+          # 已移除 DeepSeek Harness（dsh）这类额外 harness，一律只用 opencode：
+          #   - 不安装、不调用任何额外 harness，所有阶段都通过
+          #     `opencode run -m <model> [--variant ...] "$prompt"` 调用；
+          #   - DeepSeek 官方 API 只作为最后兜底，且经 opencode 内置 provider 调用
+          #     （鉴权读 DEEPSEEK_API_KEY 环境变量，不引入新工具）。
           # 主力：Zen 网关免费 deepseek-v4.1-flash-free（免鉴权，支持 tool call 与 reasoning effort）；
           # 次选：Zen 网关免费 glm-5.3-flash-free（主力不可用时优先切换，偶发 429）；
-          # 兜底：同为 Zen 网关免费的 big-pickle（Big Pickle）。
+          # 兜底 1：同为 Zen 网关免费的 big-pickle（Big Pickle）。
+          # 兜底 2：DeepSeek 官方 API deepseek/deepseek-flash（免费池三个候选全部
+          #         失效——匿名限额耗尽/网关不稳——时接管，保证循环不断写代码）。
           FREE_MODEL="opencode/deepseek-v4.1-flash-free"
           GLM_MODEL="opencode/glm-5.3-flash-free"
           PICKLE_MODEL="opencode/big-pickle"
+          DEEPSEEK_MODEL="deepseek/deepseek-flash"
           CURRENT_PROVIDER=""
           BROKEN_PROVIDERS=""
           SELECTED_MODEL=""
@@ -385,6 +392,22 @@ jobs:
                 echo "[warn] $model 冒烟测试失败/超时，换下一个候选"
                 mark_broken "$cand"
               done
+              # 兜底：DeepSeek 官方 API（免费池候选全部失效时接管；
+              # DEEPSEEK_API_KEY 未配置时本分支直接跳过，行为与原先一致）。
+              if ! is_broken deepseek && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+                if smoke_test "$DEEPSEEK_MODEL"; then
+                  SELECTED_MODEL="$DEEPSEEK_MODEL"
+                  SELECTED_PROVIDER="deepseek"
+                  SELECTED_VARIANT=""
+                  CURRENT_MODEL="$SELECTED_MODEL"
+                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
+                  echo "[provider] 选定 $DEEPSEEK_MODEL（DeepSeek 官方 API 兜底），本次 run 内固定使用，不再逐阶段探测"
+                  return 0
+                fi
+                echo "[warn] $DEEPSEEK_MODEL 冒烟测试失败/超时，本 run 不再尝试官方 API"
+                mark_broken deepseek
+              fi
               # 第一轮全部失效：清空失效标记再试一轮（可能是瞬时故障）
               [ "$pass" -eq 1 ] && BROKEN_PROVIDERS=""
             done
