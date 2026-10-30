@@ -345,7 +345,7 @@ def _MAIN_part_006():
                     pass
                 access_record = {**access_key, 'out_dir': str(out_dir), 'study_id': args.study_id, 'seed': args.seed, 'script_sha256': run_metadata.get('script_sha256'), 'environment_id': run_metadata.get('environment_id'), 'git_commit': run_metadata.get('git_commit'), 'config_sha256': config_sha256, 'hypothesis': args.hypothesis, 'primary_metric': args.primary_metric, 'selected_step': best_selection_step if selection_policy == 'best_val' else end_step, 'model_selection': selection_policy, 'allow_repeat_access': bool(args.allow_repeat_test_access), 'accessed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'note': '测试集访问账本；同一 data/split 指纹的全部访问都应进入最终报告'}
                 append_test_access_ledger(ledger_path, access_record)
-                print(f'[test] 访问账本已记录: {ledger_path}（历史访问 {access_check['matching_accesses'] + 1} 次）')
+                print(f'''[test] 访问账本已记录: {ledger_path}（历史访问 {access_check['matching_accesses'] + 1} 次）''')
                 metrics_file.write(json.dumps(_json_safe({'step': 'test_started', 'split': 'test'}), ensure_ascii=False) + '\n')
                 metrics_file.flush()
                 write_test_evaluation_seal(out_dir, {'dataset_sha256': dataset.data_sha256, 'test_fraction': dataset.test_fraction, 'split_sha256': dict(dataset.split_sha256)})

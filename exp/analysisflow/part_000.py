@@ -80,13 +80,13 @@ def _PA_part_000():
         print('  无运行目录可分析')
     elif not controlled['violations']:
         if controlled.get('unchecked_keys'):
-            print(f'  已核对 {len(controlled['checked_keys'])} 项协议；另有 {len(controlled['unchecked_keys'])} 项在所有运行中都未记录，不能算作已控制')
+            print(f'''  已核对 {len(controlled['checked_keys'])} 项协议；另有 {len(controlled['unchecked_keys'])} 项在所有运行中都未记录，不能算作已控制''')
         else:
-            print(f'  OK：{len(controlled['checked_keys'])} 项协议在声明因子之外完全一致')
+            print(f'''  OK：{len(controlled['checked_keys'])} 项协议在声明因子之外完全一致''')
     else:
         for violation in controlled['violations']:
             values_text = ', '.join((f'{run}={_format_factor_value(value)}' for run, value in violation['values'].items()))
-            print(f'  [violation] {violation['key']}: {values_text}')
+            print(f'''  [violation] {violation['key']}: {values_text}''')
         print('  以上差异会使对比结论无法归因到待验证模块；请统一这些设置后重跑，或在 --compare-factors 中显式声明为因子')
         design_violations = single_factor_design['violations']
         if design_violations:
@@ -97,10 +97,10 @@ def _PA_part_000():
     if cross_violations:
         for violation in cross_violations:
             values_text = ', '.join((f'{run}={_format_factor_value(value)}' for run, value in violation['values'].items()))
-            print(f'  [violation] 跨 family {violation['key']}: {values_text}')
+            print(f'''  [violation] 跨 family {violation['key']}: {values_text}''')
         print('  神经运行与 ngram 统计基线的数据/评估口径不一致：跨 family 的基线强弱判断无效，请先统一口径重跑')
     elif controlled.get('cross_family_checked_keys'):
-        print(f'  OK：跨 family 的 {len(controlled['cross_family_checked_keys'])} 项数据/评估口径一致')
+        print(f'''  OK：跨 family 的 {len(controlled['cross_family_checked_keys'])} 项数据/评估口径一致''')
     if controlled.get('cross_family_unchecked_keys'):
         print('  [warn] 以下跨 family 口径项缺少记录，无法核对: ' + ', '.join(controlled['cross_family_unchecked_keys']))
     provenance = check_run_provenance(rows)
@@ -121,10 +121,10 @@ def _PA_part_000():
     elif provenance['mismatches']:
         for mismatch in provenance['mismatches']:
             values_text = ', '.join((f'{run}={_format_factor_value(value)}' for run, value in mismatch['values'].items()))
-            print(f'  [violation] {mismatch['key']}: {values_text}')
+            print(f'''  [violation] {mismatch['key']}: {values_text}''')
         print('  以上差异来自代码版本或运行环境，不是待验证的实验因子；请在同一份代码与同一环境下重跑后再比较')
     elif provenance['checked_keys']:
-        print(f'  OK：{len(provenance['checked_keys'])} 项代码/环境记录完全一致')
+        print(f'''  OK：{len(provenance['checked_keys'])} 项代码/环境记录完全一致''')
     if provenance['unchecked_keys']:
         print('  [warn] 以下代码/环境项所有运行都未记录，无法核对: ' + ', '.join(provenance['unchecked_keys']))
     if provenance['hashseed_unset_runs']:
@@ -137,9 +137,9 @@ def _PA_part_000():
     print('[numerical] 数值完整性：NaN/Inf、数值停止、污染检查点续跑或 diverged 运行不进入聚合与显著性检验')
     if numerical_failures['failed']:
         for item in numerical_failures['failed']:
-            print(f'  [excluded] {item['run']}（mode={item['mode']}, seed={item['seed']}） curve={item['curve_status']} nonfinite={item['nonfinite_events']} stop={item['numerical_stop']} polluted={item['numerical_polluted']} prior_stop={item['prior_numerical_stop']}')
+            print(f'''  [excluded] {item['run']}（mode={item['mode']}, seed={item['seed']}） curve={item['curve_status']} nonfinite={item['nonfinite_events']} stop={item['numerical_stop']} polluted={item['numerical_polluted']} prior_stop={item['prior_numerical_stop']}''')
         if numerical_failures.get('by_mode'):
-            print('  各 mode 失败率: ' + '; '.join((f'{entry['mode']}={entry['failed_runs']}/{entry['attempted_runs']}' for entry in numerical_failures['by_mode'])))
+            print('  各 mode 失败率: ' + '; '.join((f'''{entry['mode']}={entry['failed_runs']}/{entry['attempted_runs']}''' for entry in numerical_failures['by_mode'])))
         print('  [warn] ' + str(numerical_failures['advisory']))
     elif numerical_failures['unknown']:
         print('  [note] 以下运行缺少数值完整性记录（旧运行），无法确认是否发生过 NaN/Inf: ' + ', '.join(numerical_failures['unknown']))
@@ -150,7 +150,7 @@ def _PA_part_000():
     for arm in failure_rates['arms']:
         rate = arm.get('failure_rate')
         rate_text = 'n/a' if rate is None else _format_finite(rate, '.1%')
-        print(f'  {arm['mode']}: planned={arm['planned_runs']} failed={arm['failed_runs']} unknown={arm['unknown_runs']} success={arm['success_runs']} failure_rate={rate_text}')
+        print(f'''  {arm['mode']}: planned={arm['planned_runs']} failed={arm['failed_runs']} unknown={arm['unknown_runs']} success={arm['success_runs']} failure_rate={rate_text}''')
     if failure_rates['differential_failure']:
         print('  [warn] ' + str(failure_rates['differential_failure']['note']))
     print('  [note] ' + str(failure_rates['retry_policy']))
@@ -163,9 +163,9 @@ def _PA_part_000():
     for cell in hypotheses['cells']:
         rq_text = ' / '.join(cell['research_questions']) if cell['research_questions'] else '-'
         if cell['hypotheses']:
-            print(f'  {cell['mode']}（{cell['n_runs']} 个运行, RQ: {rq_text}）: ' + ' | '.join(cell['hypotheses']))
+            print(f'''  {cell['mode']}（{cell['n_runs']} 个运行, RQ: {rq_text}）: ''' + ' | '.join(cell['hypotheses']))
         else:
-            print(f'  {cell['mode']}（{cell['n_runs']} 个运行）: 未登记假设')
+            print(f'''  {cell['mode']}（{cell['n_runs']} 个运行）: 未登记假设''')
     for message in hypotheses['advisories']:
         print(f'  [warn] {message}')
     print()
@@ -175,18 +175,18 @@ def _PA_part_000():
     else:
         for check in alignment['checks']:
             delta = check.get('delta')
-            delta_text = f'Δ={_format_finite(delta, '+.4f')}' if isinstance(delta, (int, float)) else 'Δ=NA'
+            delta_text = f'''Δ={_format_finite(delta, '+.4f')}''' if isinstance(delta, (int, float)) else 'Δ=NA'
             direction = check.get('expected_direction')
             direction_text = '/'.join(direction) if isinstance(direction, list) else str(direction)
             p_holm = check.get('p_value_holm')
             p_text = f'Holm p={_format_finite(p_holm)}' if isinstance(p_holm, (int, float)) else 'Holm p=NA'
-            print(f'  [{check['status']}] {check['baseline']}→{check['variant']}  {delta_text}  预期 {direction_text}  {p_text}')
+            print(f'''  [{check['status']}] {check['baseline']}→{check['variant']}  {delta_text}  预期 {direction_text}  {p_text}''')
     for message in alignment['advisories']:
         print(f'  [warn] {message}')
     print()
     print('[aggregate] 按实验单元聚合（Mean ± Std，样本标准差；std 反映不同随机种子的方差；CI 为均值的 t 分布 95% 置信区间，n<2 或确定性折叠后不给出；n(seed) 中括号为独立种子数，与运行数不同时说明存在伪重复或确定性折叠）')
     if selection_metric_mismatch:
-        print(f'  [selection] [warn] 以下运行的 checkpoint 选型指标不是当前判定指标 {metric}：最终模型不是按假设的判定口径选出的，指标差异可能混入选型规则；请在训练时用 --selection-metric 对齐判定指标后重跑: ' + ', '.join((f'{item['run']}（{item['selection_metric']}）' for item in selection_metric_mismatch)))
+        print(f'  [selection] [warn] 以下运行的 checkpoint 选型指标不是当前判定指标 {metric}：最终模型不是按假设的判定口径选出的，指标差异可能混入选型规则；请在训练时用 --selection-metric 对齐判定指标后重跑: ' + ', '.join((f'''{item['run']}（{item['selection_metric']}）''' for item in selection_metric_mismatch)))
     if selection_bias.get('advisory'):
         print('  [selection-bias] [warn] ' + str(selection_bias['advisory']) + '；挑选最优 checkpoint 的极值噪声会被误当成方法收益，不能把纯 val 选型结果当作无偏证据')
     elif selection_bias.get('applicable') and selection_bias.get('unknown_selection_runs'):
@@ -199,7 +199,7 @@ def _PA_part_000():
         metric_columns = ['val_loss']
         if metric != 'val_loss':
             metric_columns.append(metric)
-        header = f'{'cell':<40} {'n(seed)':>8} ' + ' '.join((f'{column:>39}' for column in metric_columns))
+        header = f'''{'cell':<40} {'n(seed)':>8} ''' + ' '.join((f'{column:>39}' for column in metric_columns))
         print(f'  判定指标（--compare-metric）: {metric}' + ('' if metric == 'val_loss' else '（表中同时给出 val_loss 以便对照）'))
         print(header)
         print('-' * len(header))
@@ -212,7 +212,7 @@ def _PA_part_000():
             text = f'{_format_finite(mean)}' if std is None else f'{_format_finite(mean)}±{_format_finite(std)}'
             ci = (aggregate.get('ci95') or {}).get(base_metric)
             if ci:
-                text += f' CI[{_format_finite(ci.get('low'))},{_format_finite(ci.get('high'))}]'
+                text += f''' CI[{_format_finite(ci.get('low'))},{_format_finite(ci.get('high'))}]'''
             return text
 
         def _n_text(aggregate) -> str:
@@ -220,7 +220,7 @@ def _PA_part_000():
             seeds = int(aggregate.get('effective_seed_count', runs) or runs)
             return str(runs) if seeds == runs else f'{runs}({seeds})'
         for aggregate in aggregates:
-            print(f'{str(aggregate['label'])[:39]:<40} {_n_text(aggregate):>8} ' + ' '.join((f'{_stat(aggregate, column):>39}' for column in metric_columns)))
+            print(f'''{str(aggregate['label'])[:39]:<40} {_n_text(aggregate):>8} ''' + ' '.join((f'{_stat(aggregate, column):>39}' for column in metric_columns)))
         underpowered = [aggregate['label'] for aggregate in aggregates if not aggregate.get('deterministic') and int(aggregate.get('effective_seed_count', 0)) < _RECOMMENDED_SEEDS]
         if underpowered:
             print(f'  统计可靠性不足：以下实验单元种子数 < {_RECOMMENDED_SEEDS}（建议 3~5 个不同随机种子并汇报 Mean ± Std）: ' + '; '.join(underpowered))
@@ -228,20 +228,20 @@ def _PA_part_000():
         if deterministic_cells:
             print('  [note] 确定性基线（ngram）不做种子重复：换 seed 重跑是同一估计的复制，已折叠为 1 个观测；其评估不确定性应来自评估窗口/时间切分的 bootstrap 或多次切分，而不是种子数: ' + '; '.join(deterministic_cells))
         if deterministic_conflict_cells:
-            print('  [warn] 以下确定性基线单元的不同 seed 运行给出了不同指标值：确定性管线本应逐位一致，可能存在数据/评估差异；已折叠为 1 个观测，但不能按多种子重复解读: ' + '; '.join((f'{item['cell']}（' + ', '.join(item['metrics']) + '）' for item in deterministic_conflict_cells)))
+            print('  [warn] 以下确定性基线单元的不同 seed 运行给出了不同指标值：确定性管线本应逐位一致，可能存在数据/评估差异；已折叠为 1 个观测，但不能按多种子重复解读: ' + '; '.join((f'''{item['cell']}（''' + ', '.join(item['metrics']) + '）' for item in deterministic_conflict_cells)))
         if duplicate_seed_cells:
-            details = '; '.join((f'{cell['cell']}（种子 ' + ', '.join((str(seed) for seed in cell['duplicate_seeds'])) + f' 各出现多次，共 {cell['n_runs']} 个运行）' for cell in duplicate_seed_cells))
+            details = '; '.join((f'''{cell['cell']}（种子 ''' + ', '.join((str(seed) for seed in cell['duplicate_seeds'])) + f''' 各出现多次，共 {cell['n_runs']} 个运行）''' for cell in duplicate_seed_cells))
             print('  [warn] 伪重复：以下实验单元含重复随机种子（复制的同一运行不是独立重复实验；已按独立种子折叠为一个观测，复制运行不增加 n）: ' + details)
         routing_summary_fields = ['routing_jaccard_branch', 'routing_slot_reuse_branch', 'routing_r2_load_entropy', 'routing_r2_dead_experts', 'routing_branch_cosine']
         present_routing_fields = [field for field in routing_summary_fields if metric != field and any((aggregate.get(f'{field}_mean') is not None for aggregate in aggregates))]
         if present_routing_fields:
             print()
             print('[routing] RQ3/RQ4 路由指标按实验单元聚合（Mean ± Std；可用 --compare-metric 直接选为判定指标做显著性检验）')
-            routing_header = f'{'cell':<40} ' + ' '.join((f'{field.replace('routing_', ''):>16}' for field in present_routing_fields))
+            routing_header = f'''{'cell':<40} ''' + ' '.join((f'''{field.replace('routing_', ''):>16}''' for field in present_routing_fields))
             print(routing_header)
             print('-' * len(routing_header))
             for aggregate in aggregates:
-                print(f'{str(aggregate['label'])[:39]:<40} ' + ' '.join((f'{_stat(aggregate, field):>16}' for field in present_routing_fields)))
+                print(f'''{str(aggregate['label'])[:39]:<40} ''' + ' '.join((f'{_stat(aggregate, field):>16}' for field in present_routing_fields)))
     else:
         print('  无有效指标可聚合')
     print()
@@ -264,7 +264,7 @@ def _PA_part_000():
     if cost_rows:
         print()
         print('[efficiency] 各实验单元效率（运行结束时测量；参数量/FLOPs 可跨环境比较，其余字段受硬件影响，仅在同一环境内可比）')
-        cost_header = f'{'cell':<40} {'params':>10} {'GFLOPs':>9} {'lat(ms)':>9} {'train(ms)':>10} {'mem(MB)':>9}'
+        cost_header = f'''{'cell':<40} {'params':>10} {'GFLOPs':>9} {'lat(ms)':>9} {'train(ms)':>10} {'mem(MB)':>9}'''
         print(cost_header)
         print('-' * len(cost_header))
 
@@ -274,7 +274,7 @@ def _PA_part_000():
                 return '-'
             return _format_finite(entry.get('mean'), spec, scale)
         for aggregate in cost_rows:
-            print(f'{str(aggregate['label'])[:39]:<40} {_cost_text(aggregate, 'n_params', 1.0, '.0f'):>10} {_cost_text(aggregate, 'flops_per_forward', 1e-09):>9} {_cost_text(aggregate, 'latency_ms_per_forward'):>9} {_cost_text(aggregate, 'training_ms_per_step', 1.0, '.1f'):>10} {_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}')
+            print(f'''{str(aggregate['label'])[:39]:<40} {_cost_text(aggregate, 'n_params', 1.0, '.0f'):>10} {_cost_text(aggregate, 'flops_per_forward', 1e-09):>9} {_cost_text(aggregate, 'latency_ms_per_forward'):>9} {_cost_text(aggregate, 'training_ms_per_step', 1.0, '.1f'):>10} {_cost_text(aggregate, 'peak_memory_mb', 1.0, '.1f'):>9}''')
         timing_ci_lines = []
         for aggregate in cost_rows:
             parts = []
@@ -287,9 +287,9 @@ def _PA_part_000():
                 mean = entry.get('mean')
                 if not (isinstance(low, (int, float)) and isinstance(high, (int, float)) and isinstance(mean, (int, float))):
                     continue
-                parts.append(f'{short} {_format_finite(mean, '.3f')} [{_format_finite(low, '.3f')},{_format_finite(high, '.3f')}]')
+                parts.append(f'''{short} {_format_finite(mean, '.3f')} [{_format_finite(low, '.3f')},{_format_finite(high, '.3f')}]''')
             if parts:
-                timing_ci_lines.append(f'{aggregate['label']}: ' + '  '.join(parts))
+                timing_ci_lines.append(f'''{aggregate['label']}: ''' + '  '.join(parts))
         if timing_ci_lines:
             print('  [efficiency-ci] 计时均值的 95% CI（t 分布；区间宽度与均值同量级时，效率差异可能只是测量噪声）:')
             for line in timing_ci_lines:
@@ -302,11 +302,11 @@ def _PA_part_000():
     if not compute_matched['runs']:
         print('  无可用的等计算量对比')
     else:
-        print(f'  共同计算量 FLOPs={_format_finite(compute_matched.get('target_flops'), '.3e')}')
+        print(f'''  共同计算量 FLOPs={_format_finite(compute_matched.get('target_flops'), '.3e')}''')
         for item in compute_matched['runs']:
             ratio = item.get('compute_ratio')
-            ratio_text = f'（用自身计算量的 {_format_finite(ratio, '.1%')}）' if isinstance(ratio, (int, float)) else ''
-            print(f'  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} loss={_format_finite(item.get('value'))}{ratio_text} [{item['interpolation']}]')
+            ratio_text = f'''（用自身计算量的 {_format_finite(ratio, '.1%')}）''' if isinstance(ratio, (int, float)) else ''
+            print(f'''  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} loss={_format_finite(item.get('value'))}{ratio_text} [{item['interpolation']}]''')
         print('  可用 --compare-metric val_loss_at_matched_flops 把它作为判定指标做聚合与显著性检验；该点只代表共同计算量处，不等于完整训练结束时的排序')
     for message in compute_matched['advisories']:
         print(f'  [note] {message}')
@@ -315,17 +315,17 @@ def _PA_part_000():
     if not common_step['runs']:
         print('  无可用的共同步数对比')
     else:
-        print(f'  共同训练步数={_format_finite(common_step.get('target_step'), '.0f')}')
+        print(f'''  共同训练步数={_format_finite(common_step.get('target_step'), '.0f')}''')
         for item in common_step['runs']:
             ratio = item.get('step_ratio')
-            ratio_text = f'（占自身验证范围 {_format_finite(ratio, '.1%')}）' if isinstance(ratio, (int, float)) else ''
-            print(f'  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} loss={_format_finite(item.get('value'))}{ratio_text} [{item['interpolation']}]')
+            ratio_text = f'''（占自身验证范围 {_format_finite(ratio, '.1%')}）''' if isinstance(ratio, (int, float)) else ''
+            print(f'''  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} loss={_format_finite(item.get('value'))}{ratio_text} [{item['interpolation']}]''')
         current_derived = metric if metric in _COMMON_STEP_METRICS else _common_step_metric_name(metric)
         if current_derived is not None and current_derived != _COMMON_STEP_METRIC:
             metric_report = _as_dict(_as_dict(common_step.get('metric_reports')).get(current_derived))
             print(f'  判定指标 {current_derived} 的共同步数取值：')
             for item in metric_report.get('runs', []):
-                print(f'  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} value={_format_finite(item.get('value'))} [{item['interpolation']}]')
+                print(f'''  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} value={_format_finite(item.get('value'))} [{item['interpolation']}]''')
         print('  可用 --compare-metric <metric>_at_common_step 把对应指标作为判定口径做聚合与显著性检验；该点只代表共同步数处，不等于完整训练结束时的排序')
     for message in common_step['advisories']:
         print(f'  [note] {message}')
@@ -337,11 +337,11 @@ def _PA_part_001():
     if not curve_mean['runs']:
         print('  无可用的曲线时均对比')
     else:
-        print(f'  窗口 = [{_format_finite(curve_mean.get('start_step'), '.0f')}, {_format_finite(curve_mean.get('end_step'), '.0f')}]，起点取各运行第一个验证步的最大值，' + ('终点为训练前固定步' if curve_mean.get('end_rule') == 'preregistered_fixed_step' else '终点取各运行最后验证步的最小值（数据依赖）'))
+        print(f'''  窗口 = [{_format_finite(curve_mean.get('start_step'), '.0f')}, {_format_finite(curve_mean.get('end_step'), '.0f')}]，起点取各运行第一个验证步的最大值，''' + ('终点为训练前固定步' if curve_mean.get('end_rule') == 'preregistered_fixed_step' else '终点取各运行最后验证步的最小值（数据依赖）'))
         for item in curve_mean['runs']:
             curve_coverage = item.get('curve_coverage')
-            coverage_text = f'（覆盖自身验证曲线 {_format_finite(curve_coverage, '.1%')}）' if isinstance(curve_coverage, (int, float)) else ''
-            print(f'  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} mean_loss={_format_finite(item.get('value'))}{coverage_text} [start={item['start_interpolation']}, end={item['end_interpolation']}]')
+            coverage_text = f'''（覆盖自身验证曲线 {_format_finite(curve_coverage, '.1%')}）''' if isinstance(curve_coverage, (int, float)) else ''
+            print(f'''  {str(item.get('run'))[:36]:<37} mode={str(item.get('mode')):<10} mean_loss={_format_finite(item.get('value'))}{coverage_text} [start={item['start_interpolation']}, end={item['end_interpolation']}]''')
         print(f'  可用 --compare-metric {_CURVE_MEAN_METRIC} 把它作为判定口径做聚合、显著性检验与 TOST；该指标同时受早期下降和最终水平影响，不能替代共同步数单点与 final 对照')
     for message in curve_mean['advisories']:
         print(f'  [note] {message}')
@@ -359,7 +359,7 @@ def _PA_part_001():
     else:
         for contrast in contrasts:
             if contrast.get('confounded'):
-                print(f'  [confounded] {contrast['cells'][0]} vs {contrast['cells'][1]}: 同时改变了 ' + ', '.join(contrast['differing_factors']) + '，结论无法归因')
+                print(f'''  [confounded] {contrast['cells'][0]} vs {contrast['cells'][1]}: 同时改变了 ''' + ', '.join(contrast['differing_factors']) + '，结论无法归因')
                 continue
             print('  ' + _contrast_display(contrast, metric))
             window_line = _format_window_paired(contrast)
@@ -370,11 +370,11 @@ def _PA_part_001():
             summaries = []
             for contrast in cost_flagged:
                 reason = '涨点但效率更低' if contrast['cost_verdict'] == 'gain_with_cost' else '变差且效率更低'
-                summaries.append(f'{contrast['baseline']}→{contrast['variant']}（{reason}）')
+                summaries.append(f'''{contrast['baseline']}→{contrast['variant']}（{reason}）''')
             print('  [cost] 需按效率权衡的对比: ' + '; '.join(summaries))
         missingness_flagged = [contrast for contrast in contrasts if contrast.get('differential_missingness')]
         if missingness_flagged:
-            print('  [warn] 以下对比两臂缺少该指标的运行数不同（完整案例分析建立在不同运行子集上，结论可能来自缺测而非方法差异；请核对被排除运行的原因）: ' + '; '.join((f'{contrast['baseline']}→{contrast['variant']}（缺 {contrast.get('n_missing_baseline', 0)} vs {contrast.get('n_missing_variant', 0)}，有效 {contrast.get('n_baseline', 0)} vs {contrast.get('n_variant', 0)}）' for contrast in missingness_flagged)))
+            print('  [warn] 以下对比两臂缺少该指标的运行数不同（完整案例分析建立在不同运行子集上，结论可能来自缺测而非方法差异；请核对被排除运行的原因）: ' + '; '.join((f'''{contrast['baseline']}→{contrast['variant']}（缺 {contrast.get('n_missing_baseline', 0)} vs {contrast.get('n_missing_variant', 0)}，有效 {contrast.get('n_baseline', 0)} vs {contrast.get('n_variant', 0)}）''' for contrast in missingness_flagged)))
     print()
     print('[fragility] 结果脆弱性检查（逐一/成组删除随机种子后重做配对 t 检验；alpha 为家族校正后阈值）')
     fragility_entries = fragility_summary.get('entries', [])
@@ -401,7 +401,7 @@ def _PA_part_001():
                 detail = f'删除 {deleted} 个种子后显著性消失'
             else:
                 detail = '删除单个种子后效应方向翻转'
-            print(f'  [fragile] {entry['baseline']}→{entry['variant']}: {detail}；符号方向 正/负={entry.get('n_positive')}/{entry.get('n_negative')}，不能作为稳健结论')
+            print(f'''  [fragile] {entry['baseline']}→{entry['variant']}: {detail}；符号方向 正/负={entry.get('n_positive')}/{entry.get('n_negative')}，不能作为稳健结论''')
         print('  注：fragility 是描述性敏感性分析，不替代显著性检验；但「显著」若依赖少数种子，应增加独立种子或调查异常运行后再下结论')
     print()
     print('[attrition-bounds] 缺失/失败运行下的部分识别界（假设缺失结果落在两臂已观测结果的联合范围内；不是置信区间）')
@@ -420,7 +420,7 @@ def _PA_part_001():
             low = _finite_float(entry.get('effect_min'))
             high = _finite_float(entry.get('effect_max'))
             bounds_text = f'[{low:.4g}, {high:.4g}]' if low is not None and high is not None else '无有限界'
-            print(f'  [warn] {entry['baseline']}→{entry['variant']}: 缺失 {missing}/{attempted}，{bounds_text}；完整案例的显著结论可能由「哪些运行留下了」驱动')
+            print(f'''  [warn] {entry['baseline']}→{entry['variant']}: 缺失 {missing}/{attempted}，{bounds_text}；完整案例的显著结论可能由「哪些运行留下了」驱动''')
         if not not_robust and with_missing:
             print('  有缺测/失败运行的对比在观测支持范围内仍保持效应方向；这以缺失结果不超出观测范围为前提，不能替代补齐运行')
         for message in attrition_summary.get('advisories', []):
@@ -433,7 +433,7 @@ def _PA_part_001():
             print(f'    未找到 mode={baseline_mode} 的运行')
         for contrast in reference:
             if contrast.get('confounded'):
-                print(f'    [confounded] {contrast['baseline']} vs {contrast['variant']}: 同时改变了 ' + ', '.join(contrast['differing_factors']) + '，结论无法归因')
+                print(f'''    [confounded] {contrast['baseline']} vs {contrast['variant']}: 同时改变了 ''' + ', '.join(contrast['differing_factors']) + '，结论无法归因')
                 continue
             print('    ' + _contrast_display(contrast, metric))
             window_line = _format_window_paired(contrast)
@@ -452,7 +452,7 @@ def _PA_part_001():
     if equivalence_margin is None:
         print('[equivalence] 未设定等价界（equivalence_margin=None）：只报告显著性；不显著 ≠ 等价，不能据此主张无差异')
     else:
-        print(f'[equivalence] 等价性与统计功效（等价界 = 基线均值的 ±{_format_finite(equivalence_margin, '.1f', 100.0)}%；不显著 ≠ 等价）')
+        print(f'''[equivalence] 等价性与统计功效（等价界 = 基线均值的 ±{_format_finite(equivalence_margin, '.1f', 100.0)}%；不显著 ≠ 等价）''')
         margin_status = margin_preregistration.get('status')
         if margin_status == 'consistent' and margin_preregistration.get('ok') is True:
             print('  等价界预注册: OK（当前界与训练前写入 hypothesis_preregistration 的取值一致）')
@@ -466,19 +466,19 @@ def _PA_part_001():
             inconclusive_entries = [entry for entry in equivalence_entries if not entry['significant'] and (not entry['equivalent'])]
             for entry in equivalent_entries:
                 holm = entry.get('tost_p_value_holm')
-                holm_text = f'Holm p={_format_finite(holm, '.3f')}' if isinstance(holm, (int, float)) else 'p=NA'
+                holm_text = f'''Holm p={_format_finite(holm, '.3f')}''' if isinstance(holm, (int, float)) else 'p=NA'
                 margin_abs = entry.get('equivalence_margin_abs')
                 margin_text = f'（等价界 ±{_format_finite(margin_abs)}）' if isinstance(margin_abs, (int, float)) else ''
                 significant_note = '；差异统计显著但落在等价界内（统计显著 ≠ 实际重要）' if entry['significant'] else ''
                 delta = entry.get('delta')
-                delta_text = f'Δ={_format_finite(delta, '+.4f')}' if isinstance(delta, (int, float)) else 'Δ=NA'
-                print(f'  [equivalent] {entry['baseline']}→{entry['variant']}  {delta_text}  TOST {holm_text}{margin_text}：支持无实质差异{significant_note}')
+                delta_text = f'''Δ={_format_finite(delta, '+.4f')}''' if isinstance(delta, (int, float)) else 'Δ=NA'
+                print(f'''  [equivalent] {entry['baseline']}→{entry['variant']}  {delta_text}  TOST {holm_text}{margin_text}：支持无实质差异{significant_note}''')
             for entry in inconclusive_entries:
                 mde = entry.get('mde_80')
                 mde_text = f'80% 功效 MDE={_format_finite(mde)}' if isinstance(mde, (int, float)) else 'MDE=NA'
                 mde_relative = entry.get('mde_80_relative')
                 if isinstance(mde_relative, (int, float)):
-                    mde_text += f'（相对 {_format_finite(mde_relative, '.2f', 100.0)}%）'
+                    mde_text += f'''（相对 {_format_finite(mde_relative, '.2f', 100.0)}%）'''
                 seeds_needed = entry.get('seeds_to_detect')
                 seeds_text = ''
                 current_seeds = _current_seed_count(entry)
@@ -488,7 +488,7 @@ def _PA_part_001():
                 if blocker == 'effect_exceeds_margin':
                     needed_text = '（点估计本身已超出等价界：这不是种子不够，增加种子只会让「不等价」更确定）'
                 elif blocker == 'insufficient_precision':
-                    needed_text = f'（点估计在界内但噪声半宽越界：把界至少放宽到 ±{_format_finite(entry.get('equivalence_margin_needed'))} 才可能主张等价'
+                    needed_text = f'''（点估计在界内但噪声半宽越界：把界至少放宽到 ±{_format_finite(entry.get('equivalence_margin_needed'))} 才可能主张等价'''
                     seeds_to_achieve = entry.get('equivalence_seeds_to_achieve')
                     if isinstance(seeds_to_achieve, int):
                         needed_text += f'，或在当前种子波动下约需 {seeds_to_achieve} 个种子'
@@ -496,11 +496,11 @@ def _PA_part_001():
                 else:
                     needed_text = ''
                 delta = entry.get('delta')
-                delta_text = f'Δ={_format_finite(delta, '+.4f')}' if isinstance(delta, (int, float)) else 'Δ=NA'
-                print(f'  [inconclusive] {entry['baseline']}→{entry['variant']}  {delta_text}  {mde_text}{seeds_text}{needed_text}：不显著也说明不了等价')
+                delta_text = f'''Δ={_format_finite(delta, '+.4f')}''' if isinstance(delta, (int, float)) else 'Δ=NA'
+                print(f'''  [inconclusive] {entry['baseline']}→{entry['variant']}  {delta_text}  {mde_text}{seeds_text}{needed_text}：不显著也说明不了等价''')
             precision_limited = [entry for entry in equivalence_entries if entry.get('equivalence_blocker') == 'insufficient_precision' and (not entry.get('equivalent'))]
             if precision_limited:
-                print('  [warn] 以下对比的等价判定卡在精度而不是效应：点估计落在等价界内，但种子噪声把置信区间推出了界外——TOST 未通过不能读成「两者不同」，应增加种子（而不是放宽等价界）: ' + '; '.join((f'{entry['baseline']}→{entry['variant']}' + (f'（约需 {entry['equivalence_seeds_to_achieve']} 个种子）' if isinstance(entry.get('equivalence_seeds_to_achieve'), int) else '') for entry in precision_limited)))
+                print('  [warn] 以下对比的等价判定卡在精度而不是效应：点估计落在等价界内，但种子噪声把置信区间推出了界外——TOST 未通过不能读成「两者不同」，应增加种子（而不是放宽等价界）: ' + '; '.join((f'''{entry['baseline']}→{entry['variant']}''' + (f'''（约需 {entry['equivalence_seeds_to_achieve']} 个种子）''' if isinstance(entry.get('equivalence_seeds_to_achieve'), int) else '') for entry in precision_limited)))
             if not equivalent_entries and (not inconclusive_entries):
                 print('  所有对比均显著：本家族没有需要等价性解读的对比')
             print('  注：等价界必须事先声明（--equivalence-margin）；看到数据后再放宽等价界可以「制造」等价结论')
@@ -511,7 +511,7 @@ def _PA_part_001():
     else:
         print('  预注册对照基线: ' + ', '.join((str(mode) for mode in baseline_preregistration['declared_modes'])))
         if baseline_preregistration.get('ok') is True:
-            print(f'  OK：分析使用的对照基线 {baseline_preregistration.get('baseline_mode')} 与训练前预注册一致')
+            print(f'''  OK：分析使用的对照基线 {baseline_preregistration.get('baseline_mode')} 与训练前预注册一致''')
     for message in baseline_preregistration.get('advisories', []):
         level = 'warn' if baseline_preregistration.get('ok') is False else 'note'
         print(f'  [{level}] {message}')
@@ -522,14 +522,14 @@ def _PA_part_001():
             print(f'  [note] {message}')
     else:
         baseline_mean = adequacy.get('baseline_mean')
-        print(f'  基线 mode={adequacy['baseline_mode']}（{adequacy['n_baseline_runs']} 个运行）' + (f'，{metric} 均值 {_format_finite(baseline_mean)}' if baseline_mean is not None else ''))
+        print(f'''  基线 mode={adequacy['baseline_mode']}（{adequacy['n_baseline_runs']} 个运行）''' + (f'，{metric} 均值 {_format_finite(baseline_mean)}' if baseline_mean is not None else ''))
         if adequacy['ok'] is True:
             print('  OK：基线在主指标上强于无上下文 unigram 参考（核对依据：各运行 config.json 的 reference_baselines）')
         if adequacy.get('baseline_mode') == 'ngram':
             print('  OK：统计基线在 val 上做过 阶数 × 平滑系数 网格调优（简单基线已充分调参）')
         elif adequacy.get('tuned') and (not adequacy.get('tuning_metric_mismatch')):
             tuned_runs = adequacy.get('tuned_runs') or []
-            details = '; '.join((f'{item['run']}（调参口径={item.get('tuning_metric')}, winner lr={item.get('winner_lr')}）' for item in tuned_runs))
+            details = '; '.join((f'''{item['run']}（调参口径={item.get('tuning_metric')}, winner lr={item.get('winner_lr')}）''' for item in tuned_runs))
             print('  OK：基线记录了调参来源（--baseline-tuning-from）' + (f': {details}' if details else ''))
         elif adequacy.get('tuned'):
             print('  [warn] 基线记录了调参来源，但调参口径与当前对比指标不一致：不能证明基线在当前指标上被调强；请在该指标上重新调参，或改用与调参口径一致的对比指标')
@@ -545,11 +545,11 @@ def _PA_part_001():
         parity = adequacy.get('tuning_parity') or {}
         parity_mismatches = parity.get('challengers_without_tuning_parity') or []
         if parity.get('baseline_winner_lrs'):
-            print('  [tuning-parity] 基线调参 winner lr=' + ', '.join((_format_finite(lr, 'g') for lr in parity['baseline_winner_lrs'])) + f'；复用同一 lr 的挑战臂 {len(parity.get('challengers_using_baseline_lr') or [])} 个，有独立调参来源的挑战臂 {len(parity.get('challengers_with_own_tuning') or [])} 个')
+            print('  [tuning-parity] 基线调参 winner lr=' + ', '.join((_format_finite(lr, 'g') for lr in parity['baseline_winner_lrs'])) + f'''；复用同一 lr 的挑战臂 {len(parity.get('challengers_using_baseline_lr') or [])} 个，有独立调参来源的挑战臂 {len(parity.get('challengers_with_own_tuning') or [])} 个''')
         if parity_mismatches:
             print('  [tuning-parity] [warn] 以下挑战臂的学习率与调参基线不一致且没有独立调参来源：调参不对称，落败不能排除调参不足、胜出是保守下界')
             for item in parity_mismatches:
-                print(f'    {item['run']}（{item['mode']}, lr={_format_finite(item.get('lr'), 'g')} vs 基线 winner lr={_format_finite(item.get('baseline_tuned_lr'), 'g')}）')
+                print(f'''    {item['run']}（{item['mode']}, lr={_format_finite(item.get('lr'), 'g')} vs 基线 winner lr={_format_finite(item.get('baseline_tuned_lr'), 'g')}）''')
     print()
     print("[tuning-seeds] 调参种子与最终评估种子独立性核对（同一批种子既选 winner 又评估会把 winner's curse 带进对比）")
     if tuning_seed_overlap['ok'] is True:
@@ -562,44 +562,44 @@ def _PA_part_001():
     expected_cells = coverage.get('expected_cells') or []
     shape_text = f'{len(expected_cells) // 2}×2' if expected_cells else '延迟合并 × 均衡损失'
     print()
-    print(f'[ablation] 消融覆盖检查（{shape_text}：{coverage['legend']}）')
+    print(f'''[ablation] 消融覆盖检查（{shape_text}：{coverage['legend']}）''')
     if coverage.get('partial'):
         print('  [partial] 本轮是显式允许的部分消融：未覆盖项目方案 ' + ', '.join(coverage.get('undeclared_project_modes', [])) + '，结论不能支撑全部创新点各自有用')
     if coverage['missing_cells']:
         for message in coverage['missing_cells']:
             print(f'  [missing] {message}')
     if coverage['present_cells']:
-        present = ', '.join((f'{cell['cell']}(n={cell['n_runs']})' for cell in coverage['present_cells']))
+        present = ', '.join((f'''{cell['cell']}(n={cell['n_runs']})''' for cell in coverage['present_cells']))
         print(f'  已覆盖组合: {present}')
     for message in coverage.get('structural_confounds', []):
         print(f'  [confounded] {message}')
     for entry in coverage.get('numerical_attrition', []):
         if int(entry.get('failed_runs', 0) or 0) <= 0:
             continue
-        print(f'  [attrition] {entry['cell']}：失败 {entry['failed_runs']}/{entry['attempted_runs']}（可用 {entry['usable_runs']}）' + ('，失败运行: ' + ', '.join(entry.get('failed_run_names') or []) if entry.get('failed_run_names') else ''))
+        print(f'''  [attrition] {entry['cell']}：失败 {entry['failed_runs']}/{entry['attempted_runs']}（可用 {entry['usable_runs']}）''' + ('，失败运行: ' + ', '.join(entry.get('failed_run_names') or []) if entry.get('failed_run_names') else ''))
     for confound in coverage.get('attrition_confounds', []):
         print('  [confounded] 数值失败/脱落不平衡: ' + str(confound.get('details')) + '；幸存运行的均值不能归因到组件')
     for entry in coverage.get('seed_alignment', []):
         seeds_text = ', '.join((str(seed) for seed in entry['common_seeds']))
         if entry['aligned']:
-            print(f'  种子对齐: {entry['delayed_mode']} 的 2×2 各格共享 {entry['n_common_seeds']} 个种子' + (f'（{seeds_text}）' if seeds_text else ''))
+            print(f'''  种子对齐: {entry['delayed_mode']} 的 2×2 各格共享 {entry['n_common_seeds']} 个种子''' + (f'（{seeds_text}）' if seeds_text else ''))
         else:
-            print(f'  [warn] 种子未对齐: {entry['delayed_mode']} 的 2×2 各格种子集合不同，仅在 {entry['n_common_seeds']} 个共同种子上可配对')
+            print(f'''  [warn] 种子未对齐: {entry['delayed_mode']} 的 2×2 各格种子集合不同，仅在 {entry['n_common_seeds']} 个共同种子上可配对''')
     global_alignment = coverage.get('global_seed_alignment')
     if isinstance(global_alignment, dict) and global_alignment.get('applicable'):
         seeds_text = ', '.join((str(seed) for seed in global_alignment.get('common_seeds', [])))
         if global_alignment.get('aligned'):
-            print(f'  全因子种子对齐: 所有消融格共享 {global_alignment.get('n_common_seeds', 0)} 个种子' + (f'（{seeds_text}）' if seeds_text else ''))
+            print(f'''  全因子种子对齐: 所有消融格共享 {global_alignment.get('n_common_seeds', 0)} 个种子''' + (f'（{seeds_text}）' if seeds_text else ''))
         elif global_alignment.get('all_expected_present'):
-            print(f'  [warn] 全因子种子未对齐: 各格种子集合不同，共同种子只有 {global_alignment.get('n_common_seeds', 0)} 个；不同方案可能在不同种子子集上比较，不能拼成「各创新点各自有用」')
+            print(f'''  [warn] 全因子种子未对齐: 各格种子集合不同，共同种子只有 {global_alignment.get('n_common_seeds', 0)} 个；不同方案可能在不同种子子集上比较，不能拼成「各创新点各自有用」''')
     for entry in coverage.get('compute_parity', []):
         if entry['matched']:
             continue
-        print(f'  [confounded] 计算量不匹配: {entry['delayed_mode']} 的 {entry['field']} 是 local_base 的 {_format_finite(entry.get('ratio'), '.2f')} 倍，该方案的主效应混入计算量；请用 --compare-metric val_loss_at_matched_flops 在等训练计算量点复核')
+        print(f'''  [confounded] 计算量不匹配: {entry['delayed_mode']} 的 {entry['field']} 是 local_base 的 {_format_finite(entry.get('ratio'), '.2f')} 倍，该方案的主效应混入计算量；请用 --compare-metric val_loss_at_matched_flops 在等训练计算量点复核''')
     for entry in coverage.get('capacity_parity', []):
         if entry['matched']:
             continue
-        print(f'  [confounded] 参数量不匹配: {entry['delayed_mode']} 的 n_params 是 local_base 的 {_format_finite(entry.get('ratio'), '.2f')} 倍，即使 FLOPs 对齐，多出的容量也可能带来收益，主效应不能归因到延迟合并')
+        print(f'''  [confounded] 参数量不匹配: {entry['delayed_mode']} 的 n_params 是 local_base 的 {_format_finite(entry.get('ratio'), '.2f')} 倍，即使 FLOPs 对齐，多出的容量也可能带来收益，主效应不能归因到延迟合并''')
     if coverage['low_replicate_cells']:
         for message in coverage['low_replicate_cells']:
             print(f'  [warn] {message}')
@@ -618,11 +618,11 @@ def _PA_part_001():
             else:
                 detail = str(confound.get('label')) + '初始化不同'
             values = ', '.join((f'{run}={_format_factor_value(value)}' for run, value in confound['values'].items()))
-            print(f'  [confounded] 种子 {confound['seed']}：{detail}（{', '.join(confound['modes'])}）')
+            print(f'''  [confounded] 种子 {confound['seed']}：{detail}（{', '.join(confound['modes'])}）''')
             print(f'    指纹: {values[:240]}')
         print('  同种子配对假设不成立：以上差异不是声明因子的效应，相关主效应/交互不能归因')
     else:
-        print(f'  OK：{randomness['groups_checked']} 个种子分组的初始化与首批训练数据指纹一致')
+        print(f'''  OK：{randomness['groups_checked']} 个种子分组的初始化与首批训练数据指纹一致''')
     for message in randomness['unverified']:
         print(f'  [warn] {message}：无法确认同种子随机性对齐')
     full_factorial = 'mode' in factors and 'balance_coef' in factors and bool(expected_cells) and (not coverage.get('partial')) and (len(coverage['present_cells']) == len(expected_cells))
@@ -672,9 +672,9 @@ def _PA_part_002():
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
         for design in factorial['designs']:
-            print('  设计: ' + f'{design['delayed_mode']} vs local_base' + ('（' + ', '.join((f'{key}={_format_factor_value(value)}' for key, value in design['context'].items())) + '）' if design['context'] else ''))
+            print('  设计: ' + f'''{design['delayed_mode']} vs local_base''' + ('（' + ', '.join((f'{key}={_format_factor_value(value)}' for key, value in design['context'].items())) + '）' if design['context'] else ''))
         for design in factorial['incomplete_designs']:
-            print('  [missing] ' + f'{design['delayed_mode']} vs local_base' + ' 缺格: ' + ', '.join(design['missing_cells']))
+            print('  [missing] ' + f'''{design['delayed_mode']} vs local_base''' + ' 缺格: ' + ', '.join(design['missing_cells']))
         for effect in factorial['effects']:
             print(_format_factorial_effect(effect))
         for advisory in factorial['advisories']:
@@ -684,7 +684,7 @@ def _PA_part_002():
             print('  等价性：TOST p 值同族做 Holm/BH 校正；只有校正后仍 <= alpha 才可主张「无实质差异」，「不显著」本身不构成等价证据')
     if common_step_sensitivity['applicable']:
         print()
-        print(f'[factorial common-step] 在 {common_step_sensitivity['common_step_metric']} 上复核选型偏差（无 checkpoint 选择的即时口径）')
+        print(f'''[factorial common-step] 在 {common_step_sensitivity['common_step_metric']} 上复核选型偏差（无 checkpoint 选择的即时口径）''')
         if common_step_sensitivity['effects']:
 
             def _delta_text(value: object) -> str:
@@ -699,7 +699,7 @@ def _PA_part_002():
                     flag = ' [SIGN-FLIP]'
                 elif item['claim_flip']:
                     flag = ' [claim-changed]'
-                print(f'  {item.get('delayed_mode')}/{item.get('effect_name')}: final={item['primary_claim']} (Δ={_delta_text(item.get('primary_mean_effect'))}), common-step={item['common_step_claim']} (Δ={_delta_text(item.get('common_step_mean_effect'))})' + flag)
+                print(f'''  {item.get('delayed_mode')}/{item.get('effect_name')}: final={item['primary_claim']} (Δ={_delta_text(item.get('primary_mean_effect'))}), common-step={item['common_step_claim']} (Δ={_delta_text(item.get('common_step_mean_effect'))})''' + flag)
         else:
             print('  无共同步数效应可比较')
         if common_step_sensitivity['support_flips']:
@@ -710,7 +710,7 @@ def _PA_part_002():
         print()
         print('[ablation-verdict] 组件级联合判定（每个创新点必须有独立支持证据，不能把部分显著拼成「各自有用」）')
         for component in component_verdicts['components']:
-            print(f'  [{component['status']}] {component['label']}' + '：' + '；'.join((str(reason) for reason in component['reasons'] if reason)))
+            print(f'''  [{component['status']}] {component['label']}''' + '：' + '；'.join((str(reason) for reason in component['reasons'] if reason)))
         if component_verdicts['all_components_supported']:
             print('  OK：全部组件均获得无混杂的支持证据')
         else:
@@ -732,14 +732,14 @@ def _PA_part_002():
         print()
         print('[curve] 跨运行训练曲线诊断（读取各运行 metrics.jsonl 的 curve_analysis；不是最终单点）')
         curve_run_width = max(20, max((len(str(entry.get('run'))) for entry in curve_diagnostics['runs']), default=3))
-        curve_header = f'{'run':<{curve_run_width}} {'status':<14} {'best@':>7} {'regr%':>7} {'gap%':>7} {'recentVal%':>10} {'gradSpike':>9} {'lr/peak':>8}'
+        curve_header = f'''{'run':<{curve_run_width}} {'status':<14} {'best@':>7} {'regr%':>7} {'gap%':>7} {'recentVal%':>10} {'gradSpike':>9} {'lr/peak':>8}'''
         print(curve_header)
         print('-' * len(curve_header))
 
         def _curve_value(value, spec='.2f'):
             return _format_finite(value, spec, 100.0)
         for entry in curve_diagnostics['runs']:
-            print(f'{str(entry['run']):<{curve_run_width}} {str(entry.get('status'))[:13]:<14} {str(entry.get('best_val_step') or '-'):>7} {_curve_value(entry.get('val_regression_from_best')):>7} {_curve_value(entry.get('generalization_gap_ratio_last')):>7} {_curve_value(entry.get('recent_val_drop')):>10} {_curve_value(entry.get('grad_norm_spike_ratio')):>9} {_curve_value(entry.get('last_lr_over_peak')):>8}')
+            print(f'''{str(entry['run']):<{curve_run_width}} {str(entry.get('status'))[:13]:<14} {str(entry.get('best_val_step') or '-'):>7} {_curve_value(entry.get('val_regression_from_best')):>7} {_curve_value(entry.get('generalization_gap_ratio_last')):>7} {_curve_value(entry.get('recent_val_drop')):>10} {_curve_value(entry.get('grad_norm_spike_ratio')):>9} {_curve_value(entry.get('last_lr_over_peak')):>8}''')
         if curve_diagnostics['overfitting_runs']:
             print('  [warn] 以下运行判定为过拟合：最终 val 指标不是其最优泛化点，比较时应同时看 best@/regr%：' + '; '.join(curve_diagnostics['overfitting_runs']))
         print('  ' + str(curve_diagnostics['note']))
@@ -750,7 +750,7 @@ def _PA_part_002():
         category_names = list(_BAD_CASE_CATEGORIES)
         short_names = {'ambiguous': 'ambig', 'systematic_confusion': 'sysConf', 'label_noise_suspect': 'labelNoise', 'uncertain': 'uncert'}
         bad_run_width = max(20, max((len(str(entry.get('run'))) for entry in bad_case_comparison['runs']), default=3))
-        bad_header = f'{'run':<{bad_run_width}} {'acc':>7} {'wrong':>8} ' + ' '.join((f'{short_names.get(name, name[:9]):>10}' for name in category_names))
+        bad_header = f'''{'run':<{bad_run_width}} {'acc':>7} {'wrong':>8} ''' + ' '.join((f'{short_names.get(name, name[:9]):>10}' for name in category_names))
         print(bad_header)
         print('-' * len(bad_header))
 
@@ -758,7 +758,7 @@ def _PA_part_002():
             return _format_finite(value, spec)
         for entry in bad_case_comparison['runs']:
             shares = entry['error_category_shares']
-            print(f'{str(entry['run']):<{bad_run_width}} {_bad_value(entry.get('token_accuracy')):>7} {str(entry.get('wrong_tokens')):>8} ' + ' '.join((f'{_bad_value(shares.get(name)):>10}' for name in category_names)))
+            print(f'''{str(entry['run']):<{bad_run_width}} {_bad_value(entry.get('token_accuracy')):>7} {str(entry.get('wrong_tokens')):>8} ''' + ' '.join((f'{_bad_value(shares.get(name)):>10}' for name in category_names)))
         persistent = bad_case_comparison['persistent_confusions']
         if persistent:
             min_runs = bad_case_comparison['persistent_confusion_min_runs']
@@ -766,7 +766,7 @@ def _PA_part_002():
             print(f'  [bad-case] 稳定混淆对（至少 {min_runs} 个运行的 top-10 中出现）: {pairs_text}')
         if bad_case_comparison['unstable_categories']:
             ranges = bad_case_comparison['category_share_ranges']
-            print('  [bad-case] [warn] 错误类别占比跨运行极差 ≥20pp: ' + ', '.join((f'{name}={_format_finite(ranges.get(name, 0.0), '.1f', 100.0)}pp' for name in bad_case_comparison['unstable_categories'])) + '；失败模式可能由种子/运行差异驱动')
+            print('  [bad-case] [warn] 错误类别占比跨运行极差 ≥20pp: ' + ', '.join((f'''{name}={_format_finite(ranges.get(name, 0.0), '.1f', 100.0)}pp''' for name in bad_case_comparison['unstable_categories'])) + '；失败模式可能由种子/运行差异驱动')
         print('  ' + str(bad_case_comparison['coverage_note']))
         print('  ' + str(bad_case_comparison['note']))
     for aggregate in aggregates:
@@ -781,9 +781,9 @@ def _PA_part_002():
     else:
         rho = order_audit.get('detrended_spearman')
         p_value = order_audit.get('detrended_p_value')
-        rho_text = f'{_format_finite(rho, '+.2f')}' if isinstance(rho, (int, float)) else 'NA'
-        p_text = f'{_format_finite(p_value, '.3f')}' if isinstance(p_value, (int, float)) else 'NA'
-        print(f'  顺序方案={','.join(order_audit.get('order_schemes') or []) or 'NA'}，带顺序记录的运行={order_audit.get('n_runs')}，区组={order_audit.get('n_blocks')}；去模式均值后 ρ(order,{metric})={rho_text}（p={p_text}）')
+        rho_text = f'''{_format_finite(rho, '+.2f')}''' if isinstance(rho, (int, float)) else 'NA'
+        p_text = f'''{_format_finite(p_value, '.3f')}''' if isinstance(p_value, (int, float)) else 'NA'
+        print(f'''  顺序方案={','.join(order_audit.get('order_schemes') or []) or 'NA'}，带顺序记录的运行={order_audit.get('n_runs')}，区组={order_audit.get('n_blocks')}；去模式均值后 ρ(order,{metric})={rho_text}（p={p_text}）''')
         for warning in order_audit.get('warnings') or []:
             print(f'  [warn] {warning}')
         if order_audit.get('verdict') == 'insufficient':

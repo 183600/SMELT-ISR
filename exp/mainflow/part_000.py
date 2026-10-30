@@ -227,7 +227,7 @@ def _MAIN_part_001():
         if preregistration_error is not None:
             parser.error(preregistration_error)
         args.preregistration_record = preregistration_record(preregistration_payload, args.preregistration, preregistration_sha256, applied_fields, args)
-        print(f'[prereg] study_id={preregistration_payload['study_id']}，冻结提交 {str(preregistration_payload['frozen_commit'])[:12]}...，种子={preregistration_payload['seeds']}' + ('；由文件补齐: ' + ', '.join(applied_fields) if applied_fields else '；命令行与预注册逐项一致'))
+        print(f'''[prereg] study_id={preregistration_payload['study_id']}，冻结提交 {str(preregistration_payload['frozen_commit'])[:12]}...，种子={preregistration_payload['seeds']}''' + ('；由文件补齐: ' + ', '.join(applied_fields) if applied_fields else '；命令行与预注册逐项一致'))
     if args.design_pilot_runs is not None:
         pilot_conflicts = [flag for flag, active in (('--compare', args.compare is not None), ('--final-test-comparison', args.final_test_comparison is not None), ('--evaluate-test', bool(args.evaluate_test)), ('--resume', args.resume is not None), ('--sanity-only', bool(args.sanity_only)), ('--statistical-baseline', bool(args.statistical_baseline)), ('--suite-baseline-tuning', bool(args.suite_baseline_tuning))) if active]
         if pilot_conflicts:
@@ -400,7 +400,7 @@ def _MAIN_part_001():
             parser.error('--baseline-tuning-lrs 的每个候选必须是有限正数')
     if len(set(args.baseline_tuning_lrs)) != len(args.baseline_tuning_lrs):
         parser.error('--baseline-tuning-lrs 存在重复候选')
-    tuning_labels = [f'lr{format(lr, 'g')}' for lr in args.baseline_tuning_lrs]
+    tuning_labels = [f'''lr{format(lr, 'g')}''' for lr in args.baseline_tuning_lrs]
     if len(set(tuning_labels)) != len(tuning_labels):
         parser.error('--baseline-tuning-lrs 的候选在输出目录名中格式化后重名（%g 精度不足）：请改用差异更大的学习率候选，避免调参运行互相覆盖')
     if args.suite_baseline_tuning and len(set(args.baseline_tuning_lrs)) < 2:
@@ -408,7 +408,7 @@ def _MAIN_part_001():
 
 def _MAIN_part_002():
     global _, amp_change_error, amp_dtype, candidates_error, cfg, checkpoint_git_commit, checkpoint_script_sha256, code_changed, compare_analysis, compare_conflicts, compare_rows, conflicts, current_git_commit, current_script_sha256, current_value, dense_fnn_hidden, design, device, error, evidence_field, flag, formatted, formatter, hypothesis_error, integer, invalid, invalid_compare_paths, item, known_config_fields, numerical_error, out_dir, overwrite_error, plan, plan_root, preregistration_error, report, rng_payload, same_run_dir, saved_args, saved_config, saved_data_effective_train_sha256, saved_data_sha256, saved_data_split_isolation, saved_data_split_sha256, saved_data_test_fraction, saved_data_val_fraction, saved_masks, saved_numerical_state, saved_out, saved_value, scaler, schedule_field, start_step, unknown_config_fields, values
-    for flag, values, formatter, integer in (('--baseline-tuning-dense-hiddens', list(args.baseline_tuning_dense_hiddens), lambda value: f'h{value}', True), ('--baseline-tuning-weight-decays', list(args.baseline_tuning_weight_decays), lambda value: f'wd{format(value, 'g')}', False)):
+    for flag, values, formatter, integer in (('--baseline-tuning-dense-hiddens', list(args.baseline_tuning_dense_hiddens), lambda value: f'h{value}', True), ('--baseline-tuning-weight-decays', list(args.baseline_tuning_weight_decays), lambda value: f'''wd{format(value, 'g')}''', False)):
         if not values:
             continue
         candidates_error = baseline_tuning_axis_candidates_error(flag, values, integer)
@@ -478,7 +478,7 @@ def _MAIN_part_002():
         print_design_summary(design)
         print('[design] 计划单元（执行顺序）:')
         for item in plan:
-            print(f'  {int(item['order_index']):>3}. 区组 {item.get('block')} 内第 {item.get('position_in_block')} 个: {item.get('label')}（mode={item.get('mode')}, seed={item.get('seed')}）')
+            print(f'''  {int(item['order_index']):>3}. 区组 {item.get('block')} 内第 {item.get('position_in_block')} 个: {item.get('label')}（mode={item.get('mode')}, seed={item.get('seed')}）''')
         print('[design] 注意：--plan-design 不加载数据，数据指纹/切分协议仍会在正式训练入口核对；确认计划后把该 design_plan.json 与预注册文件一起冻结')
         raise _SC_RETURN(None)
     if args.data is None:
@@ -525,7 +525,7 @@ def _MAIN_part_002():
     except ValueError as error:
         parser.error(f'设计计划核对失败: {error}')
     if args.design_assignment:
-        print(f'[design] 执行分配：计划 {str(args.design_assignment.get('plan_id'))[:12]}...，顺序 {args.design_assignment.get('order_index')}（区组 {args.design_assignment.get('block')} 内第 {args.design_assignment.get('position_in_block')} 个）')
+        print(f'''[design] 执行分配：计划 {str(args.design_assignment.get('plan_id'))[:12]}...，顺序 {args.design_assignment.get('order_index')}（区组 {args.design_assignment.get('block')} 内第 {args.design_assignment.get('position_in_block')} 个）''')
     start_step = 0
     rng_payload = None
     saved_data_sha256 = None
@@ -596,7 +596,7 @@ def _MAIN_part_002():
         if 'document_masks' in saved_args:
             saved_masks = bool(saved_args.get('document_masks'))
             if saved_masks != bool(getattr(args, 'document_masks', False)):
-                print(f'resume restored document_masks {getattr(args, 'document_masks', False)} -> {saved_masks} (注意力可见性是模型语义的一部分)')
+                print(f'''resume restored document_masks {getattr(args, 'document_masks', False)} -> {saved_masks} (注意力可见性是模型语义的一部分)''')
                 args.document_masks = saved_masks
         saved_data_sha256 = saved_args.get('data_sha256')
         saved_data_val_fraction = saved_args.get('data_val_fraction')
@@ -834,7 +834,7 @@ def _MAIN_part_003():
     args.paper_fidelity = paper_fidelity_report(cfg, protocol_state)
     fidelity = args.paper_fidelity
     if fidelity.get('is_full_reproduction'):
-        print(f'[paper] 架构与 3.1 节协议均对齐论文披露口径（单元 {fidelity['cell']}）')
+        print(f'''[paper] 架构与 3.1 节协议均对齐论文披露口径（单元 {fidelity['cell']}）''')
     elif not fidelity.get('architecture_faithful'):
         print('[paper][warn] 当前配置不是论文附录 A 的忠实复现：' + ', '.join(fidelity['deviations']))
     elif not fidelity.get('protocol_faithful'):
@@ -842,7 +842,7 @@ def _MAIN_part_003():
     budget = fidelity.get('budget_audit')
     if isinstance(budget, dict):
         measured = budget['measured']
-        print(f'[paper] 预算审计：FLOPs 比 {measured['flops_ratio_vs_base']:.3f}（论文 {budget['paper']['flops_ratio']}），KV 比 {measured['kv_ratio_vs_base']:.3f}（论文 {budget['paper']['kv_ratio']}），S={measured['compute_equivalent_sparsity'] * 100:.1f}%（论文 {budget['paper']['compute_equivalent_sparsity'] * 100:.1f}%）')
+        print(f'''[paper] 预算审计：FLOPs 比 {measured['flops_ratio_vs_base']:.3f}（论文 {budget['paper']['flops_ratio']}），KV 比 {measured['kv_ratio_vs_base']:.3f}（论文 {budget['paper']['kv_ratio']}），S={measured['compute_equivalent_sparsity'] * 100:.1f}%（论文 {budget['paper']['compute_equivalent_sparsity'] * 100:.1f}%）''')
     budget_baseline = args.budget_match if args.budget_match is not None else 'base' if cfg.mode != 'base' else 'smelt'
     if budget_baseline not in Config.MODEL_MODES:
         parser.error('--budget-match 必须是模型模式之一: ' + ', '.join(sorted(Config.MODEL_MODES)))
@@ -850,17 +850,17 @@ def _MAIN_part_003():
         parser.error('--budget-tolerance 必须是有限正数')
     budget_report = budget_match_report(cfg, budget_baseline, args.budget_tolerance)
     args.budget_match_report = budget_report
-    print(f'[budget] 解析口径：每 token FLOPs {budget_report['candidate_flops_per_token']:,} vs {budget_report['baseline_flops_per_token']:,} ({budget_baseline})，比例 {budget_report['flops_ratio']:.3f}')
+    print(f'''[budget] 解析口径：每 token FLOPs {budget_report['candidate_flops_per_token']:,} vs {budget_report['baseline_flops_per_token']:,} ({budget_baseline})，比例 {budget_report['flops_ratio']:.3f}''')
     if args.budget_match is not None:
         search = budget_report.get('search')
         if not budget_report['matched']:
             hint = ''
             if isinstance(search, dict):
                 if search.get('kind') == 'k2':
-                    hint = f'；按完整计算图最接近预算的 k2={search['recommended_k2']}（比例 {search['flops_ratio_at_recommendation']:.3f}）'
+                    hint = f'''；按完整计算图最接近预算的 k2={search['recommended_k2']}（比例 {search['flops_ratio_at_recommendation']:.3f}）'''
                 elif search.get('kind') == 'k1_k2':
-                    hint = f'；按完整计算图最接近预算的 k1={search['recommended_k1']}, k2={search['recommended_k2']}（比例 {search['flops_ratio_at_recommendation']:.3f}）'
-            parser.error(f'--budget-match 未通过：候选模式与 {budget_baseline} 的解析 FLOPs 比例为 {budget_report['flops_ratio']:.3f}，超出 ±{args.budget_tolerance:.0%} 的允许误差' + hint + '。仅令 k1*k2≈2*top_k 会漏掉第一阶段成本，不是充分的预算匹配；请调整 k1/k2/宽度后重跑')
+                    hint = f'''；按完整计算图最接近预算的 k1={search['recommended_k1']}, k2={search['recommended_k2']}（比例 {search['flops_ratio_at_recommendation']:.3f}）'''
+            parser.error(f'''--budget-match 未通过：候选模式与 {budget_baseline} 的解析 FLOPs 比例为 {budget_report['flops_ratio']:.3f}，超出 ±{args.budget_tolerance:.0%} 的允许误差''' + hint + '。仅令 k1*k2≈2*top_k 会漏掉第一阶段成本，不是充分的预算匹配；请调整 k1/k2/宽度后重跑')
     try:
         dataset = ByteDataset(args.data, cfg.seq_len, val_fraction=args.val_fraction, test_fraction=args.test_fraction, device=device, group_separator=group_separator_bytes, deduplicate_train_groups=args.deduplicate_train_groups, drop_train_shared_chunks=args.drop_train_shared_chunks, drop_train_near_duplicate_groups=args.drop_train_near_duplicate_groups, near_duplicate_audit=args.near_duplicate_audit, near_duplicate_threshold=args.near_duplicate_threshold, near_duplicate_shingle_bytes=args.near_duplicate_shingle_bytes, drop_train_corrupt_groups=args.drop_train_corrupt_groups, drop_train_corrupt_bytes=args.drop_train_corrupt_bytes, drop_train_degenerate_groups=args.drop_train_degenerate_groups, drop_train_degenerate_runs=args.drop_train_degenerate_runs, clean_train_against_test=bool(getattr(args, 'clean_train_against_test', False) or getattr(args, 'allow_eval_content_for_cleaning', False)), include_test_in_cleaning=bool(getattr(args, 'allow_eval_content_for_cleaning', False)))
     except (OSError, ValueError) as error:
@@ -888,16 +888,16 @@ def _MAIN_part_003():
         except (OSError, ValueError) as error:
             parser.error(f'--entity-manifest 无效: {error}')
         if not entity_audit.get('available'):
-            parser.error('--entity-manifest 需要 --group-separator：没有群组边界就无法把实体清单映射到 split，实体隔离审计无法执行' + (f'（{entity_audit.get('reason')}）' if entity_audit.get('reason') else ''))
+            parser.error('--entity-manifest 需要 --group-separator：没有群组边界就无法把实体清单映射到 split，实体隔离审计无法执行' + (f'''（{entity_audit.get('reason')}）''' if entity_audit.get('reason') else ''))
         args.data_entity_audit = entity_audit
         if entity_audit.get('cross_split_entities'):
-            message = f'实体清单显示 {entity_audit['cross_split_entities']} 个实体同时出现在多个 split：分隔符只保证连续片段完整，不保证实体隔离；同一用户/作者/文档版本的非相邻片段仍会泄露'
+            message = f'''实体清单显示 {entity_audit['cross_split_entities']} 个实体同时出现在多个 split：分隔符只保证连续片段完整，不保证实体隔离；同一用户/作者/文档版本的非相邻片段仍会泄露'''
             if args.allow_entity_overlap:
                 print('[data] [warn] ' + message)
             else:
                 parser.error(message + '。请重新切分/剔除跨界实体，或显式加 --allow-entity-overlap（会写入配置）')
         else:
-            print(f'[data] 实体审计通过：{entity_audit.get('entities')} 个实体均未跨 split')
+            print(f'''[data] 实体审计通过：{entity_audit.get('entities')} 个实体均未跨 split''')
     data_change_error = resume_data_change_error(saved_data_sha256, dataset.data_sha256)
     if data_change_error is not None:
         parser.error(data_change_error)
@@ -942,7 +942,7 @@ def _MAIN_part_004():
         if provenance_error is not None:
             parser.error('--baseline-tuning-from 与本次训练不一致: ' + provenance_error)
         baseline_tuning_record = baseline_tuning_provenance_record(tuning_payload, str(tuning_path))
-        print(f'[baseline-tuning] 基线调参来源已核对: mode={baseline_tuning_record['mode']}, winner lr={format(float(baseline_tuning_record['winner_lr']), 'g')}, metric={baseline_tuning_record['metric']}')
+        print(f'''[baseline-tuning] 基线调参来源已核对: mode={baseline_tuning_record['mode']}, winner lr={format(float(baseline_tuning_record['winner_lr']), 'g')}, metric={baseline_tuning_record['metric']}''')
         seed_overlap = tuning_seed_overlap_report([{'run': str(out_dir), 'mode': cfg.mode, 'seed': args.seed, 'baseline_tuning': baseline_tuning_record}])
         for advisory in seed_overlap['advisories']:
             print('[baseline-tuning] [warn] ' + str(advisory))
@@ -966,10 +966,10 @@ def _MAIN_part_004():
         raise _SC_RETURN(None)
     reference_baselines = compute_reference_baselines(dataset, args.batch_size, args.eval_batches, torch.device('cpu'), split='val')
     reference_window = (args.batch_size, args.eval_batches)
-    print(f'[reference] uniform val_loss={reference_baselines['uniform_loss']:.4f} (= ln 256), unigram val_loss={reference_baselines['unigram_loss']:.4f}, unigram token_accuracy={reference_baselines['unigram_token_accuracy']:.4f}（类别不平衡下解读 accuracy 的参考下界）')
+    print(f'''[reference] uniform val_loss={reference_baselines['uniform_loss']:.4f} (= ln 256), unigram val_loss={reference_baselines['unigram_loss']:.4f}, unigram token_accuracy={reference_baselines['unigram_token_accuracy']:.4f}（类别不平衡下解读 accuracy 的参考下界）''')
     unigram_macro_nll = reference_baselines.get('unigram_macro_nll')
     if isinstance(unigram_macro_nll, (int, float)):
-        print(f'[reference] 类平衡似然参考：uniform macro_nll={reference_baselines['uniform_macro_nll']:.4f} (= ln 256), unigram macro_nll={float(unigram_macro_nll):.4f}（按出现类等权的 NLL；频率加权的 val_loss 几乎只反映高频字节，稀有字节的表现看这一项）')
+        print(f'''[reference] 类平衡似然参考：uniform macro_nll={reference_baselines['uniform_macro_nll']:.4f} (= ln 256), unigram macro_nll={float(unigram_macro_nll):.4f}（按出现类等权的 NLL；频率加权的 val_loss 几乎只反映高频字节，稀有字节的表现看这一项）''')
     if args.hypothesis.strip():
         print(f'[hypothesis] {args.hypothesis.strip()}' + (f' (rq={args.rq.strip()})' if args.rq.strip() else ''))
         entry_mentions = hypothesis_metric_mentions(args.hypothesis)
@@ -1004,13 +1004,13 @@ def _MAIN_part_004():
             sanity_result['passed'] = False
             print('[sanity] FAILED: 同一配置 / 同一种子的重复运行结果不一致（同一台机器上不可复现）。差异项：')
             for mismatch in reproducibility['mismatches']:
-                print(f'  - repeat {mismatch['repeat']} {mismatch['key']}: {mismatch['first']!r} != {mismatch['repeat_value']!r}')
+                print(f'''  - repeat {mismatch['repeat']} {mismatch['key']}: {mismatch['first']!r} != {mismatch['repeat_value']!r}''')
             print('这通常意味着仍有未固定的随机源、非确定性算子（可加 --strict-determinism 定位）、异步执行顺序或 CUDA 精度设置差异；在解释清楚之前不要开始全量训练。')
         elif reproducibility['identical'] is True:
-            print(f'[sanity] 复现性检查通过：{reproducibility['repeats']} 次同种子运行的初始/最终损失、准确率与梯度范数逐位一致')
+            print(f'''[sanity] 复现性检查通过：{reproducibility['repeats']} 次同种子运行的初始/最终损失、准确率与梯度范数逐位一致''')
         sanity_record = {'step': 'sanity', **sanity_result}
         if sanity_result['passed']:
-            print(f'[sanity] PASSED: final total_loss={sanity_result['final_total_loss']:.4f}, final lm_loss={sanity_result['final_lm_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}')
+            print(f'''[sanity] PASSED: final total_loss={sanity_result['final_total_loss']:.4f}, final lm_loss={sanity_result['final_lm_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}''')
         elif reproducibility['identical'] is not False:
             if not sanity_result.get('data_sampling_uses_explicit_generator', True):
                 print('[sanity] FAILED: 数据采样消耗了 torch 全局 RNG（未完全使用传入的 torch.Generator）。同一份数据会随模型初始化等其他全局随机消耗的顺序漂移，同种子难以稳定复现；请先修正数据管线的随机源再开始全量训练。')
@@ -1021,7 +1021,7 @@ def _MAIN_part_004():
             elif not sanity_result.get('gradient_flow_ok', True):
                 print('[sanity] FAILED: 梯度检查未通过（缺失/全零/非有限梯度或损失未连入计算图），具体失败项见上方 [sanity] 梯度检查与排查建议；请先修复反向传播路径再开始全量训练。')
             else:
-                print(f'[sanity] FAILED: 模型未能在小批量上过拟合 (initial total_loss={sanity_result['initial_total_loss']}, final total_loss={sanity_result['final_total_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}, relative_reduction={sanity_result['loss_reduction']})。这通常意味着梯度没有反向传播、损失计算错误、优化器或学习率配置有严重问题；请先排查再开始全量训练。确需跳过可用 --skip-sanity-check。')
+                print(f'''[sanity] FAILED: 模型未能在小批量上过拟合 (initial total_loss={sanity_result['initial_total_loss']}, final total_loss={sanity_result['final_total_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}, relative_reduction={sanity_result['loss_reduction']})。这通常意味着梯度没有反向传播、损失计算错误、优化器或学习率配置有严重问题；请先排查再开始全量训练。确需跳过可用 --skip-sanity-check。''')
     if args.sanity_only or (sanity_result is not None and (not sanity_result['passed'])):
         sanity_run_metadata = collect_run_metadata(device)
         write_run_config(out_dir, cfg, args, n_params=int(sanity_result['n_params']), run_metadata=sanity_run_metadata, sanity_result=sanity_result, data_audit=data_audit, reference_baselines=reference_baselines, baseline_tuning=baseline_tuning_record, data_protocol_check=data_protocol_check, dataset=dataset, init_fingerprints=None)
@@ -1164,7 +1164,7 @@ def _MAIN_part_004():
     print(f'device={device} start_step={start_step}')
     scale_guard = build_scale_guard(cfg, args, int(n_params), dataset)
     args.scale_guard = scale_guard
-    print(f'[scale] tokens_seen={scale_guard['tokens_seen']:,} tokens/param={scale_guard['tokens_per_param']:.2f} epochs={scale_guard['epochs_over_train']} tier={scale_guard['scale_tier']}')
+    print(f'''[scale] tokens_seen={scale_guard['tokens_seen']:,} tokens/param={scale_guard['tokens_per_param']:.2f} epochs={scale_guard['epochs_over_train']} tier={scale_guard['scale_tier']}''')
     if scale_guard['scale_tier'] == 'prototype':
         print('[scale] [warn] 原型级规模：结果只支持可行性/机制验证，不能外推到大规模 MoE、长上下文或推理任务；需要多来源、多上下文长度与多模型规模的复核')
     config_sanity_result = sanity_result

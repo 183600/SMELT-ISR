@@ -954,7 +954,7 @@ def _selfcheck_body_64420_0107():
     clear_paths = []
     for lr, value in ((0.0001, 4.0), (0.0003, 4.5), (0.001, 4.2)):
         for seed in (42, 43, 44):
-            clear_paths.append(_write_analysis_run(f'clear_lr{format(lr, 'g')}_seed{seed}', 'dense', seed, lr, 100, 0.0, value))
+            clear_paths.append(_write_analysis_run(f'''clear_lr{format(lr, 'g')}_seed{seed}''', 'dense', seed, lr, 100, 0.0, value))
     clear_report = analyze_baseline_tuning(compare_runs(clear_paths), 'val_loss', 'dense', [0.0001, 0.0003, 0.001], [42, 43, 44])
     assert clear_report['winner']['lr'] == 0.0001
     assert clear_report['winner_selection'] == 'best_mean'
