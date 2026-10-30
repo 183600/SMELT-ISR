@@ -281,6 +281,17 @@ jobs:
           # 这里留 10 分钟给收尾的清理 / 最终提交 / 推送）
           RUN_HOURS=3
           DEADLINE=$(( $(date +%s) + RUN_HOURS*3600 - 600 ))
+          # ⭐ 远端同步：后继 run 是在本 run 开始时派发的，workflow_dispatch 在事件创建时
+          # 解析 ref → SHA，排队中的 run 其 checkout 可能停在派发时刻的旧 commit。
+          # 这里强制对齐远端分支最新提交，保证阶段轮换状态（.github/.loop-phase）
+          # 与代码总是最新，也避免 workflow 防篡改守卫把新版本误判为「被篡改」而回滚。
+          git fetch origin "$BRANCH" --prune >/dev/null 2>&1 || true
+          if git rev-parse --verify -q "origin/${BRANCH}" >/dev/null 2>&1; then
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${BRANCH}")" ]; then
+              echo "[sync] 工作区落后于 origin/${BRANCH}，重置到最新提交"
+              git reset --hard "origin/${BRANCH}" >/dev/null 2>&1 || true
+            fi
+          fi
 
           # ================= 五阶段提示词 =================
           PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
@@ -562,75 +573,67 @@ jobs:
             # 整个阶段（含所有重试）共用的硬上限：重试不得让总时长超过 budget
             local phase_end=$(( $(date +%s) + budget ))
 
-            while :; do
-              attempt=$((attempt+1))
+            # ⭐ 单次调用约束：本阶段只发起一次 opencode 调用，失败/限流不在本 job 内重试。
+            # 需要重试时由后继 job 对同一阶段再次发起（阶段轮换状态不推进），
+            # 连续 3 个 job 都失败则放弃该阶段、轮换到下一个阶段。
+            local NOW=$(date +%s)
+            if [ "$NOW" -ge "$DEADLINE" ]; then
+              echo "[info] phase=$phase 全局时间已用尽，跳过"
+              return 1
+            fi
+            local REMAIN=$(( DEADLINE - NOW ))
+            local budget_now=$(( phase_end - NOW ))
+            [ "$budget_now" -gt "$REMAIN" ] && budget_now="$REMAIN"
+            if [ "$budget_now" -le 60 ]; then
+              echo "[info] phase=$phase 剩余时间不足，跳过"
+              return 1
+            fi
 
-              local NOW=$(date +%s)
-              if [ "$NOW" -ge "$DEADLINE" ]; then
-                echo "[info] phase=$phase 全局时间已用尽，跳过"
+            # run 开始时已选定模型；没有就现选一次（模型冒烟测试属于测试，不计入阶段调用）
+            if [ -z "$SELECTED_MODEL" ]; then
+              if ! select_harness_model; then
+                echo "[warn] phase=$phase 暂时没有可用模型，本 job 结束，后继 job 重试该阶段"
                 return 1
               fi
-              local REMAIN=$(( DEADLINE - NOW ))
-              local budget_now=$(( phase_end - NOW ))
-              [ "$budget_now" -gt "$REMAIN" ] && budget_now="$REMAIN"
-              if [ "$budget_now" -le 60 ]; then
-                echo "[info] phase=$phase 剩余时间不足，跳过"
-                return 1
-              fi
+            fi
 
-              # 正常路径：run 开始时已选定模型，这里不会发起任何网络探测
-              if [ -z "$SELECTED_MODEL" ]; then
-                if ! select_harness_model; then
-                  echo "[warn] phase=$phase 暂时没有可用模型，180s 后重试 (attempt=$attempt)"
-                  sleep 180
-                  continue
-                fi
-              fi
+            # 防止 agent 写入的 opencode 配置干扰本次调用
+            rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
-              # 防止 agent 写入的 opencode 配置干扰后续调用
-              rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
+            # 思考强度：由探测阶段根据模型元数据选定（max / high / 不设置）
+            local EFFORT="${SELECTED_VARIANT:-}" VARFLAG=()
+            if [ -n "$EFFORT" ]; then
+              VARFLAG=(--variant "$EFFORT")
+              echo "[info] model=$SELECTED_MODEL 思考强度=$EFFORT"
+            else
+              echo "[info] model=$SELECTED_MODEL 按默认档位启动"
+            fi
+            echo "=========== run #${GITHUB_RUN_NUMBER:-?} | phase=$phase | provider=$SELECTED_PROVIDER | model=$SELECTED_MODEL effort=${EFFORT:-none} ==========="
 
-              local extra=""
-              case "$SELECTED_MODEL" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+            record_model "$SELECTED_MODEL"
+            local oc_extra=""
+            [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
+            # shellcheck disable=SC2086
+            timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
+            local EC=$?
 
-              record_model "$SELECTED_MODEL"
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$SELECTED_MODEL ==========="
-              # shellcheck disable=SC2086
-              local oc_extra=""
-              [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
-              # shellcheck disable=SC2086
-              timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
-              local EC=$?
+            # 成功 / 超时被杀：预算耗尽属正常结束，改动照常提交，阶段正常完成
+            if [ $EC -eq 0 ] || [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
+              return $EC
+            fi
 
-              # 成功
-              if [ $EC -eq 0 ]; then
-                return 0
-              fi
-
-              # 超时 / 被杀：阶段预算耗尽属正常结束，改动照常提交
-              if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
-                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
-                return $EC
-              fi
-
-              # 调用失败（非超时）→ 标记该模型失效，下一轮重新探测
-              oc_mark_broken "$SELECTED_MODEL"
-
-              # 429 限流 / 5xx / 连接失败：丢弃当前模型，下一次循环重新探测（并跳过它）
-              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
-                echo "[warn] phase=$phase 限流/5xx/连接失败（$SELECTED_MODEL），重新探测 provider (attempt=$attempt)"
-                mark_broken "$SELECTED_PROVIDER"
-                SELECTED_MODEL=""
-                sleep 60
-                continue
-              fi
-
-              # 其它非零退出：同样丢弃当前模型并重新探测，直到阶段预算或全局时间用尽
-              echo "[warn] phase=$phase 调用失败 (exit=$EC, model=$SELECTED_MODEL)，重新探测 provider (attempt=$attempt)"
-              mark_broken "$SELECTED_PROVIDER"
-              SELECTED_MODEL=""
-              sleep 60
-            done
+            # 调用失败（非超时）：标记该模型失效，但不在本 job 内重试；
+            # 后继 job 会对同一阶段再发起一次新的 opencode 调用
+            oc_mark_broken "$SELECTED_MODEL"
+            if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
+              echo "[warn] phase=$phase 限流/5xx/连接失败（$SELECTED_MODEL），交由后继 job 重试"
+              mark_broken "model:$SELECTED_MODEL"
+            elif tail -40 "$OUT" | grep -qiE "401|unauthorized|invalid.{0,4}api.?key|missing.{0,4}api.?key"; then
+              echo "[hint] 疑似鉴权问题：匿名限额可能耗尽。可在仓库 secrets 配置 OPENCODE_API_KEY 提升限额后重试"
+            else
+              echo "[warn] phase=$phase 调用失败 (exit=$EC, model=$SELECTED_MODEL)，交由后继 job 重试"
+            fi
+            return $EC
           }
 
           # ================= 单次调用内“先定位、再修复” =================
@@ -730,89 +733,121 @@ jobs:
           }
 
           # ================= 主循环 =================
-          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-            i=$((i+1))
-
-            AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
-            echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
-            free -h | head -2
-            if [ "$AVAIL_MB" -lt 2048 ]; then
-              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
-              break
-            fi
-
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（7 选 1，含单因素）-> apply（clean 的清理工作交给收尾的 shell 步骤）-----
-            # for phase in perf bug sci clean apply; do
-            for phase in bug sci apply; do
-              case "$phase" in
-                perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
-                bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
-                sci)
-                  # 科研方法改进：从 PROMPT_SCI_1~6 + PROMPT_SINGLE 中随机选一个提示词（7 选 1）
-                  SCI_ROLL=$(( (RANDOM % 7) + 1 ))
-                  case "$SCI_ROLL" in
-                    1) P="$PROMPT_SCI_1"; SCI_LABEL='通用（不指定方面）' ;;
-                    2) P="$PROMPT_SCI_2"; SCI_LABEL='实验设计与准备' ;;
-                    3) P="$PROMPT_SCI_3"; SCI_LABEL='数据处理' ;;
-                    4) P="$PROMPT_SCI_4"; SCI_LABEL='可复现性与工程规范' ;;
-                    5) P="$PROMPT_SCI_5"; SCI_LABEL='对比实验与消融' ;;
-                    6) P="$PROMPT_SCI_6"; SCI_LABEL='结果分析' ;;
-                    7) P="$PROMPT_SINGLE"; SCI_LABEL='单因素实验' ;;
-                  esac
-                  T="$SCI_TIMEOUT"
-                  echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
-                ;;
-                clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
-                apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
+          # ================= 单阶段执行（每个 job 只做一次 opencode 调用） =================
+          # 原 while 多阶段循环改为：本 job 只执行「阶段轮换状态」指定的一个阶段、只发起一次
+          # opencode 调用；需要进行下一次调用时，由已排队的后继 job 接续（concurrency 队列
+          # + 收尾 next-run job + */15 心跳三重兜底，链条永不断）。
+          # 测试类调用不受单次限制：前置测试门、模型冒烟测试、testfix 测试修复仍在 job 内进行。
+          # 轮换状态存于 .github/.loop-phase（phase:failcount），受 opencode 编辑权限 deny 保护，
+          # 随收尾提交推送；后继 job 读取并推进：bug → sci → apply →（1/10 概率插入 docs）→ 循环。
+          STATE_FILE=".github/.loop-phase"
+          read_loop_state() {
+            if [ -f "$STATE_FILE" ]; then
+              local line p n
+              line="$(head -1 "$STATE_FILE" 2>/dev/null | tr -d '[:space:]')"
+              p="${line%%:*}"; n="${line##*:}"
+              case "$p" in
+                bug|sci|apply|docs) ;;
+                *) p="bug" ;;
               esac
-
-              # 收窄到剩余时间
-              REMAIN=$(( DEADLINE - $(date +%s) ))
-              if [ "$REMAIN" -le 0 ]; then
-                echo "[info] 全局时间已到，退出循环"
-                break 2
-              fi
-              if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
-
-              echo ">>> iteration #$i | phase=$phase | budget=${T}s"
-              case "$phase" in
-                perf|bug) P="$(fast_prompt "$phase" "$P")" ;;
-              esac
-              run_phase "$phase" "$P" "$T"
-              # 无论成功失败，先把已完成的改动提交上去
-              commit_and_push "$i-$phase"
-
-              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
-              case "$phase" in
-                bug|sci) maybe_run_tests "$i" ;;
-              esac
-
-              sleep 5
-            done
-
-            # ================= 新增：docs 阶段（每次循环 1/10 概率执行） =================
-            # 每次循环迭代掷一次骰子：1/10 概率命中才执行「优化代码和文档」阶段。
-            # 未命中时直接跳过、不占用本轮预算；命中时复用既有 run_phase / commit_and_push 机制。
-            DOCS_ROLL=$(( RANDOM % 10 ))
-            if [ "$DOCS_ROLL" -eq 0 ]; then
-              echo "[info] docs 阶段命中 1/10 概率（roll=0），本轮执行代码与文档优化"
-              P="$PROMPT_DOCS"
-              T="$DOCS_TIMEOUT"
-              REMAIN=$(( DEADLINE - $(date +%s) ))
-              if [ "$REMAIN" -le 0 ]; then
-                echo "[info] 全局时间已到，跳过 docs 阶段"
-              else
-                if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
-                echo ">>> iteration #$i | phase=docs | budget=${T}s"
-                run_phase docs "$P" "$T"
-                commit_and_push "$i-docs"
-                # ⭐ 测试门：docs 阶段也可能触碰代码，提交后与 bug / sci 一样跑全量测试
-                maybe_run_tests "$i"
-              fi
+              case "$n" in ''|*[!0-9]*) n="0" ;; esac
+              printf '%s:%s' "$p" "$n"
             else
-              echo "[info] docs 阶段未命中 1/10 概率（roll=$DOCS_ROLL），本轮跳过"
+              printf 'bug:0'
             fi
-          done
+          }
+          write_loop_state() {
+            mkdir -p .github
+            printf '%s:%s\n' "$1" "$2" > "$STATE_FILE"
+            git add -f "$STATE_FILE" 2>/dev/null || true
+          }
+          next_phase_of() {
+            case "$1" in
+              bug)   printf '%s' "sci" ;;
+              sci)   printf '%s' "apply" ;;
+              apply)   if [ $(( RANDOM % 10 )) -eq 0 ]; then printf 'docs'; else printf 'bug'; fi ;;
+              docs)  printf '%s' "bug" ;;
+
+            esac
+          }
+          STATE_LINE="$(read_loop_state)"
+          PHASE="${STATE_LINE%%:*}"
+          STATE_FAIL="${STATE_LINE##*:}"
+          i="run${GITHUB_RUN_NUMBER:-0}"
+
+          AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
+          echo "--- $i | phase=$PHASE | fail=$STATE_FAIL | free disk: ${AVAIL_MB}MB ---"
+          free -h | head -2
+          if [ "$AVAIL_MB" -lt 2048 ]; then
+            echo "[error] 磁盘剩余不足 2GB，本 job 提前结束，交给收尾步骤清理"
+            exit 0
+          fi
+
+          # ----- 本 job 唯一要执行的阶段 -----
+          case "$PHASE" in
+            bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
+            sci)
+              # 科研方法改进：从 PROMPT_SCI_1~6 + PROMPT_SINGLE 中随机选一个提示词（7 选 1）
+              SCI_ROLL=$(( (RANDOM % 7) + 1 ))
+              case "$SCI_ROLL" in
+                1) P="$PROMPT_SCI_1"; SCI_LABEL='通用（不指定方面）' ;;
+                2) P="$PROMPT_SCI_2"; SCI_LABEL='实验设计与准备' ;;
+                3) P="$PROMPT_SCI_3"; SCI_LABEL='数据处理' ;;
+                4) P="$PROMPT_SCI_4"; SCI_LABEL='可复现性与工程规范' ;;
+                5) P="$PROMPT_SCI_5"; SCI_LABEL='对比实验与消融' ;;
+                6) P="$PROMPT_SCI_6"; SCI_LABEL='结果分析' ;;
+                7) P="$PROMPT_SINGLE"; SCI_LABEL='单因素实验' ;;
+              esac
+              T="$SCI_TIMEOUT"
+              echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
+            ;;
+            apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
+            docs)  P="$PROMPT_DOCS";  T="$DOCS_TIMEOUT"  ;;
+          esac
+
+          # 收窄到剩余时间
+          REMAIN=$(( DEADLINE - $(date +%s) ))
+          if [ "$REMAIN" -le 0 ]; then
+            echo "[info] 全局时间已到，本 job 不再发起调用"
+            exit 0
+          fi
+          if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
+
+          echo ">>> $i | phase=$PHASE | budget=${T}s"
+          case "$PHASE" in
+            perf|bug) P="$(fast_prompt "$PHASE" "$P")" ;;
+          esac
+
+          run_phase "$PHASE" "$P" "$T"
+          PHASE_RC=$?
+
+          # 无论成功失败，先把已完成的改动提交上去
+          commit_and_push "$i-$PHASE"
+
+          # ⭐ 测试门：bug / sci / docs 阶段提交后跑一遍全量测试（testfix 属测试修复类，不受单次调用限制）
+          case "$PHASE" in
+            bug|sci|docs) maybe_run_tests "$i" ;;
+          esac
+
+          # ---- 阶段轮换推进：成功/超时 → 下一阶段；失败 → 后继 job 重试同一阶段（连续 3 个 job 后放弃） ----
+          case "$PHASE_RC" in
+            0|124|137|143)
+              NEXT="$(next_phase_of "$PHASE")"
+              write_loop_state "$NEXT" 0
+              echo "[state] phase=$PHASE 结束 (rc=$PHASE_RC) → 后继 job 将执行 $NEXT"
+              ;;
+            *)
+              STATE_FAIL=$(( STATE_FAIL + 1 ))
+              if [ "$STATE_FAIL" -ge 3 ]; then
+                NEXT="$(next_phase_of "$PHASE")"
+                write_loop_state "$NEXT" 0
+                echo "[state] phase=$PHASE 连续 ${STATE_FAIL} 个 job 失败，放弃该阶段 → 后继 job 将执行 $NEXT"
+              else
+                write_loop_state "$PHASE" "$STATE_FAIL"
+                echo "[state] phase=$PHASE 调用失败 (rc=$PHASE_RC) → 后继 job 重试同一阶段 (${STATE_FAIL}/3)"
+              fi
+              ;;
+          esac
 
       - name: Cleanup repo artifacts
         if: always()
