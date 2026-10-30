@@ -1082,6 +1082,15 @@ def compare_cells_to_baseline(
         paired_effect_size = _paired_effect_size(delta, result)
 
         entry = {
+            # 与同函数混杂分支及 factor_contrasts 同口径：对比
+            # 的双方身份用 cells 成对给出，供报告按单元对索引。
+            "cells": [
+                reference["label"],
+                aggregate["label"],
+            ],
+            # 走到这里说明受控变量无违规，对比未被判定为混杂；
+            # 与 factor_contrasts 一致，每个对比都显式携带该标记。
+            "confounded": False,
             "factor": "mode",
             "baseline": reference["label"],
             "variant": aggregate["label"],
