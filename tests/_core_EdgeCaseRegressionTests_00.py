@@ -736,6 +736,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(
             experiment.resume_data_change_error("", "abc")
         )
+        # 逐 split 记录损坏时同样不能因为当前记录缺失而绕过。
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error(
+                {"train": 123}, None
+            ),
+        )
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error(
+                {"train": ""}, None
+            ),
+        )
         # split 记录的键可能是损坏的混合类型；排序/拼接不能
         # 抛 TypeError，损坏的哈希值也不能静默放行。
         mixed = experiment.resume_split_change_error(

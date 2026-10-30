@@ -604,6 +604,19 @@ def resume_split_change_error(
             "请修复检查点或换用全新的 --out 目录从头训练。"
         )
     if current_split_sha256 is None:
+        # 当前数据可能来自不支持逐 split 指纹的旧版本，此时无法
+        # 比较；但检查点自身记录损坏（非字符串/空指纹）不能借
+        # 「当前缺失」绕过格式检查，否则损坏记录会被静默放行。
+        if any(
+            not isinstance(saved_hash, str) or not saved_hash
+            for saved_hash in saved_split_sha256.values()
+        ):
+            return (
+                "resume 数据划分内容指纹记录格式损坏（存在非字符串"
+                "或空指纹）：无法核对检查点与当前数据是否同一"
+                "划分，拒绝续跑；请修复检查点或换用全新的 --out "
+                "目录从头训练。"
+            )
         return None
     if not isinstance(current_split_sha256, dict):
         # 当前数据是新加载的；旧数据集只会缺字段（None）。
