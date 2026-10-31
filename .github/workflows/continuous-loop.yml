@@ -322,6 +322,12 @@ jobs:
           APPLY_TIMEOUT=$((3*3600))    # 3h
           DOCS_TIMEOUT=$((3*3600))    # 3h（docs 阶段：优化代码与文档，1/10 概率执行）
 
+          # ⭐ 停滞看门狗阈值：opencode 输出（$OUT）连续无增长的容忍秒数。
+          # 实测 agent 正常最长静默 ≈ 9 分钟（跑全量 pytest 且输出重定向时）；
+          # 免费网关流式挂死则一动辄 2 小时+（run #763/#765/#768 实测 132-149 分钟）。
+          # 20 分钟阈值两侧都留了余量：正常静默不会误杀，真停滞最多损失 20 分钟。
+          STALL_TIMEOUT=1200
+
 
           # ================= 模型策略：只用 opencode + Zen 免费模型 =================
           # 已移除 DeepSeek Harness 与 DeepSeek 官方 API 接入：
@@ -636,8 +642,70 @@ jobs:
             [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
             # shellcheck disable=SC2086
             # ⭐ 同 smoke_test：stdin 接 /dev/null，避免 opencode 阻塞在 stdin 读取
-            timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" < /dev/null 2>&1 | tee "$OUT"
-            local EC=$?
+            # ⭐ 停滞看门狗（stall watchdog）：免费网关偶发把长流式请求无限挂死
+            #    （连接保持、无错误帧、无任何输出，直到阶段预算耗尽才被杀，
+            #    整段机时全损，且 rc=124 被状态机当成“正常结束”、阶段照常轮换）。
+            #    处理：后台执行 timeout+opencode+tee（stdout 仍直通步骤日志，
+            #    实时输出不受影响），前台每 20s 检查 $OUT 大小；超过 STALL_TIMEOUT
+            #    秒无增长 → 判定停滞，立即终止本次调用并返回 75：
+            #      - 已完成的改动由主流程 commit_and_push 照常提交推送（不丢进度）；
+            #      - 75 不在 {0,124,137,143} → 阶段不推进，后继 job（开头
+            #        “Queue next run” 已排队）几秒内起跑并重试同一阶段；
+            #      - 停滞是网关故障而非模型问题：不走 oc_mark_broken，避免误杀
+            #        模型候选池导致循环停摆。
+            #    正常路径与原实现等价：EC 仍取 timeout 的 PIPESTATUS[0]。
+            echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用并推送进度，后继 job 重试同阶段）"
+            rm -f /tmp/.oc_exit_code
+            # shellcheck disable=SC2086
+            # setsid：让包装进程成为独立进程组组长（包装/timeout/tee 一个组），
+            # 与步骤主脚本的进程组隔离，停滞时可整组终止而不误伤主脚本；
+            # GNU timeout 还会把 opencode 单独放一个子组，终止时两组都要覆盖
+            # （见下方 kill 处理），才能不留持有输出管道的孤儿进程。
+            setsid bash -c '
+              timeout --kill-after=180 "$1" opencode run -m "$2" $3 "$4" < /dev/null 2>&1 | tee "$5"
+              echo "${PIPESTATUS[0]}" > /tmp/.oc_exit_code
+            ' _ "$budget_now" "$SELECTED_MODEL" "$oc_extra" "$prompt" "$OUT" &
+            local OC_BG=$!
+            local _sz=-1 _ts=$(date +%s) _stalled=0 _nsz
+            while kill -0 "$OC_BG" 2>/dev/null; do
+              sleep 20
+              _nsz=$(stat -c %s "$OUT" 2>/dev/null || echo 0)
+              if [ "$_nsz" != "$_sz" ]; then
+                _sz="$_nsz"; _ts=$(date +%s)
+              elif [ $(( $(date +%s) - _ts )) -ge "$STALL_TIMEOUT" ]; then
+                _stalled=1; break
+              fi
+            done
+            if [ "$_stalled" -eq 1 ]; then
+              echo "[watchdog] opencode 输出已 ${STALL_TIMEOUT}s 无增长（$OUT 停在 ${_sz}B）→ 判定网关停滞，终止本次调用；已完成的改动将照常提交推送，后继 job 将重试 $phase 阶段"
+              # 先 TERM 优雅退出，60s 后升级 KILL。注意 GNU timeout 默认把 opencode
+              # 放进独立进程组（opencode 的子进程都在该组），包装进程的组信号够不到它；
+              # 因此对每个 cmdline 含 "opencode run" 的进程，向其所在进程组逐一发信号，
+              # 包装组 + timeout 子组全覆盖，不留仍持有输出管道的孤儿进程。
+              for _pid in $(pgrep -f "opencode run" 2>/dev/null); do
+                _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                [ -n "$_pgid" ] && kill -TERM -- "-$_pgid" 2>/dev/null
+              done
+              kill -TERM -- "-$OC_BG" 2>/dev/null
+              pkill -TERM -f "opencode run" 2>/dev/null
+              kill -TERM "$OC_BG" 2>/dev/null
+              for _w in 1 2 3; do
+                sleep 20
+                kill -0 "$OC_BG" 2>/dev/null || break
+              done
+              for _pid in $(pgrep -f "opencode run" 2>/dev/null); do
+                _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                [ -n "$_pgid" ] && kill -KILL -- "-$_pgid" 2>/dev/null
+              done
+              kill -KILL -- "-$OC_BG" 2>/dev/null
+              pkill -KILL -f "opencode run" 2>/dev/null
+              kill -KILL "$OC_BG" 2>/dev/null
+              wait "$OC_BG" 2>/dev/null
+              return 75
+            fi
+            wait "$OC_BG" 2>/dev/null
+            local EC=124
+            [ -s /tmp/.oc_exit_code ] && EC=$(cat /tmp/.oc_exit_code)
 
             # 成功 / 超时被杀：预算耗尽属正常结束，改动照常提交，阶段正常完成
             if [ $EC -eq 0 ] || [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
