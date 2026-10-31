@@ -106,12 +106,15 @@ _RUN_ORDER_KEYS = ("scheme", "seed")
 # 每个种子区组内随机化臂顺序（默认）；counterbalanced 在完整
 # 区组的基础上用循环拉丁方/平衡排列，使每个处理在各区组位置
 # 上的出现次数尽可能相等，避免小样本随机化偶然把某个臂系统性
-# 地放在更晚/更早的时间片。
+# 地放在更晚/更早的时间片；williams 在完整区组上使用 Williams
+# 设计，除位置平衡外还平衡区组内相邻处理的一阶 carryover
+# （偶数处理 n 个区组、奇数处理 2n 个区组可完全平衡）。
 _RUN_ORDER_SCHEMES = (
     "grouped",
     "blocked",
     "randomized",
     "counterbalanced",
+    "williams",
 )
 
 

@@ -759,14 +759,57 @@ def print_design_summary(design: Dict[str, object]) -> None:
                 f"{balance.get('max_position_imbalance')}）："
                 "请检查区组是否包含同一组处理"
             )
+        elif design.get("order_scheme") == "williams":
+            print(
+                "[design][order][warn] williams 计划未达到位置"
+                "平衡（最大极差 "
+                f"{balance.get('max_position_imbalance')}）："
+                "请检查区组是否包含同一组处理，或区组数是否"
+                "不足以覆盖设计行"
+            )
         else:
             print(
                 "[design][order] 提示：当前顺序的最大位置计数"
                 f"极差为 {balance.get('max_position_imbalance')}；"
                 "randomized 只保证区组内随机化，不保证位置计数"
                 "均衡。若担心热漂移与位置混杂，可改用 "
-                "--run-order counterbalanced"
+                "--run-order counterbalanced 或 williams"
             )
+        carryover = balance.get("carryover")
+        if isinstance(carryover, dict):
+            if carryover.get("available"):
+                if carryover.get("balanced"):
+                    print(
+                        "[design][order] 一阶 carryover 平衡："
+                        f"{carryover.get('pairs_observed')}/"
+                        f"{carryover.get('pairs_possible')} 个有序"
+                        "相邻处理对已覆盖，计数极差 "
+                        f"{carryover.get('max_pair_imbalance')}"
+                    )
+                elif design.get("order_scheme") == "williams":
+                    print(
+                        "[design][order][warn] williams 计划未达到"
+                        "一阶 carryover 平衡（覆盖 "
+                        f"{carryover.get('pairs_observed')}/"
+                        f"{carryover.get('pairs_possible')} 个有序"
+                        "相邻处理对，计数极差 "
+                        f"{carryover.get('max_pair_imbalance')}）："
+                        "完全平衡需区组数为 "
+                        f"{carryover.get('full_balance_block_multiple')}"
+                        " 的整数倍；当前结论需按部分平衡报告"
+                    )
+                elif design.get("order_scheme") == "counterbalanced":
+                    print(
+                        "[design][order] 注意：counterbalanced 只平衡"
+                        "位置，不保证一阶 carryover；若担心上一次"
+                        "运行残留影响，可改用 --run-order williams"
+                    )
+            elif design.get("order_scheme") == "williams":
+                print(
+                    "[design][order][warn] 无法审计 williams 一阶 "
+                    "carryover："
+                    f"{carryover.get('reason')}"
+                )
     power = design.get("power")
     if isinstance(power, dict):
         recompute_failed = (

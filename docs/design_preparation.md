@@ -10,8 +10,9 @@
    差值 sd 与脱落率校准声明值（2.3 节）；
 2. **随机化/平衡完整区组**：把「哪个臂先跑」从便利顺序变成
    预先声明的顺序，避免机器热漂移/负载漂移与处理效应混杂；
-3. **设计计划冻结**：把运行清单、顺序、位置平衡、功效、试点
-   证据与预算写成 `design_plan.json`，子进程开跑前逐项核对。
+3. **设计计划冻结**：把运行清单、顺序、位置/一阶 carryover
+   平衡、功效、试点证据与预算写成 `design_plan.json`，子进程
+   开跑前逐项核对。
 
 这三项都属于**准备阶段**，与训练后的显著性检验、等价性检验和
 脆弱性分析互补。它们不能替研究者保证结论正确，但能避免几类
@@ -33,8 +34,9 @@ python experiment.py \
 `--plan-design` 只生成并打印计划，**不加载数据、不训练**：
 
 - 每个运行单元的 label / mode / seed / balance 系数；
-- 执行顺序、种子区组与区组内位置，以及位置平衡审计
-  （`order_balance`：每个处理在各位置上的计数与最大极差）；
+- 执行顺序、种子区组与区组内位置，以及位置/一阶 carryover
+  平衡审计（`order_balance`：每个处理在各位置上的计数与最大
+  极差，以及 `carryover` 有序相邻处理对的覆盖与计数极差）；
 - `design_plan.json` 的规范化指纹 `plan_id`；
 - 先验功效（若预注册文件提供 `power` 块），包括按预期脱落率
   折算的可用种子数、实际功效、MDE 与 sd 敏感性；`planned_contrasts`
@@ -311,7 +313,7 @@ block seed2: A, B
 block seed3: B, A
 ```
 
-四种方案：
+五种方案：
 
 | `--run-order` | 行为 | 用途 |
 |---|---|---|
@@ -319,6 +321,7 @@ block seed3: B, A
 | `blocked` | 按种子成区组，区组内保持原臂顺序 | 需要固定臂顺序但希望平衡时间片 |
 | `randomized` | 按种子成区组，区组内随机化 | 默认；区组内顺序随机，但小样本下不保证位置计数均衡 |
 | `counterbalanced` | 按种子成区组，用循环拉丁方轮换臂位置 | 种子数较少、担心位置与热漂移混杂时的限制性随机化；要求每个区组包含同一组处理 |
+| `williams` | 按种子成区组，使用 Williams 设计行 | 同时平衡位置与区组内一阶 carryover；偶数处理需 `n` 个区组、奇数处理需 `2n` 个区组的整数倍才能完全平衡 |
 
 `randomized` 只保证「每个区组都跑每个臂」，不保证每个臂在
 区组第 1/2/3… 个位置上的出现次数相等。6 个种子、2 个臂时，
@@ -331,10 +334,27 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
 运行，`--plan-design` 会直接拒绝，而不是生成一个看似平衡、
 实则缺格的计划。
 
+`counterbalanced` 只平衡**位置**：所有区组共享同一循环顺序，
+区组内相邻处理只覆盖该循环的 `n` 个有向边，其余
+`n(n-1)-n` 个有序对永远不会相邻。如果上一次运行的缓存/
+优化器状态/机器负载会 carryover 到下一次运行，处理效应仍可能
+被污染。`williams` 使用 Williams
+平衡拉丁方：偶数 n 用 `n` 行，奇数 n 用两个 `n` 行拉丁方共
+`2n` 行；完整使用设计行时，每个处理在每一位置出现次数相同，
+且每个有序相邻处理对 `(前一个, 后一个)` 出现次数相同。处理
+标签与起始行由 `--run-order-seed` 确定性随机化。区组数不是
+`n`（偶数）或 `2n`（奇数）的整数倍时，位置计数可能接近平衡
+但不保证极差 ≤1；`order_balance.carryover.balanced` 会标为
+false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不得把
+部分平衡写成已平衡。
+
 `design_plan.json` 的 `order_balance` 会记录每个处理在各位置
-上的计数、`max_position_imbalance` 与 `balanced`。`randomized`
-不均衡时只提示可改用 `counterbalanced`；`counterbalanced`
-不均衡则视为设计错误并告警。
+上的计数、`max_position_imbalance` 与 `balanced`，并在
+`carryover` 子字段记录有序相邻处理对的 `pairs_observed` /
+`pairs_possible`、`max_pair_imbalance` 与 `balanced`。`randomized`
+不均衡时只提示可改用 `counterbalanced` 或 `williams`；
+`counterbalanced` 不均衡则视为设计错误并告警；`williams`
+只达到部分 carryover 平衡时也告警并给出所需区组倍数。
 
 `--run-order-seed` 固定洗牌种子（默认 0）；同一计划必须使用同一
 种子才能复现顺序。看到结果后换顺序不再是原设计。
@@ -396,9 +416,11 @@ b 行中每个处理在各位置最多出现一次，位置计数极差不超过
    `power.plan_equivalence=true`，同时查看
    `equivalence.required_seeds_with_attrition` 与
    `equivalence.margin_for_target_power`；
-2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置平衡、
-   对比类型功效（`binding_contrast` 通常是交互）、
-   `pilot_evidence` 与 token 预算；调整种子数或最小效应后再冻结；
+2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置与
+   一阶 carryover 平衡（担心残留效应时选 `williams` 并确认
+   区组数是设计行数的整数倍）、对比类型功效（`binding_contrast`
+   通常是交互）、`pilot_evidence` 与 token 预算；调整种子数或
+   最小效应后再冻结；
 3. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
    放入同一只读目录；
 4. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；

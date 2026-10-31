@@ -1036,9 +1036,12 @@ def resolve_run_order(args: argparse.Namespace) -> Tuple[str, int]:
     默认 ``randomized``：每个种子是一个完整区组，区组内的臂
     顺序随机化。``counterbalanced`` 在同一区组结构上进一步用
     循环拉丁方约束位置计数，适合种子数较少、担心热漂移与
-    区组内位置混杂的确证运行。旧行为 ``grouped`` 会先把一个
-    臂的所有种子跑完再跑下一个臂，机器热漂移、共享缓存与
-    集群负载随时间变化时，这些漂移与臂效应完全混杂。
+    区组内位置混杂的确证运行；但它不保证一阶 carryover。
+    ``williams`` 使用 Williams 设计同时平衡位置与区组内相邻
+    处理对，适合担心上一次运行残留影响下一次运行的场景。
+    旧行为 ``grouped`` 会先把一个臂的所有种子跑完再跑下一个
+    臂，机器热漂移、共享缓存与集群负载随时间变化时，这些
+    漂移与臂效应完全混杂。
     """
     scheme = getattr(args, "run_order", None)
     if scheme is None:
@@ -1157,6 +1160,50 @@ def _plan_treatment_key(item: Dict[str, object]):
 
 
 
+def _complete_block_layout(
+    blocks: Dict[object, List[Dict[str, object]]],
+    scheme_name: str,
+) -> Tuple[
+    List[object],
+    List[object],
+    Dict[object, Dict[object, Dict[str, object]]],
+]:
+    """校验完整区组并返回 (区组顺序, 处理集合, 处理到运行条目)。
+
+    位置平衡与 carryover 平衡都要求每个种子区组包含完全相同的
+    处理单元集合各一次；缺格或重复时不能声称「平衡」，必须在
+    设计阶段显式拒绝，而不是生成一个看似平衡、实则缺格的计划。
+    """
+    block_keys = sorted(blocks, key=_order_block_sort_key)
+    reference: Optional[List] = None
+    keyed_blocks: Dict[object, Dict[object, Dict[str, object]]] = {}
+    for block_key in block_keys:
+        entries = blocks[block_key]
+        keys = [_plan_treatment_key(item) for item in entries]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                f"{scheme_name} 顺序要求同一区组内的处理单元"
+                "互不相同；当前区组 "
+                f"{block_key!r} 有重复处理单元"
+            )
+        block_reference = sorted(set(keys), key=repr)
+        if reference is None:
+            reference = block_reference
+        elif block_reference != reference:
+            raise ValueError(
+                f"{scheme_name} 顺序要求每个种子区组包含完全"
+                "相同的处理单元集合；当前区组 "
+                f"{block_key!r} 与其它区组不同。请检查套件是否"
+                "有只在部分种子上运行的候选；这种情况不能声称"
+                "平衡，应改用 randomized 或补齐运行。"
+            )
+        keyed_blocks[block_key] = {
+            key: item for key, item in zip(keys, entries)
+        }
+    return block_keys, list(reference or []), keyed_blocks
+
+
+
 def _counterbalanced_order(
     blocks: Dict[object, List[Dict[str, object]]],
     order_seed: int,
@@ -1170,37 +1217,18 @@ def _counterbalanced_order(
     每个位置上最多出现一次，因此位置计数之差不超过 1。相比
     纯随机化，这避免了小样本下某个臂偶然总在同一位置、与
     机器热漂移/缓存预热混杂。
+
+    注意：循环移位只平衡**位置**。所有区组共享同一循环顺序，
+    因此区组内相邻处理只覆盖该循环的 n 个有向边（其余
+    n(n-1)-n 个有序对永远不出现）；若机器状态会从前一次运行
+    carryover 到下一次，需要改用 williams 顺序平衡一阶
+    carryover。
     """
     if not blocks:
         return []
-    block_keys = sorted(
-        blocks, key=_order_block_sort_key
+    block_keys, reference, keyed_blocks = _complete_block_layout(
+        blocks, "counterbalanced"
     )
-    reference: Optional[List] = None
-    keyed_blocks: Dict[object, Dict[object, Dict[str, object]]] = {}
-    for block_key in block_keys:
-        entries = blocks[block_key]
-        keys = [_plan_treatment_key(item) for item in entries]
-        if len(set(keys)) != len(keys):
-            raise ValueError(
-                "counterbalanced 顺序要求同一区组内的处理单元"
-                "互不相同；当前区组 "
-                f"{block_key!r} 有重复处理单元"
-            )
-        block_reference = sorted(set(keys), key=repr)
-        if reference is None:
-            reference = block_reference
-        elif block_reference != reference:
-            raise ValueError(
-                "counterbalanced 顺序要求每个种子区组包含完全"
-                "相同的处理单元集合；当前区组 "
-                f"{block_key!r} 与其它区组不同。请检查套件是否"
-                "有只在部分种子上运行的候选；这种情况不能声称"
-                "位置已平衡，应改用 randomized 或补齐运行。"
-            )
-        keyed_blocks[block_key] = {
-            key: item for key, item in zip(keys, entries)
-        }
     if not reference:
         # 空区组（损坏/手工计划）没有可排列的处理单元：返回空
         # 顺序，而不是在 len(base) 取模时抛 ZeroDivisionError。
@@ -1217,4 +1245,111 @@ def _counterbalanced_order(
         row = base[rotation:] + base[:rotation]
         mapping = keyed_blocks[block_key]
         ordered.extend(dict(mapping[key]) for key in row)
+    return ordered
+
+
+
+def _williams_rng(order_seed: int) -> random.Random:
+    """Williams 设计的确定性 RNG（与其它顺序方案分开命名空间）。"""
+    digest = hashlib.sha256(
+        f"smelt-isr-williams:{int(order_seed)}".encode("utf-8")
+    ).digest()
+    return random.Random(int.from_bytes(digest[:16], "big"))
+
+
+
+def _williams_first_row(n_treatments: int) -> List[int]:
+    """Williams 设计的基础序列（0-based）。
+
+    以 1-based 记，偶数 n 为 0, 1, n, 2, n−1, 3, …（如 n=6 →
+    0,1,6,2,5,3）；奇数 n 为同样的低/高交替，最后落在中间
+    （如 n=5 → 0,1,5,2,4）。后续行由该序列逐项 +1（模 n）
+    得到。0-based 返回时整体减 1。
+    """
+    if n_treatments <= 1:
+        return [0] * max(n_treatments, 0)
+    row = [0]
+    low = 1
+    high = n_treatments - 1
+    while len(row) < n_treatments:
+        row.append(low)
+        low += 1
+        if len(row) < n_treatments:
+            row.append(high)
+            high -= 1
+    return row
+
+
+
+def _williams_design_rows(n_treatments: int) -> List[List[int]]:
+    """构造 Williams 设计的行序列（0-based 处理编号）。
+
+    偶数处理数用 n 行的一个拉丁方即可平衡一阶 carryover；
+    奇数处理数需要两个 n 行拉丁方（第二方的基础序列为第一方
+    的逆序），共 2n 行。完整使用这些行时，每个有序相邻处理对
+    出现次数相同。
+    """
+    if n_treatments <= 1:
+        return [[0] for _ in range(max(n_treatments, 0))]
+    first = _williams_first_row(n_treatments)
+    rows = [
+        [(value + shift) % n_treatments for value in first]
+        for shift in range(n_treatments)
+    ]
+    if n_treatments % 2 == 1:
+        second = list(reversed(first))
+        rows.extend(
+            [
+                [
+                    (value + shift) % n_treatments
+                    for value in second
+                ]
+                for shift in range(n_treatments)
+            ]
+        )
+    return rows
+
+
+
+def _williams_order(
+    blocks: Dict[object, List[Dict[str, object]]],
+    order_seed: int,
+) -> List[Dict[str, object]]:
+    """
+    构造 Williams 顺序：完整区组 + 位置平衡 + 一阶 carryover 平衡。
+
+    与 counterbalanced 一样，每个种子区组包含同一组处理各一次；
+    但区组不再共享同一个循环顺序，而是从 Williams 设计的行序列
+    中取行。偶数 n 个处理使用 n 行，奇数 n 使用 2n 行；完整使用
+    时每个处理在每一位置出现相同次数，且区组内每个有序相邻处理
+    对出现相同次数。处理标签与起始行由 order_seed 确定性随机化，
+    因此看到结果后换种子会改变计划指纹。
+
+    区组数 B 不是设计行数的整数倍时，只使用前 B 行（循环取行）：
+    位置计数可能接近平衡，但未覆盖的有序对计数为 0，报告会把
+    ``carryover.balanced`` 标为 false；要完全平衡一阶 carryover，
+    种子区组数必须是 n（偶数）或 2n（奇数）的整数倍。
+    """
+    if not blocks:
+        return []
+    block_keys, reference, keyed_blocks = _complete_block_layout(
+        blocks, "williams"
+    )
+    if not reference:
+        return []
+
+    n_treatments = len(reference)
+    rng = _williams_rng(order_seed)
+    randomized = list(reference)
+    rng.shuffle(randomized)
+    rows = _williams_design_rows(n_treatments)
+    start = rng.randrange(len(rows)) if rows else 0
+
+    ordered: List[Dict[str, object]] = []
+    for block_index, block_key in enumerate(block_keys):
+        row = rows[(start + block_index) % len(rows)]
+        mapping = keyed_blocks[block_key]
+        ordered.extend(
+            dict(mapping[randomized[index]]) for index in row
+        )
     return ordered

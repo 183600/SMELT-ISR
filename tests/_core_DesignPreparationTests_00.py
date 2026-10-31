@@ -77,7 +77,13 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
             {"label": "A_bad2", "mode": "A", "balance_coef": 0.0, "seed": {"x": 1}},
             {"label": "B_bad2", "mode": "B", "balance_coef": 0.0, "seed": {"x": 1}},
         ]
-        for scheme in ("grouped", "blocked", "randomized", "counterbalanced"):
+        for scheme in (
+            "grouped",
+            "blocked",
+            "randomized",
+            "counterbalanced",
+            "williams",
+        ):
             ordered = experiment.order_sweep_plan(plan, scheme, 3)
             self.assertEqual(len(ordered), 4, scheme)
             self.assertEqual(
@@ -261,6 +267,15 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
         error = experiment.preregistration_schema_error(payload)
         self.assertIsNotNone(error)
         self.assertIn("planned_comparisons", error)
+    def test_preregistration_accepts_williams_run_order(self):
+        payload = self._payload()
+        payload["run_order"] = {
+            "scheme": "williams",
+            "seed": 7,
+        }
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
     def test_preregistration_run_order_applied_and_conflict_rejected(self):
         payload = self._payload()
         payload["run_order"] = {
@@ -1032,6 +1047,176 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
                 plan, "counterbalanced", 0
             )
         self.assertIn("相同的处理单元", str(context.exception))
+    def test_williams_order_balances_carryover_even(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3, 4, 5, 6],
+            modes=["A", "B", "C", "D", "E", "F"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "williams", 13
+        )
+        repeated = experiment.order_sweep_plan(
+            plan, "williams", 13
+        )
+        self.assertEqual(
+            [item["label"] for item in ordered],
+            [item["label"] for item in repeated],
+        )
+        report = experiment.run_order_balance_report(ordered)
+        self.assertTrue(report["available"])
+        self.assertTrue(report["complete_blocks"])
+        self.assertTrue(report["balanced"])
+        self.assertEqual(report["max_position_imbalance"], 0)
+        carryover = report["carryover"]
+        self.assertTrue(carryover["available"])
+        self.assertTrue(carryover["balanced"])
+        self.assertEqual(carryover["pairs_possible"], 30)
+        self.assertEqual(carryover["pairs_observed"], 30)
+        self.assertEqual(carryover["transitions"], 30)
+        self.assertEqual(carryover["max_pair_imbalance"], 0)
+        self.assertEqual(
+            carryover["full_balance_block_multiple"], 6
+        )
+        pair_counts = {}
+        for seed in range(1, 7):
+            block = sorted(
+                [
+                    item
+                    for item in ordered
+                    if item["block"] == seed
+                ],
+                key=lambda item: item["position_in_block"],
+            )
+            modes = [item["mode"] for item in block]
+            for left, right in zip(modes, modes[1:]):
+                pair_counts[(left, right)] = (
+                    pair_counts.get((left, right), 0) + 1
+                )
+        self.assertEqual(len(pair_counts), 30)
+        self.assertEqual(set(pair_counts.values()), {1})
+    def test_williams_order_balances_carryover_odd(self):
+        plan = experiment.build_sweep_plan(
+            seeds=list(range(1, 11)),
+            modes=["A", "B", "C", "D", "E"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "williams", 17
+        )
+        report = experiment.run_order_balance_report(ordered)
+        self.assertTrue(report["complete_blocks"])
+        self.assertTrue(report["balanced"])
+        self.assertEqual(report["max_position_imbalance"], 0)
+        carryover = report["carryover"]
+        self.assertTrue(carryover["available"])
+        self.assertTrue(carryover["balanced"])
+        self.assertEqual(carryover["pairs_possible"], 20)
+        self.assertEqual(carryover["pairs_observed"], 20)
+        self.assertEqual(carryover["transitions"], 40)
+        self.assertEqual(carryover["min_pair_count"], 2)
+        self.assertEqual(carryover["max_pair_count"], 2)
+        self.assertEqual(carryover["max_pair_imbalance"], 0)
+        self.assertEqual(
+            carryover["full_balance_block_multiple"], 10
+        )
+    def test_williams_order_reports_partial_carryover(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3, 4, 5],
+            modes=["A", "B", "C", "D", "E"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "williams", 19
+        )
+        report = experiment.run_order_balance_report(ordered)
+        self.assertTrue(report["complete_blocks"])
+        carryover = report["carryover"]
+        self.assertTrue(carryover["available"])
+        self.assertFalse(carryover["balanced"])
+        self.assertLess(
+            carryover["pairs_observed"],
+            carryover["pairs_possible"],
+        )
+        self.assertEqual(
+            carryover["full_balance_block_multiple"], 10
+        )
+    def test_print_design_summary_warns_partial_williams(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2, 3, 4, 5],
+            modes=["A", "B", "C", "D", "E"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "williams", 19
+        )
+        design = {
+            "planned_runs": len(ordered),
+            "order_scheme": "williams",
+            "order_seed": 19,
+            "plan_id": "x" * 20,
+            "path": "design.json",
+            "order_balance": experiment.run_order_balance_report(
+                ordered
+            ),
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            experiment.print_design_summary(design)
+        text = output.getvalue()
+        self.assertIn("[warn] williams", text)
+        self.assertIn("10", text)
+    def test_williams_order_requires_exact_carryover_counts(self):
+        plan = experiment.build_sweep_plan(
+            seeds=list(range(1, 8)),
+            modes=["A", "B", "C", "D", "E", "F"],
+            ablation=False,
+            balance_coef=0.01,
+            default_mode="B",
+        )
+        ordered = experiment.order_sweep_plan(
+            plan, "williams", 23
+        )
+        report = experiment.run_order_balance_report(ordered)
+        carryover = report["carryover"]
+        self.assertTrue(carryover["available"])
+        self.assertEqual(carryover["pairs_observed"], 30)
+        self.assertEqual(carryover["max_pair_imbalance"], 1)
+        self.assertFalse(carryover["balanced"])
+    def test_williams_rejects_unequal_blocks(self):
+        plan = [
+            {
+                "label": "A_seed1",
+                "mode": "A",
+                "balance_coef": 0.01,
+                "seed": 1,
+            },
+            {
+                "label": "B_seed1",
+                "mode": "B",
+                "balance_coef": 0.01,
+                "seed": 1,
+            },
+            {
+                "label": "A_seed2",
+                "mode": "A",
+                "balance_coef": 0.01,
+                "seed": 2,
+            },
+        ]
+        with self.assertRaises(ValueError) as context:
+            experiment.order_sweep_plan(
+                plan, "williams", 0
+            )
+        self.assertIn("williams", str(context.exception))
     def test_order_balance_report_detects_position_confounding(self):
         plan = [
             {

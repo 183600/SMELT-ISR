@@ -680,7 +680,8 @@ AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都�
 - `counterbalanced` 平衡的是**位置计数**，不是所有高阶顺序
   效应；循环拉丁方不保证一阶 carryover（前一个处理对后一个
   处理的影响）完全平衡，也不消除机器漂移本身。它只降低小样本
-  随机化偶然造成的位置混杂。
+  随机化偶然造成的位置混杂。需要一阶 carryover 平衡时应改用
+  §41 的 `williams`；后者也仍不处理跨区组边界与高阶交互。
 - 位置平衡要求区组同质（每个种子跑同一组处理）。如果套件本身
   有缺格，正确做法是补齐运行或改用 `randomized` 并明确承认
   不平衡，不能把缺格计划标成平衡。
@@ -1380,6 +1381,60 @@ python experiment.py --audit-run runs/final/A --audit-strict \
 审计。群组分析与种子级检验来自同一批运行，不是两次独立验证；
 报告仍不得把不显著读成等价。
 
+## 41. 实验设计与准备：一阶 carryover 平衡（williams 顺序，本轮补充）
+
+**判定：`counterbalanced` 解决了位置计数混杂，但没有解决区组内
+一阶 carryover；仅凭位置平衡不能排除「上一次运行影响下一次运行」。**
+
+循环拉丁方让所有区组共享同一个循环顺序。以 n=6 为例，基础顺序
+为 `0,1,5,2,4,3`，所有区组只在循环移位后取行；区组内相邻对
+永远只来自这个循环的 n 个有向边，其余 `n(n-1)-n` 个有序对
+一次也不会出现。于是每个有向边重复 `n-1` 次，而其他边计数为
+0。若缓存、GPU 温度、优化器/分配器状态或集群负载会把上一次
+运行的影响带入下一次，处理效应仍可能与 carryover 混杂，而且
+这种混杂不会被 `order_balance.balanced=true` 发现。
+
+**已修正：**
+
+- 新增 `--run-order williams`。偶数 n 个处理使用 n 行 Williams
+  平衡拉丁方；奇数 n 使用两个 n 行拉丁方（第二个以第一个的
+  逆序为基础），共 2n 行。完整使用设计行时，每个处理在每一位
+  置出现次数相同，且每个有序相邻处理对 `(前一个, 后一个)` 的
+  出现次数相同。处理标签与起始行由 `--run-order-seed` 确定性
+  随机化，预注册/设计计划指纹覆盖顺序。
+- `order_balance` 新增 `carryover` 字段：`pairs_possible =
+  n(n-1)`、`pairs_observed`、`transitions`、`min_pair_count`、
+  `max_pair_count`、`max_pair_imbalance`、`balanced` 与
+  `full_balance_block_multiple`。`balanced` 要求所有有序对都被
+  覆盖且计数完全相同（极差 0），而不是只要求位置平衡或计数
+  接近。
+- 区组数 B 不是 n（偶数）或 2n（奇数）的整数倍时，位置计数
+  仍可能接近平衡但不保证极差 ≤1；`carryover.balanced` 一定为
+  false，`print_design_summary` 会告警并给出完整平衡所需的
+  区组倍数。不得把「部分平衡」写成「carryover 已平衡」。
+- `counterbalanced` 的计划在摘要中明确提示只平衡位置；若担心
+  一阶 carryover，应改用 `williams`。
+- 新增回归测试：偶数处理完整设计每个有序对恰好一次、奇数处理
+  完整设计每个有序对恰好两次、区组不足时正确报告部分平衡、
+  区组处理集合不一致时拒绝、相同种子可复现。
+
+**仍有限制：**
+
+- Williams 设计只平衡**区组内**一阶 carryover。跨区组边界
+  （上一个区组最后一个处理到下一个区组第一个处理）不在平衡
+  声明内；若漂移跨区组连续累积，仍需随机化区组顺序、插入
+  washout/重置，或把区组边界作为敏感性分析变量。
+- 一阶计数平衡不等于消除了 carryover 的**交互作用**。若
+  carryover 大小本身依赖前一个处理（处理×carryover 交互），
+  标准 Williams 平衡只能保证一阶相邻对计数相同，不能保证
+  直接效应估计无偏；需要显式 carryover 模型或 washout 设计。
+- 完整平衡要求区组数达到设计行数的整数倍。种子数很少时，
+  奇数处理可能需要 2n 个区组才能覆盖全部有序对；不能为了
+  凑平衡重复使用同一批训练种子而不把重复视为技术重复。
+- 顺序设计只处理时间/顺序混杂，不消除机器漂移、数据顺序、
+  随机种子差异或失败率差异；分析阶段仍需报告 `run_order`
+  漂移诊断、失败率与设计指纹一致性。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1396,8 +1451,10 @@ python experiment.py --audit-run runs/final/A --audit-strict \
 3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
    最小效应、目标功效、预期脱落率；消融还要写
    `planned_contrasts` 含 `interaction`）与 `run_order`
-   （`counterbalanced` + 种子；区组缺格时退回 `randomized`
-   并承认位置可能不均衡），若已有试点/先前运行则用
+   （`counterbalanced` 或 `williams` + 种子；担心上一次运行
+   carryover 时用 `williams`，区组数不足设计行数整数倍时
+   报告部分平衡；区组缺格时退回 `randomized` 并承认位置/
+   carryover 可能不均衡），若已有试点/先前运行则用
    `--design-pilot-runs` 把观测配对 sd 与脱落率写进
    `pilot_evidence` 并强制重算，再用 `--plan-design` 检查所需
    启动种子数、按对比类型分层的实际功效/MDE（`binding_contrast`，
@@ -1418,7 +1475,8 @@ python experiment.py --audit-run runs/final/A --audit-strict \
    `--common-step`，用曲线时均回答「收敛速度」、用共同步数
    单点回答「该时刻质量」，两者与 final 一起报告；报告
    失败率、MDE、门槛检验、TOST、`fragility_summary`、
-   `design.order_balance` 与 `run_order`；逐检验 95% CI 只
+   `design.order_balance`（含 `carryover`）与 `run_order`；
+   逐检验 95% CI 只
    描述效应量，校正后的结论以 Holm 为准，并同时报告
    Bonferroni `α/m` 同时区间；窗口级证据同时报告种子×窗口
    两层 bootstrap 与方差占比，用它决定补种子还是扩评估集。

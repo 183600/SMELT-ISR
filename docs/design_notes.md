@@ -484,15 +484,19 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   不能用命令行默认值代替，也不能看到数据后放宽；若当前精度
   支持的最小界大于声明界，应增加种子。
 - **随机化/平衡完整区组（`run_order`）**：`--run-order
-  {grouped,blocked,randomized,counterbalanced}` 与
+  {grouped,blocked,randomized,counterbalanced,williams}` 与
   `--run-order-seed` 控制套件执行顺序，默认 `randomized`——
   每个种子是一个完整区组，区组内所有臂都跑一次、臂顺序由
   `(order_seed, seed)` 确定性洗牌。`counterbalanced` 用循环
   拉丁方限制性随机化，使每个处理在各区组位置上的出现次数
   尽可能相等；它要求每个区组包含同一组处理，缺格时拒绝
-  生成计划。`grouped` 保留历史顺序，但模式与时间/机器漂移
-  完全混杂，只用于兼容旧运行。预注册可用 `run_order` 冻结
-  方案与种子，命令行显式冲突拒绝启动。
+  生成计划。`williams` 用 Williams 设计同时平衡位置与区组内
+  一阶 carryover：偶数 n 需 `n` 个区组、奇数 n 需 `2n` 个
+  区组的整数倍才能完全平衡；不足时报告 `carryover.balanced
+  = false`，不能把部分平衡写成已平衡。`grouped` 保留历史
+  顺序，但模式与时间/机器漂移完全混杂，只用于兼容旧运行。
+  预注册可用 `run_order` 冻结方案与种子，命令行显式冲突
+  拒绝启动。
 - **设计计划（`design_plan.json`）**：套件父进程在训练前
   写运行清单、执行顺序/区组、`order_balance` 位置平衡审计、
   先验功效、计划实际会估计的 `planned_contrasts`、种子计划与
@@ -1123,8 +1127,9 @@ A B）、`--allow-underpowered`（显式允许套件在 <3 个种子下
 至少需要 6 个种子，否则用显式豁免并标记 `robust_claim_possible=false`。
 设计准备相关：`--plan-design`（只生成/打印
 `design_plan.json`，不训练）、`--run-order
-{grouped,blocked,randomized,counterbalanced}`（默认 randomized
-完整区组；counterbalanced 进一步平衡区组内位置）、
+{grouped,blocked,randomized,counterbalanced,williams}`（默认
+randomized 完整区组；counterbalanced 平衡区组内位置；
+williams 同时平衡位置与一阶 carryover）、
 `--run-order-seed`（确定性洗牌种子）；预注册文件另有可选
 `power`（含预期脱落率与 sd 敏感性）与 `run_order` 块。
 套件逐进程调用自身，结束后自动输出完整对比分析并写入

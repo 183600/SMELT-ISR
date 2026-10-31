@@ -909,7 +909,7 @@ def run_order_drift_report(
         warnings.append(
             "执行顺序是 grouped：同一臂的所有种子先跑完，"
             "时间/机器漂移与臂效应完全混杂；确证实验应使用"
-            "randomized 或 counterbalanced 完整区组"
+            "randomized / counterbalanced / williams 完整区组"
         )
     if len(entries) < 3:
         return {

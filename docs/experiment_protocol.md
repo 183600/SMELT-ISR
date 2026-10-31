@@ -136,12 +136,16 @@
   `preregistration.power` 落盘。详见
   [design_preparation.md](design_preparation.md)。
 - `run_order`（可选）冻结执行顺序：`scheme` 为 `grouped` /
-  `blocked` / `randomized` / `counterbalanced`，`seed` 为确定性
-  洗牌种子。默认 `randomized`（随机化完整区组）：每个种子区组
-  内所有臂都跑一次、臂顺序随机化，避免机器漂移与臂效应混杂。
-  `counterbalanced` 进一步用循环拉丁方限制性随机化，使每个处理
-  在各区组位置上的出现次数尽可能相等；它要求每个种子区组包含
-  同一组处理，缺格时拒绝生成计划。命令行 `--run-order` /
+  `blocked` / `randomized` / `counterbalanced` / `williams`，`seed`
+  为确定性洗牌种子。默认 `randomized`（随机化完整区组）：每个
+  种子区组内所有臂都跑一次、臂顺序随机化，避免机器漂移与臂效应
+  混杂。`counterbalanced` 进一步用循环拉丁方限制性随机化，使每个
+  处理在各区组位置上的出现次数尽可能相等；它要求每个种子区组包含
+  同一组处理，缺格时拒绝生成计划。`williams` 使用 Williams 设计
+  同时平衡位置与区组内一阶 carryover：偶数 n 个处理需 `n` 个区组、
+  奇数 n 需 `2n` 个区组的整数倍才能完全平衡；否则
+  `order_balance.carryover.balanced` 为 false，报告会给出已覆盖
+  有序对与所需区组倍数。命令行 `--run-order` /
   `--run-order-seed` 显式冲突时拒绝启动。
 - `budget_match` 为 `null` 或模式名；非 null 时等价于
   `--budget-match` 的完整计算图硬门。它按**本次运行的候选

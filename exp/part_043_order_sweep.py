@@ -2,18 +2,124 @@ from __future__ import annotations
 
 
 
+def _carryover_balance_report(
+    blocks: Dict[object, List[Dict[str, object]]],
+    complete_blocks: bool,
+    n_treatments: int,
+) -> Dict[str, object]:
+    """统计区组内相邻处理对，检查一阶 carryover 是否平衡。
+
+    位置平衡只约束「每个处理出现在各位置的次数」；若机器状态
+    会把上一次运行的影响带入下一次，还需要让每个有序相邻处理
+    对 ``(前一个处理, 后一个处理)`` 出现次数相同。这里同时报告
+    覆盖到的有序对数与计数极差，避免把「位置平衡」误读成
+    「carryover 已平衡」。
+    """
+    n_pairs = n_treatments * (n_treatments - 1)
+    full_balance_multiple = (
+        n_treatments
+        if n_treatments % 2 == 0
+        else 2 * n_treatments
+    )
+    if n_treatments < 2:
+        return {
+            "available": False,
+            "balanced": None,
+            "reason": "少于两个处理，不存在一阶 carryover 对",
+            "pairs_possible": 0,
+            "pairs_observed": 0,
+            "transitions": 0,
+            "max_pair_imbalance": None,
+            "full_balance_block_multiple": full_balance_multiple,
+        }
+    if not complete_blocks:
+        return {
+            "available": False,
+            "balanced": None,
+            "reason": "区组不完整或位置标记损坏",
+            "pairs_possible": n_pairs,
+            "pairs_observed": 0,
+            "transitions": 0,
+            "max_pair_imbalance": None,
+            "full_balance_block_multiple": full_balance_multiple,
+        }
+
+    pair_counts: Dict[Tuple[object, object], int] = {}
+    transitions = 0
+    for entries in blocks.values():
+        positioned: List[Tuple[int, object]] = []
+        for item in entries:
+            position = item.get("position_in_block")
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 1
+            ):
+                return {
+                    "available": False,
+                    "balanced": None,
+                    "reason": "区组内位置标记损坏",
+                    "pairs_possible": n_pairs,
+                    "pairs_observed": 0,
+                    "transitions": 0,
+                    "max_pair_imbalance": None,
+                    "full_balance_block_multiple": (
+                        full_balance_multiple
+                    ),
+                }
+            positioned.append(
+                (position, _plan_treatment_key(item))
+            )
+        positioned.sort(key=lambda pair: pair[0])
+        treatments = [treatment for _, treatment in positioned]
+        for left, right in zip(treatments, treatments[1:]):
+            key = (left, right)
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+            transitions += 1
+
+    pairs_observed = len(pair_counts)
+    min_count = min(pair_counts.values()) if pair_counts else 0
+    max_count = max(pair_counts.values()) if pair_counts else 0
+    max_imbalance = max_count - min_count
+    balanced = bool(
+        pairs_observed == n_pairs and min_count == max_count
+    )
+    return {
+        "available": True,
+        "balanced": balanced,
+        "pairs_possible": n_pairs,
+        "pairs_observed": pairs_observed,
+        "transitions": transitions,
+        "min_pair_count": min_count,
+        "max_pair_count": max_count,
+        "max_pair_imbalance": max_imbalance,
+        "ideal_count_per_pair": (
+            transitions / n_pairs if n_pairs else 0.0
+        ),
+        "full_balance_block_multiple": full_balance_multiple,
+        "note": (
+            "一阶 carryover 平衡定义为每个有序相邻处理对都"
+            "被覆盖，且出现次数完全相同（极差 0）；完整 "
+            "Williams 设计在区组数为 n（偶数）或 2n（奇数）"
+            "的整数倍时达到"
+        ),
+    }
+
+
+
 def run_order_balance_report(
     plan: List[Dict[str, object]],
 ) -> Dict[str, object]:
     """
-    检查区组内位置是否平衡。
+    检查区组内位置与一阶 carryover 是否平衡。
 
     完整区组设计只保证「每个区组都跑每个处理」，不保证每个
     处理在各位置上的出现次数相等。纯随机化在小样本下可能让
     某个臂 5 次里有 4 次排在区组最后；若位置与机器热漂移/
     缓存状态相关，臂效应就仍会混入时间效应。这里报告每个
-    处理在各位置上的计数与最大失衡，供 `design_plan.json`
-    在设计阶段留证，而不是等分析期才从结果反推。
+    处理在各位置上的计数、最大失衡，以及区组内相邻处理对的
+    覆盖与计数，供 `design_plan.json` 在设计阶段留证，而不是
+    等分析期才从结果反推。
     """
     if not plan:
         return {
@@ -95,19 +201,25 @@ def run_order_balance_report(
             "max_position_imbalance": span,
         })
     balanced = bool(complete_blocks and max_imbalance <= 1)
+    n_treatments = len(common)
     return {
         "available": True,
         "n_blocks": len(blocks),
-        "n_treatments": len(common),
+        "n_treatments": n_treatments,
         "complete_blocks": complete_blocks,
         "max_position_imbalance": max_imbalance,
         "balanced": balanced,
+        "carryover": _carryover_balance_report(
+            blocks, complete_blocks, n_treatments
+        ),
         "treatments": details,
         "note": (
-            "均衡定义为每个区组包含同一组处理各一次，且每个"
-            "处理在各位置上的计数极差 <= 1。counterbalanced "
-            "按循环拉丁方保证该性质；randomized 只保证区组内"
-            "随机化，不保证位置计数均衡"
+            "位置均衡定义为每个区组包含同一组处理各一次，且"
+            "每个处理在各位置上的计数极差 <= 1。counterbalanced "
+            "与 williams 按设计行保证位置平衡；williams 还平衡"
+            "区组内一阶 carryover，具体见 carryover 字段。"
+            "randomized 只保证区组内随机化，不保证位置或 "
+            "carryover 计数均衡"
         ),
     }
 
@@ -129,6 +241,10 @@ def order_sweep_plan(
       循环拉丁方让每个处理在各区组位置上的出现次数尽可能
       相等（位置平衡/限制性随机化）。它要求每个区组包含同一
       组处理单元，否则无法定义平衡排列并直接拒绝。
+    - ``williams``：按种子组成完整区组，使用 Williams 设计
+      同时平衡位置与区组内一阶 carryover。偶数个处理使用
+      n 行，奇数个使用 2n 行；完整使用设计行时每个有序相邻
+      处理对出现次数相同。
 
     同一区组内每个臂出现一次，因此「先跑/后跑」在臂之间被
     平衡，而不是让某个臂系统性地占据更晚的时间片。
@@ -148,6 +264,8 @@ def order_sweep_plan(
             blocks.setdefault(block_key, []).append(dict(item))
         if scheme == "counterbalanced":
             ordered = _counterbalanced_order(blocks, order_seed)
+        elif scheme == "williams":
+            ordered = _williams_order(blocks, order_seed)
         else:
             ordered = []
             for block_key, block in blocks.items():
