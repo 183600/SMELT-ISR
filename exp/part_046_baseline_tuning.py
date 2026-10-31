@@ -919,9 +919,19 @@ def analyze_baseline_tuning_axes(
 
         # 网格边界：winner 或最优均值候选落在候选边界时，最优
         # 可能落在网格之外。
+        candidate_grid: List[object] = []
+        for value in candidate_values:
+            if value is None:
+                continue
+            if not any(
+                _axis_value_equal(value, other)
+                for other in candidate_grid
+            ):
+                candidate_grid.append(value)
+        candidate_grid.sort(key=_axis_value_sort_key)
         boundary_values = (
-            (observed_values[0], observed_values[-1])
-            if observed_values
+            (candidate_grid[0], candidate_grid[-1])
+            if candidate_grid
             else ()
         )
         winner_at_boundary = False
@@ -937,7 +947,7 @@ def analyze_baseline_tuning_axes(
             )
             if (
                 winner_at_boundary or best_at_boundary
-            ) and len(observed_values) > 1:
+            ) and len(candidate_grid) > 1:
                 reason = (
                     f"winner {label}="
                     f"{_axis_value_text(winner['value'])}"
@@ -950,7 +960,7 @@ def analyze_baseline_tuning_axes(
                     + " 位于候选网格边界（"
                     + ", ".join(
                         _axis_value_text(value)
-                        for value in observed_values
+                        for value in candidate_grid
                     )
                     + "）：最优可能落在网格之外，当前「调过参的"
                     "基线」仍可能被网格边界限制；建议扩展该轴的"

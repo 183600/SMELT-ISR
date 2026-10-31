@@ -363,6 +363,41 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 experiment.load_baseline_tuning(path)
+    def test_baseline_tuning_axes_boundary_uses_candidate_grid(self):
+        rows = []
+        for lr, metric_value in (
+            (1e-3, 1.0),
+            (1e-2, 0.5),
+            (1e-1, 0.9),
+        ):
+            for seed in (1, 2, 3):
+                rows.append({
+                    "run": f"lr{lr:g}_seed{seed}",
+                    "seed": seed,
+                    "protocol": {"lr": lr},
+                    "val_loss": metric_value,
+                })
+        report = experiment.analyze_baseline_tuning_axes(
+            rows,
+            "val_loss",
+            "dense",
+            [{
+                "name": "lr",
+                "protocol_key": "lr",
+                "label": "学习率",
+                "values": [1e-3, 1e-2],
+                "base_value": 1e-1,
+            }],
+            [1, 2, 3],
+            {"lr": 1e-1},
+        )
+        axis = report["axes"][0]
+        self.assertEqual(axis["winner"]["value"], 1e-2)
+        self.assertTrue(axis["winner_at_boundary"])
+        self.assertTrue(axis["best_mean_at_boundary"])
+        self.assertTrue(
+            any("网格边界" in issue for issue in axis["issues"])
+        )
     def test_analysis_helpers_tolerate_out_of_float_range_numbers(self):
         huge = 10**400
         self.assertEqual(
