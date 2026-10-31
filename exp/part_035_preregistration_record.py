@@ -1214,3 +1214,599 @@ def hypothesis_alignment(
         ),
         "advisories": advisories,
     }
+
+
+def _coverage_seed(value: object) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coverage_float_equal(first: object, second: object) -> bool:
+    try:
+        left = float(first)  # type: ignore[arg-type]
+        right = float(second)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isclose(
+        left,
+        right,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+
+
+def preregistration_analysis_coverage(
+    rows: List[Dict[str, object]],
+    payload: Dict[str, object],
+    *,
+    file_sha256: Optional[str] = None,
+    metric: Optional[str] = None,
+    baseline_mode: Optional[str] = None,
+    common_step: Optional[float] = None,
+    common_step_data_dependent: bool = False,
+    equivalence_margin: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    核对对比分析是否覆盖训练前预注册的全部确证单元。
+
+    ``--compare`` 本身只汇总手头传入的运行目录，调用者可以
+    少传一个失败臂、只传有利的种子，或换一个未声明的指标，
+    仍然得到一份「显著」的报告。本函数把分析集合与预注册文件
+    逐项对齐：声明的模式/种子单元是否齐全、每个运行落盘的
+    预注册文件指纹与 study_id 是否一致、数据协议与代码树指纹
+    是否仍是被冻结的版本，以及分析指标、基线、共同步数与
+    等价界是否就是预注册值。
+
+    返回结构化结果；``ok`` 为 True 仅表示没有发现偏离。调用
+    方仍应把 ``errors`` 原样展示，不能只报一个布尔值。
+    """
+    errors: List[str] = []
+    advisories: List[str] = []
+    missing_comparisons: List[List[str]] = []
+    missing_seed_cells: List[Dict[str, object]] = []
+    extra_seed_cells: List[Dict[str, object]] = []
+    prereg_mismatches: List[Dict[str, object]] = []
+    data_mismatches: List[Dict[str, object]] = []
+
+    study_id = payload.get("study_id")
+    raw_comparisons = payload.get("comparisons")
+    declared_pairs: List[List[str]] = []
+    if isinstance(raw_comparisons, list):
+        for pair in raw_comparisons:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                declared_pairs.append(
+                    [str(pair[0]), str(pair[1])]
+                )
+    declared_modes = sorted(
+        {arm for pair in declared_pairs for arm in pair}
+    )
+    raw_seeds = payload.get("seeds")
+    declared_seeds = sorted(
+        {
+            seed
+            for seed in (
+                _coverage_seed(item)
+                for item in (
+                    raw_seeds if isinstance(raw_seeds, list) else []
+                )
+            )
+            if seed is not None
+        }
+    )
+
+    row_entries: List[
+        Tuple[Dict[str, object], str, Optional[int], bool]
+    ] = []
+    present_modes = set()
+    deterministic_modes = set()
+    seeds_by_mode: Dict[str, set] = {}
+    for row in rows:
+        mode = row.get("mode")
+        if not isinstance(mode, str) or not mode:
+            errors.append(
+                "运行 "
+                + str(row.get("run") or row.get("path"))
+                + " 缺少 mode：无法核对预注册覆盖"
+            )
+            continue
+        seed = _coverage_seed(row.get("seed"))
+        deterministic = bool(row.get("deterministic"))
+        row_entries.append((row, mode, seed, deterministic))
+        present_modes.add(mode)
+        if deterministic:
+            deterministic_modes.add(mode)
+        if seed is not None:
+            seeds_by_mode.setdefault(mode, set()).add(seed)
+
+    for first, second in declared_pairs:
+        absent = [
+            arm
+            for arm in (first, second)
+            if arm not in present_modes
+        ]
+        if absent:
+            missing_comparisons.append([first, second])
+            errors.append(
+                f"预注册对比 {first} vs {second} 缺少模式: "
+                + ", ".join(absent)
+            )
+            continue
+        if (
+            first not in deterministic_modes
+            and second not in deterministic_modes
+        ):
+            common = seeds_by_mode.get(first, set()) & seeds_by_mode.get(
+                second, set()
+            )
+            if not common:
+                errors.append(
+                    f"预注册对比 {first} vs {second} 没有共同种子："
+                    "无法形成配对比较"
+                )
+
+    declared_seed_set = set(declared_seeds)
+    for mode in declared_modes:
+        if mode not in present_modes or mode in deterministic_modes:
+            continue
+        observed = seeds_by_mode.get(mode, set())
+        missing = sorted(declared_seed_set - observed)
+        extra = sorted(observed - declared_seed_set)
+        if missing:
+            missing_seed_cells.append(
+                {"mode": mode, "seeds": missing}
+            )
+            errors.append(
+                f"模式 {mode} 缺少预注册种子: "
+                + ", ".join(str(seed) for seed in missing)
+            )
+        if extra:
+            extra_seed_cells.append(
+                {"mode": mode, "seeds": extra}
+            )
+            errors.append(
+                f"模式 {mode} 含预注册之外的种子: "
+                + ", ".join(str(seed) for seed in extra)
+                + "（事后追加种子会改变重复实验集合）"
+            )
+
+    unexpected_modes = sorted(present_modes - set(declared_modes))
+    if unexpected_modes:
+        advisories.append(
+            "分析包含未在预注册 comparisons 中声明的模式: "
+            + ", ".join(unexpected_modes)
+            + "；这些单元只能作为探索性分析，不能混入确证结论"
+        )
+
+    declared_tree = payload.get("frozen_source_tree_sha256")
+    declared_script = payload.get("frozen_script_sha256")
+    for row, mode, seed, _deterministic in row_entries:
+        label = str(row.get("run") or row.get("path") or "<unknown>")
+        record = row.get("preregistration_record")
+        if not isinstance(record, dict):
+            if row.get("execution_status") == "failed":
+                advisories.append(
+                    f"失败运行 {label} 没有预注册落盘记录："
+                    "只能按失败标记计入覆盖，不能作为证据"
+                )
+            else:
+                prereg_mismatches.append(
+                    {
+                        "run": label,
+                        "field": "preregistration_record",
+                        "declared": "present",
+                        "actual": None,
+                    }
+                )
+            continue
+        record_study = record.get("study_id")
+        if (
+            record_study is not None
+            and str(record_study) != str(study_id)
+        ):
+            prereg_mismatches.append(
+                {
+                    "run": label,
+                    "field": "study_id",
+                    "declared": study_id,
+                    "actual": record_study,
+                }
+            )
+        record_file = record.get("file_sha256")
+        if file_sha256 is not None and (
+            not isinstance(record_file, str)
+            or record_file.lower() != file_sha256.lower()
+        ):
+            prereg_mismatches.append(
+                {
+                    "run": label,
+                    "field": "file_sha256",
+                    "declared": file_sha256,
+                    "actual": record_file,
+                }
+            )
+        record_mode = record.get("run_mode")
+        if (
+            record_mode is not None
+            and str(record_mode) != mode
+        ):
+            prereg_mismatches.append(
+                {
+                    "run": label,
+                    "field": "run_mode",
+                    "declared": mode,
+                    "actual": record_mode,
+                }
+            )
+        record_seed = _coverage_seed(record.get("run_seed"))
+        if (
+            record_seed is not None
+            and seed is not None
+            and record_seed != seed
+        ):
+            prereg_mismatches.append(
+                {
+                    "run": label,
+                    "field": "run_seed",
+                    "declared": seed,
+                    "actual": record_seed,
+                }
+            )
+        provenance = row.get("provenance")
+        if not isinstance(provenance, dict):
+            provenance = {}
+        for field, declared in (
+            ("source_tree_sha256", declared_tree),
+            ("script_sha256", declared_script),
+        ):
+            if declared is None:
+                continue
+            actual = provenance.get(field)
+            if not isinstance(actual, str):
+                advisories.append(
+                    f"运行 {label} 缺少 {field}：无法核对它是否"
+                    "运行在预注册冻结的代码上"
+                )
+            elif actual.lower() != str(declared).lower():
+                prereg_mismatches.append(
+                    {
+                        "run": label,
+                        "field": field,
+                        "declared": declared,
+                        "actual": actual,
+                    }
+                )
+
+    if prereg_mismatches:
+        errors.append(
+            f"{len(prereg_mismatches)} 处运行记录与预注册不一致："
+            "分析集合混入了未按同一预注册启动的运行"
+        )
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        errors.append("预注册文件缺少 data 对象：无法核对数据协议")
+    else:
+        declared_sha = data.get("sha256")
+        declared_policy = data.get("split_policy")
+        declared_group = data.get(
+            "group_separator", _PREREGISTRATION_MISSING
+        )
+        declared_cleaning = data.get("cleaning")
+        if not isinstance(declared_cleaning, dict):
+            declared_cleaning = {}
+        alias_values = {
+            bool(declared_cleaning[key])
+            for key in _CLEAN_AGAINST_TEST_ALIASES
+            if key in declared_cleaning
+        }
+        declared_clean_effective = (
+            next(iter(alias_values)) if alias_values else False
+        )
+        for row, _mode, _seed, _deterministic in row_entries:
+            label = str(
+                row.get("run") or row.get("path") or "<unknown>"
+            )
+            protocol = row.get("protocol")
+            if not isinstance(protocol, dict):
+                protocol = {}
+            actual_sha = protocol.get("data_sha256")
+            if (
+                not isinstance(actual_sha, str)
+                or not isinstance(declared_sha, str)
+                or actual_sha.lower() != declared_sha.lower()
+            ):
+                data_mismatches.append(
+                    {
+                        "run": label,
+                        "field": "data_sha256",
+                        "declared": declared_sha,
+                        "actual": actual_sha,
+                    }
+                )
+            actual_policy = protocol.get("split_policy")
+            if str(actual_policy) != str(declared_policy):
+                data_mismatches.append(
+                    {
+                        "run": label,
+                        "field": "split_policy",
+                        "declared": declared_policy,
+                        "actual": actual_policy,
+                    }
+                )
+            for key in ("val_fraction", "test_fraction"):
+                if not _coverage_float_equal(
+                    protocol.get(key), data.get(key)
+                ):
+                    data_mismatches.append(
+                        {
+                            "run": label,
+                            "field": key,
+                            "declared": data.get(key),
+                            "actual": protocol.get(key),
+                        }
+                    )
+            if declared_group is not _PREREGISTRATION_MISSING:
+                actual_group = protocol.get("group_separator")
+                try:
+                    declared_bytes = (
+                        None
+                        if declared_group is None
+                        else parse_group_separator(
+                            str(declared_group)
+                        )
+                    )
+                    actual_bytes = (
+                        None
+                        if actual_group is None
+                        else parse_group_separator(
+                            str(actual_group)
+                        )
+                    )
+                except ValueError:
+                    declared_bytes = object()
+                    actual_bytes = object()
+                if declared_bytes != actual_bytes:
+                    data_mismatches.append(
+                        {
+                            "run": label,
+                            "field": "group_separator",
+                            "declared": declared_group,
+                            "actual": actual_group,
+                        }
+                    )
+            for key in _PREREGISTRATION_CLEANING_BOOL_KEYS:
+                if key in _CLEAN_AGAINST_TEST_ALIASES:
+                    continue
+                expected = bool(declared_cleaning.get(key, False))
+                actual = bool(protocol.get(key, False))
+                if actual != expected:
+                    data_mismatches.append(
+                        {
+                            "run": label,
+                            "field": "cleaning." + key,
+                            "declared": expected,
+                            "actual": actual,
+                        }
+                    )
+            actual_clean_effective = bool(
+                protocol.get("clean_train_against_test", False)
+                or protocol.get(
+                    "allow_eval_content_for_cleaning", False
+                )
+            )
+            if actual_clean_effective != declared_clean_effective:
+                data_mismatches.append(
+                    {
+                        "run": label,
+                        "field": (
+                            "cleaning.clean_train_against_test"
+                        ),
+                        "declared": declared_clean_effective,
+                        "actual": actual_clean_effective,
+                    }
+                )
+            for key, default in (
+                (
+                    "near_duplicate_threshold",
+                    _NEAR_DUP_DEFAULT_THRESHOLD,
+                ),
+                (
+                    "near_duplicate_shingle_bytes",
+                    _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+                ),
+            ):
+                expected = declared_cleaning.get(key, default)
+                actual = protocol.get(key, default)
+                if not _coverage_float_equal(actual, expected):
+                    data_mismatches.append(
+                        {
+                            "run": label,
+                            "field": "cleaning." + key,
+                            "declared": expected,
+                            "actual": actual,
+                        }
+                    )
+        if data_mismatches:
+            errors.append(
+                f"{len(data_mismatches)} 处运行数据协议与预注册不一致："
+                "分析集不是预注册冻结的数据切分"
+            )
+
+    declared_metric = payload.get("primary_metric")
+    metric_check = {
+        "declared": declared_metric,
+        "analyzed": metric,
+        "ok": (
+            metric is None
+            or str(metric) == str(declared_metric)
+        ),
+    }
+    if not metric_check["ok"]:
+        errors.append(
+            f"分析指标 {metric} 与预注册主指标 "
+            f"{declared_metric} 不一致：确证结论只能按预注册"
+            "指标判定，换指标需重新预注册"
+        )
+
+    declared_baseline = payload.get("baseline_mode")
+    baseline_check = {
+        "declared": declared_baseline,
+        "analyzed": baseline_mode,
+        "ok": (
+            baseline_mode is not None
+            and str(baseline_mode) == str(declared_baseline)
+        ),
+    }
+    if baseline_mode is None:
+        errors.append(
+            "无法从分析中确定对照基线：预注册覆盖核对要求"
+            "明确的分析基线"
+        )
+    elif not baseline_check["ok"]:
+        errors.append(
+            f"分析基线 {baseline_mode} 与预注册基线 "
+            f"{declared_baseline} 不一致：事后更换对照臂会"
+            "改变所有对比的方向与显著性"
+        )
+
+    declared_common_step = payload.get("common_step")
+    common_step_check = {
+        "declared": declared_common_step,
+        "analyzed": common_step,
+        "data_dependent": bool(common_step_data_dependent),
+        "ok": (
+            not common_step_data_dependent
+            and common_step is not None
+            and _coverage_float_equal(
+                common_step, declared_common_step
+            )
+        ),
+    }
+    if common_step_data_dependent:
+        errors.append(
+            "分析共同步数仍由数据决定：预注册要求固定在 "
+            f"{declared_common_step} 步，必须显式用 "
+            "--common-step 指定预注册步数"
+        )
+    elif common_step is None:
+        errors.append(
+            "分析没有固定共同步数：无法在预注册的比较点上"
+            "判定结论"
+        )
+    elif not common_step_check["ok"]:
+        errors.append(
+            f"分析共同步数 {common_step} 与预注册 "
+            f"{declared_common_step} 不一致：跨运行比较点"
+            "被事后移动"
+        )
+
+    declared_margin = payload.get("equivalence_margin")
+    margin_check = {
+        "declared": declared_margin,
+        "analyzed": equivalence_margin,
+        "ok": True,
+    }
+    if declared_margin is not None:
+        margin_check["ok"] = (
+            equivalence_margin is not None
+            and _coverage_float_equal(
+                equivalence_margin, declared_margin
+            )
+        )
+        if equivalence_margin is None:
+            errors.append(
+                "预注册声明了等价界 "
+                f"{declared_margin}，但分析未设置等价界："
+                "无法判断「无实质差异」是否成立"
+            )
+        elif not margin_check["ok"]:
+            errors.append(
+                f"分析等价界 {equivalence_margin} 与预注册 "
+                f"{declared_margin} 不一致：看到数据后放宽"
+                "等价界可以制造等价结论"
+            )
+    elif equivalence_margin is not None:
+        advisories.append(
+            "分析设置了预注册未声明的等价界 "
+            f"{equivalence_margin}：TOST 等价结论属于事后"
+            "分析，不能作为确证证据"
+        )
+
+    failed_runs = sum(
+        1
+        for row, _mode, _seed, _deterministic in row_entries
+        if row.get("execution_status") == "failed"
+    )
+    return {
+        "schema": "smelt-isr/preregistration-coverage/v1",
+        "study_id": study_id,
+        "preregistration_file_sha256": file_sha256,
+        "declared_comparisons": declared_pairs,
+        "declared_modes": declared_modes,
+        "declared_seeds": declared_seeds,
+        "analyzed_modes": sorted(present_modes),
+        "analyzed_seed_cells": {
+            mode: sorted(seeds)
+            for mode, seeds in sorted(seeds_by_mode.items())
+        },
+        "n_runs": len(rows),
+        "n_failed_runs": failed_runs,
+        "missing_comparisons": missing_comparisons,
+        "missing_seed_cells": missing_seed_cells,
+        "extra_seed_cells": extra_seed_cells,
+        "unexpected_modes": unexpected_modes,
+        "preregistration_mismatches": prereg_mismatches,
+        "data_mismatches": data_mismatches,
+        "metric_check": metric_check,
+        "baseline_check": baseline_check,
+        "common_step_check": common_step_check,
+        "equivalence_margin_check": margin_check,
+        "ok": not errors,
+        "errors": errors,
+        "advisories": advisories,
+    }
+
+
+def print_preregistration_analysis_coverage(
+    coverage: Dict[str, object],
+) -> None:
+    """打印预注册分析覆盖核对结果。"""
+    study_id = coverage.get("study_id")
+    digest = coverage.get("preregistration_file_sha256")
+    digest_text = (
+        str(digest)[:12] + "..." if isinstance(digest, str) else "NA"
+    )
+    print(
+        "[prereg-coverage] 预注册分析覆盖核对"
+        f"（study_id={study_id}，file_sha256={digest_text}）"
+    )
+    declared_comparisons = coverage.get("declared_comparisons") or []
+    declared_modes = coverage.get("declared_modes")
+    declared_seeds = coverage.get("declared_seeds")
+    analyzed_modes = coverage.get("analyzed_modes")
+    print(
+        "  声明: "
+        f"{len(declared_comparisons)} 个对比，"
+        f"模式={declared_modes}，"
+        f"种子={declared_seeds}；"
+        f"分析: {coverage.get('n_runs')} 个运行，"
+        f"模式={analyzed_modes}，"
+        f"失败={coverage.get('n_failed_runs')}"
+    )
+    for message in coverage.get("errors") or []:
+        print("  [fail] " + str(message))
+    for message in coverage.get("advisories") or []:
+        print("  [warn] " + str(message))
+    if coverage.get("ok") is True:
+        print(
+            "  OK：分析集合覆盖预注册的全部对比、种子单元与"
+            "数据/指标/基线/共同步数/等价界"
+        )

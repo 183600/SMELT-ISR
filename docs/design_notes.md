@@ -357,6 +357,13 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   默认只打印；显式
   传 `--compare-report FILE` 时把完整分析（含 `fragility_summary`）
   写入 JSON，便于随运行目录一起归档与复核，而不是只留在终端。
+  正式对比再加 `--compare-preregistration preregistration.json`：
+  它核对分析集合是否覆盖预注册的全部模式/种子，运行记录的
+  预注册文件指纹、`study_id`、数据协议与源码树是否仍是冻结
+  版本，以及指标/基线/共同步数/等价界是否与预注册一致；偏离
+  时非零退出且不写报告。`--allow-preregistration-coverage-deviation`
+  只用于显式记录探索性偏离，报告中会写
+  `preregistration_coverage_override`，不能称为确证结论。
 - **结果脆弱性（单种子敏感性）**：显著性检验回答的是「整批
   种子的均值是否偏离 0」，不回答「这个结论是否由一两个运行
   撑起来」。原有的 leave-one-out 只检查**方向**是否翻转；一个
@@ -898,7 +905,10 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   提交、补齐字段、实际数据指纹）写入 `config.json` 的
   `preregistration` 字段，resume 时保留原记录。结构校验还
   拒绝重复 JSON 键、NaN/Infinity、少于 3 个种子、未覆盖
-  `baseline_mode` 的对比与重复/自比较。
+  `baseline_mode` 的对比与重复/自比较。分析阶段的
+  `--compare-preregistration` 会再次读取该记录，核对本次
+  `--compare` 传入的运行是否覆盖预注册的全部确证单元，防止
+  少传失败臂或只挑有利种子后仍得到「显著」报告。
 
 - **选型指标与判定口径对齐**：模型 checkpoint 默认按
   `val_loss` 选型并早停，但若预注册主指标是 macro F1 等

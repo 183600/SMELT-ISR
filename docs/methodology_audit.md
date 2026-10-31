@@ -1541,6 +1541,78 @@ git commit / 同一入口指纹下可以运行完全不同的实现，冻结、
 - 指纹证明「文件内容相同」，不证明运行过程没有动态加载外部
   代码或修改运行时状态；严格复现仍需固定解释器、依赖与命令。
 
+## 44. 结果分析：预注册必须约束分析集合，而不只约束训练启动（本轮补充）
+
+**判定：原实现的预注册门只设在训练启动前，`--compare` 仍可
+由调用者任意挑选运行目录。** `--preregistration` 会核对
+commit、源码树、数据、种子集合、指标、基线与等价界，但这些
+核对发生在每个训练进程内部；到了分析阶段，`--compare` 只
+汇总命令行传入的目录。少传一个失败臂、只传显著种子、把
+`--compare-metric` 换成另一个指标，或把 `--common-step`
+移到更有利的位置，仍然能得到一份「显著」的对比报告，而报告
+本身没有记录分析集合是否覆盖了训练前声明的全部确证单元。
+`--audit-run --audit-preregistration` 只能逐个运行核对文件
+指纹，不能回答「这次分析是否把该研究的全部臂/种子都纳入
+了」。
+
+**已修正：**
+
+- 新增只读入口 `--compare-preregistration FILE`（必须与
+  `--compare` 同用）。它在对比分析完成后，把分析集合与
+  预注册文件逐项对齐：
+  - `comparisons` 声明的每个模式都必须出现在分析中，且
+    非确定性臂之间至少有一个共同种子可形成配对；
+  - 每个非确定性模式必须恰好覆盖预注册 `seeds`，缺格与
+    事后追加种子都判失败；确定性基线（如 `ngram`）不要求
+    逐种子复制；
+  - 每个运行 `config.json` 里的 `preregistration` 记录必须
+    存在（失败运行可缺，但只作为脱落计入），且 `study_id`、
+    预注册文件 SHA-256、`run_mode`、`run_seed` 与分析行一致；
+  - 预注册声明了 `frozen_source_tree_sha256` /
+    `frozen_script_sha256` 时，运行记录中的对应指纹必须
+    相同，防止用冻结后的代码改动重跑；
+  - 运行的数据协议必须与 `data` 一致：`sha256`、
+    `split_policy`、`val_fraction`、`test_fraction`、
+    `group_separator`、清洗开关与近重复阈值；
+  - 分析指标必须是预注册 `primary_metric`，分析基线必须是
+    预注册 `baseline_mode`，共同步数必须显式固定为预注册
+    `common_step`，等价界必须与预注册 `equivalence_margin`
+    一致。缺一即拒绝出报告。
+- `--compare` 的每一行现在携带完整 `preregistration_record`，
+  不再只保留几个派生字段；覆盖结果写入
+  `comparison_analysis.json` 的 `preregistration_coverage`
+  （含 `errors`、`advisories`、`missing_comparisons`、
+  `missing_seed_cells`、`extra_seed_cells`、
+  `preregistration_mismatches`、`data_mismatches` 与各
+  协议项核对结果）。发现偏离时以非零状态码退出，且不写
+  报告文件。
+- `--allow-preregistration-coverage-deviation` 只用于显式
+  记录探索性分析：报告会写
+  `preregistration_coverage_override=true`，但不能把该报告
+  称为确证结论。该开关必须与 `--compare-preregistration`
+  同用，避免静默失效。
+- 只读入口（`--check-environment`、`--check-source`、
+  `--write-manifest`、`--verify-manifest`、`--audit-run`）
+  拒绝与这两个新参数同时使用，防止参数被静默忽略。
+- 新增回归测试：完整设计通过；缺臂、缺种子、事后加种子、
+  预注册文件指纹变化、指标/基线/共同步数/等价界漂移、数据
+  协议漂移、源码树漂移均判失败；确定性基线豁免逐种子复制；
+  失败运行缺记录只发 warning；两个新参数缺 `--compare` 时
+  由 argparse 拒绝。
+
+**仍有限制：**
+
+- 覆盖门核对的是「分析集合与预注册声明一致」，不核对每个
+  运行内部的指标是否真实；后者仍由 `--audit-run`、test 封条
+  与 artifact manifest 负责。
+- 它不替代 test 访问账本：`--compare` 只使用 val 指标，
+  test 仍必须在冻结候选后通过 `--test-ledger` 统一解封。
+- 预注册之外的模式只记为探索性 `advisories`，不强制排除；
+  若研究要把它们写入确证结论，必须重新预注册。
+- 同一模式/种子存在多个运行（例如不同消融格）时，覆盖门只
+  检查种子单元存在，不判断调用者是否只挑了其中一个有利配置；
+  这仍需要预注册 `comparisons` 与消融覆盖检查共同约束。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1594,7 +1666,13 @@ git commit / 同一入口指纹下可以运行完全不同的实现，冻结、
    观测支持范围内界跨 0，完整案例的显著性不能写成稳健；该界是
    有界结果假设下的部分识别，不是置信区间，缺失可能超出观测范围
    时真实界为无穷宽，正确反应是补齐运行而不是只报一个界。顺序
-   强相关先查漂移。
+   强相关先查漂移。正式分析必须用
+   `--compare ... --compare-preregistration preregistration.json
+   --compare-report runs/analysis.json`：先核对分析集合覆盖了
+   预注册的全部臂/种子与数据/指标/基线/共同步数/等价界，再
+   把带 `preregistration_coverage` 的报告归档；覆盖失败时先
+   补齐运行或重新预注册，不能改用 `--allow-...` 把偏离写成
+   确证结论。
 6. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
    每个候选只解封一次；用 `--final-test-comparison` 报告全部
    候选，而不是只报告最好的那个。

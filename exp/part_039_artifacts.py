@@ -492,6 +492,23 @@ def manifest_mode_error(args) -> Optional[str]:
                 getattr(args, "compare_report", None) is not None,
             ),
             (
+                "--compare-preregistration",
+                getattr(
+                    args, "compare_preregistration", None
+                )
+                is not None,
+            ),
+            (
+                "--allow-preregistration-coverage-deviation",
+                bool(
+                    getattr(
+                        args,
+                        "allow_preregistration_coverage_deviation",
+                        False,
+                    )
+                ),
+            ),
+            (
                 "--final-test-comparison",
                 getattr(args, "final_test_comparison", None)
                 is not None,

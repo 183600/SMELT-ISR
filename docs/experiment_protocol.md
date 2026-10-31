@@ -358,6 +358,16 @@ python experiment.py --data corpus.txt --out runs/confirm \
 - 只读对比用 `--compare ... --compare-report runs/analysis.json`
   把完整分析落盘；默认的 `--compare` 只打印，终端输出不是
   可归档的分析记录。归档时把该 JSON 与输入运行目录一起保存。
+- 正式对比必须同时加
+  `--compare-preregistration preregistration.json`：它核对分析
+  集合是否覆盖预注册声明的全部模式/种子，每个运行落盘的
+  预注册文件指纹与 `study_id` 是否一致，数据/源码树指纹是否
+  仍是冻结版本，以及 `--compare-metric`、`--compare-baseline`、
+  `--common-step`、`--equivalence-margin` 是否就是预注册值。
+  任一偏离都会以非零状态码退出且不写报告；只能显式加
+  `--allow-preregistration-coverage-deviation` 记录探索性
+  偏离，报告中会标记 `preregistration_coverage_override`，
+  不能称为确证结论。
 - 报告 `fragility_summary`：每个显著对比都要回答「删除
   1~3 个种子后显著性是否仍在」。`fragile` / `direction_mixed`
   的对比不能写成稳健结论，应增加独立种子或调查异常运行后
@@ -374,7 +384,8 @@ python experiment.py --data corpus.txt --out runs/confirm \
 
 ## 5. 测试集：冻结候选后统一解封
 
-1. 所有候选运行完成并通过 val 分析后，冻结候选清单
+1. 所有候选运行完成并通过 val 分析与
+   `--compare-preregistration` 覆盖核对后，冻结候选清单
    （run 目录、config/metrics 的 SHA-256、代码 commit）。
 2. 指定**所有候选共享**的访问账本：
 

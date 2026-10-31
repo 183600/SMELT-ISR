@@ -1262,6 +1262,14 @@ def source_mode_error(args) -> Optional[str]:
             ("--compare", _has("compare")),
             ("--compare-report", _has("compare_report")),
             (
+                "--compare-preregistration",
+                _has("compare_preregistration"),
+            ),
+            (
+                "--allow-preregistration-coverage-deviation",
+                _enabled("allow_preregistration_coverage_deviation"),
+            ),
+            (
                 "--final-test-comparison",
                 _has("final_test_comparison"),
             ),

@@ -462,6 +462,13 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["hypothesis_baseline"] = preregistration.get(
             "baseline"
         )
+        # 完整预注册落盘记录（文件指纹/study_id/运行模式与种子）：
+        # --compare-preregistration 用它核对分析集合是否确实由
+        # 同一份冻结协议启动，而不只是看配置里的几个派生字段。
+        record = config_payload.get("preregistration")
+        row["preregistration_record"] = (
+            record if isinstance(record, dict) else None
+        )
 
         # 实验规模守卫（tokens_seen / tokens per param / epochs）：
         # 原型级结果不能外推为规模结论。

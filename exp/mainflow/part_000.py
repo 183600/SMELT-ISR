@@ -100,6 +100,8 @@ def _MAIN_part_000():
     parser.add_argument('--routing-intervention-batches', type=int, default=None, metavar='N', help='干预实验使用的验证窗口批数；默认 min(eval_batches, 5)，设为 0 表示与 --eval-batches 相同')
     parser.add_argument('--compare', nargs='+', default=None, metavar='RUN_DIR', help='不训练，直接对比多个运行目录的指标后退出（含受控变量检查、按种子聚合的 Mean ± Std 与单因子显著性检验）')
     parser.add_argument('--compare-report', type=str, default=None, metavar='FILE', help='配合 --compare：把完整对比分析（含 fragility_summary、聚合、检验、功效/等价性与消融检查）写入指定 JSON 文件，而不是只打印到终端。只读入口默认不写文件；显式给出该路径才落盘，便于把结果分析随运行一起归档')
+    parser.add_argument('--compare-preregistration', type=str, default=None, metavar='FILE', help='配合 --compare：把分析集合与训练前冻结的预注册文件逐项核对，包括声明的模式/种子单元是否齐全、每个运行落盘的预注册文件指纹与 study_id 是否一致、数据协议与代码树指纹是否仍是被冻结的版本，以及分析指标/基线/共同步数/等价界是否就是预注册值。发现偏离时以非零状态码退出，避免少传失败臂或事后换指标仍得到「显著」报告')
+    parser.add_argument('--allow-preregistration-coverage-deviation', action='store_true', help='配合 --compare-preregistration：显式承认分析集合与预注册存在偏离，仍写出报告并在报告中标记 override。默认偏离即失败；该开关只用于记录探索性分析，不能把偏离后的结果称为确证结论')
     parser.add_argument('--write-manifest', type=str, default=None, metavar='RUN_DIR', help='不训练：为运行/归档目录生成 artifact_manifest.json（逐文件 SHA-256、大小、符号链接目标，外加生成时的代码与解释器版本）。必须在所有训练/评估进程结束后执行，清单才代表最终归档内容；--verify-manifest 可逐项复核')
     parser.add_argument('--verify-manifest', type=str, default=None, metavar='RUN_DIR', help='不训练：复核目录内的 artifact_manifest.json，报告缺失、大小/SHA-256 不符、类型变化与清单外新增文件；完整性失败时以非零状态码退出')
     parser.add_argument('--verify-manifest-strict', action='store_true', help='与 --verify-manifest 配合：清单之外的任何新增文件也算失败（严格归档逐字一致）；默认只报告untracked，不把后续追加的日志误判为损坏')
@@ -176,6 +178,10 @@ def _MAIN_part_001():
         raise _SC_RETURN(None)
     if args.compare_report is not None and args.compare is None:
         parser.error('--compare-report 只能配合 --compare 使用：它保存的是只读对比分析，不参与训练')
+    if args.compare_preregistration is not None and args.compare is None:
+        parser.error('--compare-preregistration 只能配合 --compare 使用：它核对的是只读对比分析是否覆盖预注册，不参与训练')
+    if args.allow_preregistration_coverage_deviation and args.compare_preregistration is None:
+        parser.error('--allow-preregistration-coverage-deviation 需要 --compare-preregistration：单独使用会让覆盖门静默失效')
     audit_error = audit_mode_error(args)
     if audit_error is not None:
         parser.error(audit_error)
@@ -430,7 +436,7 @@ def _MAIN_part_001():
         parser.error('--suite-baseline-tuning 至少需要两个不同的学习率候选（--baseline-tuning-lrs），单档网格不构成调参')
 
 def _MAIN_part_002():
-    global _, amp_change_error, amp_dtype, candidates_error, cfg, checkpoint_git_commit, checkpoint_script_sha256, checkpoint_source_tree_sha256, code_changed, compare_analysis, compare_conflicts, compare_rows, conflicts, current_git_commit, current_script_sha256, current_source_tree_sha256, current_value, dense_fnn_hidden, design, device, error, evidence_field, flag, formatted, formatter, hypothesis_error, integer, invalid, invalid_compare_paths, item, known_config_fields, numerical_error, out_dir, overwrite_error, plan, plan_root, preregistration_error, report, rng_payload, same_run_dir, saved_args, saved_config, saved_data_effective_train_sha256, saved_data_sha256, saved_data_split_isolation, saved_data_split_sha256, saved_data_test_fraction, saved_data_val_fraction, saved_masks, saved_numerical_state, saved_out, saved_value, scaler, schedule_field, source_tree_changed, start_step, unknown_config_fields, values
+    global _, amp_change_error, amp_dtype, candidates_error, cfg, checkpoint_git_commit, checkpoint_script_sha256, checkpoint_source_tree_sha256, code_changed, compare_analysis, compare_conflicts, compare_rows, conflicts, coverage, coverage_ok, current_git_commit, current_script_sha256, current_source_tree_sha256, current_value, dense_fnn_hidden, design, device, error, evidence_field, flag, formatted, formatter, hypothesis_error, integer, invalid, invalid_compare_paths, item, known_config_fields, numerical_error, out_dir, overwrite_error, plan, plan_root, preregistration_error, preregistration_payload, preregistration_sha256, report, rng_payload, same_run_dir, saved_args, saved_config, saved_data_effective_train_sha256, saved_data_sha256, saved_data_split_isolation, saved_data_split_sha256, saved_data_test_fraction, saved_data_val_fraction, saved_masks, saved_numerical_state, saved_out, saved_value, scaler, schedule_field, source_tree_changed, start_step, unknown_config_fields, values
     for flag, values, formatter, integer in (('--baseline-tuning-dense-hiddens', list(args.baseline_tuning_dense_hiddens), lambda value: f'h{value}', True), ('--baseline-tuning-weight-decays', list(args.baseline_tuning_weight_decays), lambda value: f'''wd{format(value, 'g')}''', False)):
         if not values:
             continue
@@ -468,6 +474,10 @@ def _MAIN_part_002():
         raise _SC_RETURN(None)
     if args.compare_report is not None and args.compare is None:
         parser.error('--compare-report 只能配合 --compare 使用：它保存的是只读对比分析，不参与训练')
+    if args.compare_preregistration is not None and args.compare is None:
+        parser.error('--compare-preregistration 只能配合 --compare 使用：它核对的是只读对比分析是否覆盖预注册，不参与训练')
+    if args.allow_preregistration_coverage_deviation and args.compare_preregistration is None:
+        parser.error('--allow-preregistration-coverage-deviation 需要 --compare-preregistration：单独使用会让覆盖门静默失效')
     if args.compare is not None:
         compare_conflicts = [flag for flag, active in (('--resume', args.resume is not None), ('--evaluate-test', bool(args.evaluate_test)), ('--sanity-only', bool(args.sanity_only)), ('--statistical-baseline', bool(args.statistical_baseline)), ('--suite-baseline-tuning', bool(args.suite_baseline_tuning)), ('--plan-design', bool(args.plan_design)), ('--design-pilot-runs', args.design_pilot_runs is not None)) if active]
         if compare_conflicts:
@@ -478,6 +488,26 @@ def _MAIN_part_002():
         compare_rows = compare_runs(args.compare)
         print_comparison(compare_rows)
         compare_analysis = print_comparison_analysis(compare_rows, factors=parse_factor_spec(args.compare_factors), baseline_mode=args.compare_baseline, metric=args.compare_metric, equivalence_margin=args.equivalence_margin, common_step=args.common_step)
+        if args.compare_preregistration is not None:
+            try:
+                preregistration_payload, preregistration_sha256 = load_preregistration(args.compare_preregistration)
+            except ValueError as error:
+                parser.error(f'--compare-preregistration 无法读取: {error}')
+            baseline_info = compare_analysis.get('baseline_preregistration')
+            if not isinstance(baseline_info, dict):
+                baseline_info = {}
+            common_step_info = compare_analysis.get('common_step')
+            if not isinstance(common_step_info, dict):
+                common_step_info = {}
+            coverage = preregistration_analysis_coverage(compare_rows, preregistration_payload, file_sha256=preregistration_sha256, metric=compare_analysis.get('metric'), baseline_mode=baseline_info.get('baseline_mode'), common_step=common_step_info.get('target_step'), common_step_data_dependent=bool(common_step_info.get('target_step_data_dependent')), equivalence_margin=compare_analysis.get('equivalence_margin'))
+            compare_analysis['preregistration_coverage'] = coverage
+            print_preregistration_analysis_coverage(coverage)
+            coverage_ok = coverage.get('ok') is True
+            if not coverage_ok:
+                if not args.allow_preregistration_coverage_deviation:
+                    raise SystemExit(1)
+                compare_analysis['preregistration_coverage_override'] = True
+                print('[prereg-coverage] [warn] 已显式允许偏离：报告会标记 override，不能作为确证结论')
         if args.compare_report is not None:
             try:
                 write_comparison_report_file(Path(args.compare_report), compare_analysis)
