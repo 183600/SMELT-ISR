@@ -280,6 +280,50 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             "path": str(run_dir),
         }
 
+        # 套件父进程在子运行非零退出后写入的失败标记。后续
+        # --compare 必须仍能把该目录识别为失败：只看 final
+        # 记录会把训练期崩溃误标成 unknown，甚至让失败运行
+        # 以缺失值进入聚合。
+        sweep_failure: Dict[str, object] = {}
+        failure_path = run_dir / _SWEEP_FAILURE_FILENAME
+        try:
+            failure_exists = failure_path.exists()
+        except OSError:
+            failure_exists = False
+        if failure_exists:
+            try:
+                with open(
+                    failure_path, encoding="utf-8"
+                ) as handle:
+                    loaded_failure = json.load(handle)
+                if isinstance(loaded_failure, dict):
+                    sweep_failure = loaded_failure
+                else:
+                    sweep_failure = {
+                        "failure_reason": (
+                            "invalid_sweep_failure_record"
+                        )
+                    }
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ):
+                sweep_failure = {
+                    "failure_reason": (
+                        "invalid_sweep_failure_record"
+                    )
+                }
+            row["execution_status"] = "failed"
+            row["execution_returncode"] = sweep_failure.get(
+                "returncode"
+            )
+            row["execution_failure_reason"] = (
+                sweep_failure.get("failure_reason")
+                or "sweep_failure_marker"
+            )
+            row["sweep_failure"] = sweep_failure
+
         config_payload: Dict[str, object] = {}
         config_path = run_dir / "config.json"
         try:
@@ -347,9 +391,25 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
                 "expert_hidden"
             )
 
+        if sweep_failure:
+            # 启动前失败没有 config.json；失败标记里冻结的计划
+            # 身份仍能给出 mode/seed/balance，使后续 --compare
+            # 按正确的臂与消融格计入失败率，而不是归到 unknown。
+            for key in (
+                "mode",
+                "seed",
+                "balance_coef",
+                "dense_fnn_hidden",
+                "lr",
+            ):
+                if row.get(key) is None:
+                    row[key] = sweep_failure.get(key)
+
         run_args = config_payload.get("args") or {}
         if isinstance(run_args, dict):
-            row["seed"] = run_args.get("seed")
+            config_seed = run_args.get("seed")
+            if config_seed is not None:
+                row["seed"] = config_seed
             # 选型指标：旧运行没有该字段，历史行为是在
             # val_loss 上选 checkpoint；ngram 不训练，保持
             # None，不参与选型一致性检查。
@@ -819,6 +879,12 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
                 else None
             )
         )
+        if sweep_failure:
+            # 进程非零退出与数值失败在分析上同等处理：都不能
+            # 进入均值/检验，但必须计入失败率与脱落界。另保留
+            # execution_status 区分「训练期崩溃」与「NaN/发散」。
+            row["numerical_status"] = "failed"
+            row["numerical_integrity_ok"] = False
         row["early_stopped"] = (
             final_record.get("early_stopped")
             if final_record is not None

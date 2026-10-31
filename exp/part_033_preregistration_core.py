@@ -118,11 +118,18 @@ _RUN_ORDER_SCHEMES = (
 )
 
 
-_DESIGN_PLAN_SCHEMA_VERSION = 2
+_DESIGN_PLAN_SCHEMA_VERSION = 3
 
 _DESIGN_PLAN_FILENAME = "design_plan.json"
 
 _RUN_ORDER_FILENAME = "run_order.json"
+
+# 父进程在子运行非零退出后写入的失败标记。失败目录必须能
+# 被后续 --compare 识别为失败，而不是因为缺少 final 记录被
+# 当作 unknown 或静默漏掉。
+_SWEEP_FAILURE_FILENAME = "sweep_failure.json"
+
+_SWEEP_FAILURE_POLICIES = ("stop", "continue")
 
 
 _PREREGISTRATION_DATA_OPTIONAL_FIELDS = (

@@ -173,6 +173,27 @@ def _atomic_write_json(
 
 
 
+def _resolve_sweep_failure_policy(
+    args: argparse.Namespace,
+    kind: str,
+) -> str:
+    """
+    决定套件遇到子运行失败时是否继续。
+
+    训练套件默认 ``continue``：随机化完整区组的意义是每个
+    区组都跑同一组处理；首个数值失败就停止会让后续区组整体
+    缺失，失败率与脱落界也无法按计划分母计算。基线调参必须
+    跑完整网格，失败即停止，不能用一个缺格的网格选 winner。
+    """
+    if kind == "baseline_tuning":
+        return "stop"
+    return (
+        "stop"
+        if bool(getattr(args, "sweep_stop_on_failure", False))
+        else "continue"
+    )
+
+
 def write_design_plan(
     out_root: Path,
     plan: List[Dict[str, object]],
@@ -398,6 +419,7 @@ def write_design_plan(
         runs.append(entry)
 
     order_balance = run_order_balance_report(plan)
+    failure_policy = _resolve_sweep_failure_policy(args, kind)
     core: Dict[str, object] = {
         "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
         "kind": kind,
@@ -407,6 +429,7 @@ def write_design_plan(
         ),
         "order": {"scheme": scheme, "seed": int(order_seed)},
         "order_balance": order_balance,
+        "failure_policy": failure_policy,
         "planned_runs": len(runs),
         "runs": runs,
         "planned_comparisons": int(planned_comparisons),
@@ -467,10 +490,12 @@ def write_design_plan(
         "path": str(path),
         "file_sha256": file_sha256,
         "plan_id": plan_id,
+        "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
         "kind": kind,
         "order_scheme": scheme,
         "order_seed": int(order_seed),
         "order_balance": order_balance,
+        "failure_policy": failure_policy,
         "planned_runs": len(runs),
         "planned_comparisons": int(planned_comparisons),
         "planned_contrasts": list(planned_contrasts),
@@ -1078,6 +1103,8 @@ def _write_run_order_log(
     design: Optional[Dict[str, object]],
     plan: List[Dict[str, object]],
     records: List[Dict[str, object]],
+    *,
+    failure_policy: str = "stop",
 ) -> None:
     """把计划顺序与实际开始/结束时间落盘（失败条目也保留）。"""
     payload: Dict[str, object] = {
@@ -1100,6 +1127,10 @@ def _write_run_order_log(
             if isinstance(design, dict)
             else None
         ),
+        "failure_policy": failure_policy,
+        "failed_runs": sum(
+            1 for record in records if record.get("status") == "failed"
+        ),
         "runs": records,
         "updated_utc": datetime.datetime.now(
             datetime.timezone.utc
@@ -1109,16 +1140,74 @@ def _write_run_order_log(
 
 
 
+def _write_sweep_failure(
+    run_out: Path,
+    item: Dict[str, object],
+    order_index: int,
+    returncode: int,
+    *,
+    config_written: bool,
+) -> Dict[str, object]:
+    """把失败运行的身份与退出码写到其目录，供后续 --compare 识别。"""
+    finished_utc = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat()
+    payload: Dict[str, object] = {
+        "schema": "smelt-isr/sweep-failure/v1",
+        "status": "failed",
+        "label": item.get("label"),
+        "order_index": item.get("order_index", order_index),
+        "block": item.get("block"),
+        "position_in_block": item.get("position_in_block"),
+        "mode": item.get("mode"),
+        "seed": item.get("seed"),
+        "balance_coef": item.get("balance_coef"),
+        "dense_fnn_hidden": item.get("dense_fnn_hidden"),
+        "lr": item.get("lr"),
+        "returncode": int(returncode),
+        "failure_stage": (
+            "child_process" if config_written else "before_config"
+        ),
+        "failure_reason": (
+            "child_exit_nonzero"
+            if config_written
+            else "child_exit_before_config"
+        ),
+        "config_written": bool(config_written),
+        "finished_utc": finished_utc,
+    }
+    try:
+        _atomic_write_json(
+            Path(run_out) / _SWEEP_FAILURE_FILENAME,
+            payload,
+        )
+    except OSError as error:
+        print(
+            "[sweep][warn] 无法写入失败标记 "
+            f"{Path(run_out) / _SWEEP_FAILURE_FILENAME}: {error}；"
+            "run_order.json 仍会记录该失败"
+        )
+    return payload
+
+
 def _execute_sweep_plan(
     base_argv: List[str],
     plan: List[Dict[str, object]],
     out_root: Path,
     design: Optional[Dict[str, object]] = None,
-) -> List[str]:
+    *,
+    continue_on_failure: bool = False,
+) -> Dict[str, object]:
     """
     逐运行以独立子进程执行计划中的每个条目；覆盖 --seed/--out
-    以及条目声明的 --mode/--balance-coef/--lr。任一运行失败即
-    停止并退出（可用 --compare 分析已完成的目录）。
+    以及条目声明的 --mode/--balance-coef/--lr。
+
+    失败策略由 ``design.failure_policy`` 冻结；未提供设计时由
+    ``continue_on_failure`` 决定（默认 stop）。``continue`` 只
+    对已经写出 config.json 的训练期失败生效：启动前失败（数据/
+    配置/预注册）通常会让后续运行重复失败，仍立即停止。继续
+    执行时，失败目录与 ``sweep_failure.json`` 会保留，剩余区组
+    照常运行，最后统一进入失败率/脱落界分析。
 
     每个子进程都带上按 seed 固定的 PYTHONHASHSEED 环境
     （见 ``_sweep_child_env``），避免同种子运行因 hash 随机化
@@ -1128,8 +1217,22 @@ def _execute_sweep_plan(
     (order_index, block, position)。子进程开跑前会重新核对，
     防止报告里的顺序与实际执行顺序不一致；实际开始/结束时间
     写到 ``run_order.json``，供顺序漂移诊断使用。
+
+    返回 ``run_paths``、``failures``、``failure_policy`` 与
+    计划/完成/失败计数；调用方负责在写完整份分析报告后以非零
+    退出码标记本轮不完整。
     """
+    failure_policy = (
+        "continue" if continue_on_failure else "stop"
+    )
+    if isinstance(design, dict):
+        frozen_policy = design.get("failure_policy")
+        if frozen_policy in _SWEEP_FAILURE_POLICIES:
+            failure_policy = str(frozen_policy)
+    continue_on_failure = failure_policy == "continue"
+
     run_paths: List[str] = []
+    failures: List[Dict[str, object]] = []
     order_records: List[Dict[str, object]] = [
         {
             "order_index": item.get("order_index", index),
@@ -1145,8 +1248,13 @@ def _execute_sweep_plan(
         }
         for index, item in enumerate(plan, start=1)
     ]
-    if design is not None:
-        _write_run_order_log(out_root, design, plan, order_records)
+    _write_run_order_log(
+        out_root,
+        design,
+        plan,
+        order_records,
+        failure_policy=failure_policy,
+    )
 
     for index, item in enumerate(plan, start=1):
         run_out = out_root / str(item["label"])
@@ -1230,15 +1338,33 @@ def _execute_sweep_plan(
             record["started_utc"] = datetime.datetime.now(
                 datetime.timezone.utc
             ).isoformat()
-            if design is not None:
-                _write_run_order_log(
-                    out_root, design, plan, order_records
-                )
+            _write_run_order_log(
+                out_root,
+                design,
+                plan,
+                order_records,
+                failure_policy=failure_policy,
+            )
 
         completed = subprocess.run(
             command,
             env=child_env,
         )
+
+        if completed.returncode != 0:
+            config_written = (run_out / "config.json").is_file()
+            failure = _write_sweep_failure(
+                run_out,
+                item,
+                index,
+                int(completed.returncode),
+                config_written=config_written,
+            )
+            if record is not None:
+                record["failure_reason"] = failure.get(
+                    "failure_reason"
+                )
+                record["config_written"] = config_written
 
         if record is not None:
             record["finished_utc"] = datetime.datetime.now(
@@ -1250,22 +1376,72 @@ def _execute_sweep_plan(
                 if completed.returncode == 0
                 else "failed"
             )
-            if design is not None:
-                _write_run_order_log(
-                    out_root, design, plan, order_records
-                )
+            _write_run_order_log(
+                out_root,
+                design,
+                plan,
+                order_records,
+                failure_policy=failure_policy,
+            )
+
+        if completed.returncode == 0:
+            # --resume 重跑可能覆盖此前失败；成功完成后旧标记必须
+            # 删除，否则后续 --compare 仍会把该目录当成失败运行，
+            # 与 run_order.json 的 completed 状态矛盾。
+            stale_failure = run_out / _SWEEP_FAILURE_FILENAME
+            if stale_failure.is_file():
+                try:
+                    stale_failure.unlink()
+                except OSError as exc:
+                    print(
+                        f"[sweep][warn] 运行 {item['label']} 已成功，"
+                        f"但无法删除旧的 {_SWEEP_FAILURE_FILENAME}："
+                        f"{exc}；--compare 仍会把它视为失败"
+                    )
 
         if completed.returncode != 0:
+            if continue_on_failure and config_written:
+                failures.append(failure)
+                run_paths.append(str(run_out))
+                print(
+                    f"[sweep][warn] 运行 {item['label']} 失败 "
+                    f"(exit={completed.returncode})：按设计冻结的 "
+                    "continue 策略保留失败目录并继续执行剩余"
+                    "计划，以维持完整区组并让失败率/脱落界按"
+                    "计划分母计算"
+                )
+                continue
             print(
                 f"[sweep] 运行 {item['label']} 失败 "
-                f"(exit={completed.returncode})；已停止后续"
-                "运行，可用 --compare 分析已完成的目录"
+                f"(exit={completed.returncode})；"
+                + (
+                    "该失败发生在 config.json 写出之前，"
+                    "继续执行大概率重复失败，因此停止后续运行"
+                    if continue_on_failure
+                    else "已按设计冻结的 stop 策略停止后续运行"
+                )
+                + "；可用 --compare 分析已完成的目录"
             )
             raise SystemExit(1)
 
         run_paths.append(str(run_out))
 
-    return run_paths
+    return {
+        "run_paths": run_paths,
+        "failures": failures,
+        "failure_policy": failure_policy,
+        "planned_runs": len(plan),
+        "completed_runs": sum(
+            1
+            for record in order_records
+            if record.get("status") == "completed"
+        ),
+        "failed_runs": len(failures),
+        "stopped_early": any(
+            record.get("status") == "planned"
+            for record in order_records
+        ),
+    }
 
 
 

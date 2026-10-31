@@ -294,6 +294,12 @@ python experiment.py --data corpus.txt --out runs/confirm \
   核对计划文件 SHA-256、`plan_id`、顺序/区组与自己的 label/seed/
   mode 后才训练。实际开始/结束时间写 `run_order.json`。
 - 每臂保留失败目录；`failure_rate` 与成功条件指标一起报告。
+  训练期失败默认按设计冻结的 `failure_policy=continue` 继续执行
+  剩余计划，以保留完整区组并按计划分母计算失败率/脱落界；
+  启动前失败仍立即停止。需要 fail-fast 时在计划阶段用
+  `--sweep-stop-on-failure` 冻结 `stop`。失败运行目录写入
+  `sweep_failure.json`，`run_order.json` 保留每个条目的状态；
+  报告写完后父进程以非零退出码标记本轮不完整。
 - 每臂至少一次 `--routing-interventions`（可选但建议），用于
   RQ4 的功能证据。
 
@@ -325,8 +331,9 @@ python experiment.py --data corpus.txt --out runs/confirm \
   「两者不同」，也不能事后放宽等价界。
 - 共同步数用预注册的 `--common-step`；报告
   `target_step_rule` 与 `target_step_data_dependent`。
-- 报告 `failure_rates`、`pseudo_replication`、差分缺失、
-  `scale_guard` 与 `budget_match_report`。
+- 报告 `failure_rates`、`sweep_execution`、`pseudo_replication`、
+  差分缺失、`scale_guard` 与 `budget_match_report`；失败运行不得
+  因缺少 final 记录被漏计。
 - 报告 `attrition_bounds_summary`：两两对比与全因子效应各有
   `attrition_bounds`，在「缺失结果落在已观测联合范围」的有界
   结果假设下给出 `effect_min` / `effect_max`。界跨 0

@@ -1435,6 +1435,61 @@ python experiment.py --audit-run runs/final/A --audit-strict \
   随机种子差异或失败率差异；分析阶段仍需报告 `run_order`
   漂移诊断、失败率与设计指纹一致性。
 
+## 42. 实验设计与准备：失败运行的完整区组保留（本轮补充）
+
+**判定：原实现记录了失败目录与失败率，但首个子运行非零退出就
+停止后续运行。** 这会同时破坏三件事：后续种子区组整体缺失，
+位置/一阶 carryover 平衡不再成立；`failure_rate` 的分母退化为
+「实际启动数」，无法与预注册的计划分母比较；脱落界只能看到
+最早失败之前的运行。若某方法更容易在训练中崩溃，停止策略还会
+让失败率与臂别、执行位置混杂。
+
+**已修正：**
+
+- 训练套件在 `design_plan.json` 中写入并冻结
+  `failure_policy`（schema v3，参与 `plan_id`）：默认
+  `continue`，显式 `--sweep-stop-on-failure` 可冻结 `stop`。
+  正式运行时改策略会改变计划指纹，不能看到结果后再换。
+- `continue` 只对已经写出 `config.json` 的训练期失败生效；
+  启动前失败（数据/配置/预注册）仍立即停止，避免把同一基础
+  设施错误重复跑满整批。
+- 失败运行目录保留并写入 `sweep_failure.json`（计划身份、
+  mode/seed/balance、退出码、失败阶段、是否写出 config）；
+  `run_order.json` 记录 `failure_policy` 与每个条目的
+  `planned`/`running`/`completed`/`failed` 状态。用 `--resume`
+  重跑同一目录并成功时会删除旧失败标记，避免与 completed 状态
+  矛盾。
+- `compare_runs` 读取失败标记，把进程失败标为
+  `execution_status="failed"`，同时置
+  `numerical_status="failed"`，使其进入 `failure_rates`、
+  `attrition_bounds` 与消融覆盖检查，但不进入均值/显著性
+  检验；没有 `config.json` 时仍可从标记恢复 mode/seed/balance。
+- 套件在全部计划运行结束后才写 `comparison_analysis.json`，
+  新增 `sweep_execution`（计划数、完成数、失败数、策略与失败
+  明细）；写完后父进程以非零退出码标记本轮不完整。
+- 基线调参套件固定 `stop`：缺格的调参网格不能用于选 winner，
+  避免把「失败候选」静默变成「未评估候选」。
+- 新增回归测试：continue 保留后续区组并写失败标记；stop 将
+  未启动条目保留为 planned；启动前失败在 continue 下仍停止；
+  设计计划冻结 continue/stop 且冻结的 stop 覆盖调用参数；
+  `--resume` 成功后删除旧失败标记；`compare_runs` 识别失败
+  标记并计入失败率。
+
+**仍有限制：**
+
+- `continue` 只保留区组结构，不修复失败本身；失败运行的指标
+  仍不可用，主检验仍是完整案例分析，必须与失败率、脱落界和
+  失败原因分层一起报告。
+- 失败原因目前只区分「启动前」与「训练期进程非零退出」，
+  不自动区分 OOM、NaN、数据错误或外部 kill；需要逐目录查看
+  日志或扩展 `sweep_failure.json` 的分类。
+- 父进程只能看到退出码与目录状态；若子进程在写出 config 后
+  被信号杀死、但留下可读的 final 记录，仍按失败处理并从主
+  检验排除。这是保守选择，不是对失败机制的推断。
+- 失败标记由父进程写入；手工删除 `sweep_failure.json` 会让
+  后续 `--compare` 退回按 metrics 推断状态，归档时应与
+  `run_order.json` 一起保存。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
@@ -1469,14 +1524,16 @@ python experiment.py --audit-run runs/final/A --audit-strict \
    **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
    固定 `--common-step` 与训练预算；用 `--budget-match` 报告
    完整计算图比例；按同一 `--run-order-seed` 执行随机化/
-   平衡区组。
+   平衡区组；确认 `failure_policy`（默认 `continue`，需
+   fail-fast 时在计划阶段冻结 `stop`），训练期失败后仍让
+   剩余区组跑完并保留失败目录。
 5. 统计：主检验配对 t + 符号翻转（明确对称性假设）；RQ1
    同时预注册 `val_loss_curve_mean_to_common_step` 与固定
    `--common-step`，用曲线时均回答「收敛速度」、用共同步数
    单点回答「该时刻质量」，两者与 final 一起报告；报告
-   失败率、MDE、门槛检验、TOST、`fragility_summary`、
-   `design.order_balance`（含 `carryover`）与 `run_order`；
-   逐检验 95% CI 只
+   失败率、`sweep_execution`、MDE、门槛检验、TOST、
+   `fragility_summary`、`design.order_balance`（含 `carryover`）
+   与 `run_order`；逐检验 95% CI 只
    描述效应量，校正后的结论以 Holm 为准，并同时报告
    Bonferroni `α/m` 同时区间；窗口级证据同时报告种子×窗口
    两层 bootstrap 与方差占比，用它决定补种子还是扩评估集。

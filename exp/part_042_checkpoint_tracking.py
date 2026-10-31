@@ -721,6 +721,7 @@ _SWEEP_BOOL_FLAGS = (
     "--allow-underpowered",
     "--allow-partial-ablation",
     "--plan-design",
+    "--sweep-stop-on-failure",
 )
 
 

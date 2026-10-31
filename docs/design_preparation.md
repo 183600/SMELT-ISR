@@ -38,6 +38,8 @@ python experiment.py \
   平衡审计（`order_balance`：每个处理在各位置上的计数与最大
   极差，以及 `carryover` 有序相邻处理对的覆盖与计数极差）；
 - `design_plan.json` 的规范化指纹 `plan_id`；
+- 失败策略 `failure_policy`（默认 `continue`；可用
+  `--sweep-stop-on-failure` 冻结为 `stop`）；
 - 先验功效（若预注册文件提供 `power` 块），包括按预期脱落率
   折算的可用种子数、实际功效、MDE 与 sd 敏感性；`planned_contrasts`
   声明与实际计划推断的对比类型会取并集，逐项给出 `contrast_power`
@@ -387,6 +389,41 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
 `order_balance`，因此事后把不平衡顺序改成平衡顺序（或反过来）
 也会改变指纹。
 
+### 3.2 失败运行与完整区组
+
+随机化完整区组要求每个种子区组都尝试同一组处理。旧行为在首个
+子运行非零退出时立即停止，后续区组整体不执行：不仅失败率的分母
+变成「实际启动数」，位置/一阶 carryover 平衡也被破坏，无法区分
+「方法更容易失败」与「失败后没跑完」。
+
+训练套件现在默认把 `failure_policy="continue"` 写入
+`design_plan.json`，并由 `plan_id` 冻结：
+
+- **训练期失败**（已写出 `config.json`，随后崩溃/NaN/被 OOM
+  kill）保留运行目录与 `sweep_failure.json`，继续执行剩余计划；
+- **启动前失败**（数据/配置/预注册错误，尚未写出 `config.json`）
+  通常会让后续运行重复失败，仍立即停止；
+- 全部计划运行结束后才写 `comparison_analysis.json`；失败运行
+  以 `numerical_status="failed"` 与 `execution_status="failed"`
+  进入 `failure_rates`、`attrition_bounds` 与消融覆盖检查，
+  不会进入均值/显著性检验；
+- 报告写完后父进程以非零退出码标记本轮不完整，不能当作完整
+  设计的成功复现。
+
+需要 fail-fast 时在计划阶段显式加 `--sweep-stop-on-failure`，
+设计计划会冻结 `failure_policy="stop"`；正式运行时改这个开关
+会改变 `plan_id`，不能悄悄换策略。基线调参套件固定 `stop`：
+缺格的网格不能用来选 winner。
+
+`run_order.json` 记录 `failure_policy`、每个条目的
+`status`（`planned` / `running` / `completed` / `failed`）、
+退出码与失败原因。失败目录中的 `sweep_failure.json` 还记录
+计划身份（mode/seed/balance），因此即使 `config.json` 不可用，
+后续 `--compare` 也能把该目录归入正确的臂并计入失败率。若用
+`--resume` 重跑同一目录并成功，父进程会删除旧的
+`sweep_failure.json`，避免分析仍把已修复的运行当成失败；失败
+目录若保留，则应作为脱落证据归档，不能只留成功运行。
+
 ## 4. 分析阶段的顺序漂移诊断
 
 `--compare` 与套件汇总会对带设计记录的非确定性运行做描述性
@@ -424,20 +461,23 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
 3. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
    放入同一只读目录；
 4. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；
-5. 分析时同时报告 `power`、`seed_plan`、`order_balance` 与
-   `run_order`；顺序相关强时先调查漂移，而不是直接解释臂间
-   差异；交互不显著时先看它的 MDE/功效，不能把「按两两对比
-   够用的种子数」当成「交互也有足够功效」；
+   确认 `failure_policy` 是预注册想要的 `continue`（默认）或
+   `stop`；训练期失败后仍让剩余区组跑完；
+5. 分析时同时报告 `power`、`seed_plan`、`order_balance`、
+   `run_order` 与 `sweep_execution`；顺序相关强时先调查漂移，
+   而不是直接解释臂间差异；交互不显著时先看它的 MDE/功效，
+   不能把「按两两对比够用的种子数」当成「交互也有足够功效」；
 6. 增加种子/重跑必须作为新研究阶段重新预注册，不能反复换种子
    直到显著。因数值失败而剔除运行也必须按预注册的脱落/失败率
-   口径报告，不能只保留成功运行。
+   口径报告，不能只保留成功运行；失败目录、`run_order.json` 与
+   `comparison_analysis.json` 要一起归档。
 
 ## 6. 与现有协议的关系
 
 - `docs/experiment_protocol.md` 的冻结 → 预注册 → 运行 → 统一
   解封流程不变；本文件补上「预注册前如何判断设计可执行」；
-- `docs/methodology_audit.md` 第 29、33、37 节记录设计、等价性
-  功效与试点校准修正；
+- `docs/methodology_audit.md` 第 29、33、37、42 节记录设计、
+  等价性功效、试点校准与失败运行策略修正；
 - 设计计划不替代 `artifact_manifest.json`：前者是训练前设计，
   后者是训练后归档内容完整性；两者都应随最终报告保存。
   `pilot_evidence` 不是预注册 schema 字段：它由工具从运行目录

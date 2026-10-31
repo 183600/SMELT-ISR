@@ -524,9 +524,10 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
             f"{len(seeds)} 个"
         )
 
-    run_paths = _execute_sweep_plan(
+    execution = _execute_sweep_plan(
         base_argv, plan, out_root, design=design
     )
+    run_paths = execution["run_paths"]
 
     # 套件必须使用同一份预注册文件：若文件在运行中途被编辑，
     # 各子运行实际执行的协议就不再相同，不能合并成一项研究。
@@ -741,6 +742,16 @@ def print_design_summary(design: Dict[str, object]) -> None:
             "[design] 解析训练预算："
             f"{budget.get('total_tokens')} tokens（"
             f"{budget.get('runs')} × {budget.get('tokens_per_run')}）"
+        )
+    failure_policy = design.get("failure_policy")
+    if failure_policy == "continue":
+        print(
+            "[design] 失败策略：continue（训练期失败保留目录并继续"
+            "剩余计划；启动前失败仍立即停止）"
+        )
+    elif failure_policy == "stop":
+        print(
+            "[design] 失败策略：stop（首个失败即停止后续运行）"
         )
     balance = design.get("order_balance")
     if isinstance(balance, dict) and balance.get("available"):

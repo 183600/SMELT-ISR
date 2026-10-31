@@ -56,9 +56,10 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             )
 
     print_design_summary(design)
-    run_paths = _execute_sweep_plan(
+    execution = _execute_sweep_plan(
         base_argv, plan, out_root, design=design
     )
+    run_paths = execution["run_paths"]
 
     # 每个子进程都会重新读取预注册文件；文件在套件运行中途被
     # 修改时，各子运行会基于不同 sha256 训练。父进程必须核对
@@ -116,10 +117,12 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
             "path",
             "file_sha256",
             "plan_id",
+            "schema_version",
             "kind",
             "order_scheme",
             "order_seed",
             "order_balance",
+            "failure_policy",
             "planned_runs",
             "planned_comparisons",
             "planned_contrasts",
@@ -158,10 +161,33 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
                 "结论只能作为探索性证据，不能把交互/主效应的不显著"
                 "读成「没有效应」；该豁免已随 design.power 落盘"
             )
+    analysis["sweep_execution"] = {
+        "failure_policy": execution["failure_policy"],
+        "planned_runs": execution["planned_runs"],
+        "completed_runs": execution["completed_runs"],
+        "failed_runs": execution["failed_runs"],
+        "stopped_early": execution["stopped_early"],
+        "failures": execution["failures"],
+        "note": (
+            "continue 策略下，训练期失败运行仍保留目录并作为"
+            "失败/缺失进入 failure_rates 与 attrition_bounds；"
+            "报告写完后父进程以非零退出码标记本轮不完整。"
+            "启动前失败（无 config.json）仍立即停止。"
+        ),
+    }
     analysis["run_order"] = run_order_drift_report(
         rows, args.compare_metric
     )
     write_comparison_report(out_root, analysis)
+    if execution["failed_runs"]:
+        print(
+            "[sweep][warn] 本轮有 "
+            f"{execution['failed_runs']}/{execution['planned_runs']} "
+            "个计划运行失败；完整分析已写入 "
+            f"{out_root / 'comparison_analysis.json'}，但本轮"
+            "不能作为完整设计的成功复现，退出码将为非零"
+        )
+        raise SystemExit(1)
 
 def main():
     from exp._runner import run_isolated

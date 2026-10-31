@@ -125,6 +125,7 @@ def _MAIN_part_001():
     parser.add_argument('--design-pilot-runs', nargs='+', default=None, metavar='RUN', help='试点/先前运行目录（必须包含失败目录）：从相同 seed 的配对差值估计实际种子间 sd，并按处理单元估计脱落率，与预注册 power 的 expected_seed_sd_relative / expected_attrition_rate 对照。观测值更大时设计计划按观测值强制重算功效并写入 pilot_evidence；仍不足则在第一个子进程前拒绝。需配合 --preregistration 与 --seeds/--plan-design')
     parser.add_argument('--run-order', type=str, default=None, choices=_RUN_ORDER_SCHEMES, help='套件的执行顺序设计：grouped=按臂分组（历史行为，时间漂移与臂效应完全混杂）；blocked=按种子成完整区组、区组内保持原臂顺序；randomized=区组内随机化臂顺序（默认，随机化完整区组设计）；counterbalanced=在完整区组上用循环拉丁方限制性随机化，使每个处理在各区组位置上的出现次数尽可能相等（要求每个种子区组包含同一组处理）；williams=在完整区组上用 Williams 设计同时平衡位置与区组内一阶 carryover（偶数处理需 n 个区组、奇数处理需 2n 个区组的整数倍才能完全平衡）')
     parser.add_argument('--run-order-seed', type=int, default=None, metavar='SEED', help='随机化区组顺序的确定性种子（默认 0）；同一计划必须使用同一种子才能复现执行顺序，看到结果后换顺序不再是原设计')
+    parser.add_argument('--sweep-stop-on-failure', action='store_true', help='种子套件遇到首个训练期失败即停止（默认 continue：保留失败目录并继续执行剩余计划，以维持完整区组并让失败率/脱落界按计划分母计算；启动前失败仍立即停止）。该策略写入 design_plan.json 的 failure_policy 并受 plan_id 冻结')
     parser.add_argument('--seeds', nargs='+', type=int, default=None, metavar='SEED', help='多随机种子运行：每个种子训练一次到 <out>/seed<SEED>，结束后自动给出 Mean ± Std 与显著性检验（关键实验建议 3~5 个种子）')
     parser.add_argument('--suite-modes', nargs='+', choices=sorted(Config.MODEL_MODES), default=None, metavar='MODE', help='配合 --seeds：把同一套受控设置依次应用到多个模式（输出 <out>/<mode>_seed<SEED>），用于严格控变量的模式对比')
     parser.add_argument('--suite-ablation', action='store_true', help='配合 --seeds：运行「延迟合并 × 均衡损失」全因子消融（立即合并对照 local_base 与各延迟合并方案 A/B × balance_coef=0/当前值）；balance 关闭臂为 0，开启臂取 --balance-coef。每个创新点都必须证明各自有用，默认覆盖 A 与 B 两个方案')
@@ -369,6 +370,10 @@ def _MAIN_part_001():
             parser.error('--seeds 需要 --out')
     if (args.suite_modes or args.suite_ablation or args.suite_baseline_tuning) and args.seeds is None:
         parser.error('--suite-modes / --suite-ablation / --suite-baseline-tuning 必须配合 --seeds 使用（关键实验至少 3~5 个种子）')
+    if args.sweep_stop_on_failure and args.seeds is None:
+        parser.error('--sweep-stop-on-failure 需要 --seeds（或由预注册文件补齐 seeds）：它只控制种子套件的失败策略')
+    if args.sweep_stop_on_failure and args.suite_baseline_tuning:
+        parser.error('--suite-baseline-tuning 必须跑完整调参网格：任何候选失败都不能用 --sweep-stop-on-failure 继续选 winner；该套件固定失败即停止')
     if args.run_order_seed is not None:
         order_seed_message = seed_error(args.run_order_seed)
         if order_seed_message:

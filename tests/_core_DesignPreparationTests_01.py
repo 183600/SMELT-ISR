@@ -908,3 +908,312 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
                 no_power, allow_underpowered=True
             )
         )
+
+    def _sweep_plan_for_failure_tests(self):
+        return [
+            {
+                "order_index": 1,
+                "block": 1,
+                "position_in_block": 1,
+                "label": "A_seed1",
+                "mode": "A",
+                "seed": 1,
+                "balance_coef": 0.01,
+            },
+            {
+                "order_index": 2,
+                "block": 1,
+                "position_in_block": 2,
+                "label": "B_seed1",
+                "mode": "B",
+                "seed": 1,
+                "balance_coef": 0.01,
+            },
+            {
+                "order_index": 3,
+                "block": 2,
+                "position_in_block": 1,
+                "label": "A_seed2",
+                "mode": "A",
+                "seed": 2,
+                "balance_coef": 0.01,
+            },
+        ]
+
+    def _fake_sweep_child(self, command, env=None):
+        out_dir = Path(command[command.index("--out") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "config.json").write_text(
+            json.dumps({
+                "config": {"mode": "A", "balance_coef": 0.01},
+                "args": {"seed": 1},
+            }),
+            encoding="utf-8",
+        )
+        return mock.Mock(returncode=0)
+
+    def test_sweep_continue_preserves_later_blocks_after_failure(self):
+        plan = self._sweep_plan_for_failure_tests()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = []
+
+            def fake_run(command, env=None):
+                calls.append(command)
+                result = self._fake_sweep_child(command, env)
+                if len(calls) == 2:
+                    result.returncode = 1
+                return result
+
+            with mock.patch.object(
+                experiment.subprocess, "run", side_effect=fake_run
+            ):
+                execution = experiment._execute_sweep_plan(
+                    [],
+                    plan,
+                    root,
+                    continue_on_failure=True,
+                )
+
+            self.assertEqual(
+                [Path(path).name for path in execution["run_paths"]],
+                ["A_seed1", "B_seed1", "A_seed2"],
+            )
+            self.assertEqual(execution["failed_runs"], 1)
+            self.assertEqual(execution["completed_runs"], 2)
+            self.assertEqual(execution["failure_policy"], "continue")
+            failure = json.loads(
+                (root / "B_seed1" / "sweep_failure.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(failure["returncode"], 1)
+            self.assertEqual(failure["mode"], "B")
+            self.assertEqual(failure["seed"], 1)
+            log = json.loads(
+                (root / "run_order.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [record["status"] for record in log["runs"]],
+                ["completed", "failed", "completed"],
+            )
+            self.assertEqual(log["failure_policy"], "continue")
+            self.assertEqual(log["failed_runs"], 1)
+
+    def test_successful_resume_removes_stale_failure_marker(self):
+        plan = self._sweep_plan_for_failure_tests()[:1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_out = root / "A_seed1"
+            run_out.mkdir()
+            marker = run_out / "sweep_failure.json"
+            marker.write_text(
+                json.dumps({"returncode": 1}), encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                experiment.subprocess,
+                "run",
+                side_effect=self._fake_sweep_child,
+            ):
+                execution = experiment._execute_sweep_plan(
+                    [],
+                    plan,
+                    root,
+                    continue_on_failure=True,
+                )
+
+            self.assertFalse(marker.exists())
+            self.assertEqual(execution["failed_runs"], 0)
+            log = json.loads(
+                (root / "run_order.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(log["runs"][0]["status"], "completed")
+
+    def test_sweep_stop_policy_marks_unstarted_runs_planned(self):
+        plan = self._sweep_plan_for_failure_tests()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = []
+
+            def fake_run(command, env=None):
+                calls.append(command)
+                result = self._fake_sweep_child(command, env)
+                result.returncode = 1
+                return result
+
+            with mock.patch.object(
+                experiment.subprocess, "run", side_effect=fake_run
+            ):
+                with self.assertRaises(SystemExit):
+                    experiment._execute_sweep_plan(
+                        [], plan, root, continue_on_failure=False
+                    )
+
+            self.assertEqual(len(calls), 1)
+            log = json.loads(
+                (root / "run_order.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [record["status"] for record in log["runs"]],
+                ["failed", "planned", "planned"],
+            )
+            self.assertEqual(log["failure_policy"], "stop")
+
+    def test_design_frozen_stop_overrides_continue_argument(self):
+        plan = self._sweep_plan_for_failure_tests()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self._args(
+                seeds=[1, 2],
+                suite_modes=["A", "B"],
+                mode="A",
+                sweep_stop_on_failure=True,
+            )
+            design = experiment.write_design_plan(
+                root, plan, "randomized", 0, args
+            )
+            calls = []
+
+            def fake_run(command, env=None):
+                calls.append(command)
+                result = self._fake_sweep_child(command, env)
+                result.returncode = 1
+                return result
+
+            with mock.patch.object(
+                experiment.subprocess, "run", side_effect=fake_run
+            ):
+                with self.assertRaises(SystemExit):
+                    experiment._execute_sweep_plan(
+                        [],
+                        plan,
+                        root,
+                        design=design,
+                        continue_on_failure=True,
+                    )
+
+            self.assertEqual(len(calls), 1)
+
+    def test_sweep_continue_still_stops_before_config(self):
+        plan = self._sweep_plan_for_failure_tests()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = []
+
+            def fake_run(command, env=None):
+                calls.append(command)
+                return mock.Mock(returncode=1)
+
+            with mock.patch.object(
+                experiment.subprocess, "run", side_effect=fake_run
+            ):
+                with self.assertRaises(SystemExit):
+                    experiment._execute_sweep_plan(
+                        [],
+                        plan,
+                        root,
+                        continue_on_failure=True,
+                    )
+
+            self.assertEqual(len(calls), 1)
+            failure = json.loads(
+                (root / "A_seed1" / "sweep_failure.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(failure["config_written"])
+            self.assertEqual(
+                failure["failure_stage"], "before_config"
+            )
+            log = json.loads(
+                (root / "run_order.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [record["status"] for record in log["runs"]],
+                ["failed", "planned", "planned"],
+            )
+
+    def test_design_plan_freezes_failure_policy(self):
+        plan = self._sweep_plan_for_failure_tests()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self._args(
+                seeds=[1, 2],
+                suite_modes=["A", "B"],
+                mode="A",
+                sweep_stop_on_failure=True,
+            )
+            design = experiment.write_design_plan(
+                root / "stop", plan, "randomized", 0, args
+            )
+            self.assertEqual(design["failure_policy"], "stop")
+            self.assertEqual(design["schema_version"], 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self._args(
+                seeds=[1, 2],
+                suite_modes=["A", "B"],
+                mode="A",
+            )
+            design = experiment.write_design_plan(
+                root / "continue", plan, "randomized", 0, args
+            )
+            self.assertEqual(
+                design["failure_policy"], "continue"
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self._args(
+                seeds=[1, 2],
+                suite_modes=["A", "B"],
+                mode="A",
+                sweep_stop_on_failure=True,
+            )
+            design = experiment.write_design_plan(
+                root / "tuning",
+                plan,
+                "randomized",
+                0,
+                args,
+                kind="baseline_tuning",
+            )
+            self.assertEqual(design["failure_policy"], "stop")
+
+    def test_compare_runs_recognizes_sweep_failure_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "A_seed7"
+            run_dir.mkdir()
+            (run_dir / "sweep_failure.json").write_text(
+                json.dumps({
+                    "status": "failed",
+                    "mode": "A",
+                    "seed": 7,
+                    "balance_coef": 0.01,
+                    "returncode": 137,
+                    "failure_reason": "child_exit_nonzero",
+                }),
+                encoding="utf-8",
+            )
+            rows = experiment.compare_runs([str(run_dir)])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["execution_status"], "failed")
+        self.assertEqual(row["execution_returncode"], 137)
+        self.assertEqual(row["mode"], "A")
+        self.assertEqual(row["seed"], 7)
+        self.assertEqual(row["balance_coef"], 0.01)
+        self.assertEqual(row["numerical_status"], "failed")
+        self.assertFalse(row["numerical_integrity_ok"])
+        report = experiment.failure_rate_report(rows)
+        self.assertEqual(report["arms"][0]["mode"], "A")
+        self.assertEqual(report["arms"][0]["planned_runs"], 1)
+        self.assertEqual(report["arms"][0]["failed_runs"], 1)
