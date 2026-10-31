@@ -1705,6 +1705,35 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             bound,
         )
         self.assertAlmostEqual(cdf / alpha, 1.0, places=9)
+    def test_binomial_upper_bound_handles_rates_below_machine_epsilon(self):
+        for failures, trials, confidence, expected in (
+            (5000, 10 ** 18, 0.95, 5.117886079407686e-15),
+            (5000, 10 ** 22, 0.95, 5.117886079407686e-19),
+            (
+                5000,
+                10 ** 18,
+                1.0 - 1.0e-15,
+                5.5834617958970515e-15,
+            ),
+            (10 ** 6, 10 ** 22, 0.95, 1.0016464227676167e-16),
+            (
+                10 ** 6,
+                10 ** 22,
+                1.0 - 1.0e-15,
+                1.0079631496577706e-16,
+            ),
+        ):
+            bound = experiment._binomial_upper_confidence_bound(
+                failures,
+                trials,
+                confidence,
+            )
+            self.assertIsNotNone(bound)
+            self.assertAlmostEqual(
+                bound / expected,
+                1.0,
+                places=9,
+            )
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None

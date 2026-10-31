@@ -681,6 +681,10 @@ def _sd_upper_confidence_bound(
 
 
 
+_BINOMIAL_DIRECT_TAIL_MAX_FAILURES = 100_000
+_BINOMIAL_POISSON_FALLBACK_BOUND = 1.0e-8
+
+
 def _binomial_lower_tail_probability(
     failures: int,
     trials: int,
@@ -754,7 +758,7 @@ def _binomial_upper_confidence_bound(
     high = 1.0
     # failures 很小时根在 p≈1e-12 量级，不完全 Beta 的互补
     # 分支会被 1-p 的舍入放大；直接累加二项下尾更稳。
-    if failures <= 4096:
+    if failures <= _BINOMIAL_DIRECT_TAIL_MAX_FAILURES:
         for _ in range(200):
             middle = (low + high) / 2.0
             cdf = _binomial_lower_tail_probability(
@@ -809,7 +813,17 @@ def _binomial_upper_confidence_bound(
         )
         if high - low <= tolerance:
             break
-    return (low + high) / 2.0
+    bound = (low + high) / 2.0
+    if bound <= _BINOMIAL_POISSON_FALLBACK_BOUND:
+        quantile = _chi_square_quantile(
+            confidence_value,
+            2.0 * (failures + 1.0),
+        )
+        if quantile is not None and quantile > 0.0:
+            poisson_bound = quantile / (2.0 * trials)
+            if math.isfinite(poisson_bound) and poisson_bound > 0.0:
+                return poisson_bound
+    return bound
 
 
 
