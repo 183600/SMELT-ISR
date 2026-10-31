@@ -496,6 +496,17 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         # None，不虚报指标。
         routing = config_payload.get("routing_analysis")
         row["routing_available"] = isinstance(routing, dict)
+        interventions = config_payload.get(
+            "routing_interventions"
+        )
+        row["routing_interventions"] = (
+            interventions
+            if isinstance(interventions, dict)
+            else None
+        )
+        row["routing_interventions_available"] = isinstance(
+            interventions, dict
+        )
         for key in _ROUTING_ROW_FIELDS:
             row[key] = None
         if isinstance(routing, dict):

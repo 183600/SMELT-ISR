@@ -1613,6 +1613,75 @@ commit、源码树、数据、种子集合、指标、基线与等价界，但�
   检查种子单元存在，不判断调用者是否只挑了其中一个有利配置；
   这仍需要预注册 `comparisons` 与消融覆盖检查共同约束。
 
+## 45. RQ4 干预证据的不确定性与跨种子汇总（本轮补充）
+
+**判定：`--routing-interventions` 此前只有单次运行的损失差值点估计，
+没有区间，也没有跨种子汇总。** `routing_shuffle` 的 Δloss、逐专家
+`expert_drop` 的重要性排序与 `importance_cv` 都来自同一批固定验证
+窗口的一次前向；把「Δloss>0」或「CV 很大」直接写成专家专门化的
+功能证据，会把有限评估批的抽样噪声当成方法性质。README 还声称
+这些干预会在 `--compare` 中按种子聚合，但对比层实际只聚合了
+`routing_analysis` 的利用率/重合度指标，干预结果仍停留在单运行
+定性描述。
+
+**已修正：**
+
+- `_intervention_eval` 保留每个固定评估批的损失、token 准确率与
+  token 数（`per_batch`），汇总字段不变；逐批明细只用于计算，
+  不写进最终报告，避免 E 个专家产生 O(E×batches) 条冗余记录。
+- 新增 `_paired_bootstrap_delta_ci`：在同一批固定验证批上对
+  「干预 − 基线」做配对百分位 bootstrap（默认 2000 次、95%），
+  重采样单位是评估批而不是 token，批级差值再按该批 token 数
+  加权以对齐总量口径；随机种子由
+  `blake2b(run_seed|intervention|batches)` 确定性派生，不消耗
+  全局 RNG。批数少于 2、批数不一致、批下标不一致或有限配对不足
+  时返回 `available=false` 与具体原因，不伪造 0 宽区间。
+- `routing_shuffle` 新增 `loss_delta_ci95`、`accuracy_delta_ci95`
+  与完整 `bootstrap` 元数据；每个 `expert_drop` 条目新增
+  `loss_delta_ci95`。`expert_drop` 汇总新增
+  `experts_with_ci_excluding_zero`、`experts_with_positive_ci_low`、
+  `max_expert_ci95_low`、`min_expert_ci95_high`、
+  `importance_ci_separated` 与 `specialization_evidence`
+  （`separated` / `not_separated` / `insufficient_batches`）。
+  `separated` 仅表示最重与最轻专家的 95% 区间分离，是描述性
+  证据，不是对 E 个专家做多重比较校正后的确证检验；同时报告
+  `max_loss_delta_relative` / `min_loss_delta_relative`，避免把
+  「统计上可分辨但实际可忽略」的差值写成重要发现。
+- 新增 `routing_intervention_comparison_report`：
+  `--compare` 按模式汇总各运行的打乱 Δloss、最大专家屏蔽 Δloss、
+  重要性 CV、区间排除 0 的运行数、`specialization_evidence=separated`
+  的运行数与批数；`comparison_analysis.json` 新增
+  `routing_intervention_comparison`，展示层新增
+  `[rq4-intervention]` 小节。批数不一致、少于 3 个种子、没有
+  区间分离或只有部分运行区间排除 0 时给出警告，明确这些跨种子
+  汇总仍是描述性证据，不替代预注册的独立分析。
+- 新增回归测试：配对 bootstrap 的确定性、均值与区间方向、单批
+  不可用；逐批统计与总损失/总 token 数一致；干预报告包含区间
+  与合法 `specialization_evidence`；跨运行按模式汇总的均值、
+  区间排除 0 计数与分离计数。
+
+**仍有限制：**
+
+- 区间只覆盖**这批固定验证批**的评估抽样不确定性；它不覆盖
+  换训练种子、换文档/来源或时间外推。跨种子汇总也只是
+  Mean ± Std 与计数，不是对干预效应的事后确证检验；不得因为
+  某个种子/专家区间排除 0 就选择性报告。
+- 默认干预批数 `min(eval_batches, 5)` 通常很少，百分位区间很粗；
+  批数少于 2 时直接不可用。需要更精确的干预证据时应在训练前
+  增加 `--routing-intervention-batches`，而不是事后挑一个
+  区间最窄的设置。
+- 配对 bootstrap 假设固定评估批在干预前后可交换且批间近似
+  独立；同一批内 token 相关已被「按批重采样」吸收，但批间若
+  沿数据顺序强自相关，区间仍会偏窄。报告保留批数与
+  `bootstrap` 元数据，读者应结合评估窗口重叠/自相关诊断解读。
+- `expert_drop` 的区间分离只比较点估计最大/最小专家，未对全部
+  E 个专家做同时区间或 Holm 校正；`importance_cv` 仍只是描述性
+  离散度。真正的「专家专门化」主张仍应配合预注册的干预分析、
+  多种子重复与外部验证，而不是单个运行的区间。
+- 跨运行汇总只读取 `config.json` 的 `routing_interventions`；
+  旧运行或未启用干预的运行不参与，不会被当成「干预无效应」。
+  不同运行若使用不同评估批数/窗口，汇总会告警但不能自动对齐。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /

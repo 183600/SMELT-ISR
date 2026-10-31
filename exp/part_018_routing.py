@@ -1029,6 +1029,27 @@ def _routing_shuffle_seed(
 
 
 
+_INTERVENTION_BOOTSTRAP_REPLICATES = 2000
+
+_INTERVENTION_BOOTSTRAP_LEVEL = 0.95
+
+
+def _intervention_bootstrap_seed(
+    run_seed: int,
+    name: str,
+    batches: int,
+) -> int:
+    """干预 bootstrap 的稳定种子（不依赖对象地址或全局随机流）。"""
+    material = (
+        f"routing_intervention_bootstrap_v1|{int(run_seed)}|"
+        f"{str(name)}|{int(batches)}"
+    ).encode("utf-8")
+    return int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(),
+        "big",
+    )
+
+
 def _intervention_eval(
     model: nn.Module,
     dataset: ByteDataset,
@@ -1036,8 +1057,16 @@ def _intervention_eval(
     batches: int,
     device: torch.device,
     amp_dtype: Optional[torch.dtype],
-) -> Dict[str, float]:
-    """在固定验证窗口上做一次前向，返回损失与 token 准确率。"""
+) -> Dict[str, object]:
+    """
+    在固定验证窗口上做一次前向，返回损失、token 准确率与逐批统计。
+
+    ``per_batch`` 保留每个固定评估批的损失和/准确率，供干预前后
+    的**配对** bootstrap 使用。把总损失相减再声称「显著上升」会
+    忽略评估窗口抽样噪声；逐批配对才能给出「同一批窗口上换干预」
+    的区间。逐批明细只用于计算，不写进最终报告，避免 E 个专家
+    的干预记录膨胀成 O(E×batches) 条冗余字段。
+    """
     core = _unwrap_model(model)
     was_training = core.training
     core.eval()
@@ -1045,6 +1074,7 @@ def _intervention_eval(
     total_loss = 0.0
     total_tokens = 0
     correct = 0
+    per_batch: List[Dict[str, float]] = []
     try:
         with torch.autocast(
             device_type="cuda",
@@ -1068,11 +1098,28 @@ def _intervention_eval(
                         y.reshape(-1),
                         reduction="sum",
                     )
-                    total_loss += float(loss)
-                    total_tokens += int(y.numel())
-                    correct += int(
+                    batch_tokens = int(y.numel())
+                    batch_loss = float(loss)
+                    batch_correct = int(
                         (logits.argmax(dim=-1) == y).sum()
                     )
+                    total_loss += batch_loss
+                    total_tokens += batch_tokens
+                    correct += batch_correct
+                    per_batch.append({
+                        "batch_index": int(batch_index),
+                        "loss": (
+                            batch_loss / batch_tokens
+                            if batch_tokens > 0
+                            else float("nan")
+                        ),
+                        "token_accuracy": (
+                            batch_correct / batch_tokens
+                            if batch_tokens > 0
+                            else float("nan")
+                        ),
+                        "tokens": batch_tokens,
+                    })
     finally:
         core.train(was_training)
     if total_tokens <= 0:
@@ -1080,11 +1127,190 @@ def _intervention_eval(
             "loss": float("nan"),
             "token_accuracy": float("nan"),
             "tokens": 0,
+            "per_batch": per_batch,
         }
     return {
         "loss": total_loss / total_tokens,
         "token_accuracy": correct / total_tokens,
         "tokens": total_tokens,
+        "per_batch": per_batch,
+    }
+
+
+def _intervention_totals(
+    evaluation: Dict[str, object],
+) -> Dict[str, object]:
+    """去掉逐批明细后的干预汇总（写入报告/归档的版本）。"""
+    return {
+        key: value
+        for key, value in evaluation.items()
+        if key != "per_batch"
+    }
+
+
+def _paired_bootstrap_delta_ci(
+    baseline: Dict[str, object],
+    treatment: Dict[str, object],
+    *,
+    name: str,
+    seed: int,
+    resamples: int = _INTERVENTION_BOOTSTRAP_REPLICATES,
+    level: float = _INTERVENTION_BOOTSTRAP_LEVEL,
+) -> Dict[str, object]:
+    """
+    同一批固定评估窗口上「干预 − 基线」的配对百分位 bootstrap 区间。
+
+    重采样单位是固定评估批，而不是 token：同一批内的 token 高度
+    相关，把 token 当独立样本会把区间压得过窄。批级差值再按该批
+    token 数加权，使区间中心与总量口径的点估计一致。基线/干预
+    必须来自同一模型、同一批窗口、同一批大小；批数少于 2 时
+    无法重采样，显式返回不可用原因，不能把单批差值的 0 宽区间
+    当成精确证据。
+    """
+    baseline_batches = baseline.get("per_batch")
+    treatment_batches = treatment.get("per_batch")
+    if not isinstance(baseline_batches, list) or not isinstance(
+        treatment_batches, list
+    ):
+        return {
+            "available": False,
+            "reason": "per_batch_missing",
+        }
+    if len(baseline_batches) < 2 or len(treatment_batches) < 2:
+        return {
+            "available": False,
+            "reason": "fewer_than_two_batches",
+            "batches": min(
+                len(baseline_batches),
+                len(treatment_batches),
+            ),
+        }
+    if len(baseline_batches) != len(treatment_batches):
+        return {
+            "available": False,
+            "reason": "batch_count_mismatch",
+            "baseline_batches": len(baseline_batches),
+            "treatment_batches": len(treatment_batches),
+        }
+
+    loss_differences: List[Tuple[float, float]] = []
+    accuracy_differences: List[Tuple[float, float]] = []
+    for index, (base, treat) in enumerate(
+        zip(baseline_batches, treatment_batches)
+    ):
+        if not isinstance(base, dict) or not isinstance(treat, dict):
+            continue
+        if base.get("batch_index") != treat.get("batch_index"):
+            return {
+                "available": False,
+                "reason": "batch_index_mismatch",
+                "batch_index": index,
+            }
+        base_loss = _finite_float(base.get("loss"))
+        treat_loss = _finite_float(treat.get("loss"))
+        base_acc = _finite_float(base.get("token_accuracy"))
+        treat_acc = _finite_float(treat.get("token_accuracy"))
+        base_tokens = _finite_float(base.get("tokens"))
+        treat_tokens = _finite_float(treat.get("tokens"))
+        if (
+            base_loss is None
+            or treat_loss is None
+            or base_acc is None
+            or treat_acc is None
+            or base_tokens is None
+            or treat_tokens is None
+            or base_tokens <= 0.0
+            or base_tokens != treat_tokens
+        ):
+            continue
+        loss_differences.append(
+            (treat_loss - base_loss, base_tokens)
+        )
+        accuracy_differences.append(
+            (treat_acc - base_acc, base_tokens)
+        )
+
+    if len(loss_differences) < 2:
+        return {
+            "available": False,
+            "reason": "fewer_than_two_finite_paired_batches",
+            "batches": len(loss_differences),
+        }
+
+    def _weighted_mean(
+        differences: List[Tuple[float, float]],
+        indices: List[int],
+    ) -> float:
+        total_weight = sum(
+            differences[index][1] for index in indices
+        )
+        return sum(
+            differences[index][0] * differences[index][1]
+            for index in indices
+        ) / total_weight
+
+    generator = random.Random(int(seed))
+    n = len(loss_differences)
+    loss_means: List[float] = []
+    accuracy_means: List[float] = []
+    for _ in range(max(1, int(resamples))):
+        sampled = [
+            generator.randrange(n)
+            for _ in range(n)
+        ]
+        loss_means.append(
+            _weighted_mean(loss_differences, sampled)
+        )
+        accuracy_means.append(
+            _weighted_mean(accuracy_differences, sampled)
+        )
+
+    loss_low, loss_high = _percentile_interval(
+        torch.tensor(loss_means, dtype=torch.float64),
+        level,
+    )
+    accuracy_low, accuracy_high = _percentile_interval(
+        torch.tensor(accuracy_means, dtype=torch.float64),
+        level,
+    )
+    loss_mean = _weighted_mean(
+        loss_differences, list(range(n))
+    )
+    accuracy_mean = _weighted_mean(
+        accuracy_differences, list(range(n))
+    )
+
+    def _interval(
+        mean: float,
+        low: float,
+        high: float,
+    ) -> Dict[str, object]:
+        return {
+            "mean_delta": mean,
+            "low": low,
+            "high": high,
+            "excludes_zero": bool(low > 0.0 or high < 0.0),
+        }
+
+    return {
+        "available": True,
+        "method": "paired_percentile_bootstrap",
+        "unit": "fixed_eval_batch",
+        "level": float(level),
+        "resamples": int(max(1, int(resamples))),
+        "seed": int(seed),
+        "batches_used": n,
+        "batches_total": len(baseline_batches),
+        "tokens_used": int(
+            sum(weight for _, weight in loss_differences)
+        ),
+        "intervention": str(name),
+        "loss_delta": _interval(
+            loss_mean, loss_low, loss_high
+        ),
+        "accuracy_delta": _interval(
+            accuracy_mean, accuracy_low, accuracy_high
+        ),
     }
 
 
@@ -1156,23 +1382,40 @@ def analyze_routing_interventions(
         for block in core.blocks
         if isinstance(getattr(block, "moe", None), SparseMoE)
     ]
+    baseline_eval = _intervention_eval(
+        core,
+        dataset,
+        batch_size,
+        batches,
+        device,
+        amp_dtype,
+    )
     report: Dict[str, object] = {
         "mode": cfg.mode,
         "split": "val",
         "batches_requested": batches,
+        "batches_evaluated": len(
+            baseline_eval.get("per_batch") or []
+        ),
         "batch_size": batch_size,
         "n_experts": cfg.n_experts,
-        "baseline": _intervention_eval(
-            core,
-            dataset,
-            batch_size,
-            batches,
-            device,
-            amp_dtype,
-        ),
+        "baseline": _intervention_totals(baseline_eval),
         "interventions": {
             "routing_shuffle": {},
             "expert_drop": {},
+        },
+        "bootstrap": {
+            "method": "paired_percentile_bootstrap",
+            "unit": "fixed_eval_batch",
+            "level": _INTERVENTION_BOOTSTRAP_LEVEL,
+            "resamples": _INTERVENTION_BOOTSTRAP_REPLICATES,
+            "seed_derivation": (
+                "blake2b(run_seed|intervention|batches)"
+            ),
+            "note": (
+                "区间只覆盖这批固定验证批的抽样不确定性；"
+                "少于 2 个有限配对批时不给出区间。"
+            ),
         },
         "notes": [
             "只使用验证集固定窗口；测试集不参与。",
@@ -1181,6 +1424,8 @@ def analyze_routing_interventions(
             "被屏蔽专家的输出置零。",
             "这是功能干预证据；负载熵/死专家数只是利用率描述，"
             "均匀随机路由也能得到高熵，不能单独证明专门化。",
+            "损失差/准确率差附配对 bootstrap 区间；区间跨 0 时"
+            "不能把点估计写成显著的功能差异。",
             "代价：E+2 次验证前向，大 E 时开销明显。",
         ],
     }
@@ -1236,8 +1481,18 @@ def analyze_routing_interventions(
     finally:
         for module in moe_modules:
             module._routing_override = None
+    shuffle_ci = _paired_bootstrap_delta_ci(
+        baseline_eval,
+        shuffled,
+        name="routing_shuffle",
+        seed=_intervention_bootstrap_seed(
+            seed,
+            "routing_shuffle",
+            batches,
+        ),
+    )
     report["interventions"]["routing_shuffle"] = {
-        **shuffled,
+        **_intervention_totals(shuffled),
         "loss_delta": float(shuffled["loss"]) - baseline_loss,
         "loss_ratio": (
             float(shuffled["loss"]) / baseline_loss
@@ -1245,6 +1500,17 @@ def analyze_routing_interventions(
             else None
         ),
         "accuracy_delta": float(shuffled["token_accuracy"]) - baseline_acc,
+        "loss_delta_ci95": (
+            shuffle_ci.get("loss_delta")
+            if shuffle_ci.get("available")
+            else shuffle_ci
+        ),
+        "accuracy_delta_ci95": (
+            shuffle_ci.get("accuracy_delta")
+            if shuffle_ci.get("available")
+            else shuffle_ci
+        ),
+        "bootstrap": shuffle_ci,
     }
 
     # 专家屏蔽：逐个专家置零。E 较大时也只在 val 固定窗口上
@@ -1268,9 +1534,25 @@ def analyze_routing_interventions(
                 module._expert_drop_index = None
         delta = float(dropped["loss"]) - baseline_loss
         drop_deltas.append(delta)
+        drop_ci = _paired_bootstrap_delta_ci(
+            baseline_eval,
+            dropped,
+            name=f"expert_drop:{expert_index}",
+            seed=_intervention_bootstrap_seed(
+                seed,
+                f"expert_drop:{expert_index}",
+                batches,
+            ),
+        )
         drop_rows[str(expert_index)] = {
-            **dropped,
+            **_intervention_totals(dropped),
             "loss_delta": delta,
+            "loss_delta_ci95": (
+                drop_ci.get("loss_delta")
+                if drop_ci.get("available")
+                else drop_ci
+            ),
+            "bootstrap": drop_ci,
         }
     finite_deltas = [
         value for value in drop_deltas if math.isfinite(value)
@@ -1290,13 +1572,71 @@ def analyze_routing_interventions(
         )
         max_delta = drop_deltas[max_index]
         min_delta = drop_deltas[min_index]
+
+        def _ci_excludes_zero(row: Dict[str, object]) -> Optional[bool]:
+            interval = row.get("loss_delta_ci95")
+            if not isinstance(interval, dict):
+                return None
+            value = interval.get("excludes_zero")
+            return bool(value) if isinstance(value, bool) else None
+
+        def _ci_bound(
+            row: Dict[str, object],
+            field: str,
+        ) -> Optional[float]:
+            interval = row.get("loss_delta_ci95")
+            if not isinstance(interval, dict):
+                return None
+            return _finite_float(interval.get(field))
+
+        ci_excluding = sum(
+            1
+            for row in drop_rows.values()
+            if _ci_excludes_zero(row) is True
+        )
+        positive_ci_low = sum(
+            1
+            for row in drop_rows.values()
+            if (
+                (_ci_bound(row, "low") is not None)
+                and float(_ci_bound(row, "low")) > 0.0
+            )
+        )
+        max_ci_low = _ci_bound(
+            drop_rows[str(max_index)], "low"
+        )
+        min_ci_high = _ci_bound(
+            drop_rows[str(min_index)], "high"
+        )
+        ci_separated = (
+            max_ci_low is not None
+            and min_ci_high is not None
+            and max_ci_low > 0.0
+            and max_ci_low > min_ci_high
+        )
+        if max_ci_low is None or min_ci_high is None:
+            specialization = "insufficient_batches"
+        elif ci_separated:
+            specialization = "separated"
+        else:
+            specialization = "not_separated"
         report["interventions"]["expert_drop"] = {
             "per_expert": drop_rows,
             "mean_loss_delta": mean_delta,
             "std_loss_delta": math.sqrt(variance),
             "max_loss_delta": max_delta,
+            "max_loss_delta_relative": (
+                max_delta / baseline_loss
+                if baseline_loss > 0.0
+                else None
+            ),
             "max_expert": max_index,
             "min_loss_delta": min_delta,
+            "min_loss_delta_relative": (
+                min_delta / baseline_loss
+                if baseline_loss > 0.0
+                else None
+            ),
             "min_expert": min_index,
             "max_over_min_abs_ratio": (
                 abs(max_delta) / abs(min_delta)
@@ -1307,6 +1647,17 @@ def analyze_routing_interventions(
                 math.sqrt(variance) / abs(mean_delta)
                 if abs(mean_delta) > 1e-12
                 else None
+            ),
+            "experts_with_ci_excluding_zero": ci_excluding,
+            "experts_with_positive_ci_low": positive_ci_low,
+            "max_expert_ci95_low": max_ci_low,
+            "min_expert_ci95_high": min_ci_high,
+            "importance_ci_separated": bool(ci_separated),
+            "specialization_evidence": specialization,
+            "specialization_note": (
+                "separated 仅表示最重与最轻专家的 95% 配对 bootstrap"
+                " 区间分离；这是描述性证据，不是对 E 个专家做"
+                " 多重比较校正后的确证检验。"
             ),
         }
     else:
@@ -1332,10 +1683,19 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
         "routing_shuffle"
     ) or {}
     if shuffle.get("loss_delta") is not None:
+        interval = shuffle.get("loss_delta_ci95")
+        ci_text = ""
+        if isinstance(interval, dict) and interval.get("low") is not None:
+            ci_text = (
+                " 95%CI=["
+                f"{_format_finite(interval.get('low'), '+.6f')}, "
+                f"{_format_finite(interval.get('high'), '+.6f')}]"
+            )
         print(
             "[routing-intervention] 路由打乱："
             "Δloss="
-            f"{_format_finite(shuffle.get('loss_delta'), '+.6f')} "
+            f"{_format_finite(shuffle.get('loss_delta'), '+.6f')}"
+            f"{ci_text} "
             f"ratio={shuffle.get('loss_ratio')} "
             "Δacc="
             f"{_format_finite(shuffle.get('accuracy_delta'), '+.4f')}"
@@ -1355,8 +1715,277 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
             "mean="
             f"{_format_finite(drop.get('mean_loss_delta'), '+.6f')}"
             f"±{_format_finite(drop.get('std_loss_delta'), '.6f')} "
-            f"CV={drop.get('importance_cv')}"
+            f"CV={drop.get('importance_cv')} "
+            "specialization="
+            f"{drop.get('specialization_evidence')}"
         )
+
+
+def routing_intervention_comparison_report(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    跨运行汇总 RQ4 干预证据（按模式聚合，描述性）。
+
+    单个运行的干预 Δloss 只是该种子上的点估计；README 承诺
+    ``--compare`` 会按种子聚合，但此前只聚合了 ``routing_analysis``
+    的利用率/重合度指标。这里把每个运行的
+    ``routing_interventions`` 摘要按模式汇总：打乱敏感性、
+    最大专家屏蔽效应、重要性 CV 与「区间分离」判定。跨种子
+    仍只做描述性 Mean ± Std 与计数，不对干预效应做确证检验；
+    确证结论必须来自预注册的独立分析，而不是事后挑选最有利
+    的种子或专家。
+    """
+    runs: List[Dict[str, object]] = []
+    by_mode: Dict[str, List[Dict[str, object]]] = {}
+    warnings: List[str] = []
+
+    for row in rows:
+        payload = row.get("routing_interventions")
+        if not isinstance(payload, dict):
+            continue
+        interventions = _as_dict(
+            payload.get("interventions")
+        )
+        shuffle = _as_dict(
+            interventions.get("routing_shuffle")
+        )
+        drop = _as_dict(
+            interventions.get("expert_drop")
+        )
+        shuffle_ci = _as_dict(
+            shuffle.get("loss_delta_ci95")
+        )
+        per_expert = _as_dict(drop.get("per_expert"))
+        max_expert = drop.get("max_expert")
+        max_expert_row = _as_dict(
+            per_expert.get(str(max_expert))
+        )
+        drop_max_ci = _as_dict(
+            max_expert_row.get("loss_delta_ci95")
+        )
+        mode = row.get("mode") or payload.get("mode")
+        entry = {
+            "run": str(row.get("run")),
+            "mode": mode,
+            "seed": row.get("seed"),
+            "batches_evaluated": payload.get(
+                "batches_evaluated"
+            ),
+            "shuffle_loss_delta": _finite_float(
+                shuffle.get("loss_delta")
+            ),
+            "shuffle_loss_ci95_low": _finite_float(
+                shuffle_ci.get("low")
+            ),
+            "shuffle_loss_ci95_high": _finite_float(
+                shuffle_ci.get("high")
+            ),
+            "shuffle_ci_excludes_zero": shuffle_ci.get(
+                "excludes_zero"
+            ),
+            "drop_max_loss_delta": _finite_float(
+                drop.get("max_loss_delta")
+            ),
+            "drop_max_expert": drop.get("max_expert"),
+            "drop_max_ci95_low": _finite_float(
+                drop.get("max_expert_ci95_low")
+            ),
+            "drop_max_ci_excludes_zero": (
+                drop_max_ci.get("excludes_zero")
+                if drop_max_ci
+                else None
+            ),
+            "drop_min_loss_delta": _finite_float(
+                drop.get("min_loss_delta")
+            ),
+            "importance_cv": _finite_float(
+                drop.get("importance_cv")
+            ),
+            "importance_ci_separated": drop.get(
+                "importance_ci_separated"
+            ),
+            "specialization_evidence": drop.get(
+                "specialization_evidence"
+            ),
+        }
+        runs.append(entry)
+        if mode is not None:
+            by_mode.setdefault(str(mode), []).append(entry)
+
+    if not runs:
+        return {
+            "available": False,
+            "reason": "no_routing_interventions",
+            "schema": "smelt-isr/routing-intervention-comparison/v1",
+            "note": (
+                "没有运行带 routing_interventions 记录；"
+                "需在训练时显式启用 --routing-interventions。"
+            ),
+        }
+
+    def _mean_sd(
+        values: List[Optional[float]],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        finite = [
+            float(value)
+            for value in values
+            if value is not None
+        ]
+        if not finite:
+            return None, None
+        mean = sum(finite) / len(finite)
+        if len(finite) < 2:
+            return mean, None
+        variance = sum(
+            (value - mean) ** 2 for value in finite
+        ) / (len(finite) - 1)
+        return mean, math.sqrt(variance)
+
+    summary: Dict[str, object] = {}
+    for mode, entries in by_mode.items():
+        mode_warnings: List[str] = []
+        batch_counts = sorted({
+            int(entry["batches_evaluated"])
+            for entry in entries
+            if isinstance(entry.get("batches_evaluated"), int)
+            and not isinstance(entry.get("batches_evaluated"), bool)
+        })
+        if len(batch_counts) > 1:
+            mode_warnings.append(
+                "同一模式内的干预批数不一致（"
+                + ", ".join(str(value) for value in batch_counts)
+                + "）；跨运行 Δloss 不是同一评估抽样口径。"
+            )
+        unique_seeds = {
+            entry.get("seed")
+            for entry in entries
+            if entry.get("seed") is not None
+        }
+        if len(unique_seeds) < 3:
+            mode_warnings.append(
+                "少于 3 个不同种子的干预证据；跨种子 Mean ± Std "
+                "不足以支持稳健结论。"
+            )
+        shuffle_mean, shuffle_sd = _mean_sd([
+            entry.get("shuffle_loss_delta")
+            for entry in entries
+        ])
+        drop_mean, drop_sd = _mean_sd([
+            entry.get("drop_max_loss_delta")
+            for entry in entries
+        ])
+        cv_mean, cv_sd = _mean_sd([
+            entry.get("importance_cv")
+            for entry in entries
+        ])
+        shuffle_ci_runs = sum(
+            1
+            for entry in entries
+            if entry.get("shuffle_ci_excludes_zero") is True
+        )
+        drop_ci_runs = sum(
+            1
+            for entry in entries
+            if entry.get("drop_max_ci_excludes_zero") is True
+        )
+        separated_runs = sum(
+            1
+            for entry in entries
+            if entry.get("specialization_evidence") == "separated"
+        )
+        insufficient_runs = sum(
+            1
+            for entry in entries
+            if entry.get("specialization_evidence")
+            == "insufficient_batches"
+        )
+        if separated_runs == 0:
+            mode_warnings.append(
+                "没有运行达到「最重/最轻专家区间分离」；"
+                "不能把重要性 CV 或负载熵单独写成专门化证据。"
+            )
+        if shuffle_ci_runs < len(entries):
+            mode_warnings.append(
+                f"仅 {shuffle_ci_runs}/{len(entries)} 个运行的路由"
+                "打乱 Δloss 区间排除 0；其余不能写成显著功能差异。"
+            )
+        summary[mode] = {
+            "n_runs": len(entries),
+            "n_unique_seeds": len(unique_seeds),
+            "seeds": [
+                entry.get("seed") for entry in entries
+            ],
+            "batches": batch_counts,
+            "shuffle_loss_delta_mean": shuffle_mean,
+            "shuffle_loss_delta_sd": shuffle_sd,
+            "shuffle_ci_excludes_zero_runs": shuffle_ci_runs,
+            "drop_max_loss_delta_mean": drop_mean,
+            "drop_max_loss_delta_sd": drop_sd,
+            "drop_max_ci_excludes_zero_runs": drop_ci_runs,
+            "importance_cv_mean": cv_mean,
+            "importance_cv_sd": cv_sd,
+            "specialization_separated_runs": separated_runs,
+            "specialization_insufficient_batches_runs": (
+                insufficient_runs
+            ),
+            "warnings": mode_warnings,
+        }
+        warnings.extend(
+            f"{mode}: {message}" for message in mode_warnings
+        )
+
+    return {
+        "available": True,
+        "schema": "smelt-isr/routing-intervention-comparison/v1",
+        "split": "val",
+        "n_runs": len(runs),
+        "runs": runs,
+        "by_mode": summary,
+        "warnings": warnings,
+        "note": (
+            "跨种子汇总为描述性证据；每运行区间只覆盖固定验证批"
+            "的抽样不确定性，不覆盖训练种子或换文档/来源的外推。"
+            "不得事后只报告区间排除 0 的种子或专家。"
+        ),
+    }
+
+
+def print_routing_intervention_comparison(
+    report: Dict[str, object],
+) -> None:
+    """打印跨运行 RQ4 干预证据摘要。"""
+    if not report.get("available"):
+        return
+    print()
+    print(
+        "[rq4-intervention] 跨运行路由干预证据（val 固定窗口；"
+        "区间为批级配对 bootstrap，跨种子为描述性汇总）"
+    )
+    for mode, summary in (report.get("by_mode") or {}).items():
+        if not isinstance(summary, dict):
+            continue
+        print(
+            f"  {mode}: runs={summary.get('n_runs')} "
+            "shuffleΔloss="
+            f"{_format_finite(summary.get('shuffle_loss_delta_mean'), '+.6f')}"
+            f"±{_format_finite(summary.get('shuffle_loss_delta_sd'), '.6f')} "
+            "(CI≠0: "
+            f"{summary.get('shuffle_ci_excludes_zero_runs')}/"
+            f"{summary.get('n_runs')}) "
+            "dropMaxΔloss="
+            f"{_format_finite(summary.get('drop_max_loss_delta_mean'), '+.6f')}"
+            f"±{_format_finite(summary.get('drop_max_loss_delta_sd'), '.6f')} "
+            "(CI≠0: "
+            f"{summary.get('drop_max_ci_excludes_zero_runs')}/"
+            f"{summary.get('n_runs')}) "
+            "specialization="
+            f"{summary.get('specialization_separated_runs')}/"
+            f"{summary.get('n_runs')}"
+        )
+        for message in summary.get("warnings") or []:
+            print(f"  [warn] {mode}: {message}")
+    print(f"  {report.get('note')}")
 
 
 

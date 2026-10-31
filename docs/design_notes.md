@@ -344,6 +344,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   `top_cases_unique_windows` 与 `top_cases_window_concentration`，
   单一窗口占比 ≥60% 且案例数 ≥3 时提示这些案例不是彼此独立的
   失败模式。测试集解封的唯一一次评估会附带 test 坏案例。
+- **RQ4 功能干预的不确定性**：`--routing-interventions` 的
+  `routing_shuffle` 与逐专家 `expert_drop` 不再只报点估计。
+  每次干预与基线在同一批固定验证批上配对，`_intervention_eval`
+  保留逐批损失/准确率，`_paired_bootstrap_delta_ci` 以固定评估批
+  为重采样单位给出 95% 百分位区间（默认 2000 次，随机种子由运行
+  seed 与干预名确定性派生，不消耗全局 RNG）。批数少于 2 时显式
+  返回不可用原因，不把单批差值的 0 宽区间当精确证据。
+  `routing_interventions.json` 记录打乱 Δloss/Δacc 的区间、每个
+  专家的屏蔽 Δloss 区间，以及 `importance_ci_separated` /
+  `specialization_evidence`（`separated` / `not_separated` /
+  `insufficient_batches`）；`separated` 只表示最重与最轻专家的
+  区间分离，是描述性证据，不是对 E 个专家做多重比较校正后的
+  确证检验。`--compare` 另把各运行的干预摘要按模式汇总为
+  `[rq4-intervention]`：跨种子 Mean ± Std、区间排除 0 的运行数、
+  区间分离的运行数与批数不一致警告；不得事后只报告区间排除 0
+  的种子或专家。
 - **早停与选型**：`--early-stop-patience` 启用；NaN 验证损失不算
   「改善」；`--resume` 时从 `metrics.jsonl` 重建早停状态，保证续跑
   语义一致。最优验证点同时是模型选择依据（`best.pt`），final/test

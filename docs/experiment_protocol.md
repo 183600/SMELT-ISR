@@ -380,7 +380,13 @@ python experiment.py --data corpus.txt --out runs/confirm \
   直接把臂间差异解释为方法效应。该诊断是描述性的，不替代随机化
   设计。
 - 路由结论必须带机会水平（`jaccard_chance_*`、`lift`）与干预
-  结果，不能只报负载熵/死专家数。
+  结果，不能只报负载熵/死专家数。干预的 Δloss/Δacc 必须带
+  固定评估批上的配对 bootstrap 区间（`loss_delta_ci95`）；区间
+  跨 0 时不能写成显著功能差异。跨种子用 `--compare` 的
+  `[rq4-intervention]` 汇总（Mean ± Std、区间排除 0 的运行数、
+  `specialization_evidence=separated` 的运行数），不得事后只
+  报告最有利的种子或专家；`separated` 只是描述性区间分离，
+  不是多重比较校正后的确证结论。
 
 ## 5. 测试集：冻结候选后统一解封
 

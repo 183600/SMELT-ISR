@@ -128,7 +128,7 @@ PA_OWNED = {
     'p_holm', 'p_text', 'p_value', 'pairs_text', 'parity', 'parity_entries', 'parity_mismatches', 'parts',
     'payloads', 'persistent', 'precision_limited', 'present', 'present_routing_fields', 'provenance', 'randomness', 'ranges',
     'rate', 'rate_text', 'ratio', 'ratio_text', 'reason', 'reference', 'resolved_baseline', 'rho',
-    'rho_text', 'routing_header', 'routing_summary_fields', 'row', 'rows', 'rq_text', 'scale_guard_report', 'scale_tiers',
+    'rho_text', 'routing_header', 'routing_intervention_comparison', 'routing_summary_fields', 'row', 'rows', 'rq_text', 'scale_guard_report', 'scale_tiers',
     'seeds_needed', 'seeds_text', 'seeds_to_achieve', 'selection_bias', 'selection_metric_mismatch', 'shape_text', 'shares', 'short',
     'short_names', 'significant_note', 'single_factor_design', 'stable_count', 'summaries', 'tier', 'timing_ci_lines', 'tuned_runs',
     'tuning_seed_overlap', 'underpowered', 'value', 'values', 'values_text', 'violation', 'warning', 'width_parity_ok',
