@@ -336,7 +336,7 @@ jobs:
           for m in "${CANDIDATES[@]}"; do
             echo "[model] 测试 $m ..."
             # 每个候选都做一次真实冒烟调用，避免选中目录里存在但实际不可用的模型。
-            if ( cd "$SMOKE_DIR" && timeout --kill-after=30 180 opencode run --auto -m "$m" "只回复两个字：OK" ) > "$SMOKE_DIR/smoke.log" 2>&1; then
+            if ( cd "$SMOKE_DIR" && timeout --kill-after=30 180 opencode run --auto -m "$m" "只回复两个字：OK" < /dev/null ) > "$SMOKE_DIR/smoke.log" 2>&1; then
               echo "[model] 可用：$m"
               SELECTED="$m"
               break
@@ -434,7 +434,7 @@ jobs:
           echo "[opencode] model=$MODEL issue=#$ISSUE_NUMBER"
           # 280 分钟（16800s）硬超时：比步骤上限 290 分钟留 10 分钟余量；
           # --kill-after=120 给 opencode 更充分的优雅退出时间。
-          timeout --kill-after=120 16800 opencode run --auto -m "$MODEL" "$PROMPT" 2>&1 | tee "$LOG"
+          timeout --kill-after=120 16800 opencode run --auto -m "$MODEL" "$PROMPT" < /dev/null 2>&1 | tee "$LOG"
           EC=${PIPESTATUS[0]}
           echo "exit_code=$EC" >> "$GITHUB_OUTPUT"
           echo "[opencode] exit=$EC"

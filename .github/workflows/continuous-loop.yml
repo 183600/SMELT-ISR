@@ -356,8 +356,20 @@ jobs:
           smoke_test() {
             local m="$1" extra=""
             case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+            # ⭐ stdin 必须显式接 /dev/null：opencode 1.19.x 的 run 命令对非 TTY 的
+            # stdin 会执行 await Bun.stdin.text()（读到 EOF 为止）。若 runner 的 stdin
+            # 是未关闭的管道，opencode 将永久阻塞：无任何输出、被 timeout 杀掉，
+            # 表现为「冒烟测试失败/超时」。接 /dev/null 立即 EOF，位置参数传参不受影响。
             # shellcheck disable=SC2086
-            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" < /dev/null > /tmp/smoke_test.log 2>&1
+            local rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "[smoke] $m 失败 (exit=$rc)，/tmp/smoke_test.log 末尾内容："
+              tail -c 2000 /tmp/smoke_test.log 2>/dev/null || true
+              echo
+              echo "[smoke] ---- end of smoke log ----"
+            fi
+            return "$rc"
           }
 
           detect_provider() {
@@ -617,7 +629,8 @@ jobs:
             local oc_extra=""
             [ -n "$SELECTED_VARIANT" ] && oc_extra="--variant $SELECTED_VARIANT"
             # shellcheck disable=SC2086
-            timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" 2>&1 | tee "$OUT"
+            # ⭐ 同 smoke_test：stdin 接 /dev/null，避免 opencode 阻塞在 stdin 读取
+            timeout --kill-after=180 "$budget_now" opencode run -m "$SELECTED_MODEL" $oc_extra "$prompt" < /dev/null 2>&1 | tee "$OUT"
             local EC=$?
 
             # 成功 / 超时被杀：预算耗尽属正常结束，改动照常提交，阶段正常完成
