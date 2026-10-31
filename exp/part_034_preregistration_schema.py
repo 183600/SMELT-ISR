@@ -580,11 +580,18 @@ def preregistration_schema_error(
         )
         if error is not None:
             return error
-    if (
-        float(data["val_fraction"])  # type: ignore[arg-type]
-        + float(data["test_fraction"])  # type: ignore[arg-type]
-        >= 1.0
-    ):
+    # 与命令行校验保持同一可运行口径：验证集用于选型/早停，
+    # 不能为空；测试集可以为 0（不评估），但不能占满切分。
+    val_fraction = float(data["val_fraction"])  # type: ignore[arg-type]
+    test_fraction = float(data["test_fraction"])  # type: ignore[arg-type]
+    if not 0.0 < val_fraction < 1.0:
+        return (
+            "data.val_fraction 必须落在 (0, 1)"
+            "（验证集用于选型/早停，不能为空）"
+        )
+    if not 0.0 <= test_fraction < 1.0:
+        return "data.test_fraction 必须落在 [0, 1)"
+    if val_fraction + test_fraction >= 1.0:
         return "data.val_fraction + data.test_fraction 必须小于 1"
 
     group_separator = data.get(

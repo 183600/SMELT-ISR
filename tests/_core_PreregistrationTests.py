@@ -833,6 +833,23 @@ class PreregistrationTests(unittest.TestCase):
             experiment.preregistration_schema_error(payload)
         )
 
+    def test_schema_rejects_empty_validation_fraction(self):
+        payload = self._payload()
+        payload["data"]["val_fraction"] = 0.0
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("data.val_fraction", error)
+        self.assertIn("(0, 1)", error)
+
+    def test_schema_rejects_full_test_fraction(self):
+        payload = self._payload()
+        payload["data"]["val_fraction"] = 0.1
+        payload["data"]["test_fraction"] = 1.0
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIsNotNone(error)
+        self.assertIn("data.test_fraction", error)
+        self.assertIn("[0, 1)", error)
+
     def test_schema_rejects_out_of_range_seed(self):
         payload = self._payload()
         payload["seeds"] = [
