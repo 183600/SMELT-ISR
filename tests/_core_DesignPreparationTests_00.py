@@ -1252,6 +1252,35 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
         self.assertTrue(report["available"])
         self.assertFalse(report["balanced"])
         self.assertEqual(report["max_position_imbalance"], 2)
+    def test_order_balance_report_rejects_malformed_block_positions(self):
+        # 位置必须是 1..n 连续唯一；重复（全 1）或跳号会让
+        # 位置计数极差看起来为 0，但不能算作完整区组证据。
+        for positions in ([1, 1, 1, 1], [1, 2, 3, 5]):
+            plan = experiment.build_sweep_plan(
+                seeds=[1, 2, 3, 4],
+                modes=["A", "B", "C", "D"],
+                ablation=False,
+                balance_coef=0.01,
+                default_mode="B",
+            )
+            ordered = experiment.order_sweep_plan(
+                plan, "williams", 13
+            )
+            blocks = {}
+            for item in ordered:
+                blocks.setdefault(
+                    item["block"], []
+                ).append(item)
+            for block in blocks.values():
+                for item, position in zip(block, positions):
+                    item["position_in_block"] = position
+            report = experiment.run_order_balance_report(ordered)
+            self.assertTrue(report["available"])
+            self.assertFalse(report["complete_blocks"])
+            self.assertFalse(report["balanced"])
+            carryover = report["carryover"]
+            self.assertFalse(carryover["available"])
+            self.assertFalse(carryover["balanced"])
     def test_preregistration_power_accounts_for_attrition(self):
         payload = self._payload()
         payload["seeds"] = list(range(42, 50))

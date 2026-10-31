@@ -142,6 +142,7 @@ def run_order_balance_report(
     max_position = 0
     for entries in blocks.values():
         seen = set()
+        positions_seen = set()
         per_block = set()
         for item in entries:
             treatment = _plan_treatment_key(item)
@@ -155,14 +156,21 @@ def run_order_balance_report(
                 continue
             max_position = max(max_position, position)
             per_block.add(treatment)
-            if treatment in seen:
+            if treatment in seen or position in positions_seen:
                 malformed += 1
                 continue
             seen.add(treatment)
+            positions_seen.add(position)
             position_counts = counts.setdefault(treatment, {})
             position_counts[position] = (
                 position_counts.get(position, 0) + 1
             )
+        # 位置必须是 1..len(entries) 的唯一连续序列：只检查
+        # 正整数会让「所有条目标成同一位置」或跳号（如
+        # 1,2,4,3）的计划在极差上看起来完全平衡，并把伪造的
+        # 位置平衡写进设计证据。
+        if positions_seen != set(range(1, len(entries) + 1)):
+            malformed += 1
         block_treatment_sets.append(per_block)
 
     if not counts:
