@@ -11,6 +11,7 @@ class ArtifactManifestTests(unittest.TestCase):
             "run_metadata": {
                 "timestamp_utc": "2026-01-01T00:00:00+00:00",
                 "script_sha256": "script-sha",
+                "source_tree_sha256": "tree-sha",
                 "git_commit": "abc123",
                 "git_dirty": False,
             },
@@ -65,6 +66,14 @@ class ArtifactManifestTests(unittest.TestCase):
             self.assertEqual(
                 payload["run"]["comparison_protocol_sha256"],
                 "protocol-sha",
+            )
+            self.assertEqual(
+                payload["run"]["source_tree_sha256"],
+                "tree-sha",
+            )
+            self.assertEqual(
+                payload["provenance"]["source_tree_sha256"],
+                experiment._source_tree_sha256(),
             )
 
             report = experiment.verify_artifact_manifest(root)
@@ -327,12 +336,14 @@ class ArtifactManifestTests(unittest.TestCase):
             config["original_run_metadata"] = {
                 "timestamp_utc": "2025-01-01T00:00:00+00:00",
                 "script_sha256": "original-script",
+                "source_tree_sha256": "original-tree",
                 "git_commit": "original-commit",
                 "git_dirty": False,
             }
             config["run_metadata"] = {
                 "timestamp_utc": "2026-01-01T00:00:00+00:00",
                 "script_sha256": "resumed-script",
+                "source_tree_sha256": "resumed-tree",
                 "git_commit": "resumed-commit",
                 "git_dirty": True,
             }
@@ -350,6 +361,9 @@ class ArtifactManifestTests(unittest.TestCase):
             )
             self.assertEqual(
                 summary["git_commit"], "original-commit"
+            )
+            self.assertEqual(
+                summary["source_tree_sha256"], "original-tree"
             )
 
     def test_manifest_entry_limit_counts_across_directories(self):

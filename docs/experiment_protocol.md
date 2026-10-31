@@ -14,9 +14,17 @@
    ```bash
    git rev-parse HEAD
    sha256sum experiment.py        # 入口脚本指纹（frozen_script_sha256）
+   python experiment.py --print-source-fingerprint \
+     > source_tree_fingerprint.json  # 完整源码树指纹（含 exp/、selfcheck/）
    git archive --format=tar HEAD | sha256sum  # 完整源码包指纹
    git status --porcelain         # 必须为空
    ```
+
+   `source_tree_fingerprint.json` 里的 `sha256` 就是
+   `frozen_source_tree_sha256`；它只由相对路径、字节数与
+   文件 SHA-256 决定，不依赖仓库目录名、mtime 或 git，因此
+   同一份源码换目录/解压到别的主机后指纹不变。预注册前把
+   该文件与源码包、数据清单一起归档。
 
 3. 把 `git archive HEAD`、`requirements-ci.txt`、数据清单（SHA-256、
    切分边界、`split_sha256`）与预注册文件放到同一个只读目录；
@@ -32,6 +40,7 @@
   "study_id": "smelt-isr-confirm-001",
   "frozen_commit": "<git sha>",
   "frozen_script_sha256": "<可选：入口 experiment.py 的 SHA-256>",
+  "frozen_source_tree_sha256": "<可选：--print-source-fingerprint 输出的 sha256>",
   "primary_metric": "val_loss_at_common_step",
   "common_step": 20000,
   "steps": 20000,
@@ -80,14 +89,18 @@
 - `frozen_commit` 必须是 7~64 位十六进制 git commit。当前
   `HEAD` 可以与它相同，也可以是它的后代（通常是在记录
   `frozen_commit` 之后又提交了预注册文件本身）；但
-  `git diff frozen_commit..HEAD -- experiment.py` 必须为空——
-  冻结后改代码必须开始新研究阶段。工作区有未提交修改、或
-  提供了 `frozen_script_sha256` 而脚本内容不同，同样拒绝
-  启动。没有 git 时必须提供 `frozen_script_sha256`。**当前入口
-  只对 `experiment.py` 做差异/脚本指纹核对，不逐个遍历 `exp/`；
-  因此还必须在冻结后用 `git archive` 保存完整源码、保持工作区
-  干净，并在归档/复核时核对 `exp/` 未变（入口本身不会拦截只改
-  `exp/` 的后继提交）。**
+  `git diff frozen_commit..HEAD -- experiment.py exp selfcheck`
+  必须为空——冻结后改任何运行时代码都必须开始新研究阶段。
+  工作区有未提交修改、`frozen_script_sha256` 与入口脚本内容
+  不同，或 `frozen_source_tree_sha256` 与当前完整源码树指纹
+  （`experiment.py + exp/ + selfcheck/`）不同，同样拒绝启动。
+  没有 git 时必须提供 `frozen_script_sha256`；建议同时提供
+  `frozen_source_tree_sha256`，否则只修改 `exp/` 的后继提交
+  不会被 git 差异检查拦截。只比较入口脚本无法证明训练实现
+  未被改动，因此确证实验应把源码树指纹也写进预注册。冻结后
+  仍须用 `git archive` 保存完整源码；归档/复核时用
+  `--check-source RUN_DIR` 或 `--audit-run --audit-source <源码目录>`
+  重新核对完整源码树。
 - `primary_metric` 必须是评估管线真正计算的指标；`common_step`
   必须是正整数且不超过 `steps`；`min_effect` 是相对
   `baseline_mode` 均值的比例；`direction` 为 `decrease` 或
@@ -390,7 +403,8 @@ python experiment.py --data corpus.txt --out runs/confirm \
 
 必须保存（不可变存储）：
 
-- `git archive` 的源码包 + commit SHA + `script_sha256`；
+- `git archive` 的源码包 + commit SHA + `script_sha256` +
+  `source_tree_sha256`（`source_tree_fingerprint.json`）；
 - 全部运行的 `config.json`、`metrics.jsonl`、`best.pt`（如允许）、
   `comparison_analysis.json`、`routing*.json`、失败运行目录；
 - 预注册文件、最终报告、分析脚本、依赖版本与环境信息
@@ -409,9 +423,11 @@ python experiment.py --verify-manifest runs/final/A \
 
 `artifact_manifest.json` 逐文件记录相对路径、字节数、SHA-256
 与符号链接目标，并从 `config.json` 摘出 `script_sha256`、
-`environment_id`、`environment_file_sha256`、`git_commit`、
-数据/切分指纹、预注册文件指纹与
-`comparison_protocol_sha256`。校验器拒绝绝对路径、`..` 与
+`source_tree_sha256`、`environment_id`、
+`environment_file_sha256`、`git_commit`、数据/切分指纹、
+预注册文件指纹与 `comparison_protocol_sha256`；清单自身的
+`provenance` 也记录生成时的完整源码树指纹。校验器拒绝绝对
+路径、`..` 与
 非规范相对路径；默认把清单外新增文件列为 `untracked`（可能
 是后续日志），`--verify-manifest-strict` 下才算失败。清单是
 写入时刻的快照：`--resume`、补跑 `--evaluate-test` 或追加
@@ -431,11 +447,17 @@ sanity 重复运行与预注册是否仍指向同一次运行。正式归档使�
 
 ```bash
 python experiment.py --audit-run runs/final/A --audit-strict \
-  --audit-source archive/experiment.py \
+  --audit-source archive/src \
   --audit-data archive/corpus.txt \
   --audit-preregistration archive/preregistration.json \
   --audit-report archive/runs/final/A/reproducibility_audit.json
 ```
+
+`--audit-source` 传目录时按目录内的 `experiment.py + exp/ +
+selfcheck/` 重算完整源码树指纹，并与 `source_tree_sha256`
+核对；传单个文件时仍兼容旧用法，只比较入口 SHA-256。也可用
+`python experiment.py --check-source runs/final/A` 单独检查
+当前源码树是否仍是产出该运行的那一份。
 
 `--audit-run` 只读，不训练也不修改运行目录；非零退出码表示
 证据链不一致，不能把该运行作为最终可复现证据。审计报告放在

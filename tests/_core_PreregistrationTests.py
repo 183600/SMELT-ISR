@@ -209,6 +209,79 @@ class PreregistrationTests(unittest.TestCase):
         )
         self.assertIsNone(error)
 
+    def test_schema_rejects_invalid_frozen_source_tree(self):
+        payload = self._payload()
+        payload["frozen_source_tree_sha256"] = "not-a-digest"
+        self.assertIn(
+            "frozen_source_tree_sha256",
+            experiment.preregistration_schema_error(payload),
+        )
+
+    def test_apply_accepts_uppercase_frozen_source_tree(self):
+        payload = self._payload()
+        payload["frozen_source_tree_sha256"] = "F" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256="d" * 64,
+            current_source_tree_sha256="f" * 64,
+        )
+        self.assertIsNone(error)
+
+    def test_apply_rejects_frozen_source_tree_mismatch(self):
+        payload = self._payload()
+        payload["frozen_source_tree_sha256"] = "d" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256="d" * 64,
+            current_source_tree_sha256="e" * 64,
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("源码树", error)
+        self.assertIn("exp/", error)
+
+    def test_apply_rejects_unverifiable_frozen_source_tree(self):
+        payload = self._payload()
+        payload["frozen_source_tree_sha256"] = "d" * 64
+        args = self._args()
+        _, error = experiment.preregistration_apply(
+            args,
+            payload,
+            current_commit="a" * 40,
+            working_tree_dirty=False,
+            current_script_sha256="d" * 64,
+            current_source_tree_sha256=None,
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("无法", error)
+        self.assertIn("源码树", error)
+
+    def test_record_includes_source_tree_identity(self):
+        payload = self._payload()
+        payload["frozen_source_tree_sha256"] = "f" * 64
+        before = experiment._source_tree_sha256()
+        self.assertIsNotNone(before)
+        record = experiment.preregistration_record(
+            payload,
+            "/tmp/prereg.json",
+            "a" * 64,
+            [],
+            self._args(),
+        )
+        self.assertEqual(
+            record["frozen_source_tree_sha256"], "f" * 64
+        )
+        self.assertEqual(
+            record["source_tree_sha256"], before
+        )
+
     def test_apply_allows_frozen_commit_ancestor(self):
         args = self._args()
         _, error = experiment.preregistration_apply(

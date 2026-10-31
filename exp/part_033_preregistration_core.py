@@ -67,6 +67,7 @@ _PREREGISTRATION_OPTIONAL_FIELDS = (
     "equivalence_margin",
     "steps",
     "frozen_script_sha256",
+    "frozen_source_tree_sha256",
     "power",
     "run_order",
     "notes",

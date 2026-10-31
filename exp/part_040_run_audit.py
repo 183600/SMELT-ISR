@@ -15,6 +15,8 @@ def audit_run_directory(
 
     检查的是**证据之间的链接**，不是重新训练：
     - config.json 的代码/数据/协议/环境指纹是否齐全且格式合法；
+      代码身份同时核对入口 ``script_sha256`` 与完整源码树
+      ``source_tree_sha256``，并验证源码树明细与摘要自洽；
     - environment.json 的 environment_id 是否与自身内容、
       config.json 摘要及 run_metadata 一致；
     - metrics.jsonl 首行与 final/test 记录是否仍指向同一份
@@ -24,7 +26,9 @@ def audit_run_directory(
     - sanity 重复运行是否确实逐位一致（同机同种子可复现的
       运行时证据）；
     - artifact_manifest.json 若存在，逐文件完整性是否通过；
-    - 可选地核对归档源码、语料与预注册文件的外部 SHA-256。
+    - 可选地核对归档源码（文件比对入口 SHA-256，目录比对完整
+      源码树指纹）、语料与预注册文件的外部 SHA-256；预注册声明
+      ``frozen_source_tree_sha256`` 时也与运行记录核对。
 
     ``strict=True`` 时把「可复现性证据不足」的警告也判为失败
     （如未固定 PYTHONHASHSEED、未启用确定性算子、git 工作区
@@ -131,6 +135,12 @@ def audit_run_directory(
         "git_commit": metadata.get("git_commit"),
         "git_dirty": metadata.get("git_dirty"),
         "script_sha256": metadata.get("script_sha256"),
+        "source_tree_sha256": metadata.get(
+            "source_tree_sha256"
+        ),
+        "source_tree_file_count": metadata.get(
+            "source_tree_file_count"
+        ),
         "environment_id": metadata.get("environment_id"),
         "pythonhashseed_at_start": metadata.get(
             "pythonhashseed_at_start"
@@ -148,6 +158,38 @@ def audit_run_directory(
             "无法证明结果由哪份代码产出",
         )
         script_sha = None
+
+    source_tree_sha = metadata.get("source_tree_sha256")
+    if not _audit_digest(source_tree_sha):
+        add_warning(
+            "source_tree_sha_missing",
+            "run_metadata 缺少合法的 source_tree_sha256："
+            "无法证明 exp/ 与 selfcheck/ 的实现与结果一致"
+            "（旧运行可能只记录了入口脚本指纹）",
+        )
+        source_tree_sha = None
+    recorded_source_tree = metadata.get("source_tree")
+    if (
+        isinstance(recorded_source_tree, dict)
+        and source_tree_sha is not None
+    ):
+        files = recorded_source_tree.get("files")
+        try:
+            recomputed = _source_tree_digest(
+                files if isinstance(files, list) else []
+            )
+        except (KeyError, TypeError, ValueError):
+            recomputed = None
+        if recomputed != source_tree_sha:
+            add_error(
+                "source_tree_digest_mismatch",
+                "run_metadata.source_tree 的文件明细与 "
+                "source_tree_sha256 不一致：源码身份记录被"
+                "拼接或改写",
+                expected=source_tree_sha,
+                actual=recomputed,
+            )
+
     if not str(metadata.get("command") or "").strip():
         add_warning(
             "command_missing",
@@ -426,6 +468,7 @@ def audit_run_directory(
             "data_sha256": data_sha,
             "data_split_sha256": split_sha,
             "script_sha256": script_sha,
+            "source_tree_sha256": source_tree_sha,
             "environment_id": environment_id,
             "comparison_protocol_sha256": protocol_sha,
         }
@@ -931,12 +974,50 @@ def audit_run_directory(
     if source_path is not None:
         source = Path(source_path)
         entry: Dict[str, object] = {"path": str(source)}
-        if not source.is_file():
+        if source.is_dir():
+            # 目录形式核对完整源码树：把归档目录里的
+            # experiment.py + exp/ + selfcheck/ 重新哈希，而不是
+            # 只比较入口文件——只核对入口会让 exp/ 的实现改动
+            # 完全透明。
+            entry["kind"] = "source_tree"
+            fingerprint = source_tree_fingerprint(source)
+            entry["sha256"] = fingerprint.get("sha256")
+            entry["available"] = bool(
+                fingerprint.get("available")
+            )
+            entry["file_count"] = fingerprint.get("file_count")
+            if not fingerprint.get("available"):
+                add_error(
+                    "source_tree_unreadable",
+                    "无法从归档目录计算源码树指纹",
+                    error=fingerprint.get("error"),
+                )
+            if source_tree_sha is None:
+                add_error(
+                    "source_tree_sha_missing",
+                    "运行记录没有 source_tree_sha256，无法与归档"
+                    "源码目录核对",
+                )
+            else:
+                entry["matches"] = (
+                    fingerprint.get("sha256")
+                    == source_tree_sha
+                )
+                if not entry["matches"]:
+                    add_error(
+                        "source_tree_sha_mismatch",
+                        "归档源码树的指纹与运行记录的 "
+                        "source_tree_sha256 不一致",
+                        expected=source_tree_sha,
+                        actual=fingerprint.get("sha256"),
+                    )
+        elif not source.is_file():
             add_error(
                 "source_missing",
                 f"待核对源码不存在: {source}",
             )
         else:
+            entry["kind"] = "file"
             try:
                 actual = _sha256_file(source)
             except OSError as error:
@@ -1085,6 +1166,40 @@ def audit_run_directory(
                         expected=script_sha,
                         actual=frozen_script,
                     )
+                frozen_source_tree = prereg_payload.get(
+                    "frozen_source_tree_sha256"
+                )
+                if (
+                    _audit_digest(frozen_source_tree)
+                    and source_tree_sha is not None
+                    and frozen_source_tree.lower()
+                    != source_tree_sha.lower()
+                ):
+                    add_error(
+                        "frozen_source_tree_mismatch",
+                        "预注册 frozen_source_tree_sha256 与运行"
+                        "记录的 source_tree_sha256 不一致",
+                        expected=source_tree_sha,
+                        actual=frozen_source_tree,
+                    )
+                prereg_record = config.get("preregistration")
+                if isinstance(prereg_record, dict):
+                    record_source_tree = prereg_record.get(
+                        "source_tree_sha256"
+                    )
+                    if (
+                        _audit_digest(record_source_tree)
+                        and source_tree_sha is not None
+                        and record_source_tree.lower()
+                        != source_tree_sha.lower()
+                    ):
+                        add_error(
+                            "preregistration_source_tree_mismatch",
+                            "config.preregistration 记录的源码树"
+                            "指纹与 run_metadata 不一致",
+                            expected=source_tree_sha,
+                            actual=record_source_tree,
+                        )
         checks["preregistration"] = entry
 
     report["summary"] = {
@@ -1113,6 +1228,7 @@ def print_run_audit(report: Dict[str, object]) -> None:
             print(
                 "[audit] code="
                 f"{provenance.get('script_sha256')} "
+                f"tree={provenance.get('source_tree_sha256')} "
                 f"git={provenance.get('git_commit')} "
                 f"dirty={provenance.get('git_dirty')}"
             )

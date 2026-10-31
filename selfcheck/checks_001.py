@@ -117,6 +117,12 @@ def _selfcheck_top_55802_0040():
     assert metadata['torch_num_threads'] == torch.get_num_threads()
     assert metadata['torch_num_interop_threads'] == torch.get_num_interop_threads()
     assert metadata['script_sha256'] == hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    assert metadata['source_tree_schema'] == 'smelt-isr/source-tree/v1'
+    assert metadata['source_tree_sha256'] == source_tree_fingerprint()['sha256']
+    assert metadata['source_tree_file_count'] >= 3
+    assert any((entry['path'] == 'experiment.py' for entry in metadata['source_tree']['files']))
+    assert any((entry['path'].startswith('exp/') for entry in metadata['source_tree']['files']))
+    assert any((entry['path'].startswith('selfcheck/') for entry in metadata['source_tree']['files']))
     assert 'git_diff_sha256' in metadata
     if metadata['git_dirty']:
         assert metadata['git_diff_sha256']

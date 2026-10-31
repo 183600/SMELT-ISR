@@ -837,18 +837,463 @@ def _sha256_text(text: str) -> str:
 
 def _script_sha256() -> Optional[str]:
     """
-    实验脚本自身的 SHA-256 指纹。
+    入口脚本 ``experiment.py`` 的 SHA-256 指纹。
 
-    本项目是单文件代码库，脚本指纹即完整实验代码的指纹：
-    git 不可用（如压缩包直接运行）时它是唯一的代码版本记录，
-    工作区有未提交修改时它能把「同一 commit 的不同脏状态」
-    区分开——只有 commit + dirty 布尔位做不到这一点。
+    它只覆盖入口兼容层，不覆盖 ``exp/`` 包内的训练/统计实现。
+    完整运行代码身份必须用 :func:`source_tree_fingerprint`；
+    保留 ``script_sha256`` 是为了兼容旧检查点、旧预注册文件与
+    ``--audit-source`` 的单文件用法。
     """
     try:
         source = Path(__file__).resolve().read_bytes()
     except OSError:
         return None
     return hashlib.sha256(source).hexdigest()
+
+
+
+_SOURCE_TREE_SCHEMA = "smelt-isr/source-tree/v1"
+
+# 参与运行时代码身份的源码范围：入口脚本 + 两个包内的全部
+# Python 文件。测试代码不进入身份（测试改动不会改变训练结果），
+# ``__pycache__`` 与编译产物也不进入（它们随解释器/平台变化）。
+_SOURCE_TREE_PACKAGES = ("exp", "selfcheck")
+
+
+
+def _source_tree_root() -> Optional[Path]:
+    """
+    定位包含 ``experiment.py`` 与 ``exp/`` 的仓库根目录。
+
+    不能依赖 ``Path.cwd()``：在同一台机器上从不同工作目录启动
+    实验时，源码身份必须仍然相同。``exp/__init__.py`` 会把
+    ``__file__`` 指向入口脚本，因此这里从入口脚本所在目录向上
+    查找。
+    """
+    try:
+        start = Path(__file__).resolve().parent
+    except (NameError, OSError):
+        start = Path.cwd()
+    for candidate in (start, *start.parents):
+        if (
+            (candidate / "experiment.py").is_file()
+            and (candidate / "exp").is_dir()
+        ):
+            return candidate
+    return None
+
+
+
+def _source_tree_files(root: Path) -> List[Path]:
+    """按相对路径排序返回参与代码身份的全部 Python 源文件。"""
+    root = Path(root)
+    files: List[Path] = []
+    entry = root / "experiment.py"
+    if entry.is_file():
+        files.append(entry)
+    for package in _SOURCE_TREE_PACKAGES:
+        directory = root / package
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            if path.is_file():
+                files.append(path)
+    return sorted(
+        files,
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+
+
+
+def _source_tree_digest(
+    files: List[Dict[str, object]],
+) -> str:
+    """
+    源码树内容指纹：只由 schema + 文件相对路径/SHA-256/字节数
+    决定，不包含根目录名、采集时间或文件 mtime。
+
+    因此把同一份源码复制到别的目录、解压到别的主机，指纹仍
+    相同；只要任一运行文件的字节变化，指纹就会变化。mtime
+    不进入指纹，避免 checkout/解压时间把同一份代码判成不同。
+    """
+    canonical = {
+        "schema": _SOURCE_TREE_SCHEMA,
+        "files": [
+            {
+                "path": entry["path"],
+                "bytes": entry["bytes"],
+                "sha256": entry["sha256"],
+            }
+            for entry in files
+        ],
+    }
+    return _canonical_json_sha256(canonical)
+
+
+
+def source_tree_fingerprint(
+    root: Optional[object] = None,
+) -> Dict[str, object]:
+    """
+    计算完整运行时代码身份（``smelt-isr/source-tree/v1``）。
+
+    与只覆盖 ``experiment.py`` 的 ``script_sha256`` 不同，这里
+    遍历 ``exp/`` 与 ``selfcheck/`` 的全部 Python 源文件。项目
+    拆分后训练/统计实现都在 ``exp/``，仅核对入口脚本会让冻结后
+    修改实现代码的运行静默通过预注册与 resume 的代码一致性
+    检查。
+
+    ``root`` 仅供测试/归档核对指定源码根目录；默认从入口脚本
+    所在位置向上查找。返回结构始终包含 ``sha256``（不可用时为
+    ``None``）、``available``、``files``、``file_count`` 与
+    ``error``，调用方不需要捕获异常。
+    """
+    record: Dict[str, object] = {
+        "schema": _SOURCE_TREE_SCHEMA,
+        "available": False,
+        "sha256": None,
+        "file_count": 0,
+        "total_bytes": 0,
+        "root_name": None,
+        "files": [],
+        "error": None,
+    }
+    if root is not None:
+        try:
+            base = Path(root).resolve()
+        except (OSError, RuntimeError) as error:
+            record["error"] = f"无法解析源码根目录: {error}"
+            return record
+    else:
+        base = _source_tree_root()
+    if base is None:
+        record["error"] = (
+            "无法定位实验源码根目录（需要 experiment.py 与 exp/）："
+            "不能把缺失的源码身份当成已核对"
+        )
+        return record
+    record["root_name"] = base.name or str(base)
+    if not base.is_dir():
+        record["error"] = f"源码根目录不存在或不是目录: {base}"
+        return record
+
+    paths = _source_tree_files(base)
+    if not paths:
+        record["error"] = (
+            f"源码根目录 {base} 下没有找到 experiment.py / "
+            "exp/*.py / selfcheck/*.py"
+        )
+        return record
+
+    files: List[Dict[str, object]] = []
+    total_bytes = 0
+    for path in paths:
+        relative = path.relative_to(base).as_posix()
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            record["error"] = f"无法读取源码文件 {relative}: {error}"
+            return record
+        digest = hashlib.sha256(data).hexdigest()
+        entry = {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": digest,
+        }
+        files.append(entry)
+        total_bytes += len(data)
+
+    record.update(
+        {
+            "available": True,
+            "files": files,
+            "file_count": len(files),
+            "total_bytes": total_bytes,
+            "sha256": _source_tree_digest(files),
+        }
+    )
+    return record
+
+
+
+def _source_tree_sha256() -> Optional[str]:
+    """当前进程源码树的 SHA-256；无法计算时返回 None。"""
+    digest = source_tree_fingerprint().get("sha256")
+    return digest if isinstance(digest, str) and digest else None
+
+
+
+def source_tree_differences(
+    recorded: object,
+    current: object,
+) -> Dict[str, List[str]]:
+    """
+    比较两份源码树记录并列出修改/新增/删除的相对路径。
+
+    只在双方都带 ``files`` 明细时给出文件级差异；旧运行只有
+    摘要指纹时返回空列表，调用方仍可用 ``sha256`` 判定是否
+    一致，不能把「无法列出差异」写成「没有差异」。
+    """
+    def _map(value: object) -> Dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        entries = value.get("files")
+        if not isinstance(entries, list):
+            return {}
+        result: Dict[str, str] = {}
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            digest = item.get("sha256")
+            if isinstance(path, str) and isinstance(digest, str):
+                result[path] = digest
+        return result
+
+    before = _map(recorded)
+    after = _map(current)
+    return {
+        "changed": sorted(
+            path
+            for path in before.keys() & after.keys()
+            if before[path] != after[path]
+        ),
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+    }
+
+
+
+def _load_run_metadata_for_source_check(
+    path: Path,
+) -> Tuple[Dict[str, object], Optional[str]]:
+    """读取运行目录/JSON 中的 run_metadata，并返回 config 文件哈希。"""
+    config_sha256: Optional[str] = None
+    if path.is_dir():
+        config_path = path / "config.json"
+    else:
+        config_path = path
+    raw = config_path.read_bytes()
+    if path.is_dir():
+        config_sha256 = hashlib.sha256(raw).hexdigest()
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{config_path} 顶层必须是 JSON 对象")
+    metadata = payload.get("original_run_metadata")
+    if not isinstance(metadata, dict):
+        metadata = payload.get("run_metadata")
+    if not isinstance(metadata, dict):
+        # 允许直接传入 run_metadata 片段（例如从 config.json
+        # 单独摘出的溯源记录）。
+        metadata = payload
+    return metadata, config_sha256
+
+
+
+def check_source_tree_against_run(
+    path: object,
+) -> Dict[str, object]:
+    """
+    只读核对当前源码树与运行记录中的源码树是否一致。
+
+    回答「现在这套 ``experiment.py`` + ``exp/`` + ``selfcheck/``
+    是不是产出该运行的那一套」。与 ``--check-environment`` 并列：
+    环境核对回答「数值依赖/硬件是否相同」，本入口回答「代码
+    实现是否相同」。运行记录缺少源码树指纹时判为失败，而不是
+    把「无法核对」写成「一致」。
+    """
+    run_path = Path(path)
+    report: Dict[str, object] = {
+        "schema": "smelt-isr/source-check/v1",
+        "run": str(run_path),
+        "config_sha256": None,
+        "recorded_sha256": None,
+        "current_sha256": None,
+        "recorded_file_count": None,
+        "current_file_count": None,
+        "recorded_source_tree": None,
+        "current_source_tree": None,
+        "changed_files": [],
+        "added_files": [],
+        "removed_files": [],
+        "ok": False,
+        "error": None,
+    }
+    try:
+        metadata, config_sha256 = _load_run_metadata_for_source_check(
+            run_path
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        report["error"] = f"无法读取运行记录: {error}"
+        return report
+    report["config_sha256"] = config_sha256
+    recorded_tree = metadata.get("source_tree")
+    recorded_tree = (
+        recorded_tree if isinstance(recorded_tree, dict) else None
+    )
+    recorded_digest = metadata.get("source_tree_sha256")
+    if not isinstance(recorded_digest, str) and recorded_tree is not None:
+        candidate = recorded_tree.get("sha256")
+        if isinstance(candidate, str):
+            recorded_digest = candidate
+    report["recorded_source_tree"] = recorded_tree
+    report["recorded_sha256"] = (
+        recorded_digest if isinstance(recorded_digest, str) else None
+    )
+    if not isinstance(recorded_digest, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{64}", recorded_digest
+    ):
+        report["error"] = (
+            "运行记录缺少合法的 source_tree_sha256：旧运行或未记录"
+            "完整源码树，无法核对 exp/ 与 selfcheck/ 是否被改动"
+        )
+        return report
+
+    current_tree = source_tree_fingerprint()
+    report["current_source_tree"] = current_tree
+    report["current_sha256"] = current_tree.get("sha256")
+    report["current_file_count"] = current_tree.get("file_count")
+    report["recorded_file_count"] = (
+        recorded_tree.get("file_count")
+        if recorded_tree is not None
+        else None
+    )
+    if not current_tree.get("available"):
+        report["error"] = str(
+            current_tree.get("error")
+            or "无法计算当前源码树指纹"
+        )
+        return report
+    differences = source_tree_differences(
+        recorded_tree, current_tree
+    )
+    report.update(
+        {
+            "changed_files": differences["changed"],
+            "added_files": differences["added"],
+            "removed_files": differences["removed"],
+            "ok": (
+                str(recorded_digest).lower()
+                == str(current_tree["sha256"]).lower()
+            ),
+        }
+    )
+    if not report["ok"]:
+        report["error"] = (
+            "当前源码树与运行记录不一致：代码在运行后被修改，"
+            "不能把当前实现的重跑当作同一实验的复现"
+        )
+    return report
+
+
+
+def print_source_check(report: Dict[str, object]) -> None:
+    """打印源码树核对的简短摘要（完整报告由调用方输出 JSON）。"""
+    if report.get("error"):
+        print(f"[source][warn] {report['error']}")
+    recorded = str(report.get("recorded_sha256") or "?")[:12]
+    current = str(report.get("current_sha256") or "?")[:12]
+    status = "一致" if report.get("ok") else "不一致"
+    print(
+        f"[source] 源码树指纹{status}：记录 {recorded}... / "
+        f"当前 {current}..."
+    )
+    for label, key in (
+        ("修改", "changed_files"),
+        ("新增", "added_files"),
+        ("删除", "removed_files"),
+    ):
+        paths = report.get(key)
+        if isinstance(paths, list):
+            for path in paths:
+                print(f"[source][diff] {label} {path}")
+
+
+
+def source_mode_error(args) -> Optional[str]:
+    """校验 --print-source-fingerprint / --check-source 的互斥参数。"""
+    print_mode = bool(
+        getattr(args, "print_source_fingerprint", False)
+    )
+    check_path = getattr(args, "check_source", None)
+    if print_mode and check_path is not None:
+        return (
+            "--print-source-fingerprint 与 --check-source 不能"
+            "同时使用：一个输出当前指纹，一个核对运行记录"
+        )
+    if not print_mode and check_path is None:
+        return None
+
+    def _has(name: str) -> bool:
+        return getattr(args, name, None) is not None
+
+    def _enabled(name: str) -> bool:
+        return bool(getattr(args, name, False))
+
+    conflicts = [
+        flag
+        for flag, active in (
+            ("--check-environment", _has("check_environment")),
+            (
+                "--check-environment-strict",
+                _enabled("check_environment_strict"),
+            ),
+            ("--audit-run", _has("audit_run")),
+            ("--audit-report", _has("audit_report")),
+            ("--audit-source", _has("audit_source")),
+            ("--audit-data", _has("audit_data")),
+            (
+                "--audit-preregistration",
+                _has("audit_preregistration"),
+            ),
+            ("--audit-strict", _enabled("audit_strict")),
+            ("--write-manifest", _has("write_manifest")),
+            ("--verify-manifest", _has("verify_manifest")),
+            (
+                "--verify-manifest-strict",
+                _enabled("verify_manifest_strict"),
+            ),
+            (
+                "--expect-manifest-sha256",
+                _has("expect_manifest_sha256"),
+            ),
+            ("--compare", _has("compare")),
+            ("--compare-report", _has("compare_report")),
+            (
+                "--final-test-comparison",
+                _has("final_test_comparison"),
+            ),
+            ("--preregistration", _has("preregistration")),
+            ("--data", _has("data")),
+            ("--out", _has("out")),
+            ("--seeds", _has("seeds")),
+            ("--resume", _has("resume")),
+            ("--evaluate-test", _enabled("evaluate_test")),
+            ("--plan-design", _enabled("plan_design")),
+            ("--design-pilot-runs", _has("design_pilot_runs")),
+            ("--suite-modes", _has("suite_modes")),
+            ("--suite-ablation", _enabled("suite_ablation")),
+            (
+                "--suite-baseline-tuning",
+                _enabled("suite_baseline_tuning"),
+            ),
+            (
+                "--statistical-baseline",
+                _enabled("statistical_baseline"),
+            ),
+            ("--sanity-only", _enabled("sanity_only")),
+            ("--paper-cell", _has("paper_cell")),
+        )
+        if active
+    ]
+    if conflicts:
+        return (
+            "源码树核对入口是只读模式，不能与以下训练/分析参数"
+            "同时使用: " + ", ".join(conflicts)
+        )
+    return None
 
 
 

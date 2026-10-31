@@ -29,6 +29,7 @@ class RunAuditTests(unittest.TestCase):
                 "test": "3" * 64,
             },
             "script_sha256": "d" * 64,
+            "source_tree_sha256": "f" * 64,
             "environment_id": snapshot["environment_id"],
             "comparison_protocol_sha256": "c" * 64,
         }
@@ -42,6 +43,7 @@ class RunAuditTests(unittest.TestCase):
             "git_dirty": False,
             "git_diff_sha256": None,
             "script_sha256": identity["script_sha256"],
+            "source_tree_sha256": identity["source_tree_sha256"],
             "environment_id": identity["environment_id"],
             "pythonhashseed_at_start": "7",
             "rng_seed_manifest": {"seed": 7},
@@ -131,6 +133,107 @@ class RunAuditTests(unittest.TestCase):
             self.assertTrue(strict["ok"], strict)
             self.assertEqual(strict["errors"], [])
             self.assertEqual(strict["warnings"], [])
+
+    def test_audit_warns_when_source_tree_identity_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            config, _, _ = self._build_run(root)
+            config["run_metadata"].pop("source_tree_sha256")
+            (root / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            report = experiment.audit_run_directory(
+                root, strict=True
+            )
+            self.assertFalse(report["ok"])
+            self.assertIn(
+                "source_tree_sha_missing",
+                self._codes(report, "warnings"),
+            )
+
+    def test_audit_detects_source_tree_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            config, _, _ = self._build_run(root)
+            config["run_metadata"]["source_tree"] = {
+                "schema": "smelt-isr/source-tree/v1",
+                "files": [],
+            }
+            (root / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            report = experiment.audit_run_directory(root)
+            self.assertFalse(report["ok"])
+            self.assertIn(
+                "source_tree_digest_mismatch",
+                self._codes(report, "errors"),
+            )
+
+    def test_audit_can_check_archived_source_tree_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            config, identity, _ = self._build_run(root)
+            fingerprint = experiment.source_tree_fingerprint()
+            identity["source_tree_sha256"] = fingerprint["sha256"]
+            config["run_metadata"]["source_tree_sha256"] = (
+                fingerprint["sha256"]
+            )
+            config["run_metadata"]["source_tree"] = fingerprint
+            records = [
+                json.loads(line)
+                for line in (root / "metrics.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            for record in records:
+                if "source_tree_sha256" in record:
+                    record["source_tree_sha256"] = (
+                        fingerprint["sha256"]
+                    )
+            (root / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            (root / "metrics.jsonl").write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            source_root = Path(experiment.__file__).resolve().parent
+            report = experiment.audit_run_directory(
+                root, source_path=source_root
+            )
+            self.assertNotIn(
+                "source_tree_sha_mismatch",
+                self._codes(report, "errors"),
+            )
+            self.assertEqual(
+                report["checks"]["source"]["kind"],
+                "source_tree",
+            )
+            self.assertTrue(report["checks"]["source"]["matches"])
+
+    def test_audit_rejects_archived_source_tree_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            self._build_run(root)
+            other = Path(tmp) / "other"
+            (other / "exp").mkdir(parents=True)
+            (other / "experiment.py").write_text(
+                "", encoding="utf-8"
+            )
+            (other / "exp" / "part_000.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            report = experiment.audit_run_directory(
+                root, source_path=other
+            )
+            self.assertFalse(report["ok"])
+            self.assertIn(
+                "source_tree_sha_mismatch",
+                self._codes(report, "errors"),
+            )
 
     def test_audit_accepts_complete_final_line_without_newline(self):
         with tempfile.TemporaryDirectory() as tmp:

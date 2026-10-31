@@ -1043,17 +1043,22 @@ SMELT-ISR 在 SMELT（中间层循环两次的稀疏 MoE Transformer）的基础
   运行、`--skip-sanity-check` 跳过。
 - 每轮实验的代码版本、运行环境、超参数与随机种子、数据指纹、
   sanity check 结果写入 `config.json`；训练曲线与最终结果写入
-  `metrics.jsonl`，全程自动记录。代码版本是三层记录：
+  `metrics.jsonl`，全程自动记录。代码版本是四层记录：
   git commit（仓库可用时）、`git_diff_sha256`（工作区脏时对
-  `git diff HEAD` 的指纹，区分同一 commit 的不同未提交状态）与
-  `script_sha256`（入口文件 `experiment.py` 的 SHA-256；它不覆盖
-  `exp/` 包内实现，完整源码需另行用 `git archive` 与
-  `artifact_manifest.json` 锁定，不依赖 git 的只有该入口指纹，
-  覆盖压缩包运行与脏工作区两种 commit 无法定位代码的场景）。
+  `git diff HEAD` 的指纹，区分同一 commit 的不同未提交状态）、
+  `script_sha256`（入口文件 `experiment.py` 的 SHA-256，兼容旧
+  检查点/预注册）与 `source_tree_sha256`（`experiment.py` +
+  `exp/` + `selfcheck/` 全部运行时代码的确定性指纹，只由相对
+  路径、字节数与文件 SHA-256 决定，不依赖 git、目录名或 mtime）。
+  项目拆分后训练/统计实现都在 `exp/`，只记录入口指纹会让冻结后
+  修改实现的运行静默通过预注册、续跑与归档审计；完整源码树
+  指纹同时写入预注册记录、检查点、metrics 首行与
+  `artifact_manifest.json`，并参与 `--compare` 的硬核对。
 - 归档完整性不依赖人工 `sha256sum`：`--write-manifest RUN_DIR`
   在目录内原子写入 `artifact_manifest.json`，逐文件记录相对
   路径、大小、SHA-256 与符号链接目标，并附生成时的
-  `script_sha256`、git 状态、Python/torch/NumPy 版本；从
+  `script_sha256`、`source_tree_sha256`、git 状态、
+  Python/torch/NumPy 版本；从
   `config.json` 摘出 study_id、数据/切分指纹、预注册文件指纹与
   `comparison_protocol_sha256`。`--verify-manifest RUN_DIR`
   重新哈希并报告缺失、大小/内容不符、类型或链接目标变化；

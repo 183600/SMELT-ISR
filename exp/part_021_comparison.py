@@ -1294,6 +1294,11 @@ SINGLE_FACTOR_DESIGN_KEYS: Tuple[str, ...] = (
 # 未核对，不虚报一致。
 _REPRODUCIBILITY_HARD_KEYS: Tuple[str, ...] = (
     "script_sha256",
+    # 完整运行时代码身份（experiment.py + exp/ + selfcheck/）。
+    # script_sha256 只覆盖入口兼容层；只比较入口会让 exp/ 内
+    # 实现被改动的运行被误判为同一份代码。旧运行缺该字段时
+    # 保持「未核对」。
+    "source_tree_sha256",
     # 完整环境身份（关键依赖 + 编译选项 + 设备 + 确定性开关）。
     # 旧运行没有该字段时保持「未核对」，不虚报一致。
     "environment_id",

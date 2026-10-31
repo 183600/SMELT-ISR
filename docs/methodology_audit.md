@@ -1490,11 +1490,63 @@ python experiment.py --audit-run runs/final/A --audit-strict \
   后续 `--compare` 退回按 metrics 推断状态，归档时应与
   `run_order.json` 一起保存。
 
+## 43. 可复现性与工程规范：代码身份必须覆盖 `exp/` 实现（本轮补充）
+
+**判定：原实现只对入口 `experiment.py` 计算和核对
+`script_sha256`，但训练/统计实现已全部迁到 `exp/` 包内。**
+这意味着冻结提交之后只修改 `exp/part_*.py`（不改入口）时：
+预注册的 `git diff frozen_commit..HEAD -- experiment.py` 为空，
+`--resume` 的 `script_sha256` 比较一致，`--audit-run` 只核对
+入口指纹，`artifact_manifest.json` 也只锚定入口。结果是同一
+git commit / 同一入口指纹下可以运行完全不同的实现，冻结、
+续跑与归档核对都无法发现，代码身份链在研究最关键的位置
+是断开的。文档此前把「完整源码需另行核对」写成人工步骤，
+但机器可执行入口并没有提供对应核对。
+
+**已修正：**
+
+- 新增确定性源码树指纹（schema `smelt-isr/source-tree/v1`）：
+  文件集为根 `experiment.py` + `exp/**/*.py` + `selfcheck/**/*.py`
+  （排除 `__pycache__`、测试与编译产物）；规范化 SHA-256 只由
+  相对路径、字节数和每个文件的 SHA-256 决定，不含根目录名、
+  mtime 或采集时间，因此同一份源码复制/解压到别处指纹不变。
+  `--print-source-fingerprint` 输出逐文件清单与摘要。
+- `run_metadata`、检查点、`metrics.jsonl` 首行、final/test
+  记录、预注册记录与 `artifact_manifest.json` 同时写入
+  `source_tree_sha256`（以及 `source_tree` 明细）；续跑时比较
+  检查点与当前源码树，变化时明确告警并写入
+  `resume_code_provenance`。
+- 预注册支持可选 `frozen_source_tree_sha256`；`--preregistration`
+  在启动前核对当前完整源码树，缺失或不同则拒绝启动。
+  `git diff frozen_commit..HEAD` 的检查范围改为
+  `experiment.py exp selfcheck`，只改 `exp/` 的后继提交不再
+  静默通过。
+- `--check-source RUN_DIR_OR_JSON` 只读核对当前源码树与运行记录，
+  列出修改/新增/删除文件，不一致时非零退出；
+  `--audit-run --audit-source <目录>` 可从归档源码目录重算指纹
+  并核对，单文件用法仍兼容 `script_sha256`。`--compare` 的
+  复现性硬核对键加入 `source_tree_sha256`。
+- 新增回归测试：指纹与目录位置无关、文件增删改会被列出、
+  预注册拒绝缺失/不匹配/非法格式的源码树指纹、审计对缺失
+  指纹发 warning 并检出明细与摘要不一致、清单与运行摘要携带
+  源码树身份。
+
+**仍有限制：**
+
+- 旧运行没有 `source_tree_sha256`，工具只能标为「未核对」，
+  不能事后补出当时的实现；这些运行仍需依赖 `git archive`
+  与人工核对。
+- 指纹覆盖 Python 运行时代码，不覆盖数据、配置、模型权重或
+  非 Python 资源；这些仍由各自的数据/环境/清单指纹负责。
+- 指纹证明「文件内容相同」，不证明运行过程没有动态加载外部
+  代码或修改运行时状态；严格复现仍需固定解释器、依赖与命令。
+
 ## 推荐的确证流程（优先级）
 
 1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
-   `script_sha256`；把 `docs/experiment_protocol.md` 与预注册
-   假设一起归档。
+   `script_sha256` / `source_tree_sha256`（`--print-source-fingerprint`），
+   把 `source_tree_fingerprint.json`、
+   `docs/experiment_protocol.md` 与预注册假设一起归档。
 2. 固定数据协议：`--split-policy chronological` + 时间清单，
    或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
    默认 val-only 清洗；训练前核对 `data_audit.label_coverage`、

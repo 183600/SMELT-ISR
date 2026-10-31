@@ -52,6 +52,9 @@ def _manifest_run_summary(
         "research_question": config.get("research_question"),
         "run_started_utc": metadata.get("timestamp_utc"),
         "script_sha256": metadata.get("script_sha256"),
+        "source_tree_sha256": metadata.get(
+            "source_tree_sha256"
+        ),
         "git_commit": metadata.get("git_commit"),
         "git_dirty": metadata.get("git_dirty"),
         # 环境身份与 environment.json 自身摘要：归档摘要不用
@@ -96,6 +99,7 @@ def _manifest_current_provenance() -> Dict[str, object]:
     environment_id = environment["environment_id"]
     return {
         "script_sha256": _script_sha256(),
+        "source_tree_sha256": _source_tree_sha256(),
         "git_commit": _git_output("rev-parse", "HEAD"),
         "git_dirty": (
             bool(status) if status is not None else None
@@ -209,6 +213,7 @@ def verify_artifact_manifest(
         "errors": [],
         "integrity_ok": False,
         "code_matches_current": None,
+        "source_tree_matches_current": None,
         "environment_matches_current": None,
         "ok": False,
     }
@@ -378,6 +383,15 @@ def verify_artifact_manifest(
         result["code_matches_current"] = (
             provenance.get("script_sha256")
             == _script_sha256()
+        )
+        recorded_source_tree = provenance.get(
+            "source_tree_sha256"
+        )
+        current_source_tree = _source_tree_sha256()
+        result["source_tree_matches_current"] = (
+            None
+            if recorded_source_tree is None
+            else recorded_source_tree == current_source_tree
         )
         current_snapshot = build_environment_snapshot(
             torch.device(

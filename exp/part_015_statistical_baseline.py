@@ -491,6 +491,9 @@ def run_statistical_baseline(
         "script_sha256": ngram_run_metadata.get(
             "script_sha256"
         ),
+        "source_tree_sha256": ngram_run_metadata.get(
+            "source_tree_sha256"
+        ),
         "git_commit": ngram_run_metadata.get("git_commit"),
         "git_dirty": ngram_run_metadata.get("git_dirty"),
         "run_started_utc": ngram_run_metadata.get(
@@ -693,6 +696,9 @@ def run_statistical_baseline(
                         "ngram_alpha": best_alpha,
                         "script_sha256": ngram_run_metadata.get(
                             "script_sha256"
+                        ),
+                        "source_tree_sha256": ngram_run_metadata.get(
+                            "source_tree_sha256"
                         ),
                         "git_commit": ngram_run_metadata.get(
                             "git_commit"

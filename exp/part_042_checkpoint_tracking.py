@@ -18,6 +18,7 @@ def load_tracking_provenance(
     empty: Dict[str, object] = {
         "run_started_utc": None,
         "original_script_sha256": None,
+        "original_source_tree_sha256": None,
         "original_git_commit": None,
         "original_git_dirty": None,
         "original_environment_id": None,
@@ -57,6 +58,9 @@ def load_tracking_provenance(
     return {
         "run_started_utc": original.get("timestamp_utc"),
         "original_script_sha256": original.get("script_sha256"),
+        "original_source_tree_sha256": original.get(
+            "source_tree_sha256"
+        ),
         "original_git_commit": original.get("git_commit"),
         "original_git_dirty": original.get("git_dirty"),
         "original_environment_id": original.get(
@@ -93,6 +97,9 @@ def tracking_header_fields(
             dataset, "effective_train_sha256", None
         ),
         "script_sha256": run_metadata.get("script_sha256"),
+        "source_tree_sha256": run_metadata.get(
+            "source_tree_sha256"
+        ),
         "environment_id": run_metadata.get("environment_id"),
         "git_commit": run_metadata.get("git_commit"),
         "git_dirty": run_metadata.get("git_dirty"),
@@ -323,10 +330,12 @@ def save_checkpoint(
         # NumPy 全局随机状态：只含基本类型，torch.load 在
         # weights_only=True 下也能安全读取。
         "numpy_rng_state": _numpy_rng_state_payload(),
-        # 代码指纹：resume 时与当前脚本/commit 比对，跨代码
-        # 版本续跑会明确警告并写入 config.json，避免把两次
-        # 不同实现的训练轨迹冒充成同一实验。
+        # 代码指纹：resume 时同时比对入口脚本与完整源码树
+        # （experiment.py + exp/ + selfcheck/），跨代码版本续跑
+        # 会明确警告并写入 config.json，避免把两次不同实现的
+        # 训练轨迹冒充成同一实验。
         "script_sha256": _script_sha256(),
+        "source_tree_sha256": _source_tree_sha256(),
         "git_commit": _git_output("rev-parse", "HEAD"),
         "args": vars(args),
         # 数值事件与停止/污染标记随检查点存档：resume 不能把

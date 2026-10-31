@@ -105,17 +105,19 @@ def _MAIN_part_000():
     parser.add_argument('--verify-manifest-strict', action='store_true', help='与 --verify-manifest 配合：清单之外的任何新增文件也算失败（严格归档逐字一致）；默认只报告untracked，不把后续追加的日志误判为损坏')
     parser.add_argument('--check-environment', type=str, default=None, metavar='RUN_DIR_OR_JSON', help='不训练：把当前环境与运行目录的 environment.json（或 config.json 中的环境快照）逐项比较，environment_id 不一致时以非零状态码退出。用于重跑/续跑/换机器前确认关键依赖、编译选项、设备与确定性开关相同；默认只要求关键环境一致，--check-environment-strict 还要求完整包清单一致')
     parser.add_argument('--check-environment-strict', action='store_true', help='与 --check-environment 配合：完整包清单（含与数值无关的包）也必须逐项一致，任何新增/删除/版本变化都判失败')
+    parser.add_argument('--print-source-fingerprint', action='store_true', help='不训练：打印当前完整运行时代码指纹（experiment.py + exp/ + selfcheck/ 的逐文件 SHA-256 与规范化 source_tree_sha256）。用于冻结/预注册前记录代码身份，以及把源码复制到其它目录后确认指纹不变')
+    parser.add_argument('--check-source', type=str, default=None, metavar='RUN_DIR_OR_JSON', help='不训练：只读核对当前源码树与运行记录中的 source_tree_sha256 是否一致，并列出修改/新增/删除的源文件；不一致时以非零状态码退出。用于重跑/续跑/归档核对「运行代码是否仍是 experiment.py + exp/ + selfcheck/ 的那一份」，旧运行缺少源码树指纹时判为无法核对')
     parser.add_argument('--expect-manifest-sha256', type=str, default=None, metavar='HEX', help='与 --verify-manifest 配合：要求清单自身的 SHA-256等于外部归档记录中的值（64 位十六进制）。只校验清单内文件不足以防清单被整体替换；把 --write-manifest打印的指纹写入 DOI/归档记录后，用本参数才能验证「被校验的清单就是被记录的那一份」')
     parser.add_argument('--audit-run', type=str, default=None, metavar='RUN_DIR', help='不训练：对已完成的运行目录做只读复现审计，核对 config.json、environment.json、metrics.jsonl、test 封条/账本、sanity 重复运行与 artifact_manifest 之间的身份是否互相一致；发现不一致时以非零状态码退出。用于归档前确认「这些文件确实属于同一次运行」')
     parser.add_argument('--audit-report', type=str, default=None, metavar='FILE', help='配合 --audit-run：把完整审计报告写入指定 JSON 文件（默认只打印）；建议写在运行目录之外，或在归档前重新生成 artifact_manifest')
-    parser.add_argument('--audit-source', type=str, default=None, metavar='FILE', help='配合 --audit-run：核对归档源码的 SHA-256 是否等于运行记录中的 script_sha256（防止源码包与结果不匹配）')
+    parser.add_argument('--audit-source', type=str, default=None, metavar='FILE_OR_DIR', help='配合 --audit-run：文件时核对 SHA-256 是否等于 script_sha256；目录时按 experiment.py + exp/ + selfcheck/ 重算源码树指纹并核对 source_tree_sha256（防止源码包与结果不匹配）')
     parser.add_argument('--audit-data', type=str, default=None, metavar='FILE', help='配合 --audit-run：核对归档语料的 SHA-256 是否等于 config.data.sha256')
     parser.add_argument('--audit-preregistration', type=str, default=None, metavar='FILE', help='配合 --audit-run：核对预注册文件的 SHA-256 与关键字段是否仍与运行记录一致（发现运行后编辑预注册）')
     parser.add_argument('--audit-strict', action='store_true', help='配合 --audit-run：把可复现性证据不足的警告也判为失败（未固定 PYTHONHASHSEED、未启用确定性算子、git 工作区脏、缺少 artifact_manifest 等），用于正式归档前的硬门')
     parser.add_argument('--compare-factors', type=str, default=','.join(DEFAULT_COMPARISON_FACTORS), help='对比时允许跨运行不同的实验因子（逗号分隔）；其余协议项（优化器/学习率/训练步数/数据增强/数据指纹等）必须完全一致，否则报警。默认: ' + ','.join(DEFAULT_COMPARISON_FACTORS))
 
 def _MAIN_part_001():
-    global actual_manifest_sha, alpha, applied_fields, args, audit_error, audit_report, environment_error, error, expected_manifest_sha, group_separator_bytes, hashseed_error, lr, manifest_error, manifest_path, matches_expected, missing_pilot, omitted_modes, order_seed_message, parsed_factors, pilot_conflicts, prereg_power, preregistration_error, preregistration_payload, preregistration_sha256, report, report_path, seed, seed_message, suite_error, tuning_labels
+    global actual_manifest_sha, alpha, applied_fields, args, audit_error, audit_report, environment_error, error, expected_manifest_sha, group_separator_bytes, hashseed_error, lr, manifest_error, manifest_path, matches_expected, missing_pilot, omitted_modes, order_seed_message, parsed_factors, pilot_conflicts, prereg_power, preregistration_error, preregistration_payload, preregistration_sha256, report, report_path, seed, seed_message, source_error, source_report, suite_error, tuning_labels
     parser.add_argument('--compare-baseline', type=str, default=None, metavar='MODE', help='以指定模式作为基线，在统计报告中给出其余实验单元相对基线的差值（如 smelt 或 local_base）；同时核对基线是否真的强于无上下文 unigram 参考与调优好的 n-gram（稻草人守卫：战胜弱基线不能证明复杂模型的收益）')
     parser.add_argument('--compare-metric', type=str, default='val_loss', help='显著性检验使用的指标（默认 val_loss）；val_loss 来自验证集选中的 checkpoint，跨运行比较有选型偏差，建议同时/改用 val_loss_at_common_step（共同训练步数处的即时验证损失，不经过选型）、val_loss_curve_mean_to_common_step（共同窗口内的时均验证损失，用于 RQ1 收敛速度）或 val_loss_at_matched_flops（等训练计算量）；只允许 val 口径指标（测试集尘封协议：test 指标不参与跨运行对比与选择，只在单个运行的最终评估中出现）；可选: ' + ', '.join(COMPARISON_METRIC_KEYS))
     parser.add_argument('--common-step', type=float, default=None, metavar='STEP', help='预注册的共同训练步数，用于 <metric>_at_common_step 派生指标。默认取各运行最后一个周期验证步的最小值，该步由观察到的端点决定（早停/不等步数时与结果相关），不是选型无关口径；正式对比应在训练前固定该步')
@@ -156,6 +158,22 @@ def _MAIN_part_001():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     _normalize_clean_against_test(args)
+    source_error = source_mode_error(args)
+    if source_error is not None:
+        parser.error(source_error)
+    if args.print_source_fingerprint:
+        print(json.dumps(_json_safe(source_tree_fingerprint()), ensure_ascii=False, indent=2))
+        raise _SC_RETURN(None)
+    if args.check_source is not None:
+        try:
+            source_report = check_source_tree_against_run(Path(args.check_source))
+        except (OSError, ValueError) as error:
+            parser.error(f'--check-source 失败: {error}')
+        print_source_check(source_report)
+        print(json.dumps(_json_safe(source_report), ensure_ascii=False, indent=2))
+        if not source_report['ok']:
+            raise SystemExit(1)
+        raise _SC_RETURN(None)
     if args.compare_report is not None and args.compare is None:
         parser.error('--compare-report 只能配合 --compare 使用：它保存的是只读对比分析，不参与训练')
     audit_error = audit_mode_error(args)
@@ -224,7 +242,7 @@ def _MAIN_part_001():
             preregistration_payload, preregistration_sha256 = load_preregistration(args.preregistration)
         except ValueError as error:
             parser.error(str(error))
-        applied_fields, preregistration_error = preregistration_apply(args, preregistration_payload, current_commit=_git_output('rev-parse', 'HEAD'), working_tree_dirty=bool(_git_output('status', '--porcelain')), current_script_sha256=_script_sha256(), frozen_code_matches=preregistration_frozen_commit_status(str(preregistration_payload['frozen_commit'])))
+        applied_fields, preregistration_error = preregistration_apply(args, preregistration_payload, current_commit=_git_output('rev-parse', 'HEAD'), working_tree_dirty=bool(_git_output('status', '--porcelain')), current_script_sha256=_script_sha256(), current_source_tree_sha256=_source_tree_sha256(), frozen_code_matches=preregistration_frozen_commit_status(str(preregistration_payload['frozen_commit'])))
         if preregistration_error is not None:
             parser.error(preregistration_error)
         args.preregistration_record = preregistration_record(preregistration_payload, args.preregistration, preregistration_sha256, applied_fields, args)
@@ -412,7 +430,7 @@ def _MAIN_part_001():
         parser.error('--suite-baseline-tuning 至少需要两个不同的学习率候选（--baseline-tuning-lrs），单档网格不构成调参')
 
 def _MAIN_part_002():
-    global _, amp_change_error, amp_dtype, candidates_error, cfg, checkpoint_git_commit, checkpoint_script_sha256, code_changed, compare_analysis, compare_conflicts, compare_rows, conflicts, current_git_commit, current_script_sha256, current_value, dense_fnn_hidden, design, device, error, evidence_field, flag, formatted, formatter, hypothesis_error, integer, invalid, invalid_compare_paths, item, known_config_fields, numerical_error, out_dir, overwrite_error, plan, plan_root, preregistration_error, report, rng_payload, same_run_dir, saved_args, saved_config, saved_data_effective_train_sha256, saved_data_sha256, saved_data_split_isolation, saved_data_split_sha256, saved_data_test_fraction, saved_data_val_fraction, saved_masks, saved_numerical_state, saved_out, saved_value, scaler, schedule_field, start_step, unknown_config_fields, values
+    global _, amp_change_error, amp_dtype, candidates_error, cfg, checkpoint_git_commit, checkpoint_script_sha256, checkpoint_source_tree_sha256, code_changed, compare_analysis, compare_conflicts, compare_rows, conflicts, current_git_commit, current_script_sha256, current_source_tree_sha256, current_value, dense_fnn_hidden, design, device, error, evidence_field, flag, formatted, formatter, hypothesis_error, integer, invalid, invalid_compare_paths, item, known_config_fields, numerical_error, out_dir, overwrite_error, plan, plan_root, preregistration_error, report, rng_payload, same_run_dir, saved_args, saved_config, saved_data_effective_train_sha256, saved_data_sha256, saved_data_split_isolation, saved_data_split_sha256, saved_data_test_fraction, saved_data_val_fraction, saved_masks, saved_numerical_state, saved_out, saved_value, scaler, schedule_field, source_tree_changed, start_step, unknown_config_fields, values
     for flag, values, formatter, integer in (('--baseline-tuning-dense-hiddens', list(args.baseline_tuning_dense_hiddens), lambda value: f'h{value}', True), ('--baseline-tuning-weight-decays', list(args.baseline_tuning_weight_decays), lambda value: f'''wd{format(value, 'g')}''', False)):
         if not values:
             continue
@@ -554,15 +572,20 @@ def _MAIN_part_002():
         if saved_numerical_state.get('numerical_polluted'):
             parser.error(f'--resume 检查点 {args.resume} 标记为数值已污染：不能把受污染运行当作新的训练起点；请使用污染前的检查点或换全新目录重跑')
         checkpoint_script_sha256 = rng_payload.get('script_sha256')
+        checkpoint_source_tree_sha256 = rng_payload.get('source_tree_sha256')
         checkpoint_git_commit = rng_payload.get('git_commit')
         current_script_sha256 = _script_sha256()
+        current_source_tree_sha256 = _source_tree_sha256()
         current_git_commit = _git_output('rev-parse', 'HEAD')
         code_changed = bool(isinstance(checkpoint_script_sha256, str) and isinstance(current_script_sha256, str) and checkpoint_script_sha256 and current_script_sha256 and (checkpoint_script_sha256 != current_script_sha256))
+        source_tree_changed = bool(isinstance(checkpoint_source_tree_sha256, str) and isinstance(current_source_tree_sha256, str) and checkpoint_source_tree_sha256 and current_source_tree_sha256 and (checkpoint_source_tree_sha256 != current_source_tree_sha256))
         if code_changed:
             print(f'[repro] [warn] resume 检查点由另一份 experiment.py 保存（checkpoint script_sha256={checkpoint_script_sha256[:12]}..., current={current_script_sha256[:12]}...）：两次不同代码版本的参数被接在一起，训练轨迹不是任何单一代码版本的产物；如需可归因的结论，请用全新 --out 目录从头训练。')
-        if isinstance(checkpoint_git_commit, str) and isinstance(current_git_commit, str) and checkpoint_git_commit and current_git_commit and (checkpoint_git_commit != current_git_commit) and (not code_changed):
-            print(f'[repro] [note] resume checkpoint git commit {checkpoint_git_commit[:12]}... 与当前 {current_git_commit[:12]}... 不同（实验脚本内容一致）；请确认差异来自与本实验无关的文件。')
-        args.resume_code_provenance = {'checkpoint_script_sha256': checkpoint_script_sha256, 'checkpoint_git_commit': checkpoint_git_commit, 'current_script_sha256': current_script_sha256, 'current_git_commit': current_git_commit, 'code_changed': code_changed}
+        if source_tree_changed:
+            print(f'[repro] [warn] resume 检查点由另一份完整源码树保存（checkpoint source_tree_sha256={checkpoint_source_tree_sha256[:12]}..., current={current_source_tree_sha256[:12]}...）：exp/ 或 selfcheck/ 的实现已在两次运行之间改变，训练轨迹不是任何单一实现版本的产物；如需可归因的结论，请用全新 --out 目录从头训练。')
+        if isinstance(checkpoint_git_commit, str) and isinstance(current_git_commit, str) and checkpoint_git_commit and current_git_commit and (checkpoint_git_commit != current_git_commit) and (not code_changed) and (not source_tree_changed):
+            print(f'[repro] [note] resume checkpoint git commit {checkpoint_git_commit[:12]}... 与当前 {current_git_commit[:12]}... 不同（运行时代码内容一致）；请确认差异来自与本实验无关的文件。')
+        args.resume_code_provenance = {'checkpoint_script_sha256': checkpoint_script_sha256, 'checkpoint_source_tree_sha256': checkpoint_source_tree_sha256, 'checkpoint_git_commit': checkpoint_git_commit, 'current_script_sha256': current_script_sha256, 'current_source_tree_sha256': current_source_tree_sha256, 'current_git_commit': current_git_commit, 'code_changed': code_changed, 'source_tree_changed': source_tree_changed}
         saved_args = rng_payload.get('args', {})
         if isinstance(saved_args, dict):
             saved_out = saved_args.get('out')

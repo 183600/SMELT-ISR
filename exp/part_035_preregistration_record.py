@@ -227,6 +227,13 @@ def preregistration_record(
         "frozen_script_sha256": payload.get(
             "frozen_script_sha256"
         ),
+        # 完整源码树锚点：预注册声明值（如有）与当前实际
+        # 指纹一并落盘。只记录 experiment.py 的 sha256 无法
+        # 证明 exp/ 实现在训练前后未变。
+        "frozen_source_tree_sha256": payload.get(
+            "frozen_source_tree_sha256"
+        ),
+        "source_tree_sha256": _source_tree_sha256(),
         "primary_metric": payload.get("primary_metric"),
         "common_step": payload.get("common_step"),
         "direction": payload.get("direction"),

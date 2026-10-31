@@ -892,14 +892,18 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     保证实验可追溯：代码版本 + 环境 + 超参数 + 种子 +
     数据指纹（args.data_sha256）+ 训练曲线（metrics.jsonl）。
 
-    代码版本有三层记录：git commit（仓库可用时）、
+    代码版本有四层记录：git commit（仓库可用时）、
     git_diff_sha256（工作区脏时对 git diff HEAD 的指纹，
-    用于区分同一 commit 的不同未提交状态）与
-    script_sha256（脚本文件本身的指纹，不依赖 git，
-    覆盖压缩包运行与脏工作区两种 commit 无法定位代码的场景）。
+    用于区分同一 commit 的不同未提交状态）、script_sha256
+    （入口 experiment.py 的指纹，兼容旧检查点/预注册）与
+    source_tree_sha256（experiment.py + exp/ + selfcheck/
+    全部运行时代码的确定性指纹，不依赖 git）。项目拆分后
+    训练/统计实现都在 exp/，只有源码树指纹能证明重跑、续跑
+    或归档核对使用的是同一份完整实现。
     """
     commit = _git_output("rev-parse", "HEAD")
     status = _git_output("status", "--porcelain")
+    source_tree = source_tree_fingerprint()
 
     git_dirty = bool(status) if status is not None else None
 
@@ -985,6 +989,13 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
         "git_dirty": git_dirty,
         "git_diff_sha256": git_diff_sha256,
         "script_sha256": _script_sha256(),
+        # 完整运行时代码身份：入口 + exp/ + selfcheck/。旧运行
+        # 没有该字段时保持缺失，由对比/审计显式标为「未核对」，
+        # 不能把缺失当成一致。
+        "source_tree_sha256": source_tree.get("sha256"),
+        "source_tree_schema": source_tree.get("schema"),
+        "source_tree_file_count": source_tree.get("file_count"),
+        "source_tree": source_tree,
         # 环境身份：决定数值结果的关键依赖/编译选项/设备/确定性
         # 开关的规范化 SHA-256。同环境同代码的运行应一致；换
         # CUDA/cuBLAS/MKL/Triton/CPU 指令集或线程配置会改变它。

@@ -217,6 +217,119 @@ class ReproducibilityTests(unittest.TestCase):
             )
             self.assertIsNone(provenance["run_started_utc"])
             self.assertEqual(provenance["resume_count"], 0)
+            self.assertIsNone(
+                provenance["original_source_tree_sha256"]
+            )
+
+    def test_source_tree_fingerprint_is_location_independent(self):
+        def _write_tree(root, body):
+            root.mkdir(parents=True)
+            (root / "exp").mkdir()
+            (root / "selfcheck").mkdir()
+            (root / "experiment.py").write_text(
+                "print('entry')\n", encoding="utf-8"
+            )
+            (root / "exp" / "part_000.py").write_text(
+                body, encoding="utf-8"
+            )
+            (root / "selfcheck" / "checks_001.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first"
+            second = Path(tmp) / "second"
+            _write_tree(first, "VALUE = 1\n")
+            _write_tree(second, "VALUE = 1\n")
+            one = experiment.source_tree_fingerprint(first)
+            two = experiment.source_tree_fingerprint(second)
+            self.assertTrue(one["available"], one)
+            self.assertEqual(one["sha256"], two["sha256"])
+            self.assertEqual(one["file_count"], 3)
+            self.assertEqual(
+                [entry["path"] for entry in one["files"]],
+                [
+                    "exp/part_000.py",
+                    "experiment.py",
+                    "selfcheck/checks_001.py",
+                ],
+            )
+
+            (second / "exp" / "part_000.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            changed = experiment.source_tree_fingerprint(second)
+            self.assertNotEqual(one["sha256"], changed["sha256"])
+            differences = experiment.source_tree_differences(
+                one, changed
+            )
+            self.assertEqual(
+                differences["changed"], ["exp/part_000.py"]
+            )
+            self.assertEqual(differences["added"], [])
+            self.assertEqual(differences["removed"], [])
+
+    def test_source_tree_detects_added_and_removed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "exp").mkdir()
+            (root / "experiment.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "exp" / "a.py").write_text(
+                "A = 1\n", encoding="utf-8"
+            )
+            before = experiment.source_tree_fingerprint(root)
+            (root / "exp" / "a.py").unlink()
+            (root / "exp" / "b.py").write_text(
+                "B = 1\n", encoding="utf-8"
+            )
+            after = experiment.source_tree_fingerprint(root)
+            differences = experiment.source_tree_differences(
+                before, after
+            )
+            self.assertEqual(differences["removed"], ["exp/a.py"])
+            self.assertEqual(differences["added"], ["exp/b.py"])
+
+    def test_source_tree_check_rejects_missing_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps({
+                    "run_metadata": {
+                        "script_sha256": "d" * 64,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            report = experiment.check_source_tree_against_run(
+                run_dir
+            )
+            self.assertFalse(report["ok"])
+            self.assertIn("source_tree_sha256", report["error"])
+
+    def test_source_tree_check_uses_full_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps({
+                    "run_metadata": {
+                        "source_tree_sha256": "a" * 64,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            report = experiment.check_source_tree_against_run(
+                run_dir
+            )
+            self.assertTrue(report["current_source_tree"]["available"])
+            self.assertEqual(
+                report["recorded_sha256"], "a" * 64
+            )
+            self.assertFalse(report["ok"])
+            self.assertTrue(report["error"])
 
     def test_non_expert_digest_tracks_parameter_updates(self):
         model = experiment.LanguageModel(_tiny_config())

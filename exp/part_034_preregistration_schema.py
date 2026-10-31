@@ -535,6 +535,18 @@ def preregistration_schema_error(
     ):
         return "frozen_script_sha256 必须是 64 位十六进制 SHA-256"
 
+    frozen_source = payload.get(
+        "frozen_source_tree_sha256", _PREREGISTRATION_MISSING
+    )
+    if (
+        frozen_source is not _PREREGISTRATION_MISSING
+        and not _preregistration_sha256_text(frozen_source)
+    ):
+        return (
+            "frozen_source_tree_sha256 必须是 64 位十六进制 "
+            "SHA-256"
+        )
+
     data = payload.get("data")
     if not isinstance(data, dict):
         return "data 必须是对象"
@@ -735,8 +747,10 @@ def preregistration_frozen_commit_status(
     预注册文件本身通常要在记录 ``frozen_commit`` 之后提交，
     因此 HEAD 必然比冻结提交多一个（或多个只改预注册/文档的）
     提交；要求二者完全相等会让协议无法执行。这里允许
-    ``frozen_commit`` 是 HEAD 的祖先，但要求
-    ``experiment.py`` 从冻结提交到 HEAD 逐字节未变。任何代码
+    ``frozen_commit`` 是 HEAD 的祖先，但要求运行时代码
+    （``experiment.py``、``exp/``、``selfcheck/``）从冻结提交
+    到 HEAD 逐字节未变。只比较入口脚本会让冻结后修改 ``exp/``
+    实现的提交静默通过，等于没有冻结实验代码。任何运行时代码
     变更都返回 False；git 不可用/提交不存在时返回 None。
     """
     head = _git_output("rev-parse", "HEAD")
@@ -775,6 +789,8 @@ def preregistration_frozen_commit_status(
                 "HEAD",
                 "--",
                 "experiment.py",
+                "exp",
+                "selfcheck",
             ],
             cwd=repository,
             capture_output=True,
@@ -794,6 +810,7 @@ def preregistration_apply(
     current_commit: Optional[str] = None,
     working_tree_dirty: Optional[bool] = None,
     current_script_sha256: Optional[str] = None,
+    current_source_tree_sha256: Optional[str] = None,
     frozen_code_matches: Optional[bool] = None,
 ) -> Tuple[List[str], Optional[str]]:
     """
@@ -807,7 +824,8 @@ def preregistration_apply(
     - ``--seed`` 允许只跑预注册中的一个臂/一个种子；``--seeds``
       必须与预注册种子集合完全一致；二者都未给出时按预注册
       种子集合运行完整套件；
-    - 冻结提交、工作区脏状态与脚本指纹不一致时拒绝启动。
+    - 冻结提交、工作区脏状态、入口脚本指纹或完整源码树
+      指纹不一致时拒绝启动。
 
     返回 ``(applied_fields, error)``。
     """
@@ -916,6 +934,26 @@ def preregistration_apply(
                 "当前 experiment.py 的 SHA-256 与预注册 "
                 "frozen_script_sha256 不一致：同一 commit 的"
                 "脚本内容也必须是冻结内容"
+            )
+
+    expected_source_tree = payload.get(
+        "frozen_source_tree_sha256"
+    )
+    if expected_source_tree is not None:
+        if current_source_tree_sha256 is None:
+            return applied, (
+                "预注册声明了 frozen_source_tree_sha256，但无法"
+                "读取当前完整源码树指纹（experiment.py + exp/ + "
+                "selfcheck/）：不能把未核对的实现当作冻结版本"
+            )
+        if (
+            str(expected_source_tree).lower()
+            != str(current_source_tree_sha256).lower()
+        ):
+            return applied, (
+                "当前源码树指纹与预注册 frozen_source_tree_sha256"
+                " 不一致：exp/ 或 selfcheck/ 的实现已在冻结后"
+                "被修改；只核对 experiment.py 无法发现这类改动"
             )
 
     for attr, key in (
