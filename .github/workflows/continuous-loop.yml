@@ -496,8 +496,11 @@ jobs:
 
           commit_and_push() {
             # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
-            git checkout HEAD -- .github 2>/dev/null || true
-            git clean -fdq .github 2>/dev/null || true
+            # ⭐ 只回滚 .github/workflows（CI 配置）；.github/.loop-phase 是阶段轮换
+            # 状态文件，必须保留——若整目录回滚 .github，状态永远无法持久化，
+            # 阶段会一直停在 bug，无法轮换到 sci/apply/perf（参照 cage-attention）。
+            git checkout HEAD -- .github/workflows 2>/dev/null || true
+            git clean -fdq .github/workflows 2>/dev/null || true
             ensure_readme
             rm -f .opencode_issues.md
             git add -A || true
@@ -508,8 +511,11 @@ jobs:
 
           on_shutdown() {
             echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
-            git checkout HEAD -- .github 2>/dev/null || true
-            git clean -fdq .github 2>/dev/null || true
+            # ⭐ 只回滚 .github/workflows（CI 配置）；.github/.loop-phase 是阶段轮换
+            # 状态文件，必须保留——若整目录回滚 .github，状态永远无法持久化，
+            # 阶段会一直停在 bug，无法轮换到 sci/apply/perf（参照 cage-attention）。
+            git checkout HEAD -- .github/workflows 2>/dev/null || true
+            git clean -fdq .github/workflows 2>/dev/null || true
             ensure_readme
             rm -f .opencode_issues.md
             git add -A || true
@@ -879,8 +885,9 @@ jobs:
         if: always()
         run: |
           set +e
-          git checkout HEAD -- .github 2>/dev/null || true
-          git clean -fdq .github 2>/dev/null || true
+          # ⭐ 同上：只回滚 .github/workflows，保留 .github/.loop-phase 阶段状态
+          git checkout HEAD -- .github/workflows 2>/dev/null || true
+          git clean -fdq .github/workflows 2>/dev/null || true
           # 防删自愈：收尾提交前恢复被删的 README.md
           if [ ! -f "README.md" ]; then
             if git show HEAD:README.md > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
