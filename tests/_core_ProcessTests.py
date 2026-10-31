@@ -820,6 +820,75 @@ class ProcessTests(unittest.TestCase):
             ]
         )
 
+    def test_ablation_rejects_extra_declared_factor_as_single_factor(self):
+        # n_kv_heads 被允许显式声明为实验因子；一旦声明，受控
+        # 变量检查就不再把它当违规。但消融的主效应/交互只允许
+        # mode × balance_coef 两轴，额外因子在单元间变化时仍是
+        # 多因子对比，必须由覆盖检查拦下。
+        def rows_with_kv_heads(values):
+            rows = []
+            for mode in ("local_base", "A"):
+                for balance in (0.0, 0.01):
+                    for seed in (42, 43, 44):
+                        rows.append({
+                            "run": f"{mode}_{balance}_{seed}",
+                            "mode": mode,
+                            "balance_coef": balance,
+                            "seed": seed,
+                            "k1": 2,
+                            "k2": 2,
+                            "top_k": 2,
+                            "residual_scale": 1.0,
+                            "n_kv_heads": values[mode],
+                        })
+            return rows
+
+        factors = [
+            "mode",
+            "balance_coef",
+            "seed",
+            "n_kv_heads",
+        ]
+        confounded = experiment.ablation_coverage(
+            rows_with_kv_heads({"local_base": 4, "A": 2}),
+            factors,
+            ["A"],
+        )
+        self.assertTrue(
+            any(
+                "n_kv_heads" in message
+                for message in confounded["structural_confounds"]
+            ),
+            confounded["structural_confounds"],
+        )
+        factorial = {
+            "effects": [{
+                "effect_name": "delayed_merge_main",
+                "claim": "supports_component",
+            }],
+        }
+        experiment.annotate_factorial_confounds(
+            factorial,
+            {"ok": True, "unchecked_keys": []},
+            confounded,
+        )
+        self.assertEqual(
+            factorial["effects"][0]["claim"], "confounded"
+        )
+
+        single_factor = experiment.ablation_coverage(
+            rows_with_kv_heads({"local_base": 4, "A": 4}),
+            factors,
+            ["A"],
+        )
+        self.assertFalse(
+            any(
+                "n_kv_heads" in message
+                for message in single_factor["structural_confounds"]
+            ),
+            single_factor["structural_confounds"],
+        )
+
     def test_ngram_bootstrap_honours_block_size(self):
         data = torch.tensor(
             [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],

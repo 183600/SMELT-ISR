@@ -241,6 +241,37 @@ def ablation_coverage(
             "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
         )
 
+    # 全因子设计只允许 mode × balance_coef 两轴变化。调用方若
+    # 把其它键显式声明为实验因子（如 n_kv_heads、split_policy），
+    # 受控变量检查会因「已声明因子」跳过它们；这些键在消融
+    # 单元间实际变化时，主效应/交互同样不是单因子对比，必须在
+    # 这里按实际取值再核对一次。
+    ablation_rows = [
+        row
+        for row in rows
+        if str(_row_factor_value(row, "mode")) in ablation_related
+    ]
+    design_axes = {
+        "mode",
+        "balance_coef",
+        "seed",
+        *_ABLATION_STRUCTURAL_KEYS,
+    }
+    for factor in factors:
+        if factor in design_axes:
+            continue
+        values = {
+            _stable_factor_key(_row_factor_value(row, factor))
+            for row in ablation_rows
+        }
+        if len(values) <= 1:
+            continue
+        report["structural_confounds"].append(
+            f"声明的实验因子 {factor} 在消融单元间也发生变化"
+            f"（{len(values)} 个取值）：延迟合并/均衡损失的主效应"
+            "与交互不是单因子对比，不能归因到待验证的设计上"
+        )
+
     # 均衡损失轴自身必须只有一档开启值：A 与 B 的开启臂若用了
     # 不同 balance_coef，方案比较会混入均衡强度差异。
     if len(balance_values_on) > 1:
