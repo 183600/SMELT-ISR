@@ -1496,9 +1496,10 @@ def preregistration_analysis_coverage(
     else:
         declared_sha = data.get("sha256")
         declared_policy = data.get("split_policy")
-        declared_group = data.get(
-            "group_separator", _PREREGISTRATION_MISSING
-        )
+        # 未声明 group_separator 等价于「不使用群组切分」；
+        # 与 preregistration_data_error 的口径保持一致，否则
+        # 预注册后补加 --group-separator 的运行会绕过覆盖核对。
+        declared_group = data.get("group_separator")
         declared_cleaning = data.get("cleaning")
         if not isinstance(declared_cleaning, dict):
             declared_cleaning = {}
@@ -1553,35 +1554,34 @@ def preregistration_analysis_coverage(
                             "actual": protocol.get(key),
                         }
                     )
-            if declared_group is not _PREREGISTRATION_MISSING:
-                actual_group = protocol.get("group_separator")
-                try:
-                    declared_bytes = (
-                        None
-                        if declared_group is None
-                        else parse_group_separator(
-                            str(declared_group)
-                        )
+            actual_group = protocol.get("group_separator")
+            try:
+                declared_bytes = (
+                    None
+                    if declared_group is None
+                    else parse_group_separator(
+                        str(declared_group)
                     )
-                    actual_bytes = (
-                        None
-                        if actual_group is None
-                        else parse_group_separator(
-                            str(actual_group)
-                        )
+                )
+                actual_bytes = (
+                    None
+                    if actual_group is None
+                    else parse_group_separator(
+                        str(actual_group)
                     )
-                except ValueError:
-                    declared_bytes = object()
-                    actual_bytes = object()
-                if declared_bytes != actual_bytes:
-                    data_mismatches.append(
-                        {
-                            "run": label,
-                            "field": "group_separator",
-                            "declared": declared_group,
-                            "actual": actual_group,
-                        }
-                    )
+                )
+            except ValueError:
+                declared_bytes = object()
+                actual_bytes = object()
+            if declared_bytes != actual_bytes:
+                data_mismatches.append(
+                    {
+                        "run": label,
+                        "field": "group_separator",
+                        "declared": declared_group,
+                        "actual": actual_group,
+                    }
+                )
             for key in _PREREGISTRATION_CLEANING_BOOL_KEYS:
                 if key in _CLEAN_AGAINST_TEST_ALIASES:
                     continue

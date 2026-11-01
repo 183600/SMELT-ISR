@@ -1030,6 +1030,22 @@ class PreregistrationCoverageTests(unittest.TestCase):
             "data_sha256",
         )
 
+    def test_rejects_undeclared_group_separator_in_analysis(self):
+        # 预注册未声明 group_separator 等于不使用群组切分；
+        # 运行却用了分隔符时必须判为数据协议漂移，不能因为
+        # 预注册文件省略了该字段就跳过核对。
+        rows = self._rows()
+        for row in rows:
+            row["protocol"]["group_separator"] = "\\n\\n"
+        coverage = self._coverage(rows)
+        self.assertFalse(coverage["ok"])
+        self.assertTrue(
+            any(
+                item["field"] == "group_separator"
+                for item in coverage["data_mismatches"]
+            )
+        )
+
     def test_rejects_source_tree_drift(self):
         payload = self._payload()
         payload["frozen_source_tree_sha256"] = "d" * 64
