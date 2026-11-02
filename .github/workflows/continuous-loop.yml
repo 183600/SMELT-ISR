@@ -368,7 +368,7 @@ jobs:
             # 是未关闭的管道，opencode 将永久阻塞：无任何输出、被 timeout 杀掉，
             # 表现为「冒烟测试失败/超时」。接 /dev/null 立即 EOF，位置参数传参不受影响。
             # NVIDIA 重度推理模型给足冒烟时间；免费池快速失败（网关挂起时省时）
-            local st=90; case "$m" in nvidia/*) st=300 ;; esac
+            local st=90; case "$m" in nvidia/*) st=75 ;; esac
             # shellcheck disable=SC2086
             timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" < /dev/null > /tmp/smoke_test.log 2>&1
             local rc=$?
@@ -381,6 +381,23 @@ jobs:
             return "$rc"
           }
 
+          # ⭐ 模型策略（2026-11-02 diag v7b 对 NVIDIA 85 模型 + opencode 免费 130 模型全量实测）：
+          #   1) 优先 z-ai/glm-5.3-flash（实测可用：冒烟 43s/工具 136s，波动大偶尔慢，由看门狗兜底）；
+          #   2) 8 个验证池模型（60s 冒烟+工具调用双通过）每次 run 随机轮换（"所有模型随机"策略）；
+          #   3) opencode 免费网关 130 个模型已全部实测失败，仅留 deepseek/glm/pickle 三席兜底（若复活自动可用）。
+          # deepseek-ai/deepseek-v4.1-flash 三次实测挂死（303s 空响应 / 300s / 240s 超时），永久排除。
+          NV_FIRST="nvidia/z-ai/glm-5.3-flash"
+          NV_POOL=(
+            "nvidia/poolside/laguna-xs-2.1"
+            "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"
+            "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"
+            "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
+            "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+            "nvidia/minimaxai/minimax-m3.1-flash"
+            "nvidia/meta/muse-glimmer-30b"
+            "nvidia/meta/llama-3.2-90b-vision-instruct"
+          )
+
           detect_provider() {
             local pass cand model
             for pass in 1 2; do
@@ -389,14 +406,17 @@ jobs:
               #   → minimax-m3.1-flash → step-5-preview；其后 Zen 免费池兜底
               #   （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
               # 不再使用 DeepSeek 官方 API。
-              for cand in nv-ds nv-glm nv-glm2 nv-mmx nv-step free glm pickle; do
+                            # ⭐ glm 优先 + 验证池随机轮换（每次 run 打乱，实现所有可用模型随机）
+              mapfile -t NV_SHUF < <(printf '%s\n' "${NV_POOL[@]}" | shuf)
+              NV_CANDS=(nv-first)
+              _i=0
+              for _m in "${NV_SHUF[@]}"; do _i=$((_i+1)); NV_CANDS+=("nv-r${_i}"); done
+              NV_CANDS+=(free glm pickle)
+              for cand in "${NV_CANDS[@]}"; do
                 is_broken "$cand" && continue
                 case "$cand" in
-                  nv-ds)   model="nvidia/deepseek-ai/deepseek-v4.1-flash" ;;
-                  nv-glm)  model="nvidia/z-ai/glm-5.3-flash" ;;
-                  nv-glm2) model="nvidia/z-ai/glm-5.3" ;;
-                  nv-mmx)  model="nvidia/minimaxai/minimax-m3.1-flash" ;;
-                  nv-step) model="nvidia/stepfun-ai/step-5-preview" ;;
+                  nv-first) model="$NV_FIRST" ;;
+                  nv-r*)    _i="${cand#nv-r}"; model="${NV_SHUF[$((_i-1))]}" ;;
                   free)   model="$FREE_MODEL" ;;
                   glm)    model="$GLM_MODEL" ;;
                   pickle) model="$PICKLE_MODEL" ;;
