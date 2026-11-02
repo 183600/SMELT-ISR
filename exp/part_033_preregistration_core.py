@@ -70,6 +70,7 @@ _PREREGISTRATION_OPTIONAL_FIELDS = (
     "frozen_source_tree_sha256",
     "power",
     "run_order",
+    "compute_budget",
     "notes",
     "metadata",
 )
@@ -97,6 +98,13 @@ _POWER_KEYS = (
     "underpowered_acknowledged",
     "justification",
 )
+
+
+# 预注册的**训练墙钟预算**（compute_budget）。设计计划会用
+# 试点运行实测步耗时外推总训练墙钟；声明上限后，正式套件在
+# 第一个子进程前核对估计是否超限，避免把算力预算不足的设计
+# 跑到一半才发现。
+_COMPUTE_BUDGET_KEYS = ("max_total_training_hours",)
 
 
 _RUN_ORDER_KEYS = ("scheme", "seed")

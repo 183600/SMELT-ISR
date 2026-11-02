@@ -728,6 +728,7 @@ _SWEEP_BOOL_FLAGS = (
     "--suite-ablation",
     "--suite-baseline-tuning",
     "--allow-underpowered",
+    "--allow-over-compute-budget",
     "--allow-partial-ablation",
     "--plan-design",
     "--sweep-stop-on-failure",

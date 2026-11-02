@@ -136,6 +136,7 @@ def _MAIN_part_001():
     parser.add_argument('--ablation-modes', nargs='+', choices=sorted(_DELAYED_MERGE_MODES), default=None, metavar='MODE', help='配合 --suite-ablation：声明本轮消融必须覆盖的延迟合并方案（默认 A B）；只跑部分方案时结论只能覆盖已跑方案，覆盖检查会按声明核对')
     parser.add_argument('--allow-partial-ablation', action='store_true', help='显式允许 --suite-ablation 只覆盖 --ablation-modes 声明的部分延迟合并方案（阶段性调试用）。报告会记录 partial 与未覆盖的项目方案；正式结论仍须覆盖 A 与 B 全部方案')
     parser.add_argument('--allow-underpowered', action='store_true', help='显式允许套件在少于 3 个随机种子下运行（低统计功效，仅用于冒烟/调试；关键结论不得据此做显著性主张，豁免会记录进报告）')
+    parser.add_argument('--allow-over-compute-budget', action='store_true', help='显式允许套件在训练墙钟估计超出预注册 compute_budget.max_total_training_hours 时运行（豁免随报告落盘；正确做法是调整设计或更新预注册后重新冻结）')
     parser.add_argument('--suite-baseline-tuning', action='store_true', help='配合 --seeds：对简单基线（--baseline-tuning-mode）做预注册的学习率网格搜索（--baseline-tuning-lrs，训练配置固定），在 val 上选 winner 并写出 baseline_tuning.json；没调过参的弱基线只能证明复杂模型比稻草人强')
     parser.add_argument('--baseline-tuning-lrs', nargs='+', type=float, default=list(_DEFAULT_BASELINE_TUNING_LRS), help='基线调参的学习率候选网格（默认 ' + ' '.join((format(lr, 'g') for lr in _DEFAULT_BASELINE_TUNING_LRS)) + '）；候选之间只有学习率不同，其余设置逐项一致')
     parser.add_argument('--baseline-tuning-mode', type=str, default='dense', choices=sorted(Config.MODEL_MODES), help='基线调参的模式（默认 dense：最简单的神经基线；先调强简单基线，再谈复杂模型）')

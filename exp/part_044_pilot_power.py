@@ -226,6 +226,7 @@ def build_pilot_power_evidence(
     planned_modes: Optional[Sequence[object]] = None,
     expected_protocol: Optional[Dict[str, object]] = None,
     calibration_confidence: float = _PILOT_DEFAULT_CONFIDENCE,
+    rows: Optional[Sequence[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """从试点/先前运行估计配对差值 sd 与脱落率，并对照声明值。
 
@@ -259,7 +260,10 @@ def build_pilot_power_evidence(
     if confidence is None or not 0.5 < confidence < 1.0:
         confidence = _PILOT_DEFAULT_CONFIDENCE
     paths = [str(path) for path in pilot_runs]
-    rows = compare_runs(paths)
+    if rows is None:
+        rows = compare_runs(paths)
+    # ``rows`` 允许调用方复用同一次 compare_runs 结果：设计计划
+    # 还要用同一批试点运行估计墙钟成本，重复读盘没有必要。
 
     annotation_report: Optional[Dict[str, object]] = None
     if metric in _COMMON_STEP_METRICS:
@@ -1273,6 +1277,260 @@ def _pilot_gate_note(evidence: object) -> str:
         + "。"
     )
 
+
+
+def _data_file_preflight(
+    args: argparse.Namespace,
+    prereg: Optional[Dict[str, object]],
+    tokens_per_run: int,
+    n_runs: int,
+) -> Dict[str, object]:
+    """设计阶段的数据文件预检（只读字节流，不加载语料）。
+
+    ``--plan-design`` 不加载数据，因此此前「语料与预注册指纹
+    不符」「语料缺失」「token 预算相对 train 切分过多/过少」
+    都要等到正式训练加载数据（或更晚的 scale_guard）才会暴露：
+    设计可能已经冻结、算力可能已经排上。这里在写设计计划前
+    对语料做一次流式 SHA-256：文件缺失或与预注册
+    ``data.sha256`` 不符时直接拒绝冻结设计；同时按字节级
+    tokenizer 的口径（token 数 ≈ 字节数）估计计划的 epoch
+    预算，把「同一批训练字节被重复训练多遍」这类设计层问题
+    提前变成可核对的证据。
+
+    该块写入 ``training_budget.data_file`` 并参与 ``plan_id``：
+    设计计划因此绑定到它要运行的那份语料，事后换语料会改变
+    指纹，不能伪装成同一份设计。
+    """
+    data_path = getattr(args, "data", None)
+    if not data_path:
+        return {
+            "available": False,
+            "reason": "data_path_not_provided",
+            "note": (
+                "本次设计预检未提供 --data：计划不绑定语料指纹，"
+                "正式训练入口仍会核对预注册 data.sha256；建议在"
+                "冻结设计前带上 --data 完成预检"
+            ),
+        }
+    path = Path(data_path)
+    if not path.is_file():
+        raise ValueError(
+            f"--data 语料文件不存在: {path}；设计预检拒绝冻结"
+            "一个没有语料的计划。请核对路径，或确认语料已就位"
+            "后再生成设计计划"
+        )
+    size_bytes = int(path.stat().st_size)
+    sha256 = _sha256_file(path)
+    prereg_data = (
+        prereg.get("data") if isinstance(prereg, dict) else None
+    )
+    declared_sha256: Optional[str] = None
+    if isinstance(prereg_data, dict):
+        declared = prereg_data.get("sha256")
+        if isinstance(declared, str) and declared.strip():
+            declared_sha256 = declared.strip().lower()
+    matches_preregistration: Optional[bool] = None
+    if declared_sha256 is not None:
+        matches_preregistration = sha256 == declared_sha256
+        if not matches_preregistration:
+            raise ValueError(
+                "--data 语料文件与预注册 data.sha256 不一致"
+                f"（实际 {sha256}，预注册声明 {declared_sha256}）："
+                "设计计划不能绑定到与预注册不同的语料。请核对"
+                "语料版本；若确要换语料，属于新研究阶段，必须"
+                "更新预注册并重新冻结，不能沿用旧设计"
+            )
+    prereg_fractions = (
+        prereg_data if isinstance(prereg_data, dict) else {}
+    )
+    val_fraction = _finite_float(
+        prereg_fractions.get(
+            "val_fraction", getattr(args, "val_fraction", None)
+        )
+    )
+    test_fraction = _finite_float(
+        prereg_fractions.get(
+            "test_fraction", getattr(args, "test_fraction", None)
+        )
+    )
+    if val_fraction is None or not 0.0 <= val_fraction < 1.0:
+        val_fraction = 0.05
+    if test_fraction is None or not 0.0 <= test_fraction < 1.0:
+        test_fraction = 0.05
+    train_fraction = max(0.0, 1.0 - val_fraction - test_fraction)
+    estimated_train_bytes = int(size_bytes * train_fraction)
+    epochs_per_run: Optional[float] = None
+    total_epochs: Optional[float] = None
+    if estimated_train_bytes > 0 and tokens_per_run > 0:
+        epochs_per_run = tokens_per_run / estimated_train_bytes
+        if n_runs > 0:
+            total_epochs = epochs_per_run * int(n_runs)
+    warnings: List[str] = []
+    if epochs_per_run is not None:
+        if epochs_per_run > 1.0:
+            warnings.append(
+                "计划 token 预算约为 train 切分的 "
+                f"{epochs_per_run:.2f} 个 epoch：同一批训练字节会被"
+                "重复训练多遍。若这是有意的预算决策，请在预注册 "
+                "notes 中写明；否则请减少 steps 或扩大语料"
+            )
+        elif epochs_per_run < 1.0:
+            warnings.append(
+                "计划 token 预算不足 train 切分的 1 个 epoch"
+                f"（约 {epochs_per_run:.3f}）：与运行期 scale_guard "
+                "的 prototype 口径一致，结论只能支持原型可行性，"
+                "不能外推到大规模设置"
+            )
+    return {
+        "available": True,
+        "path": str(path),
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+        "preregistration_sha256": declared_sha256,
+        "matches_preregistration": matches_preregistration,
+        "val_fraction": val_fraction,
+        "test_fraction": test_fraction,
+        "estimated_train_fraction": train_fraction,
+        "estimated_train_bytes": estimated_train_bytes,
+        "tokens_per_run": int(tokens_per_run),
+        "planned_runs": int(n_runs),
+        "estimated_epochs_per_run": epochs_per_run,
+        "estimated_total_epochs": total_epochs,
+        "warnings": warnings,
+        "note": (
+            "字节级 tokenizer 下 token 数≈字节数；train 切分字节"
+            "按文件占比估计，未计入群组切分吸附与训练集清洗"
+            "（两者只会减少有效训练字节，因此 epoch 估计是下界）。"
+            "epoch 估计回答「这份预算会反复训练同一批字节多少遍」，"
+            "不评估收敛充分性"
+        ),
+    }
+
+
+def _wall_clock_estimate(
+    args: argparse.Namespace,
+    plan: Sequence[Dict[str, object]],
+    pilot_rows: Optional[Sequence[Dict[str, object]]],
+) -> Dict[str, object]:
+    """用试点运行的效率记录外推计划的训练墙钟预算。
+
+    解析 token 预算回答不了「这个设计要占多少算力」：同一份
+    token 预算在原型与论文规模上的墙钟差几个量级，而算力申请
+    与排期都按墙钟计。每个已完成的运行都会在 config.json 写出
+    ``efficiency.training_ms_per_step``（前向+反向的中位计时），
+    试点运行因此携带可复用的实测步耗时。这里按 mode 汇总试点
+    观测（取最大值，偏保守），乘以计划步数与各 mode 的运行数，
+    得到每运行与总的训练墙钟估计，供设计阶段对照算力预算。
+
+    口径与限制：估计只覆盖前向+反向，不含优化器更新、评估、
+    checkpoint I/O 与排队；假设正式运行与试点在同一硬件/数值
+    环境（试点可比性报告会核对环境项，但墙钟仍受共享负载影响）；
+    计划中没有试点观测的 mode 不计入估计，因此总估计是下界。
+    """
+    steps = int(getattr(args, "steps", 0) or 0)
+    if steps <= 0:
+        return {
+            "available": False,
+            "reason": "training_steps_unknown",
+            "note": (
+                "计划步数未知（steps=0）：无法把试点步耗时外推成"
+                "墙钟估计；请确认训练预算后重新生成设计计划"
+            ),
+        }
+    samples: Dict[str, List[float]] = {}
+    devices: Dict[str, List[str]] = {}
+    for row in pilot_rows or []:
+        if not isinstance(row, dict):
+            continue
+        mode = row.get("mode")
+        ms = _finite_float(row.get("training_ms_per_step"))
+        if mode is None or ms is None or ms <= 0.0:
+            continue
+        key = str(mode)
+        samples.setdefault(key, []).append(float(ms))
+        device = row.get("device_type") or row.get("device")
+        if isinstance(device, str) and device:
+            devices.setdefault(key, [])
+            if device not in devices[key]:
+                devices[key].append(device)
+    if not samples:
+        return {
+            "available": False,
+            "reason": "no_pilot_efficiency_records",
+            "note": (
+                "试点运行没有可用的 efficiency.training_ms_per_step"
+                "记录（运行未完成或旧版本未写出效率测量）：设计计划"
+                "只含解析 token 预算，不含墙钟估计。若要对照算力"
+                "预算，请用已完成的同配置试点运行（训练结束会写出"
+                "efficiency 记录）重新生成设计计划"
+            ),
+        }
+    planned_counts: Dict[str, int] = {}
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        mode = item.get("mode")
+        if mode is None:
+            continue
+        key = str(mode)
+        planned_counts[key] = planned_counts.get(key, 0) + 1
+    per_mode: Dict[str, Dict[str, object]] = {}
+    total_seconds = 0.0
+    covered_runs = 0
+    for mode in sorted(samples):
+        values = sorted(samples[mode])
+        middle = len(values) // 2
+        if len(values) % 2:
+            median_ms = values[middle]
+        else:
+            median_ms = (values[middle - 1] + values[middle]) / 2.0
+        max_ms = values[-1]
+        entry: Dict[str, object] = {
+            "pilot_samples": len(values),
+            "median_training_ms_per_step": median_ms,
+            "max_training_ms_per_step": max_ms,
+            "pilot_devices": devices.get(mode, []),
+        }
+        n_planned = planned_counts.get(mode, 0)
+        entry["planned_runs"] = n_planned
+        if n_planned > 0:
+            # 保守口径：用试点观测的最大步耗时外推。
+            seconds_per_run = steps * max_ms / 1000.0
+            entry["estimated_training_seconds_per_run"] = (
+                seconds_per_run
+            )
+            entry["estimated_training_hours_per_run"] = (
+                seconds_per_run / 3600.0
+            )
+            total_seconds += seconds_per_run * n_planned
+            covered_runs += n_planned
+        per_mode[mode] = entry
+    uncovered_modes = sorted(
+        mode
+        for mode, count in planned_counts.items()
+        if mode not in samples and count > 0
+    )
+    return {
+        "available": covered_runs > 0,
+        "basis": "pilot_efficiency_records",
+        "steps": steps,
+        "planned_runs": len(plan),
+        "covered_runs": covered_runs,
+        "uncovered_runs": len(plan) - covered_runs,
+        "uncovered_modes": uncovered_modes,
+        "per_mode": per_mode,
+        "estimated_total_training_hours": (
+            total_seconds / 3600.0 if covered_runs else None
+        ),
+        "note": (
+            "由试点运行的 efficiency.training_ms_per_step（前向+"
+            "反向中位计时，取各 mode 试点观测的最大值）外推："
+            "不含优化器更新/评估/checkpoint I/O 与排队，假设正式"
+            "运行与试点硬件/数值环境一致，且试点与正式协议可比"
+            "（可比性见 pilot_evidence.comparability）；没有试点"
+            "观测的 mode 不计入，因此总估计是下界而非上限"
+        ),
+    }
 
 
 def _training_budget_summary(

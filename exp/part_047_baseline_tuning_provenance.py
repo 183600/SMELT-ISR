@@ -743,6 +743,79 @@ def print_design_summary(design: Dict[str, object]) -> None:
             f"{budget.get('total_tokens')} tokens（"
             f"{budget.get('runs')} × {budget.get('tokens_per_run')}）"
         )
+        data_file = budget.get("data_file")
+        if isinstance(data_file, dict):
+            if data_file.get("available"):
+                matches = data_file.get("matches_preregistration")
+                epochs = _finite_float(
+                    data_file.get("estimated_epochs_per_run")
+                )
+                print(
+                    "[design][data] 语料预检："
+                    f"{data_file.get('size_bytes')} 字节，"
+                    f"sha256={str(data_file.get('sha256'))[:12]}..."
+                    + (
+                        "（与预注册 data.sha256 一致）"
+                        if matches is True
+                        else (
+                            "（预注册未声明语料指纹）"
+                            if matches is None
+                            else "（与预注册不一致：不应到达这里）"
+                        )
+                    )
+                    + (
+                        "；计划 token 预算 ≈ "
+                        f"{epochs:.2f} epoch/train 切分"
+                        if epochs is not None
+                        else ""
+                    )
+                )
+                for warning in list(
+                    data_file.get("warnings") or []
+                ):
+                    print(f"[design][data][warn] {warning}")
+            else:
+                print(
+                    "[design][data][warn] 未提供 --data：设计计划"
+                    "未绑定语料指纹，也没有 epoch 预算估计（正式"
+                    "训练入口仍会核对预注册 data.sha256）；建议"
+                    "冻结设计前带上 --data 重新预检"
+                )
+        wall_clock = budget.get("wall_clock")
+        if isinstance(wall_clock, dict) and wall_clock.get(
+            "available"
+        ):
+            hours = _finite_float(
+                wall_clock.get("estimated_total_training_hours")
+            )
+            covered = wall_clock.get("covered_runs")
+            planned = wall_clock.get("planned_runs")
+            print(
+                "[design][wall-clock] 训练墙钟估计（试点步耗时"
+                "外推，不含评估/优化器更新/排队）：总计 ≈ "
+                + (
+                    f"{hours:.2f} 小时"
+                    if hours is not None
+                    else "NA"
+                )
+                + f"（覆盖 {covered}/{planned} 个计划运行；"
+                "未覆盖模式不计入，估计为下界）"
+            )
+        compute_budget = budget.get("compute_budget")
+        if (
+            isinstance(compute_budget, dict)
+            and compute_budget.get("estimate_available")
+            and compute_budget.get("within_budget") is False
+        ):
+            print(
+                "[design][budget][warn] 估计训练墙钟 ≈ "
+                f"{compute_budget.get('estimated_total_training_hours'):.2f}"
+                " 小时，超出预注册 compute_budget 上限 "
+                f"{compute_budget.get('declared_max_total_training_hours')}"
+                " 小时；正式套件会在第一个子进程前拒绝启动，除非"
+                "显式加 --allow-over-compute-budget（豁免会随报告"
+                "落盘，不能称为按预算执行的设计）"
+            )
     failure_policy = design.get("failure_policy")
     if failure_policy == "continue":
         print(
@@ -1321,4 +1394,58 @@ def design_power_gate_error(
         "并写明 justification；冒烟/调试可显式加 "
         "--allow-underpowered。调整后请使用新的 --out（被拒绝"
         "的设计计划已落盘，旧目录会按冻结设计拒绝覆盖）。"
+    )
+
+
+def design_budget_gate_error(
+    design: Dict[str, object],
+    allow_over_budget: bool = False,
+) -> Optional[str]:
+    """训练前的硬门：墙钟估计是否超出预注册算力预算。
+
+    预注册 ``compute_budget.max_total_training_hours`` 声明的是
+    本次研究的训练墙钟上限。设计计划用试点运行的实测步耗时
+    外推总训练墙钟；估计超出上限时，正确反应是减少运行数/
+    步数或修订预算（后者是新研究阶段，必须重新预注册），而
+    不是跑到一半发现算力不足、留下一个缺格设计。
+
+    估计缺失（没有试点效率记录）时不拦截：估计是下界口径，
+    不应把「无法估计」当成「超预算」，但设计摘要会提示补试点。
+    """
+    budget = design.get("training_budget")
+    if not isinstance(budget, dict):
+        return None
+    declared = budget.get("compute_budget")
+    if not isinstance(declared, dict):
+        return None
+    if not declared.get("estimate_available"):
+        return None
+    if declared.get("within_budget"):
+        return None
+    if allow_over_budget:
+        # 豁免记录到内存中的设计对象：套件结束后随
+        # comparison_analysis.json 的 design.training_budget
+        # 落盘，报告不能把超预算运行说成按预算执行。
+        declared["acknowledged_over_budget"] = True
+        return None
+    estimated = declared.get("estimated_total_training_hours")
+    maximum = declared.get("declared_max_total_training_hours")
+    estimated_text = (
+        f"{estimated:.2f} 小时"
+        if isinstance(estimated, (int, float))
+        else "未知"
+    )
+    maximum_text = (
+        f"{maximum:g} 小时"
+        if isinstance(maximum, (int, float))
+        else "未知"
+    )
+    return (
+        "设计计划的训练墙钟估计超出预注册 compute_budget：估计约 "
+        f"{estimated_text}，声明上限 {maximum_text}。请减少计划"
+        "运行数/steps、或把 compute_budget.max_total_training_hours "
+        "改为真实可用预算（属于修改研究协议，必须更新预注册并"
+        "重新冻结、用新的 --out 重新生成设计计划）；确需照原样"
+        "运行，可显式加 --allow-over-compute-budget，豁免会随"
+        "报告落盘，本轮不能称为按预算执行的设计"
     )

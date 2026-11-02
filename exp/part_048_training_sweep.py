@@ -40,6 +40,29 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
     if power_gate_error is not None:
         raise SystemExit(f"[design] {power_gate_error}")
 
+    # 预注册 compute_budget 的启动门：试点外推的墙钟估计超出
+    # 声明上限时，在第一个子进程启动前拒绝，避免把算力不足的
+    # 设计跑到一半留下缺格区组。
+    budget_gate_error = design_budget_gate_error(
+        design,
+        allow_over_budget=bool(
+            getattr(args, "allow_over_compute_budget", False)
+        ),
+    )
+    if budget_gate_error is not None:
+        raise SystemExit(f"[design] {budget_gate_error}")
+    if isinstance(
+        (design.get("training_budget") or {}).get("compute_budget"),
+        dict,
+    ) and (design["training_budget"]["compute_budget"].get(
+        "acknowledged_over_budget"
+    )):
+        print(
+            "[design][budget][warn] 已通过 --allow-over-compute-budget "
+            "显式允许超出预注册算力预算：豁免随报告落盘，本轮不能"
+            "称为按预算执行的设计"
+        )
+
     if len(args.seeds) < _RECOMMENDED_SEEDS:
         print(
             "[sweep] 提示：关键实验建议使用 3~5 个不同随机"

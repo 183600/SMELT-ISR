@@ -247,6 +247,10 @@ def preregistration_record(
         # 足够」以及「执行顺序是否按预注册的区组随机化」。
         "power": power_record,
         "run_order": payload.get("run_order"),
+        # 训练墙钟预算声明随记录落盘：设计计划与启动门按它
+        # 核对试点外推的墙钟估计，归档时能核对「当时的算力
+        # 上限声明」与「设计计划的估计」是否一致。
+        "compute_budget": payload.get("compute_budget"),
         "data": payload.get("data"),
         "applied_fields": list(applied_fields),
         "run_mode": getattr(args, "mode", None),

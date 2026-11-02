@@ -526,6 +526,44 @@ def preregistration_schema_error(
                 "预注册的共同步数指标"
             )
 
+    # 可选的训练墙钟预算（compute_budget）：设计计划会用试点
+    # 运行的实测步耗时外推总训练墙钟，超出声明上限且未显式
+    # 豁免时，正式套件在第一个子进程前拒绝启动。上限必须在
+    # 训练前声明；看到估计结果后再改属于修改研究协议。
+    compute_budget = payload.get(
+        "compute_budget", _PREREGISTRATION_MISSING
+    )
+    if compute_budget is not _PREREGISTRATION_MISSING:
+        if not isinstance(compute_budget, dict):
+            return "compute_budget 必须是对象"
+        unknown_budget = sorted(
+            set(compute_budget)
+            - set(_COMPUTE_BUDGET_KEYS)
+        )
+        if unknown_budget:
+            return "compute_budget 含未知字段: " + ", ".join(
+                unknown_budget
+            )
+        if "max_total_training_hours" not in compute_budget:
+            return (
+                "compute_budget 缺少必需字段: "
+                "max_total_training_hours"
+            )
+        max_hours = compute_budget["max_total_training_hours"]
+        error = _preregistration_finite_number(
+            max_hours,
+            "compute_budget.max_total_training_hours",
+            minimum=0.0,
+        )
+        if error is not None:
+            return error
+        if float(max_hours) <= 0.0:  # type: ignore[arg-type]
+            return (
+                "compute_budget.max_total_training_hours 必须是"
+                "正数（训练墙钟上限，小时；只约束训练步耗时外推，"
+                "不含评估与排队）"
+            )
+
     frozen_script = payload.get(
         "frozen_script_sha256", _PREREGISTRATION_MISSING
     )

@@ -251,8 +251,12 @@ def write_design_plan(
     # 先验功效必须按最吃种子的类型判定，不能只按两两对比。
     planned_contrasts = planned_contrast_types_for_plan(plan)
     pilot_evidence: Optional[Dict[str, object]] = None
+    pilot_rows: Optional[List[Dict[str, object]]] = None
     pilot_runs = getattr(args, "design_pilot_runs", None)
     if pilot_runs:
+        pilot_rows = list(
+            compare_runs([str(path) for path in pilot_runs])
+        )
         declared_sd = None
         declared_attrition = None
         if power is not None:
@@ -295,6 +299,7 @@ def write_design_plan(
             ],
             expected_protocol=expected_protocol,
             calibration_confidence=pilot_confidence,
+            rows=pilot_rows,
         )
         comparability = _as_dict(
             pilot_evidence.get("comparability")
@@ -395,6 +400,60 @@ def write_design_plan(
         else None
     )
     budget = _training_budget_summary(args, len(plan))
+    # 设计阶段的可行性预检（写进 training_budget，随 plan_id
+    # 冻结）：语料指纹与 epoch 预算、试点实测步耗时外推的墙钟
+    # 估计，以及预注册声明的算力上限。数据预检发现语料缺失或
+    # 与预注册指纹不符时直接拒绝冻结设计。
+    steps_for_budget = int(getattr(args, "steps", 0) or 0)
+    batch_for_budget = int(getattr(args, "batch_size", 0) or 0)
+    seq_len_for_budget = int(getattr(args, "seq_len", 0) or 0)
+    tokens_per_run_for_budget = (
+        steps_for_budget
+        * batch_for_budget
+        * seq_len_for_budget
+    )
+    budget["data_file"] = _data_file_preflight(
+        args,
+        prereg,
+        tokens_per_run=tokens_per_run_for_budget,
+        n_runs=len(plan),
+    )
+    wall_clock = _wall_clock_estimate(args, plan, pilot_rows)
+    budget["wall_clock"] = wall_clock
+    prereg_budget = (
+        prereg.get("compute_budget")
+        if isinstance(prereg, dict)
+        else None
+    )
+    if isinstance(prereg_budget, dict):
+        declared_hours = _finite_float(
+            prereg_budget.get("max_total_training_hours")
+        )
+        if declared_hours is not None:
+            estimated_hours = (
+                wall_clock.get("estimated_total_training_hours")
+                if isinstance(wall_clock, dict)
+                else None
+            )
+            estimated_hours = _finite_float(estimated_hours)
+            budget["compute_budget"] = {
+                "declared_max_total_training_hours": (
+                    declared_hours
+                ),
+                "estimated_total_training_hours": estimated_hours,
+                "estimate_available": estimated_hours is not None,
+                "within_budget": (
+                    estimated_hours <= declared_hours
+                    if estimated_hours is not None
+                    else None
+                ),
+                "note": (
+                    "max_total_training_hours 是预注册声明的训练"
+                    "墙钟上限（小时）；估计来自试点效率记录外推"
+                    "（见 wall_clock.note），估计缺失时不做判定，"
+                    "正式套件的启动门也不因此拦截"
+                ),
+            }
 
     runs: List[Dict[str, object]] = []
     for item in plan:
