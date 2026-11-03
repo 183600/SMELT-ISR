@@ -1269,11 +1269,13 @@ def _paired_result_fragility(
                 reduced_p is not None
                 and float(reduced_p) <= alpha_value
             ),
+            "note": reduced_test.get("note"),
         })
     valid_loo_p = [
         float(entry["p_value"])
         for entry in leave_one_out
         if entry.get("p_value") is not None
+        and entry.get("note") != "noise_free_separation"
     ]
     max_loo_p = max(valid_loo_p) if valid_loo_p else None
     survives_loo = (
@@ -1326,9 +1328,14 @@ def _paired_result_fragility(
                 ]
                 reduced_test = _paired_t_test(reduced)
                 reduced_p = reduced_test.get("p_value")
+                # Skip zero-variance cases: when std=0, the t-test
+                # returns p=1.0 with note "noise_free_separation"; this
+                # is a degenerate case, not true fragility.
+                is_zero_variance = reduced_test.get("note") == "noise_free_separation"
                 deletions_tested += 1
                 if (
                     reduced_p is not None
+                    and not is_zero_variance
                     and float(reduced_p) > alpha_value
                 ):
                     min_deletions = delete_count
@@ -1348,12 +1355,17 @@ def _paired_result_fragility(
         verdict = "not_significant"
     elif not leave_one_out_evaluable:
         verdict = "not_evaluable"
+    # Check direction_mixed BEFORE fragile: if the sign test shows mixed
+    # directions (majority vs minority), it's direction_mixed regardless
+    # of whether min_deletions was found. This handles cases like
+    # [5.0]*7 + [-1.0] where the overall effect is driven by a majority
+    # but a minority of seeds have opposite sign.
+    elif not direction_consistent:
+        verdict = "direction_mixed"
     elif min_deletions is not None:
         verdict = "fragile"
     elif sign_flip_loo:
         verdict = "fragile"
-    elif not direction_consistent:
-        verdict = "direction_mixed"
     else:
         verdict = "stable"
 
