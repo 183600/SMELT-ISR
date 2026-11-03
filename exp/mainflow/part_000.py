@@ -100,6 +100,7 @@ def _MAIN_part_000():
     parser.add_argument('--routing-intervention-batches', type=int, default=None, metavar='N', help='干预实验使用的验证窗口批数；默认 min(eval_batches, 5)，设为 0 表示与 --eval-batches 相同')
     parser.add_argument('--compare', nargs='+', default=None, metavar='RUN_DIR', help='不训练，直接对比多个运行目录的指标后退出（含受控变量检查、按种子聚合的 Mean ± Std 与单因子显著性检验）')
     parser.add_argument('--compare-report', type=str, default=None, metavar='FILE', help='配合 --compare：把完整对比分析（含 fragility_summary、聚合、检验、功效/等价性与消融检查）写入指定 JSON 文件，而不是只打印到终端。只读入口默认不写文件；显式给出该路径才落盘，便于把结果分析随运行一起归档')
+    parser.add_argument('--compare-csv', type=str, default=None, metavar='FILE', help='配合 --compare：把对比分析导出为机器可读的 CSV 表格（FILE=对比表：单因子对比/--compare-baseline 直接对比/全因子效应，含 p 值、Holm/BH 校正、效应量及其 CI、Wilcoxon/Cliff\'s δ 与诊断标记；自动同时写出 FILE.aggregates.csv=各实验单元 Mean±Std 与 95% CI）。列名只增不改，供绘图与二次分析；只导出已算好的结果，不重算统计量')
     parser.add_argument('--compare-preregistration', type=str, default=None, metavar='FILE', help='配合 --compare：把分析集合与训练前冻结的预注册文件逐项核对，包括声明的模式/种子单元是否齐全、每个运行落盘的预注册文件指纹与 study_id 是否一致、数据协议与代码树指纹是否仍是被冻结的版本，以及分析指标/基线/共同步数/等价界是否就是预注册值。发现偏离时以非零状态码退出，避免少传失败臂或事后换指标仍得到「显著」报告')
     parser.add_argument('--allow-preregistration-coverage-deviation', action='store_true', help='配合 --compare-preregistration：显式承认分析集合与预注册存在偏离，仍写出报告并在报告中标记 override。默认偏离即失败；该开关只用于记录探索性分析，不能把偏离后的结果称为确证结论')
     parser.add_argument('--write-manifest', type=str, default=None, metavar='RUN_DIR', help='不训练：为运行/归档目录生成 artifact_manifest.json（逐文件 SHA-256、大小、符号链接目标，外加生成时的代码与解释器版本）。必须在所有训练/评估进程结束后执行，清单才代表最终归档内容；--verify-manifest 可逐项复核')
@@ -179,6 +180,8 @@ def _MAIN_part_001():
         raise _SC_RETURN(None)
     if args.compare_report is not None and args.compare is None:
         parser.error('--compare-report 只能配合 --compare 使用：它保存的是只读对比分析，不参与训练')
+    if args.compare_csv is not None and args.compare is None:
+        parser.error('--compare-csv 只能配合 --compare 使用：它导出的是只读对比分析的结果表格，不参与训练')
     if args.compare_preregistration is not None and args.compare is None:
         parser.error('--compare-preregistration 只能配合 --compare 使用：它核对的是只读对比分析是否覆盖预注册，不参与训练')
     if args.allow_preregistration_coverage_deviation and args.compare_preregistration is None:
@@ -475,6 +478,8 @@ def _MAIN_part_002():
         raise _SC_RETURN(None)
     if args.compare_report is not None and args.compare is None:
         parser.error('--compare-report 只能配合 --compare 使用：它保存的是只读对比分析，不参与训练')
+    if args.compare_csv is not None and args.compare is None:
+        parser.error('--compare-csv 只能配合 --compare 使用：它导出的是只读对比分析的结果表格，不参与训练')
     if args.compare_preregistration is not None and args.compare is None:
         parser.error('--compare-preregistration 只能配合 --compare 使用：它核对的是只读对比分析是否覆盖预注册，不参与训练')
     if args.allow_preregistration_coverage_deviation and args.compare_preregistration is None:
@@ -514,6 +519,11 @@ def _MAIN_part_002():
                 write_comparison_report_file(Path(args.compare_report), compare_analysis)
             except OSError as error:
                 parser.error(f'--compare-report 无法写入: {error}')
+        if args.compare_csv is not None:
+            try:
+                write_comparison_csv_files(Path(args.compare_csv), compare_analysis)
+            except OSError as error:
+                parser.error(f'--compare-csv 无法写入: {error}')
         raise _SC_RETURN(None)
     if args.plan_design:
         conflicts = [flag for flag, active in (('--resume', args.resume is not None), ('--evaluate-test', bool(args.evaluate_test)), ('--sanity-only', bool(args.sanity_only)), ('--statistical-baseline', bool(args.statistical_baseline)), ('--suite-baseline-tuning', bool(args.suite_baseline_tuning)), ('--final-test-comparison', args.final_test_comparison is not None)) if active]

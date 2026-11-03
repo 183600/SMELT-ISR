@@ -372,6 +372,35 @@ def factorial_effects(
                     "randomization_required_seeds": result.get(
                         "randomization_required_seeds"
                     ),
+                    # 与两两对比同口径：线性组合效应的差值分布
+                    # 诊断与 Wilcoxon 对照必须随效应一起落盘，
+                    # 不能只出现在单因子家族。
+                    "paired_diagnostics": result.get(
+                        "paired_diagnostics"
+                    ),
+                    "wilcoxon_p_value": result.get(
+                        "wilcoxon_p_value"
+                    ),
+                    "wilcoxon_method": result.get(
+                        "wilcoxon_method"
+                    ),
+                    "wilcoxon_rank_biserial": result.get(
+                        "wilcoxon_rank_biserial"
+                    ),
+                    "wilcoxon_min_attainable_p": result.get(
+                        "wilcoxon_min_attainable_p"
+                    ),
+                    "wilcoxon_can_reach_significance": result.get(
+                        "wilcoxon_can_reach_significance"
+                    ),
+                    "cohens_dz": result.get("cohens_dz"),
+                    "hedges_gz": result.get("hedges_gz"),
+                    "cohens_dz_ci95": result.get(
+                        "cohens_dz_ci95"
+                    ),
+                    "hedges_gz_ci95": result.get(
+                        "hedges_gz_ci95"
+                    ),
                     "leave_one_out_effect_min": result.get(
                         "leave_one_out_effect_min"
                     ),

@@ -5,6 +5,7 @@ from _core_support import *  # noqa: F401,F403
 from _core_CoreModelTests import CoreModelTests
 from _core_CostModelTests import CostModelTests
 from _core_StatisticsTests import StatisticsTests
+from _core_StatisticsTests import ResultsAnalysisDiagnosticsTests
 from _core_DesignPreparationTests_00 import DesignPreparationTests
 from _core_DesignPreparationTests_01 import DesignPreparationTestsPart2
 from _core_DesignPreparationTests_base import _DesignPreparationTestsBase
@@ -25,3 +26,27 @@ from _core_GroupClusterRegressionTests import GroupClusterRegressionTests
 
 if __name__ == "__main__":
     unittest.main()
+
+__all__ = [
+    "CoreModelTests",
+    "CostModelTests",
+    "StatisticsTests",
+    "ResultsAnalysisDiagnosticsTests",
+    "DesignPreparationTests",
+    "DesignPreparationTestsPart2",
+    "_DesignPreparationTestsBase",
+    "DesignPreflightTests",
+    "RoutingTests",
+    "ReproducibilityTests",
+    "RunAuditTests",
+    "NearDuplicateDataTests",
+    "ProcessTests",
+    "PreregistrationTests",
+    "ArtifactManifestTests",
+    "EnvironmentSnapshotTests",
+    "EdgeCaseRegressionTests",
+    "EdgeCaseRegressionTestsPart2",
+    "NumericalScaleTests",
+    "CurveMeanMetricTests",
+    "GroupClusterRegressionTests",
+]

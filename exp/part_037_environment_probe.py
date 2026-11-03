@@ -1261,6 +1261,7 @@ def source_mode_error(args) -> Optional[str]:
             ),
             ("--compare", _has("compare")),
             ("--compare-report", _has("compare_report")),
+            ("--compare-csv", _has("compare_csv")),
             (
                 "--compare-preregistration",
                 _has("compare_preregistration"),

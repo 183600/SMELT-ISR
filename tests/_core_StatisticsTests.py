@@ -747,3 +747,418 @@ class StatisticsTests(unittest.TestCase):
         )
         self.assertIn("两层 bootstrap 95%CI", display)
         self.assertIn("方差占比", display)
+
+
+class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
+    """结果分析口径的补充：假设诊断、符号秩/秩效应量与 CSV 导出。"""
+
+    def test_paired_difference_diagnostics_flags_skew_and_degenerate(self):
+        # 单个极端差值的 8 点样本：偏度/峰度同时超过 2·SE。
+        # 注意 n=5 时标记在数学上不可达（最大偏度 ≈(n-2)/√(n-1)
+        # = 1.5 < 2·SE ≈ 1.83），因此极端情形用 n=8 构造。
+        flagged = experiment._paired_difference_diagnostics(
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 25.0]
+        )
+        self.assertTrue(flagged["available"])
+        self.assertTrue(flagged["skewness_flag"])
+        self.assertTrue(flagged["kurtosis_flag"])
+        self.assertEqual(flagged["status"], "questionable")
+        symmetric = experiment._paired_difference_diagnostics(
+            [-1.0, -0.5, 0.0, 0.5, 1.0]
+        )
+        self.assertEqual(symmetric["status"], "ok")
+        self.assertFalse(symmetric["skewness_flag"])
+        # n<4 时峰度标准误无定义：数值仍报告，但不参与标记。
+        tiny_kurtosis = experiment._paired_difference_diagnostics(
+            [0.1, 0.2, 9.0]
+        )
+        self.assertTrue(tiny_kurtosis["available"])
+        self.assertIsNone(tiny_kurtosis["kurtosis_se"])
+        self.assertFalse(tiny_kurtosis["kurtosis_flag"])
+        zero_variance = experiment._paired_difference_diagnostics(
+            [1.0, 1.0, 1.0]
+        )
+        self.assertFalse(zero_variance["available"])
+        self.assertEqual(zero_variance["reason"], "zero_variance")
+        tiny = experiment._paired_difference_diagnostics([1.0, 2.0])
+        self.assertEqual(
+            tiny["reason"], "insufficient_observations"
+        )
+        nonfinite = experiment._paired_difference_diagnostics(
+            [1.0, float("nan"), 2.0, 3.0]
+        )
+        self.assertEqual(nonfinite["reason"], "invalid_values")
+
+    def test_wilcoxon_exact_matches_hand_computation(self):
+        # d=[0.8,0.5,1.2,-0.3,0.9]：|d| 秩为 1..5，W+=14，期望
+        # 7.5；穷举 32 种符号组合中 4 种满足 |W+-7.5|>=6.5
+        # （{}、{1}、{2,3,4,5}、{1,2,3,4,5}），p=4/32=0.125。
+        result = experiment._wilcoxon_signed_rank_test(
+            [0.8, 0.5, 1.2, -0.3, 0.9]
+        )
+        self.assertEqual(result["method"], "exact")
+        self.assertAlmostEqual(result["p_value"], 0.125)
+        self.assertAlmostEqual(result["w_plus"], 14.0)
+        self.assertAlmostEqual(result["w_minus"], 1.0)
+        self.assertAlmostEqual(
+            result["rank_biserial"], 13.0 / 15.0
+        )
+        # 全部同号时统计量取到两端：最小可达双侧 p = 2/2^n。
+        same_sign = experiment._wilcoxon_signed_rank_test(
+            [1.0, 2.0, 3.0, 4.0, 5.0]
+        )
+        self.assertAlmostEqual(same_sign["p_value"], 0.0625)
+        self.assertAlmostEqual(same_sign["rank_biserial"], 1.0)
+        self.assertFalse(same_sign["can_reach_significance"])
+        self.assertEqual(same_sign["required_seeds_for_alpha"], 6)
+
+    def test_wilcoxon_ties_use_midranks_and_drops_zeros(self):
+        tied = experiment._wilcoxon_signed_rank_test(
+            [0.8, 0.5, 1.2, -0.3, 0.9, 0.9]
+        )
+        self.assertEqual(tied["tie_groups"], 1)
+        self.assertAlmostEqual(tied["w_plus"], 20.0)
+        self.assertAlmostEqual(tied["w_minus"], 1.0)
+        self.assertAlmostEqual(tied["p_value"], 0.0625)
+        with_zero = experiment._wilcoxon_signed_rank_test(
+            [0.0, 0.0, 1.0, 2.0, 3.0]
+        )
+        self.assertEqual(with_zero["n_zero_dropped"], 2)
+        self.assertEqual(with_zero["n_effective"], 3)
+        self.assertAlmostEqual(with_zero["p_value"], 0.25)
+        all_zero = experiment._wilcoxon_signed_rank_test(
+            [0.0, 0.0, 0.0]
+        )
+        self.assertEqual(all_zero["method"], "degenerate_all_zero")
+        self.assertIsNone(all_zero["p_value"])
+
+    def test_wilcoxon_normal_approximation_for_larger_n(self):
+        result = experiment._wilcoxon_signed_rank_test(
+            [float(i) for i in range(1, 21)]
+        )
+        self.assertEqual(result["method"], "normal_approximation")
+        self.assertAlmostEqual(result["rank_biserial"], 1.0)
+        self.assertIsNotNone(result["p_value"])
+        self.assertLess(result["p_value"], 1e-3)
+
+    def test_cliffs_delta_extremes_ties_and_bootstrap_ci(self):
+        self.assertAlmostEqual(
+            experiment._cliffs_delta([1, 2, 3], [10, 20, 30]),
+            -1.0,
+        )
+        self.assertAlmostEqual(
+            experiment._cliffs_delta([10, 20, 30], [1, 2, 3]),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            experiment._cliffs_delta([1, 2], [1, 2]), 0.0
+        )
+        # 并列既不占优也不被占优：(1,2)(1,3)(2,2)(2,3) 中
+        # greater=0, lesser=3 → δ=-0.75。
+        self.assertAlmostEqual(
+            experiment._cliffs_delta([1, 2], [2, 3]), -0.75
+        )
+        complete = experiment._cliffs_delta_bootstrap_ci(
+            [1, 2, 3, 4], [10, 11, 12, 13]
+        )
+        self.assertTrue(complete["available"])
+        self.assertAlmostEqual(complete["low"], -1.0)
+        self.assertAlmostEqual(complete["high"], -1.0)
+        repeat = experiment._cliffs_delta_bootstrap_ci(
+            [1, 2, 3, 4], [10, 11, 12, 13]
+        )
+        self.assertEqual(complete, repeat)
+        insufficient = experiment._cliffs_delta_bootstrap_ci(
+            [1.0], [10.0, 11.0]
+        )
+        self.assertFalse(insufficient["available"])
+        self.assertIsNone(
+            experiment._cliffs_delta([1.0], [float("nan"), 2.0])
+        )
+
+    def test_welch_variance_ratio_flags_heteroscedastic(self):
+        flagged = experiment._welch_variance_ratio(
+            [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+        )
+        self.assertTrue(flagged["available"])
+        self.assertAlmostEqual(flagged["variance_ratio"], 100.0)
+        self.assertEqual(flagged["status"], "heteroscedastic")
+        comparable = experiment._welch_variance_ratio(
+            [1.0, 2.0, 3.0], [2.0, 4.0, 6.0]
+        )
+        self.assertEqual(comparable["status"], "ok")
+        self.assertAlmostEqual(comparable["p_value"], 0.4)
+        degenerate = experiment._welch_variance_ratio(
+            [1.0, 1.0, 1.0], [2.0, 4.0, 6.0]
+        )
+        self.assertEqual(degenerate["status"], "zero_variance_one_arm")
+
+    def test_paired_effect_size_attaches_confidence_interval(self):
+        effect = experiment._paired_effect_size(
+            0.5,
+            {"test": "paired_t", "n_pairs": 6, "se": 0.1, "df": 5.0},
+        )
+        self.assertAlmostEqual(effect["cohens_dz"], 2.0412414523)
+        ci = effect["cohens_dz_ci95"]
+        self.assertLess(ci["low"], effect["cohens_dz"])
+        self.assertGreater(ci["high"], effect["cohens_dz"])
+        self.assertEqual(ci["method"], "normal_approximation")
+        gz_ci = effect["hedges_gz_ci95"]
+        correction = experiment._hedges_g_correction(5.0)
+        self.assertAlmostEqual(
+            gz_ci["low"], ci["low"] * correction, places=12
+        )
+        # 零方差/非配对口径不伪造效应量区间。
+        self.assertEqual(
+            experiment._paired_effect_size(
+                0.5,
+                {"test": "paired_t", "n_pairs": 6, "se": 0.0, "df": 5.0},
+            ),
+            {},
+        )
+        self.assertEqual(
+            experiment._paired_effect_size(
+                0.5,
+                {"test": "welch_t", "n_pairs": 0, "se": 0.1, "df": 4.0},
+            ),
+            {},
+        )
+
+    def test_contrast_test_attaches_diagnostics_and_rank_statistics(self):
+        samples_a = [
+            {"seed": seed, "value": value}
+            for seed, value in zip(
+                (41, 42, 43), (2.0, 2.1, 1.9)
+            )
+        ]
+        samples_b = [
+            {"seed": seed, "value": value}
+            for seed, value in zip(
+                (41, 42, 43), (1.0, 1.1, 0.9)
+            )
+        ]
+        paired = experiment._contrast_test(samples_a, samples_b)
+        self.assertEqual(paired["test"], "paired_t")
+        self.assertTrue(paired["paired_diagnostics"]["available"])
+        self.assertEqual(
+            paired["wilcoxon"]["method"], "exact"
+        )
+        self.assertIsNotNone(paired["wilcoxon_p_value"])
+        self.assertAlmostEqual(
+            paired["wilcoxon_rank_biserial"], -1.0
+        )
+        # 种子集合不同 → Welch：附 Clifford δ 与方差诊断。
+        welch = experiment._contrast_test(
+            [
+                {"seed": 41, "value": 1.0},
+                {"seed": 42, "value": 2.0},
+                {"seed": 43, "value": 3.0},
+            ],
+            [
+                {"seed": 51, "value": 10.0},
+                {"seed": 52, "value": 20.0},
+                {"seed": 53, "value": 30.0},
+            ],
+        )
+        self.assertEqual(welch["test"], "welch_t")
+        self.assertAlmostEqual(welch["cliffs_delta"], -1.0)
+        self.assertTrue(welch["cliffs_delta_ci95"]["available"])
+        self.assertEqual(
+            welch["variance_diagnostics"]["status"],
+            "heteroscedastic",
+        )
+
+    def test_factor_contrasts_propagate_new_fields(self):
+        def cell(label, mode, values):
+            return {
+                "label": label,
+                "keys": {"mode": mode},
+                "samples": {
+                    "val_loss": [
+                        {"seed": seed, "value": value}
+                        for seed, value in zip(
+                            (41, 42, 43), values
+                        )
+                    ]
+                },
+                "val_loss_mean": sum(values) / len(values),
+                "val_loss_std": 0.1,
+                "n_runs": 3,
+                "effective_seed_count": 3,
+                "deterministic": False,
+                "duplicate_seeds": [],
+                "deterministic_repeat_conflicts": [],
+                "ci95": {},
+            }
+
+        aggregates = [
+            cell("base", "local_base", (2.0, 2.1, 1.9)),
+            cell("delayed", "A", (1.0, 1.1, 0.9)),
+        ]
+        contrasts = experiment.factor_contrasts(
+            aggregates, ["mode"], "val_loss"
+        )
+        self.assertEqual(len(contrasts), 1)
+        contrast = contrasts[0]
+        self.assertEqual(
+            contrast["paired_diagnostics"]["status"], "ok"
+        )
+        self.assertIsNotNone(contrast["wilcoxon_p_value"])
+        self.assertAlmostEqual(
+            contrast["wilcoxon_rank_biserial"], -1.0
+        )
+        self.assertIn("cohens_dz_ci95", contrast)
+        self.assertIn("paired_differences", contrast)
+        json.dumps(contrasts, allow_nan=False)
+
+    def test_metric_multiplicity_report_flags_metric_switching(self):
+        rows = [
+            {
+                "run": "a",
+                "mode": "A",
+                "primary_metric": "val_loss_at_common_step",
+            },
+            {
+                "run": "b",
+                "mode": "B",
+                "primary_metric": "val_loss",
+            },
+        ]
+        mismatched = experiment._metric_multiplicity_report(
+            rows, "val_loss"
+        )
+        self.assertFalse(mismatched["ok"])
+        self.assertEqual(
+            mismatched["runs_with_metric_mismatch"], ["a"]
+        )
+        self.assertTrue(
+            any("事后" in advisory for advisory in mismatched["advisories"])
+        )
+        self.assertTrue(
+            any("探索性" in advisory for advisory in mismatched["advisories"])
+        )
+        consistent = experiment._metric_multiplicity_report(
+            [
+                {"run": "a", "primary_metric": "val_loss"},
+                {"run": "b", "primary_metric": "val_loss"},
+            ],
+            "val_loss",
+        )
+        self.assertIs(consistent["ok"], True)
+        undeclared = experiment._metric_multiplicity_report(
+            [{"run": "a"}], "val_loss"
+        )
+        self.assertIsNone(undeclared["ok"])
+        self.assertTrue(
+            any(
+                "没有任何运行预注册主指标" in advisory
+                for advisory in undeclared["advisories"]
+            )
+        )
+
+    def test_comparison_analysis_payload_and_display_include_new_sections(self):
+        rows = []
+        for mode, offset in (("A", 0.0), ("B", 0.5)):
+            for seed in (41, 42, 43):
+                rows.append(
+                    {
+                        "run": f"{mode}{seed}",
+                        "mode": mode,
+                        "seed": seed,
+                        "val_loss": 3.0
+                        - offset
+                        + (seed % 3) * 0.05,
+                        "protocol": {
+                            "comparison_family": "neural",
+                        },
+                        "protocol_recorded_keys": [],
+                    }
+                )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode"],
+                metric="val_loss",
+            )
+        self.assertIn("metric_multiplicity", report)
+        self.assertEqual(
+            report["metric_multiplicity"]["analysis_metric"],
+            "val_loss",
+        )
+        contrast = report["contrasts"][0]
+        self.assertIn("paired_diagnostics", contrast)
+        self.assertIn("wilcoxon_p_value", contrast)
+        self.assertIn("cohens_dz_ci95", contrast)
+        rendered = output.getvalue()
+        self.assertIn("[multiplicity]", rendered)
+        self.assertIn("[assumptions]", rendered)
+
+    def test_comparison_csv_export_is_stable_and_complete(self):
+        rows = []
+        for mode, offset in (("A", 0.0), ("B", 0.5)):
+            for seed in (41, 42, 43):
+                rows.append(
+                    {
+                        "run": f"{mode}{seed}",
+                        "mode": mode,
+                        "seed": seed,
+                        "val_loss": 3.0
+                        - offset
+                        + (seed % 3) * 0.05,
+                        "protocol": {
+                            "comparison_family": "neural",
+                        },
+                        "protocol_recorded_keys": [],
+                    }
+                )
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode"],
+                metric="val_loss",
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "analysis.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                written = experiment.write_comparison_csv_files(
+                    path, report
+                )
+            self.assertEqual(len(written), 2)
+            self.assertTrue(path.is_file())
+            aggregates_path = Path(tmp) / "analysis.aggregates.csv"
+            self.assertTrue(aggregates_path.is_file())
+            import csv
+
+            with path.open(encoding="utf-8", newline="") as handle:
+                contrast_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(contrast_rows), 1)
+            contrast_row = contrast_rows[0]
+            self.assertEqual(contrast_row["family"], "single_factor")
+            self.assertEqual(contrast_row["factor"], "mode")
+            self.assertIn("p_value_holm", contrast_row)
+            self.assertIn("wilcoxon_p_value", contrast_row)
+            self.assertIn("cohens_dz_ci95_low", contrast_row)
+            self.assertIn("fragility_verdict", contrast_row)
+            self.assertNotEqual(contrast_row["p_value"], "")
+            self.assertNotEqual(contrast_row["wilcoxon_p_value"], "")
+            with aggregates_path.open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                aggregate_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(aggregate_rows), 2)
+            labels = {row["cell"] for row in aggregate_rows}
+            self.assertEqual(len(labels), 2)
+            for row in aggregate_rows:
+                self.assertNotEqual(row["metric_mean"], "")
+                self.assertEqual(row["n_runs"], "3")
+
+    def test_environment_mode_rejects_compare_csv(self):
+        conflict = experiment.environment_mode_error(
+            argparse.Namespace(
+                check_environment="run",
+                check_environment_strict=False,
+                compare_csv="analysis.csv",
+            )
+        )
+        self.assertIn("--compare-csv", conflict)

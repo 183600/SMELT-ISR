@@ -1147,6 +1147,475 @@ def _paired_sign_flip_test(
 
 
 
+# Wilcoxon 符号秩检验的精确枚举上限：与符号翻转检验一致，
+# 有效观测（非零差值）不超过该值时穷举 2^n 种符号组合得到
+# 精确 p 值；更大样本用带连续性与并列校正的正态近似。
+_WILCOXON_EXACT_MAX_N = 12
+
+
+
+def _paired_difference_diagnostics(
+    differences: List[float],
+) -> Dict[str, object]:
+    """
+    配对差值的分布诊断（描述性，不构成显著性检验）。
+
+    配对 t 检验假设差值近似正态；符号翻转与 Wilcoxon 符号秩
+    检验假设差值分布关于 0 对称。这些假设在小样本（种子数
+    3~6）下无法用正式检验可靠评估——n=3 时的 Shapiro 检验
+    几乎没有功效，「未拒绝正态」不构成正态证据。因此这里只
+    报告描述性统计量并按「偏离正态的两倍标准误」经验规则
+    （Kim, 2013）给出提示性标记：
+
+    - 偏度 g1 与其正态假设下的标准误 SE1；|g1| > 2·SE1 记
+      ``skewness_flag``；
+    - 超额峰度 g2 与标准误 SE2（≈2·SE1）；|g2| > 2·SE2 记
+      ``kurtosis_flag``；
+    - 均值与中位数之差（按差值标准差归一），给出对称性的
+      简易参考。
+
+    标记为 ``questionable`` 时，t 检验的 p 值应与符号翻转 /
+    Wilcoxon 结论一起读；本诊断不改变任何判定。
+    """
+    values = _finite_values(differences)
+    if values is None:
+        return {
+            "available": False,
+            "reason": "invalid_values",
+        }
+    n = len(values)
+    if n < 3:
+        return {
+            "available": False,
+            "reason": "insufficient_observations",
+            "n": n,
+        }
+    mean = _mean(values)
+    std = _sample_std(values)
+    median = _median(values)
+    if mean is None or std is None or median is None:
+        return {
+            "available": False,
+            "reason": "invalid_values",
+            "n": n,
+        }
+    if std <= 0.0 or not math.isfinite(std):
+        return {
+            "available": False,
+            "reason": "zero_variance",
+            "n": n,
+            "mean": mean,
+        }
+    # 中心矩按总体矩口径（除 n）：偏度 g1 = m3/m2^{3/2}，
+    # 超额峰度 g2 = m4/m2^2 - 3。逐项先除以尺度再求幂，
+    # |中心化值|/scale <= sqrt(n)，不会溢出。
+    centered = [value - mean for value in values]
+    m2 = math.fsum(c * c for c in centered) / n
+    if m2 <= 0.0 or not math.isfinite(m2):
+        return {
+            "available": False,
+            "reason": "zero_variance",
+            "n": n,
+            "mean": mean,
+        }
+    scale = math.sqrt(m2)
+    m3 = math.fsum((c / scale) ** 3 for c in centered) / n
+    m4 = math.fsum((c / scale) ** 4 for c in centered) / n
+    skewness = m3
+    excess_kurtosis = m4 - 3.0
+    # 正态假设下偏度/峰度的标准误（样本偏度/峰度的渐近方差
+    # 开方；小样本下只作量级参考）。峰度标准误的分母含 (n-3)，
+    # n<4 时无定义：此时峰度只作数值展示、不参与标记。
+    se_skew = math.sqrt(
+        6.0 * n * (n - 1.0)
+        / ((n - 2.0) * (n + 1.0) * (n + 3.0))
+    )
+    if n >= 4:
+        se_kurt = math.sqrt(
+            4.0 * (n * n - 1.0) * se_skew * se_skew
+            / ((n - 3.0) * (n + 5.0))
+        )
+    else:
+        se_kurt = None
+    skewness_flag = abs(skewness) > 2.0 * se_skew
+    kurtosis_flag = (
+        se_kurt is not None
+        and abs(excess_kurtosis) > 2.0 * se_kurt
+    )
+    n_positive = sum(1 for value in values if value > 0.0)
+    n_negative = sum(1 for value in values if value < 0.0)
+    notes = [
+        "小样本（n<8）下正式正态性检验功效不足；偏度/峰度"
+        "只作描述性诊断，未标记不等于正态成立"
+    ]
+    if se_kurt is None:
+        notes.append(
+            "n<4 时超额峰度的标准误无定义，峰度只作数值展示，"
+            "不参与偏离标记"
+        )
+    return {
+        "available": True,
+        "n": n,
+        "mean": mean,
+        "median": median,
+        "std": std,
+        "skewness": skewness,
+        "excess_kurtosis": excess_kurtosis,
+        "skewness_se": se_skew,
+        "kurtosis_se": se_kurt,
+        "skewness_flag": skewness_flag,
+        "kurtosis_flag": kurtosis_flag,
+        "n_positive": n_positive,
+        "n_negative": n_negative,
+        "mean_median_shift_sd": abs(mean - median) / std,
+        "status": (
+            "questionable"
+            if (skewness_flag or kurtosis_flag)
+            else "ok"
+        ),
+        "notes": notes,
+    }
+
+
+
+def _wilcoxon_signed_rank_test(
+    differences: List[float],
+) -> Dict[str, object]:
+    """
+    Wilcoxon 符号秩检验与匹配对秩双列相关（rank-biserial）。
+
+    与符号翻转检验（统计量 = 差值均值）互补：符号秩同时利用
+    差值的符号与相对幅度（秩），对单个极端种子比 t 检验更不
+    敏感，通常比只看符号的精确符号检验更有功效。零假设仍是
+    「配对差值分布关于 0 对称」（与符号翻转相同的假设，不是
+    「无分布假设」），因此它同样只作稳健性对照，不替代 t 检验
+    的 Holm 家族判定。
+
+    - 有效观测（非零差值）n <= 12 时穷举 2^n 种符号组合得到
+      精确双侧 p 值；并列 |差值| 用平均秩（midrank）处理；
+    - 更大样本用带并列校正与连续性校正的正态近似；
+    - 零差值丢弃并报告计数；全部为零时判为退化；
+    - rank-biserial r = (W+ - W-)/(W+ + W-) 是符号秩检验的
+      效应量：±1 表示所有差值同向，0 表示正负秩平衡。
+    """
+    values = _finite_values(differences)
+    if values is None:
+        return {"test": "invalid_values"}
+    n_total = len(values)
+    if n_total < _MIN_SEEDS_FOR_STATS:
+        return {"test": "insufficient_seeds"}
+    nonzero = [value for value in values if value != 0.0]
+    n_zero_dropped = n_total - len(nonzero)
+    n = len(nonzero)
+    if n < _MIN_SEEDS_FOR_STATS:
+        return {
+            "test": "wilcoxon_signed_rank",
+            "p_value": None,
+            "method": "degenerate_all_zero",
+            "n_effective": n,
+            "n_zero_dropped": n_zero_dropped,
+            "rank_biserial": None,
+            "min_attainable_p": None,
+            "can_reach_significance": False,
+            "randomization_null_assumption": (
+                "symmetric_paired_differences_about_zero"
+            ),
+        }
+
+    # 平均秩（midrank）：并列的 |差值| 分享它们名次的平均。
+    abs_values = [abs(value) for value in nonzero]
+    order = sorted(range(n), key=lambda i: abs_values[i])
+    ranks = [0.0] * n
+    tie_group_sizes: List[int] = []
+    i = 0
+    while i < n:
+        j = i
+        while (
+            j + 1 < n
+            and abs_values[order[j + 1]] == abs_values[order[i]]
+        ):
+            j += 1
+        group_size = j - i + 1
+        average_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = average_rank
+        if group_size > 1:
+            tie_group_sizes.append(group_size)
+        i = j + 1
+
+    total_rank = math.fsum(ranks)
+    w_plus = math.fsum(
+        rank
+        for rank, value in zip(ranks, nonzero)
+        if value > 0.0
+    )
+    w_minus = total_rank - w_plus
+    rank_sum = w_plus + w_minus
+    rank_biserial = None
+    if rank_sum > 0.0:
+        candidate = (w_plus - w_minus) / rank_sum
+        if math.isfinite(candidate):
+            rank_biserial = candidate
+
+    expected = total_rank / 2.0
+    # W+ 只能取秩和的离散子集；容差必须覆盖浮点秩累加误差
+    # （秩可能是 .5 的平均秩，误差量级 ~1e-13）。
+    tolerance = 1e-9 * max(1.0, total_rank)
+    if n <= _WILCOXON_EXACT_MAX_N:
+        count = 0
+        for signs in itertools.product((0, 1), repeat=n):
+            statistic = math.fsum(
+                rank
+                for rank, sign in zip(ranks, signs)
+                if sign
+            )
+            if (
+                abs(statistic - expected)
+                >= abs(w_plus - expected) - tolerance
+            ):
+                count += 1
+        permutations = 2 ** n
+        p_value = count / permutations
+        method = "exact"
+        min_attainable_p = 2.0 / permutations
+        required_seeds = _sign_flip_required_seeds(
+            _SIGNIFICANCE_LEVEL
+        )
+    else:
+        variance = (
+            n * (n + 1.0) * (2.0 * n + 1.0) / 24.0
+            - math.fsum(
+                (float(size) ** 3 - float(size)) / 48.0
+                for size in tie_group_sizes
+            )
+        )
+        if variance <= 0.0:
+            return {
+                "test": "wilcoxon_signed_rank",
+                "p_value": None,
+                "method": "degenerate_ties",
+                "n_effective": n,
+                "n_zero_dropped": n_zero_dropped,
+                "rank_biserial": rank_biserial,
+                "w_plus": w_plus,
+                "w_minus": w_minus,
+                "min_attainable_p": None,
+                "can_reach_significance": False,
+                "randomization_null_assumption": (
+                    "symmetric_paired_differences_about_zero"
+                ),
+            }
+        deviation = abs(w_plus - expected)
+        # 连续性校正：秩和是离散的，用 (|偏差| - 0.5) 修正。
+        z_value = max(0.0, (deviation - 0.5)) / math.sqrt(
+            variance
+        )
+        p_value = math.erfc(z_value / math.sqrt(2.0))
+        method = "normal_approximation"
+        min_attainable_p = None
+        required_seeds = None
+
+    return {
+        "test": "wilcoxon_signed_rank",
+        "p_value": p_value,
+        "method": method,
+        "n_effective": n,
+        "n_zero_dropped": n_zero_dropped,
+        "w_plus": w_plus,
+        "w_minus": w_minus,
+        "rank_biserial": rank_biserial,
+        "tie_groups": len(tie_group_sizes),
+        "min_attainable_p": min_attainable_p,
+        "can_reach_significance": (
+            min_attainable_p is not None
+            and min_attainable_p <= _SIGNIFICANCE_LEVEL
+        ),
+        "required_seeds_for_alpha": required_seeds,
+        "randomization_null_assumption": (
+            "symmetric_paired_differences_about_zero"
+        ),
+    }
+
+
+
+def _cliffs_delta(
+    values_a: List[float],
+    values_b: List[float],
+) -> Optional[float]:
+    """
+    Cliff's δ：两组独立样本的随机优势（rank-domination）效应量。
+
+    δ = (#(x>y) - #(x<y)) / (n_a·n_b)：δ=1 表示 A 的每个观测都
+    大于 B 的每个观测，δ=0 表示两组随机占优互相抵消。与
+    Cohen's d / Hedges g 用合并标准差作尺度不同，δ 只依赖秩，
+    对重尾分布与量纲不敏感——Welch 对比（种子集合不完全相同
+    时）没有配对 dz，这里补一个稳健的效应量口径。
+
+    常规解读阈值（Romano et al., 2006）：|δ|<0.147 可忽略，
+    <0.33 小，<0.474 中等，否则大；阈值只是约定，不是判定。
+    """
+    finite_a = _finite_values(values_a)
+    finite_b = _finite_values(values_b)
+    if not finite_a or not finite_b:
+        return None
+    greater = 0
+    lesser = 0
+    for x in finite_a:
+        for y in finite_b:
+            if x > y:
+                greater += 1
+            elif x < y:
+                lesser += 1
+    denominator = len(finite_a) * len(finite_b)
+    if denominator == 0:
+        return None
+    delta = (greater - lesser) / denominator
+    return delta if math.isfinite(delta) else None
+
+
+
+def _cliffs_delta_bootstrap_ci(
+    values_a: List[float],
+    values_b: List[float],
+    replicates: int = 2000,
+) -> Dict[str, object]:
+    """
+    Cliff's δ 的百分位 bootstrap 95% CI（确定性种子，可复现）。
+
+    两臂分别有放回重采样后重算 δ；随机种子由样本内容确定性
+    派生（blake2b，不消耗全局 RNG），同一份数据两次运行的区间
+    逐位一致。任一臂少于 2 个观测时不可用——不伪造 0 宽区间。
+    该区间只描述本批种子上的重采样不确定性，不覆盖换一批
+    训练种子的外推。
+    """
+    finite_a = _finite_values(values_a)
+    finite_b = _finite_values(values_b)
+    if (
+        not finite_a
+        or not finite_b
+        or len(finite_a) < 2
+        or len(finite_b) < 2
+    ):
+        return {"available": False, "reason": "insufficient_samples"}
+    material = repr(
+        [sorted(finite_a), sorted(finite_b)]
+    ).encode("utf-8")
+    seed = int.from_bytes(
+        hashlib.blake2b(material, digest_size=8).digest(),
+        "big",
+    )
+    generator = torch.Generator().manual_seed(seed)
+    n_a = len(finite_a)
+    n_b = len(finite_b)
+    tensor_a = torch.tensor(finite_a, dtype=torch.float64)
+    tensor_b = torch.tensor(finite_b, dtype=torch.float64)
+    # 并列比较向量化：deltas[i, j] = sign(a_i - b_j)。
+    signs = torch.sign(
+        tensor_a.unsqueeze(1) - tensor_b.unsqueeze(0)
+    )
+    delta_values = torch.empty(replicates, dtype=torch.float64)
+    for replicate in range(replicates):
+        index_a = torch.randint(
+            low=0, high=n_a, size=(n_a,), generator=generator
+        )
+        index_b = torch.randint(
+            low=0, high=n_b, size=(n_b,), generator=generator
+        )
+        resampled = signs[index_a][:, index_b]
+        delta_values[replicate] = resampled.mean()
+    low = float(torch.quantile(delta_values, 0.025).item())
+    high = float(torch.quantile(delta_values, 0.975).item())
+    point = float(signs.mean().item())
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return {"available": False, "reason": "unrepresentable_bounds"}
+    return {
+        "available": True,
+        "low": low,
+        "high": high,
+        "replicates": replicates,
+        "method": "percentile_bootstrap",
+        "seed_derivation": "blake2b_of_sample_content",
+    }
+
+
+
+def _welch_variance_ratio(
+    values_a: List[float],
+    values_b: List[float],
+) -> Dict[str, object]:
+    """
+    Welch 对比两臂的方差齐性诊断（描述性，信息性输出）。
+
+    Welch 检验本身不假设方差相等，因此该诊断**不改变检验**；
+    它用于解读 ``hedges_g``：合并标准差在两臂方差悬殊时会
+    被大方差臂抬高/压低，把 |Δ|/合并 sd 解读为「效应相对
+    噪声的大小」时需要知道这个前提有多不可靠。
+
+    报告大方差/小方差的比值与两样本 F 检验的双侧 p 值
+    （F = s²_max/s²_min，p = 2·min(P(F≥f), P(F≤f))，用正则化
+    不完全 Beta 计算）。p < 0.05 时标记 ``heteroscedastic``。
+    """
+    finite_a = _finite_values(values_a)
+    finite_b = _finite_values(values_b)
+    if not finite_a or not finite_b:
+        return {"available": False, "reason": "invalid_values"}
+    if len(finite_a) < 2 or len(finite_b) < 2:
+        return {"available": False, "reason": "insufficient_samples"}
+    var_a = _sample_variance(finite_a)
+    var_b = _sample_variance(finite_b)
+    if var_a is None or var_b is None:
+        return {"available": False, "reason": "invalid_values"}
+    if var_a <= 0.0 and var_b <= 0.0:
+        return {
+            "available": True,
+            "variance_ratio": 1.0,
+            "p_value": 1.0,
+            "status": "zero_variance_both_arms",
+        }
+    if var_a <= 0.0 or var_b <= 0.0:
+        return {
+            "available": True,
+            "variance_ratio": None,
+            "p_value": None,
+            "status": "zero_variance_one_arm",
+            "note": (
+                "一臂方差为 0（如确定性折叠后只剩单值）：方差比"
+                "与 F 检验无定义，效应量解读应直接查看逐种子差值"
+            ),
+        }
+    ratio = max(var_a, var_b) / min(var_a, var_b)
+    if not math.isfinite(ratio):
+        return {"available": False, "reason": "unrepresentable_ratio"}
+    df_a = len(finite_a) - 1.0
+    df_b = len(finite_b) - 1.0
+    f_statistic = ratio
+    # F(v1, v2) 的 CDF：P(F <= f) = I_{v1 f / (v1 f + v2)}(v1/2, v2/2)。
+    x = df_a * f_statistic / (df_a * f_statistic + df_b)
+    cdf = _regularized_incomplete_beta(x, df_a / 2.0, df_b / 2.0)
+    if cdf is None:
+        return {"available": False, "reason": "invalid_values"}
+    p_value = 2.0 * min(cdf, 1.0 - cdf)
+    p_value = max(0.0, min(1.0, p_value))
+    return {
+        "available": True,
+        "variance_ratio": ratio,
+        "f_statistic": f_statistic,
+        "df_numerator": df_a,
+        "df_denominator": df_b,
+        "p_value": p_value,
+        "status": (
+            "heteroscedastic"
+            if p_value < _SIGNIFICANCE_LEVEL
+            else "ok"
+        ),
+        "note": (
+            "Welch 检验不要求方差相等；该诊断用于解读合并标准差"
+            "口径的效应量（hedges_g），不改变显著性判定"
+        ),
+    }
+
+
+
 # ============================================================
 # 逐窗口配对比较（固定评估窗口）
 # ============================================================

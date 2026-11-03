@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 def _PA_part_000():
-    global _cost_text, _n_text, _stat, adequacy, aggregate, aggregates, alignment, arm, attrition_summary, autocorrelated_splits, balance_scale, baseline_mode, baseline_preregistration, cell, check, common_step, common_step_sensitivity, component_verdicts, compute_matched, compute_parity_failed, contrasts, controlled, cost_header, cost_rows, coverage, cross_violations, current_derived, curve_mean, delta, delta_text, design_violations, details, deterministic_cells, deterministic_conflict_cells, direction, direction_text, distinct, duplicate_seed_cells, effects, entry, factorial, factorial_balance_scale, factorial_compute_matched, factorial_coverage, factorial_fragility, factors, failure_rates, fragility_summary, group_keys, guard, header, high, higher_is_better, hypotheses, imbalance, item, key, line, low, margin_preregistration, matched_coverage, mean, message, metric_columns, metric_report, mismatch, missing_efficiency_cells, numeric, numerical_failures, order_audit, p_holm, p_text, parts, present_routing_fields, provenance, randomness, rate, rate_text, ratio, ratio_text, reference, resolved_baseline, routing_header, routing_summary_fields, row, rq_text, scale_guard_report, scale_tiers, selection_bias, selection_metric_mismatch, short, single_factor_design, tier, timing_ci_lines, tuning_seed_overlap, underpowered, value, values_text, violation
+    global _cost_text, _n_text, _stat, adequacy, aggregate, aggregates, alignment, arm, attrition_summary, autocorrelated_splits, balance_scale, baseline_mode, baseline_preregistration, cell, check, common_step, common_step_sensitivity, component_verdicts, compute_matched, compute_parity_failed, contrasts, controlled, cost_header, cost_rows, coverage, cross_violations, current_derived, curve_mean, delta, delta_text, design_violations, details, deterministic_cells, deterministic_conflict_cells, direction, direction_text, distinct, duplicate_seed_cells, effects, entry, factorial, factorial_balance_scale, factorial_compute_matched, factorial_coverage, factorial_fragility, factors, failure_rates, fragility_summary, group_keys, guard, header, high, higher_is_better, hypotheses, imbalance, item, key, line, low, margin_preregistration, matched_coverage, mean, metric_multiplicity, message, metric_columns, metric_report, mismatch, missing_efficiency_cells, numeric, numerical_failures, order_audit, p_holm, p_text, parts, present_routing_fields, provenance, randomness, rate, rate_text, ratio, ratio_text, reference, resolved_baseline, routing_header, routing_summary_fields, row, rq_text, scale_guard_report, scale_tiers, selection_bias, selection_metric_mismatch, short, single_factor_design, tier, timing_ci_lines, tuning_seed_overlap, underpowered, value, values_text, violation
     '\n    打印完整的对比分析：受控变量检查、按种子聚合的\n    Mean ± Std、单因子显著性检验（含多重比较校正与效应量\n    95% 置信区间）、80% 功效的最小可检出效应（MDE）与\n    TOST 等价性检验，以及消融覆盖检查。\n\n    ``ablation_modes`` 声明本轮消融必须覆盖的延迟合并方案\n    （--suite-ablation --ablation-modes）；为 None 且运行集\n    涉及延迟合并时默认核对项目声明的全部方案（A、B）。\n    ``allow_partial_ablation`` 显式允许阶段性部分消融，但报告\n    仍记录 ``partial`` 与未覆盖方案，不会把部分覆盖说成完整。\n\n    ``equivalence_margin`` 是相对基线均值的等价界比例\n    （--equivalence-margin，默认 1%）：报告用 TOST 区分\n    「证据支持无实质差异」与「未发现显著差异（不确定）」，\n    并把 MDE 与观测效应所需的种子数列出；为 None 时只做\n    显著性检验（不推荐，不显著会被误读为等价）。\n\n    返回结构化结果，供写入汇总报告。\n    '
     if factors is None:
         factors = list(DEFAULT_COMPARISON_FACTORS)
@@ -63,6 +63,7 @@ def _PA_part_000():
     tuning_seed_overlap = tuning_seed_overlap_report(rows)
     imbalance = imbalance_metric_advisory(rows, metric)
     selection_metric_mismatch = [{'run': str(row.get('run')), 'mode': row.get('mode'), 'selection_metric': row.get('selection_metric')} for row in rows if metric in _SELECTION_METRIC_KEYS and str(row.get('mode')) != 'ngram' and (row.get('selection_metric') is not None) and (str(row.get('selection_metric')) != metric)] if metric in _SELECTION_METRIC_KEYS else []
+    metric_multiplicity = _metric_multiplicity_report(rows, metric)
     higher_is_better = metric_higher_is_better(metric)
     factorial_fragility = []
     if isinstance(factorial, dict):
@@ -333,7 +334,7 @@ def _PA_part_000():
     print('[convergence] 共同训练窗口内的时均验证损失（周期曲线梯形积分/窗口长度；越低表示窗口内整体损失更低，常与更早收敛一致，但不能单独分离速度与最终水平）')
 
 def _PA_part_001():
-    global advisory, aligned_text, alpha_value, attempted, attrition_entries, baseline_mean, blocker, bounds_text, capacity_entries, capacity_parity_checked, capacity_parity_ok, compute_aligned, compute_parity_checked, compute_parity_ok, confound, contrast, cost_flagged, counts, coverage_text, current_seeds, curve_coverage, deleted, deleted_p, delta, delta_text, detail, details, direction, entry, equivalence_entries, equivalent_entries, expected_cells, family, family_contrasts, family_sizes, fragile_count, fragility_entries, fragility_flagged, full_factorial, global_alignment, global_alignment_info, global_seed_ok, high, holm, holm_text, inconclusive_entries, item, largest_family, level, low, margin_abs, margin_status, margin_text, mde, mde_relative, mde_text, message, mismatch_messages, missing, missingness_flagged, mixed_count, needed_text, not_evaluable_count, not_robust, parity, parity_entries, parity_mismatches, precision_limited, present, reason, seeds_needed, seeds_text, seeds_to_achieve, shape_text, significant_note, stable_count, summaries, tuned_runs, values, width_parity_ok, window_line, with_missing
+    global advisory, aligned_text, alpha_value, assumption_entry, assumption_flagged, assumption_label, assumption_reasons, attempted, attrition_entries, baseline_mean, blocker, bounds_text, capacity_entries, capacity_parity_checked, capacity_parity_ok, compute_aligned, compute_parity_checked, compute_parity_ok, confound, contrast, cost_flagged, counts, coverage_text, current_seeds, curve_coverage, deleted, deleted_p, delta, delta_text, detail, details, direction, entry, equivalence_entries, equivalent_entries, expected_cells, family, family_contrasts, family_sizes, fragile_count, fragility_entries, fragility_flagged, full_factorial, global_alignment, global_alignment_info, global_seed_ok, high, holm, holm_text, inconclusive_entries, item, largest_family, level, low, margin_abs, margin_status, margin_text, mde, mde_relative, mde_text, message, metric_multiplicity, mismatch_messages, missing, missingness_flagged, mixed_count, needed_text, not_evaluable_count, not_robust, parity, parity_entries, parity_mismatches, precision_limited, present, reason, seeds_needed, seeds_text, seeds_to_achieve, shape_text, significant_note, stable_count, summaries, tuned_runs, values, width_parity_ok, window_line, with_missing
     if not curve_mean['runs']:
         print('  无可用的曲线时均对比')
     else:
@@ -348,6 +349,8 @@ def _PA_part_001():
     print()
     direction = '越低越好' if not higher_is_better else '越高越好'
     print(f'[stats] 指标 {metric}（{direction}）；单因子对比（每个对比只改变一个因子；p 为原始值，显著性判定用家族内 Holm 校正后的 p）')
+    for message in metric_multiplicity.get('advisories', []):
+        print(f'  [multiplicity] {message}')
     family_sizes = sorted({int(size) for size in (contrast.get('significance_family_size') for contrast in contrasts) if isinstance(size, int) and (not isinstance(size, bool))})
     if any((size > 1 for size in family_sizes)):
         largest_family = max(family_sizes)
@@ -375,6 +378,42 @@ def _PA_part_001():
         missingness_flagged = [contrast for contrast in contrasts if contrast.get('differential_missingness')]
         if missingness_flagged:
             print('  [warn] 以下对比两臂缺少该指标的运行数不同（完整案例分析建立在不同运行子集上，结论可能来自缺测而非方法差异；请核对被排除运行的原因）: ' + '; '.join((f'''{contrast['baseline']}→{contrast['variant']}（缺 {contrast.get('n_missing_baseline', 0)} vs {contrast.get('n_missing_variant', 0)}，有效 {contrast.get('n_baseline', 0)} vs {contrast.get('n_variant', 0)}）''' for contrast in missingness_flagged)))
+    print()
+    print('[assumptions] 检验假设诊断（描述性，不改变显著性判定；小样本下无法证明正态/对称性，未标记不等于假设成立）')
+    assumption_flagged = []
+    for assumption_entry in list(contrasts) + list(reference) + list(factorial_fragility):
+        if not isinstance(assumption_entry, dict) or assumption_entry.get('confounded'):
+            continue
+        assumption_reasons = []
+        assumption_diag = _as_dict(assumption_entry.get('paired_diagnostics'))
+        if assumption_diag.get('available') and assumption_diag.get('status') == 'questionable':
+            diag_parts = []
+            if assumption_diag.get('skewness_flag'):
+                diag_parts.append(f"偏度 g1={_format_finite(assumption_diag.get('skewness'), '.2f')}（SE={_format_finite(assumption_diag.get('skewness_se'), '.2f')}）")
+            if assumption_diag.get('kurtosis_flag'):
+                diag_parts.append(f"超额峰度 g2={_format_finite(assumption_diag.get('excess_kurtosis'), '.2f')}（SE={_format_finite(assumption_diag.get('kurtosis_se'), '.2f')}）")
+            if diag_parts:
+                assumption_reasons.append('配对差值分布偏离正态（|统计量|>2·SE）: ' + '；'.join(diag_parts) + '；t 检验 p 值应与符号翻转/Wilcoxon 结论对照')
+        assumption_variance = _as_dict(assumption_entry.get('variance_diagnostics'))
+        if assumption_variance.get('available') and assumption_variance.get('status') == 'heteroscedastic':
+            assumption_reasons.append(f"两臂方差比={_format_finite(assumption_variance.get('variance_ratio'), '.1f')}（F 检验 p={_format_finite(assumption_variance.get('p_value'), '.3f')}）；合并标准差口径的 hedges_g 解读受影响（Welch 检验本身不受影响）")
+        assumption_t_p = _finite_float(assumption_entry.get('p_value'))
+        assumption_w_p = _finite_float(assumption_entry.get('wilcoxon_p_value'))
+        if assumption_t_p is not None and assumption_w_p is not None and (assumption_t_p <= _SIGNIFICANCE_LEVEL) != (assumption_w_p <= _SIGNIFICANCE_LEVEL):
+            assumption_reasons.append(f"配对 t（p={_format_finite(assumption_t_p)}）与 Wilcoxon 符号秩（p={_format_finite(assumption_w_p)}）在 0.05 水平上结论不一致；请检查逐种子差值（paired_differences）是否有单点驱动")
+        if assumption_reasons:
+            assumption_label = (
+                f"{assumption_entry.get('baseline')}→{assumption_entry.get('variant')}"
+                if assumption_entry.get('baseline') is not None
+                else str(assumption_entry.get('effect_name') or assumption_entry.get('cells') or assumption_entry.get('variant'))
+            )
+            assumption_flagged.append((assumption_label, assumption_reasons))
+    if not assumption_flagged:
+        print('  OK：无偏斜/重尾/方差悬殊/检验结论冲突的标记（只说明未发现偏离证据，不证明假设成立）')
+    else:
+        for assumption_label, assumption_reasons in assumption_flagged:
+            print(f"  [flag] {assumption_label}: " + '；'.join(assumption_reasons))
+        print('  注：诊断来自同一批运行，不是独立验证；显著结论应同时对照 [fragility] 与逐种子差值，必要时增加种子或调查异常运行')
     print()
     print('[fragility] 结果脆弱性检查（逐一/成组删除随机种子后重做配对 t 检验；alpha 为家族校正后阈值）')
     fragility_entries = fragility_summary.get('entries', [])
@@ -667,7 +706,7 @@ def _PA_part_001():
         print('  OK：各运行的有效路由宽度与均衡强度一致')
 
 def _PA_part_002():
-    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
+    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
     if factorial['designs'] or factorial['incomplete_designs']:
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
@@ -794,5 +833,5 @@ def _PA_part_002():
                 print(f'  {reason}')
         elif order_audit.get('verdict') == 'ok':
             print('  未发现强顺序相关；随机化区组平衡了时间片，但描述性诊断不能证明没有漂移')
-    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'n_runs': len(rows)})
+    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'n_runs': len(rows)})
 

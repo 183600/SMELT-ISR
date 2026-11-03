@@ -1265,6 +1265,80 @@ def resolve_preregistered_baseline(
             report["ok"] = None
     return report
 
+
+def _metric_multiplicity_report(
+    rows: List[Dict[str, object]],
+    metric: str,
+) -> Dict[str, object]:
+    """
+    跨指标多重性披露：显著性校正只在单一判定指标内部进行。
+
+    ``--compare`` 会对全部可聚合指标给出 Mean ± Std 与对比表，
+    但 Holm/BH 家族只覆盖 ``--compare-metric`` 选定的那一个
+    指标内部的检验。如果研究者在多个指标上分别看结果、只报告
+    显著的那个，相当于做了未校正的多重检验（garden of
+    forking paths）。该报告把这一结构性事实写进结果：
+
+    - ``preregistered_primary_metrics``：各运行训练前预注册的
+      主指标（--primary-metric）；只有它支持确证结论；
+    - ``runs_with_metric_mismatch``：预注册主指标与当前分析
+      指标不一致的运行——在这些运行上换指标分析属于事后
+      指标选择，只能作探索性证据并显式披露；
+    - ``correction_scope``：记录校正家族的作用范围，供
+      ``comparison_analysis.json`` 的机器可读复核。
+
+    本报告不改变任何统计判定；它的价值是把「除了主指标之外
+    的所有指标都是探索性的」从惯例变成报告里的显式字段。
+    """
+    declared: Dict[str, str] = {}
+    for row in rows:
+        run = str(row.get("run"))
+        value = row.get("primary_metric")
+        if isinstance(value, str) and value:
+            declared[run] = value
+    distinct = sorted(set(declared.values()))
+    mismatch_runs = [
+        run for run, value in declared.items() if value != metric
+    ]
+    report: Dict[str, object] = {
+        "analysis_metric": metric,
+        "preregistered_primary_metrics": distinct,
+        "runs_with_preregistered_metric": declared,
+        "runs_with_metric_mismatch": mismatch_runs,
+        "n_metrics_in_comparison_catalogue": len(
+            COMPARISON_METRIC_KEYS
+        ),
+        "correction_scope": "single_metric_family",
+        "ok": None,
+        "advisories": [],
+    }
+    report["advisories"].append(
+        "显著性校正（Holm/BH）只作用于判定指标 "
+        f"{metric} 内部的检验家族；报告同时聚合的全部指标中，"
+        "除预注册主指标外的都只能作探索性证据，不能在看到"
+        "结果后挑选其中显著者作为结论"
+    )
+    if not declared:
+        report["advisories"].append(
+            "没有任何运行预注册主指标（--primary-metric）："
+            "无法排除事后指标选择，当前指标的显著性不构成"
+            "确证结论"
+        )
+        return report
+    if mismatch_runs:
+        report["ok"] = False
+        report["advisories"].append(
+            "以下运行预注册的主指标与当前分析指标不同（事后"
+            "换指标）：其显著性只能作探索性证据: "
+            + ", ".join(
+                f"{run}（预注册 {declared[run]}）"
+                for run in mismatch_runs
+            )
+        )
+    else:
+        report["ok"] = True
+    return report
+
 def print_comparison_analysis(rows: List[Dict[str, object]], factors: Optional[List[str]]=None, baseline_mode: Optional[str]=None, metric: str='val_loss', ablation_modes: Optional[List[str]]=None, equivalence_margin: Optional[float]=_DEFAULT_EQUIVALENCE_MARGIN, allow_partial_ablation: bool=False, common_step: Optional[float]=None) -> Dict[str, object]:
     from exp._runner import run_isolated
     from exp import _manifest
@@ -1335,6 +1409,352 @@ def write_comparison_report(
         out_dir / "comparison_analysis.json",
         analysis,
     )
+
+
+
+# CSV 导出的对比表列名（顺序固定）。列名只增不改：后续版本
+# 可以在末尾新增列，但不能重命名或删除既有列，否则下游分析
+# 脚本会静默失配。
+_COMPARISON_CSV_CONTRAST_COLUMNS = (
+    "family",
+    "cells",
+    "factor",
+    "baseline",
+    "variant",
+    "baseline_value",
+    "variant_value",
+    "confounded",
+    "differing_factors",
+    "mean_baseline",
+    "mean_variant",
+    "std_baseline",
+    "std_variant",
+    "delta",
+    "ci95_low",
+    "ci95_high",
+    "ci_family_adjusted_low",
+    "ci_family_adjusted_high",
+    "se",
+    "t",
+    "df",
+    "test",
+    "n_pairs",
+    "n_baseline",
+    "n_variant",
+    "p_value",
+    "p_value_holm",
+    "p_value_bh",
+    "significant",
+    "significant_raw",
+    "randomization_p_value",
+    "wilcoxon_p_value",
+    "wilcoxon_method",
+    "wilcoxon_rank_biserial",
+    "delta_over_noise",
+    "hedges_g",
+    "cohens_dz",
+    "cohens_dz_ci95_low",
+    "cohens_dz_ci95_high",
+    "hedges_gz",
+    "hedges_gz_ci95_low",
+    "hedges_gz_ci95_high",
+    "cliffs_delta",
+    "cliffs_delta_ci95_low",
+    "cliffs_delta_ci95_high",
+    "paired_diagnostics_status",
+    "paired_diagnostics_skewness",
+    "paired_diagnostics_kurtosis",
+    "variance_diagnostics_status",
+    "variance_ratio",
+    "fragility_verdict",
+    "attrition_bounds_verdict",
+    "equivalent",
+    "tost_p_value",
+    "equivalence_margin_abs",
+    "verdict",
+    "cost_verdict",
+)
+
+_COMPARISON_CSV_AGGREGATE_COLUMNS = (
+    "cell",
+    "n_runs",
+    "effective_seed_count",
+    "deterministic",
+    "duplicate_seeds",
+    "metric_mean",
+    "metric_std",
+    "metric_ci95_low",
+    "metric_ci95_high",
+    "val_loss_mean",
+    "val_loss_std",
+    "val_loss_ci95_low",
+    "val_loss_ci95_high",
+    "n_params_mean",
+    "flops_per_forward_mean",
+    "latency_ms_per_forward_mean",
+)
+
+
+
+def _comparison_csv_cell(
+    value: object,
+) -> object:
+    """CSV 单元格规范化：None→空串，布尔→true/false，嵌套结构→JSON。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(_json_safe(value), ensure_ascii=False)
+    return value
+
+
+
+def _comparison_contrast_row(
+    contrast: Dict[str, object],
+    family: str,
+) -> Dict[str, object]:
+    """把一个对比记录摊平成 CSV 行（缺失字段写空单元格）。"""
+    paired_diagnostics = _as_dict(
+        contrast.get("paired_diagnostics")
+    )
+    variance_diagnostics = _as_dict(
+        contrast.get("variance_diagnostics")
+    )
+    fragility = _as_dict(contrast.get("fragility"))
+    attrition = _as_dict(contrast.get("attrition_bounds"))
+    dz_ci = _as_dict(contrast.get("cohens_dz_ci95"))
+    gz_ci = _as_dict(contrast.get("hedges_gz_ci95"))
+    cliff_ci = _as_dict(contrast.get("cliffs_delta_ci95"))
+    row: Dict[str, object] = {
+        "family": family,
+        "cells": contrast.get("cells"),
+        "factor": contrast.get("factor"),
+        "baseline": contrast.get("baseline"),
+        "variant": contrast.get("variant"),
+        "baseline_value": contrast.get("baseline_value"),
+        "variant_value": contrast.get("variant_value"),
+        "confounded": contrast.get("confounded"),
+        "differing_factors": contrast.get("differing_factors"),
+        "mean_baseline": contrast.get("mean_baseline"),
+        "mean_variant": contrast.get("mean_variant"),
+        "std_baseline": contrast.get("std_baseline"),
+        "std_variant": contrast.get("std_variant"),
+        "delta": contrast.get("delta"),
+        "ci95_low": contrast.get("ci95_low"),
+        "ci95_high": contrast.get("ci95_high"),
+        "ci_family_adjusted_low": contrast.get(
+            "ci_family_adjusted_low"
+        ),
+        "ci_family_adjusted_high": contrast.get(
+            "ci_family_adjusted_high"
+        ),
+        "se": contrast.get("se"),
+        "t": contrast.get("t"),
+        "df": contrast.get("df"),
+        "test": contrast.get("test"),
+        "n_pairs": contrast.get("n_pairs"),
+        "n_baseline": contrast.get("n_baseline"),
+        "n_variant": contrast.get("n_variant"),
+        "p_value": contrast.get("p_value"),
+        "p_value_holm": contrast.get("p_value_holm"),
+        "p_value_bh": contrast.get("p_value_bh"),
+        "significant": contrast.get("significant"),
+        "significant_raw": contrast.get("significant_raw"),
+        "randomization_p_value": contrast.get(
+            "randomization_p_value"
+        ),
+        "wilcoxon_p_value": contrast.get("wilcoxon_p_value"),
+        "wilcoxon_method": contrast.get("wilcoxon_method"),
+        "wilcoxon_rank_biserial": contrast.get(
+            "wilcoxon_rank_biserial"
+        ),
+        "delta_over_noise": contrast.get("delta_over_noise"),
+        "hedges_g": contrast.get("hedges_g"),
+        "cohens_dz": contrast.get("cohens_dz"),
+        "cohens_dz_ci95_low": dz_ci.get("low"),
+        "cohens_dz_ci95_high": dz_ci.get("high"),
+        "hedges_gz": contrast.get("hedges_gz"),
+        "hedges_gz_ci95_low": gz_ci.get("low"),
+        "hedges_gz_ci95_high": gz_ci.get("high"),
+        "cliffs_delta": contrast.get("cliffs_delta"),
+        "cliffs_delta_ci95_low": cliff_ci.get("low"),
+        "cliffs_delta_ci95_high": cliff_ci.get("high"),
+        "paired_diagnostics_status": paired_diagnostics.get(
+            "status"
+        ),
+        "paired_diagnostics_skewness": paired_diagnostics.get(
+            "skewness"
+        ),
+        "paired_diagnostics_kurtosis": paired_diagnostics.get(
+            "excess_kurtosis"
+        ),
+        "variance_diagnostics_status": variance_diagnostics.get(
+            "status"
+        ),
+        "variance_ratio": variance_diagnostics.get(
+            "variance_ratio"
+        ),
+        "fragility_verdict": fragility.get("verdict"),
+        "attrition_bounds_verdict": attrition.get("verdict"),
+        "equivalent": contrast.get("equivalent"),
+        "tost_p_value": contrast.get("tost_p_value"),
+        "equivalence_margin_abs": contrast.get(
+            "equivalence_margin_abs"
+        ),
+        "verdict": contrast.get("verdict"),
+        "cost_verdict": contrast.get("cost_verdict"),
+    }
+    return row
+
+
+
+def _comparison_aggregate_row(
+    aggregate: Dict[str, object],
+    metric: str,
+) -> Dict[str, object]:
+    """把一个实验单元的聚合摊平成 CSV 行（分析指标 + val_loss）。"""
+    ci95 = _as_dict(aggregate.get("ci95"))
+    metric_ci = _as_dict(ci95.get(metric))
+    loss_ci = _as_dict(ci95.get("val_loss"))
+    costs = _as_dict(aggregate.get("costs"))
+    params = _as_dict(costs.get("n_params"))
+    flops = _as_dict(costs.get("flops_per_forward"))
+    latency = _as_dict(costs.get("latency_ms_per_forward"))
+    return {
+        "cell": aggregate.get("label"),
+        "n_runs": aggregate.get("n_runs"),
+        "effective_seed_count": aggregate.get(
+            "effective_seed_count"
+        ),
+        "deterministic": aggregate.get("deterministic"),
+        "duplicate_seeds": bool(aggregate.get("duplicate_seeds")),
+        "metric_mean": aggregate.get(f"{metric}_mean"),
+        "metric_std": aggregate.get(f"{metric}_std"),
+        "metric_ci95_low": metric_ci.get("low"),
+        "metric_ci95_high": metric_ci.get("high"),
+        "val_loss_mean": aggregate.get("val_loss_mean"),
+        "val_loss_std": aggregate.get("val_loss_std"),
+        "val_loss_ci95_low": loss_ci.get("low"),
+        "val_loss_ci95_high": loss_ci.get("high"),
+        "n_params_mean": params.get("mean"),
+        "flops_per_forward_mean": flops.get("mean"),
+        "latency_ms_per_forward_mean": latency.get("mean"),
+    }
+
+
+
+def _comparison_csv_write(
+    path: Path,
+    columns: Sequence[str],
+    rows: List[Dict[str, object]],
+) -> None:
+    """原子写出单个 CSV 文件（先写临时文件再 os.replace）。"""
+    import csv
+
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=list(columns),
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        column: _comparison_csv_cell(
+                            row.get(column)
+                        )
+                        for column in columns
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+
+def write_comparison_csv_files(
+    path: Path,
+    analysis: Dict[str, object],
+) -> List[Path]:
+    """
+    把对比分析导出为机器可读的 CSV 表格（--compare-csv）。
+
+    JSON 报告（--compare-report）是完整但嵌套的证据结构；
+    CSV 导出面向二次分析与绘图工具（pandas/电子表格），把
+    结果摊平成稳定列名：
+
+    - ``path``：对比表（单因子对比、--compare-baseline 直接
+      对比与全因子主效应/交互，family 列区分来源）；
+    - ``path.aggregates.csv``（自动派生）：各实验单元的
+      Mean ± Std 与 95% CI。
+
+    导出只读分析结果，不重算统计量；混杂对比只写身份列，
+    统计列留空，避免下游把不可归因的对比当成有效检验。
+    """
+    metric = str(analysis.get("metric", "val_loss"))
+    contrast_rows: List[Dict[str, object]] = []
+    for family, key in (
+        ("single_factor", "contrasts"),
+        ("baseline", "reference_contrasts"),
+    ):
+        entries = analysis.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                contrast_rows.append(
+                    _comparison_contrast_row(entry, family)
+                )
+    factorial = _as_dict(analysis.get("factorial_effects"))
+    effects = factorial.get("effects")
+    if isinstance(effects, list):
+        for entry in effects:
+            if isinstance(entry, dict):
+                contrast_rows.append(
+                    _comparison_contrast_row(entry, "factorial")
+                )
+    aggregate_rows: List[Dict[str, object]] = []
+    aggregates = analysis.get("aggregates")
+    if isinstance(aggregates, list):
+        for aggregate in aggregates:
+            if isinstance(aggregate, dict):
+                aggregate_rows.append(
+                    _comparison_aggregate_row(aggregate, metric)
+                )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _comparison_csv_write(
+        path,
+        _COMPARISON_CSV_CONTRAST_COLUMNS,
+        contrast_rows,
+    )
+    aggregates_path = path.with_name(
+        path.stem + ".aggregates" + path.suffix
+    )
+    _comparison_csv_write(
+        aggregates_path,
+        _COMPARISON_CSV_AGGREGATE_COLUMNS,
+        aggregate_rows,
+    )
+    print(f"[compare-csv] 对比表已写入 {path}")
+    print(f"[compare-csv] 聚合表已写入 {aggregates_path}")
+    return [path, aggregates_path]
 
 
 

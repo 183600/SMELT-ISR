@@ -787,6 +787,45 @@ def factor_contrasts(
                 "hedges_gz": paired_effect_size.get(
                     "hedges_gz"
                 ),
+                # 效应量自身的 95% CI 与配对差值分布诊断：
+                # 点估计不给出估计精度，小种子数下区间可以同时
+                # 覆盖「可忽略」与「大效应」；诊断把 t 检验的
+                # 正态性前提显式化，不改变判定。
+                "cohens_dz_ci95": paired_effect_size.get(
+                    "cohens_dz_ci95"
+                ),
+                "hedges_gz_ci95": paired_effect_size.get(
+                    "hedges_gz_ci95"
+                ),
+                "paired_diagnostics": test.get(
+                    "paired_diagnostics"
+                ),
+                # Wilcoxon 符号秩：与符号翻转互补的稳健性对照
+                # （同对称性假设，利用秩幅度）。不进入 Holm
+                # 家族、不改变 significant 判定；与 t 结论不一致
+                # 时由展示层提示。
+                "wilcoxon_p_value": test.get(
+                    "wilcoxon_p_value"
+                ),
+                "wilcoxon_method": test.get("wilcoxon_method"),
+                "wilcoxon_rank_biserial": test.get(
+                    "wilcoxon_rank_biserial"
+                ),
+                "wilcoxon_min_attainable_p": test.get(
+                    "wilcoxon_min_attainable_p"
+                ),
+                "wilcoxon_can_reach_significance": test.get(
+                    "wilcoxon_can_reach_significance"
+                ),
+                # Welch（非配对）口径的秩效应量与方差齐性诊断：
+                # 合并标准差在两臂方差悬殊时的解读前提必须显式。
+                "cliffs_delta": test.get("cliffs_delta"),
+                "cliffs_delta_ci95": test.get(
+                    "cliffs_delta_ci95"
+                ),
+                "variance_diagnostics": test.get(
+                    "variance_diagnostics"
+                ),
                 "test": test.get("test"),
                 "t": test.get("t"),
                 "df": test.get("df"),
@@ -1031,6 +1070,11 @@ def _paired_linear_effect(
         effect_values = [value for _, value in ordered]
         result = _paired_t_test(effect_values)
         randomization = _paired_sign_flip_test(effect_values)
+        # 全因子主效应/交互的配对线性组合同样需要分布诊断与
+        # Wilcoxon 对照：交互的差值分布比两格对比更容易偏斜，
+        # 只看 t 检验会把假设前提藏起来。
+        diagnostics = _paired_difference_diagnostics(effect_values)
+        wilcoxon = _wilcoxon_signed_rank_test(effect_values)
         stability = _leave_one_out_effect_stability(
             effect_values
         )
@@ -1060,6 +1104,12 @@ def _paired_linear_effect(
             "paired_seeds": list(raw_seeds),
             "cohens_dz": paired_effect_size.get("cohens_dz"),
             "hedges_gz": paired_effect_size.get("hedges_gz"),
+            "cohens_dz_ci95": paired_effect_size.get(
+                "cohens_dz_ci95"
+            ),
+            "hedges_gz_ci95": paired_effect_size.get(
+                "hedges_gz_ci95"
+            ),
             "test": result.get("test"),
             "leave_one_out_effect_min": stability.get(
                 "leave_one_out_effect_min"
@@ -1090,6 +1140,18 @@ def _paired_linear_effect(
             ),
             "randomization_required_seeds": randomization.get(
                 "required_seeds_for_alpha"
+            ),
+            "paired_diagnostics": diagnostics,
+            "wilcoxon_p_value": wilcoxon.get("p_value"),
+            "wilcoxon_method": wilcoxon.get("method"),
+            "wilcoxon_rank_biserial": wilcoxon.get(
+                "rank_biserial"
+            ),
+            "wilcoxon_min_attainable_p": wilcoxon.get(
+                "min_attainable_p"
+            ),
+            "wilcoxon_can_reach_significance": wilcoxon.get(
+                "can_reach_significance"
             ),
             "se": result.get("se"),
             "n_pairs": len(effect_values),

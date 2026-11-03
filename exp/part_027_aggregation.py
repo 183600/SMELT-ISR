@@ -532,6 +532,31 @@ def _contrast_test(
                 if not result["significant_robust_possible"]
                 else "evaluable"
             )
+        # 配对差值的分布诊断（偏度/峰度/对称性，描述性）：小
+        # 样本下无法可靠检验正态性，但「差值明显偏斜或重尾」
+        # 必须显式暴露，不能只报一个 t 检验 p 值让读者默认
+        # 假设成立。诊断不改变判定，结论应与符号翻转/符号秩
+        # 一起读。
+        diagnostics = _paired_difference_diagnostics(differences)
+        result["paired_diagnostics"] = diagnostics
+        # Wilcoxon 符号秩检验：与符号翻转互补的稳健性对照，
+        # 同时利用差值的符号与相对幅度（秩）。与符号翻转相同
+        # 的对称性假设；不进入 Holm 家族、不改变显著性判定，
+        # 只在结论与 t 检验不一致时提示检查。
+        wilcoxon = _wilcoxon_signed_rank_test(differences)
+        result["wilcoxon"] = wilcoxon
+        if wilcoxon.get("p_value") is not None:
+            result["wilcoxon_p_value"] = wilcoxon.get("p_value")
+            result["wilcoxon_method"] = wilcoxon.get("method")
+            result["wilcoxon_rank_biserial"] = wilcoxon.get(
+                "rank_biserial"
+            )
+            result["wilcoxon_min_attainable_p"] = wilcoxon.get(
+                "min_attainable_p"
+            )
+            result["wilcoxon_can_reach_significance"] = (
+                wilcoxon.get("can_reach_significance")
+            )
         return result
 
     values_a = [float(sample["value"]) for sample in samples_a]
@@ -539,6 +564,21 @@ def _contrast_test(
     result = _welch_t_test(values_a, values_b)
     result["n_pairs"] = 0
     result["pseudo_replication"] = pseudo_replication
+    # Welch 两臂的方差齐性诊断与 Cliff's δ 效应量：Welch 不
+    # 假设等方差，诊断只用于解读合并标准差口径的 hedges_g；
+    # Cliff's δ 补上非配对情形缺失的秩（分布无关）效应量，
+    # 与 t 基效应量并列报告。两者都不改变显著性判定。
+    variance_diagnostics = _welch_variance_ratio(
+        values_a,
+        values_b,
+    )
+    result["variance_diagnostics"] = variance_diagnostics
+    cliff = _cliffs_delta(values_a, values_b)
+    result["cliffs_delta"] = cliff
+    if cliff is not None:
+        cliff_ci = _cliffs_delta_bootstrap_ci(values_a, values_b)
+        if cliff_ci.get("available"):
+            result["cliffs_delta_ci95"] = cliff_ci
 
     # 种子集合部分重叠时，主检验退回 Welch 会丢掉共同种子的
     # 配对信息（共同种子上的难度是共享的）。这里补一个仅用

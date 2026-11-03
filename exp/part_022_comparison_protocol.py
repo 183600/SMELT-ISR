@@ -1223,13 +1223,10 @@ def parse_factor_spec(spec: str) -> List[str]:
     # 必须显式标记为因子；否则在同一对比集内跨 mode 运行会被
     # 视为协议违规。而 ngram 与 neural family 之间的对比必须
     # 使用 _CROSS_FAMILY_PROTOCOL_KEYS 进行受控变量检查。
-    has_mode = "mode" in keys
-    has_ngram = any(
-        str(_row_factor_value({"mode": cfg.get("mode")}, "mode")) == "ngram"
-        for cfg in [{}]
-    )  # placeholder; actual check happens at comparison time
-    # 注意：这里仅做语法验证，跨 family 检查在 --compare 阶段由
-    # controlled_variables_check 完成。
+    # 这里仅做语法验证；mode/ngram 的实际核对在 --compare 阶段
+    # 由 controlled_variables_check / cross_family_protocol_check
+    # 完成（旧版本这里有一个对空列表求值的 has_ngram 死代码，
+    # 已删除——它永远为 False，且从未被读取）。
 
     return keys
 

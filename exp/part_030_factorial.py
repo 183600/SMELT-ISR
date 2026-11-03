@@ -1112,6 +1112,34 @@ def compare_cells_to_baseline(
             "hedges_g": hedges_g,
             "cohens_dz": paired_effect_size.get("cohens_dz"),
             "hedges_gz": paired_effect_size.get("hedges_gz"),
+            # 与 factor_contrasts 同口径：效应量 CI、配对差值
+            # 诊断、Wilcoxon 符号秩、Cliff's δ 与方差齐性诊断
+            # 必须随直接对比一起落盘，不能只出现在单因子家族。
+            "cohens_dz_ci95": paired_effect_size.get(
+                "cohens_dz_ci95"
+            ),
+            "hedges_gz_ci95": paired_effect_size.get(
+                "hedges_gz_ci95"
+            ),
+            "paired_diagnostics": result.get(
+                "paired_diagnostics"
+            ),
+            "wilcoxon_p_value": result.get("wilcoxon_p_value"),
+            "wilcoxon_method": result.get("wilcoxon_method"),
+            "wilcoxon_rank_biserial": result.get(
+                "wilcoxon_rank_biserial"
+            ),
+            "wilcoxon_min_attainable_p": result.get(
+                "wilcoxon_min_attainable_p"
+            ),
+            "wilcoxon_can_reach_significance": result.get(
+                "wilcoxon_can_reach_significance"
+            ),
+            "cliffs_delta": result.get("cliffs_delta"),
+            "cliffs_delta_ci95": result.get("cliffs_delta_ci95"),
+            "variance_diagnostics": result.get(
+                "variance_diagnostics"
+            ),
             "test": result.get("test"),
             "t": result.get("t"),
             "df": result.get("df"),

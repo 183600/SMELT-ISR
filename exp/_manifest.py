@@ -109,6 +109,7 @@ PA_PARTS = [
 PA_OWNED = {
     '_bad_value', '_cost_text', '_curve_value', '_delta_text', '_n_text', '_stat', 'ablation_modes', 'adequacy',
     'advisory', 'aggregate', 'aggregates', 'aligned_text', 'alignment', 'allow_partial_ablation', 'alpha_value', 'arm',
+    'assumption_entry', 'assumption_flagged', 'assumption_label', 'assumption_reasons',
     'attempted', 'attrition_entries', 'attrition_summary', 'autocorrelated_splits', 'bad_case_comparison', 'bad_header', 'bad_run_width', 'balance_scale',
     'baseline_mean', 'baseline_mode', 'baseline_preregistration', 'blocker', 'bounds_text', 'capacity_entries', 'capacity_parity_checked', 'capacity_parity_ok',
     'category_names', 'cell', 'check', 'common_step', 'common_step_sensitivity', 'component', 'component_verdicts', 'compute_aligned',
@@ -123,7 +124,7 @@ PA_OWNED = {
     'header', 'high', 'higher_is_better', 'holm', 'holm_text', 'hypotheses', 'imbalance', 'inconclusive_entries',
     'item', 'key', 'largest_family', 'level', 'line', 'low', 'margin_abs', 'margin_preregistration',
     'margin_status', 'margin_text', 'matched_coverage', 'mde', 'mde_relative', 'mde_text', 'mean', 'message',
-    'metric', 'metric_columns', 'metric_report', 'min_runs', 'mismatch', 'mismatch_messages', 'missing', 'missing_efficiency_cells',
+    'metric', 'metric_columns', 'metric_multiplicity', 'metric_report', 'min_runs', 'mismatch', 'mismatch_messages', 'missing', 'missing_efficiency_cells',
     'missingness_flagged', 'mixed_count', 'needed_text', 'not_evaluable_count', 'not_robust', 'numeric', 'numerical_failures', 'order_audit',
     'p_holm', 'p_text', 'p_value', 'pairs_text', 'parity', 'parity_entries', 'parity_mismatches', 'parts',
     'payloads', 'persistent', 'precision_limited', 'present', 'present_routing_fields', 'provenance', 'randomness', 'ranges',

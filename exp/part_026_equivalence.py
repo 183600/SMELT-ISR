@@ -578,6 +578,43 @@ def _paired_effect_size(
     correction = _hedges_g_correction(test.get("df"))
     if correction is not None:
         result["hedges_gz"] = dz * correction
+    # 效应量自身的 95% CI：点估计只给「效应多大」，不给「这个
+    # 估计有多准」。小种子数下 dz 的区间可以同时覆盖「可忽略」
+    # 与「大效应」，必须与点估计一起报告。采用配对标准化差值
+    # 的大样本近似 SE = sqrt(1/n + dz²/(2n))（Morris & DeShon,
+    # 2002 的配对口径）；正态分位数用 z_{0.975}，不依赖 SciPy。
+    # Hedges gz 的区间按同一宽度乘偏倚校正因子 J（g = J·d，
+    # 区间端点同比例缩放）。
+    z_critical = 1.959963984540054
+    variance_dz = (
+        1.0 / float(n_pairs) + dz * dz / (2.0 * float(n_pairs))
+    )
+    if math.isfinite(variance_dz) and variance_dz >= 0.0:
+        se_dz = math.sqrt(variance_dz)
+        low = dz - z_critical * se_dz
+        high = dz + z_critical * se_dz
+        if math.isfinite(low) and math.isfinite(high):
+            result["cohens_dz_ci95"] = {
+                "low": low,
+                "high": high,
+                "se": se_dz,
+                "method": "normal_approximation",
+                "note": (
+                    "配对标准化差值的大样本近似区间；小 n 下"
+                    "宽度偏乐观，应与 MDE/脆弱性一起解读"
+                ),
+            }
+            if correction is not None:
+                gz_low = low * correction
+                gz_high = high * correction
+                if math.isfinite(gz_low) and math.isfinite(
+                    gz_high
+                ):
+                    result["hedges_gz_ci95"] = {
+                        "low": gz_low,
+                        "high": gz_high,
+                        "method": "normal_approximation_scaled",
+                    }
     return result
 
 

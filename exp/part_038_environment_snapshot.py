@@ -663,6 +663,10 @@ def environment_mode_error(args) -> Optional[str]:
                 getattr(args, "compare_report", None) is not None,
             ),
             (
+                "--compare-csv",
+                getattr(args, "compare_csv", None) is not None,
+            ),
+            (
                 "--compare-preregistration",
                 getattr(
                     args, "compare_preregistration", None
