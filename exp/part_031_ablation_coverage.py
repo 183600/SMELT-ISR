@@ -653,6 +653,16 @@ def ablation_coverage(
                     f"缺少延迟合并方案 {mode} 的运行："
                     "无法证明该方案各自有用"
                 )
+        # 除了整体缺方案，还要把具体缺失的消融单元格
+        #（mode / balance 开关组合）逐条列入 missing_cells，
+        # 供跑报与摘要按“全因子组合”统计缺失数量。
+        for mode, level in (
+            (mode, level)
+            for mode in ("local_base", *expected_delayed)
+            for level in ("off", "on")
+        ):
+            if (mode, level) not in merge_pair_cells:
+                report["missing_cells"].append(f"{mode}/b={level}")
 
     expected_cells = [
         f"{mode}/b={level}"
