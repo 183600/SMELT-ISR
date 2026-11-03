@@ -349,8 +349,7 @@ def ablation_coverage(
         })
         if len(common) < _MIN_SEEDS_FOR_STATS:
             report["low_replicate_cells"].append(
-                f"{mode} 的 2×2 消融只有 {len(common)} 个"
-                "共同随机种子"
+                f"{mode} 的 2×2 消融共同随机种子只有 {len(common)} 个种子"
                 f"（< {_MIN_SEEDS_FOR_STATS}）：主效应/交互"
                 "无法做配对检验，不能据此声称各组件有效"
             )
@@ -859,7 +858,7 @@ def ablation_coverage(
         if all_present and len(common) < _MIN_SEEDS_FOR_STATS:
             report["low_replicate_cells"].append(
                 "全因子各格共同种子只有 "
-                f"{len(common)} 个（< {_MIN_SEEDS_FOR_STATS}）"
+                f"{len(common)} 个种子（< {_MIN_SEEDS_FOR_STATS}）"
                 "：方案之间的组件效应不再来自同一批重复实验，"
                 "不能支撑「各创新点各自有用」"
             )
@@ -926,6 +925,10 @@ def ablation_coverage(
             report["_summary_status"] = "incomplete"
     else:
         report["_summary_status"] = "partial"
+
+    if report["_summary_status"] == "complete":
+        n_modes = 1 + len(expected_delayed)
+        report["advisories"].append(f"{n_modes}×2 全因子组合齐全")
 
     return report
 

@@ -117,7 +117,7 @@ def _selfcheck_body_60601_0078():
     confounded_coverage = ablation_coverage(compare_runs(confounded_paths), factors, ['A'], allow_partial=True)
     assert not confounded_coverage['missing_cells']
     assert confounded_coverage['structural_confounds'], confounded_coverage
-    assert any(('k1' in message for message in confounded_coverage['structural_confounds']))
+    assert any(('k1' in (message if isinstance(message, str) else message.get('message', ''))) for message in confounded_coverage['structural_confounds'])
     assert not any(('全因子组合齐全' in message for message in confounded_coverage['advisories']))
 
 def _selfcheck_body_60737_0079():

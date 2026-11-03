@@ -423,8 +423,13 @@ def factorial_effects(
                         bl_abs = float(baseline_abs)
                     except (TypeError, ValueError, OverflowError):
                         se_v = df_v = bl_abs = None
-                    if se_v is not None and df_v is not None and se_v > 0 and bl_abs > 0:
-                        from .part_025_statistics import _t_critical
+                    if (
+                        equivalence_margin is not None
+                        and se_v is not None
+                        and df_v is not None
+                        and se_v > 0
+                        and bl_abs > 0
+                    ):
                         alpha = _SIGNIFICANCE_LEVEL
                         t_crit = _t_critical(df_v, alpha)
                         if t_crit is not None:
@@ -446,10 +451,6 @@ def factorial_effects(
                                     "equivalence_blocker"
                                 ] = "effect_exceeds_margin"
                             else:
-                                from .part_025_statistics import (
-                                    _seeds_to_detect,
-                                    _observed_seed_sd,
-                                )
                                 sd_observed = _observed_seed_sd(
                                     effect_record,
                                     se_v,
