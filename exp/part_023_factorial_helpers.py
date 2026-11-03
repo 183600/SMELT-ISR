@@ -967,7 +967,7 @@ def _paired_t_test(
             "test": "paired_t",
             "t": None,
             "df": float(n - 1),
-            "p_value": 0.0,
+            "p_value": 1.0,
             "note": "noise_free_separation",
             "effect": mean,
             "se": 0.0,
