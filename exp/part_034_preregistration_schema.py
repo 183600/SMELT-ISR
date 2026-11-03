@@ -553,7 +553,6 @@ def preregistration_schema_error(
         error = _preregistration_finite_number(
             max_hours,
             "compute_budget.max_total_training_hours",
-            minimum=0.0,
         )
         if error is not None:
             return error

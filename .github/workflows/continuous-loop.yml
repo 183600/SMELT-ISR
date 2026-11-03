@@ -627,7 +627,40 @@ jobs:
             # 失败即推送当前状态并以 exit 86 提前结束本 job（后继 run 已在队列中，数秒内自动接续）。
             case "$phase" in
               testfix) : ;;
-              *) pre_phase_test "$phase" || exit 86 ;;
+              *)
+                # ⭐ 前置测试门自愈（2026-11-03）：测试明确失败时不再直接 exit 86——
+                # 后继 run 会撞上同一道门，永远轮不到 testfix，循环死锁（SMELT-ISR /
+                # xuen / KnowProlog 均已实际发生）。改为先安排一次 testfix 修复，
+                # 复跑门禁；仍失败才 exit 86（后继 run 还会再试，修复机会不丢失）。
+                if ! pre_phase_test "$phase"; then
+                  PTF_BUDGET=$(( DEADLINE - $(date +%s) - 900 ))
+                  if [ "$PTF_BUDGET" -lt 900 ]; then
+                    echo "[pre-test] 剩余时间不足以安排 testfix 修复，提前结束本 job"
+                    exit 86
+                  fi
+                  [ "$PTF_BUDGET" -gt 10800 ] && PTF_BUDGET=10800
+                  {
+                    echo '本仓库的测试跑不通，请修复。复现方式：在仓库根目录运行 bash /tmp/pretest_run.sh。'
+                    echo
+                    echo '失败日志（最后 80 行）：'
+                    tail -80 /tmp/pretest_gate.log 2>/dev/null
+                    echo
+                    echo '要求：'
+                    echo '1. 只修复导致测试失败的问题，不得削弱、跳过或删除测试，不得修改门禁脚本让断言失效；'
+                    echo '2. 不要借修复之名重写无关代码，保持原有功能语义不变；'
+                    echo '3. .github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；'
+                    echo '4. 修复后必须自行运行测试并确认完全通过。'
+                  } > /tmp/ptf_fix_prompt.txt
+                  run_phase "testfix" "$(cat /tmp/ptf_fix_prompt.txt)" "$PTF_BUDGET" || true
+                  commit_and_push "pregate-testfix" || true
+                  if pre_phase_test "$phase"; then
+                    echo "[pre-test] testfix 修复后门禁通过，继续执行阶段 $phase"
+                  else
+                    echo "[pre-test] testfix 修复后门禁仍未通过，提前结束本 job（后继 run 会再次尝试修复）"
+                    exit 86
+                  fi
+                fi
+                ;;
             esac
             local attempt=0
             # 整个阶段（含所有重试）共用的硬上限：重试不得让总时长超过 budget

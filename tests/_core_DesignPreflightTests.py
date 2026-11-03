@@ -69,7 +69,7 @@ class DesignPreflightTests(unittest.TestCase):
     ):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            corpus = self._write_corpus(root, b"xy" * 5000)
+            corpus = self._write_corpus(root, b"xy" * 10000)
             sha = hashlib.sha256(corpus.read_bytes()).hexdigest()
             prereg = self._prereg_record(sha)
             args = self._plan_args(corpus, prereg, steps=10)
@@ -91,7 +91,11 @@ class DesignPreflightTests(unittest.TestCase):
             self.assertAlmostEqual(
                 data_file["estimated_epochs_per_run"], 0.01
             )
-            self.assertFalse(data_file["warnings"])
+            # 0.01 epoch 属 prototype 规模：应给出且仅给出
+            # 「token 预算不足 1 个 epoch」的口径提示。
+            self.assertEqual(len(data_file["warnings"]), 1)
+            self.assertIn("不足", data_file["warnings"][0])
+            self.assertIn("1 个 epoch", data_file["warnings"][0])
 
     def test_data_preflight_binds_corpus_identity_into_plan_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,7 +218,7 @@ class DesignPreflightTests(unittest.TestCase):
         ms_per_step: float,
     ) -> Path:
         run_dir = root / f"{mode}_seed{seed}"
-        run_dir.mkdir()
+        run_dir.mkdir(parents=True)
         (run_dir / "config.json").write_text(
             json.dumps(
                 {
@@ -300,7 +304,7 @@ class DesignPreflightTests(unittest.TestCase):
             )
             wall_clock = design["training_budget"]["wall_clock"]
             self.assertFalse(wall_clock["available"])
-            self.assertEqual(wall_clock["reason"], "no_pilot_runs")
+            self.assertEqual(wall_clock["reason"], "no_pilot_efficiency_records")
 
     def test_compute_budget_gate_blocks_over_budget(self):
         design = {
