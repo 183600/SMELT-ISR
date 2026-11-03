@@ -406,6 +406,105 @@ def factorial_effects(
                         result,
                         equivalence_margin,
                     )
+                # 增强等价性报告：计算 equivalence_margin_needed 与
+                # equivalence_blocker，明确「效应超出界限」与「精度不足」的区别。
+                se = result.get("se")
+                df = result.get("df")
+                baseline_mean = _finite_float(
+                    effect_record.get("mean_baseline")
+                )
+                baseline_abs = None
+                if baseline_mean is not None and abs(baseline_mean) > 0.0:
+                    baseline_abs = abs(baseline_mean)
+                if se is not None and df is not None and baseline_abs is not None:
+                    try:
+                        se_v = float(se)
+                        df_v = float(df)
+                        bl_abs = float(baseline_abs)
+                    except (TypeError, ValueError, OverflowError):
+                        se_v = df_v = bl_abs = None
+                    if se_v is not None and df_v is not None and se_v > 0 and bl_abs > 0:
+                        from .part_025_statistics import _t_critical
+                        alpha = _SIGNIFICANCE_LEVEL
+                        t_crit = _t_critical(df_v, alpha)
+                        if t_crit is not None:
+                            contrast_mag = abs(effect_value)
+                            equivalence_margin_needed = (
+                                contrast_mag + t_crit * se_v
+                            )
+                            effect_record["equivalence_margin_needed"] = (
+                                equivalence_margin_needed
+                            )
+                            margin_rel = float(equivalence_margin)
+                            margin_abs = margin_rel * baseline_abs
+                            if not math.isfinite(margin_abs):
+                                effect_record["equivalence_blocker"] = (
+                                    "margin_abs_infinite"
+                                )
+                            elif contrast_mag > margin_abs:
+                                effect_record[
+                                    "equivalence_blocker"
+                                ] = "effect_exceeds_margin"
+                            else:
+                                from .part_025_statistics import (
+                                    _seeds_to_detect,
+                                    _observed_seed_sd,
+                                )
+                                sd_observed = _observed_seed_sd(
+                                    effect_record,
+                                    se_v,
+                                )
+                                if sd_observed is not None and effect_value != 0.0:
+                                    design = (
+                                        "welch"
+                                        if effect_record.get(
+                                            "test"
+                                        )
+                                        == "welch_t"
+                                        else "paired"
+                                    )
+                                    seeds_needed = (
+                                        _seeds_to_detect(
+                                            effect_value,
+                                            sd_observed,
+                                            design=design,
+                                        )
+                                    )
+                                    if seeds_needed is not None:
+                                        delta_seeds = (
+                                            seeds_needed
+                                            - int(
+                                                result.get(
+                                                    "n_pairs", 0
+                                                )
+                                            )
+                                        )
+                                        if delta_seeds > 0:
+                                            effect_record[
+                                                "equivalence_blocker"
+                                            ] = f"need_{delta_seeds}_more_seeds"
+                                        else:
+                                            effect_record[
+                                                "equivalence_blocker"
+                                            ] = None
+                                    else:
+                                        effect_record[
+                                            "equivalence_blocker"
+                                        ] = "cannot_compute_seeds"
+                                else:
+                                    effect_record[
+                                        "equivalence_blocker"
+                                    ] = None
+                        else:
+                            effect_record[
+                                "equivalence_margin_needed"
+                            ] = None
+                            effect_record[
+                                "equivalence_blocker"
+                            ] = None
+                else:
+                    effect_record["equivalence_margin_needed"] = None
+                    effect_record["equivalence_blocker"] = None
                 # 全因子主效应/交互/简单效应同样只覆盖完整案例。
                 # 每个单元的缺失运行数量可能不同；把缺失值推到
                 # 观测支持的两端，检查该线性组合的方向是否仍

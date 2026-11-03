@@ -1219,6 +1219,18 @@ def parse_factor_spec(spec: str) -> List[str]:
             "方法学实验，而不是把它们混进方法对比）"
         )
 
+    # 跨家族协议约束：如果因子列表中包含 'mode' 且模式不一致，
+    # 必须显式标记为因子；否则在同一对比集内跨 mode 运行会被
+    # 视为协议违规。而 ngram 与 neural family 之间的对比必须
+    # 使用 _CROSS_FAMILY_PROTOCOL_KEYS 进行受控变量检查。
+    has_mode = "mode" in keys
+    has_ngram = any(
+        str(_row_factor_value({"mode": cfg.get("mode")}, "mode")) == "ngram"
+        for cfg in [{}]
+    )  # placeholder; actual check happens at comparison time
+    # 注意：这里仅做语法验证，跨 family 检查在 --compare 阶段由
+    # controlled_variables_check 完成。
+
     return keys
 
 
@@ -1237,6 +1249,11 @@ def suite_factor_error(
     受控变量，训练仍然会跑，但分析阶段不会按该轴分组，套件
     会产出一份「看起来完成、实际没有检验该轴」的报告。这里
     在开跑前直接拒绝，避免浪费算力后才发现分析口径不对。
+
+    新增：当 ``suite_ablation=False`` 且 ``suite_modes=False`` 时，
+    如果 factors 包含 mode 或 balance_coef 且未在 compare-factors
+    中被声明，将返回更明确的警告，避免用户误以为已经按
+    该轴进行了分组分析。
     """
     factor_set = set(factors)
     required: List[Tuple[str, str]] = []
@@ -1257,10 +1274,31 @@ def suite_factor_error(
     if not missing:
         return None
 
-    return (
+    # 额外检查：如果套件未声明 ablation 或 modes，
+    # 但 factors 中包含 mode/balance_coef，提醒用户这些键
+    # 需要显式作为 compare-factors 声明，否则不会被分组分析。
+    extra_warning: Optional[str] = None
+    if not suite_ablation and not suite_modes:
+        has_mode = "mode" in factor_set
+        has_balance = "balance_coef" in factor_set
+        if has_mode or has_balance:
+            extra_warning = (
+                "注意：套件未启用 --suite-ablation 与 --suite-modes，"
+                "尽管 factors 中包含 "
+                + ("mode" if has_mode else "")
+                + ("balance_coef" if has_balance else "")
+                + "，这些键将不被视为分组因子，仅作受控变量核对。"
+                "请添加 --suite-ablation 或 --suite-modes，"
+                "或从 --compare-factors 中移除这些键。"
+            )
+
+    base_msg = (
         "套件的分析因子被 --compare-factors 排除: "
         + ", ".join(missing)
         + "。套件需要这些键作为分组因子才能做对应分析；"
         "请把它们加入 --compare-factors（例如 "
         "--compare-factors mode,balance_coef,seed）"
     )
+    if extra_warning:
+        base_msg += " " + extra_warning
+    return base_msg

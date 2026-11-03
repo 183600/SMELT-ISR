@@ -218,27 +218,39 @@ def ablation_coverage(
     # 支撑「各设计各自有用」。
     if missing_structural_units:
         report["structural_confounds"].append(
-            "消融单元存在未记录的结构设置（"
-            + ", ".join(sorted(missing_structural_keys))
-            + "；涉及 "
-            + ", ".join(sorted(missing_structural_units))
-            + "）：无法核对结构设置在单元间一致，"
-            "主效应不能归因到待验证的设计上"
+            {
+                "type": "missing_structural_settings",
+                "missing_keys": sorted(missing_structural_keys),
+                "affected_runs": sorted(missing_structural_units),
+                "message": (
+                    "消融单元存在未记录的结构设置："
+                    + ", ".join(sorted(missing_structural_keys))
+                    + "；涉及 "
+                    + ", ".join(sorted(missing_structural_units))
+                    + "：无法核对结构设置在单元间一致，"
+                    "主效应不能归因到待验证的设计上"
+                ),
+            }
         )
 
     if len(structural_signatures) > 1:
+        signatures_summary = "; ".join(
+            f"{label} ×{count}"
+            for label, count in sorted(structural_signatures.items())
+        )
         report["structural_confounds"].append(
-            "消融单元之间 "
-            + "/".join(_ABLATION_STRUCTURAL_KEYS)
-            + " 的设置不一致（"
-            + "; ".join(
-                f"{label} ×{count}"
-                for label, count in sorted(
-                    structural_signatures.items()
-                )
-            )
-            + "）：延迟合并/均衡损失的主效应会与分支几何、"
-            "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
+            {
+                "type": "structural_variation_across_cells",
+                "signatures": signatures_summary,
+                "message": (
+                    "消融单元之间 "
+                    + "/".join(_ABLATION_STRUCTURAL_KEYS)
+                    + " 的设置不一致："
+                    + signatures_summary
+                    + "：延迟合并/均衡损失的主效应会与分支几何、"
+                    "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
+                ),
+            }
         )
 
     # 全因子设计只允许 mode × balance_coef 两轴变化。调用方若
@@ -422,6 +434,11 @@ def ablation_coverage(
             "variant_value": variant_cost,
             "ratio": ratio,
             "matched": matched,
+            "ratio_description": (
+                f"{ratio:.2f}×"
+                if ratio != ratio  # NaN guard
+                else f"{ratio:.4f}"
+            ),
         })
         if not matched:
             report["advisories"].append(
@@ -478,6 +495,11 @@ def ablation_coverage(
             "variant_value": variant_params,
             "ratio": parameter_ratio,
             "matched": parameter_matched,
+            "ratio_description": (
+                f"{parameter_ratio:.2f}×"
+                if parameter_ratio != parameter_ratio  # NaN guard
+                else f"{parameter_ratio:.4f}×"
+            ),
         })
         if not parameter_matched:
             report["advisories"].append(
@@ -519,6 +541,36 @@ def ablation_coverage(
                 "A vs local_base 的差值混入计算量差异"
             )
 
+    # 宽度/容量综合提示：如果 A 的 k1×k2 超过 n_experts，
+    # 且 A 的 FLOPs/参数 相对于 local_base 达到 _COST_RATIO_MATERIAL
+    # 倍率，则差异很可能由容量而非延迟合并本身驱动。
+    if "A" in modes_present:
+        a_cells = {k: v for k, v in merge_pair_cells.items() if k[0] == "A"}
+        a_has_on = ("A", "on") in a_cells
+        a_has_off = ("A", "off") in a_cells
+        if a_has_on or a_has_off:
+            # 检查是否存在 k1*k2 > n_experts 情形
+            a_k1k2_exceeds = False
+            for row in rows:
+                if str(_row_factor_value(row, "mode")) == "A":
+                    k1v = row.get("k1")
+                    k2v = row.get("k2")
+                    nexpv = row.get("n_experts")
+                    if (
+                        isinstance(k1v, int)
+                        and isinstance(k2v, int)
+                        and isinstance(nexpv, int)
+                        and k1v * k2v > nexpv
+                    ):
+                        a_k1k2_exceeds = True
+                        break
+            if a_k1k2_exceeds:
+                report["advisories"].append(
+                    "综合诊断：A 方案出现 k1×k2 > n_experts 情形，"
+                    "其第二轮专家宽度显著超过专家总数，"
+                    " A vs local_base 的差异极可能由容量差异驱动，"
+                    "而非延迟合并本身的效应"
+                )
     if "B" in modes_present and "smelt" in modes_present:
         report["advisories"].append(
             "B 在第一轮按 k1 个分支执行后续 Attention/MoE，"
@@ -688,6 +740,8 @@ def ablation_coverage(
         "common_seeds": [],
         "n_common_seeds": 0,
         "aligned": False,
+        "per_cell_seed_counts": {},
+        "misaligned_cells": [],
     }
     if (
         "balance_coef" in factor_set
@@ -705,6 +759,7 @@ def ablation_coverage(
         seed_sets: List[set] = []
         raw_by_key: Dict[object, object] = {}
         complete_records = True
+        per_cell: Dict[tuple, int] = {}
         for pair in expected_pairs:
             seeds = merge_pair_seeds.get(pair, [])
             if pair in merge_pair_cells and (
@@ -719,6 +774,7 @@ def ablation_coverage(
                 raw_by_key.setdefault(
                     _stable_factor_key(seed), seed
                 )
+                per_cell[pair] = per_cell.get(pair, 0) + 1
         common = (
             set.intersection(*seed_sets)
             if seed_sets
@@ -746,7 +802,44 @@ def ablation_coverage(
             "common_seeds": common_raw,
             "n_common_seeds": len(common),
             "aligned": aligned,
+            "per_cell_seed_counts": {
+                f"{mode}/b={level}": count
+                for (mode, level), count in per_cell.items()
+            },
         }
+        # 详细的种子对齐诊断：哪些单元格对齐，哪些不对齐
+        for pair in expected_pairs:
+            seeds = merge_pair_seeds.get(pair, [])
+            seed_set = {
+                _stable_factor_key(seed) for seed in seeds
+            }
+            is_aligned = all(
+                seed_set == common for seed_set in seed_sets
+            ) if seed_sets else False
+            if not is_aligned:
+                own_seeds = merge_pair_seeds.get(pair, [])
+                own_set = {
+                    _stable_factor_key(s) for s in own_seeds
+                }
+                misaligned_against = set()
+                for other_pair in expected_pairs:
+                    if other_pair == pair:
+                        continue
+                    other_seeds = merge_pair_seeds.get(other_pair, [])
+                    other_set = {
+                        _stable_factor_key(s) for s in other_seeds
+                    }
+                    if own_set & other_set:
+                        misaligned_against.add(
+                            f"{other_pair[0]}/b={other_pair[1]}"
+                        )
+                if misaligned_against:
+                    report["advisories"].append(
+                        f"种子对齐诊断：{f'{pair[0]}/b={pair[1]}'} 与 "
+                        f"{', '.join(misaligned_against)} 的种子集交集非空，"
+                        "表明不同消融格共享部分种子但非完全对齐，"
+                        "组件效应只在共同子集上可配对"
+                    )
         if all_present and not complete_records:
             report["advisories"].append(
                 "全因子存在未记录随机种子的运行：无法核对各格"
@@ -769,77 +862,60 @@ def ablation_coverage(
             )
     report["global_seed_alignment"] = global_alignment
 
+    # 综合摘要：汇总缺失组件、阻塞条件与关键诊断，供阅读者快速评估
+    # 「各创新点各自有用」的整体结论状态。
+    summary_parts: List[str] = []
+    if report["missing_cells"]:
+        summary_parts.append(
+            f"缺少 {len(report['missing_cells'])} 个全因子组合"
+        )
+    if report["structural_confounds"]:
+        summary_parts.append(
+            f"结构混杂 {len(report['structural_confounds'])} 项"
+        )
+    if report["low_replicate_cells"]:
+        summary_parts.append(
+            f"种子不足 {len(report['low_replicate_cells'])} 项"
+        )
+    if report["compute_parity"]:
+        summary_parts.append(
+            f"计算量不匹配 {len(report['compute_parity'])} 项"
+        )
+    if report["capacity_parity"]:
+        summary_parts.append(
+            f"容量不匹配 {len(report['capacity_parity'])} 项"
+        )
+    if report["width_confounds"]:
+        summary_parts.append(
+            f"宽度混杂 {len(report['width_confounds'])} 项"
+        )
+    if report["attrition_confounds"]:
+        summary_parts.append(
+            f"attrition 诊断 {len(report['attrition_confounds'])} 项"
+        )
+    if report["advisories"]:
+        summary_parts.append(
+            f"提醒 {len(report['advisories'])} 条"
+        )
+    if not summary_parts:
+        summary_parts.append("全因子设计齐全，无显著诊断提醒")
+    report["_summary"] = "； ".join(summary_parts)
+
     if (
         "balance_coef" in factor_set
         and "mode" in factor_set
     ):
-        # (1 + N)×2 全部格子的存在性（两轴都在因子中时）。
-        for mode in ("local_base", *expected_delayed):
-            for level in ("off", "on"):
-                key = (mode, level)
-                if key not in merge_pair_cells:
-                    report["missing_cells"].append(
-                        f"缺少全因子组合 {mode}/b={level}"
-                        "（无法证明各创新点各自有用）"
-                    )
-    elif "balance_coef" in factor_set:
-        # 只有 balance_coef 是因子：按本项目的延迟合并模式
-        # 检查开启臂 / 关闭臂。
-        for mode in ("local_base", *expected_delayed):
-            if mode not in modes_present:
-                continue
-            balances = balance_by_mode.get(mode, [])
-            known = [b for b in balances if b is not None]
-            if not known:
-                report["low_replicate_cells"].append(
-                    f"{mode} 未记录 balance_coef"
-                )
-                continue
-            if 0 not in known:
-                report["missing_cells"].append(
-                    f"{mode} 缺少 balance_coef=0 的关闭臂："
-                    "无法证明均衡损失各自有用"
-                )
-            if not any(
-                isinstance(b, (int, float))
-                and not isinstance(b, bool)
-                and b > 0
-                for b in known
-            ):
-                report["missing_cells"].append(
-                    f"{mode} 缺少 balance_coef>0 的开启臂"
-                )
-
-    for (mode, level), count in sorted(merge_pair_cells.items()):
-        label = f"{mode}/b={level}"
-        report["present_cells"].append({
-            "cell": label,
-            "n_runs": count,
-        })
-        independent = _independent_seed_count(
-            count,
-            merge_pair_seeds.get((mode, level), []),
-        )
-        if independent < _RECOMMENDED_SEEDS:
-            report["low_replicate_cells"].append(
-                f"{label} 只有 {independent} 个种子"
-                f"（建议 ≥{_RECOMMENDED_SEEDS}）"
-            )
-
-    expected_cell_count = 2 * (1 + len(expected_delayed))
-    if (
-        "balance_coef" in factor_set
-        and "mode" in factor_set
-        and len(merge_pair_cells) == expected_cell_count
-        and not report["missing_cells"]
-        and not report["structural_confounds"]
-        and not report["partial"]
-    ):
-        report["advisories"].append(
-            f"{1 + len(expected_delayed)}×2 全因子组合齐全且"
-            "结构设置一致：可同时给出各延迟合并方案与均衡损失"
-            "的主效应及交互"
-        )
+        expected_cell_count = 2 * (1 + len(expected_delayed))
+        all_cells_present = len(merge_pair_cells) == expected_cell_count
+        no_missing = not report["missing_cells"]
+        no_structural = not report["structural_confounds"]
+        no_partial = not report["partial"]
+        if all_cells_present and no_missing and no_structural and no_partial:
+            report["_summary_status"] = "complete"
+        else:
+            report["_summary_status"] = "incomplete"
+    else:
+        report["_summary_status"] = "partial"
 
     return report
 
