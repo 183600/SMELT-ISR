@@ -629,6 +629,26 @@ class SparseMoE(nn.Module):
 
         padded.index_copy_(0, dest, gathered)
 
+        # Zero out scratch rows for overflow to avoid double gradient.
+        # The scratch row (index cap within each expert's stride) receives
+        # inputs from multiple overflow assignments via index_copy_. During
+        # batched forward it would compute a single output for the last
+        # overflow input. _GatherPaddedExpertOutputs then gathers this
+        # single output for ALL overflow positions, and its backward
+        # accumulates gradients from all overflow positions into the
+        # scratch row input (last overflow row's input). Meanwhile the
+        # fallback index_copy_ on final provides correct per-overflow
+        # gradients via separate expert forwards. This causes the last
+        # overflow row to receive double gradients. Zeroing the scratch
+        # rows here makes the batched forward output zeros for them,
+        # so _GatherPaddedExpertOutputs gathers zeros and contributes
+        # no gradient for overflow positions; the fallback provides
+        # the correct gradients.
+        if has_overflow:
+            for expert_index in range(n_experts):
+                scratch_idx = expert_index * stride + cap
+                padded[scratch_idx].zero_()
+
         if not has_overflow:
             # 常规路径到此 gathered 的数据不再被任何一方引用
             #（index_select / index_copy_ 的反向只保存下标）；
