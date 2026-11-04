@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import os
 
 
 def run_experiment_sweep(args: argparse.Namespace) -> None:
@@ -215,6 +217,6 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
 def main():
     from exp._runner import run_isolated
     from exp import _manifest
-    _root = os.path.dirname(os.path.abspath(__file__))
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _paths = [os.path.join(_root, 'exp', 'mainflow', _name) for _name in _manifest.MAIN_PARTS]
     return run_isolated(_paths, globals(), _manifest.MAIN_OWNED, _manifest.MAIN_ENTRY, {})
