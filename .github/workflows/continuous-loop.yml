@@ -370,7 +370,25 @@ jobs:
             # NVIDIA 重度推理模型给足冒烟时间；免费池快速失败（网关挂起时省时）
             local st=90; case "$m" in nvidia/*) st=75 ;; esac
             # shellcheck disable=SC2086
-            timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" < /dev/null > /tmp/smoke_test.log 2>&1
+            # ⭐ 429/限流不换模型：冒烟撞限流时同模型退避重试（45/90/135/180s，共 4 次）；
+            #    4 次仍限流 → 返回 2（调用方据此中止选择，绝不因 429 换模型）
+            local _sm_try=0
+            while ! timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" < /dev/null > /tmp/smoke_test.log 2>&1; do
+              if ! grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier" /tmp/smoke_test.log 2>/dev/null; then
+                echo "[smoke] $m 冒烟失败（非限流），日志末尾："
+                tail -c 600 /tmp/smoke_test.log 2>/dev/null || true
+                return 1
+              fi
+              if [ "$_sm_try" -ge 4 ]; then
+                echo "[smoke] $m 持续 429/限流（已退避重试 4 次）：不换模型，返回限流信号"
+                return 2
+              fi
+              _sm_try=$((_sm_try+1))
+              echo "[smoke] $m 撞 429/限流（第 ${_sm_try}/4 次）：不换模型，$((45*_sm_try))s 后同模型重试"
+              sleep $((45*_sm_try))
+            done
+            return 0
+
             local rc=$?
             if [ "$rc" -ne 0 ]; then
               echo "[smoke] $m 失败 (exit=$rc)，/tmp/smoke_test.log 末尾内容："
@@ -421,7 +439,14 @@ jobs:
                   glm)    model="$GLM_MODEL" ;;
                   pickle) model="$PICKLE_MODEL" ;;
                 esac
-                if smoke_test "$model"; then
+                smoke_test "$model"; __rc=$?
+                if [ "$__rc" -eq 2 ]; then
+                  echo "[provider] $model 持续 429/限流：不换模型、不标记失效，中止本轮模型选择，交由后继 run 重试"
+                  SELECTED_MODEL=""; SELECTED_PROVIDER=""; SELECTED_VARIANT=""
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+                  return 1
+                fi
+                if [ "$__rc" -eq 0 ]; then
                   SELECTED_MODEL="$model"
                   SELECTED_PROVIDER="$cand"
                   # 只有免费 deepseek 支持 reasoning effort 档位
@@ -721,6 +746,9 @@ jobs:
             #        模型候选池导致循环停摆。
             #    正常路径与原实现等价：EC 仍取 timeout 的 PIPESTATUS[0]。
             echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用并推送进度，后继 job 重试同阶段）"
+            # ⭐ 429/限流不换模型：同模型原地退避重试（60/120/180/240s，最多 4 次），绝不换模型
+            local _429_tries=0
+            while :; do
             rm -f /tmp/.oc_exit_code
             # shellcheck disable=SC2086
             # setsid：让包装进程成为独立进程组组长（包装/timeout/tee 一个组），
@@ -778,12 +806,31 @@ jobs:
               return $EC
             fi
 
+            # ⭐ 429/限流：同一模型原地退避重试，绝不换模型（2026-11-04）
+            if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
+              if [ "$_429_tries" -lt 4 ]; then
+                _429_tries=$((_429_tries+1))
+                local _w=$((60*_429_tries))
+                echo "[429-retry] phase=$phase 撞限流（$SELECTED_MODEL，exit=$EC）：不换模型，${_w}s 后同模型第 $((_429_tries+1)) 次调用（$_429_tries/4）"
+                sleep "$_w"
+                budget_now=$(( phase_end - $(date +%s) ))
+                if [ "$budget_now" -le 60 ]; then
+                  echo "[429-retry] phase=$phase 剩余预算不足：本 job 结束，后继 job 将以同一模型重试本阶段"
+                  return $EC
+                fi
+                continue
+              fi
+              echo "[warn] phase=$phase 持续限流（$SELECTED_MODEL，已同模型重试 4 次仍失败）：不换模型、不标记失效，交由后继 job 重试"
+              return $EC
+            fi
+            break
+            done
+
             # 调用失败（非超时）：标记该模型失效，但不在本 job 内重试；
             # 后继 job 会对同一阶段再发起一次新的 opencode 调用
             oc_mark_broken "$SELECTED_MODEL"
             if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier|status.{0,3}5[0-9][0-9]|econnreset|etimedout|fetch failed|socket hang up|connection (refused|reset)"; then
-              echo "[warn] phase=$phase 限流/5xx/连接失败（$SELECTED_MODEL），交由后继 job 重试"
-              mark_broken "model:$SELECTED_MODEL"
+              echo "[warn] phase=$phase 5xx/连接失败（$SELECTED_MODEL），交由后继 job 重试"
             elif tail -40 "$OUT" | grep -qiE "401|unauthorized|invalid.{0,4}api.?key|missing.{0,4}api.?key"; then
               echo "[hint] 疑似鉴权问题：匿名限额可能耗尽。可在仓库 secrets 配置 OPENCODE_API_KEY 提升限额后重试"
             else
