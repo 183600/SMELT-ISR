@@ -653,26 +653,63 @@ def preregistration_power_plan(
             "sd_multiplier": multiplier,
             "expected_seed_sd_relative": scaled_sd,
             "binding_contrast": scaled_binding,
-            "required_seeds_for_t": scaled_entry[
-                "required_seeds_for_t"
-            ],
+            "required_seeds_for_t": scaled_entry["required_seeds_for_t"],
             "required_seeds_with_attrition": scaled_entry[
                 "required_seeds_with_attrition"
             ],
-            "superiority_adequate_at_planned_seeds": (
-                scaled_superiority
-            ),
-            "equivalence_adequate_at_planned_seeds": (
-                scaled_equivalence
-            ),
+            "superiority_adequate_at_planned_seeds": scaled_superiority,
+            "equivalence_adequate_at_planned_seeds": scaled_equivalence,
             "adequate_at_planned_seeds": (
                 scaled_superiority
-                and (
-                    not plan_equivalence
-                    or bool(scaled_equivalence)
-                )
+                and (not plan_equivalence or bool(scaled_equivalence))
             ),
         })
+
+    # 汇总敏感性分析结果：required_seeds 随 sd 变化的范围，
+    # 以及哪个 sd 区间下 design 仍然 adequate
+    # 过滤掉 required_seeds_with_attrition 为 None 的条目（种子不足情形）
+    valid_entries = [
+        entry
+        for entry in sensitivity
+        if entry["required_seeds_with_attrition"] is not None
+    ]
+    sensitivity_summary: Dict[str, object] = {
+        "sd_range": {
+            "min_multiplier": min(
+                entry["sd_multiplier"] for entry in sensitivity
+            ),
+            "max_multiplier": max(
+                entry["sd_multiplier"] for entry in sensitivity
+            ),
+        },
+        "required_seeds_range": {
+            "min": min(
+                entry["required_seeds_with_attrition"]
+                for entry in valid_entries
+            )
+            if valid_entries
+            else None,
+            "max": max(
+                entry["required_seeds_with_attrition"]
+                for entry in valid_entries
+            )
+            if valid_entries
+            else None,
+        },
+        "adequate_at_plan_seeds_across_sd": {
+            mult: entry["adequate_at_planned_seeds"]
+            for mult, entry in zip(
+                [e["sd_multiplier"] for e in sensitivity],
+                sensitivity,
+            )
+        },
+        "binding_contrast_unstable": len(
+            set(
+                entry["binding_contrast"] for entry in sensitivity
+            )
+        )
+        > 1,
+    }
 
     return {
         "expected_seed_sd_relative": sd,
@@ -685,9 +722,7 @@ def preregistration_power_plan(
         "binding_contrast": binding,
         "binding_contrast_label": _CONTRAST_LABELS[binding],
         "contrast_power": contrast_power,
-        "contrast_variance_factor": binding_entry[
-            "variance_factor"
-        ],
+        "contrast_variance_factor": binding_entry["variance_factor"],
         "required_seeds_for_t": required_t,
         "required_seeds_for_robust_sign_flip": required_robust,
         # required_seeds 保持「无脱落时的启动数」，便于与旧报告
@@ -701,6 +736,7 @@ def preregistration_power_plan(
         "achieved_power_at_min_effect": achieved_power,
         "minimum_detectable_effect_relative": mde,
         "power_sensitivity": sensitivity,
+        "power_sensitivity_summary": sensitivity_summary,
         "plan_equivalence": plan_equivalence,
         "equivalence_margin_relative": equivalence_margin_value,
         "equivalence": equivalence,
@@ -723,5 +759,12 @@ def preregistration_power_plan(
             "功效按真实差异为零计算，是「若确实无实质差异，"
             "能否在预注册界内主张等价」的概率，不保证真实"
             "差异为零"
+            + (
+                " 若 binding_contrast 在敏感性分析中不稳定（"
+                "在不同 sd 区间切换，当前设计的对比类型假设可能"
+                "不稳健），请在冻结前确认对比类型或增加种子。"
+                if sensitivity_summary["binding_contrast_unstable"]
+                else ""
+            )
         ),
     }

@@ -83,13 +83,19 @@ def _design_power_for_family(
             ),
         )
     except (KeyError, TypeError, ValueError, OverflowError) as error:
-        # 手工构造/旧版记录可能没有重算所需的原始字段；
-        # 至少保留调整后的家族规模与对比类型。但原有
-        # ``adequate=True`` 是按更小的家族/更弱的对比算出来的，
-        # 不能继续沿用，否则新增的交互对比会绕过启动门。
+        # 手工构造/旧版记录可能没有重算所需的原始字段。
+        # 调整后的家族规模/对比类型已写入 adjusted，
+        # 但功效公式重算失败时不能宣称 adequate。
         adjusted["adequate"] = None
         adjusted["adequacy_recomputed"] = False
         adjusted["adequacy_recompute_error"] = str(error)
+        adjusted["family_size_adjusted_for_plan"] = bool(family_grew)
+        adjusted["contrasts_adjusted_for_plan"] = bool(contrasts_grew)
+        # 记录调整前的声明值，供追溯
+        adjusted["declared_planned_comparisons"] = (
+            int(declared) if declared_is_int else None
+        )
+        adjusted["declared_planned_contrasts"] = declared_contrasts
         # 重算失败时，所有依赖旧家族/旧对比类型/旧功效输入的
         # 派生字段都已过期。不能只清 adequate 而把旧
         # required_seeds、achieved_power、MDE 留在报告里；把它
@@ -117,6 +123,8 @@ def _design_power_for_family(
         }
         for key in stale_keys:
             adjusted.pop(key, None)
+        # 标记重算失败，供调用者识别并作相应处理（如拒绝启动、记录警告）
+        adjusted["power_recompute_failed"] = True
         return adjusted
     recomputed["declared_planned_comparisons"] = declared
     recomputed["declared_planned_contrasts"] = declared_contrasts
