@@ -423,18 +423,14 @@ def data_plan_differences(
     if not isinstance(expected_cleaning, dict):
         expected_cleaning = {}
 
-    declared_alias = {
+    declared_effective = any(
         bool(declared_cleaning.get(key, False))
         for key in _CLEAN_AGAINST_TEST_ALIASES
-        if key in declared_cleaning
-    }
-    declared_effective = (
-        next(iter(declared_alias)) if declared_alias else False
     )
-    expected_effective = False
-    for key in _CLEAN_AGAINST_TEST_ALIASES:
-        if key in expected_cleaning:
-            expected_effective = bool(expected_cleaning[key])
+    expected_effective = any(
+        bool(expected_cleaning.get(key, False))
+        for key in _CLEAN_AGAINST_TEST_ALIASES
+    )
     if declared_effective != expected_effective:
         differences.append(
             {
