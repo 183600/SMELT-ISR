@@ -6,6 +6,7 @@ import sys as _sys
 import types as _types
 
 import exp as _exp
+import selfcheck  # Required for run_self_test to access the checks module
 
 
 class _CompatModule(_types.ModuleType):
