@@ -162,6 +162,17 @@ def _MAIN_part_001():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
     _normalize_clean_against_test(args)
+    # 科研方法改进：多种子/套件运行必须声明假设，避免无假设的超参数排列组合
+    if not args.skip_hypothesis_check:
+        needs_hypothesis = False
+        if args.seeds is not None and len(args.seeds) > 1:
+            needs_hypothesis = True
+        if args.suite_modes is not None:
+            needs_hypothesis = True
+        if args.suite_ablation:
+            needs_hypothesis = True
+        if needs_hypothesis and not args.hypothesis.strip():
+            parser.error('--seeds / --suite-modes / --suite-ablation 多种子/对比实验必须通过 --hypothesis 明确科学假设（可使用 --skip-hypothesis-check 显式豁免，豁免会被记录进 config.json）')
     source_error = source_mode_error(args)
     if source_error is not None:
         parser.error(source_error)
