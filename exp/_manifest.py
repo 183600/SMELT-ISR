@@ -49,6 +49,7 @@ CORE_PARTS = [
     'part_046_baseline_tuning.py',
     'part_047_baseline_tuning_provenance.py',
     'part_048_training_sweep.py',
+    'part_049_data_plan.py',
 ]
 MAIN_PARTS = [
     'part_000.py',
