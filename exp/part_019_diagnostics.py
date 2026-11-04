@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 
 _NONFINITE_CHECKLIST = [
     "1) 数据：批次内是否存在 NaN/Inf 或越界 token"
@@ -1234,9 +1236,7 @@ def _is_deterministic_run(row: Dict[str, object]) -> bool:
 
 def _finite_float(value: object) -> Optional[float]:
     """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
-    if isinstance(value, bool) or not isinstance(
-        value, (int, float)
-    ):
+    if isinstance(value, bool):
         return None
     try:
         numeric = float(value)
