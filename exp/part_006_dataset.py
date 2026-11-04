@@ -1323,6 +1323,77 @@ class ByteDataset:
 
 
 # ============================================================
+# Shared dataset construction
+# ============================================================
+
+def build_byte_dataset(
+    args: object,
+    seq_len: int,
+    group_separator: Optional[bytes],
+    device: Optional[torch.device] = None,
+) -> ByteDataset:
+    """
+    按当前命令行口径构造字节级数据集。
+
+    训练入口与「数据协议准备」入口（``--write-data-plan`` /
+    ``--check-data-plan``）共用同一份构造逻辑：清洗开关一旦只
+    在一处维护，另一处就会悄悄用旧口径生成计划，预注册里的
+    数据协议就会与实际训练的数据对不上。
+    """
+    return ByteDataset(
+        str(getattr(args, "data", "")),
+        int(seq_len),
+        val_fraction=float(getattr(args, "val_fraction", 0.05)),
+        test_fraction=float(getattr(args, "test_fraction", 0.05)),
+        device=device,
+        group_separator=group_separator,
+        deduplicate_train_groups=bool(
+            getattr(args, "deduplicate_train_groups", False)
+        ),
+        drop_train_shared_chunks=bool(
+            getattr(args, "drop_train_shared_chunks", False)
+        ),
+        drop_train_near_duplicate_groups=bool(
+            getattr(args, "drop_train_near_duplicate_groups", False)
+        ),
+        near_duplicate_audit=bool(
+            getattr(args, "near_duplicate_audit", False)
+        ),
+        near_duplicate_threshold=float(
+            getattr(
+                args,
+                "near_duplicate_threshold",
+                _NEAR_DUP_DEFAULT_THRESHOLD,
+            )
+        ),
+        near_duplicate_shingle_bytes=int(
+            getattr(
+                args,
+                "near_duplicate_shingle_bytes",
+                _NEAR_DUP_DEFAULT_SHINGLE_BYTES,
+            )
+        ),
+        drop_train_corrupt_groups=bool(
+            getattr(args, "drop_train_corrupt_groups", False)
+        ),
+        drop_train_corrupt_bytes=bool(
+            getattr(args, "drop_train_corrupt_bytes", False)
+        ),
+        drop_train_degenerate_groups=bool(
+            getattr(args, "drop_train_degenerate_groups", False)
+        ),
+        drop_train_degenerate_runs=bool(
+            getattr(args, "drop_train_degenerate_runs", False)
+        ),
+        clean_train_against_test=_clean_against_test_effective(args),
+        include_test_in_cleaning=bool(
+            getattr(args, "allow_eval_content_for_cleaning", False)
+        ),
+    )
+
+
+
+# ============================================================
 # Pre-training data pipeline probe
 # ============================================================
 

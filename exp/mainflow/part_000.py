@@ -931,7 +931,7 @@ def _MAIN_part_003():
                     hint = f'''；按完整计算图最接近预算的 k1={search['recommended_k1']}, k2={search['recommended_k2']}（比例 {search['flops_ratio_at_recommendation']:.3f}）'''
             parser.error(f'''--budget-match 未通过：候选模式与 {budget_baseline} 的解析 FLOPs 比例为 {budget_report['flops_ratio']:.3f}，超出 ±{args.budget_tolerance:.0%} 的允许误差''' + hint + '。仅令 k1*k2≈2*top_k 会漏掉第一阶段成本，不是充分的预算匹配；请调整 k1/k2/宽度后重跑')
     try:
-        dataset = ByteDataset(args.data, cfg.seq_len, val_fraction=args.val_fraction, test_fraction=args.test_fraction, device=device, group_separator=group_separator_bytes, deduplicate_train_groups=args.deduplicate_train_groups, drop_train_shared_chunks=args.drop_train_shared_chunks, drop_train_near_duplicate_groups=args.drop_train_near_duplicate_groups, near_duplicate_audit=args.near_duplicate_audit, near_duplicate_threshold=args.near_duplicate_threshold, near_duplicate_shingle_bytes=args.near_duplicate_shingle_bytes, drop_train_corrupt_groups=args.drop_train_corrupt_groups, drop_train_corrupt_bytes=args.drop_train_corrupt_bytes, drop_train_degenerate_groups=args.drop_train_degenerate_groups, drop_train_degenerate_runs=args.drop_train_degenerate_runs, clean_train_against_test=bool(getattr(args, 'clean_train_against_test', False) or getattr(args, 'allow_eval_content_for_cleaning', False)), include_test_in_cleaning=bool(getattr(args, 'allow_eval_content_for_cleaning', False)))
+        dataset = build_byte_dataset(args, cfg.seq_len, group_separator_bytes, device=device)
     except (OSError, ValueError) as error:
         parser.error(f'数据管线初始化失败: {error}')
     if args.evaluate_test and (not dataset.has_test):
