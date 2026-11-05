@@ -875,7 +875,7 @@ class TransformerBlock(nn.Module):
                 cfg.effective_dense_fnn_hidden,
             )
             self.moe = None
-        else:
+else:
             self.ffn = None
             self.moe = SparseMoE(cfg)
 
