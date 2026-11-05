@@ -5,6 +5,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import numpy as np
+except ImportError:
+    # NumPy 不是必需依赖；安装时一并固定其随机种子。
+    np = None
+
+
+import os
+
+_PYTHONHASHSEED_AT_START = os.environ.get("PYTHONHASHSEED")
+_PYTHONHASHSEED_WARNED = False
+
 def _paper_budget_audit(
     cfg: Config,
     cell: PaperCell,
