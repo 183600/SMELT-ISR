@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 _DATA_PLAN_SCHEMA_VERSION = 1
 

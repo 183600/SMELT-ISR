@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:

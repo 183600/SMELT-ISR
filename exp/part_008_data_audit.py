@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def _content_chunk_duplicate_audit(

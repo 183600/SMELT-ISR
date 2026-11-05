@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def preregistration_schema_error(

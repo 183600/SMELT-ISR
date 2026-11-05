@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def build_environment_snapshot(

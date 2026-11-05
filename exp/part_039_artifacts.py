@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def _manifest_run_summary(

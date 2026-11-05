@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 def _MAIN_part_005():
     global _, _current_training_peak_mb, _saved_counter, actual_training_peak_mb, bad_case_payload, bad_case_report, bad_cases_path, best_selection_step, best_selection_value, checkpoint_gen_state, checkpoint_numerical_state, consecutive_nonfinite, consecutive_text, current_lr, curve_analysis, early_stopped, end_step, error, eval_metrics, eval_windows_payload, evals_without_improvement, f, final_metrics, final_record, finite_grad, finite_step, flush_records, gaps, grad_norm, grad_norm_value, is_branch_point, last_completed_step, last_curve_status, last_curve_warning_flags, last_saved_step, live_analysis, live_status, loss, loss_value, metrics_file, min_val_loss, min_val_loss_step, nan_checks, nan_diagnosis, nan_record_pending, nonfinite_events, numerical_polluted, numerical_stop, optimizer_steps_completed, overlap_count, overlap_fraction, payload_val_loss, pending_records, pending_scalars, prefetched_batch, previous_status, prior_flags, prior_numerical_stop, prior_training_peak_mb, records, restore_error, result, routing_probe, save_at_steps, saved_checkpoint, saved_peak, saved_selected, scaler_scale_before_step, selected_payload, selected_step, selected_val_loss, selection_note, selection_policy, selection_value, starts, step, train_autocast, train_params, val_bad_case_collector, val_loss, val_window_records, x, y
     def _saved_counter(name: str) -> int:

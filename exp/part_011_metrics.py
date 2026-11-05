@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 
 
 def print_data_audit(report: Dict[str, object]) -> None:
