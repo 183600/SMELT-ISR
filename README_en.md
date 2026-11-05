@@ -6,7 +6,7 @@
 
 ## 📖 Introduction
 
-SMELT-ISR is a routing-improvement experiment built on the [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers loop twice) architecture.
+SMELT-ISR is a routing-improvement experiment built on the [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers loop twice) architecture, focusing on systematic investigation of delayed-merge routing.
 
 In the original SMELT, expert outputs of each MoE round are merged immediately while the middle layers loop. This project proposes a **delayed-merge** mechanism:
 

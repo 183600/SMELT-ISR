@@ -1,7 +1,6 @@
 # 论文复现口径（arXiv:2609.01343v1）
 
-本文件说明本仓库如何复现 *SMELT: Scaling Laws for Compute-Matched MoE Looped
-Transformers*（arXiv:2609.01343v1），以及哪些量**不能**用公开实现逐位复现。
+本文件说明本仓库复现 *SMELT: Scaling Laws for Compute-Matched MoE Looped Transformers*（arXiv:2609.01343v1）的口径，以及哪些量**无法**通过公开实现逐位复现。
 代码入口：
 
 - 网格与预设：`exp/part_000_config.py` 的 `PAPER_CELLS` / `paper_preset()`（经 `experiment.py` 兼容入口重新导出）；

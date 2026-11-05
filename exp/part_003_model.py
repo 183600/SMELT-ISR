@@ -229,16 +229,16 @@ class SparseMoE(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        flat = self._cast_for_autocast(
+        tokens_flat = self._cast_for_autocast(
             x.reshape(-1, x.size(-1))
         )
 
         router_logits = F.linear(
-            flat,
+            tokens_flat,
             self.router.weight,
         ).float()
 
-        top_values, top_indices = router_logits.topk(
+        top_logits, top_indices = router_logits.topk(
             top_k,
             dim=-1,
         )
@@ -257,7 +257,7 @@ class SparseMoE(nn.Module):
             full_probs = router_logits.softmax(dim=-1)
             top_weights = full_probs.gather(-1, top_indices)
         else:
-            top_weights = top_values.softmax(dim=-1)
+            top_weights = top_logits.softmax(dim=-1)
 
         # 路由干预（只用于反事实评估）：在统计 counts / 计算
         # aux loss 之前改写选择，保证后续 dispatch 与负载统计
@@ -276,9 +276,9 @@ class SparseMoE(nn.Module):
         # 应按比例折算 balance_coef（保持 balance_coef * k 不变）。
         # counts 用 bincount 统计（无 ones_like 分配），输出为
         # int64，后续 dispatch 的索引算术语义与逐 token 计数一致。
-        assignment_indices = top_indices.reshape(-1)
+        flat_assignments = top_indices.reshape(-1)
         counts = torch.bincount(
-            assignment_indices,
+            flat_assignments,
             minlength=self.n_experts,
         )
 
@@ -297,7 +297,7 @@ class SparseMoE(nn.Module):
             # counts 显式转 fp32，与 soft_load（router_logits 已
             # .float()）保持同一 dtype；归一化就地完成。
             hard_load = counts.float()
-            hard_load.div_(flat.size(0))
+            hard_load.div_(tokens_flat.size(0))
 
             soft_load = router_probs.mean(dim=0)
 
@@ -321,7 +321,7 @@ class SparseMoE(nn.Module):
             )
 
         return (
-            flat,
+            tokens_flat,
             top_indices,
             top_weights,
             counts,
@@ -508,31 +508,31 @@ class SparseMoE(nn.Module):
             )
             return per_expert.gather(1, gather_index)
 
-        assignment_experts = top_indices.reshape(-1)
+        flat_assignments = top_indices.reshape(-1)
 
         # 收窄仅作用于排序键本身：torch.sort 返回的排序下标
         # 始终是 int64（与其键 dtype 无关），后续 index_select
         # 收集与 index_copy_ 散射的下标不受此处影响；CPU 侧
         # 下标须保持 int64，因此仅在 CUDA 上收窄。
-        if assignment_experts.is_cuda:
-            assignment_experts = assignment_experts.to(torch.int32)
+        if flat_assignments.is_cuda:
+            flat_assignments = flat_assignments.to(torch.int32)
 
         # 按 expert id 排序：每个专家的输入在排序后连续，
         # 按段切片分发。同一专家内部的行序不影响结果
         #（专家按行独立计算，散射下标互不重复），因此无需
         # 稳定排序；torch.sort 在相同输入上是确定性的。
-        # 排序值即排序后每行所属专家（seg_id）。
-        seg_id, perm = torch.sort(assignment_experts)
+        # 排序值即排序后每行所属专家（sorted_expert_ids）。
+        sorted_expert_ids, sort_perm = torch.sort(flat_assignments)
 
         # 展平后的 assignment 下标 j 对应 token j // top_k；
         # top_k == 1 时排序下标本身就是 token 下标。
         if top_k == 1:
-            sorted_token_ids = perm
+            sorted_token_positions = sort_perm
         elif top_k == 2:
             # 非负 int64 整除 2 与算术右移等价（精确、向下取整）。
-            sorted_token_ids = perm >> 1
+            sorted_token_positions = sort_perm >> 1
         else:
-            sorted_token_ids = perm.div(
+            sorted_token_positions = sort_perm.div(
                 top_k,
                 rounding_mode="floor",
             )
@@ -540,10 +540,10 @@ class SparseMoE(nn.Module):
         # 按排序下标收集输入。autocast 下先转换再收集：
         # 收集结果直接就是目标 dtype，与收集后转换的取值一致。
         gather_source = self._cast_for_autocast(flat)
-        gathered = gather_source.index_select(0, sorted_token_ids)
+        tokens_sorted = gather_source.index_select(0, sorted_token_positions)
 
-        total = gathered.size(0)
-        device = gathered.device
+        total = tokens_sorted.size(0)
+        device = tokens_sorted.device
         n_experts = self.n_experts
 
         # 容量上界：基础容量取均值上界 ceil(total / n_experts)，
@@ -593,15 +593,15 @@ class SparseMoE(nn.Module):
         # 影响），其输出随后被回退结果覆盖。
         stride = cap + 1 if has_overflow else cap
 
-        # 目标行号 dest[j] = seg_id[j] * stride + local[j]；
+        # 目标行号 dest[j] = sorted_expert_ids[j] * stride + local[j]；
         # 溢出路径把 local 夹到 cap，让溢出行落到 scratch 行。
         if has_overflow:
             local = (
                 row_ids
-                - starts.index_select(0, seg_id)
+                - starts.index_select(0, sorted_expert_ids)
             )
             dest = (
-                seg_id.to(index_dtype) * stride
+                sorted_expert_ids.to(index_dtype) * stride
                 + local.clamp_(max=cap)
             )
         else:
@@ -612,22 +612,22 @@ class SparseMoE(nn.Module):
                     index_dtype,
                 ) * stride
                 - starts
-            ).index_select(0, seg_id)
+            ).index_select(0, sorted_expert_ids)
             dest = row_ids + expert_offsets
 
         padded = self._padded_buffer(
-            gathered.dtype,
+            tokens_sorted.dtype,
             device,
             n_experts * stride,
             dim,
         )
         if padded is None:
-            padded = gathered.new_zeros(
+            padded = tokens_sorted.new_zeros(
                 n_experts * stride,
                 dim,
             )
 
-        padded.index_copy_(0, dest, gathered)
+        padded.index_copy_(0, dest, tokens_sorted)
 
         # Zero out scratch rows for overflow to avoid double gradient.
         # The scratch row (index cap within each expert's stride) receives
@@ -650,19 +650,19 @@ class SparseMoE(nn.Module):
                 padded[scratch_idx].zero_()
 
         if not has_overflow:
-            # 常规路径到此 gathered 的数据不再被任何一方引用
+            # 常规路径到此 tokens_sorted 的数据不再被任何一方引用
             #（index_select / index_copy_ 的反向只保存下标）；
-            # 溢出路径下方回退仍需读取 gathered，保持引用。
-            del gathered
+            # 溢出路径下方回退仍需读取 tokens_sorted，保持引用。
+            del tokens_sorted
 
         out = self._batched_experts_forward(
             padded.view(n_experts, stride, dim)
         ).view(n_experts * stride, dim)
 
-        # 散射回原始（未排序）assignment 顺序：perm[j] 是排序
-        # 行 j 的原始位置，因此 source[perm[j]] = dest[j]。
+        # 散射回原始（未排序）assignment 顺序：sort_perm[j] 是排序
+        # 行 j 的原始位置，因此 source[sort_perm[j]] = dest[j]。
         source = dest.new_empty(total)
-        source.scatter_(0, perm, dest)
+        source.scatter_(0, sort_perm, dest)
         final = _GatherPaddedExpertOutputs.apply(
             out,
             source,
@@ -682,9 +682,9 @@ class SparseMoE(nn.Module):
                     )
                     final.index_copy_(
                         0,
-                        perm[rows],
+                        sort_perm[rows],
                         experts[expert_index].forward(
-                            gathered[rows]
+                            tokens_sorted[rows]
                         ),
                     )
                 segment_start += count
@@ -774,62 +774,62 @@ class SparseMoE(nn.Module):
         # （Switch 风格，见 route 注释），不能当成恒等 1.0；
         # 加权和退化为逐行乘概率后再加残差。
         if top_k == 1:
-            output = expert_outputs.reshape(-1, dim)
-            weights = top_weights.reshape(-1, 1).to(output.dtype)
-            output = output * weights
+            weighted = expert_outputs.reshape(-1, dim)
+            gate_weights = top_weights.reshape(-1, 1).to(weighted.dtype)
+            weighted = weighted * gate_weights
 
             if residual is not None:
-                flat_residual = residual.reshape(-1, dim)
+                residual_flat = residual.reshape(-1, dim)
 
                 # dtype 一致时「缩放 + 残差相加」仍保持
                 # out-of-place：不修改调用方传入的张量。
-                if output.dtype == flat_residual.dtype:
+                if weighted.dtype == residual_flat.dtype:
                     if residual_scale != 1.0:
-                        output = output.mul(residual_scale)
-                    return output.add(flat_residual).view(out_shape)
+                        weighted = weighted.mul(residual_scale)
+                    return weighted.add(residual_flat).view(out_shape)
 
                 return torch.add(
-                    flat_residual,
-                    output,
+                    residual_flat,
+                    weighted,
                     alpha=residual_scale,
                 ).view(out_shape)
 
-            return output.view(out_shape)
+            return weighted.view(out_shape)
 
         # 权重补出 slot 维并转换 dtype。
-        weights = top_weights.to(
+        gate_weights = top_weights.to(
             expert_outputs.dtype
         ).unsqueeze(-1)
 
-        # 对 expert_outputs / weights 保持 out-of-place；
+        # 对 expert_outputs / gate_weights 保持 out-of-place；
         # unbind 出的 slot 视图与逐次 select 等价。
-        slots = expert_outputs.unbind(-2)
-        weight_slots = weights.unbind(-2)
+        expert_slots = expert_outputs.unbind(-2)
+        gate_slots = gate_weights.unbind(-2)
 
-        merged = slots[0].mul(weight_slots[0])
+        weighted_sum = expert_slots[0].mul(gate_slots[0])
         for index in range(1, top_k):
-            merged.addcmul_(
-                slots[index],
-                weight_slots[index],
+            weighted_sum.addcmul_(
+                expert_slots[index],
+                gate_slots[index],
             )
 
-        merged = merged.reshape(out_shape)
+        weighted_sum = weighted_sum.reshape(out_shape)
 
         if residual is not None:
             # dtype 一致时原地累加；dtype 不匹配（autocast）时
             # 用 add(alpha=) 完成「缩放 + 残差相加」。
-            if merged.dtype == residual.dtype:
+            if weighted_sum.dtype == residual.dtype:
                 if residual_scale != 1.0:
-                    merged.mul_(residual_scale)
-                return merged.add_(residual)
+                    weighted_sum.mul_(residual_scale)
+                return weighted_sum.add_(residual)
 
-            merged = torch.add(
+            weighted_sum = torch.add(
                 residual,
-                merged,
+                weighted_sum,
                 alpha=residual_scale,
             )
 
-        return merged
+        return weighted_sum
 
     def forward(
         self,

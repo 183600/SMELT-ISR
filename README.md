@@ -7,7 +7,7 @@
 
 ## 📖 项目简介
 
-SMELT-ISR 是基于 [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers Loop Twice) 架构的路由改进实验项目。仓库同时提供论文的未循环 MoE 基线 `base`、SMELT 基线 `smelt`（middle 循环两次、循环区域残差按 1/r 缩放）以及延迟合并方案 A/B。**默认配置是小规模原型**；要复现论文附录 A 的网格单元，用 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`（见「论文口径与复现边界」），`config.json` 的 `paper_fidelity` 会逐项给出 `architecture_faithful` / `protocol_faithful` / `budget_audit`。
+SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Transformer，middle layers Loop Twice）架构，专注于路由机制的改进实验。仓库提供论文未循环 MoE 基线 `base`、原始 SMELT 基线 `smelt`（middle 循环两次，循环区域残差按 1/r 缩放）以及延迟合并方案 A/B。**默认配置为小规模原型**；复现论文附录 A 的网格单元请使用 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`（详见「论文口径与复现边界」），`config.json` 的 `paper_fidelity` 会逐项报告 `architecture_faithful` / `protocol_faithful` / `budget_audit`。
 
 原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
 1. **第一轮路由后不合并**：Top-$k_1$ 专家的输出保留为独立分支，不进行求和或拼接。
