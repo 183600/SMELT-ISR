@@ -730,6 +730,7 @@ _SWEEP_BOOL_FLAGS = (
     "--allow-underpowered",
     "--allow-over-compute-budget",
     "--allow-partial-ablation",
+    "--ablation-mechanism-controls",
     "--plan-design",
     "--sweep-stop-on-failure",
 )
@@ -822,6 +823,7 @@ def build_sweep_plan(
     balance_coef: float,
     default_mode: Optional[str] = None,
     ablation_modes: Optional[List[str]] = None,
+    mechanism_controls: bool = False,
 ) -> List[Dict[str, object]]:
     """
     构造运行计划。每个条目包含输出子目录名与逐运行覆盖的
@@ -833,6 +835,10 @@ def build_sweep_plan(
       （{local_base} ∪ 延迟合并方案 × {0, balance_coef}）
       延迟合并方案默认覆盖全部已提出的实现 A 与 B；每个创新
       点都必须证明各自有用，只跑 A 的组合不足以支撑 B 的结论。
+    - ``mechanism_controls=True`` 时额外加入每个延迟合并方案的
+      单因素机制对照臂（local_base_k2 / B_early），同样跑两档
+      均衡强度：2×2 主效应是多因素对比，延迟合并的机制归因
+      必须由「只改合并时机/位置」的单因素对比支撑。
     """
     plan: List[Dict[str, object]] = []
 
@@ -844,7 +850,15 @@ def build_sweep_plan(
             if ablation_modes
             else list(_DELAYED_MERGE_MODES)
         )
-        for mode in ("local_base", *delayed_modes):
+        arm_modes = ["local_base", *delayed_modes]
+        if mechanism_controls:
+            for mode in delayed_modes:
+                control = _DELAYED_MERGE_MECHANISM_CONTROLS.get(
+                    mode
+                )
+                if control and control not in arm_modes:
+                    arm_modes.append(control)
+        for mode in arm_modes:
             for coefficient in (0.0, balance_coef):
                 label_coefficient = format(coefficient, "g")
                 for seed in seeds:

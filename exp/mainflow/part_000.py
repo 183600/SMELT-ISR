@@ -136,6 +136,7 @@ def _MAIN_part_001():
     parser.add_argument('--suite-ablation', action='store_true', help='配合 --seeds：运行「延迟合并 × 均衡损失」全因子消融（立即合并对照 local_base 与各延迟合并方案 A/B × balance_coef=0/当前值）；balance 关闭臂为 0，开启臂取 --balance-coef。每个创新点都必须证明各自有用，默认覆盖 A 与 B 两个方案')
     parser.add_argument('--ablation-modes', nargs='+', choices=sorted(_DELAYED_MERGE_MODES), default=None, metavar='MODE', help='配合 --suite-ablation：声明本轮消融必须覆盖的延迟合并方案（默认 A B）；只跑部分方案时结论只能覆盖已跑方案，覆盖检查会按声明核对')
     parser.add_argument('--allow-partial-ablation', action='store_true', help='显式允许 --suite-ablation 只覆盖 --ablation-modes 声明的部分延迟合并方案（阶段性调试用）。报告会记录 partial 与未覆盖的项目方案；正式结论仍须覆盖 A 与 B 全部方案')
+    parser.add_argument('--ablation-mechanism-controls', action='store_true', help='配合 --suite-ablation：额外运行每个延迟合并方案的单因素机制对照臂（A→local_base_k2：只改合并时机；B→B_early：只改合并位置），同样跑 balance_coef=0/当前值两档。2×2 主效应是多因素对比（含均衡损失轴与第二轮路由宽度/合并作用域差异），延迟合并的机制归因必须由这些单因素对比支撑；缺少时报告会把该方案的归因判为未就绪')
     parser.add_argument('--allow-underpowered', action='store_true', help='显式允许套件在少于 3 个随机种子下运行（低统计功效，仅用于冒烟/调试；关键结论不得据此做显著性主张，豁免会记录进报告）')
     parser.add_argument('--allow-over-compute-budget', action='store_true', help='显式允许套件在训练墙钟估计超出预注册 compute_budget.max_total_training_hours 时运行（豁免随报告落盘；正确做法是调整设计或更新预注册后重新冻结）')
     parser.add_argument('--suite-baseline-tuning', action='store_true', help='配合 --seeds：对简单基线（--baseline-tuning-mode）做预注册的学习率网格搜索（--baseline-tuning-lrs，训练配置固定），在 val 上选 winner 并写出 baseline_tuning.json；没调过参的弱基线只能证明复杂模型比稻草人强')
@@ -429,6 +430,8 @@ def _MAIN_part_001():
         parser.error('--ablation-modes 存在重复的延迟合并方案（重复方案会重复运行同一消融单元、覆盖输出目录）')
     if args.allow_partial_ablation and (not args.suite_ablation):
         parser.error('--allow-partial-ablation 只适用于 --suite-ablation（用于显式允许阶段性部分消融）')
+    if args.ablation_mechanism_controls and (not args.suite_ablation):
+        parser.error('--ablation-mechanism-controls 只适用于 --suite-ablation（它给消融套件补上单因素机制对照臂）')
     if args.suite_ablation and args.ablation_modes is not None:
         omitted_modes = [mode for mode in _DELAYED_MERGE_MODES if mode not in args.ablation_modes]
         if omitted_modes and (not args.allow_partial_ablation):

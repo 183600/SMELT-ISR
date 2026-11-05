@@ -71,6 +71,8 @@ def ablation_coverage(
         "structural_confounds": [],
         "width_confounds": [],
         "seed_alignment": [],
+        "mechanism_controls": [],
+        "mechanism_missing_cells": [],
         "compute_parity": [],
         "capacity_parity": [],
         "numerical_attrition": [],
@@ -86,12 +88,24 @@ def ablation_coverage(
     # 运行会把「某臂更容易崩溃」伪装成该臂均值更好（attrition
     # bias）。这里用排除前的 rows 计数，不能等过滤后再补。
     ablation_related = {"local_base", *_DELAYED_MERGE_MODES}
+    # 机制对照臂（local_base_k2 / B_early）是延迟合并的单因素
+    # 归因证据：它们不参与 (1+N)×2 全因子，但失败率、种子
+    # 对齐与结构一致性必须单独核对，否则残缺或被混杂的对照
+    # 会被当成完整证据。
+    mechanism_related = {
+        str(control)
+        for control in _DELAYED_MERGE_MECHANISM_CONTROLS.values()
+        if control
+    }
     attempted_cells: Dict[tuple, int] = {}
     failed_cells: Dict[tuple, int] = {}
     failed_runs_by_cell: Dict[tuple, List[str]] = {}
     for row in rows:
         mode = str(_row_factor_value(row, "mode"))
-        if mode not in ablation_related:
+        if (
+            mode not in ablation_related
+            and mode not in mechanism_related
+        ):
             continue
         balance = _finite_float(
             _row_factor_value(row, "balance_coef")
@@ -148,6 +162,8 @@ def ablation_coverage(
     balance_by_mode: Dict[str, List[object]] = {}
     merge_pair_cells: Dict[tuple, int] = {}
     merge_pair_seeds: Dict[tuple, List[object]] = {}
+    mechanism_pair_cells: Dict[tuple, int] = {}
+    mechanism_pair_seeds: Dict[tuple, List[object]] = {}
     rows_by_mode: Dict[str, List[Dict[str, object]]] = {}
     structural_signatures: Dict[str, int] = {}
     balance_values_on: set = set()
@@ -160,7 +176,10 @@ def ablation_coverage(
         balance = _row_factor_value(row, "balance_coef")
         modes_present[mode] = modes_present.get(mode, 0) + 1
         rows_by_mode.setdefault(mode, []).append(row)
-        if mode in ablation_related:
+        if (
+            mode in ablation_related
+            or mode in mechanism_related
+        ):
             # 精确签名：用稳定键而不是 %g 文本，浮点细微差异
             # 不能被格式化抹平；缺失值显式记录，不能把「未记录」
             # 当成「一致」。
@@ -199,6 +218,18 @@ def ablation_coverage(
                 mode,
                 "off" if balance == 0 else "on",
             )
+            if mode in mechanism_related:
+                # 机制对照臂单独记账：不进入 (1+N)×2 全因子的
+                # 单元计数，但失败率与种子对齐要单独核对。
+                mechanism_pair_cells[key] = (
+                    mechanism_pair_cells.get(key, 0) + 1
+                )
+                seed = _row_factor_value(row, "seed")
+                if seed is not None:
+                    mechanism_pair_seeds.setdefault(
+                        key, []
+                    ).append(seed)
+                continue
             merge_pair_cells[key] = merge_pair_cells.get(key, 0) + 1
             seed = _row_factor_value(row, "seed")
             if seed is not None:
@@ -243,12 +274,13 @@ def ablation_coverage(
                 "type": "structural_variation_across_cells",
                 "signatures": signatures_summary,
                 "message": (
-                    "消融单元之间 "
+                    "消融单元（含单因素机制对照臂）之间 "
                     + "/".join(_ABLATION_STRUCTURAL_KEYS)
                     + " 的设置不一致："
                     + signatures_summary
                     + "：延迟合并/均衡损失的主效应会与分支几何、"
-                    "路由宽度或残差缩放混杂，无法归因到待验证的设计上"
+                    "路由宽度或残差缩放混杂，机制对照也不再是"
+                    "只差一个因子的对比，无法归因到待验证的设计上"
                 ),
             }
         )
@@ -261,7 +293,9 @@ def ablation_coverage(
     ablation_rows = [
         row
         for row in rows
-        if str(_row_factor_value(row, "mode")) in ablation_related
+        if str(_row_factor_value(row, "mode")) in (
+            ablation_related | mechanism_related
+        )
     ]
     design_axes = {
         "mode",
@@ -359,6 +393,113 @@ def ablation_coverage(
                 f"（共同种子 {len(common)} 个）：主效应/交互"
                 "只在该共同子集上可配对，未对齐的种子不能"
                 "当作额外重复"
+            )
+
+    # 机制对照臂（local_base_k2 / B_early）是延迟合并的单因素
+    # 归因证据：它们与对应的延迟合并方案必须共用同一组随机
+    # 种子、覆盖同样的均衡档，否则「只改合并时机/位置」的
+    # 对比无法按种子配对，或只在部分水平上成立。
+    #
+    # 对照臂完全缺席时不在这里报「缺格」——机制对照是显式
+    # opt-in 的额外臂，缺席由机制对照报告点名（归因未就绪）；
+    # 但对照臂只跑了一半时必须点名，否则残缺的单因素对比会
+    # 被当成完整证据。
+    for mode in coverage_modes:
+        control = _DELAYED_MERGE_MECHANISM_CONTROLS.get(mode)
+        if control is None:
+            continue
+        if control not in modes_present:
+            continue
+        delayed_levels = [
+            level
+            for level in ("off", "on")
+            if (mode, level) in merge_pair_cells
+        ]
+        control_levels = [
+            level
+            for level in ("off", "on")
+            if (control, level) in mechanism_pair_cells
+        ]
+        missing_levels = [
+            level
+            for level in delayed_levels
+            if level not in control_levels
+        ]
+        alignment: List[Dict[str, object]] = []
+        for level in control_levels:
+            delayed_seeds = {
+                _stable_factor_key(seed)
+                for seed in merge_pair_seeds.get(
+                    (mode, level), []
+                )
+            }
+            control_seeds = {
+                _stable_factor_key(seed)
+                for seed in mechanism_pair_seeds.get(
+                    (control, level), []
+                )
+            }
+            common = delayed_seeds & control_seeds
+            alignment.append({
+                "level": level,
+                "delayed_cell": f"{mode}/b={level}",
+                "control_cell": f"{control}/b={level}",
+                "n_common_seeds": len(common),
+                "aligned": bool(
+                    common
+                    and delayed_seeds == common
+                    and control_seeds == common
+                ),
+            })
+            if len(common) < _MIN_SEEDS_FOR_STATS:
+                report["low_replicate_cells"].append(
+                    f"{mode} 与机制对照 {control} 在 b={level} 档"
+                    f"的共同随机种子只有 {len(common)} 个"
+                    f"（< {_MIN_SEEDS_FOR_STATS}）：单因素对比"
+                    "无法做配对检验，不能据此声称延迟合并机制有用"
+                )
+        attrition: List[Dict[str, object]] = []
+        for level in control_levels:
+            cell_key = (control, level)
+            attempted = attempted_cells.get(cell_key, 0)
+            if attempted <= 0:
+                continue
+            failed = failed_cells.get(cell_key, 0)
+            attrition.append({
+                "cell": f"{control}/b={level}",
+                "mode": control,
+                "level": level,
+                "attempted_runs": attempted,
+                "failed_runs": failed,
+                "usable_runs": mechanism_pair_cells.get(
+                    cell_key, 0
+                ),
+                "failure_rate": float(failed) / float(attempted),
+                "failed_run_names": list(
+                    failed_runs_by_cell.get(cell_key, [])
+                ),
+            })
+        report["mechanism_controls"].append({
+            "delayed_mode": mode,
+            "control_mode": control,
+            "delayed_levels": delayed_levels,
+            "control_levels": control_levels,
+            "missing_control_levels": missing_levels,
+            "seed_alignment": alignment,
+            "attrition": attrition,
+        })
+        for level in missing_levels:
+            report["mechanism_missing_cells"].append(
+                f"{control}/b={level}"
+            )
+        if missing_levels:
+            report["advisories"].append(
+                f"{mode} 的机制对照 {control} 缺少 "
+                + "、".join(
+                    f"b={level}" for level in missing_levels
+                )
+                + " 档：单因素对比只在对照覆盖到的均衡档上成立，"
+                "不能当成完整的两档证据"
             )
 
     # 计算量也是受控变量：B 在整个中间区域按 k1 个分支执行，
@@ -901,6 +1042,11 @@ def ablation_coverage(
     if report["attrition_confounds"]:
         summary_parts.append(
             f"attrition 诊断 {len(report['attrition_confounds'])} 项"
+        )
+    if report["mechanism_missing_cells"]:
+        summary_parts.append(
+            "机制对照缺格 "
+            f"{len(report['mechanism_missing_cells'])} 项"
         )
     if report["advisories"]:
         summary_parts.append(

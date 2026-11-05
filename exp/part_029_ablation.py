@@ -746,6 +746,802 @@ def factorial_effects(
 
 
 
+# 每个延迟合并方案的单因素机制对照（mechanism control）。
+#
+# 「延迟合并有用」是机制归因主张：只有把合并时机/合并位置
+# 之外的设置都固定住，才能把收益归因到延迟合并机制本身。
+# (1+N)×2 全因子里的 local_base 对照承担不了这个角色：
+#
+# - A vs local_base：local_base 的第二轮宽度是 min(E, k1·k2)
+#   （等专家计算量口径），A 是「每分支 k2」，差值同时含第二轮
+#   路由宽度差异；
+# - B vs local_base：B 的分支贯穿整个中间区（分支化 Attention/
+#   MoE），local_base 是局部立即合并，两者连合并作用域都不同。
+#
+# 项目已经提供只改一个变量的机制对照：
+#
+# - A 的对照 local_base_k2：第二轮宽度同为 k2、作用域同为局部，
+#   只改变合并时机；
+# - B 的对照 B_early：分支数、Attention/MoE 执行次数与 B 完全
+#   相同，只改变合并位置。
+#
+# 缺少这两个单因素对照时，2×2 主效应只能说明「方案整体（含
+# 宽度/作用域差异）更好」，不能宣称收益来自延迟合并机制。
+_DELAYED_MERGE_MECHANISM_CONTROLS: Dict[str, str] = {
+    "A": "local_base_k2",
+    "B": "B_early",
+}
+
+
+
+# 机制对照的两臂之间只允许差「被检验的那一个因子」
+# （mode：合并时机/位置）。除它之外的协议项必须逐项一致，
+# 否则这次对比就不是单因素实验。
+#
+# k1/k2/balance_coef/dense_fnn_hidden 默认是实验因子
+# （跨运行允许不同），受控变量检查不会为它们生成违规记录；
+# 但机制对照恰恰要求它们在两臂之间固定，因此这里单独按
+# comparison_protocol 的键逐项核对，不能依赖「声明因子」
+# 的默认行为。
+_MECHANISM_PROTOCOL_EXCLUDED_KEYS: Tuple[str, ...] = ("mode",)
+
+
+
+def _mechanism_row_protocol_value(
+    row: Dict[str, object],
+    key: str,
+) -> Tuple[object, bool]:
+    """
+    取运行在某个协议键上的取值，以及该取值是否被记录。
+
+    旧运行没有 comparison_protocol 时，协议值由回退逻辑补齐，
+    但「补齐后仍为 None」表示该键根本没有记录：显式 null
+    （如 cosine 调度下的 wsd_stable_steps）是已记录的可比值，
+    与「未记录」必须区分。
+    """
+    protocol = row.get("protocol")
+    if not isinstance(protocol, dict):
+        return None, False
+    value = protocol.get(key)
+    recorded = row.get("protocol_recorded_keys")
+    if isinstance(recorded, (list, tuple, set, frozenset)):
+        explicit = str(key) in {str(item) for item in recorded}
+    else:
+        explicit = value is not None
+    return value, explicit
+
+
+
+def _mechanism_single_factor_check(
+    rows_baseline: List[Dict[str, object]],
+    rows_variant: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    核对两臂是否「只差一个因子」：除 mode 外的协议项逐项一致。
+
+    返回结构：
+
+    - ``performed``：是否拿到了可核对的运行记录；
+    - ``differences``：两臂之间（或同一臂内部）实际不同的
+      协议项——这是多因素对比，必须点名；
+    - ``unverifiable``：一侧记录缺失、无法确认一致的协议项；
+    - ``unchecked_keys``：两侧都没有记录、无法核对的协议项
+      （不算违规，但报告必须说明核对范围有限）。
+
+    两侧都没有记录的键不判为差异：旧运行缺记录是「未核对」，
+    不是「不一致」；但一侧有、另一侧没有时无法确认一致，
+    记入 ``unverifiable``，不能当作单因素证据。
+    """
+    report: Dict[str, object] = {
+        "performed": False,
+        "ok": True,
+        "checked_keys": [],
+        "differences": [],
+        "unverifiable": [],
+        "unchecked_keys": [],
+    }
+    if not rows_baseline or not rows_variant:
+        report["ok"] = False
+        report["unverifiable"].append({
+            "key": "comparison_protocol",
+            "reason": "missing_runs",
+            "missing_runs": [],
+            "note": (
+                "没有可核对的运行记录：无法确认两臂除被检验"
+                "因子外逐项一致"
+            ),
+        })
+        return report
+    report["performed"] = True
+
+    for key in COMPARISON_PROTOCOL_KEYS:
+        if key in _MECHANISM_PROTOCOL_EXCLUDED_KEYS:
+            continue
+        sides: List[Tuple[Dict[str, object], List[str]]] = []
+        for side_rows in (rows_baseline, rows_variant):
+            values: Dict[str, object] = {}
+            missing: List[str] = []
+            for row in side_rows:
+                value, explicit = _mechanism_row_protocol_value(
+                    row, key
+                )
+                name = str(row.get("run"))
+                if value is None and not explicit:
+                    missing.append(name)
+                    continue
+                values[name] = value
+            sides.append((values, missing))
+        values_baseline, missing_baseline = sides[0]
+        values_variant, missing_variant = sides[1]
+
+        if not values_baseline and not values_variant:
+            report["unchecked_keys"].append(key)
+            continue
+        if missing_baseline or missing_variant:
+            report["unverifiable"].append({
+                "key": key,
+                "reason": "missing_records",
+                "missing_runs": sorted(
+                    set(missing_baseline) | set(missing_variant)
+                ),
+                "note": (
+                    "该协议项在一侧没有记录：无法确认两臂一致，"
+                    "不能当作单因素证据"
+                ),
+            })
+            continue
+
+        distinct_baseline = {
+            _stable_factor_key(value)
+            for value in values_baseline.values()
+        }
+        distinct_variant = {
+            _stable_factor_key(value)
+            for value in values_variant.values()
+        }
+        if (
+            len(distinct_baseline) > 1
+            or len(distinct_variant) > 1
+        ):
+            report["differences"].append({
+                "key": key,
+                "reason": "within_arm_variation",
+                "baseline_values": sorted(
+                    str(value)
+                    for value in {
+                        _stable_factor_key(value)
+                        for value in values_baseline.values()
+                    }
+                ),
+                "variant_values": sorted(
+                    str(value)
+                    for value in {
+                        _stable_factor_key(value)
+                        for value in values_variant.values()
+                    }
+                ),
+                "note": (
+                    "同一臂内部的该协议项取值不一致：两臂不是"
+                    "同一个实验设置，不能当作单因素对比"
+                ),
+            })
+            continue
+        if distinct_baseline != distinct_variant:
+            report["differences"].append({
+                "key": key,
+                "reason": "across_arm_difference",
+                "baseline_values": sorted(
+                    str(value)
+                    for value in {
+                        _stable_factor_key(value)
+                        for value in values_baseline.values()
+                    }
+                ),
+                "variant_values": sorted(
+                    str(value)
+                    for value in {
+                        _stable_factor_key(value)
+                        for value in values_variant.values()
+                    }
+                ),
+                "note": (
+                    "两臂在该协议项上不同：对比同时改变了多个"
+                    "因子，不是单因素证据"
+                ),
+            })
+            continue
+        report["checked_keys"].append(key)
+
+    report["ok"] = (
+        not report["differences"]
+        and not report["unverifiable"]
+    )
+    return report
+
+
+
+def _mechanism_cell_pairs(
+    delayed_cells: List[Dict[str, object]],
+    control_cells: List[Dict[str, object]],
+    group_keys: List[str],
+) -> Tuple[
+    List[Tuple[Dict[str, object], Dict[str, object]]],
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+]:
+    """
+    把延迟合并方案与其机制对照的实验单元配成「只差 mode」的
+    可比单元对。
+
+    - ``comparable``：除 mode 外其余分组键取值相同的单元对，
+      每个对都是候选的单因素对比；
+    - ``unmatched``：某个分组键在两臂之间没有共同取值
+      （例如对照臂换了 k2），此时两臂之间不存在单因素可比
+      单元，实际差异必然是多因素的，必须点名；
+    - ``partial``：两臂在该键上只有部分共同取值（对照臂没有
+      覆盖方案的全部水平）。可比单元仍然成立，但报告要说明
+      对照覆盖不完整。
+
+    分组键取值不同的单元对不是「混杂」，只是不同的实验单元
+    （例如均衡开关的两档）；只有当两臂在某个键上完全没有
+    共同取值时，才说明它们无法构成单因素对比。
+    """
+    comparable: List[
+        Tuple[Dict[str, object], Dict[str, object]]
+    ] = []
+    for delayed_cell in delayed_cells:
+        for control_cell in control_cells:
+            differing = [
+                name
+                for name in group_keys
+                if name != "mode"
+                and _stable_factor_key(
+                    delayed_cell["keys"].get(name)
+                ) != _stable_factor_key(
+                    control_cell["keys"].get(name)
+                )
+            ]
+            if not differing:
+                comparable.append(
+                    (delayed_cell, control_cell)
+                )
+    unmatched: List[Dict[str, object]] = []
+    partial: List[Dict[str, object]] = []
+    for name in group_keys:
+        if name == "mode":
+            continue
+        delayed_values = {
+            _stable_factor_key(cell["keys"].get(name))
+            for cell in delayed_cells
+        }
+        control_values = {
+            _stable_factor_key(cell["keys"].get(name))
+            for cell in control_cells
+        }
+        if not delayed_values or not control_values:
+            continue
+        shared = delayed_values & control_values
+        if not shared:
+            unmatched.append({
+                "factor": name,
+                "delayed_values": sorted(
+                    str(value) for value in delayed_values
+                ),
+                "control_values": sorted(
+                    str(value) for value in control_values
+                ),
+            })
+        elif delayed_values != control_values:
+            partial.append({
+                "factor": name,
+                "delayed_values": sorted(
+                    str(value) for value in delayed_values
+                ),
+                "control_values": sorted(
+                    str(value) for value in control_values
+                ),
+                "shared_values": sorted(
+                    str(value) for value in shared
+                ),
+            })
+    return comparable, unmatched, partial
+
+
+
+def _mechanism_cell_rows(
+    cell: Dict[str, object],
+    rows_by_run: Dict[str, Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """
+    取一个实验单元对应的运行记录（按 config.json 里的运行名）。
+
+    聚合单元只保存运行名列表；协议逐项核对需要运行本身的
+    comparison_protocol。找不到记录时返回空列表，调用方据此
+    判定「无法核对」，而不是当成「一致」。
+    """
+    runs = cell.get("runs")
+    if not isinstance(runs, (list, tuple, set, frozenset)):
+        return []
+    found: List[Dict[str, object]] = []
+    for run in runs:
+        row = rows_by_run.get(str(run))
+        if row is not None:
+            found.append(row)
+    return found
+
+
+
+def _mechanism_check_summary(
+    checks: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """
+    汇总各可比单元对的单因素核对结果。
+
+    ``performed`` 为 False 表示没有运行记录可核对（例如只拿到
+    聚合结果）；此时单因素性质只按分组键判断，报告必须说明
+    核对范围有限。
+    """
+    summary: Dict[str, object] = {
+        "performed": False,
+        "ok": None,
+        "n_pairs": len(checks),
+        "checked_keys": [],
+        "differences": [],
+        "unverifiable": [],
+        "unchecked_keys": [],
+    }
+    if not checks:
+        summary["note"] = (
+            "没有运行记录：两臂是否只差一个因子只能按分组键核对"
+        )
+        return summary
+    performed = [
+        check for check in checks if check.get("performed")
+    ]
+    summary["performed"] = bool(performed)
+    if not performed:
+        summary["note"] = (
+            "没有运行记录：两臂是否只差一个因子只能按分组键核对"
+        )
+        return summary
+    for check in performed:
+        for key in check.get("checked_keys") or []:
+            if key not in summary["checked_keys"]:
+                summary["checked_keys"].append(str(key))
+        for key in check.get("unchecked_keys") or []:
+            if key not in summary["unchecked_keys"]:
+                summary["unchecked_keys"].append(str(key))
+        summary["differences"].extend(
+            check.get("differences") or []
+        )
+        summary["unverifiable"].extend(
+            check.get("unverifiable") or []
+        )
+    summary["ok"] = (
+        not summary["differences"]
+        and not summary["unverifiable"]
+    )
+    return summary
+
+
+
+def _mechanism_contrast_direction(
+    contrast: Dict[str, object],
+    delayed_mode: str,
+) -> Optional[bool]:
+    """
+    机制对比里「延迟合并方案是否更好」。
+
+    返回 True/False 表示延迟合并方案相对机制对照更好/更差；
+    方向无法判定时返回 None。对比的 baseline/variant 顺序由
+    因子的自然顺序决定（B 排在 B_early 之前），不能假定变体
+    一定是延迟合并方案。
+    """
+    baseline_value = contrast.get("baseline_value")
+    variant_value = contrast.get("variant_value")
+    if baseline_value is None or variant_value is None:
+        return None
+    verdict = str(contrast.get("verdict"))
+    if verdict not in ("improvement", "regression"):
+        return None
+    delayed_is_variant = str(variant_value) == str(delayed_mode)
+    delayed_is_baseline = str(baseline_value) == str(delayed_mode)
+    if not (delayed_is_variant or delayed_is_baseline):
+        return None
+    improvement = verdict == "improvement"
+    if delayed_is_variant:
+        return improvement
+    return not improvement
+
+
+
+def mechanism_control_report(
+    aggregates: List[Dict[str, object]],
+    group_keys: List[str],
+    metric: str,
+    equivalence_margin: Optional[float] = None,
+    controlled_variables: Optional[Dict[str, object]] = None,
+    expected_modes: Optional[List[str]] = None,
+    rows: Optional[List[Dict[str, object]]] = None,
+) -> Dict[str, object]:
+    """
+    单因素机制对照检查：延迟合并的归因必须由单因素对照支撑。
+
+    对每个延迟合并方案 M，报告它与指定机制对照 C
+    （A→local_base_k2，B→B_early）之间「只改一个因子」的
+    对比：两臂必须在其余因子（均衡开关、上下文）上完全一致，
+    否则该对比不是单因素证据。机制对照单独成族做 Holm/BH
+    校正——它是预先指定的关键对照，不与全部两两对比混在
+    同一个家族里。
+
+    单因素性质由三道核对共同保证：
+
+    1. **可比单元**：两臂的实验单元必须除 mode 外逐项相同
+       （同一均衡档、同一 k1/k2…）。没有共同取值时该对比是
+       多因素的（``confounded``）。
+    2. **受控变量**：``check_controlled_variables`` 的违规若
+       落在参与对比的运行上，该对不是单因素对比。
+    3. **协议逐项一致**（需要 ``rows``）：除 mode 外的全部
+       comparison_protocol 键在两臂之间必须一致，且不得有
+       一侧缺记录。k1/k2/balance_coef 默认是实验因子、受控
+       变量检查不会为它们生成违规，因此这一步不能省略。
+
+    每个方案的 status：
+
+    - ``missing_control``：运行集里没有机制对照臂；
+    - ``confounded``：对照臂存在，但该对比同时改变了其它
+      因子、协议项不一致或受控变量检查不通过；
+    - ``unverifiable``：协议项缺记录，无法确认两臂只差一个
+      因子；
+    - ``insufficient_data``：两臂没有可比的实验单元；
+    - ``insufficient_seeds``：共同种子不足，做不了配对检验；
+    - ``supported``：校正后显著且延迟合并方案更好；
+    - ``contradicted``：校正后显著且延迟合并方案更差；
+    - ``partial``：部分水平支持、部分水平变差；
+    - ``not_supported``：对比存在但没有支持证据。
+    """
+    report: Dict[str, object] = {
+        "metric": metric,
+        "applicable": False,
+        "schemes": {},
+        "family_size": 0,
+        "advisories": [],
+        "single_factor_verified": False,
+    }
+    rows_by_run: Dict[str, Dict[str, object]] = {}
+    if isinstance(rows, (list, tuple)):
+        for row in rows:
+            if isinstance(row, dict):
+                rows_by_run[str(row.get("run"))] = row
+    modes = [
+        str(mode)
+        for mode in (expected_modes or _DELAYED_MERGE_MODES)
+    ]
+    present_modes = {
+        str(aggregate["keys"].get("mode"))
+        for aggregate in aggregates
+        if isinstance(aggregate.get("keys"), dict)
+    }
+    relevant = [
+        mode for mode in modes if mode in present_modes
+    ]
+    if not relevant:
+        report["advisories"].append(
+            "运行集里没有延迟合并方案（"
+            + ", ".join(modes)
+            + "）：无需检查单因素机制对照"
+        )
+        return report
+    report["applicable"] = True
+
+    family: List[Dict[str, object]] = []
+    for mode in relevant:
+        control = _DELAYED_MERGE_MECHANISM_CONTROLS.get(mode)
+        entry: Dict[str, object] = {
+            "delayed_mode": mode,
+            "control_mode": control,
+            "status": "missing_control",
+            "reason": "",
+            "contrasts": [],
+            "n_contrasts": 0,
+            "confounded_pairs": [],
+            "unverifiable_pairs": [],
+            "partial_levels": [],
+            "single_factor_check": {
+                "performed": False,
+                "ok": None,
+                "note": "没有运行记录：只能按分组键核对",
+            },
+        }
+        if control is None:
+            entry["status"] = "no_control_defined"
+            entry["reason"] = (
+                f"{mode} 没有登记单因素机制对照：无法把收益"
+                "归因到延迟合并机制本身"
+            )
+            report["schemes"][mode] = entry
+            continue
+        if control not in present_modes:
+            entry["reason"] = (
+                f"缺少单因素机制对照 {control}（只改变合并时机/"
+                f"位置的对照臂）：{mode} vs local_base 的多因素"
+                "差异不能替代单因素证据"
+            )
+            report["schemes"][mode] = entry
+            continue
+        delayed_cells = [
+            aggregate
+            for aggregate in aggregates
+            if str(aggregate["keys"].get("mode")) == mode
+        ]
+        control_cells = [
+            aggregate
+            for aggregate in aggregates
+            if str(aggregate["keys"].get("mode")) == control
+        ]
+        comparable, unmatched, partial = _mechanism_cell_pairs(
+            delayed_cells, control_cells, group_keys
+        )
+        entry["comparable_cells"] = len(comparable)
+        entry["unmatched_levels"] = unmatched
+        entry["partial_levels"] = partial
+        if not comparable:
+            if unmatched:
+                entry["status"] = "confounded"
+                entry["reason"] = (
+                    f"{mode} 与机制对照 {control} 在 "
+                    + "、".join(
+                        str(item.get("factor"))
+                        for item in unmatched
+                    )
+                    + " 上没有共同取值：两臂之间不存在只差一个"
+                    "因子的可比单元，该对比是多因素差异"
+                )
+            else:
+                entry["status"] = "insufficient_data"
+                entry["reason"] = (
+                    f"{mode} 与机制对照 {control} 之间没有可比的"
+                    "实验单元（除被检验因子外其余设置完全一致）"
+                )
+            report["schemes"][mode] = entry
+            continue
+
+        mechanism_contrasts: List[Dict[str, object]] = []
+        confounded_pairs: List[Dict[str, object]] = []
+        unverifiable_pairs: List[Dict[str, object]] = []
+        checks: List[Dict[str, object]] = []
+        for delayed_cell, control_cell in comparable:
+            pair_contrasts = factor_contrasts(
+                [delayed_cell, control_cell],
+                ["mode"],
+                metric,
+                equivalence_margin=equivalence_margin,
+                controlled_variables=controlled_variables,
+            )
+            contrast = (
+                pair_contrasts[0] if pair_contrasts else None
+            )
+            if contrast is None:
+                continue
+            if not contrast.get("factor"):
+                # 受控变量检查不通过：这一对不是单因素对比。
+                confounded_pairs.append({
+                    "delayed_cell": delayed_cell["label"],
+                    "control_cell": control_cell["label"],
+                    "reason": "controlled_variables",
+                    "differing_factors": list(
+                        contrast.get("differing_factors") or []
+                    ),
+                    "controlled_confound_keys": list(
+                        contrast.get("controlled_confound_keys")
+                        or []
+                    ),
+                    "note": (
+                        "受控变量检查不通过：参与对比的运行之间"
+                        "还有其它协议项不同"
+                    ),
+                })
+                continue
+            check = _mechanism_single_factor_check(
+                _mechanism_cell_rows(delayed_cell, rows_by_run),
+                _mechanism_cell_rows(control_cell, rows_by_run),
+            )
+            checks.append(check)
+            if check.get("performed") and not check.get("ok"):
+                differences = list(check.get("differences") or [])
+                unverifiable = list(check.get("unverifiable") or [])
+                record = {
+                    "delayed_cell": delayed_cell["label"],
+                    "control_cell": control_cell["label"],
+                    "reason": (
+                        "protocol_mismatch"
+                        if differences
+                        else "protocol_unverifiable"
+                    ),
+                    "differences": differences,
+                    "unverifiable": unverifiable,
+                }
+                if differences:
+                    record["note"] = (
+                        "两臂除被检验因子外还有协议项不同：不是"
+                        "单因素证据"
+                    )
+                    confounded_pairs.append(record)
+                else:
+                    record["note"] = (
+                        "协议项缺记录，无法确认两臂只差一个因子："
+                        "不能当作单因素证据"
+                    )
+                    unverifiable_pairs.append(record)
+                continue
+            mechanism_contrasts.append(contrast)
+        entry["contrasts"] = mechanism_contrasts
+        entry["n_contrasts"] = len(mechanism_contrasts)
+        entry["confounded_pairs"] = confounded_pairs
+        entry["unverifiable_pairs"] = unverifiable_pairs
+        entry["single_factor_check"] = _mechanism_check_summary(
+            checks
+        )
+        family.extend(mechanism_contrasts)
+        report["schemes"][mode] = entry
+
+    if family:
+        _apply_multiple_comparison_correction(family)
+        report["family_size"] = len(family)
+
+    for mode, entry in report["schemes"].items():
+        if not isinstance(entry, dict):
+            continue
+        contrasts = entry.get("contrasts") or []
+        confounded_pairs = entry.get("confounded_pairs") or []
+        unverifiable_pairs = entry.get("unverifiable_pairs") or []
+        if confounded_pairs:
+            reasons = []
+            for pair in confounded_pairs:
+                reasons.append(
+                    str(pair.get("note") or pair.get("reason"))
+                )
+            entry["status"] = "confounded"
+            entry["reason"] = (
+                f"{mode} 与机制对照 {entry.get('control_mode')} 的"
+                "单因素对比不成立（" + "；".join(reasons)
+                + "）：两臂不是只差一个因子，不能把收益归因到"
+                "延迟合并机制"
+            )
+            continue
+        if unverifiable_pairs:
+            reasons = []
+            for pair in unverifiable_pairs:
+                reasons.append(
+                    str(pair.get("note") or pair.get("reason"))
+                )
+            entry["status"] = "unverifiable"
+            entry["reason"] = (
+                f"{mode} 与机制对照 {entry.get('control_mode')} 的"
+                "单因素性质无法核对（" + "；".join(reasons)
+                + "）：不能把收益归因到延迟合并机制"
+            )
+            continue
+        if not contrasts:
+            if str(entry.get("status")) in {
+                "missing_control",
+                "no_control_defined",
+                "confounded",
+            }:
+                continue
+            entry["status"] = "insufficient_data"
+            entry["reason"] = (
+                f"{mode} 与机制对照 {entry.get('control_mode')} "
+                "之间没有可用的单因素对比"
+            )
+            continue
+        usable = [
+            contrast
+            for contrast in contrasts
+            if isinstance(contrast.get("n_pairs"), int)
+            and not isinstance(contrast.get("n_pairs"), bool)
+            and int(contrast["n_pairs"]) >= _MIN_SEEDS_FOR_STATS
+        ]
+        if not usable:
+            entry["status"] = "insufficient_seeds"
+            entry["reason"] = (
+                f"{mode} 与机制对照 {entry.get('control_mode')} "
+                "的共同种子不足 "
+                f"（< {_MIN_SEEDS_FOR_STATS}）：做不了配对检验"
+            )
+            continue
+        supports: List[Dict[str, object]] = []
+        harms: List[Dict[str, object]] = []
+        for contrast in usable:
+            direction = _mechanism_contrast_direction(
+                contrast, mode
+            )
+            if direction is None:
+                continue
+            if not contrast.get("significant"):
+                continue
+            if direction:
+                supports.append(contrast)
+            else:
+                harms.append(contrast)
+        if supports and harms:
+            entry["status"] = "partial"
+            entry["reason"] = (
+                f"{mode} 相对机制对照 {entry.get('control_mode')} "
+                "在不同水平上方向不一致：不能宣称延迟合并机制"
+                "在所有设置下有用"
+            )
+        elif harms:
+            entry["status"] = "contradicted"
+            entry["reason"] = (
+                f"{mode} 相对机制对照 {entry.get('control_mode')} "
+                "校正后显著更差：延迟合并机制本身没有带来收益"
+            )
+        elif supports:
+            entry["status"] = "supported"
+            entry["reason"] = (
+                f"{mode} 相对机制对照 {entry.get('control_mode')} "
+                "的单因素对比校正后显著且方向改善"
+            )
+        else:
+            entry["status"] = "not_supported"
+            entry["reason"] = (
+                f"{mode} 相对机制对照 {entry.get('control_mode')} "
+                "的单因素对比没有支持证据（未达校正后显著）"
+            )
+        for contrast in entry["contrasts"]:
+            direction = _mechanism_contrast_direction(
+                contrast, mode
+            )
+            contrast["delayed_mode"] = mode
+            contrast["control_mode"] = entry.get("control_mode")
+            contrast["delayed_better"] = direction
+            contrast["delta_delayed_minus_control"] = (
+                contrast.get("delta")
+                if str(contrast.get("variant_value")) == mode
+                else (
+                    -float(contrast["delta"])
+                    if isinstance(
+                        contrast.get("delta"), (int, float)
+                    )
+                    and not isinstance(
+                        contrast.get("delta"), bool
+                    )
+                    else None
+                )
+            )
+    for mode, entry in report["schemes"].items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status")) in {
+            "missing_control",
+            "no_control_defined",
+            "confounded",
+            "unverifiable",
+            "insufficient_data",
+            "insufficient_seeds",
+        }:
+            report["advisories"].append(
+                str(entry.get("reason"))
+            )
+        for item in entry.get("partial_levels") or []:
+            report["advisories"].append(
+                f"{mode} 的机制对照 {entry.get('control_mode')} 在 "
+                f"{item.get('factor')} 上没有覆盖方案的全部取值"
+                f"（方案 {item.get('delayed_values')}，对照 "
+                f"{item.get('control_values')}）：单因素对比只在"
+                "共同取值上成立"
+            )
+    report["single_factor_verified"] = all(
+        str(entry.get("status"))
+        in {"supported", "contradicted", "partial", "not_supported"}
+        for entry in report["schemes"].values()
+        if isinstance(entry, dict)
+    ) if report["schemes"] else False
+    return report
+
+
+
 # 因子效应出现这些 claim 时，统计显著也不能归因到组件本身：
 # 要么受控变量/结构/计算量/同种子随机性混杂，要么控制项根本
 # 没记录。组件级联合判定必须把这些情况集中列为 blocker。
@@ -926,10 +1722,28 @@ def _component_evidence_summary(
 
 
 
+def _mechanism_entry_for_mode(
+    mechanism: Optional[Dict[str, object]],
+    mode: str,
+) -> Optional[Dict[str, object]]:
+    """从机制对照报告里取某个延迟合并方案的条目。"""
+    if not isinstance(mechanism, dict):
+        return None
+    schemes = mechanism.get("schemes")
+    if not isinstance(schemes, dict):
+        return None
+    entry = schemes.get(str(mode))
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+
 def ablation_component_verdicts(
     factorial: Dict[str, object],
     coverage: Dict[str, object],
     metric_preregistration: Optional[Dict[str, object]] = None,
+    mechanism: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """
     把全因子效应汇总成「每个创新点是否各自有用」的联合判定。
@@ -945,7 +1759,11 @@ def ablation_component_verdicts(
     - 全因子各格共享同一组随机种子（否则不同组件是在不同
       种子子集上比较）；
     - 当前分析指标与训练前预注册的主指标一致（否则在多个
-      指标之间挑一个支持结论的，属于指标选择偏差）。
+      指标之间挑一个支持结论的，属于指标选择偏差）；
+    - 延迟合并方案还有单因素机制对照支撑（见
+      ``mechanism_control_report``）：2×2 主效应是多因素
+      对比，缺少只改合并时机/位置的机制对照时不能把收益
+      归因到延迟合并机制本身。
 
     只有全部组件均为 ``supported`` 且无 blocker 时，
     ``all_components_supported`` 才为 True；部分显著只返回
@@ -1042,12 +1860,45 @@ def ablation_component_verdicts(
             reasons.append(
                 "主效应不足，但部分简单效应支持：只算局部证据"
             )
+        mechanism_entry = _mechanism_entry_for_mode(
+            mechanism, mode
+        )
+        if mechanism_entry is not None:
+            mechanism_status = str(
+                mechanism_entry.get("status")
+            )
+            mechanism_reason = str(
+                mechanism_entry.get("reason") or ""
+            )
+            if mechanism_status != "supported":
+                if status == "supported":
+                    if mechanism_status in (
+                        "missing_control",
+                        "confounded",
+                        "no_control_defined",
+                        "unverifiable",
+                        "insufficient_data",
+                        "insufficient_seeds",
+                    ):
+                        status = "blocked"
+                    elif mechanism_status == "contradicted":
+                        status = "contradicted"
+                    else:
+                        status = "partial"
+                # 无论组件此前是否已有支持结论，机制对照未通过都
+                # 必须点名：否则读者只看到「主效应不足」，看不出
+                # 归因还缺单因素对照这一环。
+                reasons.append(
+                    "单因素机制对照未通过："
+                    + mechanism_reason
+                )
         components.append({
             "component": f"delayed_merge_{mode}",
             "label": f"延迟合并方案 {mode}",
             "status": status,
             "primary": primary_summary,
             "simple": simple_summary,
+            "mechanism": mechanism_entry,
             "reasons": reasons,
         })
 
@@ -1157,10 +2008,39 @@ def ablation_component_verdicts(
                 )
             )
         )
+    if isinstance(mechanism, dict) and mechanism.get("applicable"):
+        for mode in sorted(
+            str(name)
+            for name in (mechanism.get("schemes") or {})
+        ):
+            entry = _mechanism_entry_for_mode(mechanism, mode)
+            if entry is None:
+                continue
+            mechanism_status = str(entry.get("status"))
+            if mechanism_status not in (
+                "missing_control",
+                "confounded",
+                "no_control_defined",
+                "unverifiable",
+                "insufficient_data",
+                "insufficient_seeds",
+            ):
+                continue
+            blockers.append(
+                f"{mode} 的单因素机制对照未就绪"
+                f"（对照 {entry.get('control_mode')}，"
+                f"状态 {mechanism_status}）：2×2 主效应是多因素"
+                "对比，不能单独把收益归因到延迟合并机制本身"
+            )
     if coverage.get("missing_cells"):
         blockers.extend(
             "缺少消融组合: " + str(message)
             for message in coverage["missing_cells"]
+        )
+    if coverage.get("mechanism_missing_cells"):
+        blockers.extend(
+            "缺少单因素机制对照单元: " + str(message)
+            for message in coverage["mechanism_missing_cells"]
         )
     for key, label in (
         ("structural_confounds", "结构设置混杂"),
@@ -1410,6 +2290,7 @@ def ablation_component_verdicts(
         "statuses": statuses,
         "all_components_supported": all_supported,
         "blockers": blockers,
+        "mechanism": mechanism,
         "metric_preregistration": {
             "analysis_metric": analysis_metric,
             "metric_mismatch_runs": metric_mismatch_runs,

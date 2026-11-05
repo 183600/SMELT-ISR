@@ -1089,13 +1089,25 @@ def preregistration_apply(
         planned_modes: set = set()
         if bool(getattr(args, "suite_ablation", False)):
             planned_modes.add("local_base")
-            planned_modes.update(
+            delayed_modes = [
                 str(mode)
                 for mode in (
                     getattr(args, "ablation_modes", None)
                     or _DELAYED_MERGE_MODES
                 )
-            )
+            ]
+            planned_modes.update(delayed_modes)
+            if bool(
+                getattr(args, "ablation_mechanism_controls", False)
+            ):
+                planned_modes.update(
+                    str(control)
+                    for control in (
+                        _DELAYED_MERGE_MECHANISM_CONTROLS.get(mode)
+                        for mode in delayed_modes
+                    )
+                    if control
+                )
         elif getattr(args, "suite_modes", None):
             planned_modes.update(
                 str(mode) for mode in args.suite_modes

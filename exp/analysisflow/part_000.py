@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 def _PA_part_000():
-    global _cost_text, _n_text, _stat, adequacy, aggregate, aggregates, alignment, arm, attrition_summary, autocorrelated_splits, balance_scale, baseline_mode, baseline_preregistration, cell, check, common_step, common_step_sensitivity, component_verdicts, compute_matched, compute_parity_failed, contrasts, controlled, cost_header, cost_rows, coverage, cross_violations, current_derived, curve_mean, delta, delta_text, design_violations, details, deterministic_cells, deterministic_conflict_cells, direction, direction_text, distinct, duplicate_seed_cells, effects, entry, factorial, factorial_balance_scale, factorial_compute_matched, factorial_coverage, factorial_fragility, factors, failure_rates, fragility_summary, group_keys, guard, header, high, higher_is_better, hypotheses, imbalance, item, key, line, low, margin_preregistration, matched_coverage, mean, metric_multiplicity, message, metric_columns, metric_report, mismatch, missing_efficiency_cells, numeric, numerical_failures, order_audit, p_holm, p_text, parts, present_routing_fields, provenance, randomness, rate, rate_text, ratio, ratio_text, reference, resolved_baseline, routing_header, routing_summary_fields, row, rq_text, scale_guard_report, scale_tiers, selection_bias, selection_metric_mismatch, short, single_factor_design, tier, timing_ci_lines, tuning_seed_overlap, underpowered, value, values_text, violation
+    global _cost_text, _n_text, _stat, adequacy, aggregate, aggregates, alignment, arm, attrition_summary, autocorrelated_splits, balance_scale, baseline_mode, baseline_preregistration, cell, check, common_step, common_step_sensitivity, component_verdicts, compute_matched, compute_parity_failed, contrasts, controlled, cost_header, cost_rows, coverage, cross_violations, current_derived, curve_mean, delta, delta_text, design_violations, details, deterministic_cells, deterministic_conflict_cells, direction, direction_text, distinct, duplicate_seed_cells, effects, entry, factorial, factorial_balance_scale, factorial_compute_matched, factorial_coverage, factorial_fragility, factors, failure_rates, fragility_summary, group_keys, guard, header, high, higher_is_better, hypotheses, imbalance, item, key, line, low, margin_preregistration, matched_coverage, mean, mechanism, metric_multiplicity, message, metric_columns, metric_report, mismatch, missing_efficiency_cells, numeric, numerical_failures, order_audit, p_holm, p_text, parts, present_routing_fields, provenance, randomness, rate, rate_text, ratio, ratio_text, reference, resolved_baseline, routing_header, routing_summary_fields, row, rq_text, scale_guard_report, scale_tiers, selection_bias, selection_metric_mismatch, short, single_factor_design, tier, timing_ci_lines, tuning_seed_overlap, underpowered, value, values_text, violation
     '\n    打印完整的对比分析：受控变量检查、按种子聚合的\n    Mean ± Std、单因子显著性检验（含多重比较校正与效应量\n    95% 置信区间）、80% 功效的最小可检出效应（MDE）与\n    TOST 等价性检验，以及消融覆盖检查。\n\n    ``ablation_modes`` 声明本轮消融必须覆盖的延迟合并方案\n    （--suite-ablation --ablation-modes）；为 None 且运行集\n    涉及延迟合并时默认核对项目声明的全部方案（A、B）。\n    ``allow_partial_ablation`` 显式允许阶段性部分消融，但报告\n    仍记录 ``partial`` 与未覆盖方案，不会把部分覆盖说成完整。\n\n    ``equivalence_margin`` 是相对基线均值的等价界比例\n    （--equivalence-margin，默认 1%）：报告用 TOST 区分\n    「证据支持无实质差异」与「未发现显著差异（不确定）」，\n    并把 MDE 与观测效应所需的种子数列出；为 None 时只做\n    显著性检验（不推荐，不显著会被误读为等价）。\n\n    返回结构化结果，供写入汇总报告。\n    '
     if factors is None:
         factors = list(DEFAULT_COMPARISON_FACTORS)
@@ -30,6 +30,7 @@ def _PA_part_000():
     contrasts = factor_contrasts(aggregates, group_keys, metric, equivalence_margin=equivalence_margin, controlled_variables=controlled)
     reference = compare_cells_to_baseline(aggregates, baseline_mode, metric, equivalence_margin=equivalence_margin, controlled_variables=controlled)
     coverage = ablation_coverage(rows, factors, ablation_modes, allow_partial=allow_partial_ablation)
+    mechanism = mechanism_control_report(aggregates, group_keys, metric, equivalence_margin=equivalence_margin, controlled_variables=controlled, expected_modes=coverage.get('expected_delayed_modes'), rows=rows)
     balance_scale = balance_strength_report(rows)
     factorial_balance_scale = factorial_balance_strength(rows)
     coverage['balance_confounds'] = list(factorial_balance_scale.get('advisories') or []) if factorial_balance_scale.get('confounded') else []
@@ -55,7 +56,7 @@ def _PA_part_000():
     common_step_sensitivity = factorial_common_step_sensitivity(aggregates, group_keys, metric, factorial, coverage, controlled=controlled, equivalence_margin=equivalence_margin)
     coverage['common_step_sensitivity'] = common_step_sensitivity
     hypotheses = hypothesis_registry(rows, metric)
-    component_verdicts = ablation_component_verdicts(factorial, coverage, metric_preregistration=hypotheses)
+    component_verdicts = ablation_component_verdicts(factorial, coverage, metric_preregistration=hypotheses, mechanism=mechanism)
     duplicate_seed_cells = [{'cell': aggregate['label'], 'n_runs': aggregate['n_runs'], 'duplicate_seeds': aggregate['duplicate_seeds']} for aggregate in aggregates if aggregate.get('duplicate_seeds')]
     deterministic_conflict_cells = [{'cell': aggregate['label'], 'metrics': aggregate['deterministic_repeat_conflicts']} for aggregate in aggregates if aggregate.get('deterministic_repeat_conflicts')]
     alignment = hypothesis_alignment(rows, aggregates, contrasts, metric)
@@ -706,7 +707,7 @@ def _PA_part_001():
         print('  OK：各运行的有效路由宽度与均衡强度一致')
 
 def _PA_part_002():
-    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
+    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
     if factorial['designs'] or factorial['incomplete_designs']:
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
@@ -745,6 +746,34 @@ def _PA_part_002():
             print('  [warn] ' + str(common_step_sensitivity['advisory']))
         else:
             print('  ' + str(common_step_sensitivity['advisory']))
+    if mechanism.get('applicable'):
+        print()
+        print('[mechanism] 单因素机制对照（延迟合并的归因必须由只改合并时机/位置的单因素对比支撑；2×2 主效应是多因素对比，不能单独支撑机制归因）')
+        for mode in sorted((mechanism.get('schemes') or {}).keys()):
+            entry = (mechanism.get('schemes') or {}).get(mode) or {}
+            status = str(entry.get('status'))
+            control = str(entry.get('control_mode'))
+            print(f'''  [{status}] {mode} 的机制对照: {control}''')
+            check = entry.get('single_factor_check') or {}
+            if check.get('performed'):
+                print(f'''    单因素核对：逐项一致 {len(check.get('checked_keys') or [])} 项、未记录 {len(check.get('unchecked_keys') or [])} 项、差异 {len(check.get('differences') or [])} 项、无法核对 {len(check.get('unverifiable') or [])} 项''')
+            for pair in (entry.get('confounded_pairs') or []):
+                print(f'''    [confounded] {pair.get('delayed_cell')} vs {pair.get('control_cell')}：{pair.get('note') or pair.get('reason')}''')
+            for pair in (entry.get('unverifiable_pairs') or []):
+                print(f'''    [unverifiable] {pair.get('delayed_cell')} vs {pair.get('control_cell')}：{pair.get('note') or pair.get('reason')}''')
+            for contrast in (entry.get('contrasts') or []):
+                if contrast.get('confounded'):
+                    print(f'''    [confounded] {contrast.get('baseline')} vs {contrast.get('variant')}：同时改变了其它因子，不是单因素证据''')
+                    continue
+                delta_text = _format_finite(contrast.get('delta_delayed_minus_control'), '+.4f')
+                p_text = _format_finite(contrast.get('p_value_holm'), '.3g')
+                direction = '改善' if contrast.get('delayed_better') else ('变差' if contrast.get('delayed_better') is False else '方向不明')
+                print(f'''    {contrast.get('baseline')} vs {contrast.get('variant')}：Δ(延迟合并-对照)={delta_text}，Holm p={p_text}，{direction}，n={contrast.get('n_pairs')}''')
+            reason = str(entry.get('reason') or '')
+            if reason:
+                print(f'    {reason}')
+        for advisory in mechanism.get('advisories', []):
+            print(f'  [warn] {advisory}')
     if component_verdicts['applicable']:
         print()
         print('[ablation-verdict] 组件级联合判定（每个创新点必须有独立支持证据，不能把部分显著拼成「各自有用」）')
@@ -833,5 +862,5 @@ def _PA_part_002():
                 print(f'  {reason}')
         elif order_audit.get('verdict') == 'ok':
             print('  未发现强顺序相关；随机化区组平衡了时间片，但描述性诊断不能证明没有漂移')
-    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'n_runs': len(rows)})
+    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'n_runs': len(rows)})
 

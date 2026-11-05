@@ -677,6 +677,9 @@ def build_sweep_execution(
             if args.suite_ablation and args.ablation_modes
             else None
         ),
+        mechanism_controls=bool(
+            getattr(args, "ablation_mechanism_controls", False)
+        ),
     )
     scheme, order_seed = resolve_run_order(args)
     prereg_record = getattr(args, "preregistration_record", None)

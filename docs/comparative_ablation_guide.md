@@ -27,7 +27,7 @@
 - B 专用对照：`B_early`（分支数/Attention/MoE 执行次数与 B 完全相同，只改变合并位置）
 - 均衡损失：`balance_coef=0` 关闭，开启臂取 `--balance-coef`（默认 0.01）。
 
-默认覆盖 A 与 B，缺失任一方案会被 `ablation_coverage` 列为 `missing_cells`。
+默认覆盖 A 与 B，缺失任一方案会被 `ablation_coverage` 列为 `missing_cells`。机制对照臂（`local_base_k2` / `B_early`）不是默认单元，需显式加 `--ablation-mechanism-controls`（见 2.3）；缺它们时组件判定会把延迟合并的归因判为 `blocked`。
 
 ### 2.2 结构混杂检查
 消融单元内必须保持：
@@ -37,7 +37,38 @@
 
 `--suite-ablation --ablation-modes A B --seeds 42 43 44 45 46 47` 生成六格完整设计。
 
-### 2.3 计算量口径
+### 2.3 单因素机制对照（延迟合并归因的硬门）
+(1+N)×2 消融里的 `A`/`B` vs `local_base` 是**多因素**对比：合并时机/位置之外，第二轮路由宽度、专家复用方式与分支数也同时变化。主效应显著只能说明「这套配置整体更好」，不能说明「延迟合并机制本身有用」。要把收益归因到延迟合并，必须有只改一个因子的对照臂：
+
+| 方案 | 机制对照 | 唯一变化的因子 |
+|---|---|---|
+| A（局部延迟合并） | `local_base_k2` | 合并时机（第二轮后合并 → 第一轮后立即合并） |
+| B（全局延迟合并） | `B_early` | 合并位置（第二轮后合并 → 第一轮后提前合并再复制回 k1 分支） |
+
+报告口径：
+- `mechanism_control_report` 逐方案给出状态：`supported`（校正后显著且延迟合并更好）、`contradicted`（显著更差）、`partial`（方向不一致）、`not_supported`（无支持证据）、`missing_control`（运行集里没有对照臂）、`no_control_defined`（该方案没登记对照）、`confounded`（对照臂存在，但两臂除被检验因子外还有差异）、`unverifiable`（一侧缺协议记录，无法核对两臂是否只差一个因子）、`insufficient_data`（对照臂没有可用运行）、`insufficient_seeds`（共同种子不足）。
+- 单因素核对是逐「可比单元对」做的：先按分组键对齐方案臂与对照臂，再逐项核对两臂的 `comparison_protocol`（除 `mode` 外的全部协议项，含 `k1/k2/balance_coef/lr/训练步数` 等）。因为 `--compare-factors` 声明的因子默认不受受控变量检查约束，`k1/k2/balance_coef` 之间的差异只能在这里被拦住：协议项实际不同 → 该对比判 `confounded` 并在 `confounded_pairs` 里点名差异键；一侧缺协议记录 → 判 `unverifiable`；两臂该因子的水平没有交集（例如 A 的 `k2=4`、对照 `k2=2`）→ 判 `confounded` 并在 `unmatched_levels` 里点名因子。
+- 报告顶层给出 `single_factor_verified`（所有方案的单因素核对是否都通过）与 `single_factor_check` 汇总；只要有方案未通过，组件判定不会宣称延迟合并的收益可归因到机制本身。
+- 机制对照自成一个 Holm/BH 家族（不与全体两两对比混family），但每个对比仍要求「除被检验因子外其余受控变量逐项一致」。
+- `ablation_coverage` 单独记账机制对照臂：`mechanism_controls` 给出每个方案的对照臂、两档的种子对齐（`n_common_seeds`）与缺档 `missing_control_levels`；`mechanism_missing_cells` 列出缺失的对照单元（如 `local_base_k2/b=on`），并进入 `blockers`——只跑了一半的对照臂不能当作完整的两档证据。
+- 组件级判定（`ablation_component_verdicts`）会把延迟合并方案的门控接到该状态上：缺对照、对照被混杂/无法核对/数据或种子不足 → 该组件判为 `blocked` 并进入 `blockers`；对照反向 → 判为 `contradicted`；对照支持 → 组件结论不再受此阻断。**没有单因素对照时，不得宣称「延迟合并方案 A/B 各自有用」。**
+- 缺对照不是「机制无效」，只是归因未就绪：先补跑对照臂，不要用多因素主效应代替。
+
+运行方式（对照臂与消融同 seed、同 balance 两档，保证对照是单因素）：
+```bash
+python experiment.py --data corpus.txt --out runs/rq1 \
+  --seeds 42 43 44 45 46 47 \
+  --suite-ablation --ablation-modes A B --ablation-mechanism-controls \
+  --common-step 2000 --budget-match smelt \
+  --primary-metric val_loss --hypothesis "延迟合并改善验证损失" \
+  --hypothesis-direction decrease --hypothesis-min-effect 0.02 \
+  --hypothesis-baseline smelt --rq RQ1
+```
+- `--ablation-mechanism-controls` 是**显式 opt-in**：默认消融套件不变（避免家族规模与种子门槛被无意抬高）。
+- 开启后计划单元从 3 模式 × 2 档 = 6 臂变成 5 模式 × 2 档 = 10 臂；对照臂必须写进预注册声明的模式集合，否则预注册覆盖检查会拒绝该次分析。
+- 对照臂进入运行集后，探索性「全体两两对比」的家族规模从 15 升到 45，`--plan-design` 给出的保守所需种子数随之上升（稳健双检验下限约 11 个种子）；预先指定并分别校正的是 2×2 因子家族（每方案 7 个检验）与机制家族（每方案 2 个水平）。
+
+### 2.4 计算量口径
 - 使用 `--budget-match smelt` 检查完整计算图：Attention 执行次数 + MoE assignment + 路由。
 - 报告解析 FLOPs 与实测比例，默认容差 10%，论文级要求 <4%。
 - 成本倍数 ≥1.5× 的显著涨点会被标记 `[efficiency-flag]`，需评估性价比。
@@ -77,9 +108,13 @@ python experiment.py --data corpus.txt --out runs/pilot \
 # 生成 design_plan.json，冻结 commit，写入 preregistration.json
 
 # 3. 全因子消融（6 种子，预算匹配，固定共同步数）
+# --ablation-mechanism-controls 会额外跑 local_base_k2 / B_early
+# 两个只改合并时机/位置的对照臂；没有它们，延迟合并的收益
+# 只能算多因素差异，不能归因到机制本身
 python experiment.py --data corpus.txt --out runs/rq1 \
   --seeds 42 43 44 45 46 47 \
   --suite-ablation --ablation-modes A B \
+  --ablation-mechanism-controls \
   --common-step 2000 --budget-match smelt \
   --primary-metric val_loss --hypothesis "延迟合并改善验证损失" \
   --hypothesis-direction decrease --hypothesis-min-effect 0.02 \
@@ -96,7 +131,7 @@ python experiment.py --compare runs/rq1/* --compare-baseline smelt \
 每次运行生成：
 - `config.json`：完整配置、数据指纹、comparison_protocol、paper_fidelity、routing_analysis、sanity_check。
 - `metrics.jsonl`：训练/验证曲线、final、唯一一次 test。
-- `comparison_analysis.json`：受控变量检查、Mean±Std、显著性、MDE/TOST、消融覆盖、效率与脆弱性。
+- `comparison_analysis.json`：受控变量检查、Mean±Std、显著性、MDE/TOST、消融覆盖、单因素机制对照、效率与脆弱性。
 
 归档前运行：
 ```bash

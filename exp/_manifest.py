@@ -124,7 +124,7 @@ PA_OWNED = {
     'fragility_flagged', 'fragility_summary', 'full_factorial', 'global_alignment', 'global_alignment_info', 'global_seed_ok', 'group_keys', 'guard',
     'header', 'high', 'higher_is_better', 'holm', 'holm_text', 'hypotheses', 'imbalance', 'inconclusive_entries',
     'item', 'key', 'largest_family', 'level', 'line', 'low', 'margin_abs', 'margin_preregistration',
-    'margin_status', 'margin_text', 'matched_coverage', 'mde', 'mde_relative', 'mde_text', 'mean', 'message',
+    'margin_status', 'margin_text', 'matched_coverage', 'mde', 'mde_relative', 'mde_text', 'mean', 'mechanism', 'message',
     'metric', 'metric_columns', 'metric_multiplicity', 'metric_report', 'min_runs', 'mismatch', 'mismatch_messages', 'missing', 'missing_efficiency_cells',
     'missingness_flagged', 'mixed_count', 'needed_text', 'not_evaluable_count', 'not_robust', 'numeric', 'numerical_failures', 'order_audit',
     'p_holm', 'p_text', 'p_value', 'pairs_text', 'parity', 'parity_entries', 'parity_mismatches', 'parts',

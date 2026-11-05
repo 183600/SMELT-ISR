@@ -431,6 +431,599 @@ class StatisticsTests(unittest.TestCase):
             )
         )
 
+    def test_mechanism_control_report_flags_missing_control(self):
+        # 2×2 消融只有 local_base/A/B：缺少只改合并时机/位置的
+        # 单因素机制对照时，延迟合并的机制归因不能由多因素主
+        # 效应替代。
+        rows = []
+        for mode in ("local_base", "A", "B"):
+            for balance in (0.0, 0.01):
+                for seed in (41, 42, 43, 44):
+                    rows.append({
+                        "run": f"{mode}_{balance}_{seed}",
+                        "mode": mode,
+                        "balance_coef": balance,
+                        "seed": seed,
+                        "val_loss": 1.0 + 0.001 * seed,
+                    })
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        self.assertTrue(report["applicable"])
+        self.assertEqual(
+            report["schemes"]["A"]["control_mode"],
+            "local_base_k2",
+        )
+        self.assertEqual(
+            report["schemes"]["B"]["control_mode"],
+            "B_early",
+        )
+        for mode in ("A", "B"):
+            entry = report["schemes"][mode]
+            self.assertEqual(entry["status"], "missing_control")
+            self.assertIn(mode, entry["reason"])
+        self.assertTrue(report["advisories"])
+
+    def _mechanism_rows(self, effects):
+        rows = []
+        for mode, balance, offset in effects:
+            for seed in (41, 42, 43, 44, 45, 46):
+                rows.append({
+                    "run": f"{mode}_{balance}_{seed}",
+                    "mode": mode,
+                    "balance_coef": balance,
+                    "seed": seed,
+                    "val_loss": 1.0 + 0.001 * seed + offset,
+                })
+        return rows
+
+    def test_mechanism_control_report_detects_single_factor_support(self):
+        # 机制对照臂在位且延迟合并显著更好 → 单因素证据成立。
+        # B 的对照 B_early 在因子的自然顺序里排在 B 之后，对比
+        # 的 baseline/variant 方向与 A 相反，方向判定必须按
+        # 「延迟合并方案是否更好」而不是 baseline/variant 位置。
+        rows = self._mechanism_rows([
+            ("local_base_k2", 0.0, 0.0),
+            ("local_base_k2", 0.01, 0.0),
+            ("A", 0.0, -0.2),
+            ("A", 0.01, -0.2),
+            ("B_early", 0.0, 0.0),
+            ("B_early", 0.01, 0.0),
+            ("B", 0.0, -0.2),
+            ("B", 0.01, -0.2),
+        ])
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        for mode in ("A", "B"):
+            entry = report["schemes"][mode]
+            self.assertEqual(entry["status"], "supported")
+            self.assertEqual(entry["n_contrasts"], 2)
+            for contrast in entry["contrasts"]:
+                self.assertTrue(contrast["delayed_better"])
+                self.assertLess(
+                    contrast["delta_delayed_minus_control"], 0.0
+                )
+                self.assertTrue(contrast["significant"])
+        self.assertEqual(report["family_size"], 4)
+
+    def test_mechanism_control_report_detects_contradiction(self):
+        # 机制对照（立即合并）显著更好：延迟合并机制本身没有
+        # 带来收益，不能只靠多因素主效应宣称方案有用。
+        rows = self._mechanism_rows([
+            ("local_base_k2", 0.0, -0.2),
+            ("local_base_k2", 0.01, -0.2),
+            ("A", 0.0, 0.0),
+            ("A", 0.01, 0.0),
+        ])
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "contradicted")
+        for contrast in entry["contrasts"]:
+            self.assertFalse(contrast["delayed_better"])
+
+    def test_component_verdict_requires_single_factor_mechanism(self):
+        def effect(name):
+            return {
+                "effect_name": name,
+                "delayed_mode": "A",
+                "claim": "supports_component",
+                "mean_effect": -0.2,
+                "p_value_holm": 0.01,
+                "significant": True,
+                "equivalent": False,
+                "n_pairs": 6,
+                "fragility": {"verdict": "stable"},
+                "attrition_bounds": {"verdict": "complete_cases"},
+            }
+
+        factorial = {
+            "applicable": True,
+            "metric": "val_loss",
+            "effects": [
+                effect("delayed_merge_main"),
+                effect("delayed_merge_at_balance_off"),
+                effect("delayed_merge_at_balance_on"),
+            ],
+            "incomplete_designs": [],
+            "confounded_designs": [],
+            "controlled_variables_ok": True,
+        }
+        coverage = {
+            "expected_delayed_modes": ["A"],
+            "project_delayed_modes": ["A"],
+            "common_step_sensitivity": {"applicable": False},
+        }
+        without = experiment.ablation_component_verdicts(
+            factorial, coverage
+        )
+        component = next(
+            item
+            for item in without["components"]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertEqual(component["status"], "supported")
+
+        mechanism = {
+            "applicable": True,
+            "family_size": 0,
+            "schemes": {
+                "A": {
+                    "delayed_mode": "A",
+                    "control_mode": "local_base_k2",
+                    "status": "missing_control",
+                    "reason": (
+                        "缺少单因素机制对照 local_base_k2："
+                        "多因素差异不能替代单因素证据"
+                    ),
+                    "contrasts": [],
+                    "n_contrasts": 0,
+                }
+            },
+            "advisories": [],
+        }
+        blocked = experiment.ablation_component_verdicts(
+            factorial, coverage, mechanism=mechanism
+        )
+        component = next(
+            item
+            for item in blocked["components"]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertEqual(component["status"], "blocked")
+        self.assertTrue(
+            any(
+                "单因素机制对照" in reason
+                for reason in component["reasons"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "单因素机制对照" in blocker
+                for blocker in blocked["blockers"]
+            )
+        )
+
+        mechanism["schemes"]["A"]["status"] = "supported"
+        mechanism["schemes"]["A"]["reason"] = (
+            "A 相对机制对照 local_base_k2 的单因素对比显著改善"
+        )
+        supported = experiment.ablation_component_verdicts(
+            factorial, coverage, mechanism=mechanism
+        )
+        component = next(
+            item
+            for item in supported["components"]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertEqual(component["status"], "supported")
+        self.assertFalse(
+            any(
+                "单因素机制对照" in blocker
+                for blocker in supported["blockers"]
+            )
+        )
+
+    def test_ablation_plan_includes_mechanism_control_arms(self):
+        plan = experiment.build_sweep_plan(
+            seeds=[1, 2],
+            modes=None,
+            ablation=True,
+            balance_coef=0.01,
+            ablation_modes=["A", "B"],
+            mechanism_controls=True,
+        )
+        modes = sorted({str(item["mode"]) for item in plan})
+        self.assertEqual(
+            modes,
+            ["A", "B", "B_early", "local_base", "local_base_k2"],
+        )
+        balances = {
+            mode: sorted({
+                float(item["balance_coef"]) for item in plan
+                if item["mode"] == mode
+            })
+            for mode in modes
+        }
+        for mode in modes:
+            self.assertEqual(
+                balances[mode], [0.0, 0.01], msg=mode
+            )
+        plain = experiment.build_sweep_plan(
+            seeds=[1, 2],
+            modes=None,
+            ablation=True,
+            balance_coef=0.01,
+            ablation_modes=["A", "B"],
+        )
+        self.assertEqual(
+            sorted({str(item["mode"]) for item in plain}),
+            ["A", "B", "local_base"],
+        )
+
+    def _mechanism_protocol_rows(
+        self,
+        effects,
+        protocol_overrides=None,
+        seeds=(41, 42, 43, 44, 45, 46),
+    ):
+        """构造带 comparison_protocol 的机制对照运行行。
+
+        协议记录齐全是「两臂只差一个因子」可核对的前提：真实
+        运行把 comparison_protocol 写进 config.json，这里用同样
+        的结构模拟，才能验证单因素核对确实查了协议项。
+        """
+        protocol_overrides = protocol_overrides or {}
+        rows = []
+        for mode, balance, offset in effects:
+            overrides = protocol_overrides.get(mode, {})
+            for seed in seeds:
+                protocol = {
+                    "comparison_family": "neural",
+                    "mode": mode,
+                    "lr": 3e-4,
+                    "optimizer": "AdamW",
+                    "total_steps": 1000,
+                    "k1": 2,
+                    "k2": 2,
+                    "top_k": 2,
+                    "balance_coef": balance,
+                    "residual_scale": 1.0,
+                }
+                protocol.update(overrides)
+                rows.append({
+                    "run": f"{mode}_{balance}_{seed}",
+                    "mode": mode,
+                    "balance_coef": balance,
+                    "k1": protocol["k1"],
+                    "k2": protocol["k2"],
+                    "seed": seed,
+                    "val_loss": 1.0 + 0.001 * seed + offset,
+                    "protocol": protocol,
+                    "protocol_recorded_keys": sorted(protocol),
+                })
+        return rows
+
+    def test_mechanism_control_report_flags_protocol_difference(self):
+        # 对照臂与方案臂只差一个因子是机制归因的前提：学习率
+        # 不一致时这次对比不是单因素实验，不能拿来归因延迟合并。
+        rows = self._mechanism_protocol_rows(
+            [
+                ("local_base_k2", 0.0, 0.0),
+                ("A", 0.0, -0.2),
+            ],
+            protocol_overrides={"A": {"lr": 1e-4}},
+        )
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+            rows=rows,
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "confounded")
+        self.assertEqual(entry["n_contrasts"], 0)
+        self.assertTrue(entry["confounded_pairs"])
+        difference_keys = [
+            str(item.get("key"))
+            for pair in entry["confounded_pairs"]
+            for item in pair.get("differences") or []
+        ]
+        self.assertIn("lr", difference_keys)
+        self.assertFalse(report["single_factor_verified"])
+
+    def test_mechanism_control_report_flags_unverifiable_protocol(self):
+        # 一侧有协议记录、另一侧没有：无法确认两臂一致，不能
+        # 当作单因素证据（缺记录不等于一致）。
+        rows = self._mechanism_protocol_rows(
+            [
+                ("local_base_k2", 0.0, 0.0),
+                ("A", 0.0, -0.2),
+            ]
+        )
+        for row in rows:
+            if row["mode"] == "local_base_k2":
+                row["protocol"].pop("lr")
+                row["protocol_recorded_keys"] = sorted(
+                    row["protocol"]
+                )
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+            rows=rows,
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "unverifiable")
+        self.assertTrue(entry["unverifiable_pairs"])
+        self.assertEqual(entry["n_contrasts"], 0)
+
+    def test_mechanism_control_report_flags_unmatched_factor_levels(self):
+        # 两臂的第二轮宽度不同（k2）时不存在只差一个因子的可比
+        # 单元：对比必然是多因素差异，必须点名而不是当作单因素。
+        rows = self._mechanism_protocol_rows(
+            [
+                ("local_base_k2", 0.0, 0.0),
+                ("A", 0.0, -0.2),
+            ]
+        )
+        for row in rows:
+            if row["mode"] == "A":
+                row["k2"] = 4
+                row["protocol"]["k2"] = 4
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef", "k2"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef", "k2"],
+            "val_loss",
+            rows=rows,
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "confounded")
+        unmatched_factors = [
+            str(item.get("factor"))
+            for item in entry["unmatched_levels"]
+        ]
+        self.assertIn("k2", unmatched_factors)
+        self.assertEqual(entry["n_contrasts"], 0)
+
+    def test_mechanism_control_report_flags_insufficient_seeds(self):
+        # 共同种子不足时做不了配对检验：不能给出方向性结论。
+        rows = self._mechanism_protocol_rows(
+            [
+                ("local_base_k2", 0.0, 0.0),
+                ("A", 0.0, -0.2),
+            ],
+            seeds=(41, 42),
+        )
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+            rows=rows,
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "insufficient_seeds")
+
+    def test_mechanism_control_report_flags_partial_direction(self):
+        # 一个均衡档支持、另一个变差：不能宣称机制在所有设置
+        # 下有用。
+        rows = self._mechanism_protocol_rows(
+            [
+                ("local_base_k2", 0.0, 0.0),
+                ("local_base_k2", 0.01, -0.2),
+                ("A", 0.0, -0.2),
+                ("A", 0.01, 0.0),
+            ]
+        )
+        aggregates = experiment.aggregate_runs(
+            rows, ["mode", "balance_coef"]
+        )
+        report = experiment.mechanism_control_report(
+            aggregates,
+            ["mode", "balance_coef"],
+            "val_loss",
+            rows=rows,
+        )
+        entry = report["schemes"]["A"]
+        self.assertEqual(entry["status"], "partial")
+
+    def test_ablation_coverage_tracks_mechanism_control_arms(self):
+        # 机制对照臂只跑了一半时必须点名：残缺的单因素对比不能
+        # 当成完整的两档证据。
+        rows = []
+        for mode, levels in (
+            ("A", (0.0, 0.01)),
+            ("local_base", (0.0, 0.01)),
+            ("local_base_k2", (0.0,)),
+        ):
+            for balance in levels:
+                for seed in (41, 42, 43, 44):
+                    rows.append({
+                        "run": f"{mode}_{balance}_{seed}",
+                        "mode": mode,
+                        "balance_coef": balance,
+                        "k1": 2,
+                        "k2": 2,
+                        "top_k": 2,
+                        "residual_scale": 1.0,
+                        "seed": seed,
+                        "val_loss": 1.0 + 0.001 * seed,
+                    })
+        coverage = experiment.ablation_coverage(
+            rows, ["mode", "balance_coef"], ["A"]
+        )
+        controls = coverage["mechanism_controls"]
+        self.assertEqual(len(controls), 1)
+        entry = controls[0]
+        self.assertEqual(entry["control_mode"], "local_base_k2")
+        self.assertEqual(entry["missing_control_levels"], ["on"])
+        self.assertIn(
+            "local_base_k2/b=on",
+            coverage["mechanism_missing_cells"],
+        )
+        alignment = entry["seed_alignment"]
+        self.assertEqual(len(alignment), 1)
+        self.assertEqual(alignment[0]["n_common_seeds"], 4)
+        self.assertTrue(
+            any(
+                "机制对照" in advisory
+                for advisory in coverage["advisories"]
+            )
+        )
+
+    def test_comparison_analysis_gates_delayed_merge_claim(self):
+        # 端到端：缺少单因素机制对照时，组件级判定必须把延迟
+        # 合并的归因判为未就绪（blocked），不能只靠多因素主效应
+        # 宣称「方案各自有用」。
+        rows = []
+        for mode, offset in (
+            ("local_base", 0.0),
+            ("A", -0.2),
+        ):
+            for balance in (0.0, 0.01):
+                for seed in (41, 42, 43, 44):
+                    rows.append({
+                        "run": f"{mode}_{balance}_{seed}",
+                        "mode": mode,
+                        "balance_coef": balance,
+                        "k1": 2,
+                        "k2": 2,
+                        "seed": seed,
+                        "val_loss": 1.0 + 0.001 * seed + offset,
+                        "protocol": {
+                            "comparison_family": "neural",
+                            "mode": mode,
+                            "lr": 3e-4,
+                            "k1": 2,
+                            "k2": 2,
+                            "balance_coef": balance,
+                            "top_k": 2,
+                        },
+                        "protocol_recorded_keys": [
+                            "comparison_family",
+                            "mode",
+                            "lr",
+                            "k1",
+                            "k2",
+                            "balance_coef",
+                            "top_k",
+                        ],
+                    })
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode", "balance_coef", "seed"],
+                metric="val_loss",
+                ablation_modes=["A"],
+            )
+        mechanism = report["mechanism_controls"]
+        self.assertTrue(mechanism["applicable"])
+        self.assertEqual(
+            mechanism["schemes"]["A"]["status"], "missing_control"
+        )
+        component = next(
+            item
+            for item in report["ablation_component_verdicts"][
+                "components"
+            ]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertEqual(component["status"], "blocked")
+        self.assertTrue(
+            any(
+                "单因素机制对照" in reason
+                for reason in component["reasons"]
+            )
+        )
+
+    def test_comparison_analysis_accepts_single_factor_mechanism(self):
+        # 机制对照臂在位、两臂只差合并时机时：单因素核对通过，
+        # 组件判定不再因机制对照被阻塞。
+        rows = []
+        for mode, offset in (
+            ("local_base_k2", 0.0),
+            ("A", -0.2),
+        ):
+            for balance in (0.0, 0.01):
+                for seed in (41, 42, 43, 44, 45, 46):
+                    rows.append({
+                        "run": f"{mode}_{balance}_{seed}",
+                        "mode": mode,
+                        "balance_coef": balance,
+                        "k1": 2,
+                        "k2": 2,
+                        "seed": seed,
+                        "val_loss": 1.0 + 0.001 * seed + offset,
+                        "protocol": {
+                            "comparison_family": "neural",
+                            "mode": mode,
+                            "lr": 3e-4,
+                            "k1": 2,
+                            "k2": 2,
+                            "balance_coef": balance,
+                            "top_k": 2,
+                        },
+                        "protocol_recorded_keys": [
+                            "comparison_family",
+                            "mode",
+                            "lr",
+                            "k1",
+                            "k2",
+                            "balance_coef",
+                            "top_k",
+                        ],
+                    })
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = experiment.print_comparison_analysis(
+                rows,
+                factors=["mode", "balance_coef", "seed"],
+                metric="val_loss",
+                ablation_modes=["A"],
+            )
+        mechanism = report["mechanism_controls"]
+        entry = mechanism["schemes"]["A"]
+        self.assertEqual(entry["status"], "supported")
+        self.assertTrue(entry["single_factor_check"]["ok"])
+        self.assertTrue(mechanism["single_factor_verified"])
+        self.assertEqual(entry["n_contrasts"], 2)
+        component = next(
+            item
+            for item in report["ablation_component_verdicts"][
+                "components"
+            ]
+            if item["component"] == "delayed_merge_A"
+        )
+        self.assertNotEqual(component["status"], "blocked")
+
     def test_seed_plan_flags_robust_impossible(self):
         plan = experiment._build_seed_plan(
             [1, 2, 3, 4, 5], False
