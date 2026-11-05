@@ -14,6 +14,7 @@ from _core_RoutingTests import RoutingTests
 from _core_ReproducibilityTests import ReproducibilityTests
 from _core_RunAuditTests import RunAuditTests
 from _core_NearDuplicateDataTests import NearDuplicateDataTests
+from _core_DataPlanTests import DataPlanTests
 from _core_ProcessTests import ProcessTests
 from _core_PreregistrationTests import PreregistrationTests
 from _core_ArtifactManifestTests import ArtifactManifestTests
@@ -40,6 +41,7 @@ __all__ = [
     "ReproducibilityTests",
     "RunAuditTests",
     "NearDuplicateDataTests",
+    "DataPlanTests",
     "ProcessTests",
     "PreregistrationTests",
     "ArtifactManifestTests",

@@ -737,6 +737,18 @@ def environment_mode_error(args) -> Optional[str]:
                 "--paper-cell",
                 getattr(args, "paper_cell", None) is not None,
             ),
+            (
+                "--write-data-plan",
+                getattr(args, "write_data_plan", None) is not None,
+            ),
+            (
+                "--check-data-plan",
+                getattr(args, "check_data_plan", None) is not None,
+            ),
+            (
+                "--data-plan",
+                getattr(args, "data_plan", None) is not None,
+            ),
         )
         if active
     ]

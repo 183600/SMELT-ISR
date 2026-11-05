@@ -128,6 +128,9 @@ def _MAIN_part_001():
     parser.add_argument('--equivalence-margin', type=float, default=_DEFAULT_EQUIVALENCE_MARGIN, metavar='REL', help=f'等价性检验（TOST）的等价界，相对基线均值的比例（默认 {_DEFAULT_EQUIVALENCE_MARGIN:g}，即 1%%）：「不显著」只能说明未发现差异，不等于无差异；报告在预先声明的等价界内给出 TOST 判定，以及 80%% 功效下的最小可检出效应（MDE）与所需种子数，避免把功效不足误读成方法等价。若要把等价性作为研究主张，必须在预注册 power 中设 plan_equivalence=true 并在顶层声明该界，设计预检会同时检查 TOST 功效；命令行默认值不能代替声明')
     parser.add_argument('--plan-design', action='store_true', help='不训练：按 --seeds/--suite-modes/--suite-ablation 只生成并打印 design_plan.json（运行清单、随机化区组顺序、先验功效、解析 token 预算），供冻结/预注册前检查设计是否可执行；正式运行时同一份计划由子进程逐项核对')
     parser.add_argument('--design-pilot-runs', nargs='+', default=None, metavar='RUN', help='试点/先前运行目录（必须包含失败目录）：从相同 seed 的配对差值估计实际种子间 sd，并按处理单元估计脱落率，与预注册 power 的 expected_seed_sd_relative / expected_attrition_rate 对照。观测值更大时设计计划按观测值强制重算功效并写入 pilot_evidence；仍不足则在第一个子进程前拒绝。需配合 --preregistration 与 --seeds/--plan-design')
+    parser.add_argument('--write-data-plan', type=str, default=None, metavar='FILE', help='不训练：用与训练入口完全相同的数据管线从当前语料生成 data_plan.json（语料/切分/清洗指纹、split 边界与隔离记录），并打印可直接粘进预注册的 data 块与 metadata.data_plan_id。用于冻结预注册前固定数据协议；同一冻结路径拒绝被不同内容的计划覆盖')
+    parser.add_argument('--check-data-plan', type=str, default=None, metavar='PLAN_FILE', help='不训练：把冻结的 data_plan.json 与 --preregistration 声明的 data 块、以及当前语料/命令行口径三方逐项核对（内容与 plan_id 一致性、训练入口同一数据核对口径）；不一致时以非零状态码退出。需配合 --preregistration 与 --data')
+    parser.add_argument('--data-plan', type=str, default=None, metavar='FILE', help='训练时的数据计划核对伴侣（需配合 --preregistration）：开跑前核对冻结的 data_plan.json 完整性（内容与 plan_id 一致）、预注册 metadata.data_plan_id 声明与 data 块是否与计划一致；预注册声明了 data_plan_id 而未提供该参数时拒绝训练。核对结果随 config.json 的 preregistration 记录落盘')
     parser.add_argument('--run-order', type=str, default=None, choices=_RUN_ORDER_SCHEMES, help='套件的执行顺序设计：grouped=按臂分组（历史行为，时间漂移与臂效应完全混杂）；blocked=按种子成完整区组、区组内保持原臂顺序；randomized=区组内随机化臂顺序（默认，随机化完整区组设计）；counterbalanced=在完整区组上用循环拉丁方限制性随机化，使每个处理在各区组位置上的出现次数尽可能相等（要求每个种子区组包含同一组处理）；williams=在完整区组上用 Williams 设计同时平衡位置与区组内一阶 carryover（偶数处理需 n 个区组、奇数处理需 2n 个区组的整数倍才能完全平衡）')
     parser.add_argument('--run-order-seed', type=int, default=None, metavar='SEED', help='随机化区组顺序的确定性种子（默认 0）；同一计划必须使用同一种子才能复现执行顺序，看到结果后换顺序不再是原设计')
     parser.add_argument('--sweep-stop-on-failure', action='store_true', help='种子套件遇到首个训练期失败即停止（默认 continue：保留失败目录并继续执行剩余计划，以维持完整区组并让失败率/脱落界按计划分母计算；启动前失败仍立即停止）。该策略写入 design_plan.json 的 failure_policy 并受 plan_id 冻结')
@@ -257,6 +260,46 @@ def _MAIN_part_001():
             raise SystemExit(1)
         raise _SC_RETURN(None)
     apply_paper_cli(args, parser)
+    data_plan_mode = data_plan_mode_error(args)
+    if data_plan_mode is not None:
+        parser.error(data_plan_mode)
+    if args.write_data_plan is not None or args.check_data_plan is not None:
+        try:
+            prep_group_separator_bytes, prep_time_order_evidence = data_protocol_cli_setup(args)
+        except ValueError as error:
+            parser.error(str(error))
+        try:
+            prep_dataset = build_byte_dataset(args, args.seq_len, prep_group_separator_bytes, device=None)
+        except (OSError, ValueError) as error:
+            parser.error(f'数据管线初始化失败: {error}')
+    if args.write_data_plan is not None:
+        try:
+            prep_plan = build_data_plan(args, prep_dataset, time_order_evidence=prep_time_order_evidence)
+            prep_written = write_data_plan(Path(args.write_data_plan), prep_plan)
+        except (OSError, ValueError) as error:
+            parser.error(f'--write-data-plan 失败: {error}')
+        if prep_written['written']:
+            print(f"[data-plan] 已写入 {prep_written['path']}（plan_id={str(prep_written['plan_id'])[:12]}...，sha256={str(prep_written['file_sha256'])[:12]}...）；冻结后同一路径拒绝被不同内容的计划覆盖")
+        else:
+            print(f"[data-plan] 已存在同一份数据计划 {prep_written['path']}（plan_id 一致，未改写已冻结文件）")
+        print('[data-plan] 应写入预注册的 data 块（并在 metadata 中声明 data_plan_id）:')
+        print(json.dumps(_json_safe(prep_plan['preregistration_data_block']), ensure_ascii=False, indent=2))
+        print(f"[data-plan] metadata.data_plan_id = {prep_written['plan_id']}")
+        print(f"[data-plan] 训练时传 --data-plan {prep_written['path']} 在开跑前逐项核对该协议；归档时把数据计划与预注册文件一起保存")
+        raise _SC_RETURN(None)
+    if args.check_data_plan is not None:
+        try:
+            check_plan = load_data_plan(args.check_data_plan)
+            check_payload, check_sha256 = load_preregistration(args.preregistration)
+        except ValueError as error:
+            parser.error(f'--check-data-plan 失败: {error}')
+        check_report = check_data_plan(check_payload, check_plan, args=args, dataset=prep_dataset)
+        print_data_plan_check(check_report)
+        print(f'[data-plan] 预注册文件 sha256={check_sha256}')
+        if not check_report['ok']:
+            raise SystemExit(1)
+        print('[data-plan] 核对通过：当前语料/命令行与预注册声明的数据协议一致，可把预注册文件与数据计划一起冻结归档')
+        raise _SC_RETURN(None)
     if args.preregistration is not None:
         if any((flag for flag in (args.compare is not None, args.final_test_comparison is not None, args.sanity_only, args.statistical_baseline, args.suite_baseline_tuning))):
             parser.error('--preregistration 只适用于神经训练/多种子确证运行：--compare / --final-test-comparison / --sanity-only / --statistical-baseline / --suite-baseline-tuning 不执行预注册的训练协议')
@@ -269,6 +312,17 @@ def _MAIN_part_001():
             parser.error(preregistration_error)
         args.preregistration_record = preregistration_record(preregistration_payload, args.preregistration, preregistration_sha256, applied_fields, args)
         print(f'''[prereg] study_id={preregistration_payload['study_id']}，冻结提交 {str(preregistration_payload['frozen_commit'])[:12]}...，种子={preregistration_payload['seeds']}''' + ('；由文件补齐: ' + ', '.join(applied_fields) if applied_fields else '；命令行与预注册逐项一致'))
+        preregistration_metadata = preregistration_payload.get('metadata')
+        preregistration_declared_plan_id = preregistration_metadata.get('data_plan_id') if isinstance(preregistration_metadata, dict) else None
+        if preregistration_declared_plan_id is not None and args.data_plan is None:
+            parser.error('预注册 metadata.data_plan_id 已声明：训练时必须传 --data-plan FILE 核对冻结的数据计划，否则该声明无法兑现')
+        if args.data_plan is not None:
+            try:
+                args.data_plan_payload = load_data_plan(args.data_plan)
+            except ValueError as error:
+                parser.error(f'--data-plan 无法读取: {error}')
+            if preregistration_declared_plan_id is not None and str(preregistration_declared_plan_id) != str(args.data_plan_payload['plan_id']):
+                parser.error(f'--data-plan 的 plan_id={str(args.data_plan_payload["plan_id"])[:12]}... 与预注册 metadata.data_plan_id={str(preregistration_declared_plan_id)[:12]}... 不一致：冻结的数据计划被替换过，数据协议不能在预注册后更换')
     if args.design_pilot_runs is not None:
         pilot_conflicts = [flag for flag, active in (('--compare', args.compare is not None), ('--final-test-comparison', args.final_test_comparison is not None), ('--evaluate-test', bool(args.evaluate_test)), ('--resume', args.resume is not None), ('--sanity-only', bool(args.sanity_only)), ('--statistical-baseline', bool(args.statistical_baseline)), ('--suite-baseline-tuning', bool(args.suite_baseline_tuning))) if active]
         if pilot_conflicts:
@@ -856,61 +910,15 @@ def _MAIN_part_003():
         cfg.validate()
     except ValueError as error:
         parser.error(f'模型结构/损失配置无效: {error}')
-    group_separator_bytes = None
-    if args.group_separator is not None:
-        try:
-            group_separator_bytes = parse_group_separator(args.group_separator)
-        except ValueError as error:
-            parser.error(f'--group-separator 无效: {error}')
     for shift_flag, shift_value in (('--max-byte-shift', args.max_byte_shift), ('--max-bigram-shift', args.max_bigram_shift), ('--max-conditional-shift', args.max_conditional_shift)):
         if shift_value is None:
             continue
         if not math.isfinite(shift_value) or shift_value < 0.0 or shift_value > 1.0:
             parser.error(f'{shift_flag} 必须是 [0, 1] 内的有限数')
-    if args.deduplicate_train_groups and group_separator_bytes is None:
-        parser.error('--deduplicate-train-groups 需要 --group-separator：没有显式群组边界时无法只清洗 train 而不改动 val/test')
-    if args.drop_train_shared_chunks and group_separator_bytes is None:
-        parser.error('--drop-train-shared-chunks 需要 --group-separator：没有显式群组边界时无法整组清洗跨 split 共享内容而不改动 val/test')
-    if args.drop_train_near_duplicate_groups and group_separator_bytes is None:
-        parser.error('--drop-train-near-duplicate-groups 需要 --group-separator：近重复按群组定义，没有显式群组边界时无法只清洗 train 而不改动 val/test')
-    if args.near_duplicate_audit and group_separator_bytes is None:
-        parser.error('--near-duplicate-audit 需要 --group-separator：近重复按群组定义，没有群组边界就无法区分文档/记录')
-    if not math.isfinite(args.near_duplicate_threshold) or not 0.0 < args.near_duplicate_threshold <= 1.0:
-        parser.error('--near-duplicate-threshold 必须是 (0, 1] 内的有限数')
-    if not (isinstance(args.near_duplicate_shingle_bytes, int) and (not isinstance(args.near_duplicate_shingle_bytes, bool)) and (1 <= args.near_duplicate_shingle_bytes <= _NEAR_DUP_MAX_SHINGLE_BYTES)):
-        parser.error(f'--near-duplicate-shingle-bytes 必须是 1..{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数')
-    if args.clean_train_against_test and (not (args.deduplicate_train_groups or args.drop_train_shared_chunks or args.drop_train_near_duplicate_groups)):
-        parser.error('--clean-train-against-test 需要与 --deduplicate-train-groups、--drop-train-shared-chunks 或 --drop-train-near-duplicate-groups 一起使用：没有训练集清洗时 test 不会被读取')
-    if args.drop_train_corrupt_groups and group_separator_bytes is None:
-        parser.error('--drop-train-corrupt-groups 需要 --group-separator：没有显式群组边界时无法只清洗 train 而不改动 val/test')
-    if args.drop_train_corrupt_bytes and group_separator_bytes is not None:
-        parser.error('--drop-train-corrupt-bytes 仅用于无 --group-separator 的连续字节流；有群组边界时请用 --drop-train-corrupt-groups 以保持群组完整')
-    if args.drop_train_degenerate_groups and group_separator_bytes is None:
-        parser.error('--drop-train-degenerate-groups 需要 --group-separator：没有显式群组边界时无法只清洗 train 而不改动 val/test')
-    if args.drop_train_degenerate_runs and group_separator_bytes is not None:
-        parser.error('--drop-train-degenerate-runs 仅用于无 --group-separator 的连续字节流；有群组边界时请用 --drop-train-degenerate-groups 以保持群组完整')
-    cleaning_flags = (('--drop-train-corrupt-groups', args.drop_train_corrupt_groups), ('--drop-train-corrupt-bytes', args.drop_train_corrupt_bytes), ('--drop-train-degenerate-groups', args.drop_train_degenerate_groups), ('--drop-train-degenerate-runs', args.drop_train_degenerate_runs))
-    enabled_cleaning = [name for name, enabled in cleaning_flags if enabled]
-    if enabled_cleaning and (not (args.domain_justification and str(args.domain_justification).strip())):
-        parser.error('启用训练集清洗（' + ', '.join(enabled_cleaning) + '）需要 --domain-justification：非法 UTF-8、NUL、重复字节或退化段可能是合法字节/结构（二进制记录、表格边框、填充），也可能是任务允许的标签；没有领域依据的删除会选择性改变监督分布。请先确认这是格式损坏并记录依据，或只用审计/严格门而不删除')
-    args.cleaning_domain_justification = str(args.domain_justification).strip() if args.domain_justification else None
-    args.time_order_evidence = None
-    if args.split_policy == 'chronological':
-        if not args.time_order_manifest:
-            parser.error('--split-policy chronological 需要 --time-order-manifest：仅凭文件顺序不能证明时间顺序')
-        try:
-            time_evidence = read_time_order_manifest(args.time_order_manifest)
-        except (OSError, ValueError) as error:
-            parser.error(f'--time-order-manifest 无效: {error}')
-        if not time_evidence['monotonic_non_decreasing']:
-            parser.error('--time-order-manifest 的时间戳不是单调不减：语料文件顺序与时间顺序不一致，不能按时间前缀切分（违规行: ' + ', '.join((str(item) for item in time_evidence['order_violations'])) + '）')
-        args.time_order_evidence = time_evidence
-    elif args.time_order_manifest is not None:
-        print('[data] [note] 已提供 --time-order-manifest，但 --split-policy=contiguous：清单只作为证据记录，本次结论仍不声称时间切分')
-        try:
-            args.time_order_evidence = read_time_order_manifest(args.time_order_manifest)
-        except (OSError, ValueError) as error:
-            parser.error(f'--time-order-manifest 无效: {error}')
+    try:
+        group_separator_bytes, time_evidence = data_protocol_cli_setup(args)
+    except ValueError as error:
+        parser.error(str(error))
     args.cost_profile = mode_cost_profile(cfg)
     protocol_state = {'lr_schedule': str(getattr(args, 'lr_schedule', 'cosine')), 'batch_size': int(args.batch_size), 'steps': int(args.steps), 'stable_steps': int(args.steps if getattr(args, 'wsd_stable_steps', None) is None else args.wsd_stable_steps), 'document_masks': bool(cfg.document_masks), 'save_at_steps': list(getattr(args, 'save_at_steps', None) or [])}
     args.paper_protocol_state = protocol_state
@@ -961,6 +969,16 @@ def _MAIN_part_003():
         data_preregistration_error = preregistration_data_error(args, preregistration_payload, dataset)
         if data_preregistration_error is not None:
             parser.error(data_preregistration_error)
+        if args.data_plan is not None:
+            plan_differences = data_plan_differences(preregistration_payload.get('data'), args.data_plan_payload['preregistration_data_block'])
+            if plan_differences:
+                print('[data-plan] 预注册 data 块与冻结数据计划不一致：')
+                for plan_difference in plan_differences:
+                    print(f"  - {plan_difference.get('field')}：声明 {plan_difference.get('declared')!r}，计划 {plan_difference.get('expected')!r}（{plan_difference.get('reason')}）")
+                parser.error('--data-plan 核对未通过：预注册声明的数据协议与冻结数据计划不一致；数据协议不能在冻结后被替换，如需新协议请重新生成数据计划并重新预注册')
+            if isinstance(getattr(args, 'preregistration_record', None), dict):
+                args.preregistration_record['data_plan'] = {'path': str(args.data_plan), 'sha256': _sha256_file(Path(args.data_plan)), 'plan_id': str(args.data_plan_payload['plan_id']), 'verified': True}
+            print(f"[data-plan] 数据协议核对通过：plan_id={str(args.data_plan_payload['plan_id'])[:12]}... 与预注册 data 块逐项一致")
         if isinstance(getattr(args, 'preregistration_record', None), dict):
             args.preregistration_record.update({'data_sha256': dataset.data_sha256, 'data_split_sha256': dict(dataset.split_sha256), 'data_split_policy': args.split_policy, 'data_val_fraction': dataset.val_fraction, 'data_test_fraction': dataset.test_fraction, 'data_group_separator': args.group_separator, 'run_mode': getattr(args, 'mode', None), 'run_seed': getattr(args, 'seed', None), 'run_seeds': getattr(args, 'seeds', None), 'data_verified': True})
         print(f'[prereg] 数据协议核对通过：语料 {dataset.data_sha256[:12]}...，切分 {args.split_policy}，val/test={dataset.val_fraction:g}/{dataset.test_fraction:g}')

@@ -287,6 +287,508 @@ def write_data_plan(
 
 
 
+def load_data_plan(path: object) -> Dict[str, object]:
+    """
+    读取 ``data_plan.json`` 并核对内容与 ``plan_id`` 的一致性。
+
+    数据计划冻结后不允许被替换：文件内容与 ``plan_id`` 不一致
+    说明计划被改写过，必须拒绝核对，而不是把改写后的计划当成
+    当初冻结的那一份。缺少 ``preregistration_data_block`` 的
+    旧计划无法参与数据协议核对，同样显式拒绝。
+    """
+    target = Path(path)
+    try:
+        raw = target.read_bytes()
+        plan = json.loads(raw.decode("utf-8"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError(
+            f"无法读取数据计划 {target}: {error}"
+        ) from error
+    if not isinstance(plan, dict):
+        raise ValueError(f"数据计划 {target} 不是 JSON 对象")
+    plan_id = plan.get("plan_id")
+    if not isinstance(plan_id, str) or not plan_id:
+        raise ValueError(f"数据计划 {target} 缺少 plan_id")
+    if data_plan_id(plan) != plan_id:
+        raise ValueError(
+            f"数据计划 {target} 的内容与 plan_id 不一致："
+            "文件可能在冻结后被改写；数据协议不能被替换，"
+            "请重新生成计划并重新预注册"
+        )
+    if not isinstance(
+        plan.get("preregistration_data_block"), dict
+    ):
+        raise ValueError(
+            f"数据计划 {target} 缺少 preregistration_data_block："
+            "该计划无法参与数据协议核对，请用当前代码重新生成"
+        )
+    return plan
+
+
+
+def data_protocol_cli_setup(
+    args: argparse.Namespace,
+) -> Tuple[Optional[bytes], Optional[Dict[str, object]]]:
+    """
+    数据协议参数的一次性校验，训练入口与数据计划准备入口共用。
+
+    返回 ``(group_separator_bytes, time_order_evidence)``，并把
+    ``cleaning_domain_justification`` 与 ``time_order_evidence``
+    写回 ``args``。违反协议时抛 ``ValueError``：群组边界、清洗
+    开关与切分声明都直接改变实际参与训练/评估的字节，校验若只
+    在一个入口维护，另一个入口就会用旧口径生成计划或训练，
+    冻结的数据协议会与实际数据对不上。
+    """
+    group_separator_bytes: Optional[bytes] = None
+    if args.group_separator is not None:
+        try:
+            group_separator_bytes = parse_group_separator(
+                args.group_separator
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"--group-separator 无效: {error}"
+            ) from error
+    if args.deduplicate_train_groups and group_separator_bytes is None:
+        raise ValueError(
+            "--deduplicate-train-groups 需要 --group-separator："
+            "没有显式群组边界时无法只清洗 train 而不改动 val/test"
+        )
+    if args.drop_train_shared_chunks and group_separator_bytes is None:
+        raise ValueError(
+            "--drop-train-shared-chunks 需要 --group-separator："
+            "没有显式群组边界时无法整组清洗跨 split 共享内容而不改动 val/test"
+        )
+    if (
+        args.drop_train_near_duplicate_groups
+        and group_separator_bytes is None
+    ):
+        raise ValueError(
+            "--drop-train-near-duplicate-groups 需要 --group-separator："
+            "近重复按群组定义，没有显式群组边界时无法只清洗 train 而不改动 val/test"
+        )
+    if args.near_duplicate_audit and group_separator_bytes is None:
+        raise ValueError(
+            "--near-duplicate-audit 需要 --group-separator："
+            "近重复按群组定义，没有群组边界就无法区分文档/记录"
+        )
+    if (
+        not math.isfinite(args.near_duplicate_threshold)
+        or not 0.0 < args.near_duplicate_threshold <= 1.0
+    ):
+        raise ValueError(
+            "--near-duplicate-threshold 必须是 (0, 1] 内的有限数"
+        )
+    if not (
+        isinstance(args.near_duplicate_shingle_bytes, int)
+        and (not isinstance(args.near_duplicate_shingle_bytes, bool))
+        and (
+            1
+            <= args.near_duplicate_shingle_bytes
+            <= _NEAR_DUP_MAX_SHINGLE_BYTES
+        )
+    ):
+        raise ValueError(
+            "--near-duplicate-shingle-bytes 必须是 1.."
+            f"{_NEAR_DUP_MAX_SHINGLE_BYTES} 的整数"
+        )
+    if args.clean_train_against_test and (
+        not (
+            args.deduplicate_train_groups
+            or args.drop_train_shared_chunks
+            or args.drop_train_near_duplicate_groups
+        )
+    ):
+        raise ValueError(
+            "--clean-train-against-test 需要与 --deduplicate-train-groups、"
+            "--drop-train-shared-chunks 或 --drop-train-near-duplicate-groups "
+            "一起使用：没有训练集清洗时 test 不会被读取"
+        )
+    if args.drop_train_corrupt_groups and group_separator_bytes is None:
+        raise ValueError(
+            "--drop-train-corrupt-groups 需要 --group-separator："
+            "没有显式群组边界时无法只清洗 train 而不改动 val/test"
+        )
+    if args.drop_train_corrupt_bytes and group_separator_bytes is not None:
+        raise ValueError(
+            "--drop-train-corrupt-bytes 仅用于无 --group-separator 的"
+            "连续字节流；有群组边界时请用 --drop-train-corrupt-groups "
+            "以保持群组完整"
+        )
+    if (
+        args.drop_train_degenerate_groups
+        and group_separator_bytes is None
+    ):
+        raise ValueError(
+            "--drop-train-degenerate-groups 需要 --group-separator："
+            "没有显式群组边界时无法只清洗 train 而不改动 val/test"
+        )
+    if (
+        args.drop_train_degenerate_runs
+        and group_separator_bytes is not None
+    ):
+        raise ValueError(
+            "--drop-train-degenerate-runs 仅用于无 --group-separator 的"
+            "连续字节流；有群组边界时请用 --drop-train-degenerate-groups "
+            "以保持群组完整"
+        )
+    cleaning_flags = (
+        ("--drop-train-corrupt-groups", args.drop_train_corrupt_groups),
+        ("--drop-train-corrupt-bytes", args.drop_train_corrupt_bytes),
+        (
+            "--drop-train-degenerate-groups",
+            args.drop_train_degenerate_groups,
+        ),
+        (
+            "--drop-train-degenerate-runs",
+            args.drop_train_degenerate_runs,
+        ),
+    )
+    enabled_cleaning = [
+        name for name, enabled in cleaning_flags if enabled
+    ]
+    if enabled_cleaning and (
+        not (
+            args.domain_justification
+            and str(args.domain_justification).strip()
+        )
+    ):
+        raise ValueError(
+            "启用训练集清洗（"
+            + ", ".join(enabled_cleaning)
+            + "）需要 --domain-justification：非法 UTF-8、NUL、重复字节"
+            "或退化段可能是合法字节/结构（二进制记录、表格边框、填充），"
+            "也可能是任务允许的标签；没有领域依据的删除会选择性改变"
+            "监督分布。请先确认这是格式损坏并记录依据，或只用审计/"
+            "严格门而不删除"
+        )
+    args.cleaning_domain_justification = (
+        str(args.domain_justification).strip()
+        if args.domain_justification
+        else None
+    )
+    split_policy = str(
+        getattr(args, "split_policy", "contiguous")
+    )
+    time_order_evidence: Optional[Dict[str, object]] = None
+    if split_policy == "chronological" and not args.time_order_manifest:
+        raise ValueError(
+            "--split-policy chronological 需要 --time-order-manifest："
+            "仅凭文件顺序不能证明时间顺序"
+        )
+    if args.time_order_manifest is not None:
+        try:
+            time_order_evidence = read_time_order_manifest(
+                args.time_order_manifest
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"--time-order-manifest 无效: {error}"
+            ) from error
+        if (
+            split_policy == "chronological"
+            and not time_order_evidence["monotonic_non_decreasing"]
+        ):
+            raise ValueError(
+                "--time-order-manifest 的时间戳不是单调不减：语料文件"
+                "顺序与时间顺序不一致，不能按时间前缀切分（违规行: "
+                + ", ".join(
+                    str(item)
+                    for item in time_order_evidence["order_violations"]
+                )
+                + "）"
+            )
+        if split_policy != "chronological":
+            print(
+                "[data] [note] 已提供 --time-order-manifest，但 "
+                "--split-policy=contiguous：清单只作为证据记录，"
+                "本次结论仍不声称时间切分"
+            )
+    args.time_order_evidence = time_order_evidence
+    return group_separator_bytes, time_order_evidence
+
+
+
+def data_plan_mode_error(args: argparse.Namespace) -> Optional[str]:
+    """
+    校验 --write-data-plan / --check-data-plan / --data-plan 的互斥搭配。
+
+    数据计划是训练前的准备证据：``--write-data-plan`` 生成、
+    ``--check-data-plan`` 只读核对，两者都不能与训练/评估/归档
+    入口混用（混用时其中一个入口会被静默忽略）。``--data-plan``
+    是训练入口的核对伴侣：必须与 ``--preregistration`` 一起使用，
+    且不能与只读入口混用。
+    """
+    write_mode = getattr(args, "write_data_plan", None)
+    check_mode = getattr(args, "check_data_plan", None)
+    train_mode = getattr(args, "data_plan", None)
+    if write_mode is not None and check_mode is not None:
+        return (
+            "--write-data-plan 与 --check-data-plan 不能同时使用："
+            "先生成数据计划，再单独调用核对"
+        )
+    if write_mode is not None or check_mode is not None:
+        prep_flag = (
+            "--write-data-plan"
+            if write_mode is not None
+            else "--check-data-plan"
+        )
+        conflicts = [
+            flag
+            for flag, active in (
+                ("--compare", getattr(args, "compare", None) is not None),
+                (
+                    "--compare-report",
+                    getattr(args, "compare_report", None) is not None,
+                ),
+                (
+                    "--compare-csv",
+                    getattr(args, "compare_csv", None) is not None,
+                ),
+                (
+                    "--compare-preregistration",
+                    getattr(
+                        args, "compare_preregistration", None
+                    )
+                    is not None,
+                ),
+                (
+                    "--allow-preregistration-coverage-deviation",
+                    bool(
+                        getattr(
+                            args,
+                            "allow_preregistration_coverage_deviation",
+                            False,
+                        )
+                    ),
+                ),
+                (
+                    "--final-test-comparison",
+                    getattr(args, "final_test_comparison", None)
+                    is not None,
+                ),
+                (
+                    "--sanity-only",
+                    bool(getattr(args, "sanity_only", False)),
+                ),
+                (
+                    "--statistical-baseline",
+                    bool(getattr(args, "statistical_baseline", False)),
+                ),
+                (
+                    "--suite-baseline-tuning",
+                    bool(
+                        getattr(args, "suite_baseline_tuning", False)
+                    ),
+                ),
+                # --check-data-plan 的核对对象就是预注册文件，两者
+                # 是必需搭配而不是冲突；--write-data-plan 才与
+                # --preregistration 互斥（计划在预注册之前生成）。
+                (
+                    "--preregistration",
+                    write_mode is not None
+                    and getattr(args, "preregistration", None)
+                    is not None,
+                ),
+                (
+                    "--plan-design",
+                    bool(getattr(args, "plan_design", False)),
+                ),
+                (
+                    "--design-pilot-runs",
+                    getattr(args, "design_pilot_runs", None)
+                    is not None,
+                ),
+                (
+                    "--suite-modes",
+                    getattr(args, "suite_modes", None) is not None,
+                ),
+                (
+                    "--suite-ablation",
+                    bool(getattr(args, "suite_ablation", False)),
+                ),
+                ("--data-plan", train_mode is not None),
+                (
+                    "--write-manifest",
+                    getattr(args, "write_manifest", None) is not None,
+                ),
+                (
+                    "--verify-manifest",
+                    getattr(args, "verify_manifest", None) is not None,
+                ),
+                (
+                    "--check-environment",
+                    getattr(args, "check_environment", None)
+                    is not None,
+                ),
+                (
+                    "--check-source",
+                    getattr(args, "check_source", None) is not None,
+                ),
+                (
+                    "--print-source-fingerprint",
+                    bool(
+                        getattr(
+                            args, "print_source_fingerprint", False
+                        )
+                    ),
+                ),
+                (
+                    "--audit-run",
+                    getattr(args, "audit_run", None) is not None,
+                ),
+                ("--resume", getattr(args, "resume", None) is not None),
+                (
+                    "--evaluate-test",
+                    bool(getattr(args, "evaluate_test", False)),
+                ),
+                ("--seeds", getattr(args, "seeds", None) is not None),
+                ("--out", getattr(args, "out", None) is not None),
+            )
+            if active
+        ]
+        if conflicts:
+            return (
+                f"{prep_flag} 是训练前的数据协议准备入口，不能与"
+                "以下参数同时使用（否则其中一个会被静默忽略）: "
+                + ", ".join(conflicts)
+            )
+        if getattr(args, "data", None) is None:
+            return (
+                f"{prep_flag} 需要 --data：数据协议必须从真实语料"
+                "生成/核对，不能对不存在的语料冻结计划"
+            )
+    if check_mode is not None:
+        if getattr(args, "preregistration", None) is None:
+            return (
+                "--check-data-plan 需要 --preregistration："
+                "核对对象是预注册文件声明的 data 块与冻结的数据计划"
+            )
+        if train_mode is not None:
+            return (
+                "--check-data-plan 是只读核对，--data-plan 用于"
+                "训练入口核对，二者不能同时使用"
+            )
+        return None
+    if train_mode is not None:
+        conflicts = [
+            flag
+            for flag, active in (
+                ("--compare", getattr(args, "compare", None) is not None),
+                (
+                    "--compare-report",
+                    getattr(args, "compare_report", None) is not None,
+                ),
+                (
+                    "--compare-csv",
+                    getattr(args, "compare_csv", None) is not None,
+                ),
+                (
+                    "--compare-preregistration",
+                    getattr(
+                        args, "compare_preregistration", None
+                    )
+                    is not None,
+                ),
+                (
+                    "--allow-preregistration-coverage-deviation",
+                    bool(
+                        getattr(
+                            args,
+                            "allow_preregistration_coverage_deviation",
+                            False,
+                        )
+                    ),
+                ),
+                (
+                    "--final-test-comparison",
+                    getattr(args, "final_test_comparison", None)
+                    is not None,
+                ),
+                (
+                    "--sanity-only",
+                    bool(getattr(args, "sanity_only", False)),
+                ),
+                (
+                    "--statistical-baseline",
+                    bool(getattr(args, "statistical_baseline", False)),
+                ),
+                (
+                    "--suite-baseline-tuning",
+                    bool(
+                        getattr(args, "suite_baseline_tuning", False)
+                    ),
+                ),
+                (
+                    "--plan-design",
+                    bool(getattr(args, "plan_design", False)),
+                ),
+                (
+                    "--design-pilot-runs",
+                    getattr(args, "design_pilot_runs", None)
+                    is not None,
+                ),
+                (
+                    "--write-data-plan",
+                    getattr(args, "write_data_plan", None) is not None,
+                ),
+                (
+                    "--check-data-plan",
+                    getattr(args, "check_data_plan", None) is not None,
+                ),
+                (
+                    "--write-manifest",
+                    getattr(args, "write_manifest", None) is not None,
+                ),
+                (
+                    "--verify-manifest",
+                    getattr(args, "verify_manifest", None) is not None,
+                ),
+                (
+                    "--check-environment",
+                    getattr(args, "check_environment", None)
+                    is not None,
+                ),
+                (
+                    "--check-source",
+                    getattr(args, "check_source", None) is not None,
+                ),
+                (
+                    "--print-source-fingerprint",
+                    bool(
+                        getattr(
+                            args, "print_source_fingerprint", False
+                        )
+                    ),
+                ),
+                (
+                    "--audit-run",
+                    getattr(args, "audit_run", None) is not None,
+                ),
+            )
+            if active
+        ]
+        if conflicts:
+            return (
+                "--data-plan 是训练入口的数据协议核对伴侣，不能与"
+                "以下只读/评估入口同时使用: "
+                + ", ".join(conflicts)
+            )
+        if getattr(args, "preregistration", None) is None:
+            return (
+                "--data-plan 需要与 --preregistration 一起使用："
+                "它核对的是预注册文件冻结的数据协议与声明的"
+                " data_plan_id"
+            )
+        return None
+    return None
+
+
+
 def _data_plan_group_separator_bytes(value: object) -> Optional[bytes]:
     """把群组分隔符字符串解析成字节；None/缺省表示不使用群组切分。"""
     if value is None:
@@ -543,8 +1045,9 @@ def check_data_plan(
     notes: List[str] = []
     if gate_error is not None and not differences:
         notes.append(
-            "训练入口的数据核对同样拒绝启动，但结构化差异为空："
-            "预检与训练口径可能已漂移，请以训练入口的结论为准"
+            "声明与冻结计划逐项一致，但当前语料/命令行与声明不一致："
+            "训练入口会以相同口径拒绝启动（见 gate_error；若核对"
+            "入口同时报告 plan_drift 字段，那里给出了逐项漂移）"
         )
     if gate_error is None and differences:
         notes.append(

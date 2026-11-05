@@ -1294,6 +1294,9 @@ def source_mode_error(args) -> Optional[str]:
             ),
             ("--sanity-only", _enabled("sanity_only")),
             ("--paper-cell", _has("paper_cell")),
+            ("--write-data-plan", _has("write_data_plan")),
+            ("--check-data-plan", _has("check_data_plan")),
+            ("--data-plan", _has("data_plan")),
         )
         if active
     ]
