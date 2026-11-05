@@ -2,10 +2,17 @@ name: tests
 
 on:
   push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # main 上连发 push 时只保留最新一次测试，旧的直接取消
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   pytest:
