@@ -938,6 +938,13 @@ def baseline_adequacy(
                     f"{best_challenger.get('run')}）"
                 )
     if capacity_findings:
+        # 额外诊断：检查是否为参数容量还是 FLOPs 不匹配
+        param_findings = [
+            f for f in capacity_findings if "参数量" in f
+        ]
+        flop_findings = [
+            f for f in capacity_findings if "FLOPs" in f
+        ]
         message = (
             "挑战模型与所选基线的容量/计算量不对齐（"
             + "; ".join(capacity_findings)
@@ -946,6 +953,10 @@ def baseline_adequacy(
             "n_experts×expert_hidden）或等计算对照（如 smelt / "
             "local_base），并在结论中区分容量与机制"
         )
+        if param_findings and not flop_findings:
+            message += "（仅参数量不匹配，FLOPs 相对一致）"
+        elif flop_findings and not param_findings:
+            message += "（仅 FLOPs 不匹配，参数量相对一致）"
         report["advisories"].append(message)
         report["capacity_confounds"] = capacity_findings
     else:
@@ -1015,6 +1026,15 @@ def baseline_adequacy(
                 ),
                 "parameter_matched": True,
             }
+            # 额外诊断：即使 FLOPs 对齐，参数容量也可能是决定性因素
+            if parameter_matched > current_capacity * 1.5:
+                report["advisories"].append(
+                    "dense 基线参数容量（n_experts×expert_hidden="
+                    f"{parameter_matched}）显著大于等激活计算容量"
+                    f"（dense_fnn_hidden={current_capacity}）："
+                    "挑战模型的涨点极可能由参数容量差异驱动，"
+                    "而非延迟合并或架构效应"
+                )
 
     # 7) n-gram 统计基线对照的稳定性：单次运行的 n-gram 点估计
     #    没有种子间波动可估，拿它当「调优好的强基线」时结论可能

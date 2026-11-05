@@ -956,6 +956,11 @@ def _mechanism_single_factor_check(
         not report["differences"]
         and not report["unverifiable"]
     )
+    # 附加已检查键的汇总，供报告展示
+    if report["checked_keys"]:
+        report["checked_keys_summary"] = ", ".join(
+            str(k) for k in report["checked_keys"]
+        )
     return report
 
 
@@ -1285,6 +1290,27 @@ def mechanism_control_report(
         entry["comparable_cells"] = len(comparable)
         entry["unmatched_levels"] = unmatched
         entry["partial_levels"] = partial
+        # 单因素核对：核对两臂是否除 mode 外其余协议项一致
+        single_factor = _mechanism_single_factor_check(
+            [
+                row for row in control_cells
+                if str(row.get("mode")) == control
+            ],
+            [
+                row for row in delayed_cells
+                if str(row.get("mode")) == mode
+            ],
+        )
+        entry["single_factor_check"] = {
+            "performed": single_factor.get("performed", False),
+            "ok": single_factor.get("ok"),
+            "checked_keys": single_factor.get("checked_keys", []),
+            "differences": single_factor.get("differences", []),
+            "unverifiable": single_factor.get("unverifiable", []),
+            "unchecked_keys": single_factor.get("unchecked_keys", []),
+        }
+        if single_factor.get("performed") and single_factor.get("ok"):
+            entry["single_factor_verified"] = True
         if not comparable:
             if unmatched:
                 entry["status"] = "confounded"

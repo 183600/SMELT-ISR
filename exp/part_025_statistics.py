@@ -42,7 +42,7 @@ def _fragility_summary(
         if key in seen:
             continue
         seen.add(key)
-        entries.append({
+        entry: Dict[str, object] = {
             "family": label,
             "baseline": baseline,
             "variant": variant,
@@ -72,7 +72,87 @@ def _fragility_summary(
                 "max_leave_one_out_p_value"
             ),
             "alpha": fragility.get("alpha"),
-        })
+        }
+        # 附加 MDE 与 TOST 信息，帮助阅读者判定「脆弱性」是由
+        # 样本量不足还是效应真实超出等价界。
+        se = contrast.get("se")
+        df = contrast.get("df")
+        baseline_mean = contrast.get("mean_effect") or contrast.get(
+            "delta"
+        )
+        if se is not None and df is not None and baseline_mean is not None:
+            try:
+                se_v = float(se)
+                df_v = float(df)
+                bl_abs = float(abs(baseline_mean))
+                if se_v > 0 and bl_abs > 0:
+                    alpha = _SIGNIFICANCE_LEVEL
+                    t_crit = _t_critical(df_v, alpha)
+                    if t_crit is not None:
+                        contrast_mag = abs(float(baseline_mean))
+                        equivalence_margin_needed = (
+                            contrast_mag + t_crit * se_v
+                        )
+                        entry["equivalence_margin_needed"] = (
+                            equivalence_margin_needed
+                        )
+                        margin_rel = 0.01  # default 1%
+                        margin_abs = margin_rel * bl_abs
+                        if contrast_mag > margin_abs:
+                            entry["equivalence_blocker"] = (
+                                "effect_exceeds_margin"
+                            )
+                        else:
+                            sd_observed = _observed_seed_sd(
+                                entry,
+                                se_v,
+                            )
+                            if sd_observed is not None and effect_value != 0.0:
+                                design = (
+                                    "welch"
+                                    if contrast.get("test") == "welch_t"
+                                    else "paired"
+                                )
+                                seeds_needed = (
+                                    _seeds_to_detect(
+                                        abs(float(baseline_mean)),
+                                        sd_observed,
+                                        design=design,
+                                    )
+                                )
+                                if seeds_needed is not None:
+                                    delta_seeds = (
+                                        seeds_needed
+                                        - int(contrast.get("n_pairs", 0))
+                                    )
+                                    if delta_seeds > 0:
+                                        entry[
+                                            "equivalence_blocker"
+                                        ] = f"need_{delta_seeds}_more_seeds"
+                                    else:
+                                        entry[
+                                            "equivalence_blocker"
+                                        ] = None
+                                else:
+                                    entry[
+                                        "equivalence_blocker"
+                                    ] = "cannot_compute_seeds"
+                            else:
+                                entry[
+                                    "equivalence_blocker"
+                                ] = None
+                    else:
+                        entry[
+                            "equivalence_margin_needed"
+                        ] = None
+                        entry["equivalence_blocker"] = None
+            except (TypeError, ValueError, OverflowError):
+                entry["equivalence_margin_needed"] = None
+                entry["equivalence_blocker"] = None
+        else:
+            entry["equivalence_margin_needed"] = None
+            entry["equivalence_blocker"] = None
+        entries.append(entry)
 
     verdict_counts: Dict[str, int] = {}
     for entry in entries:
@@ -110,7 +190,15 @@ def _fragility_summary(
                     )
                     else "显著性消失"
                 )
-                + f"，alpha={float(entry['alpha']):.3f}）"
+                + f"，alpha={float(entry['alpha']):.3f}"
+                + (
+                    f"，MDE={float(entry.get('equivalence_margin_needed', 0)):.4f}"
+                    if entry.get("equivalence_margin_needed") is not None
+                    else ""
+                )
+                + f"，等需种子≈{entry.get('equivalence_blocker', 'N/A')}）："
+                "少量种子删除即丧失显著性，表明结论高度依赖少数运行；"
+                "若效应已超出等价界，则需要更多数据而非仅仅更多种子。"
                 for entry in fragile
             )
         )
@@ -121,7 +209,15 @@ def _fragility_summary(
             "读成稳健结论，也不能当作「删除后仍显著」："
             + "; ".join(
                 f"{entry['baseline']}→{entry['variant']}"
-                f"（n={entry.get('n')}）"
+                f"（n={entry.get('n')}"
+                + (
+                    f", MDE≈{entry.get('equivalence_margin_needed', '?')}"
+                    if entry.get("equivalence_margin_needed") is not None
+                    else ""
+                )
+                + "）："
+                "剩余种子不足以进行脆弱性判定；"
+                "建议增加种子数后重新评估脆弱性。"
                 for entry in not_evaluable
             )
         )
@@ -133,7 +229,15 @@ def _fragility_summary(
             + "; ".join(
                 f"{entry['baseline']}→{entry['variant']}"
                 f"（正/负={entry['n_positive']}/"
-                f"{entry['n_negative']}）"
+                f"{entry['n_negative']}"
+                + (
+                    f"，MDE≈{entry.get('equivalence_margin_needed', '?')}"
+                    if entry.get("equivalence_margin_needed") is not None
+                    else ""
+                )
+                + ")："
+                "效应方向在种子间不一致，结论不稳健；"
+                "建议增加种子数或检查种子异常来源。"
                 for entry in direction_mixed
             )
         )
