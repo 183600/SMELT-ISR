@@ -1,0 +1,300 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://smelt-isr.dev/schemas/preregistration.v1.json",
+  "title": "SMELT-ISR 预注册协议 (preregistration.v1)",
+  "description": "训练前独立固定、事后只能核对不能改写的确证实验协议。与 exp/part_033_preregistration_core.py、exp/part_034_preregistration_schema.py 的字段定义保持一致。未在此 schema 中表达的跨字段约束（如 val_fraction + test_fraction < 1、comparisons 无重复对、等价界 <= min_effect）由 Python 入口 preregistration_schema_error 逐项核对。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "study_id",
+    "frozen_commit",
+    "primary_metric",
+    "common_step",
+    "min_effect",
+    "direction",
+    "baseline_mode",
+    "comparisons",
+    "seeds",
+    "budget_match",
+    "data"
+  ],
+  "properties": {
+    "study_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\n\\r]*$",
+      "description": "研究唯一标识，非空单行字符串。"
+    },
+    "frozen_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{7,64}$",
+      "description": "冻结的 git commit（7~64 位十六进制）。确证实验必须在该提交的代码上运行。"
+    },
+    "primary_metric": {
+      "type": "string",
+      "minLength": 1,
+      "description": "预注册的主判定指标。必须是评估管线计算的指标之一（如 val_loss、val_loss_at_common_step、val_macro_f1、routing_jaccard_branch 等）。"
+    },
+    "common_step": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "训练前固定的共同比较步数。训练结束前必须能取到该步的指标。"
+    },
+    "min_effect": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1,
+      "description": "最小有意义效应，相对基线均值的比例，必须是 (0, 1] 内的有限正数。"
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["decrease", "increase"],
+      "description": "主指标预期改善方向：decrease 表示越小越好（如 val_loss），increase 表示越大越好（如 val_macro_f1）。"
+    },
+    "baseline_mode": {
+      "type": "string",
+      "enum": [
+        "base", "smelt", "local_base", "local_base_k2",
+        "A", "B", "B_early", "dense", "ngram"
+      ],
+      "description": "预注册的对照基线模式，必须出现在 comparisons 的至少一个臂中。"
+    },
+    "comparisons": {
+      "type": "array",
+      "minItems": 1,
+      "description": "声明的两两对比列表，每项为 [arm_a, arm_b]。两臂必须不同、都是已知模式，且不可重复。",
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": {
+          "type": "string",
+          "enum": [
+            "base", "smelt", "local_base", "local_base_k2",
+            "A", "B", "B_early", "dense", "ngram"
+          ]
+        },
+        "uniqueItems": true
+      }
+    },
+    "seeds": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "description": "独立随机种子集合，至少 3 个，取值 [0, 4294967295]，不可重复。",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 4294967295
+      }
+    },
+    "budget_match": {
+      "type": ["string", "null"],
+      "enum": [
+        null, "base", "smelt", "local_base", "local_base_k2",
+        "A", "B", "B_early", "dense"
+      ],
+      "description": "完整计算图预算基准模式，或 null。延迟合并与 smelt 的对照必须给出非 null 的 budget_match。"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "split_policy", "val_fraction", "test_fraction"],
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "训练数据文件的 SHA-256 指纹。"
+        },
+        "split_policy": {
+          "type": "string",
+          "enum": ["contiguous", "chronological"],
+          "description": "切分口径：contiguous=按文件顺序连续前缀切分（不等于时间切分）；chronological=按时间戳切分，必须提供 time_order_manifest。"
+        },
+        "val_fraction": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1,
+          "description": "验证集占比，必须落在 (0, 1)。验证集用于选型/早停，不能为空。"
+        },
+        "test_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1,
+          "description": "测试集占比，必须落在 [0, 1)。测试集全程尘封，默认不参与清洗。"
+        },
+        "group_separator": {
+          "type": "string",
+          "description": "群组分隔符（如 '\\n\\n' 或 '<|doc|>'），支持 \\n、\\xHH、\\uXXXX 转义。"
+        },
+        "cleaning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "deduplicate_train_groups": { "type": "boolean" },
+            "drop_train_shared_chunks": { "type": "boolean" },
+            "drop_train_near_duplicate_groups": { "type": "boolean" },
+            "drop_train_corrupt_groups": { "type": "boolean" },
+            "drop_train_corrupt_bytes": { "type": "boolean" },
+            "drop_train_degenerate_groups": { "type": "boolean" },
+            "drop_train_degenerate_runs": { "type": "boolean" },
+            "clean_train_against_test": { "type": "boolean" },
+            "allow_eval_content_for_cleaning": { "type": "boolean" },
+            "near_duplicate_threshold": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "description": "近重复 Jaccard 相似度阈值，(0, 1]。"
+            },
+            "near_duplicate_shingle_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "description": "k-shingle 字节长度，1..64。"
+            }
+          },
+          "description": "训练集清洗协议。清洗会改变实际参与训练的字节范围，必须在训练前冻结。clean_train_against_test 与 allow_eval_content_for_cleaning 是同义开关，不能给出相反取值。"
+        },
+        "entity_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "实体清单 SHA-256 指纹（可选）。"
+        },
+        "time_order_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "时间顺序清单 SHA-256 指纹（split_policy=chronological 时推荐提供）。"
+        }
+      },
+      "description": "数据协议：数据指纹、切分口径与比例、清洗开关。split_sha256 等逐 split 指纹由训练入口补填，不在预注册文件中声明。"
+    },
+    "equivalence_margin": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1,
+      "description": "TOST 等价界，相对基线均值，(0, 1]。必须 <= min_effect，否则存在同时被判「有意义」与「可忽略」的效应区间。"
+    },
+    "steps": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "训练总步数，必须 >= common_step。"
+    },
+    "frozen_script_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "description": "entry 脚本 experiment.py 的 SHA-256 指纹。"
+    },
+    "frozen_source_tree_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "description": "完整源码树（experiment.py + exp/ + selfcheck/）的 SHA-256 指纹。"
+    },
+    "power": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expected_seed_sd_relative": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "预期种子间标准差，相对基线均值。"
+        },
+        "target_power": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1,
+          "description": "目标统计功效，(0, 1)。"
+        },
+        "alpha": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 0.5,
+          "description": "显著性水平，(0, 0.5)。"
+        },
+        "planned_comparisons": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "预计检验家族规模，必须 >= comparisons 数量。"
+        },
+        "planned_contrasts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["pairwise", "simple", "main", "interaction"]
+          },
+          "description": "计划估计的对比类型。pairwise/simple=1× 方差，main=0.5×，interaction=2×。"
+        },
+        "expected_attrition_rate": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1,
+          "description": "预期因数值失败/数据问题而不可用的运行比例，[0, 1)。"
+        },
+        "pilot_calibration": {
+          "type": "string",
+          "enum": ["point", "upper_confidence_bound"],
+          "description": "试点校准策略：point=点估计，upper_confidence_bound=置信上界。"
+        },
+        "pilot_confidence": {
+          "type": "number",
+          "exclusiveMinimum": 0.5,
+          "exclusiveMaximum": 1,
+          "description": "试点置信度，(0.5, 1)。"
+        },
+        "plan_equivalence": {
+          "type": "boolean",
+          "description": "是否在设计阶段就要求 TOST 等价性功效达标。true 时必须顶层声明 equivalence_margin。"
+        },
+        "underpowered_acknowledged": {
+          "type": "boolean",
+          "description": "是否显式承认功效不足。true 时必须提供 justification。"
+        },
+        "justification": {
+          "type": "string",
+          "description": "功效不足时的理由说明。underpowered_acknowledged=true 时必须非空。"
+        }
+      },
+      "description": "先验功效分析：声明预期种子间波动与最小有意义效应，按家族校正后的 alpha 计算所需种子数。种子数不足时默认拒绝启动。"
+    },
+    "run_order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "seed"],
+      "properties": {
+        "scheme": {
+          "type": "string",
+          "enum": ["grouped", "blocked", "randomized", "counterbalanced", "williams"],
+          "description": "套件执行顺序设计：grouped=按臂分组（历史行为）；blocked=按种子成区组；randomized=区组内随机化臂顺序（默认）；counterbalanced=循环拉丁方位置平衡；williams=同时平衡位置与一阶 carryover。"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "随机化顺序的可复现种子。"
+        }
+      },
+      "description": "运行顺序设计：把「哪个臂先跑」从便利顺序变成预先声明的随机化完整区组，避免机器热漂移/负载漂移与处理效应混杂。"
+    },
+    "compute_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_total_training_hours"],
+      "properties": {
+        "max_total_training_hours": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "训练墙钟上限（小时）。设计计划会用试点实测步耗时外推总训练墙钟，超出声明上限且未显式豁免时拒绝启动。"
+        }
+      },
+      "description": "训练墙钟预算，训练前声明。"
+    },
+    "notes": {
+      "type": "string",
+      "description": "自由文本备注。"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "结构化元数据（键值对）。"
+    }
+  }
+}

@@ -17,6 +17,7 @@ from _core_NearDuplicateDataTests import NearDuplicateDataTests
 from _core_DataPlanTests import DataPlanTests
 from _core_ProcessTests import ProcessTests
 from _core_PreregistrationTests import PreregistrationTests
+from _core_SchemaTests import SchemaStructureTests, ExampleConsistencyTests
 from _core_ArtifactManifestTests import ArtifactManifestTests
 from _core_EnvironmentSnapshotTests import EnvironmentSnapshotTests
 from _core_EdgeCaseRegressionTests_00 import EdgeCaseRegressionTests
@@ -44,6 +45,8 @@ __all__ = [
     "DataPlanTests",
     "ProcessTests",
     "PreregistrationTests",
+    "SchemaStructureTests",
+    "ExampleConsistencyTests",
     "ArtifactManifestTests",
     "EnvironmentSnapshotTests",
     "EdgeCaseRegressionTests",

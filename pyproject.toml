@@ -20,3 +20,74 @@ py-modules = ["experiment"]
 
 [tool.setuptools.package-data]
 exp = ["mainflow/*.py", "analysisflow/*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["exp", "selfcheck", "tests"]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "PGH",  # pygrep-hooks
+    "RUF",  # ruff-specific
+    "PLR",  # pylint refactor
+    "RET",  # return statements
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "PTH",  # pathlib
+    "TRY",  # tryceratops
+    "DTZ",  # datetime timezone
+    "G",    # logging
+    "LOG",  # logging
+    "PERF", # perf
+    "NPY",  # numpy
+    "PLC",  # pylint convention
+    "PLE",  # pylint error
+    "PLW",  # pylint warning
+]
+ignore = [
+    "E501",  # line too long (handled by formatter / readability)
+    "B008",  # function calls in default arguments (intentional in CLI defaults)
+    "UP037", # quotes in __all__ (dynamic __all__ used)
+    "RET504",# unnecessary assignment before return
+]
+unfixable = [
+    "B008",
+    "UP037",
+    "RET504",
+]
+
+[tool.ruff.isort]
+known-first-party = ["exp", "selfcheck", "experiment"]
+force-sort-within-sections = true
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+disallow_any_generics = false
+ignore_missing_imports = true
+follow_imports = "silent"
+namespace_packages = false
+plugins = []
+exclude = [
+    "node_modules",
+    "__pycache__",
+    "build",
+    "dist",
+    ".eggs",
+]
+
+[tool.mypy.overrides]
+module = [
+    "exp.part_*",
+    "exp.mainflow.*",
+    "exp.analysisflow.*",
+]
+disallow_untyped_defs = false

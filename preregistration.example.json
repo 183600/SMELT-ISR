@@ -1,0 +1,50 @@
+{
+  "$schema": "./schemas/preregistration.v1.json",
+  "study_id": "smelt-isr-rq1-delayed-merge-2026",
+  "frozen_commit": "0000000000000000000000000000000000000000000000000000000000000000",
+  "primary_metric": "val_loss_at_common_step",
+  "common_step": 2000,
+  "min_effect": 0.01,
+  "direction": "decrease",
+  "baseline_mode": "smelt",
+  "comparisons": [
+    ["smelt", "B"],
+    ["smelt", "A"],
+    ["smelt", "local_base"]
+  ],
+  "seeds": [42, 43, 44, 45, 46, 47],
+  "budget_match": "smelt",
+  "data": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "split_policy": "contiguous",
+    "val_fraction": 0.05,
+    "test_fraction": 0.05
+  },
+  "equivalence_margin": 0.01,
+  "steps": 2000,
+  "power": {
+    "expected_seed_sd_relative": 0.005,
+    "target_power": 0.8,
+    "alpha": 0.05,
+    "planned_comparisons": 3,
+    "planned_contrasts": ["pairwise"],
+    "expected_attrition_rate": 0.1,
+    "pilot_calibration": "point",
+    "plan_equivalence": false,
+    "underpowered_acknowledged": false
+  },
+  "run_order": {
+    "scheme": "randomized",
+    "seed": 1234
+  },
+  "compute_budget": {
+    "max_total_training_hours": 24
+  },
+  "notes": "RQ1: 延迟合并 (A/B) 是否显著优于原始 SMELT。等计算量口径由 --budget-match smelt 核对；主指标 val_loss_at_common_step 避免检查点选型偏差。",
+  "metadata": {
+    "rq": "RQ1",
+    "hypothesis": "延迟合并降低验证损失",
+    "author": "researcher",
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}
