@@ -107,7 +107,7 @@ def _fragility_summary(
                                 entry,
                                 se_v,
                             )
-                            if sd_observed is not None and effect_value != 0.0:
+                            if sd_observed is not None and bl_abs != 0.0:
                                 design = (
                                     "welch"
                                     if contrast.get("test") == "welch_t"
