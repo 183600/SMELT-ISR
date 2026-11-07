@@ -484,7 +484,7 @@ def factorial_effects(
                                     effect_record,
                                     se_v,
                                 )
-                                if sd_observed is not None and effect_value != 0.0:
+                                if sd_observed is not None and baseline_abs != 0.0:
                                     design = (
                                         "welch"
                                         if effect_record.get(

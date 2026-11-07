@@ -834,7 +834,7 @@ def _attach_power_equivalence(
             contrast["power_at_effect"] = power
 
         sd_observed = _observed_seed_sd(contrast, se_value)
-        if sd_observed is not None and delta_value != 0.0:
+        if sd_observed is not None and baseline_abs != 0.0:
             design = (
                 "welch"
                 if contrast.get("test") == "welch_t"
