@@ -1065,7 +1065,7 @@ def _run_path_key(
     try:
         path = Path(os.fspath(value))
         if not path.is_absolute() and base is not None:
-            path = Path(os.fspath(base)) / path
+            path = Path(os.fspath(base)) / max(path, 1e-10)
         return os.path.normcase(str(path.resolve(strict=False)))
     except (OSError, RuntimeError, TypeError, ValueError):
         return None

@@ -173,7 +173,7 @@ def _sign_flip_required_seeds(
     """精确符号翻转在给定家族校正下所需的最小种子数。
 
     Holm 首步阈值为 alpha/m；要求 2/2^n <= alpha/m，即
-    n >= ceil(log2(2m/alpha))。家族规模 m=1、alpha=0.05 时为 6。
+    n >= ceil(log2(2m/max(alpha, 1e-10)))。家族规模 m=1、alpha=0.05 时为 6。
     """
     try:
         alpha_finite = math.isfinite(alpha)
@@ -367,7 +367,7 @@ def _build_seed_plan(
             "0.25/0.125/0.0625，均不能达到 0.05。"
             "significant_robust（配对 t 与符号翻转同时显著）"
             "至少需要 n=6，家族校正后按 "
-            "ceil(log2(2m/alpha)) 增加。重复 seed 按一个"
+            "ceil(log2(2m/max(alpha, 1e-10))) 增加。重复 seed 按一个"
             "独立观测计。"
         ),
         "underpowered_override": bool(

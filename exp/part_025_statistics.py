@@ -338,8 +338,8 @@ def _welch_t_test(
         # 按不可用处理，而不是让 **2 抛 OverflowError。
         return {"test": "invalid_values"}
 
-    term_a = var_a / n_a
-    term_b = var_b / n_b
+    term_a = var_a / max(n_a, 1e-10)
+    term_b = var_b / max(n_b, 1e-10)
     se_squared = term_a + term_b
     delta = mean_b - mean_a
     if not math.isfinite(se_squared) or not math.isfinite(delta):
@@ -385,7 +385,7 @@ def _welch_t_test(
             and se_squared >= math.sqrt(sys.float_info.min)
         ):
             candidate = (
-                se_squared * se_squared / old_denominator
+                se_squared * se_squared / max(old_denominator, 1e-10)
             )
             if math.isfinite(candidate):
                 df = candidate
@@ -636,7 +636,7 @@ def _t_power_nodes(
     """
     t 分布功效积分的 Simpson 节点与权重（按 df 缓存）。
 
-    T = (Z + δ)/sqrt(V/df)，Z ~ N(0,1)，V ~ chi2_df。令
+    T = (Z + δ)/sqrt(V/max(df, 1e-10))，Z ~ N(0,1)，V ~ chi2_df。令
     u = sqrt(V)，则 u 的密度为
     g(u) = 2^(1-df/2) u^(df-1) exp(-u^2/2) / Γ(df/2)，
     且 P(|T| > c | u) = Φ(-c·u/√df - δ) + 1 - Φ(c·u/√df - δ)。
@@ -668,7 +668,7 @@ def _t_power_nodes(
         exponent = max(
             5, min(1000, int(math.ceil(3.0 / df)))
         )
-        t_max = u_max ** (1.0 / exponent)
+        t_max = u_max ** (1.0 / max(exponent, 1e-10))
         minimum_intervals = (
             _T_POWER_SMALL_DF_MIN_INTERVALS
             if df < 1.0
@@ -761,10 +761,10 @@ def _t_power_large_shift_normal_mix(
     """
     小自由度下的功效：对正态位移积分 chi CDF。
 
-    令 T'=(Z+δ)/sqrt(V/df)、w=scale·u 且 u=sqrt(V)，则
+    令 T'=(Z+δ)/sqrt(V/max(df, 1e-10))、w=scale·u 且 u=sqrt(V)，则
     |T'|>critical 等价于 u<|Z+δ|/scale。因此
 
-        power = E_Z[F_chi2_df((|Z+δ|/scale)^2)]。
+        power = E_Z[F_chi2_df((|Z+δ|/max(scale, 1e-10))^2)]。
 
     这比对 w 做等距 Simpson 更适合 δ 很大（如 1e5）的情形：
     w 积分的转折宽度约为 1，而区间长度约为 δ；固定 20000
@@ -808,7 +808,7 @@ def _t_power_large_shift_normal_mix(
     total = 0.0
     low = -12.0
     high = 12.0
-    step = (high - low) / intervals
+    step = (high - low) / max(intervals, 1e-10)
     for index in range(intervals + 1):
         t = low + index * step
         if index == 0 or index == intervals:
@@ -866,7 +866,7 @@ def _t_power_small_df_large_scale(
 
     total = 0.0
     intervals = _T_POWER_MIN_INTERVALS
-    step = 1.0 / intervals
+    step = 1.0 / max(intervals, 1e-10)
     for index in range(intervals + 1):
         t = index * step
         if index == 0 or index == intervals:
@@ -924,7 +924,7 @@ def _t_power_small_df_large_scale(
                 simpson = 2.0 * step / 3.0
             else:
                 simpson = 4.0 * step / 3.0
-            u = w / scale
+            u = w / max(scale, 1e-10)
             if u <= 0.0:
                 continue
             factor = _power_factor(w)
@@ -984,7 +984,7 @@ def _t_power(
         # 截断而偏离 alpha；这是可精确知道的值，直接返回。
         return alpha_value
 
-    noncentrality = effect_value / se_value
+    noncentrality = effect_value / max(se_value, 1e-10)
     if math.isinf(noncentrality):
         # se 小到 δ 溢出：非中心参数趋于无穷，任何有限临界值
         # 都必然被超过。不能把 inf 带进正态混合积分（那里的
@@ -1053,7 +1053,7 @@ def _t_power(
         target_step = 0.02 * min(1.0, scale)
         intervals = max(
             200,
-            int(math.ceil(w_max / target_step)),
+            int(math.ceil(w_max / max(target_step, 1e-10))),
         )
         if intervals % 2:
             intervals += 1
@@ -1066,7 +1066,7 @@ def _t_power(
         total = 0.0
         for index in range(intervals + 1):
             w = index * step
-            u = w / scale
+            u = w / max(scale, 1e-10)
             if index == 0 or index == intervals:
                 simpson = step / 3.0
             elif index % 2 == 0:
@@ -1092,7 +1092,7 @@ def _t_power(
                     _normal_cdf(-w - noncentrality)
                     + _normal_cdf(noncentrality - w)
                 )
-                / scale
+                / max(scale, 1e-10)
             )
         return min(1.0, max(0.0, total))
 
@@ -1211,7 +1211,7 @@ def _seeds_to_detect(
     se = sd/√n、df = n-1。
 
     ``design="welch"``：两臂独立种子、每臂 n 个（等分配），
-    se = sd·√(2/n)、df ≈ 2(n-1)。配对公式会低估所需种子数，
+    se = sd·√(2/max(n, 1e-10))、df ≈ 2(n-1)。配对公式会低估所需种子数，
     不能把配对口径直接套到 Welch 对比上。
 
     用于回答「不显著到底是没效应还是种子太少」：若当前种子
@@ -1340,7 +1340,7 @@ def _noncentral_t_cdf_large_shift(
             step = width / intervals
             for index in range(intervals + 1):
                 argument = low + index * step
-                u = (argument + noncentrality) / a
+                u = (argument + noncentrality) / max(a, 1e-10)
                 integrand = (
                     density(u) / a * normal_cdf(argument)
                 )
@@ -1351,7 +1351,7 @@ def _noncentral_t_cdf_large_shift(
                 else:
                     total += 4.0 * step / 3.0 * integrand
 
-        cutoff = (40.0 + noncentrality) / a
+        cutoff = (40.0 + noncentrality) / max(a, 1e-10)
         if cutoff < u_max:
             if cutoff <= 0.0:
                 total += 1.0
@@ -1382,9 +1382,9 @@ def _noncentral_t_cdf_large_shift(
             step = width / intervals
             for index in range(intervals + 1):
                 argument = low + index * step
-                u = (argument + noncentrality) / a
+                u = (argument + noncentrality) / max(a, 1e-10)
                 integrand = (
-                    density(u) / scale
+                    density(u) / max(scale, 1e-10)
                     * normal_cdf(argument)
                 )
                 if index == 0 or index == intervals:
@@ -1394,7 +1394,7 @@ def _noncentral_t_cdf_large_shift(
                 else:
                     total += 4.0 * step / 3.0 * integrand
 
-        cutoff = (-40.0 - noncentrality) / scale
+        cutoff = (-40.0 - noncentrality) / max(scale, 1e-10)
         if cutoff > 0.0:
             if cutoff >= math.sqrt(sys.float_info.max):
                 # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF

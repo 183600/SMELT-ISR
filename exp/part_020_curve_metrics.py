@@ -619,7 +619,7 @@ def _curve_trapezoid_mean(
             return None
         # v1/2 + v2/2 避免先相加再除二造成的中间溢出。
         average = values[index - 1] / 2.0 + values[index] / 2.0
-        fraction = width / window
+        fraction = width / max(window, 1e-10)
         term = fraction * average
         if not math.isfinite(term):
             return None

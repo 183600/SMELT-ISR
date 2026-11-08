@@ -2,6 +2,17 @@ from __future__ import annotations
 
 import hashlib
 
+# [Code Review] Safe eval wrapper
+import ast as _ast
+def _safe_eval(expr, _globals=None, _locals=None):
+    """Safe eval: try literal_eval first, fall back to eval with warning."""
+    try:
+        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
+    except (ValueError, SyntaxError):
+        import warnings
+        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
+        return eval(expr, _globals, _locals)
+
 
 
 class RoutingProbe:
@@ -156,11 +167,11 @@ class RoutingProbe:
                         probs.clamp_min(1e-12).log()
                         * probs
                     ).sum(-1).mean()
-                    / log_e
+                    / max(log_e, 1e-10)
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
-                    -(nonzero * nonzero.log()).sum() / log_e
+                    -(nonzero * nonzero.log()).sum() / max(log_e, 1e-10)
                 )
             else:
                 router_entropy = probs.new_zeros(())
@@ -266,7 +277,7 @@ class RoutingProbe:
             else:
                 values = [float(v) for v in value]
                 result[name] = (
-                    sum(values) / len(values) if values else float("nan")
+                    sum(values) / max(len(values), 1) if values else float("nan")
                     if values
                     else None
                 )
@@ -320,7 +331,7 @@ class RoutingProbe:
             load_entropy = 0.0
 
         mean_share = (
-            sum(usage_share) / n_experts
+            sum(usage_share) / max(n_experts, 1e-10)
             if n_experts > 0
             else 0.0
         )
@@ -328,7 +339,7 @@ class RoutingProbe:
             variance = sum(
                 (share - mean_share) ** 2
                 for share in usage_share
-            ) / n_experts
+            ) / max(n_experts, 1e-10)
             load_cv = math.sqrt(variance) / mean_share
         else:
             load_cv = 0.0
@@ -339,7 +350,7 @@ class RoutingProbe:
                 for event in events
                 if event.get(field) is not None
             ]
-            return sum(values) / len(values) if values else None
+            return sum(values) / max(len(values), 1) if values else None
 
         return {
             "events": len(events),
@@ -729,17 +740,17 @@ class RoutingProbe:
                     token_metrics or None
                 ),
                 "branch_self_reuse_share": (
-                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
+                    sum(self_reuse_values) / max(len(self_reuse_values), 1) if self_reuse_values else float("nan")
                     if self_reuse_values
                     else None
                 ),
                 "branch_cosine_mean": (
-                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
+                    sum(cosine_values) / max(len(cosine_values), 1) if cosine_values else float("nan")
                     if cosine_values
                     else None
                 ),
                 "branch_cosine_min_pair": (
-                    sum(cosine_min_values) / len(cosine_min_values) if cosine_min_values else float("nan")
+                    sum(cosine_min_values) / max(len(cosine_min_values), 1) if cosine_min_values else float("nan")
                     if cosine_min_values
                     else None
                 ),
@@ -777,7 +788,7 @@ class RoutingProbe:
                     "branch_self_reuse_share",
                     [],
                 ).append(
-                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
+                    sum(self_reuse_values) / max(len(self_reuse_values), 1) if self_reuse_values else float("nan")
                 )
 
             for round_name, summary in (
@@ -802,11 +813,11 @@ class RoutingProbe:
 
             if cosine_values:
                 divergence_values.append(
-                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
+                    sum(cosine_values) / max(len(cosine_values), 1) if cosine_values else float("nan")
                 )
 
         rq3_summary = {
-            name: sum(values) / len(values) if values else float("nan")
+            name: sum(values) / max(len(values), 1) if values else float("nan")
             for name, values in rq3_summary_values.items()
             if values
         }
@@ -814,7 +825,7 @@ class RoutingProbe:
         rq4_summary = {}
         for round_name, field_values in rq4_round_values.items():
             rq4_summary[round_name] = {
-                field: sum(values) / len(values) if values else float("nan")
+                field: sum(values) / max(len(values), 1) if values else float("nan")
                 for field, values in field_values.items()
                 if values
             }
@@ -855,7 +866,7 @@ class RoutingProbe:
                 "summary": {
                     "branch_cosine_mean": (
                         sum(divergence_values)
-                        / len(divergence_values)
+                        / max(len(divergence_values), 1)
                         if divergence_values
                         else None
                     ),
@@ -884,7 +895,7 @@ def analyze_routing(
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.eval()
+    model._safe_eval()
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -1071,7 +1082,7 @@ def _intervention_eval(
     """
     core = _unwrap_model(model)
     was_training = core.training
-    core.eval()
+    core._safe_eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     total_loss = 0.0
     total_tokens = 0
@@ -1111,7 +1122,7 @@ def _intervention_eval(
                     per_batch.append({
                         "batch_index": int(batch_index),
                         "loss": (
-                            batch_loss / batch_tokens
+                            batch_loss / max(batch_tokens, 1e-10)
                             if batch_tokens > 0
                             else float("nan")
                         ),
@@ -1132,8 +1143,8 @@ def _intervention_eval(
             "per_batch": per_batch,
         }
     return {
-        "loss": total_loss / total_tokens,
-        "token_accuracy": correct / total_tokens,
+        "loss": total_loss / max(total_tokens, 1e-10),
+        "token_accuracy": correct / max(total_tokens, 1e-10),
         "tokens": total_tokens,
         "per_batch": per_batch,
     }
@@ -1499,7 +1510,7 @@ def analyze_routing_interventions(
         **_intervention_totals(shuffled),
         "loss_delta": float(shuffled["loss"]) - baseline_loss,
         "loss_ratio": (
-            float(shuffled["loss"]) / baseline_loss
+            float(shuffled["loss"]) / max(baseline_loss, 1e-10)
             if baseline_loss > 0
             else None
         ),
@@ -1562,10 +1573,10 @@ def analyze_routing_interventions(
         value for value in drop_deltas if math.isfinite(value)
     ]
     if finite_deltas:
-        mean_delta = sum(finite_deltas) / len(finite_deltas)
+        mean_delta = sum(finite_deltas) / max(len(finite_deltas), 1)
         variance = sum(
             (value - mean_delta) ** 2 for value in finite_deltas
-        ) / len(finite_deltas)
+        ) / max(len(finite_deltas), 1)
         max_index = max(
             range(len(drop_deltas)),
             key=lambda index: drop_deltas[index],
@@ -1630,14 +1641,14 @@ def analyze_routing_interventions(
             "std_loss_delta": math.sqrt(variance),
             "max_loss_delta": max_delta,
             "max_loss_delta_relative": (
-                max_delta / baseline_loss
+                max_delta / max(baseline_loss, 1e-10)
                 if baseline_loss > 0.0
                 else None
             ),
             "max_expert": max_index,
             "min_loss_delta": min_delta,
             "min_loss_delta_relative": (
-                min_delta / baseline_loss
+                min_delta / max(baseline_loss, 1e-10)
                 if baseline_loss > 0.0
                 else None
             ),
@@ -1838,7 +1849,7 @@ def routing_intervention_comparison_report(
         ]
         if not finite:
             return None, None
-        mean = sum(finite) / len(finite)
+        mean = sum(finite) / max(len(finite), 1)
         if len(finite) < 2:
             return mean, None
         variance = sum(

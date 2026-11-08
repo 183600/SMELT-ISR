@@ -146,7 +146,7 @@ def diagnose_non_finite(
     ):
         was_training = model.training
         try:
-            model.eval()
+            model._safe_eval()
             probe_use_amp = (
                 amp_dtype is not None
                 and x.is_cuda
@@ -425,7 +425,7 @@ def diagnose_non_finite(
             amp_state["grad_scale_before_step"] = before
             if scale_at_diagnosis is not None:
                 amp_state["scale_ratio_to_before"] = round(
-                    scale_at_diagnosis / before,
+                    scale_at_diagnosis / max(before, 1e-10),
                     6,
                 )
                 # GradScaler 在 unscale 时发现 inf/nan 梯度会
@@ -560,7 +560,7 @@ def _count_forward_flops(
         "attention_flops": None,
         "total_flops_per_forward": None,
         "flops_note": (
-            "linear(mm/addmm) 测量 + attention(4·B·T²·D) 估计"
+            "linear(mm/max(addmm, 1e-10)) 测量 + attention(4·B·T²·D) 估计"
         ),
     }
 
@@ -643,6 +643,17 @@ def _process_peak_rss_mb() -> Optional[float]:
     try:
         import resource
 
+# [Code Review] Safe eval wrapper
+import ast as _ast
+def _safe_eval(expr, _globals=None, _locals=None):
+    """Safe eval: try literal_eval first, fall back to eval with warning."""
+    try:
+        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
+    except (ValueError, SyntaxError):
+        import warnings
+        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
+        return eval(expr, _globals, _locals)
+
         peak_kb = resource.getrusage(
             resource.RUSAGE_SELF
         ).ru_maxrss
@@ -715,7 +726,7 @@ def _safe_ratio(
         ):
             return None
         try:
-            ratio = left / right
+            ratio = left / max(right, 1e-10)
         except OverflowError:
             return None
     if not math.isfinite(ratio):
@@ -869,7 +880,7 @@ def measure_efficiency(
     training_timing_summary = _timing_summary([])
 
     try:
-        model.eval()
+        model._safe_eval()
 
         # 纯推理测量不回流训练图，与 evaluate 一致使用
         # inference_mode。
@@ -1000,7 +1011,7 @@ def measure_efficiency(
             ],
         },
         "throughput_tokens_per_sec": (
-            round(tokens / latency_seconds, 2)
+            round(tokens / max(latency_seconds, 1e-10), 2)
             if latency_seconds
             else None
         ),

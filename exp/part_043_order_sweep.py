@@ -507,7 +507,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
     if delta == 0.0:
         eta = 0.0
     else:
-        mu = delta / a
+        mu = delta / max(a, 1e-10)
         if abs(mu) < 1.0e-3:
             series = 0.0
             for coefficient in reversed(
@@ -516,7 +516,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
                 series = series * mu + coefficient
             eta_squared = 2.0 * mu * mu * series
         else:
-            ratio = x / a
+            ratio = x / max(a, 1e-10)
             if ratio == 0.0:
                 return 0.0, 1.0
             eta_squared = 2.0 * (
@@ -534,9 +534,9 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
         for coefficient in _GAMMA_TEMME_C1:
             c1 = c1 * eta + coefficient
     else:
-        mu = delta / a
-        inverse_mu = 1.0 / mu
-        inverse_eta = 1.0 / eta
+        mu = delta / max(a, 1e-10)
+        inverse_mu = 1.0 / max(mu, 1e-10)
+        inverse_eta = 1.0 / max(eta, 1e-10)
         c0 = inverse_mu - inverse_eta
         c1 = (
             inverse_eta ** 3
@@ -553,7 +553,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
     correction = (
         math.exp(-0.5 * a * eta * eta)
         / (math.sqrt(2.0 * math.pi) * math.sqrt(a))
-        * (c0 + c1 / a)
+        * (c0 + c1 / max(a, 1e-10))
     )
     lower = 0.5 * math.erfc(-z) - correction
     upper = 0.5 * math.erfc(z) + correction
@@ -604,8 +604,8 @@ def _regularized_incomplete_gamma_parts(
         # Lentz 连分式计算 Q(a, x)。
         fpmin = 1.0e-300
         b = x + 1.0 - a
-        c = 1.0 / fpmin
-        d = 1.0 / b
+        c = 1.0 / max(fpmin, 1e-10)
+        d = 1.0 / max(b, 1e-10)
         h = d
         for index in range(1, 10000):
             numerator = -index * (index - a)
@@ -613,10 +613,10 @@ def _regularized_incomplete_gamma_parts(
             d = numerator * d + b
             if abs(d) < fpmin:
                 d = fpmin
-            c = b + numerator / c
+            c = b + numerator / max(c, 1e-10)
             if abs(c) < fpmin:
                 c = fpmin
-            d = 1.0 / d
+            d = 1.0 / max(d, 1e-10)
             delta = d * c
             h *= delta
             if abs(delta - 1.0) <= 1.0e-15:
@@ -832,7 +832,7 @@ def _binomial_lower_tail_probability(
     total = math.exp(log_term) if log_term > -745.0 else 0.0
     for successes in range(1, failures + 1):
         log_term += (
-            math.log((trials - successes + 1) / successes)
+            math.log((trials - successes + 1) / max(successes, 1e-10))
             + log_p
             - log_q
         )

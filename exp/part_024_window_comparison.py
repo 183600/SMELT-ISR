@@ -122,11 +122,11 @@ def paired_window_comparison(
         }
     better_fraction = (
         sum(1 for value in loss_differences if value < 0.0)
-        / n_windows
+        / max(n_windows, 1e-10)
     )
     tie_fraction = (
         sum(1 for value in loss_differences if value == 0.0)
-        / n_windows
+        / max(n_windows, 1e-10)
     )
     bootstrap = _paired_window_bootstrap_ci(
         loss_differences,
@@ -182,7 +182,7 @@ def paired_window_comparison(
         )
     elif accuracy_differences:
         accuracy_mean = (
-            sum(accuracy_differences) / len(accuracy_differences)
+            sum(accuracy_differences) / max(len(accuracy_differences), 1)
         )
         result["accuracy_status"] = "ok"
         result["n_accuracy_windows"] = len(
@@ -194,7 +194,7 @@ def paired_window_comparison(
                 1
                 for value in accuracy_differences
                 if value > 0.0
-            ) / len(accuracy_differences)
+            ) / max(len(accuracy_differences), 1)
         )
     # 默认不把逐窗口差值写进结果（报告体积大）；两层 bootstrap
     # 需要按种子聚集的原始差值，调用方显式要求才返回，并在
@@ -708,7 +708,7 @@ def _window_variance_components(
             mean_window_var_norm / total_mean_var_norm
         )
         share_interaction = (
-            mean_error_var_norm / total_mean_var_norm
+            mean_error_var_norm / max(total_mean_var_norm, 1e-10)
         )
         components["variance_share_seed"] = share_seed
         components["variance_share_window"] = share_window
@@ -751,14 +751,14 @@ def _window_variance_components(
             mean_error_var_norm / same_window_mean_var_norm
         )
         if (
-            mean_seed_var_norm / same_window_mean_var_norm
+            mean_seed_var_norm / max(same_window_mean_var_norm, 1e-10)
             >= 0.8
         ):
             components["dominant_source_same_windows"] = (
                 "training_seed"
             )
         elif (
-            mean_error_var_norm / same_window_mean_var_norm
+            mean_error_var_norm / max(same_window_mean_var_norm, 1e-10)
             >= 0.8
         ):
             components["dominant_source_same_windows"] = (
@@ -1127,7 +1127,7 @@ def _exact_sign_test(
         tail = sum(
             math.comb(n, index)
             for index in range(min(positives, negatives) + 1)
-        ) / denominator
+        ) / max(denominator, 1e-10)
         p_value = min(1.0, 2.0 * tail)
         # math.ldexp 直接给出 2^(1-n)，n 极大时安全地下溢到 0。
         min_attainable = min(1.0, math.ldexp(2.0, -n))

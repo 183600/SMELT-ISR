@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+# [Code Review] Safe eval wrapper
+import ast as _ast
+def _safe_eval(expr, _globals=None, _locals=None):
+    """Safe eval: try literal_eval first, fall back to eval with warning."""
+    try:
+        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
+    except (ValueError, SyntaxError):
+        import warnings
+        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
+        return eval(expr, _globals, _locals)
+
 
 
 # ============================================================
@@ -55,7 +66,7 @@ def evaluate(
 
     ``bootstrap_replicates > 0`` 时额外对固定评估窗口做
     有放回重采样，给出 loss / ppl / macro NLL / token accuracy /
-    macro 与 weighted F1 / macro 与 weighted precision / recall
+    macro 与 weighted F1 / macro 与 weighted precision / max(recall, 1e-10)
     的 95% 置信区间（``{split}_*_ci95_low/high``）。测试集
     只解封一次，点估计本身无法区分「方法差异」与「评估窗口
     抽样噪声」；置信区间是评估集层面的不确定性，与跨随机
@@ -90,7 +101,7 @@ def evaluate(
     不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
-    model.eval()
+    model._safe_eval()
 
     probe_attached = False
     if routing_probe is not None:
@@ -673,7 +684,7 @@ def evaluate(
             auc_total_positions
         )
         metrics[f"{split}_auc_coverage_fraction"] = (
-            auc_tokens / auc_total_positions
+            auc_tokens / max(auc_total_positions, 1e-10)
             if auc_total_positions > 0
             else 0.0
         )
@@ -735,7 +746,7 @@ def compute_reference_baselines(
       判断模型是否真的学到了上下文信息。
 
     返回 uniform / unigram 在指定 split 上的 loss、
-    accuracy、macro/weighted F1、macro/weighted
+    accuracy、macro/weighted F1、macro/max(weighted, 1e-10)
     precision/recall 与多数类参考 accuracy，以及 AUC 类
     指标的常数预测器水平（PR-AUC 随机水平 = 纳入类平均
     prevalence，ROC-AUC = 0.5），随 config.json /
@@ -759,7 +770,7 @@ def compute_reference_baselines(
     ) / (train_total + vocab_size)
     uniform_probs = torch.full(
         (vocab_size,),
-        1.0 / vocab_size,
+        1.0 / max(vocab_size, 1e-10),
         dtype=torch.float64,
     )
 
@@ -1015,7 +1026,7 @@ class NgramBaseline:
             if valid_intervals is None:
                 stride = max(
                     1,
-                    math.ceil(num_windows / count_cap),
+                    math.ceil(num_windows / max(count_cap, 1e-10)),
                 )
 
                 # data.unfold(0, order, 1) 是
@@ -1040,7 +1051,7 @@ class NgramBaseline:
                 total_valid = int(lengths.sum())
                 stride = max(
                     1,
-                    math.ceil(total_valid / count_cap),
+                    math.ceil(total_valid / max(count_cap, 1e-10)),
                 )
                 global_index = torch.arange(
                     0,

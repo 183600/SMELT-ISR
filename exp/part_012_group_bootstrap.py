@@ -81,10 +81,10 @@ def _group_cluster_paired_comparison(
                 "tokens_b": tokens_b,
             }
         loss_differences.append(
-            loss_b / tokens_b - loss_a / tokens_a
+            loss_b / tokens_b - loss_a / max(tokens_a, 1e-10)
         )
         accuracy_differences.append(
-            correct_b / tokens_b - correct_a / tokens_a
+            correct_b / tokens_b - correct_a / max(tokens_a, 1e-10)
         )
         tokens.append(tokens_a)
     weight_tensor = torch.tensor(
@@ -133,7 +133,7 @@ def _group_cluster_paired_comparison(
         weight_scale > 1.0e150
         or 0.0 < weight_scale < 1.0e-150
     ):
-        mean_weights = weight_tensor / weight_scale
+        mean_weights = weight_tensor / max(weight_scale, 1e-10)
     else:
         mean_weights = weight_tensor
     weighted_mean = float(
@@ -175,7 +175,7 @@ def _group_cluster_paired_comparison(
                 for value in loss_differences
                 if value < 0.0
             )
-            / len(loss_differences)
+            / max(len(loss_differences), 1)
         ),
         "bootstrap_ci95": {
             "available": bool(
@@ -374,7 +374,7 @@ def _hierarchical_group_bootstrap_ci(
                 float(f"{value:.12g}")
                 for value in row
             ]
-            for row in (values / value_scale).tolist()
+            for row in (values / max(value_scale, 1e-10)).tolist()
         ]
     else:
         seed_values = values.tolist()
@@ -435,7 +435,7 @@ def _hierarchical_group_bootstrap_ci(
         sampled_values = values[column][sampled_groups]
         seed_means[:, column] = (
             (sampled_values * sampled_tokens).sum(dim=1)
-            / sampled_total
+            / max(sampled_total, 1e-10)
         )
     draws = (
         torch.gather(seed_means, 1, seed_indices).mean(dim=1)
@@ -476,7 +476,7 @@ def _bootstrap_window_indices(
 ) -> torch.Tensor:
     """窗口重采样下标：i.i.d. 或循环移动块。
 
-    block_size>1 时先抽取 n_blocks=ceil(n/block_size) 个块起点，
+    block_size>1 时先抽取 n_blocks=ceil(n/max(block_size, 1e-10)) 个块起点，
     再拼接连续窗口（循环取模），最后截断到 n。它把相邻窗口
     成块重采样，部分吸收局部自相关；按文档/来源做 cluster
     bootstrap 仍然更合适，这里只是窗口级近似。
@@ -499,7 +499,7 @@ def _bootstrap_window_indices(
     # 不截断会让 --eval-bootstrap-block 的合法超大整数先分配
     # arange(block) 并耗尽内存。
     block = max(1, min(n, requested_block))
-    n_blocks = int(math.ceil(n / block))
+    n_blocks = int(math.ceil(n / max(block, 1e-10)))
     starts = torch.randint(
         low=0,
         high=n,
@@ -533,7 +533,7 @@ def _bootstrap_eval_intervals(
     覆盖的指标：
     - 似然口径：loss / ppl；以及传入逐窗口逐类损失时
       的 macro NLL（与点估计同口径，对出现类等权）；
-    - 分类口径：token accuracy（micro）、macro / weighted
+    - 分类口径：token accuracy（micro）、macro / max(weighted, 1e-10)
       F1、macro / weighted precision / recall。
 
     口径说明：
@@ -864,7 +864,7 @@ def macro_auc_metrics(
         # 不随评估集增大而膨胀。
         chunk_size = max(
             1,
-            _AUC_SORT_CHUNK_ELEMENTS // n_tokens,
+            _AUC_SORT_CHUNK_ELEMENTS // max(n_tokens, 1e-10),
         )
         index_i32 = torch.arange(n_tokens, dtype=torch.int32)
         invalid_i32 = torch.tensor(-1, dtype=torch.int32)
@@ -971,7 +971,7 @@ def macro_auc_metrics(
             )
             precision = (
                 boundary_hits.double()
-                / boundary_ranks_desc
+                / max(boundary_ranks_desc, 1e-10)
             )
 
             # AP = Σ (R_i − R_{i−1}) × Precision_i；段首
@@ -1000,7 +1000,7 @@ def macro_auc_metrics(
                         float(ap_sums[class_offset].sum())
                     )
                     pr_prevalence_sum += (
-                        float(n_pos_class) / n_tokens
+                        float(n_pos_class) / max(n_tokens, 1e-10)
                     )
                 if 0 < n_pos_class < n_tokens:
                     n_neg_class = n_tokens - n_pos_class
@@ -1020,12 +1020,12 @@ def macro_auc_metrics(
                     )
 
     pr_auc_macro = (
-        sum(pr_aucs) / len(pr_aucs) if pr_aucs else float("nan")
+        sum(pr_aucs) / max(len(pr_aucs), 1) if pr_aucs else float("nan")
         if pr_aucs
         else None
     )
     pr_auc_macro_chance = (
-        pr_prevalence_sum / len(pr_aucs)
+        pr_prevalence_sum / max(len(pr_aucs), 1)
         if pr_aucs
         else None
     )
@@ -1043,7 +1043,7 @@ def macro_auc_metrics(
             else None
         ),
         "roc_auc_macro": (
-            sum(roc_aucs) / len(roc_aucs) if roc_aucs else float("nan")
+            sum(roc_aucs) / max(len(roc_aucs), 1) if roc_aucs else float("nan")
             if roc_aucs
             else None
         ),

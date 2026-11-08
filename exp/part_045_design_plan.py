@@ -880,8 +880,8 @@ def _spearman_correlation(
         return None
     rank_x = _average_ranks(x)
     rank_y = _average_ranks(y)
-    mean_x = (sum(rank_x) / len(rank_x)) if rank_x else float("nan")
-    mean_y = (sum(rank_y) / len(rank_y)) if rank_y else float("nan")
+    mean_x = (sum(rank_x) / max(len(rank_x), 1)) if rank_x else float("nan")
+    mean_y = (sum(rank_y) / max(len(rank_y), 1)) if rank_y else float("nan")
     covariance = sum(
         (a - mean_x) * (b - mean_y)
         for a, b in zip(rank_x, rank_y)
@@ -1023,7 +1023,7 @@ def run_order_drift_report(
             str(entry["mode"]), []
         ).append(float(entry["value"]))
     means = {
-        mode: sum(values) / len(values) if values else float("nan")
+        mode: sum(values) / max(len(values), 1) if values else float("nan")
         for mode, values in mode_means.items()
     }
     # 保留原始整数序号：Spearman 只需要排序与秩，不需要把
@@ -1039,7 +1039,7 @@ def run_order_drift_report(
     if rho is not None and len(entries) > 2:
         denominator = max(1e-12, 1.0 - rho * rho)
         statistic = rho * math.sqrt(
-            (len(entries) - 2) / denominator
+            (len(entries) - 2) / max(denominator, 1e-10)
         )
         p_value = _two_sided_t_p_value(
             statistic, float(len(entries) - 2)
@@ -1071,7 +1071,7 @@ def run_order_drift_report(
         if mode_rho is not None and len(mode_entries) > 2:
             denominator = max(1e-12, 1.0 - mode_rho * mode_rho)
             statistic = mode_rho * math.sqrt(
-                (len(mode_entries) - 2) / denominator
+                (len(mode_entries) - 2) / max(denominator, 1e-10)
             )
             mode_p = _two_sided_t_p_value(
                 statistic, float(len(mode_entries) - 2)

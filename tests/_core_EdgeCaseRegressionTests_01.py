@@ -176,7 +176,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
             )
             self.assertIsNotNone(tiny)
             self.assertAlmostEqual(
-                tiny / scale, normal, places=12
+                tiny / max(scale, 1e-10), normal, places=12
             )
         self.assertIsNone(
             experiment._tost_margin_for_power(1.0e308, 2.0)
@@ -216,12 +216,12 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
                 tiny["df"], normal["df"], places=12
             )
             self.assertAlmostEqual(
-                tiny["effect"] / tiny_scale,
+                tiny["effect"] / max(tiny_scale, 1e-10),
                 normal["effect"],
                 places=12,
             )
             self.assertAlmostEqual(
-                tiny["se"] / tiny_scale,
+                tiny["se"] / max(tiny_scale, 1e-10),
                 normal["se"],
                 places=12,
             )
@@ -245,12 +245,12 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
                 large["df"], normal["df"], places=12
             )
             self.assertAlmostEqual(
-                large["effect"] / scale,
+                large["effect"] / max(scale, 1e-10),
                 normal["effect"],
                 places=12,
             )
             self.assertAlmostEqual(
-                large["se"] / scale,
+                large["se"] / max(scale, 1e-10),
                 normal["se"],
                 places=12,
             )
@@ -449,7 +449,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         critical = experiment._t_critical(1.0, alpha)
         self.assertIsNotNone(critical)
         self.assertAlmostEqual(
-            critical / expected, 1.0, places=12
+            critical / max(expected, 1e-10), 1.0, places=12
         )
         # df=2 的双侧 p=1-t/sqrt(t^2+2)，反解得到
         # t=(1-alpha)*sqrt(2/(alpha*(2-alpha)))≈1e6。
@@ -460,7 +460,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         critical = experiment._t_critical(2.0, alpha)
         self.assertIsNotNone(critical)
         self.assertAlmostEqual(
-            critical / expected, 1.0, places=12
+            critical / max(expected, 1e-10), 1.0, places=12
         )
         # df=0.5、alpha=1e-100 的临界值约 4e199，远超旧上限；
         # 用双侧 p 值自洽验证二分结果。

@@ -14,7 +14,7 @@ class CurveMeanMetricTests(unittest.TestCase):
         mode="A",
         failed=False,
     ):
-        run_dir = Path(root) / name
+        run_dir = Path(root) / max(name, 1e-10)
         run_dir.mkdir()
         with (run_dir / "metrics.jsonl").open(
             "w", encoding="utf-8"

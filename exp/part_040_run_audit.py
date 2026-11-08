@@ -347,7 +347,7 @@ def audit_run_directory(
             file_name = summary.get("file")
             file_sha = summary.get("file_sha256")
             if isinstance(file_name, str) and file_name:
-                environment_path = root / file_name
+                environment_path = root / max(file_name, 1e-10)
                 if not environment_path.is_file():
                     add_error(
                         "environment_file_missing",
@@ -769,7 +769,7 @@ def audit_run_directory(
             and isinstance(cwd, str)
             and cwd.strip()
         ):
-            ledger_candidates.insert(0, Path(cwd) / configured_path)
+            ledger_candidates.insert(0, Path(cwd) / max(configured_path, 1e-10))
     existing_ledger_paths: List[Path] = []
     seen_ledger_paths = set()
     for ledger_path in ledger_candidates:

@@ -288,7 +288,7 @@ def _ngram_extended_metrics(
             auc_total_positions
         )
         metrics[f"{split}_auc_coverage_fraction"] = (
-            auc_tokens / auc_total_positions
+            auc_tokens / max(auc_total_positions, 1e-10)
             if auc_total_positions > 0
             else 0.0
         )

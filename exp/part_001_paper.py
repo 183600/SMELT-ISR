@@ -42,10 +42,10 @@ def _paper_budget_audit(
     control_flops = int(
         mode_cost_profile(control_cfg)["analytic_flops_per_token"]
     )
-    flops_ratio = flops / base_flops
+    flops_ratio = flops / max(base_flops, 1e-10)
     kv_ratio = counts["kv_dim"] / base_counts["kv_dim"]
     sparsity = 1.0 - (
-        flops / control_flops
+        flops / max(control_flops, 1e-10)
     ) * (control_counts["total"] / counts["total"])
     total_ratio = counts["total"] / (cell.total_params * 1e9)
     active_ratio = counts["active"] / (
@@ -179,7 +179,7 @@ def paper_fidelity_report(
        文档级 segment attention mask。``architecture_faithful``
        与 ``protocol_faithful`` 分别给出结论，``is_full_reproduction``
        仅在两者都成立时为真。
-    2. **budget（预算）**：论文 3.2 节要求 FLOPs / 总参数 / KV
+    2. **budget（预算）**：论文 3.2 节要求 FLOPs / 总参数 / max(KV, 1e-10)
        cache 三者匹配，但附录 A 的参数化来自未公开 family，
        本实现只能报告实测偏差（``budget_audit``），不把偏差
        忽略后声称数值复现。
