@@ -1020,7 +1020,7 @@ def macro_auc_metrics(
                     )
 
     pr_auc_macro = (
-        sum(pr_aucs) / len(pr_aucs)
+        sum(pr_aucs) / len(pr_aucs) if pr_aucs else float("nan")
         if pr_aucs
         else None
     )
@@ -1043,7 +1043,7 @@ def macro_auc_metrics(
             else None
         ),
         "roc_auc_macro": (
-            sum(roc_aucs) / len(roc_aucs)
+            sum(roc_aucs) / len(roc_aucs) if roc_aucs else float("nan")
             if roc_aucs
             else None
         ),

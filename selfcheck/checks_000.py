@@ -538,7 +538,7 @@ def _selfcheck_top_52887_0018():
     with tempfile.NamedTemporaryFile() as chunk_file:
         chunk_file.write(chunk_payload)
         chunk_file.flush()
-        chunk_dataset = ByteDataset(chunk_file.name, seq_len=8, val_fraction=len(chunk_val) / len(chunk_payload), test_fraction=len(chunk_test) / len(chunk_payload))
+        chunk_dataset = ByteDataset(chunk_file.name, seq_len=8, val_fraction=len(chunk_val) / len(chunk_payload) if chunk_payload else 0, test_fraction=len(chunk_test) / len(chunk_payload) if chunk_payload else 0)
         assert chunk_dataset.split_bounds == {'train': (0, len(chunk_train)), 'val': (len(chunk_train), len(chunk_train) + len(chunk_val)), 'test': (len(chunk_train) + len(chunk_val), len(chunk_payload))}
         chunk_audit = audit_data_splits(chunk_dataset, include_test=True, max_windows=1)
     assert chunk_audit['duplicate_windows']['train_val']['shared_signatures'] == 0

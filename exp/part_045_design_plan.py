@@ -1023,7 +1023,7 @@ def run_order_drift_report(
             str(entry["mode"]), []
         ).append(float(entry["value"]))
     means = {
-        mode: sum(values) / len(values)
+        mode: sum(values) / len(values) if values else float("nan")
         for mode, values in mode_means.items()
     }
     # 保留原始整数序号：Spearman 只需要排序与秩，不需要把

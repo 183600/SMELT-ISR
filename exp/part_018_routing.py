@@ -266,7 +266,7 @@ class RoutingProbe:
             else:
                 values = [float(v) for v in value]
                 result[name] = (
-                    sum(values) / len(values)
+                    sum(values) / len(values) if values else float("nan")
                     if values
                     else None
                 )
@@ -729,17 +729,17 @@ class RoutingProbe:
                     token_metrics or None
                 ),
                 "branch_self_reuse_share": (
-                    sum(self_reuse_values) / len(self_reuse_values)
+                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
                     if self_reuse_values
                     else None
                 ),
                 "branch_cosine_mean": (
-                    sum(cosine_values) / len(cosine_values)
+                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
                     if cosine_values
                     else None
                 ),
                 "branch_cosine_min_pair": (
-                    sum(cosine_min_values) / len(cosine_min_values)
+                    sum(cosine_min_values) / len(cosine_min_values) if cosine_min_values else float("nan")
                     if cosine_min_values
                     else None
                 ),
@@ -777,7 +777,7 @@ class RoutingProbe:
                     "branch_self_reuse_share",
                     [],
                 ).append(
-                    sum(self_reuse_values) / len(self_reuse_values)
+                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
                 )
 
             for round_name, summary in (
@@ -802,11 +802,11 @@ class RoutingProbe:
 
             if cosine_values:
                 divergence_values.append(
-                    sum(cosine_values) / len(cosine_values)
+                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
                 )
 
         rq3_summary = {
-            name: sum(values) / len(values)
+            name: sum(values) / len(values) if values else float("nan")
             for name, values in rq3_summary_values.items()
             if values
         }
@@ -814,7 +814,7 @@ class RoutingProbe:
         rq4_summary = {}
         for round_name, field_values in rq4_round_values.items():
             rq4_summary[round_name] = {
-                field: sum(values) / len(values)
+                field: sum(values) / len(values) if values else float("nan")
                 for field, values in field_values.items()
                 if values
             }

@@ -713,7 +713,7 @@ def build_pilot_power_evidence(
         if cell.get("n_attempted")
     ]
     unassigned_attrition = (
-        len(unassigned_unusable) / len(unassigned_rows)
+        len(unassigned_unusable) / len(unassigned_rows) if unassigned_rows else 0.0
         if unassigned_rows
         else None
     )
