@@ -1246,6 +1246,8 @@ def _paired_bootstrap_delta_ci(
         total_weight = sum(
             differences[index][1] for index in indices
         )
+        if total_weight == 0:
+            return 0.0
         return sum(
             differences[index][0] * differences[index][1]
             for index in indices

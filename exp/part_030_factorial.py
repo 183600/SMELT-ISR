@@ -228,9 +228,8 @@ def _current_seed_count(
         and min(baseline_value, variant_value)
         >= _MIN_SEEDS_FOR_STATS
     ):
-        return 2.0 / (
-            1.0 / baseline_value + 1.0 / variant_value
-        )
+        denom = 1.0 / baseline_value + 1.0 / variant_value
+        return 2.0 / denom if denom > 0 else 0.0
     return None
 
 
