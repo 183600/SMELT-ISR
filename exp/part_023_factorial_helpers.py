@@ -586,7 +586,7 @@ def _sample_std(values: List[float]) -> Optional[float]:
     if numeric is None or len(numeric) < 2:
         return None
     try:
-        mean = sum(numeric) / len(numeric)
+        mean = (sum(numeric) / len(numeric)) if numeric else float("nan")
         variance = sum(
             (value - mean) ** 2 for value in numeric
         ) / (len(numeric) - 1)
@@ -610,7 +610,7 @@ def _sample_std(values: List[float]) -> Optional[float]:
     if scale == 0.0:
         return 0.0
     normalized = [value / scale for value in numeric]
-    mean = math.fsum(normalized) / len(normalized)
+    mean = (math.fsum(normalized) / len(normalized)) if normalized else float("nan")
     variance = math.fsum(
         (value - mean) ** 2 for value in normalized
     ) / (len(normalized) - 1)

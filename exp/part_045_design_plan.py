@@ -880,8 +880,8 @@ def _spearman_correlation(
         return None
     rank_x = _average_ranks(x)
     rank_y = _average_ranks(y)
-    mean_x = sum(rank_x) / len(rank_x)
-    mean_y = sum(rank_y) / len(rank_y)
+    mean_x = (sum(rank_x) / len(rank_x)) if rank_x else float("nan")
+    mean_y = (sum(rank_y) / len(rank_y)) if rank_y else float("nan")
     covariance = sum(
         (a - mean_x) * (b - mean_y)
         for a, b in zip(rank_x, rank_y)
