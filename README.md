@@ -5,11 +5,38 @@
 
 > **SMELT with Independent Second Round Routing (Delayed-Merge)**
 
+## 📖 目录
+
+- [项目简介](#-项目简介)
+- [核心特性](#-核心特性)
+- [环境依赖](#-环境依赖)
+- [代码使用说明](#-代码使用说明)
+- [实验设计与研究问题](#-实验设计与研究问题)
+- [对照口径与可复现性](#-对照口径与可复现性)
+- [多随机种子与消融套件示例](#-多随机种子与消融套件示例)
+- [论文口径与复现边界](#-论文口径与复现边界)
+- [机制对照与确证流程](#-机制对照与确证流程)
+- [输出结构](#-输出结构)
+- [注意事项与免责声明](#-注意事项与免责声明)
+
 ## 📖 项目简介
 
-SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Transformer，middle layers Loop Twice）架构，专注于路由机制的改进实验。仓库提供论文未循环 MoE 基线 `base`、原始 SMELT 基线 `smelt`（middle 循环两次，循环区域残差按 1/r 缩放）以及延迟合并方案 A/B。**默认配置为小规模原型**；复现论文附录 A 的网格单元请使用 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`（详见「论文口径与复现边界」），`config.json` 的 `paper_fidelity` 会逐项报告 `architecture_faithful` / `protocol_faithful` / `budget_audit`。
+SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Transformer，middle layers Loop Twice）架构，专注于路由机制的改进实验。
+
+仓库提供以下基线与方案：
+
+- `base`：论文的未循环 MoE 基线（middle 只执行一次）。
+- `smelt`：原始 SMELT 架构（middle 循环两次；`--residual-scaling paper` 时循环区域子层残差按 1/r 缩放）。
+- `A` / `B`：延迟合并方案（局部 / 全局）。
+- 以及配套的机制对照 `local_base`、`local_base_k2`、`B_early` 与稠密基线 `dense`。
+
+**默认配置为小规模原型。** 复现论文附录 A 的网格单元，请使用
+`--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
+（详见「论文口径与复现边界」）；`config.json` 的 `paper_fidelity` 会逐项报告
+`architecture_faithful` / `protocol_faithful` / `budget_audit`。
 
 原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
+
 1. **第一轮路由后不合并**：Top-$k_1$ 专家的输出保留为独立分支，不进行求和或拼接。
 2. **第二轮独立路由**：针对每个第一轮分支的状态，分别独立进行第二轮 Top-$k_2$ 专家路由。
 3. **最终聚合**：只有在完整第二轮结束后，才跨第一轮分支进行结果合并。

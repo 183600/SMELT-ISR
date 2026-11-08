@@ -12,11 +12,6 @@ except ImportError:
     np = None
 
 
-import os
-
-_PYTHONHASHSEED_AT_START = os.environ.get("PYTHONHASHSEED")
-_PYTHONHASHSEED_WARNED = False
-
 def _paper_budget_audit(
     cfg: Config,
     cell: PaperCell,

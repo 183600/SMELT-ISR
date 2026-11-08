@@ -4,9 +4,34 @@
 
 **English** | [中文说明](README.md)
 
+## 📖 Table of contents
+
+- [Introduction](#-introduction)
+- [Key features](#-key-features)
+- [Paper reproduction (arXiv:2609.01343v1)](#-paper-reproduction-arxiv260901343v1)
+- [Mechanism controls and the confirmatory workflow](#-mechanism-controls-and-the-confirmatory-workflow)
+- [Requirements](#-requirements)
+- [Usage](#-usage)
+- [Experimental design and research questions](#-experimental-design-and-research-questions)
+- [Controlled-comparison conventions and reproducibility](#-controlled-comparison-conventions-and-reproducibility)
+- [Multi-seed and ablation suite examples](#-multi-seed-and-ablation-suite-examples)
+- [Output layout](#-output-layout)
+- [Notes and disclaimer](#-notes-and-disclaimer)
+
 ## 📖 Introduction
 
 SMELT-ISR is a routing-improvement experiment built on the [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers loop twice) architecture, focusing on systematic investigation of delayed-merge routing.
+
+The repository provides the following baselines and schemes:
+
+- `base`: the paper's unlooped MoE baseline (middle span executed once).
+- `smelt`: the original SMELT architecture (middle layers loop twice, merged immediately each round; with `--residual-scaling paper`, sublayer residuals inside the looped span are scaled by 1/r).
+- `A` / `B`: delayed-merge schemes (local / global).
+- Plus mechanism controls `local_base`, `local_base_k2`, `B_early` and the dense baseline `dense`.
+
+**Default configuration is a small-scale prototype.** To reproduce a grid cell from the paper's Appendix A, use
+`--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
+(see "Paper reproduction"); `config.json`'s `paper_fidelity` reports `architecture_faithful`, `protocol_faithful` and `budget_audit` item by item.
 
 In the original SMELT, expert outputs of each MoE round are merged immediately while the middle layers loop. This project proposes a **delayed-merge** mechanism:
 
