@@ -256,6 +256,11 @@ def _ngram_extended_metrics(
             auc_tokens += num_new
             auc_processed_positions += int(targets.numel())
 
+    if evaluated_tokens == 0:
+        raise RuntimeError(
+            f"N-gram 评估未产生任何 token（{split} split），"
+            f"请检查数据集是否为空。"
+        )
     loss = total_nll / evaluated_tokens
 
     metrics: Dict[str, object] = {
