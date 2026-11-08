@@ -596,7 +596,7 @@ class GqaTests(unittest.TestCase):
             mode="smelt",
         )
         model = experiment.LanguageModel(cfg)
-        model.eval()
+        model.eval()  # SECURITY: eval() usage - ensure input is trusted
         x = torch.randint(0, 256, (1, 8))
         with torch.no_grad():
             a = model(x)["logits"]
@@ -728,7 +728,7 @@ class DocumentMaskTests(unittest.TestCase):
                 document_separator=[self.SEP],
             )
             torch.manual_seed(0)
-            model = experiment.LanguageModel(cfg).eval()
+            model = experiment.LanguageModel(cfg).eval()  # SECURITY: eval() usage - ensure input is trusted
             x = torch.tensor(
                 [[1, 2, 3, self.SEP, 5, 6, 7, 8]]
             )

@@ -63,10 +63,10 @@ class CoreModelTests(unittest.TestCase):
         ):
             first = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=left)
-            ).eval()
+            ).eval()  # SECURITY: eval() usage - ensure input is trusted
             second = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=right)
-            ).eval()
+            ).eval()  # SECURITY: eval() usage - ensure input is trusted
             second.load_state_dict(first.state_dict())
             with torch.no_grad():
                 a = first(x)["logits"]

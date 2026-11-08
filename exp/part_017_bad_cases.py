@@ -839,7 +839,7 @@ def analyze_bad_cases(
         )
 
     was_training = model.training
-    model.eval()
+    model.eval()  # SECURITY: eval() usage - ensure input is trusted
 
     use_amp = (
         amp_dtype is not None
