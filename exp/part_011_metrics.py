@@ -356,7 +356,7 @@ def _auc_uniform_sample_positions(
     在全部评估位置上等距抽取 capacity 个位置。
 
     ``total_positions <= capacity`` 时返回 None（无需抽样，直接
-    全量收集）。否则用全局位置步长 floor(i·N/max(K, 1e-10)) 抽样，保证前后
+    全量收集）。否则用全局位置步长 floor(i·N/K) 抽样，保证前后
     段窗口都有代表，而不是只保留序列前缀。
     """
     if capacity <= 0 or total_positions <= capacity:
@@ -454,20 +454,20 @@ def confusion_matrix_metrics(
 
     return {
         "token_accuracy": float(
-            true_positive.sum() / max(total, 1e-10)
+            true_positive.sum() / total
         ),
-        "micro_f1": float(true_positive.sum() / max(total, 1e-10)),
+        "micro_f1": float(true_positive.sum() / total),
         "macro_f1": float(f1[present].mean()),
         "weighted_f1": float(
-            (f1 * support).sum() / max(total, 1e-10)
+            (f1 * support).sum() / total
         ),
         "precision_macro": float(precision[present].mean()),
         "precision_weighted": float(
-            (precision * support).sum() / max(total, 1e-10)
+            (precision * support).sum() / total
         ),
         "recall_macro": float(recall[present].mean()),
         "recall_weighted": float(
-            (recall * support).sum() / max(total, 1e-10)
+            (recall * support).sum() / total
         ),
         "majority_accuracy": float(
             support.max() / total
@@ -634,7 +634,7 @@ def _lag1_autocorrelation(
         denominator = math.sqrt(head_square) * math.sqrt(tail_square)
     if float(denominator) <= 0.0:
         return None
-    raw_rho = float((head * tail).sum() / max(denominator, 1e-10))
+    raw_rho = float((head * tail).sum() / denominator)
     return max(-1.0, min(1.0, raw_rho))
 
 
@@ -669,7 +669,7 @@ def _ar1_effective_windows(
         )
     inflation = 1.0
     if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
-        inflation = math.sqrt(float(n_windows) / max(effective, 1e-10))
+        inflation = math.sqrt(float(n_windows) / effective)
     return effective, inflation
 
 
@@ -683,7 +683,7 @@ def _ar1_adjusted_mean_test(
     普通配对 t 检验把沿评估序列排列的窗口当独立样本；固定
     窗口可能重叠或同属相邻主题块，正自相关会让标准误偏小。
     这里用 ρ̂1 推导有效窗口数 n_eff = n(1-ρ)/(1+ρ)，把标准误
-    放大 sqrt(n/max(n_eff, 1e-10))，自由度取 n_eff-1。只放宽不收窄；ρ̂1
+    放大 sqrt(n/n_eff)，自由度取 n_eff-1。只放宽不收窄；ρ̂1
     低于阈值时不调整。n_eff<3 时不给 p 值（有效证据不足），
     避免用 1 个有效窗口伪造显著性。
     """
@@ -752,7 +752,7 @@ def _ar1_adjusted_mean_test(
         return result
 
     df = effective - 1.0
-    t_value = mean / max(se, 1e-10)
+    t_value = mean / se
     result["t"] = t_value
     result["se"] = se
     result["df"] = df
@@ -906,7 +906,7 @@ def _group_stats_bootstrap_ci(
         return None
     sampled = (
         (point_values[indices] * weights[indices]).sum(dim=1)
-        / max(sampled_weights, 1e-10)
+        / sampled_weights
     )
     sampled = sampled[valid]
     if sampled.numel() == 0:
@@ -1080,7 +1080,7 @@ def _group_cluster_eval_intervals(
         [mapping[group_id][2] for group_id in group_ids],
         dtype=torch.float64,
     )
-    loss_point = loss_sums / max(tokens, 1e-10)
+    loss_point = loss_sums / tokens
     scale = float(loss_point.abs().max().item())
     if scale > 1.0e150:
         loss_scaled = loss_point / scale
@@ -1090,7 +1090,7 @@ def _group_cluster_eval_intervals(
     else:
         scale = 1.0
         loss_scaled = loss_point
-    accuracy_point = correct / max(tokens, 1e-10)
+    accuracy_point = correct / tokens
     try:
         seed_value = int(seed) % (2 ** 64)
     except (TypeError, ValueError, OverflowError):

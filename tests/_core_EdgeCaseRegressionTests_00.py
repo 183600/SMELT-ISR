@@ -1739,7 +1739,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             1000000,
             bound,
         )
-        self.assertAlmostEqual(cdf / max(alpha, 1e-10), 1.0, places=9)
+        self.assertAlmostEqual(cdf / alpha, 1.0, places=9)
     def test_binomial_upper_bound_handles_rates_below_machine_epsilon(self):
         for failures, trials, confidence, expected in (
             (5000, 10 ** 18, 0.95, 5.117886079407686e-15),
@@ -1765,7 +1765,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             )
             self.assertIsNotNone(bound)
             self.assertAlmostEqual(
-                bound / max(expected, 1e-10),
+                bound / expected,
                 1.0,
                 places=9,
             )

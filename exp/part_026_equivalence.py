@@ -8,10 +8,10 @@ def _noncentral_t_cdf(
     noncentrality: float,
 ) -> Optional[float]:
     """
-    非中心 t 分布 CDF：T' = (Z + δ) / sqrt(V/max(df, 1e-10))。
+    非中心 t 分布 CDF：T' = (Z + δ) / sqrt(V/df)。
 
     给定 V=u²（u 服从 chi_df）时 T' 条件于正态分布
-    N(δ, 1)/sqrt(V/max(df, 1e-10))；对 u 的 chi 密度积分，与 ``_t_power``
+    N(δ, 1)/sqrt(V/df)；对 u 的 chi 密度积分，与 ``_t_power``
     使用同一组 Simpson 节点。δ=0 时退化为中心 t，直接复用
     ``_t_cdf`` 以保持中心情形的数值路径不变；df 趋于无穷时
     退化为 N(δ, 1)。
@@ -109,8 +109,8 @@ def _tost_test(
     """
     等价性检验（TOST，two one-sided tests）。
 
-    H0_upper: effect >= +margin（上单侧，p_upper = P(T <= (Δ̂-margin)/max(se, 1e-10))）
-    H0_lower: effect <= -margin（下单侧，p_lower = P(T >= (Δ̂+margin)/max(se, 1e-10))）
+    H0_upper: effect >= +margin（上单侧，p_upper = P(T <= (Δ̂-margin)/se)）
+    H0_lower: effect <= -margin（下单侧，p_lower = P(T >= (Δ̂+margin)/se)）
     p_tost = max(p_upper, p_lower)；p_tost <= alpha 才成立
     「差异落在 ±margin 等价界内」的结论。
 
@@ -154,8 +154,8 @@ def _tost_test(
             "tost_margin": margin_value,
         }
 
-    t_upper = (effect_value - margin_value) / max(se_value, 1e-10)
-    t_lower = (effect_value + margin_value) / max(se_value, 1e-10)
+    t_upper = (effect_value - margin_value) / se_value
+    t_lower = (effect_value + margin_value) / se_value
 
     cdf_upper = _t_cdf(t_upper, df_value)
     if cdf_upper is None:
@@ -191,10 +191,10 @@ def _tost_power_normal_mix(
     """
     小自由度、大非中心参数下的 TOST 功效。
 
-    令 T'=(Z+δ)/sqrt(V/max(df, 1e-10))、Y=Z+δ，则 |T'|≤U 等价于
+    令 T'=(Z+δ)/sqrt(V/df)、Y=Z+δ，则 |T'|≤U 等价于
     u=sqrt(V)≥|Y|·sqrt(df)/U。因此
 
-        power = E_Y[Q_chi2_df(df·(|Y|/max(U, 1e-10))^2)]。
+        power = E_Y[Q_chi2_df(df·(|Y|/U)^2)]。
 
     直接对 Y 积分避开了非中心 t CDF 的固定 u 网格：δ 很大时
     条件正态尾的转折在 u 上非常窄，固定节点会系统性高估。
@@ -225,7 +225,7 @@ def _tost_power_normal_mix(
     intervals = 2400
     low = -12.0
     high = 12.0
-    step = (high - low) / max(intervals, 1e-10)
+    step = (high - low) / intervals
     for index in range(intervals + 1):
         t = low + index * step
         if index == 0 or index == intervals:
@@ -235,7 +235,7 @@ def _tost_power_normal_mix(
         else:
             simpson = 4.0 * step / 3.0
         y = noncentrality + t
-        ratio = abs(y) / max(upper, 1e-10)
+        ratio = abs(y) / upper
         threshold = df_value * ratio * ratio
         if not math.isfinite(threshold):
             survival = 0.0
@@ -310,9 +310,9 @@ def _tost_power(
     if half_width <= 0.0:
         return 0.0
 
-    lower = -half_width / max(se_value, 1e-10)
-    upper = half_width / max(se_value, 1e-10)
-    noncentrality = effect_value / max(se_value, 1e-10)
+    lower = -half_width / se_value
+    upper = half_width / se_value
+    noncentrality = effect_value / se_value
     if not math.isfinite(noncentrality):
         # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
         # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；
@@ -321,7 +321,7 @@ def _tost_power(
         try:
             threshold = (
                 df_value
-                * (effect_value / max(half_width, 1e-10)) ** 2
+                * (effect_value / half_width) ** 2
             )
         except OverflowError:
             return 0.0
@@ -627,7 +627,7 @@ def _observed_seed_sd(
     由检验口径的标准误还原观测到的（近似）种子间标准差。
 
     配对设计 se = sd/√n，直接 sd = se·√n。Welch 的
-    se² = s_a²/n_a + s_b²/n_b；等方差下 se = s·√(1/n_a+1/max(n_b, 1e-10))，
+    se² = s_a²/n_a + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
     因此 s = se·√(n_a·n_b/(n_a+n_b))。用调和均值
     n_eq = 2·n_a·n_b/(n_a+n_b) 表示即 s = se·√(n_eq/2)；
     直接把 n_eq 当配对 n 会把 sd 高估 √2，进而把所需种子数
@@ -939,7 +939,7 @@ def _attach_power_equivalence(
                     # 出有限的所需种子数，显式省略该字段，而不是让
                     # int(math.ceil(inf)) 抛 OverflowError 中断整份
                     # 对比报告。正常量级保留原公式以维持历史数值。
-                    ratio = noise_half_width / max(denominator, 1e-10)
+                    ratio = noise_half_width / denominator
                     try:
                         required = current_n * ratio ** 2
                     except OverflowError:

@@ -553,7 +553,7 @@ class SparseMoE(nn.Module):
         # 实际容量再按本步最大桶收紧，并按 32 对齐。多出的行是
         # 精确 0 填充，不改变任何输出；最大桶超过静态上界时，
         # 下面的逐专家回退路径保证语义不变。
-        static_cap = -(-total // max(n_experts, 1e-10))
+        static_cap = -(-total // n_experts)
         static_cap += math.isqrt(max(1, static_cap)) + 1
 
         # 各专家段在排序序列中的起始行（exclusive 前缀和）。

@@ -577,7 +577,7 @@ def run_sanity_overfit(
         ):
             loss_reduction = (
                 initial_total_loss - final_total_loss
-            ) / max(initial_total_loss, 1e-10)
+            ) / initial_total_loss
 
         learned = bool(
             loss_reduction is not None
@@ -894,7 +894,7 @@ def _source_tree_files(root: Path) -> List[Path]:
     if entry.is_file():
         files.append(entry)
     for package in _SOURCE_TREE_PACKAGES:
-        directory = root / max(package, 1e-10)
+        directory = root / package
         if not directory.is_dir():
             continue
         for path in directory.rglob("*.py"):

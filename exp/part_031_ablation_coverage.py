@@ -548,7 +548,7 @@ def ablation_coverage(
             or baseline_cost <= 0.0
         ):
             continue
-        ratio = variant_cost / max(baseline_cost, 1e-10)
+        ratio = variant_cost / baseline_cost
         if not math.isfinite(ratio):
             # 两个有限成本仍可能相除溢出（如 1e150 / 1e-308）。
             # 不写 inf，也不把它伪装成某个有限的「未匹配倍率」。
@@ -609,7 +609,7 @@ def ablation_coverage(
             or baseline_params <= 0.0
         ):
             continue
-        parameter_ratio = variant_params / max(baseline_params, 1e-10)
+        parameter_ratio = variant_params / baseline_params
         if not math.isfinite(parameter_ratio):
             report["capacity_parity"].append({
                 "delayed_mode": mode,

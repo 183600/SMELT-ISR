@@ -21,7 +21,7 @@ def probe_data_pipeline(
     照样把固定小批次背下来，sanity check 无法发现。这里用
     独立重建的方式逐位核对数据协议：
 
-    - 三段切分边界连续、长度与字节总数一致，train/val/max(test, 1e-10)
+    - 三段切分边界连续、长度与字节总数一致，train/val/test
       互不重叠（窗口不跨越 split 边界）；
     - 训练批的采样起点可复现，且 ``batch()`` 返回的 (x, y)
       与「从原始 train 字节按起点直接切片」逐位一致（覆盖
@@ -863,12 +863,12 @@ def _conditional_bigram_shift(
 
     supported = (eval_ctx > 0) & (train_ctx > 0)
     seen_pairs = float(eval_ctx[supported].sum())
-    seen_context_share = seen_pairs / max(total_eval_pairs, 1e-10)
+    seen_context_share = seen_pairs / total_eval_pairs
 
     unseen_pairs = float(
         (evaluation * (train == 0)).sum()
     )
-    unseen_transition_share = unseen_pairs / max(total_eval_pairs, 1e-10)
+    unseen_transition_share = unseen_pairs / total_eval_pairs
 
     if seen_pairs <= 0.0:
         conditional_js = 1.0
@@ -890,7 +890,7 @@ def _conditional_bigram_shift(
             right: torch.Tensor,
         ) -> torch.Tensor:
             return (
-                left * (left / max(right, 1e-10)).log2()
+                left * (left / right).log2()
             ).sum(dim=1)
 
         js_rows = 0.5 * _kl_rows(
@@ -1067,7 +1067,7 @@ def _interval_length_summary(
     return {
         "spans": len(lengths),
         "bytes": sum(lengths),
-        "mean": (round(sum(lengths) / max(len(lengths), 1)) if lengths else float("nan"), 3),
+        "mean": (round(sum(lengths) / len(lengths)) if lengths else float("nan"), 3),
         "median": _quantile(0.5),
         "p90": _quantile(0.9),
         "max": lengths[-1],
@@ -1131,7 +1131,7 @@ def _deletion_bias_record(
         byte_js = round(
             _js_distance(
                 dropped_counts.to(torch.float64) / dropped_total,
-                kept_counts.to(torch.float64) / max(kept_total, 1e-10),
+                kept_counts.to(torch.float64) / kept_total,
             ),
             6,
         )
@@ -1150,7 +1150,7 @@ def _deletion_bias_record(
                 dropped_bigram.to(torch.float64)
                 / dropped_bigram_total,
                 kept_bigram.to(torch.float64)
-                / max(kept_bigram_total, 1e-10),
+                / kept_bigram_total,
             ),
             6,
         )
@@ -1161,8 +1161,8 @@ def _deletion_bias_record(
         "dropped_bytes": dropped_bytes,
         "kept_bytes": kept_bytes,
         "train_bytes": int(train_end),
-        "drop_fraction": round(dropped_bytes / max(train_bytes, 1e-10), 6),
-        "kept_fraction": round(kept_bytes / max(train_bytes, 1e-10), 6),
+        "drop_fraction": round(dropped_bytes / train_bytes, 6),
+        "kept_fraction": round(kept_bytes / train_bytes, 6),
         "excluded_span_lengths": _interval_length_summary(
             merged
         ),

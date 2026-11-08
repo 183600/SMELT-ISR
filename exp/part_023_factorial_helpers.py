@@ -544,14 +544,14 @@ def _mean(values: List[float]) -> Optional[float]:
         return None
     # 正常量级走原公式，保持历史结果的逐位一致性；只有直接
     # 求和溢出/非有限时才退回缩放计算。
-    direct = sum(numeric) / max(len(numeric), 1)
+    direct = sum(numeric) / len(numeric)
     if math.isfinite(direct):
         return direct
     scale = max(abs(value) for value in numeric)
     if scale == 0.0:
         return 0.0
     total = math.fsum(value / scale for value in numeric)
-    result = (total / max(len(numeric), 1)) * scale
+    result = (total / len(numeric)) * scale
     return result if math.isfinite(result) else None
 
 
@@ -586,7 +586,7 @@ def _sample_std(values: List[float]) -> Optional[float]:
     if numeric is None or len(numeric) < 2:
         return None
     try:
-        mean = (sum(numeric) / max(len(numeric), 1)) if numeric else float("nan")
+        mean = (sum(numeric) / len(numeric)) if numeric else float("nan")
         variance = sum(
             (value - mean) ** 2 for value in numeric
         ) / (len(numeric) - 1)
@@ -610,7 +610,7 @@ def _sample_std(values: List[float]) -> Optional[float]:
     if scale == 0.0:
         return 0.0
     normalized = [value / scale for value in numeric]
-    mean = (math.fsum(normalized) / max(len(normalized), 1)) if normalized else float("nan")
+    mean = (math.fsum(normalized) / len(normalized)) if normalized else float("nan")
     variance = math.fsum(
         (value - mean) ** 2 for value in normalized
     ) / (len(normalized) - 1)
@@ -649,10 +649,10 @@ def _betacf(a: float, b: float, x: float) -> float:
     qam = a - 1.0
 
     c = 1.0
-    d = 1.0 - qab * x / max(qap, 1e-10)
+    d = 1.0 - qab * x / qap
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / max(d, 1e-10)
+    d = 1.0 / d
     h = d
 
     for iteration in range(1, max_iterations + 1):
@@ -667,10 +667,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / max(c, 1e-10)
+        c = 1.0 + numerator / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
+        d = 1.0 / d
         h *= d * c
 
         numerator = (
@@ -682,10 +682,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / max(c, 1e-10)
+        c = 1.0 + numerator / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
+        d = 1.0 / d
         delta = d * c
         h *= delta
 
@@ -704,7 +704,7 @@ def _log_gamma_ratio_half(z: float) -> float:
     """
     计算 log(Γ(z+1/2)/Γ(z))，避免大 z 下两个 lgamma 相减。
     """
-    inverse = 1.0 / max(z, 1e-10)
+    inverse = 1.0 / z
     series = inverse * (
         -1.0 / 8.0
         + inverse * (
@@ -721,7 +721,7 @@ def _log_gamma_ratio_half(z: float) -> float:
 
 def _stirling_log_gamma_correction(z: float) -> float:
     """log Γ(z) 的 Stirling 级数修正项（z 足够大时）。"""
-    inverse = 1.0 / max(z, 1e-10)
+    inverse = 1.0 / z
     squared = inverse * inverse
     return inverse * (
         1.0 / 12.0
@@ -744,7 +744,7 @@ def _stirling_log_gamma_correction(z: float) -> float:
 def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
-        (z + delta - 0.5) * math.log1p(delta / max(z, 1e-10))
+        (z + delta - 0.5) * math.log1p(delta / z)
         + delta * math.log(z)
         - delta
         + _stirling_log_gamma_correction(z + delta)
@@ -834,9 +834,9 @@ def _regularized_incomplete_beta(
     )
 
     if x < (a + 1.0) / (a + b + 2.0):
-        return front * _betacf(a, b, x) / max(a, 1e-10)
+        return front * _betacf(a, b, x) / a
 
-    return 1.0 - front * _betacf(b, a, 1.0 - x) / max(b, 1e-10)
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
 
 
 
@@ -979,7 +979,7 @@ def _paired_t_test(
     # 直接做 mean / se 会抛 ZeroDivisionError；该写法对公共尺度
     # 不变，也不改变正常量级的逐位结果。
     try:
-        t = (mean / max(std, 1e-10)) * math.sqrt(n)
+        t = (mean / std) * math.sqrt(n)
     except (OverflowError, ZeroDivisionError):
         t = None
     se = std / math.sqrt(n)
@@ -1059,7 +1059,7 @@ def _paired_sign_flip_test(
     scale = max_abs if max_abs > 1.0e150 else 1.0
     if scale != 1.0:
         values = [value / scale for value in values]
-    mean_scaled = sum(values) / max(n, 1e-10)
+    mean_scaled = sum(values) / n
     mean = mean_scaled * scale
     observed = abs(mean_scaled)
     tolerance = 1e-12 * observed
@@ -1081,11 +1081,11 @@ def _paired_sign_flip_test(
                     sign * value
                     for sign, value in zip(signs, values)
                 )
-            ) / max(n, 1e-10)
+            ) / n
             if statistic >= observed - tolerance:
                 count += 1
         permutations = 2 ** n
-        p_value = count / max(permutations, 1e-10)
+        p_value = count / permutations
         method = "exact"
     else:
         generator = torch.Generator().manual_seed(
@@ -1102,7 +1102,7 @@ def _paired_sign_flip_test(
         tensor = torch.tensor(values, dtype=torch.float64)
         statistics = (
             signs * tensor
-        ).sum(dim=1).abs() / max(n, 1e-10)
+        ).sum(dim=1).abs() / n
         count = int(
             (statistics >= observed - tolerance).sum().item()
         )
@@ -1212,7 +1212,7 @@ def _paired_difference_diagnostics(
     # 超额峰度 g2 = m4/m2^2 - 3。逐项先除以尺度再求幂，
     # |中心化值|/scale <= sqrt(n)，不会溢出。
     centered = [value - mean for value in values]
-    m2 = math.fsum(c * c for c in centered) / max(n, 1e-10)
+    m2 = math.fsum(c * c for c in centered) / n
     if m2 <= 0.0 or not math.isfinite(m2):
         return {
             "available": False,
@@ -1221,8 +1221,8 @@ def _paired_difference_diagnostics(
             "mean": mean,
         }
     scale = math.sqrt(m2)
-    m3 = math.fsum((c / scale) ** 3 for c in centered) / max(n, 1e-10)
-    m4 = math.fsum((c / scale) ** 4 for c in centered) / max(n, 1e-10)
+    m3 = math.fsum((c / scale) ** 3 for c in centered) / n
+    m4 = math.fsum((c / scale) ** 4 for c in centered) / n
     skewness = m3
     excess_kurtosis = m4 - 3.0
     # 正态假设下偏度/峰度的标准误（样本偏度/峰度的渐近方差
@@ -1269,7 +1269,7 @@ def _paired_difference_diagnostics(
         "kurtosis_flag": kurtosis_flag,
         "n_positive": n_positive,
         "n_negative": n_negative,
-        "mean_median_shift_sd": abs(mean - median) / max(std, 1e-10),
+        "mean_median_shift_sd": abs(mean - median) / std,
         "status": (
             "questionable"
             if (skewness_flag or kurtosis_flag)
@@ -1377,9 +1377,9 @@ def _wilcoxon_signed_rank_test(
             ):
                 count += 1
         permutations = 2 ** n
-        p_value = count / max(permutations, 1e-10)
+        p_value = count / permutations
         method = "exact"
-        min_attainable_p = 2.0 / max(permutations, 1e-10)
+        min_attainable_p = 2.0 / permutations
         required_seeds = _sign_flip_required_seeds(
             _SIGNIFICANCE_LEVEL
         )

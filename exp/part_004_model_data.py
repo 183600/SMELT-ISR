@@ -95,7 +95,7 @@ class LanguageModel(nn.Module):
         同一参数名在不同 mode 中会得到完全相同的初始权重，
         A/B/local_base 的共享层因此可以在同种子下逐位配对；
         mode 独有的参数按各自名字取独立随机流。使用 CPU
-        generator 生成后再搬运，保证同一份代码在 CPU/max(CUDA, 1e-10)
+        generator 生成后再搬运，保证同一份代码在 CPU/CUDA
         上得到相同的初始值。
         """
         base_seed = int(torch.initial_seed())

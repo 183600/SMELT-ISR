@@ -228,7 +228,7 @@ def _current_seed_count(
         and min(baseline_value, variant_value)
         >= _MIN_SEEDS_FOR_STATS
     ):
-        denom = 1.0 / baseline_value + 1.0 / max(variant_value, 1e-10)
+        denom = 1.0 / baseline_value + 1.0 / variant_value
         return 2.0 / denom if denom > 0 else 0.0
     return None
 
@@ -1065,7 +1065,7 @@ def compare_cells_to_baseline(
                 pooled_std = math.sqrt(pooled_squared)
         noise_ratio = None
         if delta is not None and pooled_std:
-            candidate = abs(delta) / max(pooled_std, 1e-10)
+            candidate = abs(delta) / pooled_std
             if math.isfinite(candidate):
                 noise_ratio = candidate
         hedges_correction = _hedges_g_correction(result.get("df"))

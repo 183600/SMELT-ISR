@@ -25,17 +25,6 @@ from pathlib import Path
 
 try:
     import torch
-
-# [Code Review] Safe eval wrapper
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """Safe eval: try literal_eval first, fall back to eval with warning."""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
 except ImportError as error:  # pragma: no cover
     raise unittest.SkipTest(
         f"torch is required for these tests: {error}"
@@ -131,7 +120,7 @@ class ProtocolInvariantTests(unittest.TestCase):
         # 用第二轮/最终分支状态重新计算合并权重，得到的系数将与
         # first_gates 不同，断言即失败。
         cfg = _tiny_config(mode="B", k1=2, k2=2)
-        model = experiment.LanguageModel(cfg)._safe_eval()
+        model = experiment.LanguageModel(cfg).eval()
         batch, time = 2, 4
 
         def identity_block(x, top_k, scale, attn_mask=None):

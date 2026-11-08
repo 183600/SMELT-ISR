@@ -954,9 +954,9 @@ def _stratified_error_rows(
             "name": name,
             "tokens": tokens,
             "wrong": wrong,
-            "error_rate": round(wrong / max(tokens, 1e-10), 6),
+            "error_rate": round(wrong / tokens, 6),
             "share_of_errors": (
-                round(wrong / max(total_wrong, 1e-10), 6)
+                round(wrong / total_wrong, 6)
                 if total_wrong > 0
                 else None
             ),
@@ -989,7 +989,7 @@ def _calibration_report(
     计算 top1 置信度的可靠性（ECE）与过度自信程度。
 
     ``confidence`` 是每 token 的 top1 概率，``correct`` 是
-    top1 是否命中目标。ECE = Σ (n_bin / max(N, 1e-10)) · |acc_bin − conf_bin|，
+    top1 是否命中目标。ECE = Σ (n_bin / N) · |acc_bin − conf_bin|，
     按等宽概率分箱；它直接回答「模型说 90% 时是否真的对 90%」，
     这是 accuracy/loss 都看不出来的性质。
     """
@@ -1010,8 +1010,8 @@ def _calibration_report(
     ece = 0.0
     bins = []
     for index in range(num_bins):
-        lower = index / max(num_bins, 1e-10)
-        upper = (index + 1) / max(num_bins, 1e-10)
+        lower = index / num_bins
+        upper = (index + 1) / num_bins
         if index == num_bins - 1:
             mask = (confidence >= lower) & (
                 confidence <= upper
@@ -1036,7 +1036,7 @@ def _calibration_report(
         )
         accuracy = float(correct[mask].mean().item())
         gap = accuracy - mean_confidence
-        ece += (count / max(total, 1e-10)) * abs(gap)
+        ece += (count / total) * abs(gap)
         bins.append({
             "lower": round(lower, 6),
             "upper": round(upper, 6),
@@ -1136,7 +1136,7 @@ def _train_next_byte_evidence(
             "support": support,
             "majority_byte": int(majority_byte),
             "majority_share": round(
-                majority_count / max(support, 1e-10),
+                majority_count / support,
                 6,
             ),
             "counts": {

@@ -1,17 +1,6 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
-# [Code Review] Safe eval wrapper
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """Safe eval: try literal_eval first, fall back to eval with warning."""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-
 class CoreModelTests(unittest.TestCase):
     def test_all_modes_forward_backward(self):
         for mode in (
@@ -74,10 +63,10 @@ class CoreModelTests(unittest.TestCase):
         ):
             first = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=left)
-            )._safe_eval()
+            ).eval()
             second = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=right)
-            )._safe_eval()
+            ).eval()
             second.load_state_dict(first.state_dict())
             with torch.no_grad():
                 a = first(x)["logits"]

@@ -530,7 +530,7 @@ def build_pilot_power_evidence(
                 and denominator > 0.0
             ):
                 try:
-                    paired_sd_relative = paired_sd / max(denominator, 1e-10)
+                    paired_sd_relative = paired_sd / denominator
                 except OverflowError:
                     paired_sd_relative = None
                 if (
@@ -549,7 +549,7 @@ def build_pilot_power_evidence(
             ):
                 try:
                     paired_sd_relative_upper = (
-                        paired_sd_upper / max(denominator, 1e-10)
+                        paired_sd_upper / denominator
                     )
                 except OverflowError:
                     paired_sd_relative_upper = None
@@ -665,7 +665,7 @@ def build_pilot_power_evidence(
                 and denominator > 0.0
             ):
                 level_relative_values.append(
-                    upper / max(denominator, 1e-10)
+                    upper / denominator
                 )
         level_attrition_values = [
             _binomial_upper_confidence_bound(
@@ -713,7 +713,7 @@ def build_pilot_power_evidence(
         if cell.get("n_attempted")
     ]
     unassigned_attrition = (
-        len(unassigned_unusable) / max(len(unassigned_rows), 1) if unassigned_rows else 0.0
+        len(unassigned_unusable) / len(unassigned_rows) if unassigned_rows else 0.0
         if unassigned_rows
         else None
     )
@@ -861,7 +861,7 @@ def build_pilot_power_evidence(
     ):
         try:
             observed_over_declared = (
-                observed_sd_relative / max(declared_sd, 1e-10)
+                observed_sd_relative / declared_sd
             )
         except OverflowError:
             observed_over_declared = None

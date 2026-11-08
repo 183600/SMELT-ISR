@@ -1,16 +1,5 @@
 from __future__ import annotations
 
-# [Code Review] Safe eval wrapper
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """Safe eval: try literal_eval first, fall back to eval with warning."""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-
 
 
 def _bad_case_report_from_buffers(
@@ -150,7 +139,7 @@ def _bad_case_report_from_buffers(
         if count <= 0:
             break
         top_confusions.append([
-            int(index) // max(vocab_size, 1e-10),
+            int(index) // vocab_size,
             int(index) % vocab_size,
             int(count),
         ])
@@ -336,7 +325,7 @@ def _bad_case_report_from_buffers(
             str(case["window_text"])
         ]
     top_cases_window_concentration = (
-        max(window_counts.values()) / max(len(top_cases), 1)
+        max(window_counts.values()) / len(top_cases)
         if top_cases
         else None
     )
@@ -401,7 +390,7 @@ def _bad_case_report_from_buffers(
     }
     error_category_shares = {
         name: (
-            round(count / max(wrong_tokens, 1e-10), 6)
+            round(count / wrong_tokens, 6)
             if wrong_tokens > 0
             else None
         )
@@ -850,7 +839,7 @@ def analyze_bad_cases(
         )
 
     was_training = model.training
-    model._safe_eval()
+    model.eval()
 
     use_amp = (
         amp_dtype is not None
@@ -1302,7 +1291,7 @@ def _routing_set_metrics_bool(
         r1_size + r2_size - expected_uniform
     ).clamp_min(1e-12)
     chance_uniform = float(
-        (expected_uniform / max(union_uniform, 1e-10)).mean()
+        (expected_uniform / union_uniform).mean()
     )
 
     # 边际负载保持基线：P(e∈B) 取第二轮的经验负载份额，
@@ -1317,7 +1306,7 @@ def _routing_set_metrics_bool(
         r1_size + r2_size - expected_marginal
     ).clamp_min(1e-12)
     chance_marginal = float(
-        (expected_marginal / max(union_marginal, 1e-10)).mean()
+        (expected_marginal / union_marginal).mean()
     )
 
     def _adjusted(chance: float) -> Optional[float]:

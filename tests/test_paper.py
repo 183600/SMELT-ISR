@@ -19,17 +19,6 @@ from pathlib import Path
 
 try:
     import torch
-
-# [Code Review] Safe eval wrapper
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """Safe eval: try literal_eval first, fall back to eval with warning."""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
 except ImportError as error:  # pragma: no cover
     raise unittest.SkipTest(
         f"torch is required for these tests: {error}"
@@ -607,7 +596,7 @@ class GqaTests(unittest.TestCase):
             mode="smelt",
         )
         model = experiment.LanguageModel(cfg)
-        model._safe_eval()
+        model.eval()
         x = torch.randint(0, 256, (1, 8))
         with torch.no_grad():
             a = model(x)["logits"]
@@ -739,7 +728,7 @@ class DocumentMaskTests(unittest.TestCase):
                 document_separator=[self.SEP],
             )
             torch.manual_seed(0)
-            model = experiment.LanguageModel(cfg)._safe_eval()
+            model = experiment.LanguageModel(cfg).eval()
             x = torch.tensor(
                 [[1, 2, 3, self.SEP, 5, 6, 7, 8]]
             )

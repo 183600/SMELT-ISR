@@ -23,7 +23,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
             expected = -2.0 * math.log1p(-probability)
             self.assertIsNotNone(quantile)
             self.assertAlmostEqual(
-                quantile / max(expected, 1e-10), 1.0, places=12
+                quantile / expected, 1.0, places=12
             )
     def test_chi_square_quantile_handles_upper_tail(self):
         # df=2 时上侧概率 Q=exp(-x/2)，因此分位数解析解为
@@ -42,7 +42,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
             expected = -2.0 * math.log1p(-probability)
             self.assertIsNotNone(quantile)
             self.assertAlmostEqual(
-                quantile / max(expected, 1e-10), 1.0, places=12
+                quantile / expected, 1.0, places=12
             )
     def test_chi_square_quantile_handles_small_df(self):
         # df=0.5（a=0.25）的小 x 展开为
@@ -57,10 +57,10 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
         )
         expected = 2.0 * (
             probability * a * math.gamma(a)
-        ) ** (1.0 / max(a, 1e-10))
+        ) ** (1.0 / a)
         self.assertIsNotNone(quantile)
         self.assertAlmostEqual(
-            quantile / max(expected, 1e-10), 1.0, places=12
+            quantile / expected, 1.0, places=12
         )
     def test_chi_square_large_df_handles_transition_and_overflow(self):
         a = 5.0e11

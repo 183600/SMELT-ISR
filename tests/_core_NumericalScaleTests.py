@@ -823,12 +823,12 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertTrue(math.isfinite(large_ci["high"]))
         scale = 1.0e300
         self.assertAlmostEqual(
-            large_ci["low"] / max(scale, 1e-10),
+            large_ci["low"] / scale,
             small_ci["low"],
             places=12,
         )
         self.assertAlmostEqual(
-            large_ci["high"] / max(scale, 1e-10),
+            large_ci["high"] / scale,
             small_ci["high"],
             places=12,
         )
@@ -876,12 +876,12 @@ class NumericalScaleTests(unittest.TestCase):
         self.assertTrue(math.isfinite(large_ci["high"]))
         scale = 1.0e300
         self.assertAlmostEqual(
-            large_ci["low"] / max(scale, 1e-10),
+            large_ci["low"] / scale,
             small_ci["low"],
             places=12,
         )
         self.assertAlmostEqual(
-            large_ci["high"] / max(scale, 1e-10),
+            large_ci["high"] / scale,
             small_ci["high"],
             places=12,
         )

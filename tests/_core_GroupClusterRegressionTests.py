@@ -1,17 +1,6 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
-# [Code Review] Safe eval wrapper
-import ast as _ast
-def _safe_eval(expr, _globals=None, _locals=None):
-    """Safe eval: try literal_eval first, fall back to eval with warning."""
-    try:
-        return _ast.literal_eval(expr) if isinstance(expr, str) else expr
-    except (ValueError, SyntaxError):
-        import warnings
-        warnings.warn(f"eval() on non-literal: {expr!r}", stacklevel=2)
-        return eval(expr, _globals, _locals)
-
 class GroupClusterRegressionTests(unittest.TestCase):
     """文档/群组 cluster bootstrap 的边界条件回归。"""
 
@@ -711,7 +700,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            )._safe_eval()
+            ).eval()
             group_sink = []
             metrics = experiment.evaluate(
                 model,
@@ -749,7 +738,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            )._safe_eval()
+            ).eval()
             group_sink = []
             experiment.evaluate(
                 model,
