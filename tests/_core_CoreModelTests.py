@@ -19,7 +19,7 @@ class CoreModelTests(unittest.TestCase):
             y = torch.randint(0, 256, (2, 16))
             output = model(x, y)
             self.assertTrue(
-                math.isfinite(float(output["loss"])),
+                math.isfinite(output["loss"].item()),
                 mode,
             )
             output["loss"].backward()
@@ -83,7 +83,7 @@ class CoreModelTests(unittest.TestCase):
         output = model(x, y)
         output["loss"].backward()
         self.assertTrue(
-            math.isfinite(float(output["loss"]))
+            math.isfinite(output["loss"].item())
         )
         self.assertEqual(
             model.blocks[0].attn.k_proj.weight.shape[0],
