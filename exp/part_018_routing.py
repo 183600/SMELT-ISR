@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ast
 
 
 
@@ -146,7 +145,7 @@ class RoutingProbe:
 
             probs = router_logits.detach().float().softmax(dim=-1)
             log_e = (
-                math.log(max(n_experts, 1e-10))
+                math.log(n_experts)
                 if n_experts > 1
                 else 0.0
             )
@@ -295,7 +294,7 @@ class RoutingProbe:
         # 记录，避免 token 量与 assignment 量混淆。
         total = sum(usage)
         usage_share = (
-            [count / max(total, 1) for count in usage]
+            [count / total for count in usage]
             if total > 0
             else [0.0] * n_experts
         )
@@ -308,7 +307,7 @@ class RoutingProbe:
 
         shares = torch.tensor(usage_share, dtype=torch.float64)
         log_e = (
-            math.log(max(n_experts, 1e-10))
+            math.log(n_experts)
             if n_experts > 1
             else 0.0
         )
@@ -885,7 +884,7 @@ def analyze_routing(
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.ast.literal_eval(()
+    model.eval()
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -1072,7 +1071,7 @@ def _intervention_eval(
     """
     core = _unwrap_model(model)
     was_training = core.training
-    core.ast.literal_eval(()
+    core.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     total_loss = 0.0
     total_tokens = 0
@@ -1133,8 +1132,8 @@ def _intervention_eval(
             "per_batch": per_batch,
         }
     return {
-        "loss": total_loss / max(total_tokens, 1),
-        "token_accuracy": correct / max(total_tokens, 1),
+        "loss": total_loss / total_tokens,
+        "token_accuracy": correct / total_tokens,
         "tokens": total_tokens,
         "per_batch": per_batch,
     }

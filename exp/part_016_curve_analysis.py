@@ -956,7 +956,7 @@ def _stratified_error_rows(
             "wrong": wrong,
             "error_rate": round(wrong / tokens, 6),
             "share_of_errors": (
-                round(wrong / max(total_wrong, 1), 6)
+                round(wrong / total_wrong, 6)
                 if total_wrong > 0
                 else None
             ),
@@ -1010,7 +1010,7 @@ def _calibration_report(
     ece = 0.0
     bins = []
     for index in range(num_bins):
-        lower = index / max(num_bins, 1)
+        lower = index / num_bins
         upper = (index + 1) / num_bins
         if index == num_bins - 1:
             mask = (confidence >= lower) & (
@@ -1036,7 +1036,7 @@ def _calibration_report(
         )
         accuracy = float(correct[mask].mean().item())
         gap = accuracy - mean_confidence
-        ece += (count / max(total, 1)) * abs(gap)
+        ece += (count / total) * abs(gap)
         bins.append({
             "lower": round(lower, 6),
             "upper": round(upper, 6),

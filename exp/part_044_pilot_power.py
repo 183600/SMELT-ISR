@@ -424,7 +424,7 @@ def build_pilot_power_evidence(
         cell["n_usable"] = n_usable
         cell["n_failed"] = n_failed
         cell["attrition_rate"] = (
-            n_failed / max(n_attempted, 1) if n_attempted else None
+            n_failed / n_attempted if n_attempted else None
         )
         cell["attrition_upper_confidence_bound"] = (
             _binomial_upper_confidence_bound(
@@ -755,7 +755,7 @@ def build_pilot_power_evidence(
     total_attempted = sum(attempted) + len(unassigned_rows)
     total_failed = sum(failed) + len(unassigned_unusable)
     overall_attrition = (
-        total_failed / max(total_attempted, 1) if total_attempted else None
+        total_failed / total_attempted if total_attempted else None
     )
 
     if unassigned:

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import ast
 
 
 
@@ -91,7 +90,7 @@ def evaluate(
     不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
-    model.ast.literal_eval(()
+    model.eval()
 
     probe_attached = False
     if routing_probe is not None:
@@ -1016,7 +1015,7 @@ class NgramBaseline:
             if valid_intervals is None:
                 stride = max(
                     1,
-                    math.ceil(num_windows / max(count_cap, 1)),
+                    math.ceil(num_windows / count_cap),
                 )
 
                 # data.unfold(0, order, 1) 是
@@ -1041,7 +1040,7 @@ class NgramBaseline:
                 total_valid = int(lengths.sum())
                 stride = max(
                     1,
-                    math.ceil(total_valid / max(count_cap, 1)),
+                    math.ceil(total_valid / count_cap),
                 )
                 global_index = torch.arange(
                     0,
@@ -1402,7 +1401,7 @@ class NgramBaseline:
 
             updated = probabilities[
                 positions
-            ] * (alpha / max(denominator, 1).unsqueeze(1))
+            ] * (alpha / denominator.unsqueeze(1))
 
             # 同一 ctx 的 (ctx, c) 对在升序 pair_keys 中
             # 连续：散射该 ctx 的全部非零计数行。

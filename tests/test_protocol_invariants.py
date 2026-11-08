@@ -22,7 +22,6 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
-import ast
 
 try:
     import torch
@@ -121,7 +120,7 @@ class ProtocolInvariantTests(unittest.TestCase):
         # 用第二轮/最终分支状态重新计算合并权重，得到的系数将与
         # first_gates 不同，断言即失败。
         cfg = _tiny_config(mode="B", k1=2, k2=2)
-        model = experiment.LanguageModel(cfg).ast.literal_eval(()
+        model = experiment.LanguageModel(cfg).eval()
         batch, time = 2, 4
 
         def identity_block(x, top_k, scale, attn_mask=None):
