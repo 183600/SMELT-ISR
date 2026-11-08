@@ -528,7 +528,12 @@ def evaluate(
             routing_probe.detach()
         model.train(was_training)
 
-    # ByteDataset 保证至少有一个合法评估起点。
+    # ByteDataset 保证至少有一个合法评估起点；防御性处理空数据集。
+    if evaluated_tokens == 0:
+        raise RuntimeError(
+            f"评估未产生任何 token（{split} split），请检查数据集是否为空或"
+            f"评估起点配置是否正确。"
+        )
     loss = (total / evaluated_tokens).item()
 
     metrics = {
@@ -806,6 +811,10 @@ def compute_reference_baselines(
             minlength=vocab_size ** 2,
         ).view(vocab_size, vocab_size).double()
 
+    if evaluated_tokens == 0:
+        raise RuntimeError(
+            f"基线评估未产生任何 token（{split} split），请检查数据集。"
+        )
     loss_uniform = uniform_total / evaluated_tokens
     loss_unigram = unigram_total / evaluated_tokens
 
