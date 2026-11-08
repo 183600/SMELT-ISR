@@ -438,6 +438,20 @@ def confusion_matrix_metrics(
 
     present = support > 0.0
 
+    # 防御性处理：如果没有任何有效样本（total=0），返回全零指标
+    if total == 0:
+        return {
+            "token_accuracy": 0.0,
+            "micro_f1": 0.0,
+            "macro_f1": 0.0,
+            "weighted_f1": 0.0,
+            "precision_macro": 0.0,
+            "precision_weighted": 0.0,
+            "recall_macro": 0.0,
+            "recall_weighted": 0.0,
+            "majority_accuracy": 0.0,
+        }
+
     return {
         "token_accuracy": float(
             true_positive.sum() / total
