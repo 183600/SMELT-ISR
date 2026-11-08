@@ -247,7 +247,7 @@ def _leakage_scan_coverage(
             "total": total,
             "stride": stride,
             "coverage": (
-                round(sampled / total, 6) if total > 0 else None
+                round(sampled / max(total, 1), 6) if total > 0 else None
             ),
         }
         if total > 0 and stride > 1:

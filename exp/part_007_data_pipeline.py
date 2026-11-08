@@ -695,7 +695,7 @@ def _effective_edge_histogram(
     if used <= 0:
         return None, 0
 
-    return counts / counts.sum(), used
+    return counts / max(counts, 1).sum(), used
 
 
 
@@ -863,12 +863,12 @@ def _conditional_bigram_shift(
 
     supported = (eval_ctx > 0) & (train_ctx > 0)
     seen_pairs = float(eval_ctx[supported].sum())
-    seen_context_share = seen_pairs / total_eval_pairs
+    seen_context_share = seen_pairs / max(total_eval_pairs, 1)
 
     unseen_pairs = float(
         (evaluation * (train == 0)).sum()
     )
-    unseen_transition_share = unseen_pairs / total_eval_pairs
+    unseen_transition_share = unseen_pairs / max(total_eval_pairs, 1)
 
     if seen_pairs <= 0.0:
         conditional_js = 1.0

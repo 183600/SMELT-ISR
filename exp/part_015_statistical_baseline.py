@@ -1191,7 +1191,7 @@ def _sparkline(values, width=48):
                 values[
                     min(
                         last,
-                        int(round(index * last / (width - 1))),
+                        int(round(index * last / max((width - 1), 1e-10))),
                     )
                 ]
                 for index in range(width)

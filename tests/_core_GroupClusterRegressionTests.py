@@ -1,5 +1,6 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+import ast
 
 class GroupClusterRegressionTests(unittest.TestCase):
     """文档/群组 cluster bootstrap 的边界条件回归。"""
@@ -700,7 +701,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()
+            ).ast.literal_eval(()
             group_sink = []
             metrics = experiment.evaluate(
                 model,
@@ -738,7 +739,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()
+            ).ast.literal_eval(()
             group_sink = []
             experiment.evaluate(
                 model,

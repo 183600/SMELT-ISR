@@ -68,8 +68,8 @@ def _cost_comparison(
             # OverflowError；变体成本为 0 时也不能除零。
             relative_a = std_a / cost_a
             relative_b = std_b / cost_b
-            term_a = relative_a * relative_a / n_a
-            term_b = relative_b * relative_b / n_b
+            term_a = relative_a * relative_a / max(n_a, 1)
+            term_b = relative_b * relative_b / max(n_b, 1)
             relative_variance = term_a + term_b
             if (
                 math.isfinite(relative_a)
@@ -87,8 +87,8 @@ def _cost_comparison(
                     scaled_a = term_a / scale_term
                     scaled_b = term_b / scale_term
                     denominator = (
-                        scaled_a * scaled_a / (n_a - 1)
-                        + scaled_b * scaled_b / (n_b - 1)
+                        scaled_a * scaled_a / max((n_a - 1), 1e-10)
+                        + scaled_b * scaled_b / max((n_b - 1), 1e-10)
                     )
                     if (
                         denominator > 0.0

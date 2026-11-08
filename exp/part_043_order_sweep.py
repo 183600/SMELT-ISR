@@ -94,7 +94,7 @@ def _carryover_balance_report(
         "max_pair_count": max_count,
         "max_pair_imbalance": max_imbalance,
         "ideal_count_per_pair": (
-            transitions / n_pairs if n_pairs else 0.0
+            transitions / max(n_pairs, 1) if n_pairs else 0.0
         ),
         "full_balance_block_multiple": full_balance_multiple,
         "note": (
@@ -589,7 +589,7 @@ def _regularized_incomplete_gamma_parts(
         return 0.0, 1.0
     if a >= _GAMMA_TEMME_MIN_A:
         return _gamma_parts_temme(a, x)
-    log_prefactor = -x + a * math.log(x) - math.lgamma(a)
+    log_prefactor = -x + a * math.log(max(x, 1e-10)) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
         total = term
@@ -873,7 +873,7 @@ def _binomial_upper_confidence_bound(
             # 1 - α^(1/n) 在 n 很大时会被 1 的舍入吞掉
             # （n=1e12 时相对误差约 3e-5，n=1e16 时约 31%）；
             # 用 expm1 直接保留小量。
-            return -math.expm1(math.log(alpha) / float(trials))
+            return -math.expm1(math.log(max(alpha, 1e-10)) / float(trials))
         except (OverflowError, ValueError):
             return None
     remaining = _finite_float(trials - failures)

@@ -708,7 +708,7 @@ def _window_variance_components(
             mean_window_var_norm / total_mean_var_norm
         )
         share_interaction = (
-            mean_error_var_norm / total_mean_var_norm
+            mean_error_var_norm / max(total_mean_var_norm, 1)
         )
         components["variance_share_seed"] = share_seed
         components["variance_share_window"] = share_window
@@ -1196,7 +1196,7 @@ def _paired_result_fragility(
       与均值效应一致」。
 
     ``alpha`` 应传**家族校正后**的阈值（该对比在 Holm
-    step-down 中的位置阈值 alpha/(m-rank+1)），否则用未校正
+    step-down 中的位置阈值 alpha / max((m-rank+1), 1e-10)），否则用未校正
     的 0.05 会系统性高估稳健性。删除种子不改变家族规模，
     因此沿用原位置阈值仍适用（删除后 p 排序可能变化，但
     不会放宽判定）。

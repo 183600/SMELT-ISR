@@ -551,7 +551,7 @@ def _mean(values: List[float]) -> Optional[float]:
     if scale == 0.0:
         return 0.0
     total = math.fsum(value / scale for value in numeric)
-    result = (total / len(numeric)) * scale
+    result = (total / max(len(numeric), 1)) * scale
     return result if math.isfinite(result) else None
 
 
@@ -715,7 +715,7 @@ def _log_gamma_ratio_half(z: float) -> float:
             )
         )
     )
-    return 0.5 * math.log(z) + math.log1p(series)
+    return 0.5 * math.log(max(z, 1e-10)) + math.log1p(series)
 
 
 
@@ -745,7 +745,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
         (z + delta - 0.5) * math.log1p(delta / z)
-        + delta * math.log(z)
+        + delta * math.log(max(z, 1e-10))
         - delta
         + _stirling_log_gamma_correction(z + delta)
         - _stirling_log_gamma_correction(z)
@@ -830,7 +830,7 @@ def _regularized_incomplete_beta(
 
     log_beta = _log_beta_front(a, b)
     front = math.exp(
-        log_beta + a * math.log(x) + b * math.log1p(-x)
+        log_beta + a * math.log(max(x, 1e-10)) + b * math.log1p(-x)
     )
 
     if x < (a + 1.0) / (a + b + 2.0):
@@ -890,13 +890,13 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         a = df / 2.0
         if a <= 0.0:
             return 0.0
-        log_x = math.log(df) - 2.0 * math.log(abs(t))
+        log_x = math.log(max(df, 1e-10)) - 2.0 * math.log(abs(t))
         log_beta = (
             math.lgamma(a + 0.5)
             - math.lgamma(a)
             - math.lgamma(0.5)
         )
-        log_p = log_beta + a * log_x - math.log(a)
+        log_p = log_beta + a * log_x - math.log(max(a, 1e-10))
         if log_p >= 0.0:
             return 1.0
         if log_p < -745.0:
