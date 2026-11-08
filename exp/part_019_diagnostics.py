@@ -146,7 +146,7 @@ def diagnose_non_finite(
     ):
         was_training = model.training
         try:
-            model.eval()  # SECURITY: eval() usage - ensure input is trusted
+            model.eval()
             probe_use_amp = (
                 amp_dtype is not None
                 and x.is_cuda
@@ -869,7 +869,7 @@ def measure_efficiency(
     training_timing_summary = _timing_summary([])
 
     try:
-        model.eval()  # SECURITY: eval() usage - ensure input is trusted
+        model.eval()
 
         # 纯推理测量不回流训练图，与 evaluate 一致使用
         # inference_mode。

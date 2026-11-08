@@ -700,7 +700,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()  # SECURITY: eval() usage - ensure input is trusted
+            ).eval()
             group_sink = []
             metrics = experiment.evaluate(
                 model,
@@ -738,7 +738,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()  # SECURITY: eval() usage - ensure input is trusted
+            ).eval()
             group_sink = []
             experiment.evaluate(
                 model,
