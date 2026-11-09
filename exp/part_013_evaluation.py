@@ -92,7 +92,7 @@ def evaluate(
     不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
-    model.st.literal_eval()
+    model.eval()
 
     probe_attached = False
     if routing_probe is not None:

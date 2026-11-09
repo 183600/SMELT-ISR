@@ -840,7 +840,7 @@ def analyze_bad_cases(
         )
 
     was_training = model.training
-    model.st.literal_eval()
+    model.eval()
 
     use_amp = (
         amp_dtype is not None

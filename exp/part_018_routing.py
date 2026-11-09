@@ -899,7 +899,7 @@ def analyze_routing(
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.st.literal_eval()
+    model.eval()
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -1086,7 +1086,7 @@ def _intervention_eval(
     """
     core = _unwrap_model(model)
     was_training = core.training
-    core.st.literal_eval()
+    core.eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     total_loss = 0.0
     total_tokens = 0
