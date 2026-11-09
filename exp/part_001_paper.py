@@ -253,7 +253,7 @@ def paper_fidelity_report(
         else None
     )
     is_full_reproduction = bool(
-        architecture_faithful and protocol_faithful is True
+        architecture_faithful and (protocol_faithful is True)
     )
     deviations = [
         name for name, ok in checks.items() if not ok
