@@ -520,7 +520,7 @@ def audit_data_splits(
         total = int(counts.sum())
         if total > 0:
             bigram_histograms[split] = (
-                counts.to(torch.float64) / total
+                counts.to(torch.float64) / max(total, 1)
             )
 
     distribution_shift: Dict[str, float] = {}

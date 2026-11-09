@@ -1036,7 +1036,7 @@ def _calibration_report(
         )
         accuracy = float(correct[mask].mean().item())
         gap = accuracy - mean_confidence
-        ece += (count / total) * abs(gap)
+        ece += (count / max(total, 1)) * abs(gap)
         bins.append({
             "lower": round(lower, 6),
             "upper": round(upper, 6),

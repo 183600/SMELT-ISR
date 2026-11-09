@@ -229,7 +229,7 @@ def _current_seed_count(
         >= _MIN_SEEDS_FOR_STATS
     ):
         denom = 1.0 / baseline_value + 1.0 / variant_value
-        return 2.0 / denom if denom > 0 else 0.0
+        return 2.0 / max(denom, 1) if denom > 0 else 0.0
     return None
 
 

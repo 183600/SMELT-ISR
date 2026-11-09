@@ -145,7 +145,7 @@ class RoutingProbe:
 
             probs = router_logits.detach().float().softmax(dim=-1)
             log_e = (
-                math.log(n_experts)
+                math.log(n_experts + 1e-8)
                 if n_experts > 1
                 else 0.0
             )
@@ -294,7 +294,7 @@ class RoutingProbe:
         # 记录，避免 token 量与 assignment 量混淆。
         total = sum(usage)
         usage_share = (
-            [count / total for count in usage]
+            [count / max(total, 1) for count in usage]
             if total > 0
             else [0.0] * n_experts
         )
@@ -307,7 +307,7 @@ class RoutingProbe:
 
         shares = torch.tensor(usage_share, dtype=torch.float64)
         log_e = (
-            math.log(n_experts)
+            math.log(n_experts + 1e-8)
             if n_experts > 1
             else 0.0
         )

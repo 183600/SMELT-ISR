@@ -827,7 +827,7 @@ class ByteDataset:
         # 会让精确占比（如 40/80）不再是精确值。
         total = max(1, self.num_bytes)
         return {
-            split: (end - begin) / total
+            split: (end - begin) / max(total, 1)
             for split, (begin, end) in self.split_bounds.items()
         }
 

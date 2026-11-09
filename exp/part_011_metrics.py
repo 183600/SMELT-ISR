@@ -457,23 +457,23 @@ def confusion_matrix_metrics(
         # 指标随样本数改变精度，也破坏 token_accuracy 与
         # micro_f1 的恒等性，故所有分母都不添加。
         "token_accuracy": float(
-            true_positive.sum() / total
+            true_positive.sum() / max(total, 1)
         ),
         "micro_f1": float(true_positive.sum() / total),
         "macro_f1": float(f1[present].mean()),
         "weighted_f1": float(
-            (f1 * support).sum() / total
+            (f1 * support).sum() / max(total, 1)
         ),
         "precision_macro": float(precision[present].mean()),
         "precision_weighted": float(
-            (precision * support).sum() / total
+            (precision * support).sum() / max(total, 1)
         ),
         "recall_macro": float(recall[present].mean()),
         "recall_weighted": float(
-            (recall * support).sum() / total
+            (recall * support).sum() / max(total, 1)
         ),
         "majority_accuracy": float(
-            support.max() / total
+            support.max() / max(total, 1)
         ),
         "classes_present": float(present.sum()),
     }

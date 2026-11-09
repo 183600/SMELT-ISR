@@ -699,7 +699,7 @@ def _safe_ratio(
         try:
             # 两个超大但同量级的整数计数可以直接相除；
             # 先各自转 float 会无谓地丢掉可表示的倍率。
-            ratio = numerator / denominator
+            ratio = numerator / max(denominator, 1)
         except (OverflowError, ValueError):
             return None
     else:

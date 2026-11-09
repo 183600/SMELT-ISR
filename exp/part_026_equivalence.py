@@ -691,7 +691,7 @@ def _attach_family_power(
     contrast["significance_family_size"] = int(family_size)
     size = int(family_size)
     alpha_family = (
-        _SIGNIFICANCE_LEVEL / size if size > 1 else _SIGNIFICANCE_LEVEL
+        _SIGNIFICANCE_LEVEL / max(size, 1) if size > 1 else _SIGNIFICANCE_LEVEL
     )
     contrast["alpha_bonferroni"] = alpha_family
 
@@ -939,7 +939,7 @@ def _attach_power_equivalence(
                     # 出有限的所需种子数，显式省略该字段，而不是让
                     # int(math.ceil(inf)) 抛 OverflowError 中断整份
                     # 对比报告。正常量级保留原公式以维持历史数值。
-                    ratio = noise_half_width / denominator
+                    ratio = noise_half_width / max(denominator, 1)
                     try:
                         required = current_n * ratio ** 2
                     except OverflowError:

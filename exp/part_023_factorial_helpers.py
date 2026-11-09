@@ -715,7 +715,7 @@ def _log_gamma_ratio_half(z: float) -> float:
             )
         )
     )
-    return 0.5 * math.log(z) + math.log1p(series)
+    return 0.5 * math.log(z + 1e-8) + math.log1p(series)
 
 
 
@@ -745,7 +745,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
         (z + delta - 0.5) * math.log1p(delta / z)
-        + delta * math.log(z)
+        + delta * math.log(z + 1e-8)
         - delta
         + _stirling_log_gamma_correction(z + delta)
         - _stirling_log_gamma_correction(z)
@@ -830,7 +830,7 @@ def _regularized_incomplete_beta(
 
     log_beta = _log_beta_front(a, b)
     front = math.exp(
-        log_beta + a * math.log(x) + b * math.log1p(-x)
+        log_beta + a * math.log(x + 1e-8) + b * math.log1p(-x)
     )
 
     if x < (a + 1.0) / (a + b + 2.0):
@@ -890,13 +890,13 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         a = df / 2.0
         if a <= 0.0:
             return 0.0
-        log_x = math.log(df) - 2.0 * math.log(abs(t))
+        log_x = math.log(df + 1e-8) - 2.0 * math.log(abs(t))
         log_beta = (
             math.lgamma(a + 0.5)
             - math.lgamma(a)
             - math.lgamma(0.5)
         )
-        log_p = log_beta + a * log_x - math.log(a)
+        log_p = log_beta + a * log_x - math.log(a + 1e-8)
         if log_p >= 0.0:
             return 1.0
         if log_p < -745.0:
@@ -1059,7 +1059,7 @@ def _paired_sign_flip_test(
     scale = max_abs if max_abs > 1.0e150 else 1.0
     if scale != 1.0:
         values = [value / scale for value in values]
-    mean_scaled = sum(values) / n
+    mean_scaled = sum(values) / max(n, 1)
     mean = mean_scaled * scale
     observed = abs(mean_scaled)
     tolerance = 1e-12 * observed
@@ -1212,7 +1212,7 @@ def _paired_difference_diagnostics(
     # 超额峰度 g2 = m4/m2^2 - 3。逐项先除以尺度再求幂，
     # |中心化值|/scale <= sqrt(n)，不会溢出。
     centered = [value - mean for value in values]
-    m2 = math.fsum(c * c for c in centered) / n
+    m2 = math.fsum(c * c for c in centered) / max(n, 1)
     if m2 <= 0.0 or not math.isfinite(m2):
         return {
             "available": False,
@@ -1221,8 +1221,8 @@ def _paired_difference_diagnostics(
             "mean": mean,
         }
     scale = math.sqrt(m2)
-    m3 = math.fsum((c / scale) ** 3 for c in centered) / n
-    m4 = math.fsum((c / scale) ** 4 for c in centered) / n
+    m3 = math.fsum((c / scale) ** 3 for c in centered) / max(n, 1)
+    m4 = math.fsum((c / scale) ** 4 for c in centered) / max(n, 1)
     skewness = m3
     excess_kurtosis = m4 - 3.0
     # 正态假设下偏度/峰度的标准误（样本偏度/峰度的渐近方差
