@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 
 
@@ -266,7 +275,7 @@ class RoutingProbe:
             else:
                 values = [float(v) for v in value]
                 result[name] = (
-                    sum(values) / len(values) if values else float("nan")
+                    sum(values) / max(len(values), 1) if values else float("nan")
                     if values
                     else None
                 )
@@ -339,7 +348,7 @@ class RoutingProbe:
                 for event in events
                 if event.get(field) is not None
             ]
-            return sum(values) / len(values) if values else None
+            return sum(values) / max(len(values), 1) if values else None
 
         return {
             "events": len(events),
@@ -729,17 +738,17 @@ class RoutingProbe:
                     token_metrics or None
                 ),
                 "branch_self_reuse_share": (
-                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
+                    sum(self_reuse_values) / max(len(self_reuse_values), 1) if self_reuse_values else float("nan")
                     if self_reuse_values
                     else None
                 ),
                 "branch_cosine_mean": (
-                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
+                    sum(cosine_values) / max(len(cosine_values), 1) if cosine_values else float("nan")
                     if cosine_values
                     else None
                 ),
                 "branch_cosine_min_pair": (
-                    sum(cosine_min_values) / len(cosine_min_values) if cosine_min_values else float("nan")
+                    sum(cosine_min_values) / max(len(cosine_min_values), 1) if cosine_min_values else float("nan")
                     if cosine_min_values
                     else None
                 ),
@@ -777,7 +786,7 @@ class RoutingProbe:
                     "branch_self_reuse_share",
                     [],
                 ).append(
-                    sum(self_reuse_values) / len(self_reuse_values) if self_reuse_values else float("nan")
+                    sum(self_reuse_values) / max(len(self_reuse_values), 1) if self_reuse_values else float("nan")
                 )
 
             for round_name, summary in (
@@ -802,11 +811,11 @@ class RoutingProbe:
 
             if cosine_values:
                 divergence_values.append(
-                    sum(cosine_values) / len(cosine_values) if cosine_values else float("nan")
+                    sum(cosine_values) / max(len(cosine_values), 1) if cosine_values else float("nan")
                 )
 
         rq3_summary = {
-            name: sum(values) / len(values) if values else float("nan")
+            name: sum(values) / max(len(values), 1) if values else float("nan")
             for name, values in rq3_summary_values.items()
             if values
         }
@@ -814,7 +823,7 @@ class RoutingProbe:
         rq4_summary = {}
         for round_name, field_values in rq4_round_values.items():
             rq4_summary[round_name] = {
-                field: sum(values) / len(values) if values else float("nan")
+                field: sum(values) / max(len(values), 1) if values else float("nan")
                 for field, values in field_values.items()
                 if values
             }
@@ -855,7 +864,7 @@ class RoutingProbe:
                 "summary": {
                     "branch_cosine_mean": (
                         sum(divergence_values)
-                        / len(divergence_values)
+                        / max(len(divergence_values), 1)
                         if divergence_values
                         else None
                     ),
@@ -1565,7 +1574,7 @@ def analyze_routing_interventions(
         mean_delta = sum(finite_deltas) / max(len(finite_deltas), 1)
         variance = sum(
             (value - mean_delta) ** 2 for value in finite_deltas
-        ) / len(finite_deltas)
+        ) / max(len(finite_deltas), 1)
         max_index = max(
             range(len(drop_deltas)),
             key=lambda index: drop_deltas[index],

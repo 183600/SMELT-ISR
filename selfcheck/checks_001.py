@@ -1344,9 +1344,9 @@ def _selfcheck_body_59789_0072():
     dense_losses = [4.0, 4.1, 4.2, 3.9]
     variant_losses = [3.5, 3.6, 3.7, 3.4]
     if str(window_contrasts[0]['variant']) == 'mode=dense':
-        expected_window_diff = ((sum(dense_losses) - sum(variant_losses)) / len(dense_losses)) if dense_losses else float("nan")
+        expected_window_diff = ((sum(dense_losses) - sum(variant_losses)) / max(len(dense_losses), 1)) if dense_losses else float("nan")
     else:
-        expected_window_diff = ((sum(variant_losses) - sum(dense_losses)) / len(dense_losses)) if dense_losses else float("nan")
+        expected_window_diff = ((sum(variant_losses) - sum(dense_losses)) / max(len(dense_losses), 1)) if dense_losses else float("nan")
     assert abs(float(window_paired['mean_loss_diff']) - expected_window_diff) < 1e-12
     assert window_paired['direction_consistent'] is True
     assert window_paired['n_seeds_favoring_variant'] == (1 if expected_window_diff < 0.0 else 0)

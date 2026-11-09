@@ -259,7 +259,7 @@ def _selfcheck_body_61261_0083():
     json.dumps(_json_safe(factorial), ensure_ascii=False)
     def _incomplete_cell(mode_name: str, balance: float, samples: List[Tuple[object, float]]) -> Dict[str, object]:
         values = [value for _, value in samples]
-        return {'label': f'incomplete_{mode_name}_{balance}', 'keys': {'mode': mode_name, 'balance_coef': balance}, 'n_runs': len(samples), 'samples': {'val_loss': [{'seed': seed, 'run': f'incomplete_{mode_name}_{balance}', 'value': value} for seed, value in samples]}, 'val_loss_mean': sum(values) / len(values)}
+        return {'label': f'incomplete_{mode_name}_{balance}', 'keys': {'mode': mode_name, 'balance_coef': balance}, 'n_runs': len(samples), 'samples': {'val_loss': [{'seed': seed, 'run': f'incomplete_{mode_name}_{balance}', 'value': value} for seed, value in samples]}, 'val_loss_mean': sum(values) / max(len(values), 1)}
     incomplete_factorial = factorial_effects([_incomplete_cell('local_base', 0.0, [(1, 3.0), (2, 3.02), (3, 2.98), (None, 3.0)]), _incomplete_cell('A', 0.0, [(1, 2.9), (2, 2.92), (3, 2.88)]), _incomplete_cell('local_base', 0.01, [(1, 2.95), (2, 2.97), (3, 2.93)]), _incomplete_cell('A', 0.01, [(1, 2.85), (2, 2.87), (3, 2.83)])], ['mode', 'balance_coef'], 'val_loss')
     incomplete_delayed = [effect for effect in incomplete_factorial['effects'] if effect['effect_name'] == 'delayed_merge_main'][0]
     assert incomplete_delayed['n_pairs'] == 3

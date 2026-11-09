@@ -222,6 +222,7 @@ class Config:
         # 等计算口径：top_k 个专家的激活参数量。
         return self.top_k * self.expert_hidden
 
+    @torch.no_grad()
     def validate(self):
         if (
             not isinstance(self.mode, str)

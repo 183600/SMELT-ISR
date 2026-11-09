@@ -8,6 +8,7 @@ from __future__ import annotations
 
 # 评估张量不会回流到训练图，此处使用 inference_mode 是安全的。
 @torch.inference_mode()
+@torch.no_grad()
 def evaluate(
     model: LanguageModel,
     dataset: ByteDataset,

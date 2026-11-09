@@ -325,7 +325,7 @@ def _bad_case_report_from_buffers(
             str(case["window_text"])
         ]
     top_cases_window_concentration = (
-        max(window_counts.values()) / len(top_cases)
+        max(window_counts.values()) / max(len(top_cases), 1)
         if top_cases
         else None
     )

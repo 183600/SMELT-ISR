@@ -1574,7 +1574,7 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
                         )
                     ]
                 },
-                "val_loss_mean": sum(values) / len(values),
+                "val_loss_mean": sum(values) / max(len(values), 1),
                 "val_loss_std": 0.1,
                 "n_runs": 3,
                 "effective_seed_count": 3,

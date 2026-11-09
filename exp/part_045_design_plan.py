@@ -880,8 +880,8 @@ def _spearman_correlation(
         return None
     rank_x = _average_ranks(x)
     rank_y = _average_ranks(y)
-    mean_x = (sum(rank_x) / len(rank_x)) if rank_x else float("nan")
-    mean_y = (sum(rank_y) / len(rank_y)) if rank_y else float("nan")
+    mean_x = (sum(rank_x) / max(len(rank_x), 1)) if rank_x else float("nan")
+    mean_y = (sum(rank_y) / max(len(rank_y), 1)) if rank_y else float("nan")
     covariance = sum(
         (a - mean_x) * (b - mean_y)
         for a, b in zip(rank_x, rank_y)
@@ -1023,7 +1023,7 @@ def run_order_drift_report(
             str(entry["mode"]), []
         ).append(float(entry["value"]))
     means = {
-        mode: sum(values) / len(values) if values else float("nan")
+        mode: sum(values) / max(len(values), 1) if values else float("nan")
         for mode, values in mode_means.items()
     }
     # 保留原始整数序号：Spearman 只需要排序与秩，不需要把

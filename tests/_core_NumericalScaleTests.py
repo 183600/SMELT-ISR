@@ -1,5 +1,14 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 class NumericalScaleTests(unittest.TestCase):
     def test_aggregate_interval_omits_unrepresentable_bounds(self):

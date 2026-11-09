@@ -1067,7 +1067,7 @@ def _interval_length_summary(
     return {
         "spans": len(lengths),
         "bytes": sum(lengths),
-        "mean": (round(sum(lengths) / len(lengths)) if lengths else float("nan"), 3),
+        "mean": (round(sum(lengths) / max(len(lengths), 1)) if lengths else float("nan"), 3),
         "median": _quantile(0.5),
         "p90": _quantile(0.9),
         "max": lengths[-1],

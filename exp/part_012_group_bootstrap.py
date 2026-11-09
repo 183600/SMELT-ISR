@@ -175,7 +175,7 @@ def _group_cluster_paired_comparison(
                 for value in loss_differences
                 if value < 0.0
             )
-            / len(loss_differences)
+            / max(len(loss_differences), 1)
         ),
         "bootstrap_ci95": {
             "available": bool(
@@ -1020,12 +1020,12 @@ def macro_auc_metrics(
                     )
 
     pr_auc_macro = (
-        sum(pr_aucs) / len(pr_aucs) if pr_aucs else float("nan")
+        sum(pr_aucs) / max(len(pr_aucs), 1) if pr_aucs else float("nan")
         if pr_aucs
         else None
     )
     pr_auc_macro_chance = (
-        pr_prevalence_sum / len(pr_aucs)
+        pr_prevalence_sum / max(len(pr_aucs), 1)
         if pr_aucs
         else None
     )
@@ -1043,7 +1043,7 @@ def macro_auc_metrics(
             else None
         ),
         "roc_auc_macro": (
-            sum(roc_aucs) / len(roc_aucs) if roc_aucs else float("nan")
+            sum(roc_aucs) / max(len(roc_aucs), 1) if roc_aucs else float("nan")
             if roc_aucs
             else None
         ),

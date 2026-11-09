@@ -194,7 +194,7 @@ def paired_window_comparison(
                 1
                 for value in accuracy_differences
                 if value > 0.0
-            ) / len(accuracy_differences)
+            ) / max(len(accuracy_differences), 1)
         )
     # 默认不把逐窗口差值写进结果（报告体积大）；两层 bootstrap
     # 需要按种子聚集的原始差值，调用方显式要求才返回，并在

@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+# Ensure reproducibility
+import random as _rnd
+_rnd.seed(42)
+try:
+    import numpy as _np
+    _np.random.seed(42)
+except ImportError:
+    pass
+
 
 
 
@@ -1275,7 +1284,7 @@ def _counterbalanced_order(
 
     ordered: List[Dict[str, object]] = []
     for block_index, block_key in enumerate(block_keys):
-        rotation = (start + block_index) % len(base)
+        rotation = (start + block_index) % max(len(base), 1)
         row = base[rotation:] + base[:rotation]
         mapping = keyed_blocks[block_key]
         ordered.extend(dict(mapping[key]) for key in row)
@@ -1381,7 +1390,7 @@ def _williams_order(
 
     ordered: List[Dict[str, object]] = []
     for block_index, block_key in enumerate(block_keys):
-        row = rows[(start + block_index) % len(rows)]
+        row = rows[(start + block_index) % max(len(rows), 1)]
         mapping = keyed_blocks[block_key]
         ordered.extend(
             dict(mapping[randomized[index]]) for index in row
