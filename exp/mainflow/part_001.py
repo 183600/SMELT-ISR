@@ -40,6 +40,8 @@ def _MAIN_part_005():
     if args.resume is not None:
         _truncate_metrics_after_step(metrics_path, start_step)
     metrics_file = open(metrics_path, 'a' if args.resume is not None else 'w', encoding='utf-8')
+    import atexit as _atexit
+    _atexit.register(lambda _f=metrics_file: _f.closed or _f.close())
     if args.resume is None:
         metrics_file.write(json.dumps(_json_safe({'step': 'reference_baselines', **tracking_header_fields(args, dataset, run_metadata, run_started_utc=tracking_provenance.get('run_started_utc'), comparison_protocol_sha256=tracking_provenance.get('comparison_protocol_sha256')), **reference_baselines}), ensure_ascii=False) + '\n')
         metrics_file.flush()

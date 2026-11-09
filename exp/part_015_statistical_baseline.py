@@ -93,6 +93,8 @@ def run_statistical_baseline(
         "w",
         encoding="utf-8",
     )
+    import atexit as _atexit
+    _atexit.register(lambda _f=metrics_file: _f.closed or _f.close())
 
     def _write(record: Dict[str, object]) -> None:
         metrics_file.write(
