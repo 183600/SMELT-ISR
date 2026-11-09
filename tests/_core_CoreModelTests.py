@@ -22,7 +22,6 @@ class CoreModelTests(unittest.TestCase):
                 math.isfinite(output["loss"].item()),
                 mode,
             )
-            optimizer.zero_grad()
             output["loss"].backward()
             if cfg.mode != "dense":
                 grad = model.blocks[0].moe.router.weight.grad

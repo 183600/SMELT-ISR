@@ -475,7 +475,6 @@ def run_sanity_overfit(
 
                 if scaler is not None:
                     if loss_connected:
-                        optimizer.zero_grad()
                         scaler.scale(loss).backward()
 
                         if step == 1:
@@ -506,7 +505,6 @@ def run_sanity_overfit(
                     # grad_probe 的失败证据供上层报告。
                 else:
                     if loss_connected:
-                        optimizer.zero_grad()
                         loss.backward()
 
                         if step == 1:
