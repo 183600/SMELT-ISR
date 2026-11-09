@@ -1,4 +1,3 @@
-import ast
 from __future__ import annotations
 
 def _selfcheck_top_55671_0039():
