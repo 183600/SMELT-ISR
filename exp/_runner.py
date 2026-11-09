@@ -64,7 +64,18 @@ def run_isolated(part_paths, base_globals, owned_names, entry_calls, initial=Non
     namespace = _IsolatedNamespace(base_globals, owned_names)
     for path in part_paths:
         absolute = os.path.abspath(path)
-        exec(compile(_read(absolute), absolute, "exec"), namespace)
+        try:
+            code = compile(_read(absolute), absolute, "exec")
+        except SyntaxError as exc:
+            raise RuntimeError(
+                f"Failed to compile experiment part {absolute!r}: {exc}"
+            ) from exc
+        try:
+            exec(code, namespace)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to execute experiment part {absolute!r}: {exc}"
+            ) from exc
     namespace.finish_loading()
     if initial:
         for key, value in initial.items():
