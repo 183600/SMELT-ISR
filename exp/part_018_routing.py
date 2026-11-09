@@ -280,7 +280,7 @@ class RoutingProbe:
             else:
                 values = [float(v) for v in value]
                 result[name] = (
-                    sum(values) / max(len(values), 1) if values else float("nan")
+                    sum(values) / max(len(values), 1)
                     if values
                     else None
                 )
@@ -743,17 +743,17 @@ class RoutingProbe:
                     token_metrics or None
                 ),
                 "branch_self_reuse_share": (
-                    sum(self_reuse_values) / max(len(self_reuse_values), 1) if self_reuse_values else float("nan")
+                    sum(self_reuse_values) / max(len(self_reuse_values), 1)
                     if self_reuse_values
                     else None
                 ),
                 "branch_cosine_mean": (
-                    sum(cosine_values) / max(len(cosine_values), 1) if cosine_values else float("nan")
+                    sum(cosine_values) / max(len(cosine_values), 1)
                     if cosine_values
                     else None
                 ),
                 "branch_cosine_min_pair": (
-                    sum(cosine_min_values) / max(len(cosine_min_values), 1) if cosine_min_values else float("nan")
+                    sum(cosine_min_values) / max(len(cosine_min_values), 1)
                     if cosine_min_values
                     else None
                 ),
