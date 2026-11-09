@@ -1,18 +1,4 @@
 from __future__ import annotations
-# Ensure reproducibility
-import random as _rnd
-_rnd.seed(42)
-try:
-    import torch as _torch
-    _torch.manual_seed(42)
-except ImportError:
-    pass
-try:
-    import numpy as _np
-    _np.random.seed(42)
-except ImportError:
-    pass
-
 
 
 
