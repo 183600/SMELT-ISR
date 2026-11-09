@@ -453,6 +453,9 @@ def confusion_matrix_metrics(
         }
 
     return {
+        # ``total > 0`` 已在上面保证；分母加绝对 epsilon 会让
+        # 指标随样本数改变精度，也破坏 token_accuracy 与
+        # micro_f1 的恒等性，故所有分母都不添加。
         "token_accuracy": float(
             true_positive.sum() / total
         ),
@@ -634,6 +637,8 @@ def _lag1_autocorrelation(
         denominator = math.sqrt(head_square) * math.sqrt(tail_square)
     if float(denominator) <= 0.0:
         return None
+    # ``denominator > 0`` 已在上面检查；加绝对 epsilon 会随
+    # 归一化后的公共尺度改变相对大小，破坏 ρ̂1 的尺度不变性。
     raw_rho = float((head * tail).sum() / denominator)
     return max(-1.0, min(1.0, raw_rho))
 

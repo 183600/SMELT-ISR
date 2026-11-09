@@ -823,6 +823,8 @@ class ByteDataset:
         """
         各 split 的实际字节占比（吸附到群组边界后的真实值）。
         """
+        # ``total = max(1, ...)`` 已保证分母非零；加绝对 epsilon
+        # 会让精确占比（如 40/80）不再是精确值。
         total = max(1, self.num_bytes)
         return {
             split: (end - begin) / total
