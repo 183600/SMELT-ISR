@@ -64,7 +64,7 @@ def _selfcheck_top_55802_0040():
         with tempfile.TemporaryDirectory() as rng_dir:
             rng_path = Path(rng_dir) / 'rng.pt'
             torch.save({'numpy_rng_state': numpy_payload}, rng_path)
-            loaded_payload = torch.load(rng_path)
+            loaded_payload = torch.load(rng_path, weights_only=False)
         _restore_numpy_rng_state(loaded_payload['numpy_rng_state'])
         assert float(np.random.rand()) == expected_next
     failed_metrics = run_sanity_overfit(sanity_cfg, eval_dataset, eval_device, amp_dtype=None, batch_size=2, steps=1, lr=1e-09, loss_threshold=0.0, acc_threshold=1.0, seed=321)

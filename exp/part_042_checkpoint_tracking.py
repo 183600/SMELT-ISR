@@ -375,9 +375,13 @@ def load_checkpoint(
     filename: str,
     device: torch.device,
 ) -> dict:
+    # weights_only=False: 检查点包含 argparse.Namespace、Python random
+    # state、config dataclass 等非张量对象；PyTorch >= 2.6 默认
+    # weights_only=True 会拒绝反序列化这些对象，导致 resume 失败。
     return torch.load(
         filename,
         map_location=device,
+        weights_only=False,
     )
 
 
@@ -470,9 +474,12 @@ def load_selected_model(
         return None
 
     try:
+        # weights_only=False: 检查点包含非张量对象（config、rng state 等），
+        # PyTorch >= 2.6 默认 weights_only=True 会拒绝加载。
         payload = torch.load(
             path,
             map_location=device,
+            weights_only=False,
         )
     except Exception:
         # best.pt 损坏时回退到最后一步参数，不能中断训练。
