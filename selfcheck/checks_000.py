@@ -21,6 +21,7 @@ def _selfcheck_top_51350_0001():
         result = model(x, y)
         assert result['logits'].shape == (2, 8, 256)
         assert torch.isfinite(result['loss'])
+        optimizer.zero_grad()
         result['loss'].backward()
         gradients = [p.grad for p in model.parameters() if p.grad is not None]
         assert len(gradients) > 0

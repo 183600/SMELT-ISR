@@ -182,7 +182,7 @@ def paired_window_comparison(
         )
     elif accuracy_differences:
         accuracy_mean = (
-            sum(accuracy_differences) / len(accuracy_differences)
+            sum(accuracy_differences) / max(len(accuracy_differences), 1)
         )
         result["accuracy_status"] = "ok"
         result["n_accuracy_windows"] = len(

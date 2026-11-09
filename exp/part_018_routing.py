@@ -1562,7 +1562,7 @@ def analyze_routing_interventions(
         value for value in drop_deltas if math.isfinite(value)
     ]
     if finite_deltas:
-        mean_delta = sum(finite_deltas) / len(finite_deltas)
+        mean_delta = sum(finite_deltas) / max(len(finite_deltas), 1)
         variance = sum(
             (value - mean_delta) ** 2 for value in finite_deltas
         ) / len(finite_deltas)
@@ -1838,7 +1838,7 @@ def routing_intervention_comparison_report(
         ]
         if not finite:
             return None, None
-        mean = sum(finite) / len(finite)
+        mean = sum(finite) / max(len(finite), 1)
         if len(finite) < 2:
             return mean, None
         variance = sum(

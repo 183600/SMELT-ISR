@@ -544,14 +544,14 @@ def _mean(values: List[float]) -> Optional[float]:
         return None
     # 正常量级走原公式，保持历史结果的逐位一致性；只有直接
     # 求和溢出/非有限时才退回缩放计算。
-    direct = sum(numeric) / len(numeric)
+    direct = sum(numeric) / max(len(numeric), 1)
     if math.isfinite(direct):
         return direct
     scale = max(abs(value) for value in numeric)
     if scale == 0.0:
         return 0.0
     total = math.fsum(value / scale for value in numeric)
-    result = (total / len(numeric)) * scale
+    result = (total / max(len(numeric), 1)) * scale
     return result if math.isfinite(result) else None
 
 
@@ -1059,7 +1059,7 @@ def _paired_sign_flip_test(
     scale = max_abs if max_abs > 1.0e150 else 1.0
     if scale != 1.0:
         values = [value / scale for value in values]
-    mean_scaled = sum(values) / n
+    mean_scaled = sum(values) / (n + 1e-8)
     mean = mean_scaled * scale
     observed = abs(mean_scaled)
     tolerance = 1e-12 * observed
@@ -1212,7 +1212,7 @@ def _paired_difference_diagnostics(
     # 超额峰度 g2 = m4/m2^2 - 3。逐项先除以尺度再求幂，
     # |中心化值|/scale <= sqrt(n)，不会溢出。
     centered = [value - mean for value in values]
-    m2 = math.fsum(c * c for c in centered) / n
+    m2 = math.fsum(c * c for c in centered) / (n + 1e-8)
     if m2 <= 0.0 or not math.isfinite(m2):
         return {
             "available": False,
@@ -1221,8 +1221,8 @@ def _paired_difference_diagnostics(
             "mean": mean,
         }
     scale = math.sqrt(m2)
-    m3 = math.fsum((c / scale) ** 3 for c in centered) / n
-    m4 = math.fsum((c / scale) ** 4 for c in centered) / n
+    m3 = math.fsum((c / scale) ** 3 for c in centered) / (n + 1e-8)
+    m4 = math.fsum((c / scale) ** 4 for c in centered) / (n + 1e-8)
     skewness = m3
     excess_kurtosis = m4 - 3.0
     # 正态假设下偏度/峰度的标准误（样本偏度/峰度的渐近方差

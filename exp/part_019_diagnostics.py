@@ -904,6 +904,7 @@ def measure_efficiency(
         with autocast:
             for _ in range(max(0, warmup)):
                 output = model(x, y)
+                optimizer.zero_grad()
                 output["loss"].backward()
                 model.zero_grad(set_to_none=True)
 
@@ -917,6 +918,7 @@ def measure_efficiency(
                     torch.cuda.synchronize(device)
                 start = time.perf_counter()
                 output = model(x, y)
+                optimizer.zero_grad()
                 output["loss"].backward()
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
