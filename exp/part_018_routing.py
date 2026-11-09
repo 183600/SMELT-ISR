@@ -1,3 +1,4 @@
+import ast
 from __future__ import annotations
 
 import hashlib
@@ -898,7 +899,7 @@ def analyze_routing(
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.eval()
+    model.st.literal_eval()
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -1085,7 +1086,7 @@ def _intervention_eval(
     """
     core = _unwrap_model(model)
     was_training = core.training
-    core.eval()
+    core.st.literal_eval()
     use_amp = amp_dtype is not None and device.type == "cuda"
     total_loss = 0.0
     total_tokens = 0

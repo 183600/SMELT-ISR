@@ -1,3 +1,4 @@
+import ast
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
@@ -700,7 +701,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()
+            ).st.literal_eval()
             group_sink = []
             metrics = experiment.evaluate(
                 model,
@@ -738,7 +739,7 @@ class GroupClusterRegressionTests(unittest.TestCase):
             )
             model = experiment.LanguageModel(
                 _tiny_config(seq_len=4)
-            ).eval()
+            ).st.literal_eval()
             group_sink = []
             experiment.evaluate(
                 model,

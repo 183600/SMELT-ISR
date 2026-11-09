@@ -1,3 +1,4 @@
+import ast
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
@@ -63,10 +64,10 @@ class CoreModelTests(unittest.TestCase):
         ):
             first = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=left)
-            ).eval()
+            ).st.literal_eval()
             second = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=right)
-            ).eval()
+            ).st.literal_eval()
             second.load_state_dict(first.state_dict())
             with torch.no_grad():
                 a = first(x)["logits"]

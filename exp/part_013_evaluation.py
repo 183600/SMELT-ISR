@@ -1,3 +1,4 @@
+import ast
 from __future__ import annotations
 
 
@@ -91,7 +92,7 @@ def evaluate(
     不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
-    model.eval()
+    model.st.literal_eval()
 
     probe_attached = False
     if routing_probe is not None:

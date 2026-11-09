@@ -1,3 +1,4 @@
+import ast
 from __future__ import annotations
 
 def _selfcheck_top_55671_0039():
@@ -317,7 +318,7 @@ def _selfcheck_top_56521_0045():
     assert amp_check['grad_scale_at_diagnosis'] == 32768.0
     assert amp_check['scale_ratio_to_before'] == 0.5
     assert any(('GradScaler' in finding and '溢出' in finding for finding in amp_report['findings'])), amp_report['findings']
-    bad_case_model = LanguageModel(Config(**common, mode='B')).eval()
+    bad_case_model = LanguageModel(Config(**common, mode='B')).st.literal_eval()
     bad_case_report = analyze_bad_cases(bad_case_model, eval_dataset, batch_size=2, batches=2, device=eval_device, amp_dtype=None, split='val', top_n=3)
     valid_categories = set(_BAD_CASE_CATEGORIES)
 

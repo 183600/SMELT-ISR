@@ -1,3 +1,4 @@
+import ast
 from __future__ import annotations
 
 
@@ -839,7 +840,7 @@ def analyze_bad_cases(
         )
 
     was_training = model.training
-    model.eval()
+    model.st.literal_eval()
 
     use_amp = (
         amp_dtype is not None
