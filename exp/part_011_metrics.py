@@ -454,20 +454,20 @@ def confusion_matrix_metrics(
 
     return {
         "token_accuracy": float(
-            true_positive.sum() / (total + 1e-8)
+            true_positive.sum() / total
         ),
         "micro_f1": float(true_positive.sum() / total),
         "macro_f1": float(f1[present].mean()),
         "weighted_f1": float(
-            (f1 * support).sum() / (total + 1e-8)
+            (f1 * support).sum() / total
         ),
         "precision_macro": float(precision[present].mean()),
         "precision_weighted": float(
-            (precision * support).sum() / (total + 1e-8)
+            (precision * support).sum() / total
         ),
         "recall_macro": float(recall[present].mean()),
         "recall_weighted": float(
-            (recall * support).sum() / (total + 1e-8)
+            (recall * support).sum() / total
         ),
         "majority_accuracy": float(
             support.max() / total
@@ -634,7 +634,7 @@ def _lag1_autocorrelation(
         denominator = math.sqrt(head_square) * math.sqrt(tail_square)
     if float(denominator) <= 0.0:
         return None
-    raw_rho = float((head * tail).sum() / (denominator + 1e-8))
+    raw_rho = float((head * tail).sum() / denominator)
     return max(-1.0, min(1.0, raw_rho))
 
 

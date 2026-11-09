@@ -825,7 +825,7 @@ class ByteDataset:
         """
         total = max(1, self.num_bytes)
         return {
-            split: (end - begin) / (total + 1e-8)
+            split: (end - begin) / total
             for split, (begin, end) in self.split_bounds.items()
         }
 
