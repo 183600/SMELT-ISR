@@ -96,7 +96,7 @@ def _cost_comparison(
                     ):
                         df = (
                             (scaled_a + scaled_b) ** 2
-                            / max(denominator, 1)
+                            / denominator
                         )
                         critical = _t_critical(
                             df,

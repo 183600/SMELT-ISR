@@ -626,7 +626,7 @@ def _bootstrap_eval_intervals(
         2.0
         * precision[nonzero]
         * recall[nonzero]
-        / max(denominator, 1)[nonzero]
+        / denominator[nonzero]
     )
     # 每个重采样都有自己的类别集合：只对本次抽样中 support>0
     # 的类求平均。固定全量类别集合会把「本次抽样恰好没有该

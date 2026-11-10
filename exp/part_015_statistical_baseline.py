@@ -1222,7 +1222,7 @@ def _sparkline(values, width=48):
                 len(_SPARK_BLOCKS) - 1,
                 int(
                     (value - low)
-                    / max(high - low, 1)
+                    / (high - low)
                     * (len(_SPARK_BLOCKS) - 1)
                     + 0.5
                 ),

@@ -433,7 +433,7 @@ def confusion_matrix_metrics(
         2.0
         * precision[nonzero]
         * recall[nonzero]
-        / max(denominator, 1)[nonzero]
+        / denominator[nonzero]
     )
 
     present = support > 0.0
@@ -639,7 +639,7 @@ def _lag1_autocorrelation(
         return None
     # ``denominator > 0`` 已在上面检查；加绝对 epsilon 会随
     # 归一化后的公共尺度改变相对大小，破坏 ρ̂1 的尺度不变性。
-    raw_rho = float((head * tail).sum() / max(denominator, 1))
+    raw_rho = float((head * tail).sum() / denominator)
     return max(-1.0, min(1.0, raw_rho))
 
 
