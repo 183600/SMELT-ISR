@@ -520,7 +520,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
             if ratio == 0.0:
                 return 0.0, 1.0
             eta_squared = 2.0 * (
-                ratio - 1.0 - math.log(ratio + 1e-8)
+                ratio - 1.0 - math.log(ratio)
             )
         if eta_squared < 0.0:
             eta_squared = 0.0
@@ -589,7 +589,7 @@ def _regularized_incomplete_gamma_parts(
         return 0.0, 1.0
     if a >= _GAMMA_TEMME_MIN_A:
         return _gamma_parts_temme(a, x)
-    log_prefactor = -x + a * math.log(x + 1e-8) - math.lgamma(a)
+    log_prefactor = -x + a * math.log(x) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
         total = term

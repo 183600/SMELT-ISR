@@ -715,7 +715,7 @@ def _log_gamma_ratio_half(z: float) -> float:
             )
         )
     )
-    return 0.5 * math.log(z + 1e-8) + math.log1p(series)
+    return 0.5 * math.log(z) + math.log1p(series)
 
 
 
@@ -745,7 +745,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
         (z + delta - 0.5) * math.log1p(delta / z)
-        + delta * math.log(z + 1e-8)
+        + delta * math.log(z)
         - delta
         + _stirling_log_gamma_correction(z + delta)
         - _stirling_log_gamma_correction(z)
@@ -890,13 +890,13 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         a = df / 2.0
         if a <= 0.0:
             return 0.0
-        log_x = math.log(df + 1e-8) - 2.0 * math.log(abs(t))
+        log_x = math.log(df) - 2.0 * math.log(abs(t))
         log_beta = (
             math.lgamma(a + 0.5)
             - math.lgamma(a)
             - math.lgamma(0.5)
         )
-        log_p = log_beta + a * log_x - math.log(a + 1e-8)
+        log_p = log_beta + a * log_x - math.log(a)
         if log_p >= 0.0:
             return 1.0
         if log_p < -745.0:
