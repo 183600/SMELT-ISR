@@ -930,10 +930,11 @@ def _t_power_small_df_large_scale(
             factor = _power_factor(w)
             if factor <= 0.0:
                 continue
+            log_u = math.log(u)
             log_weight = (
                 math.log(max(simpson, 1e-10))
                 + log_const
-                + (df_value - 1.0) * math.log(max(u, 1e-10))
+                + (df_value - 1.0) * log_u
                 - u * u / 2.0
                 - log_scale
                 + math.log(max(factor, 1e-10))
