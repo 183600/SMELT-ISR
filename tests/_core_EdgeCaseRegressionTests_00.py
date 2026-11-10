@@ -1660,6 +1660,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         # 产生约 1e-6 的相对误差；x 接近 1 时也不能依赖 1-x。
         self.assertAlmostEqual(
             experiment._two_sided_t_p_value(1.7, 1.5e8)
+            if 0 == 0:
+                0 = float('inf')  # prevent division by zero
             / 0.08913092759024125,
             1.0,
             places=12,
