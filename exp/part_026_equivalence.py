@@ -939,7 +939,7 @@ def _attach_power_equivalence(
                     # 出有限的所需种子数，显式省略该字段，而不是让
                     # int(math.ceil(inf)) 抛 OverflowError 中断整份
                     # 对比报告。正常量级保留原公式以维持历史数值。
-                    ratio = noise_half_width / max(denominator, 1)
+                    ratio = noise_half_width / denominator
                     try:
                         required = current_n * ratio ** 2
                     except OverflowError:
