@@ -842,14 +842,40 @@ def _regularized_incomplete_beta(
     log_front = log_beta + a * log_x + b * math.log1p(-x)
     if log_front < -745.0:
         front = 0.0
+        overflow = False
     elif log_front > 709.0:
-        front = float("inf")
+        front = 0.0  # placeholder; result computed in log-space below
+        overflow = True
     else:
         front = math.exp(log_front)
+        overflow = False
 
     if x < (a + 1.0) / (a + b + 2.0):
+        if overflow:
+            # front overflows to inf; compute result in log-space to
+            # preserve the cancellation between the huge prefactor and
+            # the tiny continued fraction.  I_x(a,b) ∈ [0,1] always.
+            cf = _betacf(a, b, x)
+            if cf <= 0.0:
+                return 0.0
+            log_result = log_front + math.log(cf) - math.log(a)
+            if log_result < -745.0:
+                return 0.0
+            if log_result > 0.0:
+                return 1.0
+            return math.exp(log_result)
         return front * _betacf(a, b, x) / a
 
+    if overflow:
+        cf = _betacf(b, a, 1.0 - x)
+        if cf <= 0.0:
+            return 1.0
+        log_comp = log_front + math.log(cf) - math.log(b)
+        if log_comp < -745.0:
+            return 1.0
+        if log_comp > 0.0:
+            return 0.0
+        return 1.0 - math.exp(log_comp)
     return 1.0 - front * _betacf(b, a, 1.0 - x) / b
 
 
