@@ -520,7 +520,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
             if ratio == 0.0:
                 return 0.0, 1.0
             eta_squared = 2.0 * (
-                ratio - 1.0 - math.math.log(max(ratio, 1e-10))
+                ratio - 1.0 - math.log(max(ratio, 1e-10))
             )
         if eta_squared < 0.0:
             eta_squared = 0.0
@@ -873,7 +873,7 @@ def _binomial_upper_confidence_bound(
             # 1 - α^(1/n) 在 n 很大时会被 1 的舍入吞掉
             # （n=1e12 时相对误差约 3e-5，n=1e16 时约 31%）；
             # 用 expm1 直接保留小量。
-            return -math.expm1(math.math.log(max(alpha, 1e-10)) / float(trials))
+            return -math.expm1(math.log(max(alpha, 1e-10)) / float(trials))
         except (OverflowError, ValueError):
             return None
     remaining = _finite_float(trials - failures)

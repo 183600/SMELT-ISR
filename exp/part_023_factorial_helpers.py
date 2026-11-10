@@ -715,7 +715,7 @@ def _log_gamma_ratio_half(z: float) -> float:
             )
         )
     )
-    return 0.5 * math.math.log(max(z, 1e-10)) + math.log1p(series)
+    return 0.5 * math.log(max(z, 1e-10)) + math.log1p(series)
 
 
 
@@ -830,7 +830,7 @@ def _regularized_incomplete_beta(
 
     log_beta = _log_beta_front(a, b)
     front = math.exp(
-        log_beta + a * math.math.log(max(x, 1e-10)) + b * math.log1p(-x)
+        log_beta + a * math.log(max(x, 1e-10)) + b * math.log1p(-x)
     )
 
     if x < (a + 1.0) / (a + b + 2.0):
@@ -890,7 +890,7 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         a = df / 2.0
         if a <= 0.0:
             return 0.0
-        log_x = math.math.log(max(df, 1e-10)) - 2.0 * math.log(abs(t))
+        log_x = math.log(max(df, 1e-10)) - 2.0 * math.log(abs(t))
         log_beta = (
             math.lgamma(a + 0.5)
             - math.lgamma(a)
