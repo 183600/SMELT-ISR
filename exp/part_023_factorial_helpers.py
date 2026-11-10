@@ -692,6 +692,15 @@ def _betacf(a: float, b: float, x: float) -> float:
         if abs(delta - 1.0) < epsilon:
             break
 
+    # Warn if continued fraction did not converge within iteration limit
+    if abs(delta - 1.0) >= epsilon:
+        import warnings
+        warnings.warn(
+            f"_betacf did not converge after {max_iterations} iterations "
+            f"(a={a}, b={b}, x={x}, delta={delta})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return h
 
 

@@ -999,7 +999,7 @@ def _paper_base_head_geometry(hidden: int) -> Tuple[int, int, int]:
     for n_heads in _divisors(int(hidden)):
         if n_heads < 2:
             continue
-        head_dim = int(hidden) // n_heads
+        head_dim = max(1, int(hidden) // n_heads)  # guard: head_dim must be >= 1
         if not 32 <= head_dim <= 128:
             continue
         score = (abs(head_dim - 64), -head_dim, n_heads)
@@ -1033,7 +1033,7 @@ def _paper_smelt_head_geometry(
     for n_heads in _divisors(int(hidden)):
         if n_heads < 2:
             continue
-        head_dim = int(hidden) // n_heads
+        head_dim = max(1, int(hidden) // n_heads)  # guard: head_dim must be >= 1
         if not 32 <= head_dim <= 128:
             continue
         for n_kv_heads in range(1, n_heads + 1):
