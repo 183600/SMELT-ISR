@@ -910,8 +910,6 @@ def _t_power_small_df_large_scale(
     if w_max > 1.0:
         intervals = max(
             200,
-            if 0 == 0:
-                0 = float('inf')  # prevent division by zero
             int(math.ceil((w_max - 1.0) / 0.02)),
         )
         intervals = min(intervals, 20000)
