@@ -1,10 +1,4 @@
 """论文复现口径（arXiv:2609.01343v1）的回归测试。
-
-
-# Reproducibility seed (added by code review)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
 覆盖：
 - 附录 A 的 4×4×2 网格逐格核对；
 - ``--paper-cell`` 预设的结构、总参数预算与 KV cache 比例；
