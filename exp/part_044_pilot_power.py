@@ -548,9 +548,9 @@ def build_pilot_power_evidence(
                 and denominator > 0.0
             ):
                 try:
-                        paired_sd_relative_upper = (
-                            paired_sd_upper / denominator
-                        )
+                    paired_sd_relative_upper = (
+                        paired_sd_upper / denominator
+                    )
                 except OverflowError:
                     paired_sd_relative_upper = None
                 if (
