@@ -220,7 +220,7 @@ def _non_expert_parameter_digest(
         digest.update(str(tuple(raw.shape)).encode("ascii"))
         raw_bytes = raw.reshape(-1).view(torch.uint8)
         try:
-            payload = raw_bytes.numpy().tobytes()
+            payload = raw_bytes.cpu().numpy().tobytes()
         except (TypeError, RuntimeError):
             payload = bytes(raw_bytes.tolist())
         digest.update(payload)
@@ -277,7 +277,7 @@ def _batch_sha256(
         digest.update(str(tuple(cpu.shape)).encode("ascii"))
         raw = cpu.view(torch.uint8)
         if np is not None:
-            digest.update(raw.numpy().tobytes())
+            digest.update(raw.cpu().numpy().tobytes())
         else:
             digest.update(bytes(raw.tolist()))
 

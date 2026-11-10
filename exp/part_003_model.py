@@ -1365,7 +1365,7 @@ def _tensor_content_sha256(tensor: torch.Tensor) -> str:
         .contiguous()
     )
     try:
-        payload = array.numpy().tobytes()
+        payload = array.cpu().numpy().tobytes()
     except (TypeError, RuntimeError):
         payload = bytes(
             array.reshape(-1).view(torch.uint8).tolist()
