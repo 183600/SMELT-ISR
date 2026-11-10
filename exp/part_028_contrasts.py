@@ -87,8 +87,8 @@ def _cost_comparison(
                     scaled_a = term_a / scale_term
                     scaled_b = term_b / scale_term
                     denominator = (
-                        scaled_a * scaled_a / (n_a - 1)
-                        + scaled_b * scaled_b / (n_b - 1)
+                        scaled_a * scaled_a / max(n_a - 1, 1)
+                        + scaled_b * scaled_b / max(n_b - 1, 1)
                     )
                     if (
                         denominator > 0.0
@@ -96,7 +96,7 @@ def _cost_comparison(
                     ):
                         df = (
                             (scaled_a + scaled_b) ** 2
-                            / denominator
+                            / max(denominator, 1)
                         )
                         critical = _t_critical(
                             df,

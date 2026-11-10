@@ -1402,7 +1402,7 @@ class NgramBaseline:
 
             updated = probabilities[
                 positions
-            ] * (alpha / denominator.unsqueeze(1))
+            ] * (alpha / max(denominator, 1).unsqueeze(1))
 
             # 同一 ctx 的 (ctx, c) 对在升序 pair_keys 中
             # 连续：散射该 ctx 的全部非零计数行。
@@ -1444,7 +1444,7 @@ class NgramBaseline:
                 updated.index_put_(
                     (row_of, classes),
                     counts
-                    / denominator[row_of],
+                    / max(denominator, 1)[row_of],
                     accumulate=True,
                 )
 

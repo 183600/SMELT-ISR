@@ -1127,7 +1127,7 @@ def _exact_sign_test(
         tail = sum(
             math.comb(n, index)
             for index in range(min(positives, negatives) + 1)
-        ) / denominator
+        ) / max(denominator, 1)
         p_value = min(1.0, 2.0 * tail)
         # math.ldexp 直接给出 2^(1-n)，n 极大时安全地下溢到 0。
         min_attainable = min(1.0, math.ldexp(2.0, -n))

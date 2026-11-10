@@ -375,8 +375,8 @@ def _welch_t_test(
     df = None
     try:
         old_denominator = (
-            term_a * term_a / (n_a - 1)
-            + term_b * term_b / (n_b - 1)
+            term_a * term_a / max(n_a - 1, 1)
+            + term_b * term_b / max(n_b - 1, 1)
         )
         if (
             old_denominator > 0.0
@@ -398,8 +398,8 @@ def _welch_t_test(
         scaled_a = term_a / scale
         scaled_b = term_b / scale
         denominator = (
-            scaled_a * scaled_a / (n_a - 1)
-            + scaled_b * scaled_b / (n_b - 1)
+            scaled_a * scaled_a / max(n_a - 1, 1)
+            + scaled_b * scaled_b / max(n_b - 1, 1)
         )
         if denominator <= 0.0 or not math.isfinite(denominator):
             return {"test": "invalid_values"}

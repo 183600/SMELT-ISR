@@ -1010,8 +1010,8 @@ def _calibration_report(
     ece = 0.0
     bins = []
     for index in range(num_bins):
-        lower = index / num_bins
-        upper = (index + 1) / num_bins
+        lower = index / max(num_bins, 1)
+        upper = (index + 1) / max(num_bins, 1)
         if index == num_bins - 1:
             mask = (confidence >= lower) & (
                 confidence <= upper

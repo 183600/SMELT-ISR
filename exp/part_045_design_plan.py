@@ -1039,7 +1039,7 @@ def run_order_drift_report(
     if rho is not None and len(entries) > 2:
         denominator = max(1e-12, 1.0 - rho * rho)
         statistic = rho * math.sqrt(
-            (len(entries) - 2) / denominator
+            (len(entries) - 2) / max(denominator, 1)
         )
         p_value = _two_sided_t_p_value(
             statistic, float(len(entries) - 2)
@@ -1071,7 +1071,7 @@ def run_order_drift_report(
         if mode_rho is not None and len(mode_entries) > 2:
             denominator = max(1e-12, 1.0 - mode_rho * mode_rho)
             statistic = mode_rho * math.sqrt(
-                (len(mode_entries) - 2) / denominator
+                (len(mode_entries) - 2) / max(denominator, 1)
             )
             mode_p = _two_sided_t_p_value(
                 statistic, float(len(mode_entries) - 2)

@@ -530,7 +530,7 @@ def build_pilot_power_evidence(
                 and denominator > 0.0
             ):
                 try:
-                    paired_sd_relative = paired_sd / denominator
+                    paired_sd_relative = paired_sd / max(denominator, 1)
                 except OverflowError:
                     paired_sd_relative = None
                 if (
@@ -549,7 +549,7 @@ def build_pilot_power_evidence(
             ):
                 try:
                     paired_sd_relative_upper = (
-                        paired_sd_upper / denominator
+                        paired_sd_upper / max(denominator, 1)
                     )
                 except OverflowError:
                     paired_sd_relative_upper = None
@@ -665,7 +665,7 @@ def build_pilot_power_evidence(
                 and denominator > 0.0
             ):
                     level_relative_values.append(
-                        upper / denominator
+                        upper / max(denominator, 1)
                     )
         level_attrition_values = [
             _binomial_upper_confidence_bound(

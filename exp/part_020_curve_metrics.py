@@ -107,7 +107,7 @@ def _interpolate_curve(
         if x <= x_next:
             if x == x_next:
                 return y_next, "exact_eval_point"
-            ratio = (x - x_prev) / (x_next - x_prev)
+            ratio = (x - x_prev) / max(x_next - x_prev, 1)
             direct = y_prev + ratio * (y_next - y_prev)
             if math.isfinite(direct):
                 return direct, "linear_between_evals"
