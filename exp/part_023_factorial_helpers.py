@@ -830,7 +830,7 @@ def _regularized_incomplete_beta(
 
     log_beta = _log_beta_front(a, b)
     front = math.exp(
-        log_beta + a * math.log(x + 1e-8) + b * math.log1p(-x)
+        log_beta + a * math.log(x) + b * math.log1p(-x)
     )
 
     if x < (a + 1.0) / (a + b + 2.0):

@@ -826,7 +826,7 @@ def _binomial_lower_tail_probability(
         return 1.0
     if probability >= 1.0:
         return 0.0 if failures < trials else 1.0
-    log_p = math.log(probability + 1e-8)
+    log_p = math.log(probability)
     log_q = math.log1p(-probability)
     log_term = trials * log_q
     total = math.exp(log_term) if log_term > -745.0 else 0.0
@@ -873,7 +873,7 @@ def _binomial_upper_confidence_bound(
             # 1 - α^(1/n) 在 n 很大时会被 1 的舍入吞掉
             # （n=1e12 时相对误差约 3e-5，n=1e16 时约 31%）；
             # 用 expm1 直接保留小量。
-            return -math.expm1(math.log(alpha + 1e-8) / float(trials))
+            return -math.expm1(math.log(alpha) / float(trials))
         except (OverflowError, ValueError):
             return None
     remaining = _finite_float(trials - failures)
