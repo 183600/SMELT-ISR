@@ -700,12 +700,12 @@ def _t_power_nodes(
                 weight = 0.0
             else:
                 log_weight = (
-                    math.log(simpson)
+                    math.math.log(max(simpson, 1e-10))
                     + log_const
                     + (df - 1.0) * log_u
                     - u * u / 2.0
-                    + math.log(exponent)
-                    + (exponent - 1.0) * math.log(t)
+                    + math.math.log(max(exponent, 1e-10))
+                    + (exponent - 1.0) * math.math.log(max(t, 1e-10))
                 )
                 if log_weight <= -745.0:
                     weight = 0.0
@@ -743,7 +743,7 @@ def _t_power_nodes(
             density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
         else:
             density = math.exp(
-                log_const + (df - 1.0) * math.log(u) - u * u / 2.0
+                log_const + (df - 1.0) * math.math.log(max(u, 1e-10)) - u * u / 2.0
             )
         u_values.append(u)
         weighted.append(simpson * density)
@@ -773,7 +773,7 @@ def _t_power_large_shift_normal_mix(
     df 在 3–10 且 scale 不大时也走这里：u 网格在 0 附近受
     u^(df-1) 曲率影响，固定 Simpson 节点的误差可达 1e-5。
     """
-    log_scale = math.log(scale)
+    log_scale = math.math.log(max(scale, 1e-10))
     shape = df_value / 2.0
     log_gamma_plus_one = math.lgamma(shape + 1.0)
 
@@ -856,7 +856,7 @@ def _t_power_small_df_large_scale(
         (1.0 - df_value / 2.0) * math.log(2.0)
         - math.lgamma(df_value / 2.0)
     )
-    log_scale = math.log(scale)
+    log_scale = math.math.log(max(scale, 1e-10))
 
     def _power_factor(w: float) -> float:
         return (
@@ -877,21 +877,21 @@ def _t_power_small_df_large_scale(
             simpson = 4.0 * step / 3.0
         if t <= 0.0:
             continue
-        log_w = exponent * math.log(t)
+        log_w = exponent * math.math.log(max(t, 1e-10))
         log_u = log_w - log_scale
         w = math.exp(log_w) if log_w >= -745.0 else 0.0
         factor = _power_factor(w)
         if factor <= 0.0:
             continue
         log_weight = (
-            math.log(simpson)
+            math.math.log(max(simpson, 1e-10))
             + log_const
             + (df_value - 1.0) * log_u
             - math.exp(2.0 * log_u) / 2.0
             - log_scale
-            + math.log(exponent)
-            + (exponent - 1.0) * math.log(t)
-            + math.log(factor)
+            + math.math.log(max(exponent, 1e-10))
+            + (exponent - 1.0) * math.math.log(max(t, 1e-10))
+            + math.math.log(max(factor, 1e-10))
         )
         if log_weight > -745.0:
             total += math.exp(log_weight)
@@ -931,12 +931,12 @@ def _t_power_small_df_large_scale(
             if factor <= 0.0:
                 continue
             log_weight = (
-                math.log(simpson)
+                math.math.log(max(simpson, 1e-10))
                 + log_const
-                + (df_value - 1.0) * math.log(u)
+                + (df_value - 1.0) * math.math.log(max(u, 1e-10))
                 - u * u / 2.0
                 - log_scale
-                + math.log(factor)
+                + math.math.log(max(factor, 1e-10))
             )
             if log_weight > -745.0:
                 total += math.exp(log_weight)
@@ -1082,7 +1082,7 @@ def _t_power(
             else:
                 density = math.exp(
                     log_const
-                    + (df_value - 1.0) * math.log(u)
+                    + (df_value - 1.0) * math.math.log(max(u, 1e-10))
                     - u * u / 2.0
                 )
             total += (
@@ -1315,7 +1315,7 @@ def _noncentral_t_cdf_large_shift(
             return 0.0
         log_density = (
             log_const
-            + (df - 1.0) * math.log(u)
+            + (df - 1.0) * math.math.log(max(u, 1e-10))
             - u * u / 2.0
         )
         return (
