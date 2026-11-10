@@ -1086,7 +1086,7 @@ def _top_byte_summary(
     k = min(top_k, int(counts.numel()))
     values, indices = torch.topk(counts, k=k)
     return [
-        [int(byte), round(float(value) / total, 6)]
+        [int(byte), round(float(value) / max(total, 1), 6)]
         for value, byte in zip(values.tolist(), indices.tolist())
     ]
 

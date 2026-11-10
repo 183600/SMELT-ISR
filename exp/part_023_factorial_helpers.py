@@ -1081,7 +1081,7 @@ def _paired_sign_flip_test(
                     sign * value
                     for sign, value in zip(signs, values)
                 )
-            ) / n
+            ) / max(n, 1)
             if statistic >= observed - tolerance:
                 count += 1
         permutations = 2 ** n
@@ -1102,7 +1102,7 @@ def _paired_sign_flip_test(
         tensor = torch.tensor(values, dtype=torch.float64)
         statistics = (
             signs * tensor
-        ).sum(dim=1).abs() / n
+        ).sum(dim=1).abs() / max(n, 1)
         count = int(
             (statistics >= observed - tolerance).sum().item()
         )

@@ -989,7 +989,7 @@ def _calibration_report(
     计算 top1 置信度的可靠性（ECE）与过度自信程度。
 
     ``confidence`` 是每 token 的 top1 概率，``correct`` 是
-    top1 是否命中目标。ECE = Σ (n_bin / N) · |acc_bin − conf_bin|，
+    top1 是否命中目标。ECE = Σ (n_bin / max(N, 1)) · |acc_bin − conf_bin|，
     按等宽概率分箱；它直接回答「模型说 90% 时是否真的对 90%」，
     这是 accuracy/loss 都看不出来的性质。
     """
