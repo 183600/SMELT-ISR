@@ -248,24 +248,24 @@ def _selfcheck_top_52048_0009():
     assert merged.dtype == torch.bfloat16
     assert torch.equal(merged, torch.tensor([[2.0] * 4, [1.0] * 4, [3.0] * 4], dtype=torch.bfloat16))
     single_cfg = dict(common, top_k=1, k1=1, k2=1)
-    smelt = LanguageModel(Config(**single_cfg, mode='smelt')).eval()  # SECURITY: eval() usage - manual review needed
-    branch = LanguageModel(Config(**single_cfg, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    smelt = LanguageModel(Config(**single_cfg, mode='smelt')).eval()
+    branch = LanguageModel(Config(**single_cfg, mode='B')).eval()
     branch.load_state_dict(smelt.state_dict())
     with torch.no_grad():
         a = smelt(x)['logits']
         b = branch(x)['logits']
     torch.testing.assert_close(a, b, rtol=1e-05, atol=1e-06)
     local_cfg = dict(common, k1=1)
-    local_base = LanguageModel(Config(**local_cfg, mode='local_base')).eval()  # SECURITY: eval() usage - manual review needed
-    delayed = LanguageModel(Config(**local_cfg, mode='A')).eval()  # SECURITY: eval() usage - manual review needed
+    local_base = LanguageModel(Config(**local_cfg, mode='local_base')).eval()
+    delayed = LanguageModel(Config(**local_cfg, mode='A')).eval()
     delayed.load_state_dict(local_base.state_dict())
     with torch.no_grad():
         a = local_base(x)['logits']
         b = delayed(x)['logits']
     torch.testing.assert_close(a, b, rtol=1e-05, atol=1e-06)
-    ckpt_model = LanguageModel(Config(**common, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    ckpt_model = LanguageModel(Config(**common, mode='B')).eval()
     ckpt_model.grad_checkpoint = True
-    plain_model = LanguageModel(Config(**common, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    plain_model = LanguageModel(Config(**common, mode='B')).eval()
     plain_model.load_state_dict(ckpt_model.state_dict())
     with torch.no_grad():
         a = ckpt_model(x)['logits']
@@ -276,7 +276,7 @@ def _selfcheck_top_52048_0009():
     ckpt_loss = ckpt_model(x, y)['loss']
     ckpt_loss.backward()
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
-    causal_model = LanguageModel(Config(**common, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    causal_model = LanguageModel(Config(**common, mode='B')).eval()
     x_changed = x.clone()
     x_changed[:, -1] = (x_changed[:, -1] + 1) % 256
 
@@ -286,7 +286,7 @@ def _selfcheck_top_52201_0010():
         logits_original = causal_model(x)['logits']
         logits_changed = causal_model(x_changed)['logits']
     torch.testing.assert_close(logits_original[:, :-1], logits_changed[:, :-1], rtol=1e-05, atol=1e-06)
-    model = LanguageModel(Config(**common, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    model = LanguageModel(Config(**common, mode='B')).eval()
     block = model.blocks[model.middle_start]
     branches = torch.randn(2, 2, 8, 16)
     changed = branches.clone()
@@ -392,7 +392,7 @@ def _selfcheck_top_52478_0015():
     assert torch.equal(val_starts.sort().values, val_starts.unique(sorted=True))
     assert overfull_empty[0].numel() == 0
     assert overfull_empty[1].numel() == 0
-    eval_model = LanguageModel(Config(**common, mode='B')).eval()  # SECURITY: eval() usage - manual review needed
+    eval_model = LanguageModel(Config(**common, mode='B')).eval()
     val_metrics = evaluate(eval_model, eval_dataset, 2, 1, eval_device)
     assert 'val_loss' in val_metrics
     assert 'val_ppl' in val_metrics

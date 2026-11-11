@@ -298,7 +298,7 @@ class RoutingTests(unittest.TestCase):
         experiment.set_seed(5)
         model = experiment.LanguageModel(cfg)
         dataset = _FixedEvalDataset(cfg.seq_len)
-        evaluation = experiment._intervention_eval(  # SECURITY: eval() usage - manual review needed
+        evaluation = experiment._intervention_eval(
             model,
             dataset,
             batch_size=2,
