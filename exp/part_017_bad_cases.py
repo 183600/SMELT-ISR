@@ -152,7 +152,7 @@ def _bad_case_report_from_buffers(
         if count <= 0:
             break
         top_confusions.append([
-            int(index) // max(vocab_size, 1e-10),
+            int(index) // max(vocab_size, 1),
             int(index) % vocab_size,
             int(count),
         ])
