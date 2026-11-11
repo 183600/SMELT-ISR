@@ -1383,7 +1383,7 @@ def _noncentral_t_cdf_large_shift(
             step = width / intervals
             for index in range(intervals + 1):
                 argument = low + index * step
-                u = (argument + noncentrality) / max(a, 1e-10)
+                u = (argument + noncentrality) / a
                 integrand = (
                     density(u) / max(scale, 1e-10)
                     * normal_cdf(argument)
