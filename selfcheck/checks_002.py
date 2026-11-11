@@ -1196,7 +1196,7 @@ def _selfcheck_top_1_0113():
 def _selfcheck_top_65164_0114():
     global _write_cost_run
     def _write_cost_run(base_dir: str, name: str, mode: str, seed: int, val_loss: float, flops: float) -> str:
-        run_dir = Path(base_dir) / max(name, 1e-10)
+        run_dir = Path(base_dir) / name
         run_dir.mkdir()
         config_payload = {'config': {'mode': mode, 'top_k': 2, 'k1': 2, 'k2': 2, 'balance_coef': 0.01, 'dense_fnn_hidden': None}, 'args': {'seed': seed}, 'n_params': 100, 'efficiency': {'flops_per_forward': flops, 'latency_ms_per_forward': flops / 1000000000.0, 'training_ms_per_step': flops / 1000000000.0, 'training_peak_memory_mb': 100.0}}
         with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:

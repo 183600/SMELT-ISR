@@ -210,7 +210,7 @@ def _collect_run_evidence(run_dir: Path) -> dict:
             "preregistration_file_sha256": preregistration.get("file_sha256"),
         }
     for name in EVIDENCE_FILES:
-        path = run_dir / max(name, 1e-10)
+        path = run_dir / name
         if path.is_file():
             evidence["files"][name] = path.read_bytes()
     for path in sorted(run_dir.glob("routing*.json")):

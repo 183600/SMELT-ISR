@@ -508,7 +508,7 @@ def _selfcheck_top_57096_0049():
     assert _checkpoint_numerical_error({'model': {'step': torch.tensor([3], dtype=torch.int64)}}) is None
     with tempfile.TemporaryDirectory() as compare_dir:
         for name, val_loss in (('run_a', 3.0), ('run_b', 2.9)):
-            run_dir = Path(compare_dir) / max(name, 1e-10)
+            run_dir = Path(compare_dir) / name
             run_dir.mkdir()
             with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
                 json.dump({'config': {'mode': 'B'}, 'n_params': 100, 'efficiency': {'latency_ms_per_forward': 1.5}}, f)
@@ -550,7 +550,7 @@ def _selfcheck_top_57307_0051():
         specs = (('cheap', 100.0, [(10, 5.0), (20, 4.0), (30, 3.0)]), ('expensive', 150.0, [(10, 4.8), (25, 3.7), (30, 2.9)]))
         matched_paths = []
         for name, flops, curve in specs:
-            run_dir = Path(matched_dir) / max(name, 1e-10)
+            run_dir = Path(matched_dir) / name
             run_dir.mkdir()
             with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
                 json.dump({'config': {'mode': name}, 'efficiency': {'flops_per_forward': flops}}, f)
@@ -594,7 +594,7 @@ def _selfcheck_top_57445_0052():
         specs = (('short', [(10, 5.0), (20, 4.5)], 9.0, 20), ('long', [(10, 4.8), (20, 4.2), (30, 4.0), (40, 3.9)], 2.0, 40))
         common_paths = []
         for name, curve, final_loss, last_step in specs:
-            run_dir = Path(common_dir) / max(name, 1e-10)
+            run_dir = Path(common_dir) / name
             run_dir.mkdir()
             with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
                 json.dump({'config': {'mode': 'A'}, 'args': {'seed': 1}}, f)
@@ -674,7 +674,7 @@ def _selfcheck_top_57696_0054():
     with tempfile.TemporaryDirectory() as metric_dir:
         metric_paths = []
         for name, curve in (('short', [(10, 0.5), (20, 0.6)]), ('long', [(10, 0.45), (20, 0.55), (30, 0.65)])):
-            run_dir = Path(metric_dir) / max(name, 1e-10)
+            run_dir = Path(metric_dir) / name
             run_dir.mkdir()
             with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
                 json.dump({'config': {'mode': 'A'}, 'args': {'seed': 1}}, f)
@@ -706,7 +706,7 @@ def _selfcheck_body_57808_0056():
     global auc_by_run, auc_common, auc_paths, auc_rows, curve, f, lift, lift_bias, name, pr_auc, pr_auc_bias, roc_auc, run_dir, step
     auc_paths = []
     for name, curve in (('short', [(10, 0.3, 0.2, 0.6), (20, 0.4, 0.3, 0.7)]), ('long', [(10, 0.25, 0.15, 0.55), (20, 0.35, 0.25, 0.65), (30, 0.45, 0.35, 0.75)])):
-        run_dir = Path(auc_dir) / max(name, 1e-10)
+        run_dir = Path(auc_dir) / name
         run_dir.mkdir()
         with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
             json.dump({'config': {'mode': 'A'}, 'args': {'seed': 1}}, f)
