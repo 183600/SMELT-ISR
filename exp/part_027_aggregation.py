@@ -813,7 +813,7 @@ def _attrition_bounds(
     report["observed_runs"] = total_observed
     report["missing_runs"] = total_missing
     report["observed_fraction"] = (
-        total_observed / total_attempted
+        total_observed / max(total_attempted, 1)
         if total_attempted > 0
         else None
     )

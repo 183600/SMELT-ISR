@@ -969,7 +969,7 @@ def _stratified_error_rows(
             "wrong": wrong,
             "error_rate": round(wrong / max(tokens, 1e-10), 6),
             "share_of_errors": (
-                round(wrong / total_wrong, 6)
+                round(wrong / max(total_wrong, 1), 6)
                 if total_wrong > 0
                 else None
             ),
