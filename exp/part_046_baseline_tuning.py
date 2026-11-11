@@ -164,7 +164,10 @@ def analyze_baseline_tuning(
 
     candidates: List[Dict[str, object]] = []
     seed_alignment = report["seed_alignment"]
-    assert isinstance(seed_alignment, dict)
+    if not isinstance(seed_alignment, dict):
+        raise TypeError(
+            f"seed_alignment 必须是 dict，实际类型: {type(seed_alignment)}"
+        )
     candidate_seed_sets = seed_alignment[
         "candidate_seed_sets"
     ]
@@ -172,9 +175,18 @@ def analyze_baseline_tuning(
         "duplicate_seeds"
     ]
     missing_seed_runs = seed_alignment["missing_seed_runs"]
-    assert isinstance(candidate_seed_sets, dict)
-    assert isinstance(duplicate_seeds_by_candidate, dict)
-    assert isinstance(missing_seed_runs, list)
+    if not isinstance(candidate_seed_sets, dict):
+        raise TypeError(
+            f"candidate_seed_sets 必须是 dict，实际类型: {type(candidate_seed_sets)}"
+        )
+    if not isinstance(duplicate_seeds_by_candidate, dict):
+        raise TypeError(
+            f"duplicate_seeds_by_candidate 必须是 dict，实际类型: {type(duplicate_seeds_by_candidate)}"
+        )
+    if not isinstance(missing_seed_runs, list):
+        raise TypeError(
+            f"missing_seed_runs 必须是 list，实际类型: {type(missing_seed_runs)}"
+        )
 
     for lr in lrs:
         lr_rows = [

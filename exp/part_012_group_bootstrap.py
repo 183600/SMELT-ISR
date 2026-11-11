@@ -52,8 +52,14 @@ def _group_cluster_paired_comparison(
         }
     mapping_a = parsed_a["mapping"]
     mapping_b = parsed_b["mapping"]
-    assert isinstance(mapping_a, dict)
-    assert isinstance(mapping_b, dict)
+    if not isinstance(mapping_a, dict):
+        raise TypeError(
+            f"mapping_a 必须是 dict，实际类型: {type(mapping_a)}"
+        )
+    if not isinstance(mapping_b, dict):
+        raise TypeError(
+            f"mapping_b 必须是 dict，实际类型: {type(mapping_b)}"
+        )
     common = sorted(set(mapping_a) & set(mapping_b))
     if len(common) < 2:
         return {

@@ -1065,7 +1065,10 @@ def _group_cluster_eval_intervals(
             "unit": parsed["unit"],
         }
     mapping = parsed["mapping"]
-    assert isinstance(mapping, dict)
+    if not isinstance(mapping, dict):
+        raise TypeError(
+            f"mapping 必须是 dict，实际类型: {type(mapping)}"
+        )
     group_ids = sorted(mapping)
     if len(group_ids) < 2:
         return {

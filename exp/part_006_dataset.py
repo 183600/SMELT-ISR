@@ -973,10 +973,15 @@ class ByteDataset:
                 generator=generator,
             )
 
-        assert self._train_interval_lows is not None
-        assert self._train_interval_lengths is not None
-        assert self._train_interval_cumulative is not None
-        assert self.train_num_valid_starts is not None
+        if (
+            self._train_interval_lows is None
+            or self._train_interval_lengths is None
+            or self._train_interval_cumulative is None
+            or self.train_num_valid_starts is None
+        ):
+            raise RuntimeError(
+                "训练区间尚未初始化，请先调用相应的区间构建方法"
+            )
 
         # 在每个合法区间内按区间长度均匀采样：先按累计长度
         # 抽全局序号，再映射回区间与区间内偏移。
@@ -1106,7 +1111,10 @@ class ByteDataset:
             cache["total"] = total_batches
             cache["num_starts"] = num_starts
         starts = cache["starts"]
-        assert isinstance(starts, torch.Tensor)
+        if not isinstance(starts, torch.Tensor):
+            raise TypeError(
+                f"starts 必须是 torch.Tensor，实际类型: {type(starts)}"
+            )
         return starts
 
     def split_group_starts(

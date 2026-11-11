@@ -326,9 +326,12 @@ def evaluate(
                         group_loss_acc = None
                         group_correct_acc = None
                     else:
-                        assert group_tokens_acc is not None
-                        assert group_loss_acc is not None
-                        assert group_correct_acc is not None
+                        if group_tokens_acc is None:
+                            raise RuntimeError("group_tokens_acc 未初始化")
+                        if group_loss_acc is None:
+                            raise RuntimeError("group_loss_acc 未初始化")
+                        if group_correct_acc is None:
+                            raise RuntimeError("group_correct_acc 未初始化")
                         flat_group_ids = batch_group_ids.reshape(-1)
                         group_tokens_acc.index_add_(
                             0,
