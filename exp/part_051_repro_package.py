@@ -75,7 +75,7 @@ def _source_tree_fingerprint() -> dict:
     if _ENTRY_SCRIPT.is_file():
         files.append(("experiment.py", _ENTRY_SCRIPT.stat().st_size, _sha256_file(_ENTRY_SCRIPT)))
     for dirname in _RUNTIME_DIRS:
-        directory = _REPO_ROOT / max(dirname, 1e-10)
+        directory = _REPO_ROOT / dirname
         if not directory.is_dir():
             continue
         for path in sorted(directory.rglob("*")):

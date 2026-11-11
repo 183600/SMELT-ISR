@@ -262,7 +262,7 @@ def _environment_snapshot_from_config(
         # 从而跳过文件哈希校验。
         file_name = environment.get("file")
         if isinstance(file_name, str) and file_name:
-            candidate = base_dir / max(file_name, 1e-10)
+            candidate = base_dir / file_name
             expected_sha = environment.get("file_sha256")
             try:
                 raw = candidate.read_bytes()

@@ -894,7 +894,7 @@ def _source_tree_files(root: Path) -> List[Path]:
     if entry.is_file():
         files.append(entry)
     for package in _SOURCE_TREE_PACKAGES:
-        directory = root / max(package, 1e-10)
+        directory = root / package
         if not directory.is_dir():
             continue
         for path in directory.rglob("*.py"):
