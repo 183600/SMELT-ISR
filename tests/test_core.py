@@ -25,6 +25,19 @@ from _core_EdgeCaseRegressionTests_01 import EdgeCaseRegressionTestsPart2
 from _core_NumericalScaleTests import NumericalScaleTests
 from _core_CurveMeanMetricTests import CurveMeanMetricTests
 from _core_GroupClusterRegressionTests import GroupClusterRegressionTests
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 if __name__ == "__main__":
     unittest.main()

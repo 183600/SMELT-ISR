@@ -884,7 +884,7 @@ def analyze_routing(
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.eval()
+    model.eval()  # SECURITY: eval() usage - manual review needed
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -1052,7 +1052,7 @@ def _intervention_bootstrap_seed(
     )
 
 
-def _intervention_eval(
+def _intervention_eval(  # SECURITY: eval() usage - manual review needed
     model: nn.Module,
     dataset: ByteDataset,
     batch_size: int,
@@ -1071,7 +1071,7 @@ def _intervention_eval(
     """
     core = _unwrap_model(model)
     was_training = core.training
-    core.eval()
+    core.eval()  # SECURITY: eval() usage - manual review needed
     use_amp = amp_dtype is not None and device.type == "cuda"
     total_loss = 0.0
     total_tokens = 0
@@ -1386,7 +1386,7 @@ def analyze_routing_interventions(
         for block in core.blocks
         if isinstance(getattr(block, "moe", None), SparseMoE)
     ]
-    baseline_eval = _intervention_eval(
+    baseline_eval = _intervention_eval(  # SECURITY: eval() usage - manual review needed
         core,
         dataset,
         batch_size,
@@ -1474,7 +1474,7 @@ def analyze_routing_interventions(
         )
         module._routing_override = overrides[id(module)]
     try:
-        shuffled = _intervention_eval(
+        shuffled = _intervention_eval(  # SECURITY: eval() usage - manual review needed
             core,
             dataset,
             batch_size,
@@ -1525,7 +1525,7 @@ def analyze_routing_interventions(
         for module in moe_modules:
             module._expert_drop_index = expert_index
         try:
-            dropped = _intervention_eval(
+            dropped = _intervention_eval(  # SECURITY: eval() usage - manual review needed
                 core,
                 dataset,
                 batch_size,

@@ -1,5 +1,18 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 class CoreModelTests(unittest.TestCase):
     def test_all_modes_forward_backward(self):
@@ -63,10 +76,10 @@ class CoreModelTests(unittest.TestCase):
         ):
             first = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=left)
-            ).eval()
+            ).eval()  # SECURITY: eval() usage - manual review needed
             second = experiment.LanguageModel(
                 experiment.Config(**common, **cfg, mode=right)
-            ).eval()
+            ).eval()  # SECURITY: eval() usage - manual review needed
             second.load_state_dict(first.state_dict())
             with torch.no_grad():
                 a = first(x)["logits"]

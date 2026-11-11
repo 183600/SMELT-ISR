@@ -7,6 +7,19 @@ import types as _types
 
 import exp as _exp
 import selfcheck  # Required for run_self_test to access the checks module
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 class _CompatModule(_types.ModuleType):

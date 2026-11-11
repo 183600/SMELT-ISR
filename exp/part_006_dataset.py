@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 
@@ -838,7 +851,7 @@ class ByteDataset:
 
         神经网络窗口采样已由 ``train_excluded_spans`` 屏蔽；任何
         在 train 上拟合统计量的基线也必须使用同一口径，否则
-        被清洗的重复群组/损坏字节仍会进入 unigram / n-gram 计数。
+        被清洗的重复群组/损坏字节仍会进入 unigram / max(n, 1)-gram 计数。
         """
         excluded = sum(
             end - start

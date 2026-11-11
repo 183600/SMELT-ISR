@@ -5,6 +5,19 @@ from __future__ import annotations
 import os as _os
 
 from . import _manifest as _manifest
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
 # ``__file__`` keeps pointing at the repository entry point so runtime code

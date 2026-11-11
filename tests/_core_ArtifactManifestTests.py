@@ -1,5 +1,18 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 class ArtifactManifestTests(unittest.TestCase):
     """归档清单：内容可复核、路径不可逃逸、新增文件可披露。"""

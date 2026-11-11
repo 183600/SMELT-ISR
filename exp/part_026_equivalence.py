@@ -510,7 +510,7 @@ def _hedges_g_correction(
     df: object,
 ) -> Optional[float]:
     """
-    Hedges g 的小样本偏倚校正因子 J ≈ 1 - 3/(4·df - 1)。
+    Hedges g 的小样本偏倚校正因子 J ≈ 1 - 3 / max(4·df - 1, 1e-10)。
 
     Cohen's d（= |Δ|/合并标准差）在小样本下系统性高估真实效应：
     每臂 3 个种子时偏倚约 13%，配对口径 df=2 时约 43%。校正后
@@ -524,7 +524,7 @@ def _hedges_g_correction(
         return None
     if not math.isfinite(df_value) or df_value <= 1.0:
         return None
-    correction = 1.0 - 3.0 / (4.0 * df_value - 1.0)
+    correction = 1.0 - 3.0 / max(4.0 * df_value - 1.0, 1e-10)
     if correction <= 0.0:
         return None
     return correction
@@ -627,7 +627,10 @@ def _observed_seed_sd(
     由检验口径的标准误还原观测到的（近似）种子间标准差。
 
     配对设计 se = sd/√n，直接 sd = se·√n。Welch 的
-    se² = s_a²/n_a + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
+    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
+    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
+    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
+    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
     因此 s = se·√(n_a·n_b/(n_a+n_b))。用调和均值
     n_eq = 2·n_a·n_b/(n_a+n_b) 表示即 s = se·√(n_eq/2)；
     直接把 n_eq 当配对 n 会把 sd 高估 √2，进而把所需种子数
@@ -1000,7 +1003,7 @@ def _holm_rank_thresholds(
     alpha: float = _SIGNIFICANCE_LEVEL,
 ) -> List[Optional[float]]:
     """
-    Holm step-down 每个检验位置对应的显著性阈值 alpha/(m-rank+1)。
+    Holm step-down 每个检验位置对应的显著性阈值 alpha / max(m-rank+1, 1e-10)。
 
     脆弱性分析要按「该对比在家族中的实际位置」比较删除种子后
     的 p 值；统一用 alpha/m 会把 Holm 后段本应显著的对比误判为

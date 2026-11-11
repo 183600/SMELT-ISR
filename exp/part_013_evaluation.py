@@ -1,4 +1,17 @@
 from __future__ import annotations
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 
 
 
@@ -91,7 +104,7 @@ def evaluate(
     不确定性。没有群组边界时不写入，不伪造文档簇。
     """
     was_training = model.training
-    model.eval()
+    model.eval()  # SECURITY: eval() usage - manual review needed
 
     probe_attached = False
     if routing_probe is not None:

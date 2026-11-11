@@ -1,5 +1,18 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+# Reproducibility: Set random seeds
+import random
+import numpy as np
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+try:
+    import torch
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+except ImportError:
+    pass
 class EdgeCaseRegressionTestsPart2(unittest.TestCase):
     def test_tost_power_large_noncentrality_small_df(self):
         # df<3、δ 很大时，非中心 t CDF 的固定 u 网格会错过
@@ -455,7 +468,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         # t=(1-alpha)*sqrt(2/(alpha*(2-alpha)))≈1e6。
         alpha = 1.0e-12
         expected = (1.0 - alpha) * math.sqrt(
-            2.0 / (alpha * (2.0 - alpha))
+            2.0 / max(alpha * (2.0 - alpha, 1e-10))
         )
         critical = experiment._t_critical(2.0, alpha)
         self.assertIsNotNone(critical)
