@@ -102,6 +102,7 @@ def _MAIN_part_005():
         if finite_step:
             if scaler is not None:
                 scaler.step(optimizer)
+                scaler.update()
             else:
                 optimizer.step()
             scheduler.step()
@@ -122,8 +123,6 @@ def _MAIN_part_005():
                     numerical_stop = True
             if consecutive_nonfinite >= 3:
                 numerical_stop = True
-        if scaler is not None:
-            scaler.update()
         if finite_grad:
             recent_grad_norms.append((step + 1, grad_norm_value))
             if len(recent_grad_norms) > _NAN_GRAD_TREND_WINDOW:
