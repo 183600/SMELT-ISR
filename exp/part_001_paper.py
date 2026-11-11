@@ -42,10 +42,10 @@ def _paper_budget_audit(
     control_flops = int(
         mode_cost_profile(control_cfg)["analytic_flops_per_token"]
     )
-    flops_ratio = flops / base_flops
+    flops_ratio = flops / max(base_flops, 1e-10)
     kv_ratio = counts["kv_dim"] / base_counts["kv_dim"]
     sparsity = 1.0 - (
-        flops / control_flops
+        flops / max(control_flops, 1e-10)
     ) * (control_counts["total"] / counts["total"])
     total_ratio = counts["total"] / (cell.total_params * 1e9)
     active_ratio = counts["active"] / (
@@ -872,7 +872,7 @@ def _seed_optional_accelerators(seed: int) -> List[str]:
                 xpu.manual_seed_all(seed)
                 seeded.append("xpu")
         except (AttributeError, RuntimeError):
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:874")
 
     mps = getattr(torch, "mps", None)
     if mps is not None:
@@ -890,7 +890,7 @@ def _seed_optional_accelerators(seed: int) -> List[str]:
                 mps.manual_seed(seed)
                 seeded.append("mps")
         except (AttributeError, RuntimeError):
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:892")
 
     return seeded
 

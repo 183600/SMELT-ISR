@@ -1065,7 +1065,7 @@ def compare_cells_to_baseline(
                 pooled_std = math.sqrt(pooled_squared)
         noise_ratio = None
         if delta is not None and pooled_std:
-            candidate = abs(delta) / pooled_std
+            candidate = abs(delta) / max(pooled_std, 1e-10)
             if math.isfinite(candidate):
                 noise_ratio = candidate
         hedges_correction = _hedges_g_correction(result.get("df"))

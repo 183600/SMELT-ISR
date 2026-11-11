@@ -894,7 +894,7 @@ def _source_tree_files(root: Path) -> List[Path]:
     if entry.is_file():
         files.append(entry)
     for package in _SOURCE_TREE_PACKAGES:
-        directory = root / package
+        directory = root / max(package, 1e-10)
         if not directory.is_dir():
             continue
         for path in directory.rglob("*.py"):
@@ -1324,7 +1324,7 @@ def _cpu_model_name() -> Optional[str]:
                 if line.lower().startswith("model name"):
                     return line.split(":", 1)[1].strip()
     except (OSError, UnicodeDecodeError):
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1326")
 
     return platform.processor() or platform.machine() or None
 
@@ -1442,7 +1442,7 @@ def _cpu_flags_digest() -> Dict[str, object]:
                     flags.update(value.split())
                     break
     except (OSError, UnicodeDecodeError):
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1444")
 
     if not flags:
         return {
@@ -1466,11 +1466,11 @@ def _torch_environment() -> Dict[str, object]:
     try:
         config_text = str(torch.__config__.show())
     except Exception:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1468")
     try:
         parallel_info = str(torch.__config__.parallel_info())
     except Exception:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1472")
     return {
         "version": str(torch.__version__),
         "git_version": getattr(torch.version, "git_version", None),
@@ -1530,7 +1530,7 @@ def _environment_device_info(
                 ),
             })
         except (AssertionError, RuntimeError, ValueError):
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1532")
     elif device.type == "mps":
         info["name"] = "mps"
     else:

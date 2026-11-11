@@ -209,7 +209,7 @@ def run_statistical_baseline(
 
         for order in range(1, model.max_order + 1):
             val_loss = float(
-                totals[order - 1] / tokens
+                totals[order - 1] / max(tokens, 1e-10)
             )
             record = {
                 "step": "baseline_sweep",

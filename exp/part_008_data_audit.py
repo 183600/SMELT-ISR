@@ -166,7 +166,7 @@ def _window_signature_scan(
             "signatures": {},
         }
 
-    stride = max(1, math.ceil(total / max_windows))
+    stride = max(1, math.ceil(total / max(max_windows, 1e-10)))
     excluded = _merge_byte_intervals(
         list(exclude_spans or [])
     )
@@ -700,7 +700,7 @@ def _group_top_byte_share(
         minlength=256,
     )
     top_count = int(counts.max())
-    return int(counts.argmax()), top_count / length
+    return int(counts.argmax()), top_count / max(length, 1e-10)
 
 
 

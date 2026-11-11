@@ -66,10 +66,10 @@ def _cost_comparison(
             # 变异系数与独立观测数共同决定。先用乘法检查
             # 平方是否落在 float 范围内，避免 **2 抛
             # OverflowError；变体成本为 0 时也不能除零。
-            relative_a = std_a / cost_a
-            relative_b = std_b / cost_b
-            term_a = relative_a * relative_a / n_a
-            term_b = relative_b * relative_b / n_b
+            relative_a = std_a / max(cost_a, 1e-10)
+            relative_b = std_b / max(cost_b, 1e-10)
+            term_a = relative_a * relative_a / max(n_a, 1e-10)
+            term_b = relative_b * relative_b / max(n_b, 1e-10)
             relative_variance = term_a + term_b
             if (
                 math.isfinite(relative_a)
@@ -675,7 +675,7 @@ def factor_contrasts(
 
             noise_ratio = None
             if delta is not None and pooled_std:
-                candidate = abs(delta) / pooled_std
+                candidate = abs(delta) / max(pooled_std, 1e-10)
                 if math.isfinite(candidate):
                     noise_ratio = candidate
 

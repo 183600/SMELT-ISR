@@ -163,7 +163,7 @@ def diagnose_non_finite(
                 logits = probe_logits
                 probe_source = "diagnostic forward probe"
         except Exception:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:165")
         finally:
             model.train(was_training)
 
@@ -425,7 +425,7 @@ def diagnose_non_finite(
             amp_state["grad_scale_before_step"] = before
             if scale_at_diagnosis is not None:
                 amp_state["scale_ratio_to_before"] = round(
-                    scale_at_diagnosis / before,
+                    scale_at_diagnosis / max(before, 1e-10),
                     6,
                 )
                 # GradScaler 在 unscale 时发现 inf/nan 梯度会
@@ -481,7 +481,7 @@ def diagnose_non_finite(
             findings.append(
                 f"失败步梯度范数 {grad_norm_value:.4g} 约为近期"
                 f"中位数 {median:.4g} 的 "
-                f"{grad_norm_value / median:.1f} 倍：梯度放大明显，"
+                f"{grad_norm_value / max(median, 1e-10):.1f} 倍：梯度放大明显，"
                 "符合梯度爆炸/学习率过大特征"
             )
         elif _finite(loss) is False:
@@ -638,7 +638,7 @@ def _process_peak_rss_mb() -> Optional[float]:
                         3,
                     )
     except (OSError, ValueError, IndexError):
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:640")
 
     try:
         import resource

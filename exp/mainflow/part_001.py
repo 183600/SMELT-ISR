@@ -345,7 +345,7 @@ def _MAIN_part_006():
                 try:
                     config_sha256 = hashlib.sha256((out_dir / 'config.json').read_bytes()).hexdigest()
                 except OSError:
-                    pass
+                    import logging as _logging; _logging.warning("Suppressed exception in part_001.py:347")
                 access_record = {**access_key, 'out_dir': str(out_dir), 'study_id': args.study_id, 'seed': args.seed, 'script_sha256': run_metadata.get('script_sha256'), 'source_tree_sha256': run_metadata.get('source_tree_sha256'), 'environment_id': run_metadata.get('environment_id'), 'git_commit': run_metadata.get('git_commit'), 'config_sha256': config_sha256, 'hypothesis': args.hypothesis, 'primary_metric': args.primary_metric, 'selected_step': best_selection_step if selection_policy == 'best_val' else end_step, 'model_selection': selection_policy, 'allow_repeat_access': bool(args.allow_repeat_test_access), 'accessed_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'note': '测试集访问账本；同一 data/split 指纹的全部访问都应进入最终报告'}
                 append_test_access_ledger(ledger_path, access_record)
                 print(f'''[test] 访问账本已记录: {ledger_path}（历史访问 {access_check['matching_accesses'] + 1} 次）''')

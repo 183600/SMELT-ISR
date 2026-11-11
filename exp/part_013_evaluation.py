@@ -1019,7 +1019,7 @@ class NgramBaseline:
             if valid_intervals is None:
                 stride = max(
                     1,
-                    math.ceil(num_windows / count_cap),
+                    math.ceil(num_windows / max(count_cap, 1e-10)),
                 )
 
                 # data.unfold(0, order, 1) 是
@@ -1044,7 +1044,7 @@ class NgramBaseline:
                 total_valid = int(lengths.sum())
                 stride = max(
                     1,
-                    math.ceil(total_valid / count_cap),
+                    math.ceil(total_valid / max(count_cap, 1e-10)),
                 )
                 global_index = torch.arange(
                     0,

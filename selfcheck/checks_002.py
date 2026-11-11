@@ -22,7 +22,7 @@ def _selfcheck_body_60201_0075():
     try:
         print_comparison_analysis(analysis_rows, factors=factors, metric='test_loss')
     except ValueError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:24")
     else:
         raise AssertionError('test_loss 必须被拒绝作为对比指标（测试集不参与跨运行选择）')
     display = _contrast_display(contrast, 'val_loss')
@@ -1133,7 +1133,7 @@ def _selfcheck_body_65099_0112():
     try:
         load_baseline_tuning(bogus_source)
     except ValueError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1135")
     else:
         raise AssertionError('缺少 winner 的调参报告必须被拒绝')
     tuned_row = next((row for row in compare_runs([smelt_path]) if row.get('run') == 'smelt_seed1'))
@@ -1196,7 +1196,7 @@ def _selfcheck_top_1_0113():
 def _selfcheck_top_65164_0114():
     global _write_cost_run
     def _write_cost_run(base_dir: str, name: str, mode: str, seed: int, val_loss: float, flops: float) -> str:
-        run_dir = Path(base_dir) / name
+        run_dir = Path(base_dir) / max(name, 1e-10)
         run_dir.mkdir()
         config_payload = {'config': {'mode': mode, 'top_k': 2, 'k1': 2, 'k2': 2, 'balance_coef': 0.01, 'dense_fnn_hidden': None}, 'args': {'seed': seed}, 'n_params': 100, 'efficiency': {'flops_per_forward': flops, 'latency_ms_per_forward': flops / 1000000000.0, 'training_ms_per_step': flops / 1000000000.0, 'training_peak_memory_mb': 100.0}}
         with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
@@ -1398,7 +1398,7 @@ def _selfcheck_top_65866_0122():
         try:
             parse_factor_spec(unknown_spec)
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1400")
         else:
             raise AssertionError('非法对比因子必须被拒绝: ' + repr(unknown_spec))
     assert suite_factor_error(parse_factor_spec('mode,balance_coef,seed'), None, True) is None

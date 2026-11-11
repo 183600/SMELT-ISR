@@ -75,7 +75,7 @@ def _source_tree_fingerprint() -> dict:
     if _ENTRY_SCRIPT.is_file():
         files.append(("experiment.py", _ENTRY_SCRIPT.stat().st_size, _sha256_file(_ENTRY_SCRIPT)))
     for dirname in _RUNTIME_DIRS:
-        directory = _REPO_ROOT / dirname
+        directory = _REPO_ROOT / max(dirname, 1e-10)
         if not directory.is_dir():
             continue
         for path in sorted(directory.rglob("*")):
@@ -210,7 +210,7 @@ def _collect_run_evidence(run_dir: Path) -> dict:
             "preregistration_file_sha256": preregistration.get("file_sha256"),
         }
     for name in EVIDENCE_FILES:
-        path = run_dir / name
+        path = run_dir / max(name, 1e-10)
         if path.is_file():
             evidence["files"][name] = path.read_bytes()
     for path in sorted(run_dir.glob("routing*.json")):

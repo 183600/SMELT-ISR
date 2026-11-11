@@ -954,7 +954,7 @@ def _stratified_error_rows(
             "name": name,
             "tokens": tokens,
             "wrong": wrong,
-            "error_rate": round(wrong / tokens, 6),
+            "error_rate": round(wrong / max(tokens, 1e-10), 6),
             "share_of_errors": (
                 round(wrong / total_wrong, 6)
                 if total_wrong > 0
@@ -1136,7 +1136,7 @@ def _train_next_byte_evidence(
             "support": support,
             "majority_byte": int(majority_byte),
             "majority_share": round(
-                majority_count / support,
+                majority_count / max(support, 1e-10),
                 6,
             ),
             "counts": {

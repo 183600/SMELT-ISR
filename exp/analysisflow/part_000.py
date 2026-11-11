@@ -355,7 +355,7 @@ def _PA_part_001():
     family_sizes = sorted({int(size) for size in (contrast.get('significance_family_size') for contrast in contrasts) if isinstance(size, int) and (not isinstance(size, bool))})
     if any((size > 1 for size in family_sizes)):
         largest_family = max(family_sizes)
-        print(f'  [power] 本分析家族最多 m={largest_family} 个检验；MDE/功效/所需种子与所需等价界默认按未校正 alpha={_SIGNIFICANCE_LEVEL:g} 计算，Holm 首步阈值为 alpha/m={_SIGNIFICANCE_LEVEL / largest_family:.4f}（同口径保守值见 mde_80_bonferroni / seeds_to_detect_bonferroni / equivalence_margin_needed_bonferroni；规划种子数与等价界时按后者）')
+        print(f'  [power] 本分析家族最多 m={largest_family} 个检验；MDE/功效/所需种子与所需等价界默认按未校正 alpha={_SIGNIFICANCE_LEVEL:g} 计算，Holm 首步阈值为 alpha/m={_SIGNIFICANCE_LEVEL / max(largest_family, 1e-10):.4f}（同口径保守值见 mde_80_bonferroni / seeds_to_detect_bonferroni / equivalence_margin_needed_bonferroni；规划种子数与等价界时按后者）')
     if any((contrast.get('seeds_to_detect') is not None or contrast.get('equivalence_seeds_to_achieve') is not None for contrast in contrasts)):
         print('  [note] 所需种子数（seeds_to_detect / equivalence_seeds_to_achieve）按当前种子间标准差的点估计外推（seeds_to_detect_basis="sd_point_estimate"）；sd 自身估计不稳，其相对标准误 ≈ 1/√(2(n-1))（n=3 时约 50%）且被平方进所需种子数，实际所需可能明显更多，规划时留余量')
     if not contrasts:

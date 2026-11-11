@@ -10,7 +10,7 @@ def _selfcheck_top_51350_0001():
     try:
         Config(vocab_size=256, seq_len=8, d_model=16, n_heads=4, n_layers=3, n_experts=3, expert_hidden=24).validate()
     except ValueError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:12")
     else:
         raise AssertionError('非法 n_layers 在 -O 模式下也必须被拒绝')
     common = dict(vocab_size=256, seq_len=8, d_model=16, n_heads=4, n_layers=4, n_experts=3, expert_hidden=24, top_k=2, k1=2, k2=2)
@@ -108,7 +108,7 @@ def _selfcheck_top_51618_0003():
     try:
         Config(**common, mode='dense', dense_fnn_hidden=-1).validate()
     except ValueError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:110")
     else:
         raise AssertionError('非法 dense_fnn_hidden 必须被拒绝')
     class RouteWidthProbe(LanguageModel):
@@ -315,7 +315,7 @@ def _selfcheck_body_52263_0012():
     try:
         eval_dataset.batch('test', 2, torch.Generator().manual_seed(0), eval_device)
     except ValueError:
-        pass
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:317")
     else:
         raise AssertionError('batch() 不允许访问测试集')
     train_x, train_y = eval_dataset.batch('train', 4, torch.Generator().manual_seed(7), eval_device)
@@ -700,7 +700,7 @@ def _selfcheck_top_53462_0022():
         try:
             parse_group_separator(invalid)
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:702")
         else:
             raise AssertionError(f'非法群组分隔符必须报错: {invalid!r}')
     separator = b'\n\n'
@@ -915,7 +915,7 @@ def _selfcheck_top_54147_0027():
     f1_near = [value - 0.001 + 0.02 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_worse = [value - 0.2 + 0.01 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_windows = {(3, 1.0): f1_base, (1, 0.25): f1_near, (2, 1.0): f1_worse}
-    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / one_se_n}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / one_se_n}]
+    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / max(one_se_n, 1e-10)}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / max(one_se_n, 1e-10)}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / max(one_se_n, 1e-10)}]
     f1_selection = _select_ngram_candidate_one_se(f1_candidates[2], f1_candidates, f1_windows, 'val_macro_f1')
     assert f1_selection is not None
     assert f1_selection['available'] is True
@@ -1024,7 +1024,7 @@ def _selfcheck_top_54493_0030():
         try:
             ByteDataset(run_file.name, seq_len=8, val_fraction=0.1, test_fraction=0.1, group_separator=separator, drop_train_degenerate_runs=True)
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1026")
         else:
             raise AssertionError('drop_train_degenerate_runs 必须拒绝群组模式：否则会改动群组边界内的字节')
     assert raw_run_dataset.split_bounds == {'train': (0, 1920), 'val': (1920, 2160), 'test': (2160, 2400)}
@@ -1192,7 +1192,7 @@ def _selfcheck_top_54994_0034():
         try:
             ByteDataset(oversized_file.name, seq_len=8, group_separator=b'SEP')
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1194")
         else:
             raise AssertionError('群组无法整体划分时必须报错')
     with tempfile.NamedTemporaryFile() as no_sep_file:
@@ -1201,7 +1201,7 @@ def _selfcheck_top_54994_0034():
         try:
             ByteDataset(no_sep_file.name, seq_len=8, group_separator=b'<MISSING>')
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1203")
         else:
             raise AssertionError('分隔符不存在时必须报错')
     with tempfile.TemporaryDirectory() as metrics_dir:
@@ -1360,7 +1360,7 @@ def _selfcheck_top_55379_0037():
         try:
             set_seed(invalid_seed)
         except ValueError:
-            pass
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1362")
         else:
             raise AssertionError(f'非法种子 {invalid_seed} 必须被拒绝')
     assert torch.equal(torch.get_rng_state(), saved_torch_state)
