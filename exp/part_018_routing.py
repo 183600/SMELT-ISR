@@ -160,7 +160,7 @@ class RoutingProbe:
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
-                    -(nonzero * nonzero.log()).sum() / max(log_e, 1e-10)
+                    -(nonzero * nonzero.log()).sum() / log_e
                 )
             else:
                 router_entropy = probs.new_zeros(())
@@ -1132,8 +1132,8 @@ def _intervention_eval(
             "per_batch": per_batch,
         }
     return {
-        "loss": total_loss / max(total_tokens, 1e-10),
-        "token_accuracy": correct / max(total_tokens, 1e-10),
+        "loss": total_loss / total_tokens,
+        "token_accuracy": correct / total_tokens,
         "tokens": total_tokens,
         "per_batch": per_batch,
     }

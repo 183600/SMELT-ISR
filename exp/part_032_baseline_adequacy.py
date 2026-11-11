@@ -929,7 +929,7 @@ def baseline_adequacy(
                 or challenger_cost <= 0.0
             ):
                 continue
-            ratio = challenger_cost / max(baseline_cost, 1e-10)
+            ratio = challenger_cost / baseline_cost
             if ratio >= _COST_RATIO_MATERIAL:
                 capacity_findings.append(
                     f"{label}是基线的 {ratio:.2f} 倍"

@@ -514,7 +514,7 @@ def _window_variance_components(
         ]
     else:
         scaled_matrix = [
-            [value / max(scale, 1e-10) for value in row]
+            [value / scale for value in row]
             for row in matrix
         ]
     grand_mean_norm = (
@@ -708,7 +708,7 @@ def _window_variance_components(
             mean_window_var_norm / total_mean_var_norm
         )
         share_interaction = (
-            mean_error_var_norm / max(total_mean_var_norm, 1e-10)
+            mean_error_var_norm / total_mean_var_norm
         )
         components["variance_share_seed"] = share_seed
         components["variance_share_window"] = share_window
@@ -751,14 +751,14 @@ def _window_variance_components(
             mean_error_var_norm / same_window_mean_var_norm
         )
         if (
-            mean_seed_var_norm / max(same_window_mean_var_norm, 1e-10)
+            mean_seed_var_norm / same_window_mean_var_norm
             >= 0.8
         ):
             components["dominant_source_same_windows"] = (
                 "training_seed"
             )
         elif (
-            mean_error_var_norm / max(same_window_mean_var_norm, 1e-10)
+            mean_error_var_norm / same_window_mean_var_norm
             >= 0.8
         ):
             components["dominant_source_same_windows"] = (

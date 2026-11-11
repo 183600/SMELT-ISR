@@ -468,7 +468,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         # t=(1-alpha)*sqrt(2/(alpha*(2-alpha)))≈1e6。
         alpha = 1.0e-12
         expected = (1.0 - alpha) * math.sqrt(
-            2.0 / max(alpha * (2.0 - alpha, 1e-10))
+            2.0 / (alpha * (2.0 - alpha))
         )
         critical = experiment._t_critical(2.0, alpha)
         self.assertIsNotNone(critical)

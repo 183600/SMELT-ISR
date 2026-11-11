@@ -649,10 +649,10 @@ def _betacf(a: float, b: float, x: float) -> float:
     qam = a - 1.0
 
     c = 1.0
-    d = 1.0 - qab * x / max(qap, 1e-10)
+    d = 1.0 - qab * x / qap
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / max(d, 1e-10)
+    d = 1.0 / d
     h = d
 
     for iteration in range(1, max_iterations + 1):
@@ -667,10 +667,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / max(c, 1e-10)
+        c = 1.0 + numerator / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
+        d = 1.0 / d
         h *= d * c
 
         numerator = (
@@ -682,10 +682,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / max(c, 1e-10)
+        c = 1.0 + numerator / c
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / max(d, 1e-10)
+        d = 1.0 / d
         delta = d * c
         h *= delta
 
@@ -713,7 +713,7 @@ def _log_gamma_ratio_half(z: float) -> float:
     """
     计算 log(Γ(z+1/2)/Γ(z))，避免大 z 下两个 lgamma 相减。
     """
-    inverse = 1.0 / max(z, 1e-10)
+    inverse = 1.0 / z
     series = inverse * (
         -1.0 / 8.0
         + inverse * (
@@ -730,7 +730,7 @@ def _log_gamma_ratio_half(z: float) -> float:
 
 def _stirling_log_gamma_correction(z: float) -> float:
     """log Γ(z) 的 Stirling 级数修正项（z 足够大时）。"""
-    inverse = 1.0 / max(z, 1e-10)
+    inverse = 1.0 / z
     squared = inverse * inverse
     return inverse * (
         1.0 / 12.0
@@ -864,7 +864,7 @@ def _regularized_incomplete_beta(
             if log_result > 0.0:
                 return 1.0
             return math.exp(log_result)
-        return front * _betacf(a, b, x) / max(a, 1e-10)
+        return front * _betacf(a, b, x) / a
 
     if overflow:
         cf = _betacf(b, a, 1.0 - x)
@@ -876,7 +876,7 @@ def _regularized_incomplete_beta(
         if log_comp > 0.0:
             return 0.0
         return 1.0 - math.exp(log_comp)
-    return 1.0 - front * _betacf(b, a, 1.0 - x) / max(b, 1e-10)
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
 
 
 
@@ -1125,7 +1125,7 @@ def _paired_sign_flip_test(
             if statistic >= observed - tolerance:
                 count += 1
         permutations = 2 ** n
-        p_value = count / max(permutations, 1e-10)
+        p_value = count / permutations
         method = "exact"
     else:
         generator = torch.Generator().manual_seed(
@@ -1261,8 +1261,8 @@ def _paired_difference_diagnostics(
             "mean": mean,
         }
     scale = math.sqrt(m2)
-    m3 = math.fsum((c / max(scale, 1e-10)) ** 3 for c in centered) / max(n, 1)
-    m4 = math.fsum((c / max(scale, 1e-10)) ** 4 for c in centered) / max(n, 1)
+    m3 = math.fsum((c / scale) ** 3 for c in centered) / max(n, 1)
+    m4 = math.fsum((c / scale) ** 4 for c in centered) / max(n, 1)
     skewness = m3
     excess_kurtosis = m4 - 3.0
     # 正态假设下偏度/峰度的标准误（样本偏度/峰度的渐近方差
@@ -1309,7 +1309,7 @@ def _paired_difference_diagnostics(
         "kurtosis_flag": kurtosis_flag,
         "n_positive": n_positive,
         "n_negative": n_negative,
-        "mean_median_shift_sd": abs(mean - median) / max(std, 1e-10),
+        "mean_median_shift_sd": abs(mean - median) / std,
         "status": (
             "questionable"
             if (skewness_flag or kurtosis_flag)
@@ -1417,9 +1417,9 @@ def _wilcoxon_signed_rank_test(
             ):
                 count += 1
         permutations = 2 ** n
-        p_value = count / max(permutations, 1e-10)
+        p_value = count / permutations
         method = "exact"
-        min_attainable_p = 2.0 / max(permutations, 1e-10)
+        min_attainable_p = 2.0 / permutations
         required_seeds = _sign_flip_required_seeds(
             _SIGNIFICANCE_LEVEL
         )

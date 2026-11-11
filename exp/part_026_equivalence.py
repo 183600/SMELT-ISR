@@ -154,8 +154,8 @@ def _tost_test(
             "tost_margin": margin_value,
         }
 
-    t_upper = (effect_value - margin_value) / max(se_value, 1e-10)
-    t_lower = (effect_value + margin_value) / max(se_value, 1e-10)
+    t_upper = (effect_value - margin_value) / se_value
+    t_lower = (effect_value + margin_value) / se_value
 
     cdf_upper = _t_cdf(t_upper, df_value)
     if cdf_upper is None:
@@ -235,7 +235,7 @@ def _tost_power_normal_mix(
         else:
             simpson = 4.0 * step / 3.0
         y = noncentrality + t
-        ratio = abs(y) / max(upper, 1e-10)
+        ratio = abs(y) / upper
         threshold = df_value * ratio * ratio
         if not math.isfinite(threshold):
             survival = 0.0
@@ -310,9 +310,9 @@ def _tost_power(
     if half_width <= 0.0:
         return 0.0
 
-    lower = -half_width / max(se_value, 1e-10)
-    upper = half_width / max(se_value, 1e-10)
-    noncentrality = effect_value / max(se_value, 1e-10)
+    lower = -half_width / se_value
+    upper = half_width / se_value
+    noncentrality = effect_value / se_value
     if not math.isfinite(noncentrality):
         # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
         # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；

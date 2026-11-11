@@ -863,12 +863,12 @@ def _conditional_bigram_shift(
 
     supported = (eval_ctx > 0) & (train_ctx > 0)
     seen_pairs = float(eval_ctx[supported].sum())
-    seen_context_share = seen_pairs / max(total_eval_pairs, 1e-10)
+    seen_context_share = seen_pairs / total_eval_pairs
 
     unseen_pairs = float(
         (evaluation * (train == 0)).sum()
     )
-    unseen_transition_share = unseen_pairs / max(total_eval_pairs, 1e-10)
+    unseen_transition_share = unseen_pairs / total_eval_pairs
 
     if seen_pairs <= 0.0:
         conditional_js = 1.0
@@ -890,7 +890,7 @@ def _conditional_bigram_shift(
             right: torch.Tensor,
         ) -> torch.Tensor:
             return (
-                left * (left / max(right, 1e-10)).log2()
+                left * (left / right).log2()
             ).sum(dim=1)
 
         js_rows = 0.5 * _kl_rows(
@@ -1161,8 +1161,8 @@ def _deletion_bias_record(
         "dropped_bytes": dropped_bytes,
         "kept_bytes": kept_bytes,
         "train_bytes": int(train_end),
-        "drop_fraction": round(dropped_bytes / max(train_bytes, 1e-10), 6),
-        "kept_fraction": round(kept_bytes / max(train_bytes, 1e-10), 6),
+        "drop_fraction": round(dropped_bytes / train_bytes, 6),
+        "kept_fraction": round(kept_bytes / train_bytes, 6),
         "excluded_span_lengths": _interval_length_summary(
             merged
         ),

@@ -87,10 +87,10 @@ def _group_cluster_paired_comparison(
                 "tokens_b": tokens_b,
             }
         loss_differences.append(
-            loss_b / max(tokens_b, 1e-10) - loss_a / max(tokens_a, 1e-10)
+            loss_b / tokens_b - loss_a / tokens_a
         )
         accuracy_differences.append(
-            correct_b / max(tokens_b, 1e-10) - correct_a / max(tokens_a, 1e-10)
+            correct_b / tokens_b - correct_a / tokens_a
         )
         tokens.append(tokens_a)
     weight_tensor = torch.tensor(
@@ -139,7 +139,7 @@ def _group_cluster_paired_comparison(
         weight_scale > 1.0e150
         or 0.0 < weight_scale < 1.0e-150
     ):
-        mean_weights = weight_tensor / max(weight_scale, 1e-10)
+        mean_weights = weight_tensor / weight_scale
     else:
         mean_weights = weight_tensor
     weighted_mean = float(
@@ -380,7 +380,7 @@ def _hierarchical_group_bootstrap_ci(
                 float(f"{value:.12g}")
                 for value in row
             ]
-            for row in (values / max(value_scale, 1e-10)).tolist()
+            for row in (values / value_scale).tolist()
         ]
     else:
         seed_values = values.tolist()
@@ -505,7 +505,7 @@ def _bootstrap_window_indices(
     # 不截断会让 --eval-bootstrap-block 的合法超大整数先分配
     # arange(block) 并耗尽内存。
     block = max(1, min(n, requested_block))
-    n_blocks = int(math.ceil(n / max(block, 1e-10)))
+    n_blocks = int(math.ceil(n / block))
     starts = torch.randint(
         low=0,
         high=n,
@@ -1006,7 +1006,7 @@ def macro_auc_metrics(
                         float(ap_sums[class_offset].sum())
                     )
                     pr_prevalence_sum += (
-                        float(n_pos_class) / max(n_tokens, 1e-10)
+                        float(n_pos_class) / n_tokens
                     )
                 if 0 < n_pos_class < n_tokens:
                     n_neg_class = n_tokens - n_pos_class

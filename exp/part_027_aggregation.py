@@ -876,7 +876,7 @@ def _attrition_bounds(
             # 先求总和：极大有限值直接相加可能溢出，比例写法
             # 在极端量级下仍不会抛异常（非有限结果由下方统一
             # 标成 unbounded）。
-            observed_share = observed / max(attempted, 1e-10)
+            observed_share = observed / attempted
             missing_share = 1.0 - observed_share
             mean_low = (
                 observed_share * observed_mean

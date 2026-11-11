@@ -674,7 +674,7 @@ def _ar1_effective_windows(
         )
     inflation = 1.0
     if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
-        inflation = math.sqrt(float(n_windows) / max(effective, 1e-10))
+        inflation = math.sqrt(float(n_windows) / effective)
     return effective, inflation
 
 
@@ -757,7 +757,7 @@ def _ar1_adjusted_mean_test(
         return result
 
     df = effective - 1.0
-    t_value = mean / max(se, 1e-10)
+    t_value = mean / se
     result["t"] = t_value
     result["se"] = se
     result["df"] = df
@@ -1088,7 +1088,7 @@ def _group_cluster_eval_intervals(
         [mapping[group_id][2] for group_id in group_ids],
         dtype=torch.float64,
     )
-    loss_point = loss_sums / max(tokens, 1e-10)
+    loss_point = loss_sums / tokens
     scale = float(loss_point.abs().max().item())
     if scale > 1.0e150:
         loss_scaled = loss_point / scale

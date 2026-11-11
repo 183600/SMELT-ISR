@@ -42,10 +42,10 @@ def _paper_budget_audit(
     control_flops = int(
         mode_cost_profile(control_cfg)["analytic_flops_per_token"]
     )
-    flops_ratio = flops / max(base_flops, 1e-10)
+    flops_ratio = flops / base_flops
     kv_ratio = counts["kv_dim"] / base_counts["kv_dim"]
     sparsity = 1.0 - (
-        flops / max(control_flops, 1e-10)
+        flops / control_flops
     ) * (control_counts["total"] / counts["total"])
     total_ratio = counts["total"] / (cell.total_params * 1e9)
     active_ratio = counts["active"] / (

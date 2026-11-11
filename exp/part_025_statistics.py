@@ -290,8 +290,8 @@ def _welch_t_test(
         # 极小尺度下方差会下溢成 0，被误判成零方差/无噪声
         # 分离；先按公共尺度归一化再还原效应与标准误。
         scaled = _welch_t_test(
-            [value / max(max_abs, 1e-10) for value in values_a],
-            [value / max(max_abs, 1e-10) for value in values_b],
+            [value / max_abs for value in values_a],
+            [value / max_abs for value in values_b],
         )
         if scaled.get("test") == "welch_t":
             effect = _finite_float(scaled.get("effect"))
@@ -307,7 +307,7 @@ def _welch_t_test(
         # 还原效应与标准误时若越过 float 上限则置空，不能写 inf。
         scaled = _welch_t_test(
             [value / max_abs for value in values_a],
-            [value / max(max_abs, 1e-10) for value in values_b],
+            [value / max_abs for value in values_b],
         )
         if scaled.get("test") == "welch_t":
             effect = _finite_float(scaled.get("effect"))
@@ -338,8 +338,8 @@ def _welch_t_test(
         # 按不可用处理，而不是让 **2 抛 OverflowError。
         return {"test": "invalid_values"}
 
-    term_a = var_a / max(n_a, 1e-10)
-    term_b = var_b / max(n_b, 1e-10)
+    term_a = var_a / n_a
+    term_b = var_b / n_b
     se_squared = term_a + term_b
     delta = mean_b - mean_a
     if not math.isfinite(se_squared) or not math.isfinite(delta):
@@ -668,7 +668,7 @@ def _t_power_nodes(
         exponent = max(
             5, min(1000, int(math.ceil(3.0 / df)))
         )
-        t_max = u_max ** (1.0 / max(exponent, 1e-10))
+        t_max = u_max ** (1.0 / exponent)
         minimum_intervals = (
             _T_POWER_SMALL_DF_MIN_INTERVALS
             if df < 1.0
@@ -851,7 +851,7 @@ def _t_power_small_df_large_scale(
     """
     if not math.isfinite(noncentrality):
         return 1.0
-    exponent = max(5, min(1000, int(math.ceil(3.0 / max(df_value, 1e-10)))))
+    exponent = max(5, min(1000, int(math.ceil(3.0 / df_value))))
     log_const = (
         (1.0 - df_value / 2.0) * math.log(2.0)
         - math.lgamma(df_value / 2.0)
@@ -924,7 +924,7 @@ def _t_power_small_df_large_scale(
                 simpson = 2.0 * step / 3.0
             else:
                 simpson = 4.0 * step / 3.0
-            u = w / max(scale, 1e-10)
+            u = w / scale
             if u <= 0.0:
                 continue
             factor = _power_factor(w)
@@ -985,7 +985,7 @@ def _t_power(
         # 截断而偏离 alpha；这是可精确知道的值，直接返回。
         return alpha_value
 
-    noncentrality = effect_value / max(se_value, 1e-10)
+    noncentrality = effect_value / se_value
     if math.isinf(noncentrality):
         # se 小到 δ 溢出：非中心参数趋于无穷，任何有限临界值
         # 都必然被超过。不能把 inf 带进正态混合积分（那里的
@@ -1054,7 +1054,7 @@ def _t_power(
         target_step = 0.02 * min(1.0, scale)
         intervals = max(
             200,
-            int(math.ceil(w_max / max(target_step, 1e-10))),
+            int(math.ceil(w_max / target_step)),
         )
         if intervals % 2:
             intervals += 1
@@ -1067,7 +1067,7 @@ def _t_power(
         total = 0.0
         for index in range(intervals + 1):
             w = index * step
-            u = w / max(scale, 1e-10)
+            u = w / scale
             if index == 0 or index == intervals:
                 simpson = step / 3.0
             elif index % 2 == 0:
@@ -1335,15 +1335,15 @@ def _noncentral_t_cdf_large_shift(
         if high > low:
             width = high - low
             step = min(0.02, a / 50.0)
-            intervals = max(2, math.ceil(width / max(step, 1e-10)))
+            intervals = max(2, math.ceil(width / step))
             if intervals % 2:
                 intervals += 1
             step = width / intervals
             for index in range(intervals + 1):
                 argument = low + index * step
-                u = (argument + noncentrality) / max(a, 1e-10)
+                u = (argument + noncentrality) / a
                 integrand = (
-                    density(u) / max(a, 1e-10) * normal_cdf(argument)
+                    density(u) / a * normal_cdf(argument)
                 )
                 if index == 0 or index == intervals:
                     total += step / 3.0 * integrand
@@ -1352,7 +1352,7 @@ def _noncentral_t_cdf_large_shift(
                 else:
                     total += 4.0 * step / 3.0 * integrand
 
-        cutoff = (40.0 + noncentrality) / max(a, 1e-10)
+        cutoff = (40.0 + noncentrality) / a
         if cutoff < u_max:
             if cutoff <= 0.0:
                 total += 1.0
@@ -1377,7 +1377,7 @@ def _noncentral_t_cdf_large_shift(
         if high > low:
             width = high - low
             step = min(0.02, scale / 50.0)
-            intervals = max(2, math.ceil(width / max(step, 1e-10)))
+            intervals = max(2, math.ceil(width / step))
             if intervals % 2:
                 intervals += 1
             step = width / intervals
@@ -1385,7 +1385,7 @@ def _noncentral_t_cdf_large_shift(
                 argument = low + index * step
                 u = (argument + noncentrality) / a
                 integrand = (
-                    density(u) / max(scale, 1e-10)
+                    density(u) / scale
                     * normal_cdf(argument)
                 )
                 if index == 0 or index == intervals:
@@ -1395,7 +1395,7 @@ def _noncentral_t_cdf_large_shift(
                 else:
                     total += 4.0 * step / 3.0 * integrand
 
-        cutoff = (-40.0 - noncentrality) / max(scale, 1e-10)
+        cutoff = (-40.0 - noncentrality) / scale
         if cutoff > 0.0:
             if cutoff >= math.sqrt(sys.float_info.max):
                 # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF

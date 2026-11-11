@@ -915,7 +915,7 @@ def _selfcheck_top_54147_0027():
     f1_near = [value - 0.001 + 0.02 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_worse = [value - 0.2 + 0.01 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_windows = {(3, 1.0): f1_base, (1, 0.25): f1_near, (2, 1.0): f1_worse}
-    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / max(one_se_n, 1e-10)}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / max(one_se_n, 1e-10)}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / max(one_se_n, 1e-10)}]
+    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / one_se_n}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / one_se_n}]
     f1_selection = _select_ngram_candidate_one_se(f1_candidates[2], f1_candidates, f1_windows, 'val_macro_f1')
     assert f1_selection is not None
     assert f1_selection['available'] is True
