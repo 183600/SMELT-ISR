@@ -11,7 +11,28 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+def _resolve_repo_root() -> Path:
+    """
+    定位仓库根目录（experiment.py 所在目录）。
+
+    本文件有两种装载方式：随 exp 包被 exec 到共享命名空间时，
+    exp/__init__.py 会把 ``__file__`` 重定向到 <repo>/experiment.py；
+    作为独立子模块导入时 ``__file__`` 是 <repo>/exp/本文件。
+    两种情况都要得到同一仓库根，否则源码树指纹会指向错误目录、
+    静默产出空指纹（空串的 SHA-256），归档看起来成功实则无效。
+    """
+    entry = Path(__file__).resolve()
+    if entry.name == "experiment.py":
+        return entry.parent
+    if entry.parent.name == "exp":
+        return entry.parent.parent
+    for parent in entry.parents:
+        if (parent / "experiment.py").is_file():
+            return parent
+    return entry.parent
+
+
+_REPO_ROOT = _resolve_repo_root()
 _ENTRY_SCRIPT = _REPO_ROOT / "experiment.py"
 _RUNTIME_DIRS = ("exp", "selfcheck")
 _SKIP_NAMES = frozenset({".pyc", ".pyo"})
@@ -64,13 +85,44 @@ def _safe_rel_name(path: Path, root: Path) -> Optional[str]:
     return relative.as_posix()
 
 
-def _source_tree_fingerprint() -> dict:
-    """基于文件内容的运行时代码指纹（experiment.py + exp/ + selfcheck/）。
+def _canonical_json_sha256_local(value: object) -> str:
+    # 与 exp/part_037 的 _canonical_json_sha256 同一口径；独立
+    # 子模块导入路径下的兜底实现，保证两种装载方式产出同一指纹。
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
-    不依赖 git，同一份源码换目录/解压后指纹不变；与
-    exp/part_038_environment_snapshot.collect_run_metadata 口径一致，
-    但此处自包含，可在不导入整个 experiment 包的上下文中使用。
+
+def _source_tree_fingerprint() -> dict:
+    """运行时代码指纹（experiment.py + exp/ + selfcheck/）。
+
+    优先复用 exp/part_037 的官方 ``source_tree_fingerprint()``：
+    指纹必须与 ``--print-source-fingerprint`` / ``--check-source``
+    完全同口径，归档内的 source_tree_fingerprint.json 才能与
+    当前进程核对。作为独立子模块导入（无共享命名空间）时退回
+    自包含实现，并用与官方一致的 canonical JSON 摘要。
     """
+    official = globals().get("source_tree_fingerprint")
+    if callable(official):
+        try:
+            record = official()
+        except Exception:  # pragma: no cover - 防御：官方实现异常时退回本地实现
+            record = None
+        if isinstance(record, dict) and record.get("available"):
+            return {
+                "schema": record.get("schema"),
+                "root": str(_REPO_ROOT),
+                "file_count": record.get("file_count"),
+                "total_bytes": record.get("total_bytes"),
+                "files": record.get("files"),
+                "sha256": record.get("sha256"),
+            }
     files = []
     if _ENTRY_SCRIPT.is_file():
         files.append(("experiment.py", _ENTRY_SCRIPT.stat().st_size, _sha256_file(_ENTRY_SCRIPT)))
@@ -78,25 +130,31 @@ def _source_tree_fingerprint() -> dict:
         directory = _REPO_ROOT / dirname
         if not directory.is_dir():
             continue
-        for path in sorted(directory.rglob("*")):
-            if not path.is_file():
-                continue
-            if path.suffix in _SKIP_NAMES or "__pycache__" in path.parts:
+        # 与官方口径一致：只计入 Python 源文件，跳过 __pycache__。
+        for path in sorted(directory.rglob("*.py")):
+            if "__pycache__" in path.parts or not path.is_file():
                 continue
             relative = _safe_rel_name(path, _REPO_ROOT)
             if relative is None:
                 continue
             files.append((relative, path.stat().st_size, _sha256_file(path)))
     files.sort(key=lambda item: item[0])
-    payload = "\n".join(f"{rel}\t{size}\t{sha}" for rel, size, sha in files)
+    entries = [
+        {"path": rel, "bytes": size, "sha256": sha}
+        for rel, size, sha in files
+    ]
+    digest = _canonical_json_sha256_local(
+        {
+            "schema": "smelt-isr/source-tree/v1",
+            "files": entries,
+        }
+    )
     return {
-        "schema": "smelt-isr/source-tree-fingerprint/v1",
+        "schema": "smelt-isr/source-tree/v1",
         "root": str(_REPO_ROOT),
         "file_count": len(files),
-        "files": [
-            {"path": rel, "bytes": size, "sha256": sha} for rel, size, sha in files
-        ],
-        "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "files": entries,
+        "sha256": digest,
     }
 
 
@@ -280,6 +338,100 @@ def main(archive_root: str) -> int:
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "."))
 '''
+
+
+def repro_package_mode_error(args) -> Optional[str]:
+    """
+    校验 --export-repro-package 的互斥与搭配。
+
+    复现包导出是只读的归档工具：不需要 --data/--out/种子，也
+    不能与训练、预注册、对比等入口混用，否则用户很容易以为
+    「只是打包」而实际又启动了一次训练，或反过来把训练参数
+    静默忽略。
+    """
+    run_dirs = getattr(args, "export_repro_package", None)
+    if run_dirs is None:
+        if getattr(args, "repro_package_format", None) not in (
+            None,
+            "zip",
+        ) or getattr(args, "repro_package_out", None) not in (
+            None,
+            "reproducibility_package",
+        ):
+            return (
+                "--repro-package-format / --repro-package-out 只能配合 "
+                "--export-repro-package 使用"
+            )
+        return None
+    conflicts = [
+        flag
+        for flag, active in (
+            ("--compare", getattr(args, "compare", None) is not None),
+            (
+                "--compare-report",
+                getattr(args, "compare_report", None) is not None,
+            ),
+            (
+                "--compare-csv",
+                getattr(args, "compare_csv", None) is not None,
+            ),
+            (
+                "--final-test-comparison",
+                getattr(args, "final_test_comparison", None) is not None,
+            ),
+            ("--resume", getattr(args, "resume", None) is not None),
+            (
+                "--evaluate-test",
+                bool(getattr(args, "evaluate_test", False)),
+            ),
+            ("--sanity-only", bool(getattr(args, "sanity_only", False))),
+            (
+                "--statistical-baseline",
+                bool(getattr(args, "statistical_baseline", False)),
+            ),
+            (
+                "--suite-baseline-tuning",
+                bool(getattr(args, "suite_baseline_tuning", False)),
+            ),
+            ("--plan-design", bool(getattr(args, "plan_design", False))),
+            (
+                "--design-pilot-runs",
+                getattr(args, "design_pilot_runs", None) is not None,
+            ),
+            (
+                "--preregistration",
+                getattr(args, "preregistration", None) is not None,
+            ),
+            (
+                "--write-manifest",
+                getattr(args, "write_manifest", None) is not None,
+            ),
+            (
+                "--verify-manifest",
+                getattr(args, "verify_manifest", None) is not None,
+            ),
+            (
+                "--check-environment",
+                getattr(args, "check_environment", None) is not None,
+            ),
+            (
+                "--write-data-plan",
+                getattr(args, "write_data_plan", None) is not None,
+            ),
+            (
+                "--check-data-plan",
+                getattr(args, "check_data_plan", None) is not None,
+            ),
+        )
+        if active
+    ]
+    if conflicts:
+        return (
+            "--export-repro-package 是只读归档入口，不能与以下"
+            "训练/评估/核对参数同时使用（否则会被静默忽略）: "
+            + ", ".join(conflicts)
+        )
+    return None
 
 
 def export_reproducibility_package(

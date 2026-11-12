@@ -707,7 +707,7 @@ def _PA_part_001():
         print('  OK：各运行的有效路由宽度与均衡强度一致')
 
 def _PA_part_002():
-    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
+    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, bayesian_entries, bayesian_summary, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
     if factorial['designs'] or factorial['incomplete_designs']:
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
@@ -862,5 +862,41 @@ def _PA_part_002():
                 print(f'  {reason}')
         elif order_audit.get('verdict') == 'ok':
             print('  未发现强顺序相关；随机化区组平衡了时间片，但描述性诊断不能证明没有漂移')
-    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'n_runs': len(rows)})
+    # 贝叶斯补充分析（--bayesian 显式开启；默认关闭时不计算、
+    # 不打印、不落盘，避免额外开销与「事后挑选证据口径」的嫌疑）。
+    bayesian_entries = []
+    if bayesian:
+        bayesian_entries = [
+            entry
+            for entry in (
+                _bayesian_contrast(contrast, bayesian_prior_scale)
+                for contrast in list(contrasts) + list(reference)
+            )
+            if entry is not None
+        ]
+        bayesian_summary = _bayesian_analysis_summary(bayesian_entries, bayesian_prior_scale)
+        print()
+        print('[bayesian] JZS 贝叶斯补充分析（Cauchy(0, %.2f) 先验；证据分级按 |ln BF10|：≥1.1 实质、≥2.3 强、≥4.6 决定性，负值支持零假设）' % float(bayesian_prior_scale))
+        available_bayes = [entry for entry in bayesian_entries if entry.get('available')]
+        if not bayesian_entries:
+            print('  无可用配对/对比检验（贝叶斯因子需要 t 统计量与自由度）')
+        elif not available_bayes:
+            print('  所有对比都不可用（见 advisories）')
+        for entry in available_bayes:
+            label = f'''{entry.get('baseline')}→{entry.get('variant')}'''
+            log_bf = entry.get('log_bayes_factor_10')
+            category = str(entry.get('evidence_category'))
+            prob_alt = entry.get('posterior_prob_alternative')
+            bf_text = f'''lnBF10={_format_finite(log_bf, '+.2f')}（{_format_finite(entry.get('bayes_factor_10'), '.2f')}）'''
+            parts_text = f'''P(H1|D)={_format_finite(prob_alt, '.2f')}'''
+            if entry.get('posterior_summaries_available'):
+                superior = entry.get('posterior_prob_superior')
+                mean_text = _format_finite(entry.get('posterior_mean'), '+.3f')
+                hdi_text = f'''[{_format_finite(entry.get('posterior_hdi95_low'), '+.3f')},{_format_finite(entry.get('posterior_hdi95_high'), '+.3f')}]'''
+                parts_text += f'''，P(δ>0|D)={_format_finite(superior, '.3f')}，后验均值={mean_text}，HDI95={hdi_text}'''
+            print(f'''  {label}: {bf_text}，{category}，{parts_text}（{entry.get('design')}，N_eff={_format_finite(entry.get('n_effective'), '.1f')}）''')
+        for message in bayesian_summary.get('advisories', []):
+            print(f'  [note] {message}')
+        print('  ' + str(bayesian_summary.get('note')))
+    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'bayesian_analysis': (bayesian_summary if bayesian else None), 'n_runs': len(rows)})
 

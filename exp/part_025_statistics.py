@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
+import torch
+
 
 
 def _fragility_summary(
@@ -1409,3 +1412,599 @@ def _noncentral_t_cdf_large_shift(
                 if lower is not None:
                     total += lower
     return min(1.0, max(0.0, total))
+
+
+# ---------------------------------------------------------------------------
+# 贝叶斯补充分析（P0，--bayesian）
+#
+# 目标：在频率派判定（Holm 校正 + TOST）之外，并行提供证据强度
+# 度量。默认关闭、不改变任何现有判定，只在显式开启时计算。
+#
+# 模型：JZS（Jeffreys-Zellner-Siow）默认先验，标准化效应
+# δ ~ Cauchy(0, r)（等价地 g ~ InvGamma(1/2, r²/2)）。单侧/配对
+# 设计下 Bayes 因子有 Rouder et al. (2009) 的一维积分形式：
+#
+#   BF10 = ∫₀^∞ (1+Ng)^(-1/2)·(1+t²/((1+Ng)ν))^(-N/2)·π(g) dg
+#          / (1+t²/ν)^(-N/2)
+#
+# 其中 N 为有效样本量（配对：种子对数；Welch：n₁n₂/(n₁+n₂)），
+# ν 为 t 检验自由度，π(g) = r/√(2π)·g^(-3/2)·exp(-r²/(2g))。
+# 作代换 g = 1/u² 后积分化为 [0,∞) 上光滑函数
+#
+#   (2r/√(2π))·∫₀^∞ exp(-r²u²/2)·L(1/u²) du
+#
+# （u→0 时 L ∝ u/√N → 0，u→∞ 时高斯项迅速衰减），用复合
+# Simpson 求积即可精确到机器精度量级，无 SciPy 依赖。
+#
+# 后验量（P(δ>0|D)、分位数、HDI）不用近似 σ²：给定 g 时
+# σ²|D,g ~ InvGamma(N/2, S_g/2)（注意形状是 N/2，因为 Jeffreys
+# 先验比样本方差多一个自由度），μ|σ²,D,g ~ N(m_g, v_g·σ²)，
+# 因此
+#
+#   δ = μ/σ | D, g = c_g·√(Y/N) + √(v_g)·Z，  Y ~ χ²_N，Z ~ N(0,1)
+#
+# 是 (g, Y) 上的正态混合。对 g 用后验权重 π(g)L(g)、对 Y 用
+# χ²_N 密度做两层确定性求积，得到精确到网格分辨率的混合表示；
+# P(δ>0) 与 CDF 由混合直接累加，HDI 用 δ 网格上的最短覆盖
+# 区间计算（后验混合一般不对称，等尾区间不等于 HDI）。
+# ---------------------------------------------------------------------------
+
+_JZS_DEFAULT_PRIOR_SCALE = 0.7071067811865476  # Cauchy(0, 1/√2)「中等」先验
+_BAYES_QUAD_NODES = 513  # u 空间 Simpson 节点数（奇数）
+_BAYES_TAIL_LOG_CUT = 41.45  # exp(-r²u²/2) < e^-41.45 ≈ 1e-18 处截断
+_BAYES_Y_SIGMA_CUT = 12.0  # χ²_N 网格覆盖到均值 + 12 个标准差
+_BAYES_DELTA_SPAN_SD = 10.0  # δ 网格覆盖后验均值 ± 10 个后验标准差
+_BAYES_DELTA_GRID = 401  # δ 网格点数（CDF/HDI/密度）
+_BAYES_EVIDENCE_THRESHOLDS = (
+    (4.6, "decisive"),
+    (2.3, "strong"),
+    (1.1, "substantial"),
+    (0.69, "weak"),
+)
+_BAYES_MAX_T = 1.0e6
+
+
+def _bayes_evidence_category(
+    log_bf10: float,
+) -> str:
+    """按 |ln BF10| 给出 Jeffreys 风格的证据分级。"""
+    magnitude = abs(float(log_bf10))
+    target = "alternative" if log_bf10 > 0.0 else "null"
+    for threshold, label in _BAYES_EVIDENCE_THRESHOLDS:
+        if magnitude >= threshold:
+            return f"{label}_evidence_for_{target}"
+    return f"anecdotal_evidence_for_{target}"
+
+
+def _jzs_u_nodes_kernel(
+    t_value: float,
+    n_value: float,
+    df_value: float,
+    scale: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    返回 u 空间求积节点、被积函数值与 Simpson 权重。
+
+    被积函数 = exp(-r²u²/2)·(1+N/u²)^(-1/2)·(1+t²/((1+N/u²)ν))^(-N/2)，
+    它同时是 BF10 分子积分的被积函数与 g 后验权重的（未归一化）
+    核：π(g)L(g) 在 g=1/u² 代换下就是这个函数乘以常数 2r/√(2π)。
+
+    积分区间分两段复合：[0, u_transition] 用细网格解析
+    L(1/u²) 从 0 过渡到渐近值的区域（过渡尺度 ~√N），其余到
+    u_max（高斯截断）用粗网格。先验尺度 r 很小时 u_max 远大于
+    √N，单段网格会完全跳过过渡区，使 BF 产生百分之几的误差；
+    两段复合后该误差消失。u_max ≤ 过渡点时退化为单段。
+    """
+    r = float(scale)
+    u_max = math.sqrt(2.0 * _BAYES_TAIL_LOG_CUT) / r
+    u_transition = 12.0 * math.sqrt(float(n_value))
+    nodes = int(_BAYES_QUAD_NODES)
+    if nodes % 2 == 0:
+        nodes += 1
+
+    def _integrand(u: "np.ndarray") -> "np.ndarray":
+        values = np.zeros_like(u, dtype=np.float64)
+        positive = u > 0.0
+        inner = u[positive]
+        one_plus_ng = 1.0 + n_value / np.square(inner)
+        lam2 = 1.0 + t_value * t_value / (one_plus_ng * df_value)
+        values[positive] = np.exp(-0.5 * (r * r) * np.square(inner)) * (
+            one_plus_ng ** -0.5
+        ) * np.power(lam2, -0.5 * float(df_value))
+        return values
+
+    def _simpson_weights(span: float, count: int) -> "np.ndarray":
+        weights = np.ones(count, dtype=np.float64)
+        weights[1:-1:2] = 4.0
+        weights[2:-1:2] = 2.0
+        return weights * (span / (count - 1) / 3.0)
+
+    if u_max <= u_transition:
+        u = np.linspace(0.0, u_max, nodes)
+        kernel = _integrand(u)
+        return u, kernel, _simpson_weights(u_max, nodes)
+    first = np.linspace(0.0, u_transition, nodes)
+    second = np.linspace(u_transition, u_max, nodes)
+    u = np.concatenate((first, second[1:]))
+    kernel = np.concatenate(
+        (_integrand(first), _integrand(second[1:]))
+    )
+    weights = np.concatenate(
+        (
+            _simpson_weights(u_transition, nodes),
+            _simpson_weights(u_max - u_transition, nodes)[1:],
+        )
+    )
+    return u, kernel, weights
+
+
+def _jzs_log_bayes_factor_10(
+    t_value: float,
+    n_value: float,
+    df_value: float,
+    scale: float = _JZS_DEFAULT_PRIOR_SCALE,
+) -> Optional[float]:
+    """
+    计算 JZS Bayes 因子 BF10 的自然对数（配对/单样本 t 口径）。
+
+    返回 None 表示数值上不可计算（t 非有限、自由度/样本量非法
+    或积分下溢），调用方应把该对比标记为不可用而不是写入
+    非有限数值。
+    """
+    t_value = _finite_float(t_value)
+    n_value = _finite_float(n_value)
+    df_value = _finite_float(df_value)
+    scale = _finite_float(scale)
+    if t_value is None or n_value is None or df_value is None:
+        return None
+    if scale is None or scale <= 0.0:
+        return None
+    if n_value <= 0.0 or df_value <= 0.0:
+        return None
+    if abs(t_value) > _BAYES_MAX_T:
+        return None
+    _u, kernel, weights = _jzs_u_nodes_kernel(
+        t_value, n_value, df_value, scale
+    )
+    integral = float(np.dot(kernel, weights)) * (
+        2.0 * scale / math.sqrt(2.0 * math.pi)
+    )
+    if not math.isfinite(integral) or integral <= 0.0:
+        return None
+    # 分母 (1+t²/ν)^(-N/2) 在 log 域计算，避免大 t 下溢。
+    log_denominator = -0.5 * float(df_value) * math.log1p(
+        t_value * t_value / df_value
+    )
+    log_numerator = math.log(integral)
+    log_bf = log_numerator - log_denominator
+    if not math.isfinite(log_bf):
+        return None
+    return log_bf
+
+
+def _jzs_posterior_mixture(
+    t_value: float,
+    n_value: float,
+    df_value: float,
+    scale: float = _JZS_DEFAULT_PRIOR_SCALE,
+) -> Optional[Dict[str, object]]:
+    """
+    构造标准化效应 δ = μ/σ 的后验正态混合表示。
+
+    返回 dict：
+    - ``mixture_loc`` / ``mixture_scale`` / ``mixture_weight``：
+      (g, Y) 网格上每个正态分量的位置、标准差与权重（和为 1）；
+      δ = loc + scale·Z。
+    - ``mean`` / ``sd``：后验均值与标准差（由混合矩直接计算）。
+
+    需要 N ≥ 2（配对设计即 ≥2 个种子对；Welch 口径由调用方
+    传入 n₁n₂/(n₁+n₂)）且 t/df 有限；不满足时返回 None。
+    """
+    t_value = _finite_float(t_value)
+    n_value = _finite_float(n_value)
+    df_value = _finite_float(df_value)
+    scale = _finite_float(scale)
+    if (
+        t_value is None
+        or n_value is None
+        or df_value is None
+        or scale is None
+        or scale <= 0.0
+    ):
+        return None
+    if n_value < 2.0 or df_value <= 0.0:
+        return None
+    if abs(t_value) > _BAYES_MAX_T:
+        return None
+    _u, kernel, weights = _jzs_u_nodes_kernel(
+        t_value, n_value, df_value, scale
+    )
+    total_kernel = float(np.dot(kernel, weights))
+    if not math.isfinite(total_kernel) or total_kernel <= 0.0:
+        return None
+    # g 后验权重：u 空间 Simpson 权重 × 被积函数。u=0 节点核为
+    # 0，对应 g→∞ 的零测度端点，自然被排除。
+    g_weights = kernel * weights
+    g_nodes = np.empty_like(kernel)
+    positive = np.abs(_u) > 0.0
+    g_nodes[positive] = 1.0 / np.square(_u[positive])
+    keep = g_weights > 0.0
+    if not bool(np.any(keep)):
+        return None
+    g_nodes = g_nodes[keep]
+    g_weights = g_weights[keep]
+    g_weights = g_weights / float(np.dot(g_weights, np.ones_like(g_weights)))
+    one_plus_ng = 1.0 + n_value * g_nodes
+    v_g = g_nodes / one_plus_ng
+    lam2 = 1.0 + t_value * t_value / (one_plus_ng * df_value)
+    c_g = (
+        t_value
+        * n_value
+        * g_nodes
+        / (math.sqrt(df_value) * one_plus_ng * np.sqrt(lam2))
+    )
+    # σ²|D,g ~ InvGamma(N/2, S_g/2)：Y ~ χ²_N，σ² = S_g/Y，
+    # m_g/σ = c_g·√(Y/N)。
+    chi_df = n_value
+    y_max = chi_df + _BAYES_Y_SIGMA_CUT * math.sqrt(2.0 * chi_df)
+    y_nodes_count = 129
+    y = np.linspace(0.0, y_max, y_nodes_count)
+    y_weights = np.empty(y_nodes_count, dtype=np.float64)
+    y_weights[0] = 1.0
+    y_weights[-1] = 1.0
+    y_weights[1:-1:2] = 4.0
+    y_weights[2:-1:2] = 2.0
+    y_weights = y_weights * (y_max / (y_nodes_count - 1) / 3.0)
+    log_density = np.full(y_nodes_count, -np.inf)
+    positive_y = y > 0.0
+    if chi_df > 2.0:
+        log_density[positive_y] = (
+            (0.5 * chi_df - 1.0) * np.log(y[positive_y])
+            - 0.5 * y[positive_y]
+        )
+    elif chi_df == 2.0:
+        log_density[positive_y] = -0.5 * y[positive_y]
+        # y→0 时 χ²₂ 密度收敛到 1/2（形状参数恰为 1）。
+        log_density[0] = math.log(0.5)
+    else:
+        # N < 2 已在上游拒绝；防御性处理，不生成有限密度。
+        return None
+    log_density[positive_y] = log_density[positive_y] - (
+        0.5 * chi_df * math.log(2.0) + math.lgamma(0.5 * chi_df)
+    )
+    y_density = np.exp(log_density)
+    y_density = np.maximum(y_density, 0.0)
+    y_mass = y_density * y_weights
+    y_total = float(np.dot(y_mass, np.ones_like(y_mass)))
+    if not math.isfinite(y_total) or y_total <= 0.0:
+        return None
+    y_mass = y_mass / y_total
+    # 混合分量：外积 (g 节点 × Y 节点)。loc_ij = c_g·√(Y/N)，
+    # scale_i = √v_g（与 Y 无关），weight_ij = w_g·p_j。
+    sqrt_y_over_n = np.sqrt(y / chi_df)
+    loc = np.outer(c_g, sqrt_y_over_n)
+    scale_vector = np.sqrt(v_g)
+    weight = np.outer(g_weights, y_mass)
+    mean = float(np.sum(weight * loc))
+    second_moment = float(
+        np.sum(weight * (loc * loc + np.square(scale_vector)[:, None]))
+    )
+    variance = second_moment - mean * mean
+    if not math.isfinite(mean) or not math.isfinite(variance):
+        return None
+    sd = math.sqrt(max(variance, 0.0))
+    return {
+        "mixture_loc": loc,
+        "mixture_scale": scale_vector,
+        "mixture_weight": weight,
+        "mean": mean,
+        "sd": sd,
+        "n_effective": n_value,
+        "df": df_value,
+        "prior_scale": scale,
+    }
+
+
+def _normal_cdf_vector(values: "np.ndarray") -> "np.ndarray":
+    """向量版标准正态 CDF（torch.special.erfc，float64）。"""
+    tensor = torch.as_tensor(
+        np.clip(np.asarray(values, dtype=np.float64), -40.0, 40.0)
+    )
+    result = 0.5 * torch.special.erfc(-tensor / math.sqrt(2.0))
+    return result.numpy()
+
+
+def _jzs_posterior_summaries(
+    t_value: float,
+    n_value: float,
+    df_value: float,
+    scale: float = _JZS_DEFAULT_PRIOR_SCALE,
+) -> Optional[Dict[str, object]]:
+    """
+    从后验混合中计算 P(δ>0|D)、后验均值/标准差与 95% HDI。
+
+    HDI 在 δ 网格上用滑动窗口求最短 95% 覆盖区间；后验混合在
+    t≠0 时不对称，等尾区间一般不是 HDI，这里直接算最短区间。
+    分位数同时给出（等尾 95% 区间），供与 HDI 对照。
+    """
+    mixture = _jzs_posterior_mixture(
+        t_value, n_value, df_value, scale
+    )
+    if mixture is None:
+        return None
+    loc = mixture["mixture_loc"]
+    scale_vector = mixture["mixture_scale"]
+    weight = mixture["mixture_weight"]
+    mean = float(mixture["mean"])
+    sd = float(mixture["sd"])
+    if sd <= 0.0:
+        return None
+    # P(δ>0|D)：逐 (g, Y) 分量对 loc/sd 求正态 CDF 后加权求和。
+    probabilities = _normal_cdf_vector(loc / scale_vector[:, None])
+    prob_superior = float(np.sum(weight * probabilities))
+    prob_superior = min(1.0, max(0.0, prob_superior))
+    # δ 网格上的密度与 CDF：按 g 节点分块累加，避免大矩阵。
+    # 后验质量通常集中在少数 g 节点上；质量可忽略的节点直接
+    # 跳过（阈值远低于任何报告精度），把每次对比的计算量从
+    # 全部 ~1000 个节点降到实际有效的几十个。
+    low = mean - _BAYES_DELTA_SPAN_SD * sd
+    high = mean + _BAYES_DELTA_SPAN_SD * sd
+    delta_grid = np.linspace(low, high, _BAYES_DELTA_GRID)
+    density = np.zeros_like(delta_grid)
+    cdf = np.zeros_like(delta_grid)
+    n_g = loc.shape[0]
+    for index in range(n_g):
+        component_weight = weight[index]
+        component_mass = float(np.sum(component_weight))
+        if component_mass <= 1e-13:
+            continue
+        component_loc = loc[index]
+        component_scale = float(scale_vector[index])
+        standardized = (delta_grid[:, None] - component_loc[None, :]) / (
+            component_scale
+        )
+        density += (
+            component_weight[None, :]
+            * np.exp(-0.5 * np.square(standardized))
+            / (component_scale * math.sqrt(2.0 * math.pi))
+        ).sum(axis=1)
+        cdf += _normal_cdf_vector(standardized) @ component_weight
+    density_total = _trapz_integral(density, delta_grid)
+    if not math.isfinite(density_total) or density_total <= 0.0:
+        return None
+    density = density / density_total
+    cdf = cdf / density_total
+    cdf = np.clip(cdf, 0.0, 1.0)
+    cdf = np.maximum.accumulate(cdf)
+    # 等尾 95% 分位区间（线性插值反演 CDF）。
+    quantile_low = float(np.interp(0.025, cdf, delta_grid))
+    quantile_high = float(np.interp(0.975, cdf, delta_grid))
+    # HDI：均匀 δ 网格上的滑动窗口求最短 95% 质量区间。窗口
+    # [start, stop) 的质量对应网格点 start 到 stop 之间的梯形
+    # 质量与宽度，端点口径一致。
+    window_mass = 0.95 * _trapz_integral(density, delta_grid)
+    cumulative = np.concatenate(
+        (
+            [0.0],
+            np.cumsum(
+                0.5
+                * (density[1:] + density[:-1])
+                * np.diff(delta_grid)
+            ),
+        )
+    )
+    best_low = quantile_low
+    best_high = quantile_high
+    best_width = None
+    start = 0
+    for stop in range(1, _BAYES_DELTA_GRID):
+        while (
+            start < stop
+            and cumulative[stop] - cumulative[start] >= window_mass
+        ):
+            width = delta_grid[stop] - delta_grid[start]
+            if best_width is None or width < best_width:
+                best_width = width
+                best_low = float(delta_grid[start])
+                best_high = float(delta_grid[stop])
+            start += 1
+    if best_width is None:
+        # 网格总质量不足 95%（极端平坦）：退回等尾区间。
+        best_low = quantile_low
+        best_high = quantile_high
+    elif abs(mean) <= 1e-12:
+        # t=0 时后验关于 0 对称，最短窗口在网格对齐下可能取到
+        # 两个等宽的非对称镜像；对称化以匹配解析事实。
+        half_width = 0.5 * (best_high - best_low)
+        best_low = mean - half_width
+        best_high = mean + half_width
+    return {
+        "posterior_prob_superior": prob_superior,
+        "posterior_mean": mean,
+        "posterior_sd": sd,
+        "posterior_hdi95_low": best_low,
+        "posterior_hdi95_high": best_high,
+        "posterior_eti95_low": quantile_low,
+        "posterior_eti95_high": quantile_high,
+        "posterior_method": "exact_jzs_mixture_quadrature",
+    }
+
+
+def _trapz_integral(
+    values: "np.ndarray",
+    grid: "np.ndarray",
+) -> float:
+    """均匀/非均匀网格上的梯形积分（不依赖 np.trapz 版本差异）。"""
+    values = np.asarray(values, dtype=np.float64)
+    grid = np.asarray(grid, dtype=np.float64)
+    if values.size < 2:
+        return 0.0
+    return float(
+        np.dot(0.5 * (values[1:] + values[:-1]), np.diff(grid))
+    )
+
+
+def _bayesian_contrast(
+    contrast: Dict[str, object],
+    prior_scale: float = _JZS_DEFAULT_PRIOR_SCALE,
+) -> Optional[Dict[str, object]]:
+    """
+    为单个对比记录构造 JZS 贝叶斯补充分析。
+
+    只读：不改写对比记录本身。配对设计（paired_t）用种子对数
+    作为有效样本量；Welch 设计用 n₁n₂/(n₁+n₂)。任一必要字段
+    缺失或非有限时返回带 ``available=False`` 与原因的记录，
+    不抛异常，保证报告其余部分不受影响。
+    """
+    if not isinstance(contrast, dict):
+        return None
+    if contrast.get("confounded"):
+        return {
+            "available": False,
+            "reason": "confounded_contrast",
+        }
+    test_name = str(contrast.get("test") or "")
+    t_value = _finite_float(contrast.get("t"))
+    df_value = _finite_float(contrast.get("df"))
+    if t_value is None or df_value is None or df_value <= 0.0:
+        return {
+            "available": False,
+            "reason": "missing_or_invalid_t_statistic",
+        }
+    if test_name == "paired_t":
+        n_pairs = _finite_float(contrast.get("n_pairs"))
+        if n_pairs is None or n_pairs < 2.0:
+            return {
+                "available": False,
+                "reason": "insufficient_paired_seeds",
+            }
+        n_effective = n_pairs
+        design = "paired"
+    elif test_name == "welch_t":
+        n_baseline = _finite_float(contrast.get("n_baseline"))
+        n_variant = _finite_float(contrast.get("n_variant"))
+        if (
+            n_baseline is None
+            or n_variant is None
+            or n_baseline < 1.0
+            or n_variant < 1.0
+        ):
+            return {
+                "available": False,
+                "reason": "missing_group_sizes",
+            }
+        n_effective = (n_baseline * n_variant) / (
+            n_baseline + n_variant
+        )
+        design = "welch"
+        if n_effective < 1.0:
+            return {
+                "available": False,
+                "reason": "insufficient_effective_sample_size",
+            }
+    else:
+        return {
+            "available": False,
+            "reason": f"unsupported_test:{test_name or 'unknown'}",
+        }
+    log_bf10 = _jzs_log_bayes_factor_10(
+        t_value, n_effective, df_value, prior_scale
+    )
+    if log_bf10 is None:
+        return {
+            "available": False,
+            "reason": "bayes_factor_not_finite",
+        }
+    bf10 = math.exp(log_bf10)
+    entry: Dict[str, object] = {
+        "available": True,
+        "baseline": contrast.get("baseline"),
+        "variant": contrast.get("variant"),
+        "factor": contrast.get("factor"),
+        "design": design,
+        "test": test_name,
+        "t": t_value,
+        "df": df_value,
+        "n_effective": n_effective,
+        "delta": _finite_float(contrast.get("delta")),
+        "prior": {
+            "family": "cauchy",
+            "scale": float(prior_scale),
+            "standardized_effect": "delta = variant - baseline",
+        },
+        "log_bayes_factor_10": log_bf10,
+        "bayes_factor_10": bf10,
+        "evidence_category": _bayes_evidence_category(log_bf10),
+        # 等先验几率（P(H1)=P(H0)=0.5）下的后验模型概率：
+        # P(H1|D) = BF10/(1+BF10)。这是模型层面的概率，不是
+        # 「效应为正」的概率，后者见 posterior_prob_superior。
+        "posterior_prob_alternative": bf10 / (1.0 + bf10),
+    }
+    summaries = _jzs_posterior_summaries(
+        t_value, n_effective, df_value, prior_scale
+    )
+    if summaries is None:
+        entry["posterior_summaries_available"] = False
+        entry["posterior_summaries_reason"] = (
+            "posterior_quadrature_failed"
+        )
+    else:
+        entry["posterior_summaries_available"] = True
+        entry.update(summaries)
+    return entry
+
+
+def _bayesian_analysis_summary(
+    entries: List[Dict[str, object]],
+    prior_scale: float,
+) -> Dict[str, object]:
+    """汇总贝叶斯补充分析条目，供展示与 --compare-report 落盘。"""
+    available_entries = [
+        entry for entry in entries if entry.get("available")
+    ]
+    unavailable_entries = [
+        {
+            "baseline": entry.get("baseline"),
+            "variant": entry.get("variant"),
+            "reason": entry.get("reason"),
+        }
+        for entry in entries
+        if not entry.get("available")
+    ]
+    advisories: List[str] = []
+    for entry in unavailable_entries:
+        advisories.append(
+            f"{entry.get('baseline')}→{entry.get('variant')}: "
+            f"贝叶斯补充分析不可用（{entry.get('reason')}）"
+        )
+    summary = {
+        "schema": "smelt-isr/bayesian-supplement/v1",
+        "enabled": True,
+        "prior": {
+            "family": "cauchy",
+            "scale": float(prior_scale),
+        },
+        "n_contrasts": len(entries),
+        "n_available": len(available_entries),
+        "entries": entries,
+        "unavailable": unavailable_entries,
+        "advisories": advisories,
+        "note": (
+            "贝叶斯因子是证据强度的补充度量，不替代 Holm 校正后的"
+            "显著性判定，也不改变 TOST 等价性结论；证据分级按 "
+            "|ln BF10|（≥1.1 实质、≥2.3 强、≥4.6 决定性，负值表示"
+            "支持零假设）。posterior_prob_superior 是 "
+            "P(δ>0|D)，δ = 变体 − 基线；对「越低越好」的指标，"
+            "δ>0 对应变体更差。先验尺度是分析者选择，换尺度会"
+            "改变 BF 数值，报告必须随结果一起声明先验。"
+        ),
+    }
+    if available_entries:
+        categories: Dict[str, int] = {}
+        for entry in available_entries:
+            category = str(entry.get("evidence_category"))
+            categories[category] = categories.get(category, 0) + 1
+        summary["evidence_category_counts"] = dict(
+            sorted(categories.items())
+        )
+    return summary

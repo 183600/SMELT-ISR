@@ -1339,12 +1339,12 @@ def _metric_multiplicity_report(
         report["ok"] = True
     return report
 
-def print_comparison_analysis(rows: List[Dict[str, object]], factors: Optional[List[str]]=None, baseline_mode: Optional[str]=None, metric: str='val_loss', ablation_modes: Optional[List[str]]=None, equivalence_margin: Optional[float]=_DEFAULT_EQUIVALENCE_MARGIN, allow_partial_ablation: bool=False, common_step: Optional[float]=None) -> Dict[str, object]:
+def print_comparison_analysis(rows: List[Dict[str, object]], factors: Optional[List[str]]=None, baseline_mode: Optional[str]=None, metric: str='val_loss', ablation_modes: Optional[List[str]]=None, equivalence_margin: Optional[float]=_DEFAULT_EQUIVALENCE_MARGIN, allow_partial_ablation: bool=False, common_step: Optional[float]=None, bayesian: bool=False, bayesian_prior_scale: float=_JZS_DEFAULT_PRIOR_SCALE) -> Dict[str, object]:
     from exp._runner import run_isolated
     from exp import _manifest
     _root = os.path.dirname(os.path.abspath(__file__))
     _paths = [os.path.join(_root, 'exp', 'analysisflow', _name) for _name in _manifest.PA_PARTS]
-    return run_isolated(_paths, globals(), _manifest.PA_OWNED, _manifest.PA_ENTRY, {'rows': rows, 'factors': factors, 'baseline_mode': baseline_mode, 'metric': metric, 'ablation_modes': ablation_modes, 'equivalence_margin': equivalence_margin, 'allow_partial_ablation': allow_partial_ablation, 'common_step': common_step})
+    return run_isolated(_paths, globals(), _manifest.PA_OWNED, _manifest.PA_ENTRY, {'rows': rows, 'factors': factors, 'baseline_mode': baseline_mode, 'metric': metric, 'ablation_modes': ablation_modes, 'equivalence_margin': equivalence_margin, 'allow_partial_ablation': allow_partial_ablation, 'common_step': common_step, 'bayesian': bool(bayesian), 'bayesian_prior_scale': float(bayesian_prior_scale)})
 
 
 
