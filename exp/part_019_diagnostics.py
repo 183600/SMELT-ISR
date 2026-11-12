@@ -163,7 +163,7 @@ def diagnose_non_finite(
                 logits = probe_logits
                 probe_source = "diagnostic forward probe"
         except Exception:
-            import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:165")
+            import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:165", exc_info=True)
         finally:
             model.train(was_training)
 
@@ -638,7 +638,7 @@ def _process_peak_rss_mb() -> Optional[float]:
                         3,
                     )
     except (OSError, ValueError, IndexError):
-        import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:640")
+        import logging as _logging; _logging.warning("Suppressed exception in part_019_diagnostics.py:640", exc_info=True)
 
     try:
         import resource

@@ -22,7 +22,7 @@ def _selfcheck_body_60201_0075():
     try:
         print_comparison_analysis(analysis_rows, factors=factors, metric='test_loss')
     except ValueError:
-        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:24")
+        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:24", exc_info=True)
     else:
         raise AssertionError('test_loss 必须被拒绝作为对比指标（测试集不参与跨运行选择）')
     display = _contrast_display(contrast, 'val_loss')
@@ -1133,7 +1133,7 @@ def _selfcheck_body_65099_0112():
     try:
         load_baseline_tuning(bogus_source)
     except ValueError:
-        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1135")
+        import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1135", exc_info=True)
     else:
         raise AssertionError('缺少 winner 的调参报告必须被拒绝')
     tuned_row = next((row for row in compare_runs([smelt_path]) if row.get('run') == 'smelt_seed1'))
@@ -1398,7 +1398,7 @@ def _selfcheck_top_65866_0122():
         try:
             parse_factor_spec(unknown_spec)
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1400")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_002.py:1400", exc_info=True)
         else:
             raise AssertionError('非法对比因子必须被拒绝: ' + repr(unknown_spec))
     assert suite_factor_error(parse_factor_spec('mode,balance_coef,seed'), None, True) is None

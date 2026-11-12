@@ -10,7 +10,7 @@ def _selfcheck_top_51350_0001():
     try:
         Config(vocab_size=256, seq_len=8, d_model=16, n_heads=4, n_layers=3, n_experts=3, expert_hidden=24).validate()
     except ValueError:
-        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:12")
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:12", exc_info=True)
     else:
         raise AssertionError('非法 n_layers 在 -O 模式下也必须被拒绝')
     common = dict(vocab_size=256, seq_len=8, d_model=16, n_heads=4, n_layers=4, n_experts=3, expert_hidden=24, top_k=2, k1=2, k2=2)
@@ -108,7 +108,7 @@ def _selfcheck_top_51618_0003():
     try:
         Config(**common, mode='dense', dense_fnn_hidden=-1).validate()
     except ValueError:
-        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:110")
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:110", exc_info=True)
     else:
         raise AssertionError('非法 dense_fnn_hidden 必须被拒绝')
     class RouteWidthProbe(LanguageModel):
@@ -315,7 +315,7 @@ def _selfcheck_body_52263_0012():
     try:
         eval_dataset.batch('test', 2, torch.Generator().manual_seed(0), eval_device)
     except ValueError:
-        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:317")
+        import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:317", exc_info=True)
     else:
         raise AssertionError('batch() 不允许访问测试集')
     train_x, train_y = eval_dataset.batch('train', 4, torch.Generator().manual_seed(7), eval_device)
@@ -700,7 +700,7 @@ def _selfcheck_top_53462_0022():
         try:
             parse_group_separator(invalid)
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:702")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:702", exc_info=True)
         else:
             raise AssertionError(f'非法群组分隔符必须报错: {invalid!r}')
     separator = b'\n\n'
@@ -1028,7 +1028,7 @@ def _selfcheck_top_54493_0030():
         try:
             ByteDataset(run_file.name, seq_len=8, val_fraction=0.1, test_fraction=0.1, group_separator=separator, drop_train_degenerate_runs=True)
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1026")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1026", exc_info=True)
         else:
             raise AssertionError('drop_train_degenerate_runs 必须拒绝群组模式：否则会改动群组边界内的字节')
     assert raw_run_dataset.split_bounds == {'train': (0, 1920), 'val': (1920, 2160), 'test': (2160, 2400)}
@@ -1196,7 +1196,7 @@ def _selfcheck_top_54994_0034():
         try:
             ByteDataset(oversized_file.name, seq_len=8, group_separator=b'SEP')
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1194")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1194", exc_info=True)
         else:
             raise AssertionError('群组无法整体划分时必须报错')
     with tempfile.NamedTemporaryFile() as no_sep_file:
@@ -1205,7 +1205,7 @@ def _selfcheck_top_54994_0034():
         try:
             ByteDataset(no_sep_file.name, seq_len=8, group_separator=b'<MISSING>')
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1203")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1203", exc_info=True)
         else:
             raise AssertionError('分隔符不存在时必须报错')
     with tempfile.TemporaryDirectory() as metrics_dir:
@@ -1364,7 +1364,7 @@ def _selfcheck_top_55379_0037():
         try:
             set_seed(invalid_seed)
         except ValueError:
-            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1362")
+            import logging as _logging; _logging.warning("Suppressed exception in checks_000.py:1362", exc_info=True)
         else:
             raise AssertionError(f'非法种子 {invalid_seed} 必须被拒绝')
     assert torch.equal(torch.get_rng_state(), saved_torch_state)

@@ -872,7 +872,7 @@ def _seed_optional_accelerators(seed: int) -> List[str]:
                 xpu.manual_seed_all(seed)
                 seeded.append("xpu")
         except (AttributeError, RuntimeError):
-            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:874")
+            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:874", exc_info=True)
 
     mps = getattr(torch, "mps", None)
     if mps is not None:
@@ -890,7 +890,7 @@ def _seed_optional_accelerators(seed: int) -> List[str]:
                 mps.manual_seed(seed)
                 seeded.append("mps")
         except (AttributeError, RuntimeError):
-            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:892")
+            import logging as _logging; _logging.warning("Suppressed exception in part_001_paper.py:892", exc_info=True)
 
     return seeded
 

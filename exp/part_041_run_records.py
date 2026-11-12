@@ -484,7 +484,7 @@ def write_run_config(
     try:
         os.chmod(config_path, previous_mode)
     except OSError:
-        import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:481")
+        import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:481", exc_info=True)
 
 
 
@@ -557,7 +557,7 @@ def update_run_config(out_dir: Path, key: str, value) -> None:
     try:
         os.chmod(path, previous_mode)
     except OSError:
-        import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:554")
+        import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:554", exc_info=True)
 
 
 
@@ -1258,7 +1258,7 @@ def print_final_test_comparison(
                 (path / "config.json").read_text(encoding="utf-8")
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:1255")
+            import logging as _logging; _logging.warning("Suppressed exception in part_041_run_records.py:1255", exc_info=True)
         if not isinstance(config, dict):
             config = {}
         record = _read_test_records(path)

@@ -1324,7 +1324,7 @@ def _cpu_model_name() -> Optional[str]:
                 if line.lower().startswith("model name"):
                     return line.split(":", 1)[1].strip()
     except (OSError, UnicodeDecodeError):
-        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1326")
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1326", exc_info=True)
 
     return platform.processor() or platform.machine() or None
 
@@ -1442,7 +1442,7 @@ def _cpu_flags_digest() -> Dict[str, object]:
                     flags.update(value.split())
                     break
     except (OSError, UnicodeDecodeError):
-        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1444")
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1444", exc_info=True)
 
     if not flags:
         return {
@@ -1466,11 +1466,11 @@ def _torch_environment() -> Dict[str, object]:
     try:
         config_text = str(torch.__config__.show())
     except Exception:
-        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1468")
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1468", exc_info=True)
     try:
         parallel_info = str(torch.__config__.parallel_info())
     except Exception:
-        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1472")
+        import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1472", exc_info=True)
     return {
         "version": str(torch.__version__),
         "git_version": getattr(torch.version, "git_version", None),
@@ -1530,7 +1530,7 @@ def _environment_device_info(
                 ),
             })
         except (AssertionError, RuntimeError, ValueError):
-            import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1532")
+            import logging as _logging; _logging.warning("Suppressed exception in part_037_environment_probe.py:1532", exc_info=True)
     elif device.type == "mps":
         info["name"] = "mps"
     else:
