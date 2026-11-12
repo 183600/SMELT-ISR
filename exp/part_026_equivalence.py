@@ -628,9 +628,6 @@ def _observed_seed_sd(
 
     配对设计 se = sd/√n，直接 sd = se·√n。Welch 的
     se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
-    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
-    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
-    se² = s_a² / max(n_a, 1) + s_b²/n_b；等方差下 se = s·√(1/n_a+1/n_b)，
     因此 s = se·√(n_a·n_b/(n_a+n_b))。用调和均值
     n_eq = 2·n_a·n_b/(n_a+n_b) 表示即 s = se·√(n_eq/2)；
     直接把 n_eq 当配对 n 会把 sd 高估 √2，进而把所需种子数
