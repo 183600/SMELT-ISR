@@ -58,6 +58,19 @@ def run_statistical_baseline(
         max_order=args.ngram_max_order,
         exclude_spans=dataset.train_excluded_spans,
     )
+    counting_orders = model.counting_metadata.get("orders")
+    if isinstance(counting_orders, dict):
+        for order, details in counting_orders.items():
+            if not isinstance(details, dict):
+                continue
+            coverage = float(details.get("coverage_fraction", 0.0))
+            if coverage < 1.0:
+                print(
+                    f"[ngram][warn] order={order} 计数抽样覆盖率="
+                    f"{coverage:.3%}，stride="
+                    f"{details.get('sampling_stride')}；实际抽样口径"
+                    "已写入 ngram_counting"
+                )
 
     val_windows = _ngram_eval_batches(
         dataset,
@@ -478,6 +491,8 @@ def run_statistical_baseline(
         "ngram_order": best_order,
         "ngram_alpha": best_alpha,
         "ngram_max_order": args.ngram_max_order,
+        "ngram_counting": model.counting_metadata,
+        "data_processing": build_data_processing_record(dataset),
         "ngram_tuning_metric": tuning_metric,
         "ngram_tuning_metric_source": tuning_metric_source,
         "ngram_tuning": tuning_diagnostics,
@@ -788,6 +803,8 @@ def run_statistical_baseline(
                 "ngram_order": best_order,
                 "ngram_alpha": best_alpha,
                 "ngram_tuning_metric": tuning_metric,
+                "ngram_counting": model.counting_metadata,
+                "data_processing": build_data_processing_record(dataset),
                 **test_metrics,
                 "data_audit": test_audit,
                 "data_protocol_check": test_protocol_check,
@@ -822,11 +839,15 @@ def run_statistical_baseline(
         # 计数与固定窗口评估都不消耗随机性：显式标记，供
         # --compare 折叠多个 seed 的复制运行（不能当独立重复）。
         "deterministic": True,
+        "ngram_counting": model.counting_metadata,
+        "data_processing": build_data_processing_record(dataset),
         "config": {
             "mode": "ngram",
             "vocab_size": 256,
             "seq_len": dataset.seq_len,
             "ngram_max_order": args.ngram_max_order,
+            "ngram_count_cap": _NGRAM_COUNT_CAP,
+            "ngram_counting": model.counting_metadata,
             "ngram_alpha_grid": alpha_grid,
             "ngram_order": best_order,
             "ngram_alpha": best_alpha,
@@ -840,6 +861,8 @@ def run_statistical_baseline(
         # 受控变量检查只在神经网络运行之间进行。
         "comparison_protocol": {
             "comparison_family": "statistical",
+            "ngram_count_cap": _NGRAM_COUNT_CAP,
+            "ngram_counting": model.counting_metadata,
             "optimizer": "none",
             "lr": None,
             "lr_schedule": "none",

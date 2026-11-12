@@ -7,7 +7,7 @@ import hashlib
 # torch.Generator().manual_seed(...) and are unaffected.
 
 
-_DATA_PLAN_SCHEMA_VERSION = 1
+_DATA_PLAN_SCHEMA_VERSION = 2
 
 _DATA_PLAN_FILENAME = "data_plan.json"
 
@@ -65,6 +65,9 @@ def data_plan_preregistration_block(
         ),
         "group_separator": getattr(args, "group_separator", None),
         "cleaning": data_plan_cleaning_block(args),
+        "processing": build_data_processing_record(dataset)[
+            "protocol"
+        ],
     }
     for key, attribute in (
         ("entity_manifest_sha256", "entity_manifest"),
@@ -178,6 +181,7 @@ def build_data_plan(
             ),
         },
         "cleaning": data_plan_cleaning_block(args),
+        "processing": build_data_processing_record(dataset),
         "manifests": {
             "entity_manifest_sha256": _sha256_file(
                 Path(args.entity_manifest)
@@ -984,6 +988,47 @@ def data_plan_differences(
                     "reason": "近重复阈值/shingle 长度不一致：会改变删除哪些训练群组",
                 }
             )
+
+    declared_processing = declared.get("processing")
+    expected_processing = expected.get("processing")
+    if declared_processing is not None:
+        if not isinstance(declared_processing, dict):
+            differences.append(
+                {
+                    "field": "data.processing",
+                    "declared": declared_processing,
+                    "expected": expected_processing,
+                    "reason": "data.processing 必须是对象",
+                }
+            )
+        elif isinstance(expected_processing, dict):
+            for key in _PREREGISTRATION_PROCESSING_REQUIRED_FIELDS:
+                declared_value = declared_processing.get(key)
+                expected_value = expected_processing.get(key)
+                if declared_value != expected_value:
+                    differences.append(
+                        {
+                            "field": f"data.processing.{key}",
+                            "declared": declared_value,
+                            "expected": expected_value,
+                            "reason": (
+                                "数据处理协议不一致：切分内容、清洗"
+                                "结果或样本选择依赖已经改变"
+                            ),
+                        }
+                    )
+    elif isinstance(expected_processing, dict):
+        differences.append(
+            {
+                "field": "data.processing",
+                "declared": None,
+                "expected": expected_processing,
+                "reason": (
+                    "预注册缺少数据处理协议：无法核对清洗后的"
+                    "有效训练内容与样本选择依赖"
+                ),
+            }
+        )
 
     for key in (
         "entity_manifest_sha256",

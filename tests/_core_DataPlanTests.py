@@ -153,6 +153,52 @@ class DataPlanTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 experiment.write_data_plan(target, mutated)
 
+    def test_plan_freezes_data_processing_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._write_corpus(root)
+            args = self._args(corpus)
+            plan = self._plan(args)
+            processing = plan["processing"]
+            protocol = processing["protocol"]
+            self.assertEqual(
+                protocol["statistical_fit_scope"], "train_only"
+            )
+            self.assertEqual(
+                plan["preregistration_data_block"]["processing"],
+                protocol,
+            )
+            self.assertEqual(
+                plan["preregistration_data_block"]["processing"][
+                    "effective_train_sha256"
+                ],
+                self._dataset(args).effective_train_sha256,
+            )
+            declared = json.loads(
+                json.dumps(
+                    plan["preregistration_data_block"],
+                    ensure_ascii=False,
+                )
+            )
+            declared["processing"][
+                "effective_train_sha256"
+            ] = "0" * 64
+            report = experiment.check_data_plan(
+                {"data": declared},
+                plan,
+                args=args,
+                dataset=self._dataset(args),
+            )
+            self.assertFalse(report["ok"])
+            fields = {
+                difference["field"]
+                for difference in report["differences"]
+            }
+            self.assertIn(
+                "data.processing.effective_train_sha256",
+                fields,
+            )
+
     def test_load_data_plan_rejects_tampering(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

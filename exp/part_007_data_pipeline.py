@@ -478,6 +478,33 @@ def probe_data_pipeline(
                 "起点区间"
             )
 
+    processing = build_data_processing_record(dataset)
+    protocol = processing.get("protocol")
+    if not isinstance(protocol, dict):
+        failures.append("数据处理协议记录缺失")
+    else:
+        raw_train_bytes = int(len(dataset.train))
+        effective_train_bytes = int(dataset.effective_train_bytes)
+        if int(protocol.get("raw_train_bytes", -1)) != raw_train_bytes:
+            failures.append("数据处理协议的原始训练字节数不一致")
+        if (
+            int(protocol.get("effective_train_bytes", -1))
+            != effective_train_bytes
+        ):
+            failures.append("数据处理协议的有效训练字节数不一致")
+        if not 0 <= effective_train_bytes <= raw_train_bytes:
+            failures.append("有效训练字节数越出原始训练集范围")
+        if protocol.get("statistical_fit_scope") != "train_only":
+            failures.append("统计量拟合范围不是 train_only")
+        if protocol.get("effective_train_sha256") != (
+            dataset.effective_train_sha256
+        ):
+            failures.append("数据处理协议的有效训练集指纹不一致")
+        if protocol.get("split_sha256") != dict(
+            dataset.split_sha256
+        ):
+            failures.append("数据处理协议的逐 split 指纹不一致")
+    report["data_processing"] = processing
     report["ok"] = not failures
     return report
 

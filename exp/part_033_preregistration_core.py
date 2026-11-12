@@ -144,8 +144,21 @@ _SWEEP_FAILURE_POLICIES = ("stop", "continue")
 _PREREGISTRATION_DATA_OPTIONAL_FIELDS = (
     "group_separator",
     "cleaning",
+    "processing",
     "entity_manifest_sha256",
     "time_order_manifest_sha256",
+)
+
+
+_PREREGISTRATION_PROCESSING_REQUIRED_FIELDS = (
+    "schema",
+    "statistical_fit_scope",
+    "sample_selection_dependencies",
+    "raw_train_bytes",
+    "effective_train_bytes",
+    "effective_train_sha256",
+    "split_sha256",
+    "cleaning_kinds",
 )
 
 

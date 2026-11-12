@@ -945,6 +945,7 @@ def audit_data_splits(
         "max_windows": max_windows,
         "splits": splits_report,
         "train_cleaning": dataset.train_cleaning,
+        "data_processing": build_data_processing_record(dataset),
         "split_fractions": {
             split: info["fraction"]
             for split, info in splits_report.items()

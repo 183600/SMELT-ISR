@@ -171,6 +171,25 @@ def preregistration_data_error(
                 f" {default!r} 核对"
             )
 
+    declared_processing = data.get("processing")
+    if declared_processing is not None:
+        if not isinstance(declared_processing, dict):
+            return "data.processing 必须是对象"
+        actual_processing = build_data_processing_record(dataset)[
+            "protocol"
+        ]
+        for key in _PREREGISTRATION_PROCESSING_REQUIRED_FIELDS:
+            declared_value = declared_processing.get(key)
+            actual_value = actual_processing.get(key)
+            if declared_value != actual_value:
+                return (
+                    f"预注册 data.processing.{key}="
+                    f"{declared_value!r} 与当前实际值 "
+                    f"{actual_value!r} 不一致：数据清洗、样本选择"
+                    "或切分内容已经改变，不能在看到结果后继续"
+                    "使用原预注册"
+                )
+
     for key, attr in (
         ("entity_manifest_sha256", "entity_manifest"),
         ("time_order_manifest_sha256", "time_order_manifest"),

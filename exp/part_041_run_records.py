@@ -47,6 +47,11 @@ def write_run_config(
             comparison_protocol_sha256
         ),
         "n_params": n_params,
+        "data_processing": (
+            build_data_processing_record(dataset)
+            if dataset is not None
+            else None
+        ),
         "paper_fidelity": getattr(args, "paper_fidelity", None),
         "cost_profile": getattr(args, "cost_profile", None),
         "budget_match": getattr(

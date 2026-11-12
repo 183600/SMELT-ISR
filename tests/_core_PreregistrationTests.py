@@ -747,6 +747,37 @@ class PreregistrationTests(unittest.TestCase):
             experiment.preregistration_schema_error(payload)
         )
 
+    def test_schema_validates_data_processing_protocol(self):
+        payload = self._payload()
+        payload["data"]["processing"] = {
+            "schema": "smelt-isr/data-processing/v1",
+            "statistical_fit_scope": "train_only",
+            "sample_selection_dependencies": ["train"],
+            "raw_train_bytes": 100,
+            "effective_train_bytes": 90,
+            "effective_train_sha256": "d" * 64,
+            "split_sha256": {
+                "train": "1" * 64,
+                "val": "2" * 64,
+                "test": "3" * 64,
+            },
+            "cleaning_kinds": ["corrupt_bytes"],
+        }
+        self.assertIsNone(
+            experiment.preregistration_schema_error(payload)
+        )
+        payload["data"]["processing"][
+            "statistical_fit_scope"
+        ] = "train_and_val"
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIn("statistical_fit_scope", error)
+        payload["data"]["processing"][
+            "statistical_fit_scope"
+        ] = "train_only"
+        payload["data"]["processing"]["unknown"] = True
+        error = experiment.preregistration_schema_error(payload)
+        self.assertIn("未知字段", error)
+
     def test_data_rejects_changed_near_duplicate_threshold(self):
         # 阈值决定删除哪些训练群组，看到结果后再调阈值等于
         # 事后改变数据；预注册显式写了就必须逐项核对。

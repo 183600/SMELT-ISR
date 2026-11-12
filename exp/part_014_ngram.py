@@ -48,7 +48,7 @@ def _ngram_extended_metrics(
     """
     vocab_size = model.vocab_size
 
-    total_nll = 0.0
+    total_nll = torch.zeros((), dtype=torch.float64)
     evaluated_tokens = 0
 
     confusion = torch.zeros(
@@ -128,7 +128,9 @@ def _ngram_extended_metrics(
 
         token_nll = -target_probs.clamp_min(1e-300).log()
 
-        total_nll += float(token_nll.sum())
+        total_nll.add_(
+            token_nll.to(torch.float64).sum()
+        )
         evaluated_tokens += targets.numel()
 
         class_loss_sums.index_add_(
@@ -265,12 +267,13 @@ def _ngram_extended_metrics(
             f"N-gram 评估未产生任何 token（{split} split），"
             f"请检查数据集是否为空。"
         )
-    loss = total_nll / evaluated_tokens
+    loss = float((total_nll / evaluated_tokens).item())
 
     metrics: Dict[str, object] = {
         f"{split}_loss": loss,
         f"{split}_ppl": math.exp(min(loss, 80.0)),
         f"{split}_bits_per_byte": loss / math.log(2.0),
+        f"{split}_loss_accumulation_dtype": "float64",
     }
 
     class_metrics = confusion_matrix_metrics(confusion)
@@ -286,6 +289,14 @@ def _ngram_extended_metrics(
     )
     for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
+
+    class_weighted_loss = float(
+        class_loss_sums.sum().item()
+        / class_counts.sum().item()
+    )
+    metrics[f"{split}_loss_weighted_consistency_abs"] = abs(
+        loss - class_weighted_loss
+    )
 
     if include_auc:
         metrics[f"{split}_auc_tokens_available"] = (
@@ -347,6 +358,25 @@ def _ngram_extended_metrics(
         )
         for key, value in bootstrap_metrics.items():
             metrics[f"{split}_{key}"] = value
+
+    window_ci_available = (
+        f"{split}_loss_ci95_low" in metrics
+        and f"{split}_loss_ci95_high" in metrics
+    )
+    metrics[f"{split}_ci_unit"] = (
+        "window" if window_ci_available else "none"
+    )
+    metrics[f"{split}_ci_unit_note"] = (
+        "评估窗口 bootstrap；相邻或重叠窗口并非独立样本，"
+        "区间可能偏窄"
+        if window_ci_available
+        else "未计算评估集 bootstrap 区间"
+    )
+    metrics[f"{split}_ci_window_available"] = float(
+        window_ci_available
+    )
+    metrics[f"{split}_ci_group_available"] = 0.0
+    metrics[f"{split}_ci_group_metric_scope"] = []
 
     return metrics
 

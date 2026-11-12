@@ -711,6 +711,17 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 bootstrap_replicates=20,
                 group_sink=group_sink,
             )
+            test_group_sink = []
+            test_metrics = experiment.evaluate(
+                model,
+                dataset,
+                8,
+                1,
+                torch.device("cpu"),
+                split="test",
+                bootstrap_replicates=20,
+                group_sink=test_group_sink,
+            )
         self.assertEqual(len(group_sink), 1, group_sink)
         parsed = experiment._parse_group_stats(
             {"group_stats": group_sink[0]}
@@ -724,6 +735,22 @@ class GroupClusterRegressionTests(unittest.TestCase):
         )
         self.assertGreaterEqual(
             metrics["val_group_cluster_n_groups"], 2.0
+        )
+        self.assertEqual(metrics["val_ci_unit"], "group")
+        self.assertEqual(
+            metrics["val_ci_group_available"], 1.0
+        )
+        self.assertEqual(
+            metrics["val_loss_accumulation_dtype"], "float64"
+        )
+        self.assertLess(
+            metrics["val_loss_weighted_consistency_abs"],
+            1e-9,
+        )
+        self.assertEqual(len(test_group_sink), 1, test_group_sink)
+        self.assertEqual(test_metrics["test_ci_unit"], "group")
+        self.assertEqual(
+            test_metrics["test_ci_group_available"], 1.0
         )
 
     def test_evaluate_skips_group_stats_without_separator(self):
@@ -740,15 +767,18 @@ class GroupClusterRegressionTests(unittest.TestCase):
                 _tiny_config(seq_len=4)
             ).eval()
             group_sink = []
-            experiment.evaluate(
+            metrics = experiment.evaluate(
                 model,
                 dataset,
                 4,
                 1,
                 torch.device("cpu"),
+                bootstrap_replicates=20,
                 group_sink=group_sink,
             )
         self.assertEqual(group_sink, [])
+        self.assertEqual(metrics["val_ci_unit"], "window")
+        self.assertEqual(metrics["val_ci_group_available"], 0.0)
 
     def test_cell_window_analysis_pairs_group_stats_across_seeds(self):
         def payload(offset):

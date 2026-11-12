@@ -400,6 +400,46 @@ class ProcessTests(unittest.TestCase):
             )
         )
 
+    def test_data_processing_record_freezes_fit_and_cleaning_scope(self):
+        data = (
+            b"A" * 25
+            + b"\xff" * 5
+            + b"A" * 30
+            + b"B" * 20
+            + b"C" * 20
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "processing.bin"
+            path.write_bytes(data)
+            dataset = experiment.ByteDataset(
+                str(path),
+                seq_len=4,
+                val_fraction=0.2,
+                test_fraction=0.2,
+                drop_train_corrupt_bytes=True,
+            )
+            record = experiment.build_data_processing_record(dataset)
+        protocol = record["protocol"]
+        self.assertEqual(
+            protocol["statistical_fit_scope"], "train_only"
+        )
+        self.assertEqual(
+            protocol["sample_selection_dependencies"],
+            ["train"],
+        )
+        self.assertEqual(protocol["raw_train_bytes"], 60)
+        self.assertEqual(protocol["effective_train_bytes"], 55)
+        self.assertEqual(record["dropped_train_bytes"], 5)
+        self.assertAlmostEqual(
+            record["retained_train_fraction"], 55 / 60
+        )
+        self.assertEqual(
+            record["dropped_bytes_by_reason"]["corrupt_bytes"],
+            5,
+        )
+        self.assertTrue(record["reason_attribution_complete"])
+        self.assertEqual(len(record["protocol_sha256"]), 64)
+
     def test_interval_counts_advance_for_tiny_chunk_sizes(self):
         raw = memoryview(bytearray(b"abracadabra"))
         expected_bytes = 11
@@ -913,6 +953,40 @@ class ProcessTests(unittest.TestCase):
             metrics["val_bootstrap_unit"], "moving_block"
         )
         self.assertEqual(metrics["val_bootstrap_block_size"], 3)
+        self.assertEqual(
+            metrics["val_loss_accumulation_dtype"], "float64"
+        )
+        self.assertLess(
+            metrics["val_loss_weighted_consistency_abs"],
+            1e-9,
+        )
+        self.assertEqual(metrics["val_ci_unit"], "window")
+
+    def test_ngram_records_counting_coverage(self):
+        data = torch.arange(20, dtype=torch.uint8)
+        model = experiment.NgramBaseline(
+            data,
+            max_order=2,
+            count_cap=5,
+        )
+        orders = model.counting_metadata["orders"]
+        self.assertEqual(orders["1"]["eligible_observations"], 20)
+        self.assertEqual(orders["1"]["counted_observations"], 5)
+        self.assertEqual(orders["1"]["sampling_stride"], 4)
+        self.assertAlmostEqual(
+            orders["1"]["coverage_fraction"], 0.25
+        )
+        self.assertEqual(
+            orders["1"]["sampling"], "systematic_stride"
+        )
+        self.assertEqual(orders["2"]["eligible_observations"], 19)
+        self.assertEqual(orders["2"]["counted_observations"], 5)
+        with self.assertRaises(ValueError):
+            experiment.NgramBaseline(
+                data,
+                max_order=2,
+                count_cap=0,
+            )
 
     def test_same_seed_reports_partially_missing_fingerprints(self):
         init = {

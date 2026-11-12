@@ -560,6 +560,35 @@ class ByteDataset:
             combined_stats: Dict[str, object] = (
                 dict(group_stats[0]) if group_stats else {}
             )
+            reason_stats: Dict[str, Dict[str, object]] = {}
+            for reason, reason_payload in (
+                ("duplicate", dedup_stats),
+                ("shared_chunks", shared_chunk_stats),
+                ("near_duplicate", near_duplicate_stats),
+                ("corrupt", corrupt_stats),
+                ("corrupt_bytes", corrupt_byte_stats),
+                ("degenerate", degenerate_stats),
+                ("degenerate_runs", degenerate_run_stats),
+            ):
+                if reason_payload is None:
+                    continue
+                compact: Dict[str, object] = {
+                    "dropped_bytes": int(
+                        reason_payload.get("dropped_bytes", 0)
+                    ),
+                }
+                for key in (
+                    "groups_dropped",
+                    "runs_dropped",
+                    "groups_flagged",
+                    "shared_chunks",
+                    "invalid_utf8_bytes",
+                    "nul_bytes",
+                ):
+                    if key in reason_payload:
+                        compact[key] = int(reason_payload[key])
+                reason_stats[reason] = compact
+            combined_stats["reason_stats"] = reason_stats
             combined_stats.update({
                 "enabled": True,
                 "cleaning_kinds": [],
@@ -1340,6 +1369,119 @@ class ByteDataset:
 # ============================================================
 # Shared dataset construction
 # ============================================================
+
+def build_data_processing_record(
+    dataset: ByteDataset,
+) -> Dict[str, object]:
+    raw_train_bytes = int(len(dataset.train))
+    effective_train_bytes = int(dataset.effective_train_bytes)
+    dropped_train_bytes = max(
+        raw_train_bytes - effective_train_bytes,
+        0,
+    )
+    cleaning = (
+        dataset.train_cleaning
+        if isinstance(dataset.train_cleaning, dict)
+        else {}
+    )
+    cleaning_kinds = [
+        str(kind)
+        for kind in (cleaning.get("cleaning_kinds") or [])
+    ]
+    eval_dependent_kinds = {
+        "duplicate",
+        "shared_chunks",
+        "near_duplicate",
+    }
+    sample_selection_dependencies = ["train"]
+    if any(
+        kind in eval_dependent_kinds
+        for kind in cleaning_kinds
+    ):
+        access = (
+            dataset.eval_content_access
+            if isinstance(dataset.eval_content_access, dict)
+            else {}
+        )
+        for split in access.get("splits") or []:
+            split_name = str(split)
+            if (
+                split_name in ("val", "test")
+                and split_name not in sample_selection_dependencies
+            ):
+                sample_selection_dependencies.append(split_name)
+    protocol: Dict[str, object] = {
+        "schema": "smelt-isr/data-processing/v1",
+        "statistical_fit_scope": "train_only",
+        "sample_selection_dependencies": (
+            sample_selection_dependencies
+        ),
+        "raw_train_bytes": raw_train_bytes,
+        "effective_train_bytes": effective_train_bytes,
+        "effective_train_sha256": (
+            dataset.effective_train_sha256
+        ),
+        "split_sha256": dict(dataset.split_sha256),
+        "cleaning_kinds": cleaning_kinds,
+    }
+    protocol_sha256 = hashlib.sha256(
+        json.dumps(
+            protocol,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    reason_stats = (
+        cleaning.get("reason_stats")
+        if isinstance(cleaning.get("reason_stats"), dict)
+        else {}
+    )
+    dropped_bytes_by_reason: Dict[str, int] = {}
+    for reason, payload in reason_stats.items():
+        if not isinstance(payload, dict):
+            continue
+        dropped_bytes_by_reason[str(reason)] = int(
+            payload.get("dropped_bytes", 0)
+        )
+    attributed_bytes = sum(dropped_bytes_by_reason.values())
+    test_used_for_selection = "test" in (
+        sample_selection_dependencies
+    )
+    return {
+        "schema": "smelt-isr/data-processing/v1",
+        "protocol": protocol,
+        "protocol_sha256": protocol_sha256,
+        "raw_train_bytes": raw_train_bytes,
+        "effective_train_bytes": effective_train_bytes,
+        "dropped_train_bytes": dropped_train_bytes,
+        "retained_train_fraction": (
+            effective_train_bytes / raw_train_bytes
+            if raw_train_bytes > 0
+            else 0.0
+        ),
+        "cleaning_kinds": cleaning_kinds,
+        "dropped_bytes_by_reason": dropped_bytes_by_reason,
+        "reason_attributed_bytes": attributed_bytes,
+        "reason_overlap_bytes": max(
+            attributed_bytes - dropped_train_bytes,
+            0,
+        ),
+        "reason_attribution_complete": (
+            set(dropped_bytes_by_reason) == set(cleaning_kinds)
+        ),
+        "deletion_bias": cleaning.get("deletion_bias"),
+        "validation_role": (
+            "model_selection_and_hyperparameter_tuning"
+        ),
+        "test_role": (
+            "final_evaluation_and_train_sample_selection"
+            if test_used_for_selection
+            else "final_evaluation"
+        ),
+    }
+
+
 
 def build_byte_dataset(
     args: object,

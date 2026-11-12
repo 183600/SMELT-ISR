@@ -28,7 +28,7 @@ def evaluate(
     window_sink: Optional[List[Dict[str, float]]] = None,
     bootstrap_block: int = 1,
     group_sink: Optional[List[Dict[str, object]]] = None,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     """
     在指定评估 split 上计算加权平均语言模型损失与
     类别不平衡感知的分类指标。
@@ -116,7 +116,7 @@ def evaluate(
     total = torch.zeros(
         (),
         device=device,
-        dtype=torch.float32,
+        dtype=torch.float64,
     )
     evaluated_tokens = 0
 
@@ -522,11 +522,8 @@ def evaluate(
                         flat_logits.size(0)
                     )
 
-                # cross_entropy 返回批均值，乘回目标 token 数。
-                # add_(alpha=) 完成「乘 token 数 + 累加」。
                 total.add_(
-                    result["lm_loss"].float(),
-                    alpha=float(y.numel()),
+                    token_losses.to(torch.float64).sum()
                 )
                 evaluated_tokens += y.numel()
                 del result, raw_logits, x, y
@@ -544,10 +541,11 @@ def evaluate(
         )
     loss = (total / evaluated_tokens).item()
 
-    metrics = {
+    metrics: Dict[str, object] = {
         f"{split}_loss": loss,
         f"{split}_ppl": math.exp(min(loss, 80.0)),
         f"{split}_bits_per_byte": loss / math.log(2.0),
+        f"{split}_loss_accumulation_dtype": "float64",
     }
 
     class_metrics = confusion_matrix_metrics(confusion.double())
@@ -566,6 +564,14 @@ def evaluate(
     )
     for key, value in balanced_metrics.items():
         metrics[f"{split}_{key}"] = value
+
+    class_weighted_loss = float(
+        class_loss_sums.sum().item()
+        / class_counts.sum().item()
+    )
+    metrics[f"{split}_loss_weighted_consistency_abs"] = abs(
+        loss - class_weighted_loss
+    )
 
     group_stats_payload: Optional[Dict[str, object]] = None
     if (
@@ -671,6 +677,47 @@ def evaluate(
                     ] = float(value)
         else:
             metrics[f"{split}_group_cluster_available"] = 0.0
+
+    window_ci_available = (
+        f"{split}_loss_ci95_low" in metrics
+        and f"{split}_loss_ci95_high" in metrics
+    )
+    group_ci_available = (
+        metrics.get(f"{split}_group_cluster_available") == 1.0
+    )
+    if group_ci_available:
+        ci_unit = "group"
+        ci_unit_note = (
+            "文档/群组 cluster bootstrap；仅 loss、ppl 与 "
+            "token_accuracy 有群组级区间"
+        )
+        ci_group_metric_scope = [
+            "loss",
+            "ppl",
+            "token_accuracy",
+        ]
+    elif window_ci_available:
+        ci_unit = "window"
+        ci_unit_note = (
+            "评估窗口 bootstrap；相邻或重叠窗口并非独立样本，"
+            "区间可能偏窄"
+        )
+        ci_group_metric_scope = []
+    else:
+        ci_unit = "none"
+        ci_unit_note = "未计算评估集 bootstrap 区间"
+        ci_group_metric_scope = []
+    metrics[f"{split}_ci_unit"] = ci_unit
+    metrics[f"{split}_ci_unit_note"] = ci_unit_note
+    metrics[f"{split}_ci_window_available"] = float(
+        window_ci_available
+    )
+    metrics[f"{split}_ci_group_available"] = float(
+        group_ci_available
+    )
+    metrics[f"{split}_ci_group_metric_scope"] = (
+        ci_group_metric_scope
+    )
 
     if compute_auc:
         # 读取 CPU 收集缓冲前统一等待。
@@ -977,12 +1024,38 @@ class NgramBaseline:
                 "的 int64 上限）"
             )
 
+        if (
+            not isinstance(count_cap, int)
+            or isinstance(count_cap, bool)
+            or count_cap <= 0
+        ):
+            raise ValueError("count_cap 必须是正整数")
         self.max_order = max_order
         self.vocab_size = 256
+        self.count_cap = int(count_cap)
         self.exclude_spans = list(exclude_spans or [])
+        self.counting_metadata: Dict[str, object] = {
+            "schema": "smelt-isr/ngram-counting/v1",
+            "count_cap": self.count_cap,
+            "max_order": self.max_order,
+            "orders": {},
+        }
 
         data = train_bytes
         n_train = data.numel()
+        excluded_bytes = sum(
+            end - start
+            for start, end in _merge_byte_intervals(
+                self.exclude_spans
+            )
+        )
+        self.counting_metadata["train_bytes"] = int(n_train)
+        self.counting_metadata["effective_train_bytes"] = int(
+            n_train - excluded_bytes
+        )
+        self.counting_metadata["excluded_train_bytes"] = int(
+            excluded_bytes
+        )
 
         self.levels: Dict[int, Dict[str, torch.Tensor]] = {}
 
@@ -1006,11 +1079,36 @@ class NgramBaseline:
                 ),
             }
 
+        def _record_counting(
+            order: int,
+            eligible_observations: int,
+            sampling_stride: int,
+            counted_observations: int,
+        ) -> None:
+            eligible = int(eligible_observations)
+            counted = int(counted_observations)
+            stride = int(sampling_stride)
+            orders = self.counting_metadata["orders"]
+            if not isinstance(orders, dict):
+                raise TypeError("counting_metadata.orders 必须是字典")
+            orders[str(order)] = {
+                "eligible_observations": eligible,
+                "counted_observations": counted,
+                "sampling_stride": stride,
+                "coverage_fraction": (
+                    counted / eligible if eligible > 0 else 0.0
+                ),
+                "sampling": (
+                    "full"
+                    if stride == 1
+                    else "systematic_stride"
+                ),
+            }
+
         for order in range(1, max_order + 1):
             if n_train < order:
-                # 语料比阶数还短：该阶没有可计数的窗口，
-                # 查询时自然回退到低阶。
                 self.levels[order] = _empty_level()
+                _record_counting(order, 0, 1, 0)
                 continue
 
             num_windows = n_train - order + 1
@@ -1031,8 +1129,15 @@ class NgramBaseline:
                 # 按步长取行仍是视图，打包时才产生 int64
                 # 张量。
                 windows = data.unfold(0, order, 1)[::stride]
+                _record_counting(
+                    order,
+                    num_windows,
+                    stride,
+                    int(windows.shape[0]),
+                )
             elif not valid_intervals:
                 self.levels[order] = _empty_level()
+                _record_counting(order, 0, 1, 0)
                 continue
             else:
                 # 与神经网络训练窗口同一口径：完全落在被
@@ -1071,6 +1176,12 @@ class NgramBaseline:
                 )
                 starts = lows[interval] + offsets
                 windows = data.unfold(0, order, 1)[starts]
+                _record_counting(
+                    order,
+                    total_valid,
+                    stride,
+                    int(windows.shape[0]),
+                )
 
             keys = windows[:, 0].to(torch.int64)
             for column in range(1, order):

@@ -710,6 +710,107 @@ def preregistration_schema_error(
                 "是同义开关，不能给出相反的取值"
             )
 
+    processing = data.get("processing", _PREREGISTRATION_MISSING)
+    if processing is not _PREREGISTRATION_MISSING:
+        if not isinstance(processing, dict):
+            return "data.processing 必须是对象"
+        missing_processing = [
+            key
+            for key in _PREREGISTRATION_PROCESSING_REQUIRED_FIELDS
+            if key not in processing
+        ]
+        if missing_processing:
+            return (
+                "data.processing 缺少必需字段: "
+                + ", ".join(missing_processing)
+            )
+        unknown_processing = sorted(
+            set(processing)
+            - set(_PREREGISTRATION_PROCESSING_REQUIRED_FIELDS)
+        )
+        if unknown_processing:
+            return (
+                "data.processing 含未知字段: "
+                + ", ".join(unknown_processing)
+            )
+        if processing.get("schema") != (
+            "smelt-isr/data-processing/v1"
+        ):
+            return (
+                "data.processing.schema 必须是 "
+                "smelt-isr/data-processing/v1"
+            )
+        if processing.get("statistical_fit_scope") != "train_only":
+            return (
+                "data.processing.statistical_fit_scope 必须是 "
+                "train_only"
+            )
+        dependencies = processing.get(
+            "sample_selection_dependencies"
+        )
+        if (
+            not isinstance(dependencies, list)
+            or not dependencies
+            or any(
+                not isinstance(split, str)
+                or split not in ("train", "val", "test")
+                for split in dependencies
+            )
+            or "train" not in dependencies
+            or len(set(dependencies)) != len(dependencies)
+        ):
+            return (
+                "data.processing.sample_selection_dependencies "
+                "必须是无重复的 train/val/test 列表且包含 train"
+            )
+        for key in ("raw_train_bytes", "effective_train_bytes"):
+            value = processing.get(key)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                return f"data.processing.{key} 必须是非负整数"
+        if int(processing["effective_train_bytes"]) > int(
+            processing["raw_train_bytes"]
+        ):
+            return (
+                "data.processing.effective_train_bytes 不能大于 "
+                "raw_train_bytes"
+            )
+        if not _preregistration_sha256_text(
+            processing.get("effective_train_sha256")
+        ):
+            return (
+                "data.processing.effective_train_sha256 必须是 "
+                "64 位十六进制 SHA-256"
+            )
+        split_fingerprints = processing.get("split_sha256")
+        if not isinstance(split_fingerprints, dict):
+            return "data.processing.split_sha256 必须是对象"
+        if set(split_fingerprints) != {"train", "val", "test"}:
+            return (
+                "data.processing.split_sha256 必须包含 train/val/test"
+            )
+        for split, digest in split_fingerprints.items():
+            if not _preregistration_sha256_text(digest):
+                return (
+                    "data.processing.split_sha256."
+                    f"{split} 必须是 64 位十六进制 SHA-256"
+                )
+        cleaning_kinds = processing.get("cleaning_kinds")
+        if (
+            not isinstance(cleaning_kinds, list)
+            or any(
+                not isinstance(kind, str)
+                for kind in cleaning_kinds
+            )
+            or len(set(cleaning_kinds)) != len(cleaning_kinds)
+        ):
+            return (
+                "data.processing.cleaning_kinds 必须是无重复字符串列表"
+            )
+
     for key in (
         "entity_manifest_sha256",
         "time_order_manifest_sha256",
