@@ -918,7 +918,7 @@ def _t_power_small_df_large_scale(
         intervals = min(intervals, 20000)
         if intervals % 2:
             intervals += 1
-        step = (w_max - 1.0) / intervals
+        step = (w_max - 1.0) / max(intervals, 1)  # guard against zero intervals
         for index in range(intervals + 1):
             w = 1.0 + index * step
             if index == 0 or index == intervals:

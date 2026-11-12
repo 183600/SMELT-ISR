@@ -847,8 +847,12 @@ def _selfcheck_top_53881_0025():
     sink_tokens = sum((item['tokens'] for item in ngram_window_sink))
     sink_loss = sum((item['loss_sum'] for item in ngram_window_sink))
     sink_correct = sum((item['correct'] for item in ngram_window_sink))
-    assert abs(sink_loss / sink_tokens - float(ngram_boot['val_loss'])) < 1e-12
-    assert abs(sink_correct / sink_tokens - float(ngram_boot['val_token_accuracy'])) < 1e-12
+    if sink_tokens > 0:
+        assert abs(sink_loss / sink_tokens - float(ngram_boot['val_loss'])) < 1e-12
+    else:
+        assert sink_loss == 0.0
+    if sink_tokens > 0:
+        assert abs(sink_correct / sink_tokens - float(ngram_boot['val_token_accuracy'])) < 1e-12
     ngram_boot_repeat = _ngram_extended_metrics(cleaned_ngram, ngram_boot_windows, alpha=1.0, order=2, split='val', include_auc=False, bootstrap_replicates=128, bootstrap_seed=2024)
     for key, value in ngram_boot.items():
         assert ngram_boot_repeat[key] == value

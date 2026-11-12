@@ -1000,6 +1000,7 @@ def _selfcheck_top_58504_0062():
     expected_lower = 1.0 - _t_cdf((0.02 + 0.04) / 0.05, 6.0)
     assert expected_upper is not None and expected_lower is not None
     assert abs(float(tost_manual['tost_p_value']) - max(expected_upper, expected_lower)) < 1e-12
+    # Guard: se=0.0 edge case handled by _tost_test internally
     assert _tost_test(0.001, 0.0, 8.0, 0.02)['tost_p_value'] == 0.0
     assert _tost_test(0.05, 0.0, 8.0, 0.02)['tost_p_value'] == 1.0
     equivalence_contrasts = [{'p_value': 0.2, 'significant': False, 'equivalent': True, 'tost_p_value': 0.03, 'verdict': 'tie'}, {'p_value': 0.3, 'significant': False, 'equivalent': True, 'tost_p_value': 0.04, 'verdict': 'tie'}]
