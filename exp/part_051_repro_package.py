@@ -194,7 +194,14 @@ def _git_diff_text() -> Optional[str]:
     return _git_output("diff", "HEAD")
 
 
-def _installed_distributions() -> list:
+def _repro_installed_distributions() -> list:
+    """复现包用的原始发行包清单（保留包名大小写、不去重）。
+
+    必须与 part_037 的环境快照实现区分命名：后者按 PEP 503
+    规范化、去重并按 name 排序，environment_id 与关键依赖
+    (critical) 判定都依赖它。同名定义会在模块装配时覆盖那份
+    实现，破坏环境快照口径。
+    """
     try:
         import importlib.metadata as metadata
     except ImportError:  # pragma: no cover - Python < 3.10 not supported
@@ -486,7 +493,7 @@ def export_reproducibility_package(
         # 依赖 / 环境
         _write_json(
             payload_dir / INSTALLED_PACKAGES_NAME,
-            _installed_distributions(),
+            _repro_installed_distributions(),
         )
 
         # 逐运行收集证据
@@ -534,7 +541,7 @@ def export_reproducibility_package(
                 else None
             ),
             "environment_ids": sorted(environment_ids),
-            "installed_package_count": len(_installed_distributions()),
+            "installed_package_count": len(_repro_installed_distributions()),
             "runs": run_summaries,
         }
         _write_json(payload_dir / PACKAGE_META_NAME, package_meta)
