@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
-import os as _os
+from pathlib import Path
 
 from . import _manifest as _manifest
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
 
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_HERE = Path(__file__).resolve().parent
 # ``__file__`` keeps pointing at the repository entry point so runtime code
 # that fingerprints the script, runs git from the repository root, or spawns
 # child runs keeps the pre-split behaviour.
-__file__ = _os.path.join(_os.path.dirname(_HERE), "experiment.py")
+__file__ = str(_HERE.parent / "experiment.py")
 
 for _part_name in _manifest.CORE_PARTS:
-    _part_path = _os.path.join(_HERE, _part_name)
-    with open(_part_path, encoding="utf-8") as _part_handle:
+    _part_path = _HERE / _part_name
+    with _part_path.open(encoding="utf-8") as _part_handle:
         _part_source = _part_handle.read()
-    exec(compile(_part_source, _part_path, "exec"), globals())
+    exec(compile(_part_source, str(_part_path), "exec"), globals())
 
-del _os, _part_name, _part_path, _part_handle, _part_source
+del _part_name, _part_path, _part_handle, _part_source

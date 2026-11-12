@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
@@ -57,7 +57,7 @@ class _IsolatedNamespace(dict):
 
 
 def _read(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
+    with Path(path).open(encoding="utf-8") as handle:
         return handle.read()
 
 
@@ -66,19 +66,15 @@ def run_isolated(part_paths, base_globals, owned_names, entry_calls, initial=Non
 
     namespace = _IsolatedNamespace(base_globals, owned_names)
     for path in part_paths:
-        absolute = os.path.abspath(path)
+        absolute = str(Path(path).resolve())
         try:
             code = compile(_read(absolute), absolute, "exec")
         except SyntaxError as exc:
-            raise RuntimeError(
-                f"Failed to compile experiment part {absolute!r}: {exc}"
-            ) from exc
+            raise _CompileError(absolute) from exc
         try:
             exec(code, namespace)
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to execute experiment part {absolute!r}: {exc}"
-            ) from exc
+            raise _ExecuteError(absolute) from exc
     namespace.finish_loading()
     if initial:
         for key, value in initial.items():
@@ -90,3 +86,13 @@ def run_isolated(part_paths, base_globals, owned_names, entry_calls, initial=Non
     except _ReturnSignal as signal:
         return signal.value
     return None
+
+
+class _CompileError(RuntimeError):
+    def __init__(self, path: str):
+        super().__init__(f"Failed to compile experiment part {path!r}")
+
+
+class _ExecuteError(RuntimeError):
+    def __init__(self, path: str):
+        super().__init__(f"Failed to execute experiment part {path!r}")

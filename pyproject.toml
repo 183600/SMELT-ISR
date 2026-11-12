@@ -82,12 +82,8 @@ exclude = [
     "build",
     "dist",
     ".eggs",
+    "SMELT-ISR",
+    "exp/part_*.py",
+    "exp/mainflow/*.py",
+    "exp/analysisflow/*.py",
 ]
-
-[tool.mypy.overrides]
-module = [
-    "exp.part_*",
-    "exp.mainflow.*",
-    "exp.analysisflow.*",
-]
-disallow_untyped_defs = false
