@@ -1510,7 +1510,7 @@ def _jzs_u_nodes_kernel(
         lam2 = 1.0 + t_value * t_value / (one_plus_ng * df_value)
         values[positive] = np.exp(-0.5 * (r * r) * np.square(inner)) * (
             one_plus_ng ** -0.5
-        ) * np.power(lam2, -0.5 * float(df_value))
+        ) * np.power(lam2, -0.5 * float(n_value))
         return values
 
     def _simpson_weights(span: float, count: int) -> "np.ndarray":
@@ -1572,7 +1572,9 @@ def _jzs_log_bayes_factor_10(
     if not math.isfinite(integral) or integral <= 0.0:
         return None
     # 分母 (1+t²/ν)^(-N/2) 在 log 域计算，避免大 t 下溢。
-    log_denominator = -0.5 * float(df_value) * math.log1p(
+    # 指数按 JZS 口径用有效样本量 N（n_value），而非自由度 ν（df_value）；
+    # 括号内 t²/ν 的 ν 仍是自由度，保持不变。
+    log_denominator = -0.5 * float(n_value) * math.log1p(
         t_value * t_value / df_value
     )
     log_numerator = math.log(integral)
