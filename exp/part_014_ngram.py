@@ -272,7 +272,7 @@ def _ngram_extended_metrics(
     metrics: Dict[str, object] = {
         f"{split}_loss": loss,
         f"{split}_ppl": math.exp(min(loss, 80.0)),
-        f"{split}_bits_per_byte": loss / math.log(2.0 + 1e-8),
+        f"{split}_bits_per_byte": loss / math.log(2.0),
         f"{split}_loss_accumulation_dtype": "float64",
     }
 
@@ -542,7 +542,7 @@ def _ngram_window_tuning_value(
     if tuning_metric == "val_ppl":
         return math.exp(min(loss, 80.0))
     if tuning_metric == "val_bits_per_byte":
-        return loss / math.log(2.0 + 1e-8)
+        return loss / math.log(2.0)
     return loss
 
 

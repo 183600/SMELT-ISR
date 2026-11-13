@@ -233,7 +233,7 @@ def run_statistical_baseline(
                     min(val_loss, 80.0)
                 ),
                 "val_bits_per_byte": val_loss
-                / math.log(2.0 + 1e-8),
+                / math.log(2.0),
                 "tokens_evaluated": tokens,
                 "tuning_metric": tuning_metric,
             }

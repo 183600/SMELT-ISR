@@ -1191,7 +1191,7 @@ def _trivial_reference_value(
     if base_metric == "val_ppl":
         return math.exp(min(value, 80.0))
     if base_metric == "val_bits_per_byte":
-        return value / math.log(2.0 + 1e-8)
+        return value / math.log(2.0)
     return value
 
 

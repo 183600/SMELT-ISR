@@ -704,7 +704,7 @@ def _t_power_nodes(
         weighted: List[float] = []
         for index in range(intervals + 1):
             t = index * step
-            log_u = exponent * math.log(t + 1e-8) if t > 0.0 else float("-inf")
+            log_u = exponent * math.log(t) if t > 0.0 else float("-inf")
             u = math.exp(log_u) if log_u >= -745.0 else 0.0
             if index == 0 or index == intervals:
                 simpson = step / 3.0
@@ -837,7 +837,7 @@ def _t_power_large_shift_normal_mix(
         y = noncentrality + t
         if y == 0.0:
             continue
-        log_u = math.log(abs(y + 1e-8)) - log_scale
+        log_u = math.log(abs(y)) - log_scale
         density = math.exp(-0.5 * t * t) / math.sqrt(
             2.0 * math.pi
         )

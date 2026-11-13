@@ -1309,7 +1309,7 @@ def _MAIN_part_004():
     write_run_config(out_dir, cfg, args, n_params, run_metadata, config_sanity_result, data_audit=data_audit, reference_baselines=reference_baselines, baseline_tuning=baseline_tuning_record, data_protocol_check=data_protocol_check, dataset=dataset, init_fingerprints=getattr(model, 'init_fingerprints', None))
     tracking_provenance = load_tracking_provenance(out_dir)
     metrics_path = out_dir / 'metrics.jsonl'
-    curve_baseline_loss = min(math.log(cfg.vocab_size + 1e-8), float(reference_baselines['unigram_loss']))
+    curve_baseline_loss = min(math.log(cfg.vocab_size), float(reference_baselines['unigram_loss']))
     curve_records = _records_at_or_before_step(read_metrics_records(metrics_path), start_step) if args.resume is not None else []
     last_curve_status = None
     last_curve_warning_flags = None
