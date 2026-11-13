@@ -147,13 +147,16 @@ def _selfcheck_top_51755_0004():
     # NOTE: No random seed set in this function - results may not be reproducible
     _, uniform_aux = aux_moe(torch.randn(2, 4, common['d_model']), top_k=2)
     torch.testing.assert_close(uniform_aux, torch.tensor(2.0, device=uniform_aux.device), rtol=1e-05, atol=1e-06)
+    # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
     overlap_metrics = _routing_set_metrics(torch.tensor([[0, 1]]), torch.tensor([[1, 2]]), 4)
     assert overlap_metrics is not None
+    # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
     torch.testing.assert_close(torch.tensor(overlap_metrics['second_round_jaccard_mean']), torch.tensor(1.0 / 3.0), rtol=1e-06, atol=1e-06)
     assert overlap_metrics['second_round_exact_match_share'] == 0.0
     assert abs(overlap_metrics['first_round_recall_mean'] - 0.5) < 1e-06
     assert abs(overlap_metrics['second_round_unique_reuse_mean'] - 0.5) < 1e-06
     assert abs(overlap_metrics['second_round_slot_reuse_mean'] - 0.5) < 1e-06
+    # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
     identical_metrics = _routing_set_metrics(torch.tensor([[0, 1]]), torch.tensor([[0, 1]]), 4)
     assert identical_metrics is not None
     for name in ('second_round_jaccard_mean', 'second_round_exact_match_share', 'first_round_recall_mean', 'second_round_unique_reuse_mean', 'second_round_slot_reuse_mean'):
@@ -276,6 +279,7 @@ def _selfcheck_top_52048_0009():
     ckpt_model.train()
     ckpt_loss = ckpt_model(x, y)['loss']
     ckpt_loss.backward()
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
     causal_model = LanguageModel(Config(**common, mode='B')).eval()
     x_changed = x.clone()
@@ -1398,6 +1402,7 @@ def _selfcheck_top_55519_0038():
     saved_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
     saved_tf32_cudnn = torch.backends.cudnn.allow_tf32
     saved_matmul_precision = torch.get_float32_matmul_precision() if hasattr(torch, 'get_float32_matmul_precision') else None
+    # TODO: Report confidence intervals or std alongside point estimates
     try:
         configure_cuda_precision(False)
         assert torch.backends.cuda.matmul.allow_tf32 is False

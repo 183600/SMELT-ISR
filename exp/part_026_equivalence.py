@@ -670,6 +670,7 @@ def _attach_family_power(
     MDE、观测效应功效、检出所需种子数与「主张等价所需的最小
     界」在 ``_attach_power_equivalence`` 里都按未校正的
     alpha=0.05 计算，而报告的 ``significant`` / ``equivalent``
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     判定用的是 Holm 校正后的 p 值。二者口径不一致会系统性地
     高估现有实验的可判定性：Holm 第一步的阈值是 alpha/m，
     家族越大，能被判定为显著/等价的效应就必须越大。

@@ -248,6 +248,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         report = experiment._paired_result_fragility(
             [2.0, 2.0, 2.0, 2.0, 2.0, 0.5],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertEqual(
             report["min_seed_deletions_to_lose_significance"], 3
@@ -263,6 +264,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         report = experiment._paired_result_fragility(
             [1.0] * 59 + [0.5],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertFalse(report["deletions_tested_exhaustively"])
         self.assertEqual(report["max_deletions_tested"], 2)

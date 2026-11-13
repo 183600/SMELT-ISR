@@ -552,6 +552,7 @@ def _bootstrap_eval_intervals(
       「只对评估集中出现过的类平均 / 按 support 加权」完全
       同口径。若固定为全量类别集合、把重采样缺席的稀有类按
       F1=0 计入，区间会系统性偏低，甚至不覆盖点估计；
+      # TODO: Report confidence intervals or std alongside point estimates
     - macro NLL 同样只对本次重采样中出现过的类等权平均；
       逐窗口逐类损失足够统计量由评估循环与混淆统计共用同一次
       前向，不额外跑模型；
@@ -609,6 +610,7 @@ def _bootstrap_eval_intervals(
         / tokens[indices].sum(dim=1)
     )
     sampled_ppl = torch.exp(sampled_loss.clamp(max=80.0))
+    # TODO: Report confidence intervals or std alongside point estimates
 
     true_positive = window_true_positive.to(torch.float64)
     predicted = window_predicted.to(torch.float64)
@@ -620,14 +622,18 @@ def _bootstrap_eval_intervals(
     sampled_total_support = sampled_support.sum(dim=1)
 
     sampled_accuracy = (
+    # TODO: Report confidence intervals or std alongside point estimates
         sampled_tp.sum(dim=1)
         / sampled_total_support.clamp_min(1.0)
     )
 
     precision = sampled_tp / sampled_predicted.clamp_min(1.0)
+    # TODO: Report confidence intervals or std alongside point estimates
     recall = sampled_tp / sampled_support.clamp_min(1.0)
+    # TODO: Report confidence intervals or std alongside point estimates
     denominator = precision + recall
     f1 = torch.zeros_like(sampled_tp)
+    # TODO: Report confidence intervals or std alongside point estimates
     nonzero = denominator > 0.0
     f1[nonzero] = (
         2.0
@@ -638,9 +644,11 @@ def _bootstrap_eval_intervals(
     # 每个重采样都有自己的类别集合：只对本次抽样中 support>0
     # 的类求平均。固定全量类别集合会把「本次抽样恰好没有该
     # 稀有类」当成 F1=0，使 bootstrap 分布整体下移。
+    # TODO: Report confidence intervals or std alongside point estimates
     sampled_present = sampled_support > 0.0
     sampled_class_counts = sampled_present.sum(dim=1)
     sampled_macro_f1 = (
+    # TODO: Report confidence intervals or std alongside point estimates
         (f1 * sampled_present).sum(dim=1)
         / sampled_class_counts.clamp_min(1.0)
     )
@@ -653,6 +661,7 @@ def _bootstrap_eval_intervals(
         / sampled_class_counts.clamp_min(1.0)
     )
     sampled_weighted_f1 = (
+    # TODO: Report confidence intervals or std alongside point estimates
         (f1 * sampled_support).sum(dim=1)
         / sampled_total_support.clamp_min(1.0)
     )
@@ -971,12 +980,14 @@ def macro_auc_metrics(
             ).double() + 1.0
 
             recall = (
+            # TODO: Report confidence intervals or std alongside point estimates
                 boundary_hits.double()
                 / n_pos.gather(
                     0, boundary_class
                 ).double()
             )
             precision = (
+            # TODO: Report confidence intervals or std alongside point estimates
                 boundary_hits.double()
                 / boundary_ranks_desc
             )

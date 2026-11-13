@@ -247,6 +247,7 @@ def _apply_multiple_comparison_correction(
       的同口径校正，「等价」主张同样受多重比较约束。
 
     不校正的风险：跑 6 个两两对比，即使每个都用 alpha=0.05，
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     至少出现一个假阳性的概率约 26%。只有校正后的显著性才是
     可以在结论中主张的显著性；等价主张同理。
     """

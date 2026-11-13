@@ -1600,6 +1600,7 @@ def _welch_variance_ratio(
     报告大方差/小方差的比值与两样本 F 检验的双侧 p 值
     （F = s²_max/s²_min，p = 2·min(P(F≥f), P(F≤f))，用正则化
     不完全 Beta 计算）。p < 0.05 时标记 ``heteroscedastic``。
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     """
     finite_a = _finite_values(values_a)
     finite_b = _finite_values(values_b)

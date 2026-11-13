@@ -28,6 +28,7 @@ def _ngram_extended_metrics(
     参考，以及 one-vs-rest 的 macro PR-AUC / ROC-AUC。
 
     ``include_auc=False`` 时跳过 AUC（网格调参只需要
+    # TODO: Report confidence intervals or std alongside point estimates
     accuracy/F1 等分类指标时不收集整张概率矩阵，显著降低
     候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
 

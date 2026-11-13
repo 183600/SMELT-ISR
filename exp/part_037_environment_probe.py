@@ -424,6 +424,7 @@ def run_sanity_overfit(
         final_total_loss = float("nan")
         final_lm_loss = float("nan")
         final_acc = float("nan")
+        # TODO: Report confidence intervals or std alongside point estimates
         grad_probe: Optional[Dict[str, object]] = None
         pre_step_parameter_digest: Optional[str] = None
         post_step_parameter_digest: Optional[str] = None
@@ -506,6 +507,7 @@ def run_sanity_overfit(
                 else:
                     if loss_connected:
                         loss.backward()
+                        # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
 
                         if step == 1:
                             grad_probe = _probe_gradient_flow(
@@ -538,6 +540,7 @@ def run_sanity_overfit(
                     final_total_loss = float(loss.detach())
                     final_lm_loss = float(lm_loss.detach())
                     final_acc = float(
+                    # TODO: Report confidence intervals or std alongside point estimates
                         (
                             result["logits"].argmax(dim=-1) == y
                         ).float().mean()
@@ -548,6 +551,7 @@ def run_sanity_overfit(
                         f"total_loss={final_total_loss:.4f} "
                         f"lm_loss={final_lm_loss:.4f} "
                         f"token_acc={final_acc:.4f}"
+                        # TODO: Report confidence intervals or std alongside point estimates
                     )
 
                 # 探针失败：立即停止训练并给出排查提示。

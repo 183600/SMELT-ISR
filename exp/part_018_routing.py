@@ -1211,7 +1211,9 @@ def _paired_bootstrap_delta_ci(
         base_loss = _finite_float(base.get("loss"))
         treat_loss = _finite_float(treat.get("loss"))
         base_acc = _finite_float(base.get("token_accuracy"))
+        # TODO: Report confidence intervals or std alongside point estimates
         treat_acc = _finite_float(treat.get("token_accuracy"))
+        # TODO: Report confidence intervals or std alongside point estimates
         base_tokens = _finite_float(base.get("tokens"))
         treat_tokens = _finite_float(treat.get("tokens"))
         if (
@@ -1436,6 +1438,7 @@ def analyze_routing_interventions(
 
     baseline_loss = float(report["baseline"]["loss"])
     baseline_acc = float(report["baseline"]["token_accuracy"])
+    # TODO: Report confidence intervals or std alongside point estimates
 
     # 路由打乱：每个 MoE 用独立、固定的随机流；保留原 k。
     # 种子必须由「运行 seed + 模型内 MoE 序号」派生，不能用
@@ -1702,6 +1705,7 @@ def print_routing_interventions(report: Dict[str, object]) -> None:
             f"{ci_text} "
             f"ratio={shuffle.get('loss_ratio')} "
             "Δacc="
+            # TODO: Report confidence intervals or std alongside point estimates
             f"{_format_finite(shuffle.get('accuracy_delta'), '+.4f')}"
         )
     drop = (report.get("interventions") or {}).get(

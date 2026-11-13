@@ -80,6 +80,7 @@ class StatisticsTests(unittest.TestCase):
             [1.0, 1.0, 1.0, 1.0, 3.0],
             seeds=[1, 2, 3, 4, 5],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertTrue(report["available"])
         self.assertFalse(
@@ -96,6 +97,7 @@ class StatisticsTests(unittest.TestCase):
         report = experiment._paired_result_fragility(
             [1.0, 1.0, 1.0, 1.0, 1.2],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertEqual(report["verdict"], "stable")
         self.assertTrue(
@@ -110,6 +112,7 @@ class StatisticsTests(unittest.TestCase):
         report = experiment._paired_result_fragility(
             [1.0, 1.1, 0.9],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertEqual(report["verdict"], "not_evaluable")
         self.assertFalse(report["leave_one_out_evaluable"])
@@ -120,6 +123,7 @@ class StatisticsTests(unittest.TestCase):
         report = experiment._paired_result_fragility(
             [5.0] * 7 + [-1.0],
             alpha=0.05,
+            # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
         self.assertEqual(report["verdict"], "direction_mixed")
         self.assertFalse(report["direction_consistent"])

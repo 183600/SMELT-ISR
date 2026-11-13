@@ -1182,6 +1182,7 @@ def _autocast_snapshot() -> List[Tuple[str, bool, torch.dtype, bool]]:
 
     _BlockCheckpoint 的前向可能在外层 autocast 上下文中执行，
     而反向重算发生在 loss.backward()（autocast 上下文之外）。
+    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     必须按前向时记录的状态重入 autocast，否则 AMP 训练开启
     grad checkpoint 后，重算图走了 fp32 的 dtype 路径，梯度与
     不开启 checkpoint 的同一训练不同（torch.utils.checkpoint
@@ -1329,6 +1330,7 @@ class _BlockCheckpoint(torch.autograd.Function):
 
         # 反传放在 autocast 上下文之外：与直接调用路径一致
         # （训练循环的 loss.backward() 就在 autocast 之外执行），
+        # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
         # 也与 torch.utils.checkpoint 的非重入实现一致——重算在
         # autocast 内、重算图的反向在 autocast 外。
         if not isinstance(recomputed, tuple):

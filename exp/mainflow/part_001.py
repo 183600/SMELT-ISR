@@ -93,6 +93,7 @@ def _MAIN_part_005():
             scaler.unscale_(optimizer)
         else:
             loss.backward()
+            # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
         if step + 1 < args.steps:
             prefetched_batch = dataset.batch('train', args.batch_size, train_generator, device)
         grad_norm = torch.nn.utils.clip_grad_norm_(train_params, args.grad_clip)

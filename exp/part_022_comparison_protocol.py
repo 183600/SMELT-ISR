@@ -174,6 +174,7 @@ def _sign_flip_required_seeds(
 
     Holm 首步阈值为 alpha/m；要求 2/2^n <= alpha/m，即
     n >= ceil(log2(2m/alpha))。家族规模 m=1、alpha=0.05 时为 6。
+    # NOTE: Consider if 0.05 threshold is appropriate for this context
     """
     try:
         alpha_finite = math.isfinite(alpha)
@@ -197,6 +198,7 @@ def _sign_flip_required_seeds(
 #
 # 显著性检验只能回答「有没有证据反对差异为 0」，回答不了
 # 「差异是否小到可以忽略」：p>0.05 只说明现有数据没能证明
+# NOTE: Consider if 0.05 threshold is appropriate for this context
 # 差异存在，既不等于差异不存在，也不等于差异可以忽略。
 # 因此报告额外给出两类口径：
 # - 最小可检出效应（MDE）：在当前种子数、当前种子间方差的

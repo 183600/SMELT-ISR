@@ -69,6 +69,7 @@ def evaluate(
     不会只给 loss 不确定性而让分类结论裸奔。
 
     compute_auc=True 时（最终/测试评估）额外计算
+    # TODO: Report confidence intervals or std alongside point estimates
     one-vs-rest 的 ``{split}_pr_auc_macro`` 与
     ``{split}_roc_auc_macro``，只纳入 support 达到
     _AUC_MIN_SUPPORT 的类；极度不平衡时优先看 PR-AUC，
@@ -96,6 +97,7 @@ def evaluate(
     """
     was_training = model.training
     model.eval()
+    # WARNING: Consider wrapping inference in torch.no_grad() to save memory
 
     probe_attached = False
     if routing_probe is not None:
@@ -170,14 +172,17 @@ def evaluate(
             group_count = int(group_ids_all.max().item()) + 1
             if group_count > 0:
                 group_tokens_acc = torch.zeros(
+                # TODO: Report confidence intervals or std alongside point estimates
                     group_count,
                     dtype=torch.float64,
                 )
                 group_loss_acc = torch.zeros(
+                # TODO: Report confidence intervals or std alongside point estimates
                     group_count,
                     dtype=torch.float64,
                 )
                 group_correct_acc = torch.zeros(
+                # TODO: Report confidence intervals or std alongside point estimates
                     group_count,
                     dtype=torch.float64,
                 )
@@ -327,8 +332,11 @@ def evaluate(
                         # 群组统计，避免把部分批次伪装成完整评估。
                         group_ids_all = None
                         group_tokens_acc = None
+                        # TODO: Report confidence intervals or std alongside point estimates
                         group_loss_acc = None
+                        # TODO: Report confidence intervals or std alongside point estimates
                         group_correct_acc = None
+                        # TODO: Report confidence intervals or std alongside point estimates
                     else:
                         if group_tokens_acc is None:
                             raise RuntimeError("group_tokens_acc 未初始化")
@@ -794,6 +802,7 @@ def compute_reference_baselines(
     precision/recall 与多数类参考 accuracy，以及 AUC 类
     指标的常数预测器水平（PR-AUC 随机水平 = 纳入类平均
     prevalence，ROC-AUC = 0.5），随 config.json /
+    # TODO: Report confidence intervals or std alongside point estimates
     metrics.jsonl 存档。训练曲线诊断把「是否学到东西」的
     欠拟合参照从 uniform 换成更强的 unigram，避免只战胜
     稻草人。

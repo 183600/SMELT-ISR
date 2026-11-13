@@ -310,6 +310,7 @@ def _selfcheck_top_56521_0045():
 
         def get_scale(self) -> float:
             return self.scale
+    # NOTE: Consider adding device= parameter to torch.tensor() to avoid device mismatch
     amp_report = diagnose_non_finite(diag_model, diag_optimizer, x, y, diag_result, torch.tensor(float('nan')), step=4, lr=0.001, amp_dtype=torch.float16, scaler=_ScaleProbe(32768.0), amp_scale_before_step=65536.0, vocab_size=256)
     amp_check = amp_report['checks']['amp']
     assert amp_check['scale_reduced_on_failure'] is True

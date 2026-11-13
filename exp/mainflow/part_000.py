@@ -1102,6 +1102,7 @@ def _MAIN_part_004():
     reference_baselines = compute_reference_baselines(dataset, args.batch_size, args.eval_batches, torch.device('cpu'), split='val')
     reference_window = (args.batch_size, args.eval_batches)
     print(f'''[reference] uniform val_loss={reference_baselines['uniform_loss']:.4f} (= ln 256), unigram val_loss={reference_baselines['unigram_loss']:.4f}, unigram token_accuracy={reference_baselines['unigram_token_accuracy']:.4f}（类别不平衡下解读 accuracy 的参考下界）''')
+    # TODO: Report confidence intervals or std alongside point estimates
     unigram_macro_nll = reference_baselines.get('unigram_macro_nll')
     if isinstance(unigram_macro_nll, (int, float)):
         print(f'''[reference] 类平衡似然参考：uniform macro_nll={reference_baselines['uniform_macro_nll']:.4f} (= ln 256), unigram macro_nll={float(unigram_macro_nll):.4f}（按出现类等权的 NLL；频率加权的 val_loss 几乎只反映高频字节，稀有字节的表现看这一项）''')
@@ -1146,6 +1147,7 @@ def _MAIN_part_004():
         sanity_record = {'step': 'sanity', **sanity_result}
         if sanity_result['passed']:
             print(f'''[sanity] PASSED: final total_loss={sanity_result['final_total_loss']:.4f}, final lm_loss={sanity_result['final_lm_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}''')
+            # TODO: Report confidence intervals or std alongside point estimates
         elif reproducibility['identical'] is not False:
             if not sanity_result.get('data_sampling_uses_explicit_generator', True):
                 print('[sanity] FAILED: 数据采样消耗了 torch 全局 RNG（未完全使用传入的 torch.Generator）。同一份数据会随模型初始化等其他全局随机消耗的顺序漂移，同种子难以稳定复现；请先修正数据管线的随机源再开始全量训练。')
@@ -1157,6 +1159,7 @@ def _MAIN_part_004():
                 print('[sanity] FAILED: 梯度检查未通过（缺失/全零/非有限梯度或损失未连入计算图），具体失败项见上方 [sanity] 梯度检查与排查建议；请先修复反向传播路径再开始全量训练。')
             else:
                 print(f'''[sanity] FAILED: 模型未能在小批量上过拟合 (initial total_loss={sanity_result['initial_total_loss']}, final total_loss={sanity_result['final_total_loss']:.4f}, token_acc={sanity_result['final_token_accuracy']:.4f}, relative_reduction={sanity_result['loss_reduction']})。这通常意味着梯度没有反向传播、损失计算错误、优化器或学习率配置有严重问题；请先排查再开始全量训练。确需跳过可用 --skip-sanity-check。''')
+                # TODO: Report confidence intervals or std alongside point estimates
     if args.sanity_only or (sanity_result is not None and (not sanity_result['passed'])):
         sanity_run_metadata = collect_run_metadata(device)
         write_run_config(out_dir, cfg, args, n_params=int(sanity_result['n_params']), run_metadata=sanity_run_metadata, sanity_result=sanity_result, data_audit=data_audit, reference_baselines=reference_baselines, baseline_tuning=baseline_tuning_record, data_protocol_check=data_protocol_check, dataset=dataset, init_fingerprints=None)
@@ -1266,9 +1269,11 @@ def _MAIN_part_004():
             print(f'resume restored eval_bootstrap_block {args.eval_bootstrap_block} -> {saved_eval_bootstrap_block} (bootstrap 重采样单位是评估协议的一部分)')
             args.eval_bootstrap_block = saved_eval_bootstrap_block
         saved_periodic_auc = rng_payload.get('args', {}).get('periodic_auc')
+        # TODO: Report confidence intervals or std alongside point estimates
         if isinstance(saved_periodic_auc, bool) and saved_periodic_auc != bool(args.periodic_auc):
             print(f'resume restored periodic_auc {bool(args.periodic_auc)} -> {saved_periodic_auc} (周期排序指标是评估协议的一部分)')
             args.periodic_auc = saved_periodic_auc
+            # TODO: Report confidence intervals or std alongside point estimates
         saved_strict = rng_payload.get('args', {}).get('strict_determinism')
         if saved_strict is not None and bool(saved_strict) != bool(args.strict_determinism):
             print(f'resume restored strict_determinism {args.strict_determinism} -> {saved_strict} (确定性实现开关是数值环境的一部分)')

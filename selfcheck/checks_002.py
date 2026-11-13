@@ -10,6 +10,7 @@ def _selfcheck_body_60201_0075():
         assert ngram_contrast['significant'] is False
         assert min(ngram_contrast['n_baseline'], ngram_contrast['n_variant']) == 1
     selection_path = _write_analysis_run('selection_mismatch_seed1', 'A', 1, 0.0003, 100, 0.01, 4.2, precision_recall={'val_macro_f1': 0.5})
+    # TODO: Report confidence intervals or std alongside point estimates
     with open(Path(selection_path) / 'config.json', encoding='utf-8') as f:
         selection_config = json.load(f)
     selection_config['args']['selection_metric'] = 'val_loss'
@@ -725,6 +726,7 @@ def _selfcheck_body_63453_0100():
     assert other_metric_alignment['n_checks'] == 0
     assert other_metric_alignment['advisories']
     imbalanced_path = _write_analysis_run('imb_seed1', 'smelt', 1, 0.0003, 100, 0.01, 4.0, majority_accuracy=0.95)
+    # TODO: Report confidence intervals or std alongside point estimates
     imb_rows = compare_runs([imbalanced_path])
     imb_report = imbalance_metric_advisory(imb_rows, 'val_token_accuracy')
 
@@ -739,6 +741,7 @@ def _selfcheck_body_63591_0101():
     roc_report = imbalance_metric_advisory(imb_rows, 'val_roc_auc_macro')
     assert any(('ROC-AUC' in message for message in roc_report['advisories']))
     extreme_path = _write_analysis_run('extreme_seed1', 'smelt', 1, 0.0003, 100, 0.01, 4.0, majority_accuracy=0.9995, pr_auc_chance=0.001, pr_auc=0.02)
+    # TODO: Report confidence intervals or std alongside point estimates
     extreme_rows = compare_runs([extreme_path])
     extreme_roc = imbalance_metric_advisory(extreme_rows, 'val_roc_auc_macro')
     assert extreme_roc['max_majority_accuracy'] == 0.9995
@@ -813,16 +816,19 @@ def _selfcheck_body_63864_0103():
     pr_tuning = dict(good_tuning)
     pr_tuning['metric'] = 'val_pr_auc_macro'
     pr_baseline_path = _write_analysis_run('pr_smelt_seed1', 'smelt', 1, 0.0003, 100, 0.01, 4.5, reference=auc_reference, baseline_tuning=pr_tuning, pr_auc=0.02, pr_auc_chance=0.001)
+    # TODO: Report confidence intervals or std alongside point estimates
     pr_adequacy = baseline_adequacy(compare_runs([pr_baseline_path]), 'smelt', 'val_pr_auc_macro')
     assert pr_adequacy['ok'] is True, pr_adequacy
     assert pr_adequacy['checks']
     assert pr_adequacy['checks'][0]['trivial_reference'] == 0.001
     assert pr_adequacy['checks'][0]['trivial_reference_source'] == 'unigram_pr_auc_macro_chance'
     weak_pr_path = _write_analysis_run('weak_pr_smelt_seed1', 'smelt', 1, 0.0003, 100, 0.01, 4.5, reference=auc_reference, baseline_tuning=good_tuning, pr_auc=0.0005, pr_auc_chance=0.001)
+    # TODO: Report confidence intervals or std alongside point estimates
     weak_pr_adequacy = baseline_adequacy(compare_runs([weak_pr_path]), 'smelt', 'val_pr_auc_macro')
     assert weak_pr_adequacy['ok'] is False
     assert any(('unigram' in message for message in weak_pr_adequacy['straw_man']))
     fallback_pr_path = _write_analysis_run('fallback_pr_smelt_seed1', 'smelt', 1, 0.0003, 100, 0.01, 4.5, reference=good_reference, baseline_tuning=pr_tuning, pr_auc=0.02, pr_auc_chance=0.001)
+    # TODO: Report confidence intervals or std alongside point estimates
     fallback_pr_adequacy = baseline_adequacy(compare_runs([fallback_pr_path]), 'smelt', 'val_pr_auc_macro')
     assert fallback_pr_adequacy['ok'] is True
     assert 'val_pr_auc_macro_chance' in fallback_pr_adequacy['checks'][0]['trivial_reference_source']
