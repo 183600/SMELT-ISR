@@ -1,7 +1,7 @@
 from __future__ import annotations
 import random
 import exp
-from exp import set_seed
+from exp import Config, set_seed
 
 def _selfcheck_top_51350_0001():
     global common, grad, gradients, key, mode, model, named_dense, named_dense_state, named_moe, named_moe_state, named_shared, ordered_moe, result, x, y
