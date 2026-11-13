@@ -440,6 +440,20 @@ def _t_critical(
     ):
         return None
 
+
+    # Special case: df=1 (Cauchy distribution)
+    # P(|T| > |t|) = 1 - (2/pi) * arctan(|t|), so critical = cot(pi*alpha/2)
+    if df_value == 1.0:
+        critical = 1.0 / math.tan(math.pi * alpha_value / 2.0)
+        return critical
+    # Special case: df=2
+    # t = (1-alpha)*sqrt(2/(alpha*(2-alpha)))
+    if df_value == 2.0:
+        critical = (1.0 - alpha_value) * math.sqrt(
+            2.0 / (alpha_value * (2.0 - alpha_value))
+        )
+        return critical
+            
     low = 0.0
     high = 1.0
     while True:
