@@ -1188,7 +1188,7 @@ def _plan_treatment_key(item: Dict[str, object]):
     """
     return tuple(
         (str(key), _stable_factor_key(item.get(key)))
-        for key in sorted(item, key=str)
+        for key in sorted(item, key=lambda k: (0, k) if isinstance(k, (int, float)) else (1, str(k)))
         if str(key) not in _PLAN_IDENTITY_KEYS
     )
 

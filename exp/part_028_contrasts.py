@@ -1030,7 +1030,7 @@ def _paired_linear_effect(
     )
     effect_values: List[float] = []
     raw_seeds: List[object] = []
-    seed_keys = sorted(common, key=str)
+    seed_keys = sorted(common, key=lambda k: (0, k) if isinstance(k, (int, float)) else (1, str(k)))
     first_cell = next(iter(maps.values()))
     for seed_key in seed_keys:
         terms: List[float] = []
