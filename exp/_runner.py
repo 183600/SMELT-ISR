@@ -72,7 +72,9 @@ def run_isolated(part_paths, base_globals, owned_names, entry_calls, initial=Non
         except SyntaxError as exc:
             raise _CompileError(absolute) from exc
         try:
-            exec(code, namespace)
+            # nosec B102: exec() is used intentionally to execute experiment
+            # parts from local project files only, never from user input.
+            exec(code, namespace)  # nosec B102
         except Exception as exc:
             raise _ExecuteError(absolute) from exc
     namespace.finish_loading()
