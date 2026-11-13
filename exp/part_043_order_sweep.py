@@ -773,7 +773,7 @@ def _sd_upper_confidence_bound(
     """正态配对差值的 sd 单侧置信上界。
 
     ``sd`` 为样本 sd（ddof=1），``n`` 为配对数。按
-    ``sigma <= s * sqrt((n-1) / chi2_{1-confidence, n-1})``
+    ``sigma <= s * sqrt(max((n-1, 0.0)) / chi2_{1-confidence, n-1})``
     计算；小试点时上界会很宽，这正是需要披露的抽样不确定性。
     """
     value = _finite_float(sd)

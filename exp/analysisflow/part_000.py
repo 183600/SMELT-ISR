@@ -400,6 +400,7 @@ def _PA_part_001():
             assumption_reasons.append(f"两臂方差比={_format_finite(assumption_variance.get('variance_ratio'), '.1f')}（F 检验 p={_format_finite(assumption_variance.get('p_value'), '.3f')}）；合并标准差口径的 hedges_g 解读受影响（Welch 检验本身不受影响）")
         assumption_t_p = _finite_float(assumption_entry.get('p_value'))
         assumption_w_p = _finite_float(assumption_entry.get('wilcoxon_p_value'))
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         if assumption_t_p is not None and assumption_w_p is not None and (assumption_t_p <= _SIGNIFICANCE_LEVEL) != (assumption_w_p <= _SIGNIFICANCE_LEVEL):
             assumption_reasons.append(f"配对 t（p={_format_finite(assumption_t_p)}）与 Wilcoxon 符号秩（p={_format_finite(assumption_w_p)}）在 0.05 水平上结论不一致；请检查逐种子差值（paired_differences）是否有单点驱动")
         if assumption_reasons:

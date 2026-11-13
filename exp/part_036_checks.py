@@ -1449,7 +1449,9 @@ _COMPARISON_CSV_CONTRAST_COLUMNS = (
     "randomization_p_value",
     "wilcoxon_p_value",
     "wilcoxon_method",
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
     "wilcoxon_rank_biserial",
+    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
     "delta_over_noise",
     "hedges_g",
     "cohens_dz",
@@ -1565,9 +1567,13 @@ def _comparison_contrast_row(
             "randomization_p_value"
         ),
         "wilcoxon_p_value": contrast.get("wilcoxon_p_value"),
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         "wilcoxon_method": contrast.get("wilcoxon_method"),
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         "wilcoxon_rank_biserial": contrast.get(
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_rank_biserial"
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         ),
         "delta_over_noise": contrast.get("delta_over_noise"),
         "hedges_g": contrast.get("hedges_g"),

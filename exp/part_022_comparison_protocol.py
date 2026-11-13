@@ -301,7 +301,7 @@ _HYPOTHESIS_MIN_EFFECT_ABS_FLOOR = 1.0e-12
 
 
 # 非中心 t 功效的数值积分设置：对 u = sqrt(V)（V ~ chi2_df）
-# 做复合 Simpson 积分。u 的密度以 sqrt(df-1) 为众数、宽度
+# 做复合 Simpson 积分。u 的密度以 sqrt(max(df-1, 0.0)) 为众数、宽度
 # 约 1/√2，右尾为 exp(-u^2/2)：积分上限取众数 + _T_POWER_TAIL
 # （右尾 < 1e-31 可截断），节点数随上限自适应，df 很大时
 # 也不会把全部质量丢在积分区间之外。

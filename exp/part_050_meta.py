@@ -323,7 +323,7 @@ def meta_analyze(
         "prediction_interval": {
             "low": theta_random - prediction_half_width,
             "high": theta_random + prediction_half_width,
-            "method": "theta_hat +/- t_{0.975,k-1} * sqrt(se^2 + tau^2)",
+            "method": "theta_hat +/- t_{0.975,k-1} * sqrt(max(se^2 + tau^2, 0.0))",
             "t_critical": t_critical,
         },
         "note": (

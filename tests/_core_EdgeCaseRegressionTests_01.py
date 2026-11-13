@@ -464,8 +464,8 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         self.assertAlmostEqual(
             critical / expected, 1.0, places=12
         )
-        # df=2 的双侧 p=1-t/sqrt(t^2+2)，反解得到
-        # t=(1-alpha)*sqrt(2/(alpha*(2-alpha)))≈1e6。
+        # df=2 的双侧 p=1-t/sqrt(max(t^2+2, 0.0))，反解得到
+        # t=(1-alpha)*sqrt(max(2/(alpha*(2-alpha, 0.0))))≈1e6。
         alpha = 1.0e-12
         expected = (1.0 - alpha) * math.sqrt(
             2.0 / (alpha * (2.0 - alpha))

@@ -379,19 +379,29 @@ def factorial_effects(
                         "paired_diagnostics"
                     ),
                     "wilcoxon_p_value": result.get(
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                         "wilcoxon_p_value"
+                        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     ),
                     "wilcoxon_method": result.get(
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                         "wilcoxon_method"
+                        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     ),
                     "wilcoxon_rank_biserial": result.get(
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                         "wilcoxon_rank_biserial"
+                        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     ),
                     "wilcoxon_min_attainable_p": result.get(
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                         "wilcoxon_min_attainable_p"
+                        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     ),
                     "wilcoxon_can_reach_significance": result.get(
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                         "wilcoxon_can_reach_significance"
+                        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     ),
                     "cohens_dz": result.get("cohens_dz"),
                     "hedges_gz": result.get("hedges_gz"),

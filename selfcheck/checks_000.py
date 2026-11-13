@@ -144,6 +144,7 @@ def _selfcheck_top_51755_0004():
     aux_moe = SparseMoE(Config(**common, mode='smelt'))
     with torch.no_grad():
         aux_moe.router.weight.zero_()
+    # NOTE: No random seed set in this function - results may not be reproducible
     _, uniform_aux = aux_moe(torch.randn(2, 4, common['d_model']), top_k=2)
     torch.testing.assert_close(uniform_aux, torch.tensor(2.0, device=uniform_aux.device), rtol=1e-05, atol=1e-06)
     overlap_metrics = _routing_set_metrics(torch.tensor([[0, 1]]), torch.tensor([[1, 2]]), 4)
@@ -288,8 +289,10 @@ def _selfcheck_top_52201_0010():
     torch.testing.assert_close(logits_original[:, :-1], logits_changed[:, :-1], rtol=1e-05, atol=1e-06)
     model = LanguageModel(Config(**common, mode='B')).eval()
     block = model.blocks[model.middle_start]
+    # NOTE: No random seed set in this function - results may not be reproducible
     branches = torch.randn(2, 2, 8, 16)
     changed = branches.clone()
+    # NOTE: No random seed set in this function - results may not be reproducible
     changed[:, 1] += torch.randn_like(changed[:, 1])
     with torch.no_grad():
         out1, _ = model.run_independent_blocks(block, branches, 2)
@@ -898,7 +901,8 @@ def _selfcheck_top_54012_0026():
     one_se_near = [value + 0.0001 + 0.001 * (index % 3 - 1) for index, value in enumerate(one_se_base)]
     one_se_worse = [value + 0.01 + 1e-05 * (index % 2 - 0.5) for index, value in enumerate(one_se_base)]
     one_se_windows = {(3, 1.0): one_se_base, (1, 0.25): one_se_near, (2, 1.0): one_se_worse}
-    one_se_candidates = [{'order': 1, 'alpha': 0.25, 'val_loss': sum(one_se_near) / one_se_n}, {'order': 2, 'alpha': 1.0, 'val_loss': sum(one_se_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_loss': sum(one_se_base) / one_se_n}]
+    _denom_one_se_candidates = max(one_se_n, 1e-12)
+    one_se_candidates = [{'order': 1, 'alpha': 0.25, 'val_loss': sum(one_se_near) / _denom_one_se_candidates}, {'order': 2, 'alpha': 1.0, 'val_loss': sum(one_se_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_loss': sum(one_se_base) / one_se_n}]
     point_best = one_se_candidates[2]
     one_se_selection = _select_ngram_candidate_one_se(point_best, one_se_candidates, one_se_windows, 'val_loss')
     assert one_se_selection is not None
@@ -919,7 +923,8 @@ def _selfcheck_top_54147_0027():
     f1_near = [value - 0.001 + 0.02 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_worse = [value - 0.2 + 0.01 * (index % 2 - 0.5) for index, value in enumerate(f1_base)]
     f1_windows = {(3, 1.0): f1_base, (1, 0.25): f1_near, (2, 1.0): f1_worse}
-    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / one_se_n}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / one_se_n}]
+    _denom_f1_candidates = max(one_se_n, 1e-12)
+    f1_candidates = [{'order': 1, 'alpha': 0.25, 'val_macro_f1': sum(f1_near) / _denom_f1_candidates}, {'order': 2, 'alpha': 1.0, 'val_macro_f1': sum(f1_worse) / one_se_n}, {'order': 3, 'alpha': 1.0, 'val_macro_f1': sum(f1_base) / one_se_n}]
     f1_selection = _select_ngram_candidate_one_se(f1_candidates[2], f1_candidates, f1_windows, 'val_macro_f1')
     assert f1_selection is not None
     assert f1_selection['available'] is True
@@ -1274,11 +1279,13 @@ def _selfcheck_top_55096_0035():
 def _selfcheck_top_55229_0036():
     global _, effective_change_error, isolation_a, legacy_optimizer, legacy_param, legacy_scheduler, original, original_lrs, rebuilt, rebuilt_lrs, rebuilt_optimizer, rebuilt_param, split_change_error, warmup_optimizer, warmup_param, wrong, wrong_lrs, wrong_optimizer, wrong_param
     torch.testing.assert_close(new_optimizer.param_groups[0]['lr'], expected_lr)
+    # NOTE: No random seed set in this function - results may not be reproducible
     legacy_param = nn.Parameter(torch.randn(2))
     legacy_optimizer = torch.optim.AdamW([legacy_param], lr=0.1)
     legacy_optimizer.param_groups[0].pop('initial_lr', None)
     legacy_scheduler = build_lr_schedule(legacy_optimizer, warmup_steps=0, total_steps=8, start_step=2)
     assert legacy_scheduler.get_last_lr()[0] > 0.0, 'legacy resume must rebuild the LR schedule'
+    # NOTE: No random seed set in this function - results may not be reproducible
     warmup_param = nn.Parameter(torch.randn(2))
     warmup_optimizer = torch.optim.AdamW([warmup_param], lr=0.1)
     original = build_lr_schedule(warmup_optimizer, warmup_steps=3, total_steps=10)
@@ -1287,6 +1294,7 @@ def _selfcheck_top_55229_0036():
         original_lrs.append(warmup_optimizer.param_groups[0]['lr'])
         warmup_optimizer.step()
         original.step()
+    # NOTE: No random seed set in this function - results may not be reproducible
     wrong_param = nn.Parameter(torch.randn(2))
     wrong_optimizer = torch.optim.AdamW([wrong_param], lr=0.1)
     wrong = build_lr_schedule(wrong_optimizer, warmup_steps=5, total_steps=10)
@@ -1296,6 +1304,7 @@ def _selfcheck_top_55229_0036():
         wrong_optimizer.step()
         wrong.step()
     assert not torch.allclose(torch.tensor(original_lrs), torch.tensor(wrong_lrs)), 'warmup mismatch must change the LR schedule'
+    # NOTE: No random seed set in this function - results may not be reproducible
     rebuilt_param = nn.Parameter(torch.randn(2))
     rebuilt_optimizer = torch.optim.AdamW([rebuilt_param], lr=0.1)
     rebuilt = build_lr_schedule(rebuilt_optimizer, warmup_steps=3, total_steps=10)
@@ -1379,6 +1388,7 @@ def _selfcheck_top_55519_0038():
     global _DuplicateGroupOptimizer, coverage, duplicate_coverage, grad_probe, partial_coverage, partial_optimizer, python_rng_before, rng_before, sanity_cfg, sanity_metrics, saved_matmul_precision, saved_tf32_cudnn, saved_tf32_matmul, tiny_probe_model
     assert torch.equal(torch.rand(3), expected_rng_draw[1])
     if np is not None:
+        # NOTE: No random seed set in this function - results may not be reproducible
         assert float(np.random.rand()) == expected_rng_draw[2]
     set_seed(11, strict_determinism=True)
     assert torch.are_deterministic_algorithms_enabled()

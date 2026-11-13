@@ -8,10 +8,10 @@ def _noncentral_t_cdf(
     noncentrality: float,
 ) -> Optional[float]:
     """
-    非中心 t 分布 CDF：T' = (Z + δ) / sqrt(V/df)。
+    非中心 t 分布 CDF：T' = (Z + δ) / sqrt(max(V/df, 0.0))。
 
     给定 V=u²（u 服从 chi_df）时 T' 条件于正态分布
-    N(δ, 1)/sqrt(V/df)；对 u 的 chi 密度积分，与 ``_t_power``
+    N(δ, 1)/sqrt(max(V/df, 0.0))；对 u 的 chi 密度积分，与 ``_t_power``
     使用同一组 Simpson 节点。δ=0 时退化为中心 t，直接复用
     ``_t_cdf`` 以保持中心情形的数值路径不变；df 趋于无穷时
     退化为 N(δ, 1)。
@@ -191,7 +191,7 @@ def _tost_power_normal_mix(
     """
     小自由度、大非中心参数下的 TOST 功效。
 
-    令 T'=(Z+δ)/sqrt(V/df)、Y=Z+δ，则 |T'|≤U 等价于
+    令 T'=(Z+δ)/sqrt(max(V/df, 0.0))、Y=Z+δ，则 |T'|≤U 等价于
     u=sqrt(V)≥|Y|·sqrt(df)/U。因此
 
         power = E_Y[Q_chi2_df(df·(|Y|/U)^2)]。
@@ -315,8 +315,8 @@ def _tost_power(
     noncentrality = effect_value / se_value
     if not math.isfinite(noncentrality):
         # se 极小导致 δ 溢出：取 δ→∞ 的极限。条件
-        # |T'|≤U 等价于 (Z+δ)/sqrt(V/df) 落在 ±U 内；
-        # 除以 δ 后只剩 sqrt(V/df) ≥ 1/r（r=U/δ），
+        # |T'|≤U 等价于 (Z+δ)/sqrt(max(V/df, 0.0)) 落在 ±U 内；
+        # 除以 δ 后只剩 sqrt(max(V/df, 0.0)) ≥ 1/r（r=U/δ），
         # 即 V ≥ df·(effect/half_width)²。忽略下界（极限为 0）。
         try:
             threshold = (
@@ -581,7 +581,7 @@ def _paired_effect_size(
     # 效应量自身的 95% CI：点估计只给「效应多大」，不给「这个
     # 估计有多准」。小种子数下 dz 的区间可以同时覆盖「可忽略」
     # 与「大效应」，必须与点估计一起报告。采用配对标准化差值
-    # 的大样本近似 SE = sqrt(1/n + dz²/(2n))（Morris & DeShon,
+    # 的大样本近似 SE = sqrt(max(1/n + dz²/(2n, 0.0)))（Morris & DeShon,
     # 2002 的配对口径）；正态分位数用 z_{0.975}，不依赖 SciPy。
     # Hedges gz 的区间按同一宽度乘偏倚校正因子 J（g = J·d，
     # 区间端点同比例缩放）。

@@ -1373,7 +1373,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(
             contrast["seeds_to_detect_design"], "welch"
         )
-        # 每臂 n 个、se=sd·sqrt(2/n)、df=2(n-1)；n=17 才达到
+        # 每臂 n 个、se=sd·sqrt(max(2/n, 0.0))、df=2(n-1)；n=17 才达到
         # 80% 功效，配对公式给出的 10 会系统性低估。
         self.assertEqual(contrast["seeds_to_detect"], 17)
     def test_zero_effect_power_is_exactly_alpha(self):
@@ -1466,7 +1466,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             self.assertIsNotNone(cdf)
             self.assertAlmostEqual(cdf, reference, delta=1.0e-9)
     def test_noncentral_t_cdf_keeps_extreme_positive_tail_small_df(self):
-        # df<3 时默认 u 上界只到 sqrt(df-1)+12；δ 很大而
+        # df<3 时默认 u 上界只到 sqrt(max(df-1, 0.0))+12；δ 很大而
         # t 较小时正态尾转折落在截断之外，固定节点会漏掉
         # 整段仍可表示的正尾概率（如 df=1、δ=30、t=1 时
         # 修复前约少 34 个数量级）。参考值由高精度非中心 t
@@ -1496,7 +1496,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             delta=0.0,
         )
     def test_noncentral_t_cdf_extends_chi_tail_for_large_shift(self):
-        # df>=3 时默认 u 上界 sqrt(df-1)+12 只按 chi 众数附近
+        # df>=3 时默认 u 上界 sqrt(max(df-1, 0.0))+12 只按 chi 众数附近
         # 取界；δ 很大时正态 CDF 的转折点会落在更远的 chi 尾部，
         # 例如 df≈766、δ≈97、t≈52.6 时主导区间在 u≈44，而默认
         # 上界仅 39.7，修复前会把 CDF 低估约 20 个数量级。

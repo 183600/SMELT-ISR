@@ -1124,15 +1124,23 @@ def compare_cells_to_baseline(
                 "paired_diagnostics"
             ),
             "wilcoxon_p_value": result.get("wilcoxon_p_value"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_method": result.get("wilcoxon_method"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_rank_biserial": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_rank_biserial"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "wilcoxon_min_attainable_p": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_min_attainable_p"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "wilcoxon_can_reach_significance": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_can_reach_significance"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "cliffs_delta": result.get("cliffs_delta"),
             "cliffs_delta_ci95": result.get("cliffs_delta_ci95"),

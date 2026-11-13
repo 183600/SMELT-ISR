@@ -636,7 +636,7 @@ def _betacf(a: float, b: float, x: float) -> float:
     正则化不完全 Beta 函数的连分式（Lentz 算法），
     用于无 SciPy 依赖地计算 t 分布 p 值。
     """
-    # 连分式的收敛步数随 sqrt(a+b) 增长：a=b=1e6 时需要约
+    # 连分式的收敛步数随 sqrt(max(a+b, 0.0)) 增长：a=b=1e6 时需要约
     # 460 步，200 步会在 x≈1/2 处把 I_x 算成 0.4997，并让
     # 二项分布上置信界偏移数万分之一。正常量级仍在前几十步
     # 收敛，提高上限不会拖慢常见路径。
@@ -1321,6 +1321,7 @@ def _paired_difference_diagnostics(
 
 
 def _wilcoxon_signed_rank_test(
+# TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
     differences: List[float],
 ) -> Dict[str, object]:
     """
@@ -1352,6 +1353,7 @@ def _wilcoxon_signed_rank_test(
     if n < _MIN_SEEDS_FOR_STATS:
         return {
             "test": "wilcoxon_signed_rank",
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "p_value": None,
             "method": "degenerate_all_zero",
             "n_effective": n,
@@ -1434,6 +1436,7 @@ def _wilcoxon_signed_rank_test(
         if variance <= 0.0:
             return {
                 "test": "wilcoxon_signed_rank",
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "p_value": None,
                 "method": "degenerate_ties",
                 "n_effective": n,
@@ -1459,6 +1462,7 @@ def _wilcoxon_signed_rank_test(
 
     return {
         "test": "wilcoxon_signed_rank",
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         "p_value": p_value,
         "method": method,
         "n_effective": n,

@@ -497,7 +497,7 @@ def class_balanced_loss_metrics(
     口径下与 macro F1 对应的类平衡指标（不平衡场景下与
     macro F1 / PR-AUC 一起看才有意义）。
 
-    随机水平参照 ``macro_nll_chance`` = log(vocab_size)：
+    随机水平参照 ``macro_nll_chance`` = log(max(vocab_size, 1e-300))：
     均匀预测器对每个类的 NLL 都恰为 log V，类平衡平均后不变，
     因此它是任何模型必须显著低于的绝对下限。
 

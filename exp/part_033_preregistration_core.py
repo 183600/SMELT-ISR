@@ -453,7 +453,8 @@ def preregistration_power_plan(
         raw_contrasts = contrast_types
     contrasts = _normalize_contrast_types(raw_contrasts)
     try:
-        alpha_adjusted = alpha / family_size
+        _denom_alpha_adjusted = max(family_size, 1e-12)
+        alpha_adjusted = alpha / _denom_alpha_adjusted
     except OverflowError:
         # 家族规模是合法 JSON 整数但大到无法转成浮点：校正后
         # 的 alpha 实际为 0，任何有限 n 都不可能达到目标功效。

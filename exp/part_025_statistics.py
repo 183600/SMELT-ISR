@@ -447,7 +447,7 @@ def _t_critical(
         critical = 1.0 / math.tan(math.pi * alpha_value / 2.0)
         return critical
     # Special case: df=2
-    # t = (1-alpha)*sqrt(2/(alpha*(2-alpha)))
+    # t = (1-alpha)*sqrt(max(2/(alpha*(2-alpha, 0.0))))
     if df_value == 2.0:
         critical = (1.0 - alpha_value) * math.sqrt(
             2.0 / (alpha_value * (2.0 - alpha_value))
@@ -653,12 +653,12 @@ def _t_power_nodes(
     """
     t 分布功效积分的 Simpson 节点与权重（按 df 缓存）。
 
-    T = (Z + δ)/sqrt(V/df)，Z ~ N(0,1)，V ~ chi2_df。令
+    T = (Z + δ)/sqrt(max(V/df, 0.0))，Z ~ N(0,1)，V ~ chi2_df。令
     u = sqrt(V)，则 u 的密度为
     g(u) = 2^(1-df/2) u^(df-1) exp(-u^2/2) / Γ(df/2)，
     且 P(|T| > c | u) = Φ(-c·u/√df - δ) + 1 - Φ(c·u/√df - δ)。
 
-    默认积分区间上界取 chi 分布众数 sqrt(df-1) 加
+    默认积分区间上界取 chi 分布众数 sqrt(max(df-1, 0.0)) 加
     _T_POWER_TAIL（chi 分布的宽度约 1/√2，右尾可安全截断）；
     节点数随区间长度自适应，保证 df 从 0.5 到数千都足够精确。
     ``u_max`` 可显式扩展上界：低自由度、大非中心参数的非中心 t
@@ -756,7 +756,7 @@ def _t_power_nodes(
             simpson = 4.0 * step / 3.0
 
         if u <= 0.0:
-            # u^(df-1)：df>1 时为 0；df=1 时 g(0)=sqrt(2/π)。
+            # u^(df-1)：df>1 时为 0；df=1 时 g(0)=sqrt(max(2/π, 0.0))。
             density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
         else:
             density = math.exp(
@@ -778,7 +778,7 @@ def _t_power_large_shift_normal_mix(
     """
     小自由度下的功效：对正态位移积分 chi CDF。
 
-    令 T'=(Z+δ)/sqrt(V/df)、w=scale·u 且 u=sqrt(V)，则
+    令 T'=(Z+δ)/sqrt(max(V/df, 0.0))、w=scale·u 且 u=sqrt(V)，则
     |T'|>critical 等价于 u<|Z+δ|/scale。因此
 
         power = E_Z[F_chi2_df((|Z+δ|/scale)^2)]。
@@ -1531,7 +1531,7 @@ def _jzs_u_nodes_kernel(
         weights = np.ones(count, dtype=np.float64)
         weights[1:-1:2] = 4.0
         weights[2:-1:2] = 2.0
-        return weights * (span / (count - 1) / 3.0)
+        return weights * (span / max(count - 1, 1e-12) / 3.0)
 
     if u_max <= u_transition:
         u = np.linspace(0.0, u_max, nodes)
@@ -1670,7 +1670,7 @@ def _jzs_posterior_mixture(
     y_weights[-1] = 1.0
     y_weights[1:-1:2] = 4.0
     y_weights[2:-1:2] = 2.0
-    y_weights = y_weights * (y_max / (y_nodes_count - 1) / 3.0)
+    y_weights = y_weights * (y_max / max(y_nodes_count - 1, 1e-12) / 3.0)
     log_density = np.full(y_nodes_count, -np.inf)
     positive_y = y > 0.0
     if chi_df > 2.0:

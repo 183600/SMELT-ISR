@@ -482,6 +482,7 @@ def _bootstrap_window_indices(
 ) -> torch.Tensor:
     """窗口重采样下标：i.i.d. 或循环移动块。
 
+    _denom_n_blocks = max(block_size, 1e-12)
     block_size>1 时先抽取 n_blocks=ceil(n/block_size) 个块起点，
     再拼接连续窗口（循环取模），最后截断到 n。它把相邻窗口
     成块重采样，部分吸收局部自相关；按文档/来源做 cluster

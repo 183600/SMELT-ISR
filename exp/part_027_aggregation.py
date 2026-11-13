@@ -544,18 +544,27 @@ def _contrast_test(
         # 的对称性假设；不进入 Holm 家族、不改变显著性判定，
         # 只在结论与 t 检验不一致时提示检查。
         wilcoxon = _wilcoxon_signed_rank_test(differences)
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         result["wilcoxon"] = wilcoxon
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         if wilcoxon.get("p_value") is not None:
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             result["wilcoxon_p_value"] = wilcoxon.get("p_value")
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             result["wilcoxon_method"] = wilcoxon.get("method")
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             result["wilcoxon_rank_biserial"] = wilcoxon.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "rank_biserial"
             )
             result["wilcoxon_min_attainable_p"] = wilcoxon.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "min_attainable_p"
             )
             result["wilcoxon_can_reach_significance"] = (
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 wilcoxon.get("can_reach_significance")
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             )
         return result
 
