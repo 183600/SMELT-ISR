@@ -152,7 +152,7 @@ def _selfcheck_top_55949_0041():
     assert len(spark) == 48
     assert spark[0] == _SPARK_BLOCKS[0]
     assert spark[-1] == _SPARK_BLOCKS[-1]
-    baseline = math.log(256.0)
+    baseline = math.log(256.0 + 1e-8)
     overfit_analysis = analyze_training_curve([{'step': 10, 'train_loss': 5.0, 'val_loss': 5.1}, {'step': 20, 'train_loss': 4.0, 'val_loss': 4.5}, {'step': 30, 'train_loss': 3.0, 'val_loss': 4.4}, {'step': 40, 'train_loss': 2.0, 'val_loss': 4.6}, {'step': 50, 'train_loss': 1.5, 'val_loss': 4.9}], baseline_loss=baseline)
     assert overfit_analysis['status'] == 'overfitting', overfit_analysis
     assert overfit_analysis['best_val_step'] == 30

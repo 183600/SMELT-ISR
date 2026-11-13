@@ -589,7 +589,7 @@ def _regularized_incomplete_gamma_parts(
         return 0.0, 1.0
     if a >= _GAMMA_TEMME_MIN_A:
         return _gamma_parts_temme(a, x)
-    log_prefactor = -x + a * math.log(x) - math.lgamma(a)
+    log_prefactor = -x + a * math.log(x + 1e-8) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
         total = term
@@ -826,13 +826,13 @@ def _binomial_lower_tail_probability(
         return 1.0
     if probability >= 1.0:
         return 0.0 if failures < trials else 1.0
-    log_p = math.log(probability)
+    log_p = math.log(probability + 1e-8)
     log_q = math.log1p(-probability)
     log_term = trials * log_q
     total = math.exp(log_term) if log_term > -745.0 else 0.0
     for successes in range(1, failures + 1):
         log_term += (
-            math.log((trials - successes + 1) / successes)
+            math.log((trials - successes + 1 + 1e-8) / successes)
             + log_p
             - log_q
         )
