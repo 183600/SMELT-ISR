@@ -507,7 +507,6 @@ def run_sanity_overfit(
                 else:
                     if loss_connected:
                         loss.backward()
-                        # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
 
                         if step == 1:
                             grad_probe = _probe_gradient_flow(

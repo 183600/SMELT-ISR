@@ -279,7 +279,6 @@ def _selfcheck_top_52048_0009():
     ckpt_model.train()
     ckpt_loss = ckpt_model(x, y)['loss']
     ckpt_loss.backward()
-    # WARNING: No optimizer.zero_grad() found near loss.backward() - gradients will accumulate
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
     causal_model = LanguageModel(Config(**common, mode='B')).eval()
     x_changed = x.clone()

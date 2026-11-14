@@ -295,22 +295,31 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-# Reproducibility: Set random seeds
+# NOTE: Module-level seed setting removed to prevent silent RNG state
+# reset on import. When this module was imported (e.g. by tests),
+# random.seed(42) / np.random.seed(42) / torch.manual_seed(42) would
+# silently reset the global RNG of every other module that had already
+# set its own seeds, causing non-reproducible test ordering and
+# masking data-leakage bugs. Seeds are now set inside main() only.
 import random
 import numpy as np
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-try:
-    import torch
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-except ImportError:
-    pass
 
 
 def main(archive_root: str) -> int:
+    # Set seeds inside main() so they are only applied when this script
+    # is actually executed, not when the module is imported by tests
+    # or other code.
+    random.seed(SEED)
+    np.random.seed(SEED)
+    try:
+        import torch
+        torch.manual_seed(SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(SEED)
+    except ImportError:
+        pass
+
     root = Path(archive_root)
     runs_dir = root / "runs"
     if not runs_dir.is_dir():
