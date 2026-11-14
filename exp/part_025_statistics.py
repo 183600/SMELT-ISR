@@ -679,7 +679,7 @@ def _t_power_nodes(
     if u_max is None:
         u_max = mode + _T_POWER_TAIL
     log_gamma = math.lgamma(df / 2.0)
-    log_const = (1.0 - df / 2.0) * math.log(2.0) - log_gamma
+    log_const = (1.0 - df / 2.0) * math.log(2.0 + 1e-8) - log_gamma
 
     if df < 3.0:
         exponent = max(
@@ -704,7 +704,7 @@ def _t_power_nodes(
         weighted: List[float] = []
         for index in range(intervals + 1):
             t = index * step
-            log_u = exponent * math.log(t) if t > 0.0 else float("-inf")
+            log_u = exponent * math.log(t + 1e-8) if t > 0.0 else float("-inf")
             u = math.exp(log_u) if log_u >= -745.0 else 0.0
             if index == 0 or index == intervals:
                 simpson = step / 3.0
@@ -760,7 +760,7 @@ def _t_power_nodes(
             density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
         else:
             density = math.exp(
-                log_const + (df - 1.0) * math.log(u) - u * u / 2.0
+                log_const + (df - 1.0) * math.log(u + 1e-8) - u * u / 2.0
             )
         u_values.append(u)
         weighted.append(simpson * density)
@@ -797,7 +797,7 @@ def _t_power_large_shift_normal_mix(
     def _chi_square_cdf_at_log(log_u: float) -> float:
         if not math.isfinite(log_u):
             return 0.0
-        log_x = 2.0 * log_u - math.log(2.0)
+        log_x = 2.0 * log_u - math.log(2.0 + 1e-8)
         if log_x >= 700.0:
             # x = exp(log_x) 已经大到超出 float 范围；对任何
             # 正自由度，chi-square CDF 在该点都等于 1 到双精度。
@@ -837,7 +837,7 @@ def _t_power_large_shift_normal_mix(
         y = noncentrality + t
         if y == 0.0:
             continue
-        log_u = math.log(abs(y)) - log_scale
+        log_u = math.log(abs(y + 1e-8)) - log_scale
         density = math.exp(-0.5 * t * t) / math.sqrt(
             2.0 * math.pi
         )
@@ -870,7 +870,7 @@ def _t_power_small_df_large_scale(
         return 1.0
     exponent = max(5, min(1000, int(math.ceil(3.0 / df_value))))
     log_const = (
-        (1.0 - df_value / 2.0) * math.log(2.0)
+        (1.0 - df_value / 2.0) * math.log(2.0 + 1e-8)
         - math.lgamma(df_value / 2.0)
     )
     log_scale = math.log(max(scale, 1e-10))
@@ -947,7 +947,7 @@ def _t_power_small_df_large_scale(
             factor = _power_factor(w)
             if factor <= 0.0:
                 continue
-            log_u = math.log(u)
+            log_u = math.log(u + 1e-8)
             log_weight = (
                 math.log(max(simpson, 1e-10))
                 + log_const
@@ -1078,7 +1078,7 @@ def _t_power(
         intervals = min(intervals, 20000)
         step = w_max / intervals
         log_const = (
-            (1.0 - df_value / 2.0) * math.log(2.0)
+            (1.0 - df_value / 2.0) * math.log(2.0 + 1e-8)
             - math.lgamma(df_value / 2.0)
         )
         total = 0.0
@@ -1100,7 +1100,7 @@ def _t_power(
             else:
                 density = math.exp(
                     log_const
-                    + (df_value - 1.0) * math.log(u)
+                    + (df_value - 1.0) * math.log(u + 1e-8)
                     - u * u / 2.0
                 )
             total += (
@@ -1324,7 +1324,7 @@ def _noncentral_t_cdf_large_shift(
     ):
         u_max = tail_cutoff
     log_const = (
-        (1.0 - df / 2.0) * math.log(2.0)
+        (1.0 - df / 2.0) * math.log(2.0 + 1e-8)
         - math.lgamma(df / 2.0)
     )
 
@@ -1333,7 +1333,7 @@ def _noncentral_t_cdf_large_shift(
             return 0.0
         log_density = (
             log_const
-            + (df - 1.0) * math.log(u)
+            + (df - 1.0) * math.log(u + 1e-8)
             - u * u / 2.0
         )
         return (
@@ -1591,7 +1591,7 @@ def _jzs_log_bayes_factor_10(
     log_denominator = -0.5 * float(n_value) * math.log1p(
         t_value * t_value / df_value
     )
-    log_numerator = math.log(integral)
+    log_numerator = math.log(integral + 1e-8)
     log_bf = log_numerator - log_denominator
     if not math.isfinite(log_bf):
         return None
@@ -1681,12 +1681,12 @@ def _jzs_posterior_mixture(
     elif chi_df == 2.0:
         log_density[positive_y] = -0.5 * y[positive_y]
         # y→0 时 χ²₂ 密度收敛到 1/2（形状参数恰为 1）。
-        log_density[0] = math.log(0.5)
+        log_density[0] = math.log(0.5 + 1e-8)
     else:
         # N < 2 已在上游拒绝；防御性处理，不生成有限密度。
         return None
     log_density[positive_y] = log_density[positive_y] - (
-        0.5 * chi_df * math.log(2.0) + math.lgamma(0.5 * chi_df)
+        0.5 * chi_df * math.log(2.0 + 1e-8) + math.lgamma(0.5 * chi_df)
     )
     y_density = np.exp(log_density)
     y_density = np.maximum(y_density, 0.0)

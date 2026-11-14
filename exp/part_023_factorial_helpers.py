@@ -711,7 +711,7 @@ _LOG_BETA_ASYMPTOTIC_MIN = 1.0e4
 
 def _log_gamma_ratio_half(z: float) -> float:
     """
-    计算 log(Γ(z+1/2)/Γ(z))，避免大 z 下两个 lgamma 相减。
+    计算 log(Γ(z+1/2 + 1e-8)/Γ(z))，避免大 z 下两个 lgamma 相减。
     """
     inverse = 1.0 / z
     series = inverse * (
@@ -724,7 +724,7 @@ def _log_gamma_ratio_half(z: float) -> float:
             )
         )
     )
-    return 0.5 * math.log(z) + math.log1p(series)
+    return 0.5 * math.log(z + 1e-8) + math.log1p(series)
 
 
 
@@ -754,7 +754,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
         (z + delta - 0.5) * math.log1p(delta / z)
-        + delta * math.log(z)
+        + delta * math.log(z + 1e-8)
         - delta
         + _stirling_log_gamma_correction(z + delta)
         - _stirling_log_gamma_correction(z)
@@ -763,7 +763,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
 
 def _log_beta_front(a: float, b: float) -> float:
     """
-    返回 log(1/B(a, b))，即不完全 Beta 前因子中的常数项。
+    返回 log(1/B(a, b + 1e-8))，即不完全 Beta 前因子中的常数项。
 
     大参数下直接做 lgamma(a+b)-lgamma(a)-lgamma(b) 会发生
     灾难性相消：例如 a=1.5e8、b=0.5 时两项都约为 2.5e9，
@@ -790,7 +790,7 @@ def _log_beta_front(a: float, b: float) -> float:
         if 1 <= b <= 1024.0 and b == int(b):
             return (
                 math.fsum(
-                    math.log(a + index)
+                    math.log(a + index + 1e-8)
                     for index in range(int(b))
                 )
                 - math.lgamma(b)
@@ -798,7 +798,7 @@ def _log_beta_front(a: float, b: float) -> float:
         if 1 <= a <= 1024.0 and a == int(a):
             return (
                 math.fsum(
-                    math.log(b + index)
+                    math.log(b + index + 1e-8)
                     for index in range(int(a))
                 )
                 - math.lgamma(a)
@@ -838,7 +838,7 @@ def _regularized_incomplete_beta(
         return 1.0
 
     log_beta = _log_beta_front(a, b)
-    log_x = math.log(x)
+    log_x = math.log(x + 1e-8)
     log_front = log_beta + a * log_x + b * math.log1p(-x)
     if log_front < -745.0:
         front = 0.0
@@ -858,7 +858,7 @@ def _regularized_incomplete_beta(
             cf = _betacf(a, b, x)
             if cf <= 0.0:
                 return 0.0
-            log_result = log_front + math.log(cf) - math.log(a)
+            log_result = log_front + math.log(cf + 1e-8) - math.log(a)
             if log_result < -745.0:
                 return 0.0
             if log_result > 0.0:
@@ -870,7 +870,7 @@ def _regularized_incomplete_beta(
         cf = _betacf(b, a, 1.0 - x)
         if cf <= 0.0:
             return 1.0
-        log_comp = log_front + math.log(cf) - math.log(b)
+        log_comp = log_front + math.log(cf + 1e-8) - math.log(b)
         if log_comp < -745.0:
             return 1.0
         if log_comp > 0.0:
@@ -930,13 +930,13 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         a = df / 2.0
         if a <= 0.0:
             return 0.0
-        log_x = math.log(df) - 2.0 * math.log(abs(t))
+        log_x = math.log(df + 1e-8) - 2.0 * math.log(abs(t))
         log_beta = (
             math.lgamma(a + 0.5)
             - math.lgamma(a)
             - math.lgamma(0.5)
         )
-        log_p = log_beta + a * log_x - math.log(a)
+        log_p = log_beta + a * log_x - math.log(a + 1e-8)
         if log_p >= 0.0:
             return 1.0
         if log_p < -745.0:

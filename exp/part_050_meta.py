@@ -56,7 +56,7 @@ def _meta_gamma_upper_regularized(
                 break
             index += 1
         p_value = total * math.exp(
-            -value + shape * math.log(value) - _meta_lgamma(shape)
+            -value + shape * math.log(value + 1e-8) - _meta_lgamma(shape)
         )
         return max(0.0, min(1.0, 1.0 - p_value))
     # 连分式计算 Q。
@@ -80,7 +80,7 @@ def _meta_gamma_upper_regularized(
         if abs(delta - 1.0) < 1e-15:
             break
     q_value = math.exp(
-        -value + shape * math.log(value) - _meta_lgamma(shape)
+        -value + shape * math.log(value + 1e-8) - _meta_lgamma(shape)
     ) * h_value
     return max(0.0, min(1.0, q_value))
 
@@ -99,7 +99,7 @@ def _meta_betai(
         a_value
     ) - _meta_lgamma(b_value)
     front = math.exp(
-        ln_beta + a_value * math.log(x_value) + b_value * math.log1p(-x_value)
+        ln_beta + a_value * math.log(x_value + 1e-8) + b_value * math.log1p(-x_value)
     )
     if x_value < (a_value + 1.0) / (a_value + b_value + 2.0):
         return front * _meta_beta_continued(

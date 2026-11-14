@@ -238,7 +238,7 @@ def analyze_training_curve(
         warnings.append(
             f"训练/验证损失出现 {len(nonfinite_steps)} 次非有限"
             "（NaN/Inf）记录；按排查路径逐项检查：数据是否含 "
-            "NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合"
+            "NaN/Inf → log(0 + 1e-8)/除零/softmax 溢出 → fp16 混合"
             "精度溢出 → 梯度爆炸/学习率过大（见 "
             "diagnose_non_finite 输出的 nan_diagnosis 记录）。"
         )

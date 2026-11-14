@@ -5,7 +5,7 @@ from _core_DesignPreparationTests_base import _DesignPreparationTestsBase
 class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
     def test_chi_square_quantile_handles_small_probability(self):
         # df=2 时 CDF=1-exp(-x/2)，下侧分位数有
-        # 解析解 -2*log(1-p)。极端置信水平（如
+        # 解析解 -2*log(1-p + 1e-8)。极端置信水平（如
         # confidence=1-1e-15）会产生远小于 1e-12 的分位数，
         # 二分不能再用绝对容差提前停止；固定 200 步还会把
         # p=1e-100 的分位数卡在 2^-200 附近（约 1e-61），
@@ -27,7 +27,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
             )
     def test_chi_square_quantile_handles_upper_tail(self):
         # df=2 时上侧概率 Q=exp(-x/2)，因此分位数解析解为
-        # -2*log(1-p)。若通过 1-P 计算 Q，p 接近 1 时会把
+        # -2*log(1-p + 1e-8)。若通过 1-P 计算 Q，p 接近 1 时会把
         # Q 的绝对舍入误差放大成分位数误差。
         for probability in (
             0.6,

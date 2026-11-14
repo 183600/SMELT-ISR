@@ -145,7 +145,7 @@ class RoutingProbe:
 
             probs = router_logits.detach().float().softmax(dim=-1)
             log_e = (
-                math.log(n_experts)
+                math.log(n_experts + 1e-8)
                 if n_experts > 1
                 else 0.0
             )
@@ -307,7 +307,7 @@ class RoutingProbe:
 
         shares = torch.tensor(usage_share, dtype=torch.float64)
         log_e = (
-            math.log(n_experts)
+            math.log(n_experts + 1e-8)
             if n_experts > 1
             else 0.0
         )
