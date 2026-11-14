@@ -274,6 +274,14 @@ def preregistration_record(
         # 核对试点外推的墙钟估计，归档时能核对「当时的算力
         # 上限声明」与「设计计划的估计」是否一致。
         "compute_budget": payload.get("compute_budget"),
+        # 停止规则与排除标准随记录落盘：归档/审计时能核对
+        # 「运行数是否在预注册上限内」「事后排除是否只用了
+        # 预声明的规则」，而不是只能凭报告自述。
+        "stopping_rules": payload.get("stopping_rules"),
+        "exclusion_criteria": payload.get("exclusion_criteria"),
+        "min_effect_justification": payload.get(
+            "min_effect_justification"
+        ),
         "data": payload.get("data"),
         "applied_fields": list(applied_fields),
         "run_mode": getattr(args, "mode", None),

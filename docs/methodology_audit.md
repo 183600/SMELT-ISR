@@ -1961,3 +1961,151 @@ commit、源码树、数据、种子集合、指标、基线与等价界，但�
    `--audit-data`、`--audit-preregistration`），确认 config /
    environment / metrics / test 封条 / 预注册确实属于同一次
    运行；退出码非零的运行不能作为最终可复现证据。
+
+## 48. 实验设计：试点规模必须在跑试点之前规划（本轮补充）
+
+**判定：`--design-pilot-runs` 的试点校准只有在试点本身足够大时
+才可信，但框架此前只能在试点跑完后报告「试点运行少于 6 个」
+的告警，不能在冻结设计前回答「要按 `upper_confidence_bound`
+口径校准 sd/脱落率，试点每对处理单元至少需要多少个共同种子」。
+3~6 个配对种子的 sd 单侧置信上界是点估计的 2~4 倍（n=2 时约
+16 倍、n=6 时约 2.1 倍，95% 置信），按上界校准会把所需种子数
+推高到设计无法承受；脱落率的 Clopper-Pearson 上界同样由试点
+规模决定。研究者在冻结设计时对「试点要跑多大」没有任何工具
+支持，等于把试点规模留给了直觉。**
+
+**已修正：**
+
+- 新增 `plan_pilot_size()`（`exp/part_044_pilot_power.py`），
+  在训练前、用预注册声明的先验值回答试点规模：
+  - sd 判据（`pilot_size_plan.sd_planning`）：n 个共同配对种子
+    下，正态配对差值 sd 的单侧置信上界乘数
+    `sqrt(df / chi2_{1-c, df})` 不得超过容差
+    `sd_ucb_tolerance`（默认 1.5）；每个候选 n 同时按上界口径
+    完整重算 `required_seeds_with_attrition`，直接回答「该规模
+    试点的 UCB 会不会把设计推到种子不够」。
+  - 脱落率判据（`pilot_size_plan.attrition_planning`）：每单元
+    n 个运行、失败数按声明脱落率保守上取整时，Clopper-Pearson
+    精确上界折算后的启动种子数不得超过计划启动种子数；计划
+    没有预留脱落余量时判据不可满足，如实报告而不是放宽公式。
+  - `pilot_calibration=point` 时两类上界都不参与设计判定，
+    判据标记为信息性并告警「小试点点估计不稳定的风险由表
+    披露」。
+  - 输出 `recommended_pilot_runs_per_cell`（不低于可评估单元对
+    的最小共同种子数 3）与 `recommended_total_pilot_runs`，并
+    提示各单元应共享同一批种子，否则单元对的共同配对数会
+    少于每单元运行数。
+- `--plan-design` / 正式套件在**没有** `--design-pilot-runs` 且
+  预注册声明了 `power` 块时，把 `pilot_size_plan` 写入
+  `design_plan.json`（随 `plan_id` 冻结）并打印
+  `[design][pilot-size]` 摘要；已有试点证据时不重复规划
+  （不确定性已由 `pilot_evidence` 的实测 UCB 敏感性表披露）。
+  没有声明 `expected_seed_sd_relative` 时不生成该块——没有
+  可对照的先验值，任何规模建议都只是编造精度。
+
+**仍有限制：**
+
+- 建议值基于声明先验与卡方/Clopper-Pearson 上界公式，不是
+  对真实 sd/脱落率的保证；试点跑完后仍由
+  `--design-pilot-runs` 按单向上调规则校准，失败运行必须
+  一并传入。
+- sd 判据的默认容差 1.5 意味着「若真实 sd 位于试点 UCB，所需
+  种子数约按 (1.5)² ≈ 2.25 倍准备」；该容差是设计选择，不是
+  统计惯例，研究者应结合计划余量选择并在报告中说明。
+- 试点规模规划不解决试点与正式协议可比性问题（同代码/数据/
+  训练/评估口径仍由 `comparability` 报告核对），也不校准
+  真实效应大小。
+
+## 49. 实验设计：预注册必须包含停止规则（本轮补充）
+
+**判定：固定样本设计必须预先声明「最多跑多少次运行、允许在
+哪些步数做中期汇总」，否则「先跑 3 个种子、不显著就再加 3 个」
+的序贯偷看无法与「设计如此」区分，家族错误率在多次中期检验
+下失控。`docs/design_preparation.md` 第 5 节已要求「增加种子/
+重跑必须作为新研究阶段重新预注册」，但这只是文档约定：预注册
+schema 没有可核对的运行上限字段，设计计划与启动门也无法拒绝
+超限扩展。`ANALYSIS_IMPROVEMENTS.md` 第 3.2 节提出的
+`stopping_rules` 字段此前未实现。**
+
+**已修正：**
+
+- 预注册 schema 新增可选字段 `stopping_rules`：
+  - `max_total_runs`（必填正整数）：本项研究最多运行的次数
+    （含全部臂/种子/消融展开）。schema 校验拒绝
+    `max_total_runs < len(seeds)` 的自相矛盾声明；设计计划在
+    冻结时核对计划运行数，超限直接拒绝（错误信息明确「增加
+    种子/臂必须作为新研究阶段重新冻结并预注册」）。
+  - `interim_look_steps`（可选，无重复正整数列表）：允许做
+    中期汇总的训练步数；声明步数超过 `steps` 时被拒绝
+    （预算内取不到的观察点没有意义）。未声明的步数上做
+    中期结论属于序贯偷看。
+  - `extension_requires_new_preregistration`（可选布尔，默认
+    true）：超出预注册计划的扩展是否必须重新预注册。
+- 记录与归档：字段随每个运行的 `config.json`
+  （`preregistration.stopping_rules`）与 `design_plan.json`
+  （`stopping_rules` 回显，含 `within_max_total_runs`）落盘，
+  被 `plan_id` 与预注册文件 SHA-256 覆盖；`print_design_summary`
+  打印 `[design][stopping]` 运行上限行。
+- `preregistration.example.json` 给出 `max_total_runs=24`（覆盖
+  4 臂 × 6 种子的计划）与声明中期观察点的示例。
+
+**仍有限制：**
+
+- `interim_look_steps` 目前只声明「允许在哪里看」，不自动做
+  序贯 alpha 分配（Pocock/O'Brien-Fleming 校正）——在中期
+  观察点报告结论时必须按未校正口径声明「这是中期观察，
+  不是最终检验」，或使用预注册的调整后阈值；正式的群序贯
+  检验仍是未实现能力。
+- `max_total_runs` 只约束「计划运行数」，不约束 `--resume`
+  续跑或重跑同一目录（后者由 out 目录覆盖保护与账本机制
+  约束）；跨目录新增种子属于新研究阶段，必须重新预注册。
+- 该字段是可选的：不声明 `stopping_rules` 的旧协议不受影响，
+  但也无法用启动门拒绝事后扩展；文档建议所有确证研究声明。
+
+## 50. 实验设计：排除标准与最小效应论证必须预先声明（本轮补充）
+
+**判定：数值失败的自动检测只覆盖 NaN/Inf/数值停止；「哪些
+运行/观测因其它原因被排除出分析」（如训练曲线缺失某窗口、
+数据加载异常但未触发数值停止、评估子集损坏）此前没有预注册
+字段，事后排除是选择性报告的主要入口。同样，`min_effect`
+决定「多小的差异算没有实际意义」，是预注册里最容易事后反向
+拟合的声明——预注册只要求它是 (0, 1] 内的正数，不要求任何
+依据说明。`ANALYSIS_IMPROVEMENTS.md` 第 3.2 节提出的
+`exclusion_criteria` 与 `sample_size_justification` 此前未实现。**
+
+**已修正：**
+
+- 预注册 schema 新增可选字段 `exclusion_criteria`：
+  - `attrition_definition`（必填非空字符串）：除自动数值失败
+    检测外，按什么口径把运行排除出分析；
+  - `exclusion_rules`（可选非空字符串列表）：逐条预声明排除
+    规则；不在此列表中的事后排除都是协议违反；
+  - `note`（可选字符串）。
+- 预注册 schema 新增可选字段 `min_effect_justification`
+  （非空字符串）：说明最小有意义效应的依据（领域效应量、
+  先前研究、成本-收益权衡等）。不强制（旧协议不受影响），
+  但声明时必须是实质性内容，空白占位会被拒绝——留空等于
+  没有「要不要写依据」的决定权。
+- 两个字段随每个运行的 `config.json`
+  （`preregistration.exclusion_criteria` /
+  `preregistration.min_effect_justification`）落盘，归档时能
+  核对「事后排除是否只用了预声明规则」，而不是只能凭报告
+  自述；`preregistration.example.json` 给出完整示例。
+- `schemas/preregistration.v1.json` 与 Python 入口
+  `preregistration_schema_error` 的字段定义交叉一致；
+  `tests/_core_DesignPreparationTests_02.py` 增加接受/拒绝/
+  记录回显/schema 同步回归测试。
+
+**仍有限制：**
+
+- 两个新字段是声明与留证机制：框架不自动执行
+  `exclusion_rules`（哪些运行被排除仍由分析入口的失败检测与
+  研究者决定），也不验证 `min_effect_justification` 的论证
+  质量——外部审计仍需人工阅读依据是否实质性。
+- `exclusion_criteria` 不改变 `failure_rates` /
+  `attrition_bounds` 的既有口径：数值失败仍按 `metrics.jsonl`
+  的自动检测识别；预声明的其它排除规则若要生效，需在分析
+  阶段显式实现并在报告中披露与预注册的一致性。
+- 与 `power.justification`（功效不足时的理由）一样，这些字段
+  写进预注册后只能随新研究阶段修改；不能在同一份预注册里
+  补写。

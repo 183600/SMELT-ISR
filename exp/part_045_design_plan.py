@@ -396,6 +396,40 @@ def write_design_plan(
     power = _json_safe(power)
     if pilot_evidence is not None:
         pilot_evidence = _json_safe(pilot_evidence)
+    # 试点规模规划：还没跑试点时（没有 --design-pilot-runs），
+    # 用预注册声明的先验值回答「试点每单元需要多少运行」，
+    # 避免跑完一个 3~6 个运行的小试点才发现其置信上界根本
+    # 支撑不了 upper_confidence_bound 校准口径。已有试点证据
+    # 时不重复规划：不确定性已由 pilot_evidence 的实测 UCB
+    # 敏感性表披露。
+    pilot_size_plan: Optional[Dict[str, object]] = None
+    if power is not None and pilot_evidence is None:
+        try:
+            pilot_size_plan = plan_pilot_size(
+                power,
+                power.get("min_effect_relative"),
+                power.get("planned_seeds"),
+                int(planned_comparisons),
+                contrast_types=list(planned_contrasts),
+                equivalence_margin=power.get(
+                    "equivalence_margin_relative"
+                ),
+                n_cells=len(
+                    {
+                        _plan_treatment_key(item)
+                        for item in plan
+                    }
+                ),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            # 规划失败不能让整个设计计划不可用；如实记录原因。
+            pilot_size_plan = {
+                "schema": "smelt-isr/pilot-size-plan/v1",
+                "available": False,
+                "error": str(error),
+            }
+        if pilot_size_plan is not None:
+            pilot_size_plan = _json_safe(pilot_size_plan)
     seeds = [
         int(seed)
         for seed in (getattr(args, "seeds", None) or [])
@@ -489,6 +523,46 @@ def write_design_plan(
 
     order_balance = run_order_balance_report(plan)
     failure_policy = _resolve_sweep_failure_policy(args, kind)
+    # 预注册的停止规则（stopping_rules.max_total_runs）：把
+    # 「这项研究最多跑多少次运行」从口头约定变成训练前冻结、
+    # 开跑前核对的硬门。计划运行数超过声明上限时直接拒绝
+    # 冻结设计——想加种子必须重新预注册，而不是在同一份
+    # 预注册下反复扩展直到显著。
+    stopping_rules_echo: Optional[Dict[str, object]] = None
+    prereg_stopping = (
+        prereg.get("stopping_rules")
+        if isinstance(prereg, dict)
+        else None
+    )
+    if isinstance(prereg_stopping, dict) and (
+        "max_total_runs" in prereg_stopping
+    ):
+        raw_max_runs = prereg_stopping["max_total_runs"]
+        max_runs_valid = (
+            isinstance(raw_max_runs, int)
+            and not isinstance(raw_max_runs, bool)
+        )
+        if max_runs_valid:
+            max_total_runs = int(raw_max_runs)
+            if len(runs) > max_total_runs:
+                raise ValueError(
+                    "预注册 stopping_rules.max_total_runs="
+                    f"{max_total_runs} 小于计划运行数 {len(runs)}："
+                    "该设计超出预注册声明的运行上限。增加种子/"
+                    "臂必须作为新研究阶段重新冻结并预注册，"
+                    "不能在同一份预注册下扩展计划"
+                )
+            stopping_rules_echo = {
+                "max_total_runs": max_total_runs,
+                "planned_runs": len(runs),
+                "within_max_total_runs": True,
+                "extension_requires_new_preregistration": bool(
+                    prereg_stopping.get(
+                        "extension_requires_new_preregistration",
+                        True,
+                    )
+                ),
+            }
     core: Dict[str, object] = {
         "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
         "kind": kind,
@@ -507,11 +581,17 @@ def write_design_plan(
         "seed_plan": seed_plan,
         "training_budget": budget,
     }
+    if stopping_rules_echo is not None:
+        core["stopping_rules"] = stopping_rules_echo
     if pilot_evidence is not None:
         # 只有实际提供试点运行时才写入该键：旧计划的 plan_id
         # 不含此字段，不能在重新生成时因「多了一个 null」而
         # 被误判成另一份设计、拒绝覆盖。
         core["pilot_evidence"] = pilot_evidence
+    if pilot_size_plan is not None:
+        # 同上：只有 power 块存在（声明了先验 sd）时才写入
+        # 试点规模规划，避免旧计划重新生成时指纹漂移。
+        core["pilot_size_plan"] = pilot_size_plan
     plan_id = _design_plan_id(core)
     payload = dict(core)
     payload["plan_id"] = plan_id
@@ -570,6 +650,8 @@ def write_design_plan(
         "planned_contrasts": list(planned_contrasts),
         "power": power,
         "pilot_evidence": pilot_evidence,
+        "pilot_size_plan": pilot_size_plan,
+        "stopping_rules": stopping_rules_echo,
         "seed_plan": seed_plan,
         "training_budget": budget,
     }

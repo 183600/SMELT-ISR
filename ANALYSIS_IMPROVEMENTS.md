@@ -78,6 +78,15 @@
   - 必填：`primary_metric`、`direction`、`min_effect`、`equivalence_margin`、`baseline_mode`、`analysis_plan_hash`
   - 可选：`sample_size_justification`、`stopping_rules`、`exclusion_criteria`
 - **工具**：`validate_preregistration(config.json)` 在训练前/分析期双向校验，**违规直接阻断** `--compare`。
+- **实施状态（2026-11-14）**：schema 与训练前校验已实现；
+  `stopping_rules`（`max_total_runs` 硬门 + 中期观察点声明）、
+  `exclusion_criteria`（预声明排除规则）与
+  `min_effect_justification`（最小效应依据，对应本节
+  `sample_size_justification` 意图）已作为可选字段落地，
+  见 `docs/methodology_audit.md` 第 49/50 节。
+  `analysis_plan_hash` 仍以 `frozen_source_tree_sha256` +
+  `--compare-preregistration` 覆盖门承担同等职责，独立字段
+  未实现。
 
 ### 3.3 盲分析支持
 - **动机**：防止分析期隐性偏好（如调整等价界、挑选指标）。

@@ -565,6 +565,160 @@ def preregistration_schema_error(
                 "不含评估与排队）"
             )
 
+    # 停止规则：固定样本设计在训练前声明「最多跑多少次运行」。
+    # 没有预先声明的上限，按结果逐步加种子的序贯偷看无法与
+    # 「设计如此」区分；设计计划与启动门按该上限拒绝扩展。
+    stopping_rules = payload.get(
+        "stopping_rules", _PREREGISTRATION_MISSING
+    )
+    if stopping_rules is not _PREREGISTRATION_MISSING:
+        if not isinstance(stopping_rules, dict):
+            return "stopping_rules 必须是对象"
+        unknown_stopping = sorted(
+            set(stopping_rules) - set(_STOPPING_RULES_KEYS)
+        )
+        if unknown_stopping:
+            return (
+                "stopping_rules 含未知字段: "
+                + ", ".join(unknown_stopping)
+            )
+        if "max_total_runs" not in stopping_rules:
+            return (
+                "stopping_rules 缺少必需字段: max_total_runs"
+            )
+        max_total_runs = stopping_rules["max_total_runs"]
+        if (
+            isinstance(max_total_runs, bool)
+            or not isinstance(max_total_runs, int)
+            or max_total_runs < 1
+        ):
+            return (
+                "stopping_rules.max_total_runs 必须是正整数"
+                "（本项研究最多运行的次数；设计计划与启动门"
+                "按它拒绝超限扩展）"
+            )
+        if int(max_total_runs) < len(normalized_seeds):
+            return (
+                "stopping_rules.max_total_runs 小于 seeds 数量："
+                "计划本身已超过声明的运行上限，预注册自相矛盾"
+            )
+        interim_look_steps = stopping_rules.get(
+            "interim_look_steps"
+        )
+        if interim_look_steps is not None:
+            if not isinstance(interim_look_steps, list) or any(
+                isinstance(step, bool)
+                or not isinstance(step, int)
+                or step < 1
+                for step in interim_look_steps
+            ):
+                return (
+                    "stopping_rules.interim_look_steps 必须是"
+                    "正整数列表（允许做中期汇总的训练步数）"
+                )
+            if len(set(interim_look_steps)) != len(
+                interim_look_steps
+            ):
+                return (
+                    "stopping_rules.interim_look_steps 存在"
+                    "重复步数"
+                )
+            declared_steps = payload.get(
+                "steps", _PREREGISTRATION_MISSING
+            )
+            if (
+                declared_steps is not _PREREGISTRATION_MISSING
+                and any(
+                    int(step) > int(declared_steps)  # type: ignore[arg-type]
+                    for step in interim_look_steps
+                )
+            ):
+                return (
+                    "stopping_rules.interim_look_steps 含有"
+                    "超过 steps 的步数：预算内取不到的中期"
+                    "观察点没有意义"
+                )
+        extension_flag = stopping_rules.get(
+            "extension_requires_new_preregistration"
+        )
+        if extension_flag is not None and not isinstance(
+            extension_flag, bool
+        ):
+            return (
+                "stopping_rules."
+                "extension_requires_new_preregistration "
+                "必须是布尔值"
+            )
+
+    # 排除标准：数值失败的自动检测只覆盖 NaN/Inf/数值停止；
+    # 其它排除规则必须在训练前写死，事后排除才能与「设计
+    # 如此」区分。没有该块时不强制——已有运行的旧协议不受
+    # 影响；一旦声明，字段内容随 config.json 落盘并参与归档。
+    exclusion_criteria = payload.get(
+        "exclusion_criteria", _PREREGISTRATION_MISSING
+    )
+    if exclusion_criteria is not _PREREGISTRATION_MISSING:
+        if not isinstance(exclusion_criteria, dict):
+            return "exclusion_criteria 必须是对象"
+        unknown_exclusion = sorted(
+            set(exclusion_criteria)
+            - set(_EXCLUSION_CRITERIA_KEYS)
+        )
+        if unknown_exclusion:
+            return (
+                "exclusion_criteria 含未知字段: "
+                + ", ".join(unknown_exclusion)
+            )
+        attrition_definition = exclusion_criteria.get(
+            "attrition_definition"
+        )
+        if (
+            not isinstance(attrition_definition, str)
+            or not attrition_definition.strip()
+        ):
+            return (
+                "exclusion_criteria.attrition_definition 必须是"
+                "非空字符串（声明什么算不可用运行：除自动数值"
+                "失败检测外，按什么口径把运行排除出分析）"
+            )
+        exclusion_rules = exclusion_criteria.get(
+            "exclusion_rules"
+        )
+        if exclusion_rules is not None:
+            if not isinstance(exclusion_rules, list) or any(
+                not isinstance(rule, str)
+                or not rule.strip()
+                for rule in exclusion_rules
+            ):
+                return (
+                    "exclusion_criteria.exclusion_rules 必须是"
+                    "非空字符串列表（逐条预声明排除规则；"
+                    "不在此列表中的排除都是协议违反）"
+                )
+        exclusion_note = exclusion_criteria.get("note")
+        if exclusion_note is not None and not isinstance(
+            exclusion_note, str
+        ):
+            return "exclusion_criteria.note 必须是字符串"
+
+    # 最小有意义效应的论证：min_effect 决定「多小的差异算
+    # 没有实际意义」，是预注册里最容易事后反向拟合的声明。
+    # 不强制（旧协议不受影响），但声明时必须是实质性内容，
+    # 不能用空白占位绕过「要不要写依据」的决定。
+    if "min_effect_justification" in payload:
+        min_effect_justification = payload[
+            "min_effect_justification"
+        ]
+        if (
+            not isinstance(min_effect_justification, str)
+            or not min_effect_justification.strip()
+        ):
+            return (
+                "min_effect_justification 必须是非空字符串"
+                "（说明最小有意义效应的依据：领域效应量、"
+                "先前研究、成本-收益权衡等；留空等于没有依据）"
+            )
+
     frozen_script = payload.get(
         "frozen_script_sha256", _PREREGISTRATION_MISSING
     )

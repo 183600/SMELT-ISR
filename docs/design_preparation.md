@@ -296,6 +296,57 @@ python experiment.py \
   你原来的声明可能过于保守；是否调小应由研究者在新一轮
   预注册中显式决定，工具不会自动放宽。
 
+### 2.4 先算试点要多大，再跑试点
+
+试点校准的可靠性由试点规模决定：95% 置信下，n=2 个共同配对
+种子的 sd 单侧置信上界是点估计的约 16 倍，n=6 时仍有约 2.1 倍，
+n≈34 才能降到 1.25 倍以内。若预注册把
+`power.pilot_calibration` 设为 `upper_confidence_bound`，一个
+3~6 个运行的试点几乎必然把设计功效输入推高到无法承受；脱落率
+的 Clopper-Pearson 上界同理。在跑试点之前就应该知道它需要
+多大，而不是跑完一个小试点才发现它的置信上界毫无约束力。
+
+`--plan-design` 在**没有**提供 `--design-pilot-runs` 且预注册
+声明了 `power` 块时，会把 `pilot_size_plan` 写进
+`design_plan.json` 并打印 `[design][pilot-size]` 摘要：
+
+```bash
+python experiment.py \
+  --data corpus.txt --out runs/confirm-design \
+  --preregistration preregistration.json \
+  --seeds 42 43 44 45 46 47 48 \
+  --suite-modes smelt local_base local_base_k2 A B B_early \
+  --plan-design
+```
+
+两个判据：
+
+| 判据 | 问题 | 判定 |
+|---|---|---|
+| `sd_planning` | n 个共同配对种子下，sd 置信上界乘数 `sqrt(df / chi2_{1-c, df})` 是否 ≤ 容差（默认 1.5） | 每个候选 n 同时按上界口径完整重算所需启动种子数，直接回答「该规模试点的 UCB 会不会把设计推到种子不够」 |
+| `attrition_planning` | 每单元 n 个运行、失败数按声明脱落率保守上取整时，Clopper-Pearson 上界折算的启动种子数是否仍在计划内 | 计划没有预留脱落余量时判据不可满足，如实报告而不是放宽公式 |
+
+输出 `recommended_pilot_runs_per_cell`（不低于可评估单元对的
+最小共同种子数 3）与 `recommended_total_pilot_runs`（每单元
+建议 × 计划处理单元数）；各单元应共享同一批种子，否则单元对
+的共同配对数会少于每单元运行数。`pilot_calibration=point` 时
+两类上界都不参与设计判定，判据降为信息性并告警；声明为
+`upper_confidence_bound` 时 sd 判据是硬约束——试点小于建议
+规模就意味着按上界校准后设计可能失效。
+
+口径与限制：
+
+- 建议值基于声明先验与卡方/Clopper-Pearson 上界公式，不是对
+  真实 sd/脱落率的保证；试点跑完后仍由 `--design-pilot-runs`
+  按单向上调规则校准，失败运行必须一并传入。
+- 默认容差 1.5 意味着「若真实 sd 位于试点 UCB，所需种子数约按
+  (1.5)² ≈ 2.25 倍准备」；容差是设计选择，应结合计划余量选择
+  并在报告中说明。
+- 试点规模规划不解决试点与正式协议可比性问题（仍由
+  `comparability` 报告核对），也不校准真实效应大小。
+- 已有试点证据时设计计划不重复生成该块：不确定性已由
+  `pilot_evidence` 的实测 UCB 敏感性表披露。
+
 ## 3. 运行顺序：随机化/平衡完整区组
 
 旧行为（`grouped`）按模式分组：
@@ -483,3 +534,82 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
   `pilot_evidence` 不是预注册 schema 字段：它由工具从运行目录
   计算后写入设计计划，因此必须与预注册文件、`design_plan.json`
   一起冻结；只保留预注册文件、丢掉设计计划会失去试点校准证据。
+
+## 7. 停止规则、排除标准与最小效应论证
+
+第 5 节的流程把「增加种子必须重新预注册」作为纪律要求；本节
+把三个最容易事后反向拟合的决定变成训练前冻结、可机器核对的
+预注册字段（均为可选；旧协议不受影响，但确证研究建议全部声明）。
+
+### 7.1 `stopping_rules`：最多跑多少次运行
+
+```json
+"stopping_rules": {
+  "max_total_runs": 24,
+  "interim_look_steps": [2000],
+  "extension_requires_new_preregistration": true
+}
+```
+
+- `max_total_runs`（必填正整数）：本项研究最多运行的次数，
+  覆盖全部臂 × 种子 ×（消融/调参轴）展开。schema 拒绝
+  `max_total_runs < seeds 数量` 的自相矛盾声明；`--plan-design`
+  与正式套件在冻结设计时核对计划运行数，超限直接拒绝——
+  「不显著就再加 3 个种子」的序贯偷看不再是执行选项，而是
+  必须重新预注册的新研究阶段。
+- `interim_look_steps`（可选，无重复正整数列表）：允许做中期
+  汇总的训练步数，声明步数不得超过 `steps`。未声明的步数上
+  做中期结论属于序贯偷看；在每个观察点报告结论时必须写明
+  「中期观察，未做多 look alpha 校正」（框架目前不自动做
+  Pocock/O'Brien-Fleming 校正）。
+- `extension_requires_new_preregistration`（可选布尔，默认
+  true）：超出预注册计划的扩展是否必须重新预注册。
+
+字段随 `config.json`（`preregistration.stopping_rules`）与
+`design_plan.json`（回显，含 `within_max_total_runs`）落盘，
+被 `plan_id` 与预注册文件 SHA-256 覆盖；`print_design_summary`
+打印 `[design][stopping]` 运行上限行。注意它只约束「计划运行
+数」：`--resume` 续跑同一目录由 out 目录覆盖保护与测试访问
+账本约束；跨目录新增种子属于新研究阶段。
+
+### 7.2 `exclusion_criteria`：预先写死排除规则
+
+数值失败的自动检测只覆盖 NaN/Inf/数值停止。训练曲线缺失某
+窗口、评估子集异常、加载失败但未触发数值停止——这些「灰色」
+排除如果没有预先声明，事后排除就是选择性报告的主要入口：
+
+```json
+"exclusion_criteria": {
+  "attrition_definition": "运行在达到 common_step 前出现 NaN/Inf、数值停止或进程崩溃即不可用；指标缺失的运行按失败计入脱落率",
+  "exclusion_rules": [
+    "不因结果方向排除任何运行",
+    "不替换「更安静的」种子重跑",
+    "失败运行目录与 run_order.json 一并归档"
+  ]
+}
+```
+
+`attrition_definition` 必填非空；`exclusion_rules` 逐条列出
+预声明规则——不在此列表中的事后排除都是协议违反。字段随
+`config.json` 的 `preregistration.exclusion_criteria` 落盘，
+归档审计时能核对实际排除与预声明规则的一致性。它不改变
+`failure_rates` / `attrition_bounds` 的既有口径：数值失败仍按
+`metrics.jsonl` 的自动检测识别。
+
+### 7.3 `min_effect_justification`：最小效应的依据
+
+`min_effect` 决定「多小的差异算没有实际意义」，是预注册里
+最容易事后反向拟合的声明——只要求它是 (0, 1] 内的正数，意味着
+任何数都能通过。声明依据（领域效应量、先前研究的效应量分布、
+成本-收益权衡）应在训练前写进预注册：
+
+```json
+"min_effect_justification": "1% 验证损失改善是本算力规模下能被下游任务感知的最小收益下限（依据：先前同规模运行的损失-困惑度换算）"
+```
+
+字段是可选的（旧协议不受影响），但声明时必须是实质性内容，
+空白占位会被 schema 拒绝；随 `config.json` 的
+`preregistration.min_effect_justification` 落盘。工具不验证
+论证质量——外部审计仍需人工阅读依据，但「有没有依据」不再
+是可以跳过的决定。试点证据（第 2.3 节）只校准噪声与脱落，
+不校准效应大小，不能反过来用试点观测效应改 `min_effect`。

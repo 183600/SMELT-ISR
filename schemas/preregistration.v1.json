@@ -288,6 +288,62 @@
       },
       "description": "训练墙钟预算，训练前声明。"
     },
+    "stopping_rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_total_runs"],
+      "properties": {
+        "max_total_runs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "本项研究最多运行的次数（含全部臂/种子/消融展开）。设计计划冻结与启动前按它拒绝超限扩展；增加种子或臂必须作为新研究阶段重新预注册。"
+        },
+        "interim_look_steps": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "允许做中期汇总的训练步数（预声明观察点）。未声明的步数上做中期结论属于序贯偷看。"
+        },
+        "extension_requires_new_preregistration": {
+          "type": "boolean",
+          "description": "超出预注册计划的扩展（加种子/加臂/延长训练）是否必须重新预注册，默认 true。"
+        }
+      },
+      "description": "停止规则：训练前声明「最多跑多少次运行、允许在哪些步做中期汇总」。没有预先声明的上限，「不显著就再加种子」的序贯偷看无法与设计区分。"
+    },
+    "exclusion_criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attrition_definition"],
+      "properties": {
+        "attrition_definition": {
+          "type": "string",
+          "minLength": 1,
+          "description": "什么算不可用运行：除自动数值失败检测（NaN/Inf/数值停止）外，按什么口径把运行排除出分析。"
+        },
+        "exclusion_rules": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "逐条预声明的排除规则；不在此列表中的事后排除都是协议违反。"
+        },
+        "note": {
+          "type": "string",
+          "description": "补充说明。"
+        }
+      },
+      "description": "排除标准：训练前写死哪些运行/观测会因什么原因被排除出分析，防止事后选择性排除。"
+    },
+    "min_effect_justification": {
+      "type": "string",
+      "minLength": 1,
+      "description": "最小有意义效应（min_effect）的依据：领域效应量、先前研究、成本-收益权衡等。min_effect 是预注册里最容易事后反向拟合的声明，必须在训练前写明依据。"
+    },
     "notes": {
       "type": "string",
       "description": "自由文本备注。"

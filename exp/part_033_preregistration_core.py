@@ -71,8 +71,37 @@ _PREREGISTRATION_OPTIONAL_FIELDS = (
     "power",
     "run_order",
     "compute_budget",
+    "stopping_rules",
+    "exclusion_criteria",
+    "min_effect_justification",
     "notes",
     "metadata",
+)
+
+
+# 预注册的**停止规则**（stopping_rules）。固定样本设计必须
+# 在训练前回答「最多跑多少次运行、什么时候停」：没有预先
+# 声明的上限，「先看 3 个种子、不显著就再加 3 个」的序贯
+# 偷看会让家族错误率失控。max_total_runs 是设计计划冻结与
+# 启动前的硬门（计划运行数超过上限直接拒绝）；中期观察步
+# （interim_look_steps）只声明「允许在哪些步数做中期汇总」，
+# 供报告与归档核对。
+_STOPPING_RULES_KEYS = (
+    "max_total_runs",
+    "interim_look_steps",
+    "extension_requires_new_preregistration",
+)
+
+
+# 预注册的**排除标准**（exclusion_criteria）。数值失败的
+# 自动检测只覆盖 NaN/Inf/数值停止；「哪些运行/观测因其它
+# 原因被排除在分析之外」必须在训练前写死，否则事后排除
+# 是选择性报告的主要入口。attrition_definition 说明什么算
+# 不可用运行，exclusion_rules 逐条列出预声明排除规则。
+_EXCLUSION_CRITERIA_KEYS = (
+    "attrition_definition",
+    "exclusion_rules",
+    "note",
 )
 
 

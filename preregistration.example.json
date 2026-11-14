@@ -39,6 +39,20 @@
   "compute_budget": {
     "max_total_training_hours": 24
   },
+  "stopping_rules": {
+    "max_total_runs": 24,
+    "interim_look_steps": [2000],
+    "extension_requires_new_preregistration": true
+  },
+  "exclusion_criteria": {
+    "attrition_definition": "运行在达到 common_step 前出现 NaN/Inf、数值停止或进程崩溃即不可用；指标缺失的运行按失败计入脱落率，不进入均值与检验",
+    "exclusion_rules": [
+      "不因结果方向排除任何运行",
+      "不替换「更安静的」种子重跑",
+      "失败运行目录与 run_order.json 一并归档"
+    ]
+  },
+  "min_effect_justification": "1% 验证损失改善是本算力规模下能被下游任务感知的最小收益下限（依据：先前同规模运行的损失-困惑度换算与算力申请的收益承诺）",
   "notes": "RQ1: 延迟合并 (A/B) 是否显著优于原始 SMELT。等计算量口径由 --budget-match smelt 核对；主指标 val_loss_at_common_step 避免检查点选型偏差。",
   "metadata": {
     "rq": "RQ1",

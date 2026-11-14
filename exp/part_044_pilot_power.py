@@ -1557,6 +1557,339 @@ def _training_budget_summary(
 
 
 
+# ============================================================
+# 试点规模规划（先算试点要多大，再跑试点）
+# ============================================================
+
+_PILOT_SIZE_SCHEMA_VERSION = 1
+
+# 试点规模规划的候选共同配对种子数网格。上限只影响求解搜索；
+# 超过 64 个共同种子的「试点」通常已经接近正式规模。
+_PILOT_SIZE_PAIR_GRID = (
+    2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64,
+)
+
+# sd 置信上界乘数的默认容差：试点 UCB 口径下允许先验 sd 被
+# 抽样不确定性高估的最大比例。所需种子数近似按 sd 的平方
+# 增长，乘数 1.5 意味着「若真实 sd 位于试点 UCB，所需启动
+# 种子数约为声明值按 (1.5)^2 ≈ 2.25 倍准备」。
+_PILOT_SIZE_DEFAULT_SD_TOLERANCE = 1.5
+
+
+def plan_pilot_size(
+    power: Optional[Dict[str, object]],
+    min_effect: object,
+    planned_seeds: object,
+    comparisons_count: int,
+    contrast_types: Optional[List[str]] = None,
+    equivalence_margin: Optional[object] = None,
+    n_cells: int = 2,
+    *,
+    sd_ucb_tolerance: object = _PILOT_SIZE_DEFAULT_SD_TOLERANCE,
+) -> Optional[Dict[str, object]]:
+    """在跑试点之前回答「试点需要多大」。
+
+    `--design-pilot-runs` 的试点校准只有在试点本身足够大时才
+    可信：3~6 个配对种子的 sd 置信上界是点估计的 2~4 倍，按
+    上界口径校准会把所需种子数推高到设计无法承受；脱落率的
+    Clopper-Pearson 上界同样由试点规模决定。设计计划此前只能
+    在试点跑完后报告「试点运行少于 6 个」的告警，却不能在
+    冻结设计前告诉研究者「要按上界校准 sd，试点每对处理单元
+    至少需要多少个共同种子」。
+
+    这里在训练前、用预注册声明的先验值回答这个问题：
+
+    - sd 判据（``sd_planning``）：n 个共同配对种子下，正态
+      配对差值 sd 的单侧置信上界乘数
+      ``sqrt(df / chi2_{1-c, df})`` 不得超过容差
+      ``sd_ucb_tolerance``（默认 1.5）。每个候选 n 同时按
+      上界口径完整重算所需启动种子数，直接回答「该规模试点
+      的 UCB 会不会把设计推到种子不够」。
+    - 脱落率判据（``attrition_planning``）：每单元 n 个运行、
+      观测失败数按声明脱落率的保守上取整时，Clopper-Pearson
+      精确上界折算后的启动种子数 ``ceil(required / (1-ucb))``
+      不得超过计划启动种子数。计划没有预留脱落余量时判据
+      不可满足，如实报告而不是放宽公式。
+
+    校准策略为 ``point`` 时两类上界都不参与设计判定，判据
+    仅作信息性报告（``binding_for_calibration=false``）；
+    策略为 ``upper_confidence_bound`` 时 sd 判据是硬约束：
+    试点小于建议规模就意味着按上界校准后设计可能失效。
+
+    返回块随设计计划落盘（schema
+    ``smelt-isr/pilot-size-plan/v1``），被 ``plan_id`` 覆盖；
+    没有 ``power`` 块（未声明先验 sd）时返回 None——没有
+    可对照的声明值，任何试点规模建议都只是编造精度。
+    """
+    if not isinstance(power, dict):
+        return None
+    declared_sd = _finite_float(
+        power.get("expected_seed_sd_relative")
+    )
+    if declared_sd is None or declared_sd <= 0.0:
+        return None
+    try:
+        planned_seeds_value = int(planned_seeds)
+    except (TypeError, ValueError, OverflowError):
+        planned_seeds_value = 0
+    if planned_seeds_value < 1:
+        return None
+    try:
+        n_cells_value = max(1, int(n_cells))
+    except (TypeError, ValueError, OverflowError):
+        n_cells_value = 2
+    tolerance = _finite_float(sd_ucb_tolerance)
+    if tolerance is None or tolerance < 1.0:
+        tolerance = _PILOT_SIZE_DEFAULT_SD_TOLERANCE
+    min_effect_value = _finite_float(min_effect)
+    if min_effect_value is None or min_effect_value < 0.0:
+        min_effect_value = 0.0
+    policy, confidence = _pilot_calibration_setting(power)
+    raw_attrition = _finite_float(
+        power.get("expected_attrition_rate", 0.0)
+    )
+    attrition = (
+        raw_attrition
+        if raw_attrition is not None and 0.0 <= raw_attrition < 1.0
+        else 0.0
+    )
+    declared_plan = preregistration_power_plan(
+        power,
+        min_effect_value,
+        planned_seeds_value,
+        comparisons_count,
+        contrast_types=contrast_types,
+        equivalence_margin=equivalence_margin,
+    )
+    binding = declared_plan.get("binding_contrast")
+    required_at_declared = _finite_float(
+        declared_plan.get("required_seeds_with_attrition")
+    )
+    required_at_declared = (
+        int(required_at_declared)
+        if required_at_declared is not None
+        else None
+    )
+
+    def _plan_at_sd(sd_value: float) -> Optional[int]:
+        scaled = dict(power)
+        scaled["expected_seed_sd_relative"] = sd_value
+        scaled_plan = preregistration_power_plan(
+            scaled,
+            min_effect_value,
+            planned_seeds_value,
+            comparisons_count,
+            contrast_types=contrast_types,
+            equivalence_margin=equivalence_margin,
+        )
+        implied = _finite_float(
+            scaled_plan.get("required_seeds_with_attrition")
+        )
+        return int(implied) if implied is not None else None
+
+    policy_binds = policy == "upper_confidence_bound"
+    sd_rows: List[Dict[str, object]] = []
+    sd_min_pairs: Optional[int] = None
+    for n_pairs in _PILOT_SIZE_PAIR_GRID:
+        degrees = n_pairs - 1
+        quantile = _chi_square_quantile(
+            1.0 - confidence, degrees
+        )
+        if quantile is None or quantile <= 0.0:
+            continue
+        multiplier = math.sqrt(degrees / quantile)
+        implied = _plan_at_sd(declared_sd * multiplier)
+        sd_rows.append({
+            "pilot_pairs": n_pairs,
+            "sd_ucb_multiplier": multiplier,
+            "implied_required_seeds_with_attrition": implied,
+            "within_planned_seeds": bool(
+                implied is not None
+                and implied <= planned_seeds_value
+            ),
+        })
+        if sd_min_pairs is None and multiplier <= tolerance:
+            sd_min_pairs = n_pairs
+    if sd_min_pairs is None:
+        sd_achievable = False
+    else:
+        sd_achievable = True
+    sd_planning: Dict[str, object] = {
+        "criterion": (
+            "sd_ucb_multiplier_tolerance"
+        ),
+        "binding_for_calibration": policy_binds,
+        "tolerance": tolerance,
+        "confidence": confidence,
+        "min_pilot_pairs": sd_min_pairs,
+        "achievable_within_grid": sd_achievable,
+        "grid_max_pairs": max(_PILOT_SIZE_PAIR_GRID),
+        "table": sd_rows,
+        "note": (
+            "multiplier 是 n 个共同配对种子时 sd 单侧置信上界"
+            "相对点估计的最大倍数（正态配对差值、卡方上界）；"
+            "implied_required_seeds_with_attrition 按上界口径"
+            "完整重算。required_seeds 近似按 sd 的平方增长，"
+            "容差应结合计划的种子余量选择"
+        ),
+    }
+
+    # 脱落率判据：计划启动种子数相对 required_seeds 的余量
+    # 决定能吸收多大的脱落率上界。required 未知（如家族规模
+    # 过大导致功效不可达）时同样不可判定。
+    attrition_rows: List[Dict[str, object]] = []
+    attrition_min_runs: Optional[int] = None
+    attrition_achievable = False
+    attrition_note = (
+        "ucb 是「每单元 n 个运行、失败数按声明脱落率保守上"
+        "取整」时 Clopper-Pearson 精确单侧上界；"
+        "implied_required_seeds_with_attrition 按 "
+        "ceil(required / (1 - ucb)) 折算"
+    )
+    if required_at_declared is None:
+        attrition_note = (
+            "声明先验下的所需种子数不可判定（功效不可达），"
+            "脱落率判据无从计算"
+        )
+    elif planned_seeds_value < required_at_declared:
+        attrition_note = (
+            "计划启动种子数本身低于声明先验下的所需种子数，"
+            "没有可吸收脱落的余量"
+        )
+    else:
+        attrition_slack = 1.0 - (
+            float(required_at_declared) / float(planned_seeds_value)
+        )
+        for n_runs in _PILOT_SIZE_PAIR_GRID:
+            expected_failures = min(
+                n_runs,
+                int(math.ceil(attrition * n_runs)),
+            )
+            ucb = _binomial_upper_confidence_bound(
+                expected_failures, n_runs, confidence
+            )
+            if ucb is None:
+                continue
+            implied_launch = int(
+                math.ceil(
+                    float(required_at_declared) / (1.0 - ucb)
+                )
+                if ucb < 1.0
+                else None
+            ) if ucb < 1.0 else None
+            attrition_rows.append({
+                "pilot_runs_per_cell": n_runs,
+                "assumed_failures": expected_failures,
+                "attrition_ucb": ucb,
+                "implied_required_seeds_with_attrition": (
+                    implied_launch
+                ),
+                "within_planned_seeds": bool(
+                    implied_launch is not None
+                    and implied_launch <= planned_seeds_value
+                ),
+            })
+            if (
+                attrition_min_runs is None
+                and ucb <= attrition_slack
+            ):
+                attrition_min_runs = n_runs
+        attrition_achievable = attrition_min_runs is not None
+        if attrition_achievable:
+            attrition_note = (
+                attrition_note
+                + f"；判据为 ucb ≤ 计划余量 "
+                f"{attrition_slack:.4g}（= 1 - "
+                f"{required_at_declared}/{planned_seeds_value}）"
+            )
+    attrition_planning: Dict[str, object] = {
+        "criterion": "attrition_ucb_within_planned_slack",
+        "binding_for_calibration": policy_binds,
+        "declared_expected_attrition_rate": attrition,
+        "required_seeds_with_attrition_at_declared": (
+            required_at_declared
+        ),
+        "planned_seeds": planned_seeds_value,
+        "confidence": confidence,
+        "min_pilot_runs_per_cell": attrition_min_runs,
+        "achievable_within_grid": attrition_achievable,
+        "grid_max_runs_per_cell": max(_PILOT_SIZE_PAIR_GRID),
+        "table": attrition_rows,
+        "note": attrition_note,
+    }
+
+    warnings: List[str] = []
+    if policy_binds and not sd_achievable:
+        warnings.append(
+            f"在网格上限（{max(_PILOT_SIZE_PAIR_GRID)} 个共同"
+            "配对种子）内，sd 置信上界乘数无法降到容差 "
+            f"{tolerance:g}：按 upper_confidence_bound 校准的"
+            "设计需要更大的试点容差、更多计划种子，或改用 "
+            "point 校准并承担点估计被低估的风险"
+        )
+    if policy_binds and required_at_declared is not None:
+        if planned_seeds_value < required_at_declared:
+            warnings.append(
+                "计划启动种子数低于声明先验下的所需种子数："
+                "脱落率判据不可满足，请先满足种子数硬门"
+            )
+        elif not attrition_achievable:
+            warnings.append(
+                f"在网格上限（{max(_PILOT_SIZE_PAIR_GRID)} 个"
+                "运行/单元）内，脱落率上界都会吃掉计划余量："
+                "请增加计划种子余量，或把试点脱落证据只作"
+                "预警而不参与设计判定"
+            )
+    if not policy_binds:
+        warnings.append(
+            "power.pilot_calibration=point：试点按点估计校准，"
+            "上界判据不参与设计判定；小试点点估计不稳定的风险"
+            "由 sd/脱落率表披露，冻结前请确认这是有意选择"
+        )
+
+    floor = int(_DESIGN_PILOT_MIN_PAIRS)
+    candidate_counts = [
+        count
+        for count in (sd_min_pairs, attrition_min_runs, floor)
+        if count is not None
+    ]
+    recommended_per_cell = max(candidate_counts)
+    recommended_total = recommended_per_cell * n_cells_value
+    return {
+        "schema": (
+            f"smelt-isr/pilot-size-plan/v{_PILOT_SIZE_SCHEMA_VERSION}"
+        ),
+        "calibration_policy": policy,
+        "confidence": confidence,
+        "declared_expected_seed_sd_relative": declared_sd,
+        "declared_expected_attrition_rate": attrition,
+        "min_effect_relative": min_effect_value,
+        "planned_seeds": planned_seeds_value,
+        "planned_comparisons": declared_plan.get(
+            "planned_comparisons"
+        ),
+        "binding_contrast": binding,
+        "required_seeds_with_attrition_at_declared": (
+            required_at_declared
+        ),
+        "n_cells": n_cells_value,
+        "sd_planning": sd_planning,
+        "attrition_planning": attrition_planning,
+        "recommended_pilot_runs_per_cell": recommended_per_cell,
+        "recommended_total_pilot_runs": recommended_total,
+        "warnings": warnings,
+        "note": (
+            "试点规模建议按「每单元共同种子数 × 处理单元数」"
+            "估算总运行数；各单元应共享同一批种子，否则单元对"
+            "的共同配对数会少于每单元运行数。建议值不改变"
+            "预注册声明：试点跑完后仍由 --design-pilot-runs "
+            "按单向上调规则校准；失败运行必须一并传入，只传"
+            "成功目录会把脱落率低估为 0"
+        ),
+    }
+
+
+
 def _design_plan_id(payload: Dict[str, object]) -> str:
     """设计计划内容的规范化指纹（排除 plan_id 与创建时间）。
 

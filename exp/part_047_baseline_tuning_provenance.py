@@ -1195,6 +1195,49 @@ def print_design_summary(design: Dict[str, object]) -> None:
             )
         for warning in list(pilot.get("warnings") or [])[:4]:
             print(f"[design][pilot][warn] {warning}")
+    pilot_size = design.get("pilot_size_plan")
+    if isinstance(pilot_size, dict) and pilot_size.get(
+        "available"
+    ) is not False:
+        sd_planning = _as_dict(pilot_size.get("sd_planning"))
+        attrition_planning = _as_dict(
+            pilot_size.get("attrition_planning")
+        )
+        policy = pilot_size.get("calibration_policy")
+        per_cell = pilot_size.get(
+            "recommended_pilot_runs_per_cell"
+        )
+        total = pilot_size.get("recommended_total_pilot_runs")
+        sd_min = sd_planning.get("min_pilot_pairs")
+        attrition_min = attrition_planning.get(
+            "min_pilot_runs_per_cell"
+        )
+        binding_text = (
+            "硬判据"
+            if sd_planning.get("binding_for_calibration")
+            else "信息性"
+        )
+        print(
+            "[design][pilot-size] 试点规模建议（校准策略="
+            f"{policy}，sd 上界判据 {binding_text}）：每个处理"
+            f"单元 ≥ {per_cell} 个运行、共 ≈ {total} 个"
+            "（sd 上界乘数达标需 ≥ "
+            f"{sd_min if sd_min is not None else 'NA'} 个共同"
+            "配对种子；脱落率上界达标需 ≥ "
+            f"{attrition_min if attrition_min is not None else 'NA'}"
+            " 个/单元）"
+        )
+        for warning in list(pilot_size.get("warnings") or [])[:3]:
+            print(f"[design][pilot-size][warn] {warning}")
+    stopping = design.get("stopping_rules")
+    if isinstance(stopping, dict):
+        print(
+            "[design][stopping] 运行上限："
+            f"{stopping.get('planned_runs')}/"
+            f"{stopping.get('max_total_runs')}（预注册冻结）；"
+            "增加种子/臂必须作为新研究阶段重新预注册，"
+            "不能在同一份预注册下扩展"
+        )
     print(
         f"[design] 设计计划已写入 {design['path']}"
         "（子进程开跑前会重新核对指纹与自己的分配）"

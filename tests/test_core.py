@@ -8,6 +8,7 @@ from _core_StatisticsTests import StatisticsTests
 from _core_StatisticsTests import ResultsAnalysisDiagnosticsTests
 from _core_DesignPreparationTests_00 import DesignPreparationTests
 from _core_DesignPreparationTests_01 import DesignPreparationTestsPart2
+from _core_DesignPreparationTests_02 import DesignPreparationTestsPart3
 from _core_DesignPreparationTests_base import _DesignPreparationTestsBase
 from _core_DesignPreflightTests import DesignPreflightTests
 from _core_RoutingTests import RoutingTests
@@ -49,6 +50,7 @@ __all__ = [
     "ResultsAnalysisDiagnosticsTests",
     "DesignPreparationTests",
     "DesignPreparationTestsPart2",
+    "DesignPreparationTestsPart3",
     "_DesignPreparationTestsBase",
     "DesignPreflightTests",
     "RoutingTests",
