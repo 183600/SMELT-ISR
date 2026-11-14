@@ -97,7 +97,7 @@ def evaluate(
     """
     was_training = model.training
     model.eval()
-    # WARNING: Consider wrapping inference in torch.no_grad() to save memory
+    # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
     probe_attached = False
     if routing_probe is not None:

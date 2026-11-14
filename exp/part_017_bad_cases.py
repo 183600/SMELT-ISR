@@ -845,7 +845,7 @@ def analyze_bad_cases(
 
     was_training = model.training
     model.eval()
-    # WARNING: Consider wrapping inference in torch.no_grad() to save memory
+    # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
     use_amp = (
         amp_dtype is not None
