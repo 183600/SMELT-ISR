@@ -122,7 +122,8 @@ def audit_data_splits(
                 minlength=256,
             ).to(torch.float64)
 
-        histograms[split] = hist / hist.sum()
+        _hist_sum = hist.sum()
+        histograms[split] = hist / _hist_sum if _hist_sum > 0 else hist
 
         top_share, top_byte = torch.topk(
             histograms[split],

@@ -858,7 +858,7 @@ def _regularized_incomplete_beta(
             cf = _betacf(a, b, x)
             if cf <= 0.0:
                 return 0.0
-            log_result = log_front + math.log(cf + 1e-8) - math.log(a)
+            log_result = log_front + math.log(cf + 1e-8) - math.log(max(a, 1e-8))
             if log_result < -745.0:
                 return 0.0
             if log_result > 0.0:
@@ -870,7 +870,7 @@ def _regularized_incomplete_beta(
         cf = _betacf(b, a, 1.0 - x)
         if cf <= 0.0:
             return 1.0
-        log_comp = log_front + math.log(cf + 1e-8) - math.log(b)
+        log_comp = log_front + math.log(cf + 1e-8) - math.log(max(b, 1e-8))
         if log_comp < -745.0:
             return 1.0
         if log_comp > 0.0:

@@ -722,7 +722,10 @@ def _effective_edge_histogram(
     if used <= 0:
         return None, 0
 
-    return counts / counts.sum(), used
+    total = counts.sum()
+    if total <= 0:
+        return None, 0
+    return counts / total, used
 
 
 
