@@ -1,5 +1,4 @@
 {
-  "$schema": "./schemas/preregistration.v1.json",
   "study_id": "smelt-isr-rq1-delayed-merge-2026",
   "frozen_commit": "0000000000000000000000000000000000000000000000000000000000000000",
   "primary_metric": "val_loss_at_common_step",
