@@ -864,7 +864,7 @@ def _regularized_incomplete_beta(
             if log_result > 0.0:
                 return 1.0
             return math.exp(log_result)
-        return front * _betacf(a, b, x) / a
+        return front * _betacf(a, b, x) / max(a, 1e-300)
 
     if overflow:
         cf = _betacf(b, a, 1.0 - x)
@@ -876,7 +876,7 @@ def _regularized_incomplete_beta(
         if log_comp > 0.0:
             return 0.0
         return 1.0 - math.exp(log_comp)
-    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / max(b, 1e-300)
 
 
 
