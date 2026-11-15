@@ -929,7 +929,7 @@ def audit_run_directory(
             )
 
     # ---------- artifact_manifest.json ----------
-    manifest_path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
+    manifest_path = root / _ARTIFACT_MANIFEST_NAME
     if manifest_path.is_file():
         manifest_report = verify_artifact_manifest(
             root, strict=False

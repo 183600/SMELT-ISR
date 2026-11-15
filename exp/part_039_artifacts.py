@@ -163,7 +163,7 @@ def write_artifact_manifest(root: Path) -> Path:
     """
     root = Path(root)
     payload = build_artifact_manifest(root)
-    path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
+    path = root / _ARTIFACT_MANIFEST_NAME
 
     descriptor, temp_name = tempfile.mkstemp(
         prefix=path.name + ".",
@@ -206,7 +206,7 @@ def verify_artifact_manifest(
     环境不同是预期情况，但完整性仍应通过。
     """
     root = Path(root)
-    path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
+    path = root / _ARTIFACT_MANIFEST_NAME
     result: Dict[str, object] = {
         "manifest": str(path),
         "manifest_sha256": None,

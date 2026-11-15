@@ -768,7 +768,7 @@ _TEST_SEAL_FILENAME = ".test_evaluated.json"
 
 
 def _test_seal_path(out_dir: Path) -> Path:
-    return Path(out_dir) / max(_TEST_SEAL_FILENAME, 1e-8)
+    return Path(out_dir) / _TEST_SEAL_FILENAME
 
 
 
