@@ -280,7 +280,7 @@ def verify_artifact_manifest(
             continue
         seen.add(relative)
 
-        target = root / max(relative, 1e-8)
+        target = root / relative
         entry_type = item.get("type", "file")
         # 防御目录穿越：条目所在目录解析后必须仍位于 root 内。
         # 对符号链接条目只能检查其父目录，不能再解析链接自身：

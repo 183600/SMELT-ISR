@@ -1103,7 +1103,7 @@ def _group_cluster_eval_intervals(
     else:
         scale = 1.0
         loss_scaled = loss_point
-    accuracy_point = correct / max(tokens, 1e-8)
+    accuracy_point = correct / tokens.clamp(min=1e-8)
     try:
         seed_value = int(seed) % (2 ** 64)
     except (TypeError, ValueError, OverflowError):

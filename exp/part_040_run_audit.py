@@ -347,7 +347,7 @@ def audit_run_directory(
             file_name = summary.get("file")
             file_sha = summary.get("file_sha256")
             if isinstance(file_name, str) and file_name:
-                environment_path = root / max(file_name, 1e-8)
+                environment_path = root / file_name
                 if not environment_path.is_file():
                     add_error(
                         "environment_file_missing",

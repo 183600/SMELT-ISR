@@ -293,8 +293,8 @@ def _welch_t_test(
         # 极小尺度下方差会下溢成 0，被误判成零方差/无噪声
         # 分离；先按公共尺度归一化再还原效应与标准误。
         scaled = _welch_t_test(
-            [value / max(max_abs, 1e-8) for value in values_a],
-            [value / max(max_abs, 1e-8) for value in values_b],
+            [value / max_abs for value in values_a],
+            [value / max_abs for value in values_b],
         )
         if scaled.get("test") == "welch_t":
             effect = _finite_float(scaled.get("effect"))
@@ -1002,7 +1002,7 @@ def _t_power(
         # 截断而偏离 alpha；这是可精确知道的值，直接返回。
         return alpha_value
 
-    noncentrality = effect_value / max(se_value, 1e-8)
+    noncentrality = effect_value / se_value
     if math.isinf(noncentrality):
         # se 小到 δ 溢出：非中心参数趋于无穷，任何有限临界值
         # 都必然被超过。不能把 inf 带进正态混合积分（那里的
