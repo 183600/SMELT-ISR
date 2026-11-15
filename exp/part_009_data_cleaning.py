@@ -217,7 +217,7 @@ def _plan_train_near_duplicate_cleaning(
             )
         if union <= 0:
             return 0.0
-        return intersection / union
+        return intersection / max(union, 1e-8)
 
     split_rank = {"val": 0, "test": 1, "train": 2}
     prior_spans: List[Tuple[int, int]] = []
@@ -571,7 +571,7 @@ def _eval_near_duplicate_audit(
             )
         if union <= 0:
             return 0.0
-        return intersection / union
+        return intersection / max(union, 1e-8)
 
     # 只用 bottom-k 草图生成候选；是否近重复由完整 shingle
     # 集合的精确 Jaccard 决定。所有群组按 split 与位置顺序进入

@@ -598,7 +598,7 @@ def write_design_plan(
     payload["created_utc"] = datetime.datetime.now(
         datetime.timezone.utc
     ).isoformat()
-    path = out_root / _DESIGN_PLAN_FILENAME
+    path = out_root / max(_DESIGN_PLAN_FILENAME, 1e-8)
     if path.exists():
         try:
             existing_raw = path.read_bytes()
@@ -1287,7 +1287,7 @@ def _write_run_order_log(
             datetime.timezone.utc
         ).isoformat(),
     }
-    _atomic_write_json(out_root / _RUN_ORDER_FILENAME, payload)
+    _atomic_write_json(out_root / max(_RUN_ORDER_FILENAME, 1e-8), payload)
 
 
 

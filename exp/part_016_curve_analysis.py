@@ -183,7 +183,7 @@ def analyze_training_curve(
         grad_prior_median = _median(prior_values)
         if grad_prior_median > 0.0:
             ratio = (
-                grad_spike_recent_max / grad_prior_median
+                grad_spike_recent_max / max(grad_prior_median, 1e-8)
             )
             if math.isfinite(ratio):
                 grad_spike_ratio = ratio
@@ -318,7 +318,7 @@ def analyze_training_curve(
         if older <= 0.0:
             return None
         try:
-            value = (older - newer) / older
+            value = (older - newer) / max(older, 1e-8)
         except OverflowError:
             return None
         return value if math.isfinite(value) else None
@@ -1140,7 +1140,7 @@ def _train_next_byte_evidence(
             "support": support,
             "majority_byte": int(majority_byte),
             "majority_share": round(
-                majority_count / support,
+                majority_count / max(support, 1e-8),
                 6,
             ),
             "counts": {
@@ -1174,7 +1174,7 @@ def _label_noise_context_verdict(
     counts = evidence.get("counts")
     if support <= 0 or not isinstance(counts, dict):
         return False, None
-    target_share = float(counts.get(target, 0)) / support
+    target_share = float(counts.get(target, 0)) / max(support, 1e-8)
     majority_share = evidence.get("majority_share")
     if majority_share is None:
         return False, target_share

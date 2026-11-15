@@ -623,7 +623,7 @@ def _curve_trapezoid_mean(
             return None
         # v1/2 + v2/2 避免先相加再除二造成的中间溢出。
         average = values[index - 1] / 2.0 + values[index] / 2.0
-        fraction = width / window
+        fraction = width / max(window, 1e-8)
         term = fraction * average
         if not math.isfinite(term):
             return None
@@ -961,7 +961,7 @@ def selection_bias_report(
                 # 直接做整数真除法：两个超大但同量级的计数
                 # 仍可能给出可表示的倍率，只有倍率本身越过
                 # float 上限时才省略。
-                ratio = high / low if low > 0 else None
+                ratio = high / max(low, 1e-8) if low > 0 else None
             except (OverflowError, ValueError):
                 ratio = None
             if ratio is not None and not math.isfinite(ratio):
@@ -1213,7 +1213,7 @@ def failure_rate_report(
         planned = int(arm["planned_runs"])
         failed = int(arm["failed_runs"])
         arm["failure_rate"] = (
-            failed / planned if planned > 0 else None
+            failed / max(planned, 1e-8) if planned > 0 else None
         )
 
     rates = [

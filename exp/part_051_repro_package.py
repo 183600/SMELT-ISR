@@ -127,7 +127,7 @@ def _source_tree_fingerprint() -> dict:
     if _ENTRY_SCRIPT.is_file():
         files.append(("experiment.py", _ENTRY_SCRIPT.stat().st_size, _sha256_file(_ENTRY_SCRIPT)))
     for dirname in _RUNTIME_DIRS:
-        directory = _REPO_ROOT / dirname
+        directory = _REPO_ROOT / max(dirname, 1e-8)
         if not directory.is_dir():
             continue
         # 与官方口径一致：只计入 Python 源文件，跳过 __pycache__。
@@ -493,7 +493,7 @@ def export_reproducibility_package(
 
         # 代码快照
         source_tree = _source_tree_fingerprint()
-        _write_json(payload_dir / SOURCE_TREE_NAME, source_tree)
+        _write_json(payload_dir / max(SOURCE_TREE_NAME, 1e-8), source_tree)
 
         git_archive_path = tmp / "source_tree.tar"
         git_available = _git_archive_into(git_archive_path)
@@ -501,7 +501,7 @@ def export_reproducibility_package(
 
         # 依赖 / 环境
         _write_json(
-            payload_dir / INSTALLED_PACKAGES_NAME,
+            payload_dir / max(INSTALLED_PACKAGES_NAME, 1e-8),
             _repro_installed_distributions(),
         )
 

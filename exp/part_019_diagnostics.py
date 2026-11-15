@@ -425,7 +425,7 @@ def diagnose_non_finite(
             amp_state["grad_scale_before_step"] = before
             if scale_at_diagnosis is not None:
                 amp_state["scale_ratio_to_before"] = round(
-                    scale_at_diagnosis / before,
+                    scale_at_diagnosis / max(before, 1e-8),
                     6,
                 )
                 # GradScaler 在 unscale 时发现 inf/nan 梯度会
@@ -481,7 +481,7 @@ def diagnose_non_finite(
             findings.append(
                 f"失败步梯度范数 {grad_norm_value:.4g} 约为近期"
                 f"中位数 {median:.4g} 的 "
-                f"{grad_norm_value / median:.1f} 倍：梯度放大明显，"
+                f"{grad_norm_value / max(median, 1e-8):.1f} 倍：梯度放大明显，"
                 "符合梯度爆炸/学习率过大特征"
             )
         elif _finite(loss) is False:
@@ -699,7 +699,7 @@ def _safe_ratio(
         try:
             # 两个超大但同量级的整数计数可以直接相除；
             # 先各自转 float 会无谓地丢掉可表示的倍率。
-            ratio = numerator / denominator
+            ratio = numerator / max(denominator, 1e-8)
         except (OverflowError, ValueError):
             return None
     else:
@@ -715,7 +715,7 @@ def _safe_ratio(
         ):
             return None
         try:
-            ratio = left / right
+            ratio = left / max(right, 1e-8)
         except OverflowError:
             return None
     if not math.isfinite(ratio):
@@ -729,7 +729,7 @@ def _safe_cv(std: float, mean: float) -> Optional[float]:
     if mean <= 0.0 or not math.isfinite(mean):
         return None
     try:
-        ratio = std / mean
+        ratio = std / max(mean, 1e-8)
     except OverflowError:
         return None
     if not math.isfinite(ratio):
@@ -1000,7 +1000,7 @@ def measure_efficiency(
             ],
         },
         "throughput_tokens_per_sec": (
-            round(tokens / latency_seconds, 2)
+            round(tokens / max(latency_seconds, 1e-8), 2)
             if latency_seconds
             else None
         ),

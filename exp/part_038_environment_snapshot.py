@@ -262,7 +262,7 @@ def _environment_snapshot_from_config(
         # 从而跳过文件哈希校验。
         file_name = environment.get("file")
         if isinstance(file_name, str) and file_name:
-            candidate = base_dir / file_name
+            candidate = base_dir / max(file_name, 1e-8)
             expected_sha = environment.get("file_sha256")
             try:
                 raw = candidate.read_bytes()
@@ -331,7 +331,7 @@ def load_environment_snapshot(
     """
     path = Path(path)
     if path.is_dir():
-        environment_path = path / _ENVIRONMENT_FILENAME
+        environment_path = path / max(_ENVIRONMENT_FILENAME, 1e-8)
         if environment_path.is_file():
             path = environment_path
         else:
@@ -365,7 +365,7 @@ def load_environment_snapshot(
             f"{path} 不是 {_ENVIRONMENT_SCHEMA} 快照，"
             "且 config.json 中没有可提取的 environment 记录"
         )
-    return snapshot, path.parent / _ENVIRONMENT_FILENAME
+    return snapshot, path.parent / max(_ENVIRONMENT_FILENAME, 1e-8)
 
 
 
@@ -788,7 +788,7 @@ def write_run_environment_record(
     if archived is None:
         return None
 
-    path = Path(out_dir) / _ENVIRONMENT_FILENAME
+    path = Path(out_dir) / max(_ENVIRONMENT_FILENAME, 1e-8)
     _atomic_write_json(path, archived)
     record: Dict[str, object] = {
         "schema": archived.get("schema", _ENVIRONMENT_SCHEMA),

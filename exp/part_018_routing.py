@@ -160,7 +160,7 @@ class RoutingProbe:
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
-                    -(nonzero * nonzero.log()).sum() / log_e
+                    -(nonzero * nonzero.log()).sum() / max(log_e, 1e-8)
                 )
             else:
                 router_entropy = probs.new_zeros(())
@@ -1111,7 +1111,7 @@ def _intervention_eval(
                     per_batch.append({
                         "batch_index": int(batch_index),
                         "loss": (
-                            batch_loss / batch_tokens
+                            batch_loss / max(batch_tokens, 1e-8)
                             if batch_tokens > 0
                             else float("nan")
                         ),
@@ -1633,7 +1633,7 @@ def analyze_routing_interventions(
             "std_loss_delta": math.sqrt(variance),
             "max_loss_delta": max_delta,
             "max_loss_delta_relative": (
-                max_delta / baseline_loss
+                max_delta / max(baseline_loss, 1e-8)
                 if baseline_loss > 0.0
                 else None
             ),

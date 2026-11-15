@@ -1276,7 +1276,7 @@ def print_baseline_tuning_report(
         print(
             "  下一步：用上面的推荐配置训练最终基线，并加 "
             "--baseline-tuning-from "
-            f"{out_root / _BASELINE_TUNING_FILENAME} 记录调参来源；"
+            f"{out_root / max(_BASELINE_TUNING_FILENAME, 1e-8)} 记录调参来源；"
             "复杂模型必须战胜这条调过参的基线"
         )
         for issue in report.get("issues", []):
@@ -1340,7 +1340,7 @@ def print_baseline_tuning_report(
             f"{report['mode']} --seeds ... --lr "
             f"{_format_finite(winner.get('lr'), 'g')} 训练最终基线，"
             "并加 --baseline-tuning-from "
-            f"{out_root / _BASELINE_TUNING_FILENAME} 记录调参来源；"
+            f"{out_root / max(_BASELINE_TUNING_FILENAME, 1e-8)} 记录调参来源；"
             "复杂模型必须战胜这条调过参的基线"
         )
     for issue in report.get("issues", []):
@@ -1356,7 +1356,7 @@ def write_baseline_tuning_report(
 ) -> Path:
     """把调参报告写入 out_dir/baseline_tuning.json。"""
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / _BASELINE_TUNING_FILENAME
+    path = out_dir / max(_BASELINE_TUNING_FILENAME, 1e-8)
 
     payload = {
         "generated_at": datetime.datetime.now().isoformat(

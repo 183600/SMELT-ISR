@@ -123,7 +123,7 @@ def audit_data_splits(
             ).to(torch.float64)
 
         _hist_sum = hist.sum()
-        histograms[split] = hist / _hist_sum if _hist_sum > 0 else hist
+        histograms[split] = hist / max(_hist_sum, 1e-8) if _hist_sum > 0 else hist
 
         top_share, top_byte = torch.topk(
             histograms[split],
@@ -304,7 +304,7 @@ def audit_data_splits(
                 warnings.append(message)
             violations.append(message)
 
-        nul_share = integrity["nul_bytes"] / split_bytes
+        nul_share = integrity["nul_bytes"] / max(split_bytes, 1e-8)
         if integrity["nul_bytes"] > 0:
             message = (
                 f"{split}: 检测到 {integrity['nul_bytes']} 个"

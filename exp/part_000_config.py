@@ -639,7 +639,7 @@ def _budget_flops_ratio(
     )
     if baseline_flops <= 0:
         return float("inf")
-    return candidate_flops / baseline_flops
+    return candidate_flops / max(baseline_flops, 1e-8)
 
 
 

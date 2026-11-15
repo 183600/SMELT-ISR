@@ -293,8 +293,8 @@ def _welch_t_test(
         # 极小尺度下方差会下溢成 0，被误判成零方差/无噪声
         # 分离；先按公共尺度归一化再还原效应与标准误。
         scaled = _welch_t_test(
-            [value / max_abs for value in values_a],
-            [value / max_abs for value in values_b],
+            [value / max(max_abs, 1e-8) for value in values_a],
+            [value / max(max_abs, 1e-8) for value in values_b],
         )
         if scaled.get("test") == "welch_t":
             effect = _finite_float(scaled.get("effect"))
@@ -309,8 +309,8 @@ def _welch_t_test(
         # 误判成 invalid_values；t 检验本身对公共尺度不变。
         # 还原效应与标准误时若越过 float 上限则置空，不能写 inf。
         scaled = _welch_t_test(
-            [value / max_abs for value in values_a],
-            [value / max_abs for value in values_b],
+            [value / max(max_abs, 1e-8) for value in values_a],
+            [value / max(max_abs, 1e-8) for value in values_b],
         )
         if scaled.get("test") == "welch_t":
             effect = _finite_float(scaled.get("effect"))
@@ -388,7 +388,7 @@ def _welch_t_test(
             and se_squared >= math.sqrt(sys.float_info.min)
         ):
             candidate = (
-                se_squared * se_squared / old_denominator
+                se_squared * se_squared / max(old_denominator, 1e-8)
             )
             if math.isfinite(candidate):
                 df = candidate
@@ -406,7 +406,7 @@ def _welch_t_test(
         )
         if denominator <= 0.0 or not math.isfinite(denominator):
             return {"test": "invalid_values"}
-        df = (scaled_a + scaled_b) ** 2 / denominator
+        df = (scaled_a + scaled_b) ** 2 / max(denominator, 1e-8)
     t = delta / math.sqrt(se_squared)
     return {
         "test": "welch_t",
@@ -760,7 +760,7 @@ def _t_power_nodes(
             density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
         else:
             density = math.exp(
-                log_const + (df - 1.0) * math.log(u) - u * u / 2.0
+                log_const + (df - 1.0) * math.log(max(u, 1e-8)) - u * u / 2.0
             )
         u_values.append(u)
         weighted.append(simpson * density)
@@ -941,7 +941,7 @@ def _t_power_small_df_large_scale(
                 simpson = 2.0 * step / 3.0
             else:
                 simpson = 4.0 * step / 3.0
-            u = w / scale
+            u = w / max(scale, 1e-8)
             if u <= 0.0:
                 continue
             factor = _power_factor(w)
@@ -1002,7 +1002,7 @@ def _t_power(
         # 截断而偏离 alpha；这是可精确知道的值，直接返回。
         return alpha_value
 
-    noncentrality = effect_value / se_value
+    noncentrality = effect_value / max(se_value, 1e-8)
     if math.isinf(noncentrality):
         # se 小到 δ 溢出：非中心参数趋于无穷，任何有限临界值
         # 都必然被超过。不能把 inf 带进正态混合积分（那里的
@@ -1076,7 +1076,7 @@ def _t_power(
         if intervals % 2:
             intervals += 1
         intervals = min(intervals, 20000)
-        step = w_max / intervals
+        step = w_max / max(intervals, 1e-8)
         log_const = (
             (1.0 - df_value / 2.0) * math.log(2.0)
             - math.lgamma(df_value / 2.0)
@@ -1100,7 +1100,7 @@ def _t_power(
             else:
                 density = math.exp(
                     log_const
-                    + (df_value - 1.0) * math.log(u)
+                    + (df_value - 1.0) * math.log(max(u, 1e-8))
                     - u * u / 2.0
                 )
             total += (
@@ -1333,7 +1333,7 @@ def _noncentral_t_cdf_large_shift(
             return 0.0
         log_density = (
             log_const
-            + (df - 1.0) * math.log(u)
+            + (df - 1.0) * math.log(max(u, 1e-8))
             - u * u / 2.0
         )
         return (
@@ -1402,7 +1402,7 @@ def _noncentral_t_cdf_large_shift(
                 argument = low + index * step
                 u = (argument + noncentrality) / a
                 integrand = (
-                    density(u) / scale
+                    density(u) / max(scale, 1e-8)
                     * normal_cdf(argument)
                 )
                 if index == 0 or index == intervals:
@@ -1591,7 +1591,7 @@ def _jzs_log_bayes_factor_10(
     log_denominator = -0.5 * float(n_value) * math.log1p(
         t_value * t_value / df_value
     )
-    log_numerator = math.log(integral)
+    log_numerator = math.log(max(integral, 1e-8))
     log_bf = log_numerator - log_denominator
     if not math.isfinite(log_bf):
         return None

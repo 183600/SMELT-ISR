@@ -33,7 +33,7 @@ def _cost_comparison(
         variant_costs[field] = cost_b
         if cost_a <= 0.0:
             continue
-        ratio = cost_b / cost_a
+        ratio = cost_b / max(cost_a, 1e-8)
         if not math.isfinite(ratio):
             # 两个成本均值都有限，但真实倍率越过 float 上限。
             # 不写入 inf；单独记录溢出字段，供权衡判定使用。
@@ -680,7 +680,7 @@ def factor_contrasts(
 
             noise_ratio = None
             if delta is not None and pooled_std:
-                candidate = abs(delta) / pooled_std
+                candidate = abs(delta) / max(pooled_std, 1e-8)
                 if math.isfinite(candidate):
                     noise_ratio = candidate
 
@@ -1210,7 +1210,7 @@ def _paired_linear_effect(
             effect = 0.0
         else:
             effect = math.fsum(
-                term / scale for term in terms
+                term / max(scale, 1e-8) for term in terms
             ) * scale
             if not math.isfinite(effect):
                 effect = None

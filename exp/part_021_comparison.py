@@ -201,7 +201,7 @@ def bad_case_comparison_report(
             error_rate = None
             if tokens > 0:
                 try:
-                    ratio = wrong / tokens
+                    ratio = wrong / max(tokens, 1e-8)
                 except OverflowError:
                     # 损坏记录可能让 wrong 远大于 tokens；无法
                     # 表示的错误率按缺失处理。

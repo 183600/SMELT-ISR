@@ -71,7 +71,7 @@ def _meta_gamma_upper_regularized(
         d_value = an * d_value + b_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = b_value + an / c_value
+        c_value = b_value + an / max(c_value, 1e-8)
         if abs(c_value) < tiny:
             c_value = tiny
         d_value = 1.0 / d_value
@@ -119,10 +119,10 @@ def _meta_beta_continued(
     qap = a_value + 1.0
     qam = a_value - 1.0
     c_value = 1.0
-    d_value = 1.0 - qab * x_value / qap
+    d_value = 1.0 - qab * x_value / max(qap, 1e-8)
     if abs(d_value) < tiny:
         d_value = tiny
-    d_value = 1.0 / d_value
+    d_value = 1.0 / max(d_value, 1e-8)
     h_value = d_value
     for index in range(1, 301):
         m2 = 2 * index
@@ -132,10 +132,10 @@ def _meta_beta_continued(
         d_value = 1.0 + aa * d_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = 1.0 + aa / c_value
+        c_value = 1.0 + aa / max(c_value, 1e-8)
         if abs(c_value) < tiny:
             c_value = tiny
-        d_value = 1.0 / d_value
+        d_value = 1.0 / max(d_value, 1e-8)
         h_value *= d_value * c_value
         aa = -(a_value + index) * (qab + index) * x_value / (
             (a_value + m2) * (qap + m2)
@@ -143,7 +143,7 @@ def _meta_beta_continued(
         d_value = 1.0 + aa * d_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = 1.0 + aa / c_value
+        c_value = 1.0 + aa / max(c_value, 1e-8)
         if abs(c_value) < tiny:
             c_value = tiny
         d_value = 1.0 / d_value

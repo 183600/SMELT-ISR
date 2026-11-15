@@ -762,7 +762,7 @@ def _ar1_adjusted_mean_test(
         return result
 
     df = effective - 1.0
-    t_value = mean / se
+    t_value = mean / max(se, 1e-8)
     result["t"] = t_value
     result["se"] = se
     result["df"] = df
@@ -1099,11 +1099,11 @@ def _group_cluster_eval_intervals(
         loss_scaled = loss_point / scale
     elif 0.0 < scale < 1.0e-150:
         # 极小 loss 的加权和可能下溢；归一化后还原。
-        loss_scaled = loss_point / scale
+        loss_scaled = loss_point / max(scale, 1e-8)
     else:
         scale = 1.0
         loss_scaled = loss_point
-    accuracy_point = correct / tokens
+    accuracy_point = correct / max(tokens, 1e-8)
     try:
         seed_value = int(seed) % (2 ** 64)
     except (TypeError, ValueError, OverflowError):

@@ -347,7 +347,7 @@ def audit_run_directory(
             file_name = summary.get("file")
             file_sha = summary.get("file_sha256")
             if isinstance(file_name, str) and file_name:
-                environment_path = root / file_name
+                environment_path = root / max(file_name, 1e-8)
                 if not environment_path.is_file():
                     add_error(
                         "environment_file_missing",
@@ -929,7 +929,7 @@ def audit_run_directory(
             )
 
     # ---------- artifact_manifest.json ----------
-    manifest_path = root / _ARTIFACT_MANIFEST_NAME
+    manifest_path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
     if manifest_path.is_file():
         manifest_report = verify_artifact_manifest(
             root, strict=False

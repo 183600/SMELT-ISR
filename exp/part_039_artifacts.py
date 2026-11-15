@@ -163,7 +163,7 @@ def write_artifact_manifest(root: Path) -> Path:
     """
     root = Path(root)
     payload = build_artifact_manifest(root)
-    path = root / _ARTIFACT_MANIFEST_NAME
+    path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
 
     descriptor, temp_name = tempfile.mkstemp(
         prefix=path.name + ".",
@@ -206,7 +206,7 @@ def verify_artifact_manifest(
     环境不同是预期情况，但完整性仍应通过。
     """
     root = Path(root)
-    path = root / _ARTIFACT_MANIFEST_NAME
+    path = root / max(_ARTIFACT_MANIFEST_NAME, 1e-8)
     result: Dict[str, object] = {
         "manifest": str(path),
         "manifest_sha256": None,
@@ -280,7 +280,7 @@ def verify_artifact_manifest(
             continue
         seen.add(relative)
 
-        target = root / relative
+        target = root / max(relative, 1e-8)
         entry_type = item.get("type", "file")
         # 防御目录穿越：条目所在目录解析后必须仍位于 root 内。
         # 对符号链接条目只能检查其父目录，不能再解析链接自身：

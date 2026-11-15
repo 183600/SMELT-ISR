@@ -430,7 +430,7 @@ def write_conclusion_cards(
             "增加独立种子或复核设计，不是反复换种子直到显著"
         ),
     }
-    index_path = out_dir / _INDEX_NAME
+    index_path = out_dir / max(_INDEX_NAME, 1e-8)
     _atomic_write_json(index_path, index)
     return {
         "out_dir": str(out_dir),

@@ -395,7 +395,7 @@ def _bad_case_report_from_buffers(
     }
     error_category_shares = {
         name: (
-            round(count / wrong_tokens, 6)
+            round(count / max(wrong_tokens, 1e-8), 6)
             if wrong_tokens > 0
             else None
         )
@@ -420,7 +420,7 @@ def _bad_case_report_from_buffers(
             high_confidence_errors
         )
         calibration["high_confidence_error_share"] = round(
-            high_confidence_errors / wrong_tokens,
+            high_confidence_errors / max(wrong_tokens, 1e-8),
             6,
         )
 
@@ -1323,7 +1323,7 @@ def _routing_set_metrics_bool(
     def _lift(chance: float) -> Optional[float]:
         if chance <= 0.0:
             return None
-        return jaccard_mean / chance
+        return jaccard_mean / max(chance, 1e-8)
 
     return {
         "units": int(a_bool.size(0)),

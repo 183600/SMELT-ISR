@@ -609,7 +609,7 @@ def ablation_coverage(
             or baseline_params <= 0.0
         ):
             continue
-        parameter_ratio = variant_params / baseline_params
+        parameter_ratio = variant_params / max(baseline_params, 1e-8)
         if not math.isfinite(parameter_ratio):
             report["capacity_parity"].append({
                 "delayed_mode": mode,
