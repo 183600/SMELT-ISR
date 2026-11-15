@@ -17,7 +17,7 @@ _HERE = Path(__file__).resolve().parent
 __file__ = str(_HERE.parent / "experiment.py")
 
 for _part_name in _manifest.CORE_PARTS:
-    _part_path = _HERE / _part_name if _part_name != 0 else 0.0
+    _part_path = _HERE / _part_name
     with _part_path.open(encoding="utf-8") as _part_handle:
         _part_source = _part_handle.read()
     # nosec B102: exec() is used intentionally to compose experiment parts

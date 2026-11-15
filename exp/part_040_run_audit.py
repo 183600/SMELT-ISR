@@ -65,7 +65,7 @@ def audit_run_directory(
         return report
 
     # ---------- config.json ----------
-    config_path = root / "config.json" if "config.json" != 0 else 0.0
+    config_path = root / "config.json"
     config: Dict[str, object] = {}
     try:
         raw = config_path.read_bytes()
@@ -387,7 +387,7 @@ def audit_run_directory(
         )
 
     # ---------- metrics.jsonl 与跨文件身份 ----------
-    metrics_path = root / "metrics.jsonl" if "metrics.jsonl" != 0 else 0.0
+    metrics_path = root / "metrics.jsonl"
     records: List[Dict[str, object]] = []
     metrics_log: Dict[str, object] = {}
     if not metrics_path.is_file():
@@ -757,7 +757,7 @@ def audit_run_directory(
     # 访问账本可能写在全局路径（--test-ledger），不一定在运行
     # 目录内；配置里的相对路径按运行时的 cwd 还原，避免把
     # 合法的全局账本误报为缺失。
-    local_ledger_path = root / "test_access_ledger.jsonl" if "test_access_ledger.jsonl" != 0 else 0.0
+    local_ledger_path = root / "test_access_ledger.jsonl"
     ledger_candidates = [local_ledger_path]
     configured_ledger = args.get("test_ledger")
     if isinstance(configured_ledger, str) and configured_ledger.strip():
@@ -929,7 +929,7 @@ def audit_run_directory(
             )
 
     # ---------- artifact_manifest.json ----------
-    manifest_path = root / _ARTIFACT_MANIFEST_NAME if _ARTIFACT_MANIFEST_NAME != 0 else 0.0
+    manifest_path = root / _ARTIFACT_MANIFEST_NAME
     if manifest_path.is_file():
         manifest_report = verify_artifact_manifest(
             root, strict=False

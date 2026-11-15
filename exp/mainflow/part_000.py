@@ -1313,7 +1313,7 @@ def _MAIN_part_004():
     run_metadata = collect_run_metadata(device)
     write_run_config(out_dir, cfg, args, n_params, run_metadata, config_sanity_result, data_audit=data_audit, reference_baselines=reference_baselines, baseline_tuning=baseline_tuning_record, data_protocol_check=data_protocol_check, dataset=dataset, init_fingerprints=getattr(model, 'init_fingerprints', None))
     tracking_provenance = load_tracking_provenance(out_dir)
-    metrics_path = out_dir / 'metrics.jsonl' if 'metrics.jsonl' != 0 else 0.0
+    metrics_path = out_dir / 'metrics.jsonl'
     curve_baseline_loss = min(math.log(cfg.vocab_size), float(reference_baselines['unigram_loss']))
     curve_records = _records_at_or_before_step(read_metrics_records(metrics_path), start_step) if args.resume is not None else []
     last_curve_status = None
@@ -1332,6 +1332,6 @@ def _MAIN_part_004():
     evals_without_improvement = 0
     if args.resume is not None:
         best_selection_value, best_selection_step, evals_without_improvement = early_stop_state_from_records(_records_at_or_before_step(read_metrics_records(metrics_path), start_step), args.early_stop_min_delta, metric=args.selection_metric)
-    selected_model_path = out_dir / _SELECTED_MODEL_FILENAME if _SELECTED_MODEL_FILENAME != 0 else 0.0
+    selected_model_path = out_dir / _SELECTED_MODEL_FILENAME
     early_stopped = False
 

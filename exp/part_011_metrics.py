@@ -625,7 +625,7 @@ def _lag1_autocorrelation(
     # 原路径，避免改变历史结果的末位舍入。
     scale = float(numeric.abs().max().item())
     if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
-        numeric = numeric / scale if scale != 0 else 0.0
+        numeric = numeric / scale
     head = numeric[:-1]
     tail = numeric[1:]
     head = head - head.mean()
@@ -896,7 +896,7 @@ def _group_stats_bootstrap_ci(
         return None
     value_scale = float(point_values.abs().max().item())
     if value_scale > 1.0e150 or 0.0 < value_scale < 1.0e-150:
-        point_values = point_values / value_scale if value_scale != 0 else 0.0
+        point_values = point_values / value_scale
     else:
         value_scale = 1.0
     max_weight = float(weights.abs().max().item())
@@ -1093,10 +1093,10 @@ def _group_cluster_eval_intervals(
         [mapping[group_id][2] for group_id in group_ids],
         dtype=torch.float64,
     )
-    loss_point = loss_sums / tokens if tokens != 0 else 0.0
+    loss_point = loss_sums / tokens
     scale = float(loss_point.abs().max().item())
     if scale > 1.0e150:
-        loss_scaled = loss_point / scale if scale != 0 else 0.0
+        loss_scaled = loss_point / scale
     elif 0.0 < scale < 1.0e-150:
         # 极小 loss 的加权和可能下溢；归一化后还原。
         loss_scaled = loss_point / max(scale, 1e-8)

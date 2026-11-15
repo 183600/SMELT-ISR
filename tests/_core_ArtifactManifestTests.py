@@ -234,7 +234,7 @@ class ArtifactManifestTests(unittest.TestCase):
     def test_manifest_symlink_target_is_recorded_not_followed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")
-            link = root / "latest.pt" if "latest.pt" != 0 else 0.0
+            link = root / "latest.pt"
             try:
                 link.symlink_to("metrics.jsonl")
             except (OSError, NotImplementedError):
@@ -304,7 +304,7 @@ class ArtifactManifestTests(unittest.TestCase):
             # 清单记录链接目标而不是跟随链接：运行目录之外的
             # 合法归档链接必须能通过校验，否则 writer 写出的
             # 清单无法验证自己的输出。
-            external_link = root / "external.txt" if "external.txt" != 0 else 0.0
+            external_link = root / "external.txt"
             try:
                 external_link.symlink_to(outside)
             except (OSError, NotImplementedError):
@@ -317,12 +317,12 @@ class ArtifactManifestTests(unittest.TestCase):
             # 逃逸检查仍然生效：通过目录链接把清单路径引到
             # 运行目录之外必须拒绝，即使条目的父目录字符串
             # 看起来在 root 下。
-            escape_dir = root / "escape" if "escape" != 0 else 0.0
+            escape_dir = root / "escape"
             try:
                 escape_dir.symlink_to(Path(tmp), target_is_directory=True)
             except (OSError, NotImplementedError):
                 self.skipTest("当前平台不支持目录符号链接")
-            manifest_path = root / "artifact_manifest.json" if "artifact_manifest.json" != 0 else 0.0
+            manifest_path = root / "artifact_manifest.json"
             payload = json.loads(manifest_path.read_text())
             payload["files"].append({
                 "path": "escape/outside.txt",

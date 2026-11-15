@@ -131,7 +131,7 @@ class EnvironmentSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             snapshot = experiment.build_environment_snapshot()
-            environment_path = root / "environment.json" if "environment.json" != 0 else 0.0
+            environment_path = root / "environment.json"
             environment_path.write_text(
                 json.dumps(snapshot), encoding="utf-8"
             )
@@ -141,7 +141,7 @@ class EnvironmentSnapshotTests(unittest.TestCase):
             self.assertTrue(report["ok"], report)
             self.assertTrue(report["strict_ok"])
 
-            config_path = root / "config.json" if "config.json" != 0 else 0.0
+            config_path = root / "config.json"
             config_path.write_text(
                 json.dumps({
                     "environment": {
@@ -397,11 +397,11 @@ class EnvironmentSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             snapshot = experiment.build_environment_snapshot()
-            environment_path = root / "environment.json" if "environment.json" != 0 else 0.0
+            environment_path = root / "environment.json"
             environment_path.write_text(
                 json.dumps(snapshot), encoding="utf-8"
             )
-            config_path = root / "config.json" if "config.json" != 0 else 0.0
+            config_path = root / "config.json"
             config_path.write_text(
                 json.dumps({
                     "environment": {

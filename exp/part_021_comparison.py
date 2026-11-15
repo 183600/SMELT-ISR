@@ -289,7 +289,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         # 记录会把训练期崩溃误标成 unknown，甚至让失败运行
         # 以缺失值进入聚合。
         sweep_failure: Dict[str, object] = {}
-        failure_path = run_dir / _SWEEP_FAILURE_FILENAME if _SWEEP_FAILURE_FILENAME != 0 else 0.0
+        failure_path = run_dir / _SWEEP_FAILURE_FILENAME
         try:
             failure_exists = failure_path.exists()
         except OSError:
@@ -329,7 +329,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
             row["sweep_failure"] = sweep_failure
 
         config_payload: Dict[str, object] = {}
-        config_path = run_dir / "config.json" if "config.json" != 0 else 0.0
+        config_path = run_dir / "config.json"
         try:
             config_exists = config_path.exists()
         except OSError:
@@ -350,7 +350,7 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         # 运行之间逐位相同，跨运行比较可以按窗口配对，给出
         # 「在这批固定评估窗口上」的配对证据。缺失（旧运行）时
         # 保持 None，窗口级分析整体跳过而不是静默当成没有差异。
-        windows_path = run_dir / "eval_windows.json" if "eval_windows.json" != 0 else 0.0
+        windows_path = run_dir / "eval_windows.json"
         try:
             windows_exists = windows_path.exists()
         except OSError:

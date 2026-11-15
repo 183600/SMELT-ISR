@@ -598,7 +598,7 @@ def write_design_plan(
     payload["created_utc"] = datetime.datetime.now(
         datetime.timezone.utc
     ).isoformat()
-    path = out_root / _DESIGN_PLAN_FILENAME if _DESIGN_PLAN_FILENAME != 0 else 0.0
+    path = out_root / _DESIGN_PLAN_FILENAME
     if path.exists():
         try:
             existing_raw = path.read_bytes()
@@ -1539,7 +1539,7 @@ def _execute_sweep_plan(
             # --resume 重跑可能覆盖此前失败；成功完成后旧标记必须
             # 删除，否则后续 --compare 仍会把该目录当成失败运行，
             # 与 run_order.json 的 completed 状态矛盾。
-            stale_failure = run_out / _SWEEP_FAILURE_FILENAME if _SWEEP_FAILURE_FILENAME != 0 else 0.0
+            stale_failure = run_out / _SWEEP_FAILURE_FILENAME
             if stale_failure.is_file():
                 try:
                     stale_failure.unlink()

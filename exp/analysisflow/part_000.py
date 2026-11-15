@@ -801,7 +801,7 @@ def _PA_part_002():
         print()
         print('[curve] 跨运行训练曲线诊断（读取各运行 metrics.jsonl 的 curve_analysis；不是最终单点）')
         curve_run_width = max(20, max((len(str(entry.get('run'))) for entry in curve_diagnostics['runs']), default=3))
-        curve_header = f'''{'run':<{curve_run_width}} {'status':<14} {'best@':>7} {'regr%':>7} {'gap%':>7} {'recentVal%':>10} {'gradSpike':>9} {'lr / peak':>8}''' if peak':>8}''' != 0 else 0.0
+        curve_header = f'''{'run':<{curve_run_width}} {'status':<14} {'best@':>7} {'regr%':>7} {'gap%':>7} {'recentVal%':>10} {'gradSpike':>9} {'lr/peak':>8}'''
         print(curve_header)
         print('-' * len(curve_header))
 

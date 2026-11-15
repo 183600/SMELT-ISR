@@ -507,7 +507,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
     if delta == 0.0:
         eta = 0.0
     else:
-        mu = delta / a if a != 0 else 0.0
+        mu = delta / a
         if abs(mu) < 1.0e-3:
             series = 0.0
             for coefficient in reversed(
@@ -516,7 +516,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
                 series = series * mu + coefficient
             eta_squared = 2.0 * mu * mu * series
         else:
-            ratio = x / a if a != 0 else 0.0
+            ratio = x / a
             if ratio == 0.0:
                 return 0.0, 1.0
             eta_squared = 2.0 * (
@@ -534,9 +534,9 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
         for coefficient in _GAMMA_TEMME_C1:
             c1 = c1 * eta + coefficient
     else:
-        mu = delta / a if a != 0 else 0.0
-        inverse_mu = 1.0 / mu if mu != 0 else 0.0
-        inverse_eta = 1.0 / eta if eta != 0 else 0.0
+        mu = delta / a
+        inverse_mu = 1.0 / mu
+        inverse_eta = 1.0 / eta
         c0 = inverse_mu - inverse_eta
         c1 = (
             inverse_eta ** 3
@@ -591,7 +591,7 @@ def _regularized_incomplete_gamma_parts(
         return _gamma_parts_temme(a, x)
     log_prefactor = -x + a * math.log(x) - math.lgamma(a)
     if x < a + 1.0:
-        term = 1.0 / a if a != 0 else 0.0
+        term = 1.0 / a
         total = term
         for index in range(1, 10000):
             term *= x / (a + index)
@@ -604,8 +604,8 @@ def _regularized_incomplete_gamma_parts(
         # Lentz 连分式计算 Q(a, x)。
         fpmin = 1.0e-300
         b = x + 1.0 - a
-        c = 1.0 / fpmin if fpmin != 0 else 0.0
-        d = 1.0 / b if b != 0 else 0.0
+        c = 1.0 / fpmin
+        d = 1.0 / b
         h = d
         for index in range(1, 10000):
             numerator = -index * (index - a)
@@ -613,10 +613,10 @@ def _regularized_incomplete_gamma_parts(
             d = numerator * d + b
             if abs(d) < fpmin:
                 d = fpmin
-            c = b + numerator / c if c != 0 else 0.0
+            c = b + numerator / c
             if abs(c) < fpmin:
                 c = fpmin
-            d = 1.0 / d if d != 0 else 0.0
+            d = 1.0 / d
             delta = d * c
             h *= delta
             if abs(delta - 1.0) <= 1.0e-15:

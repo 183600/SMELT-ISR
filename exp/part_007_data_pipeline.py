@@ -893,12 +893,12 @@ def _conditional_bigram_shift(
 
     supported = (eval_ctx > 0) & (train_ctx > 0)
     seen_pairs = float(eval_ctx[supported].sum())
-    seen_context_share = seen_pairs / total_eval_pairs if total_eval_pairs != 0 else 0.0
+    seen_context_share = seen_pairs / total_eval_pairs
 
     unseen_pairs = float(
         (evaluation * (train == 0)).sum()
     )
-    unseen_transition_share = unseen_pairs / total_eval_pairs if total_eval_pairs != 0 else 0.0
+    unseen_transition_share = unseen_pairs / total_eval_pairs
 
     if seen_pairs <= 0.0:
         conditional_js = 1.0

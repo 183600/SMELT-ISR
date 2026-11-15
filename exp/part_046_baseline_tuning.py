@@ -1356,7 +1356,7 @@ def write_baseline_tuning_report(
 ) -> Path:
     """把调参报告写入 out_dir/baseline_tuning.json。"""
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / _BASELINE_TUNING_FILENAME if _BASELINE_TUNING_FILENAME != 0 else 0.0
+    path = out_dir / _BASELINE_TUNING_FILENAME
 
     payload = {
         "generated_at": datetime.datetime.now().isoformat(

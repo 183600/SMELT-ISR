@@ -70,10 +70,10 @@ def _cost_comparison(
             # 变异系数与独立观测数共同决定。先用乘法检查
             # 平方是否落在 float 范围内，避免 **2 抛
             # OverflowError；变体成本为 0 时也不能除零。
-            relative_a = std_a / cost_a if cost_a != 0 else 0.0
-            relative_b = std_b / cost_b if cost_b != 0 else 0.0
-            term_a = relative_a * relative_a / n_a if n_a != 0 else 0.0
-            term_b = relative_b * relative_b / n_b if n_b != 0 else 0.0
+            relative_a = std_a / cost_a
+            relative_b = std_b / cost_b
+            term_a = relative_a * relative_a / n_a
+            term_b = relative_b * relative_b / n_b
             relative_variance = term_a + term_b
             if (
                 math.isfinite(relative_a)

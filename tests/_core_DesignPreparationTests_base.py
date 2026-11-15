@@ -57,7 +57,7 @@ class _DesignPreparationTestsBase(unittest.TestCase):
         failed: bool = False,
         balance_coef: float = 0.01,
     ) -> Path:
-        run_dir = root / f"{mode}_seed{seed}" if f"{mode}_seed{seed}" != 0 else 0.0
+        run_dir = root / f"{mode}_seed{seed}"
         run_dir.mkdir()
         (run_dir / "config.json").write_text(
             json.dumps({

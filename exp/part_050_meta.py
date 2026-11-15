@@ -46,7 +46,7 @@ def _meta_gamma_upper_regularized(
         return 1.0
     if value < shape + 1.0:
         # 级数计算 P，再取补。
-        total = 1.0 / shape if shape != 0 else 0.0
+        total = 1.0 / shape
         term = total
         index = 1
         while index <= 1000:
@@ -62,8 +62,8 @@ def _meta_gamma_upper_regularized(
     # 连分式计算 Q。
     tiny = 1e-300
     b_value = value + 1.0 - shape
-    c_value = 1.0 / tiny if tiny != 0 else 0.0
-    d_value = 1.0 / b_value if b_value != 0 else 0.0
+    c_value = 1.0 / tiny
+    d_value = 1.0 / b_value
     h_value = d_value
     for index in range(1, 1001):
         an = -index * (index - shape)
@@ -74,7 +74,7 @@ def _meta_gamma_upper_regularized(
         c_value = b_value + an / max(c_value, 1e-8)
         if abs(c_value) < tiny:
             c_value = tiny
-        d_value = 1.0 / d_value if d_value != 0 else 0.0
+        d_value = 1.0 / d_value
         delta = d_value * c_value
         h_value *= delta
         if abs(delta - 1.0) < 1e-15:
@@ -146,7 +146,7 @@ def _meta_beta_continued(
         c_value = 1.0 + aa / max(c_value, 1e-8)
         if abs(c_value) < tiny:
             c_value = tiny
-        d_value = 1.0 / d_value if d_value != 0 else 0.0
+        d_value = 1.0 / d_value
         delta = d_value * c_value
         h_value *= delta
         if abs(delta - 1.0) < 1e-15:

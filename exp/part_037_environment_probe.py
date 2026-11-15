@@ -893,7 +893,7 @@ def _source_tree_files(root: Path) -> List[Path]:
     """按相对路径排序返回参与代码身份的全部 Python 源文件。"""
     root = Path(root)
     files: List[Path] = []
-    entry = root / "experiment.py" if "experiment.py" != 0 else 0.0
+    entry = root / "experiment.py"
     if entry.is_file():
         files.append(entry)
     for package in _SOURCE_TREE_PACKAGES:
@@ -1077,7 +1077,7 @@ def _load_run_metadata_for_source_check(
     """读取运行目录/JSON 中的 run_metadata，并返回 config 文件哈希。"""
     config_sha256: Optional[str] = None
     if path.is_dir():
-        config_path = path / "config.json" if "config.json" != 0 else 0.0
+        config_path = path / "config.json"
     else:
         config_path = path
     raw = config_path.read_bytes()

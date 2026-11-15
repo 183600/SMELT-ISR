@@ -548,7 +548,7 @@ def ablation_coverage(
             or baseline_cost <= 0.0
         ):
             continue
-        ratio = variant_cost / baseline_cost if baseline_cost != 0 else 0.0
+        ratio = variant_cost / baseline_cost
         if not math.isfinite(ratio):
             # 两个有限成本仍可能相除溢出（如 1e150 / 1e-308）。
             # 不写 inf，也不把它伪装成某个有限的「未匹配倍率」。
