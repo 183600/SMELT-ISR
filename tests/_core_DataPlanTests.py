@@ -39,7 +39,7 @@ class DataPlanTests(unittest.TestCase):
         group_bytes: int = 64,
         separator: bytes = b"<|doc|>",
     ) -> Path:
-        path = root / "corpus.txt"
+        path = root / "corpus.txt" if "corpus.txt" != 0 else 0.0
         docs = [
             cls._printable(f"plan-doc-{index}", group_bytes)
             for index in range(groups)
@@ -120,7 +120,7 @@ class DataPlanTests(unittest.TestCase):
             self.assertEqual(
                 block["split_policy"], "contiguous"
             )
-            target = root / "data_plan.json"
+            target = root / "data_plan.json" if "data_plan.json" != 0 else 0.0
             written = experiment.write_data_plan(target, plan)
             self.assertTrue(written["written"])
             self.assertEqual(
@@ -204,7 +204,7 @@ class DataPlanTests(unittest.TestCase):
             root = Path(tmp)
             corpus = self._write_corpus(root)
             plan = self._plan(self._args(corpus))
-            target = root / "data_plan.json"
+            target = root / "data_plan.json" if "data_plan.json" != 0 else 0.0
             experiment.write_data_plan(target, plan)
             tampered = json.loads(
                 target.read_text(encoding="utf-8")
@@ -216,7 +216,7 @@ class DataPlanTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 experiment.load_data_plan(target)
-            list_file = root / "list.json"
+            list_file = root / "list.json" if "list.json" != 0 else 0.0
             list_file.write_text("[1, 2]", encoding="utf-8")
             with self.assertRaises(ValueError):
                 experiment.load_data_plan(list_file)
@@ -340,7 +340,7 @@ class DataPlanTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 experiment.data_protocol_cli_setup(chronological)
-            manifest = root / "time.txt"
+            manifest = root / "time.txt" if "time.txt" != 0 else 0.0
             manifest.write_text(
                 "2026-01-01T00:00:00Z\n"
                 "2026-01-02T00:00:00Z\n"
@@ -359,7 +359,7 @@ class DataPlanTests(unittest.TestCase):
             self.assertEqual(
                 ordered.time_order_evidence, evidence
             )
-            unordered = root / "unordered.txt"
+            unordered = root / "unordered.txt" if "unordered.txt" != 0 else 0.0
             unordered.write_text(
                 "2026-01-03T00:00:00Z\n"
                 "2026-01-01T00:00:00Z\n",
@@ -498,7 +498,7 @@ class DataPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             corpus = self._write_corpus(root)
-            manifest = root / "time.txt"
+            manifest = root / "time.txt" if "time.txt" != 0 else 0.0
             manifest.write_text(
                 "2026-01-01T00:00:00Z\n"
                 "2026-01-02T00:00:00Z\n",

@@ -68,7 +68,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
     def test_update_run_config_refuses_to_overwrite_corrupt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            config = run_dir / "config.json"
+            config = run_dir / "config.json" if "config.json" != 0 else 0.0
             config.write_text("{not json", encoding="utf-8")
             with self.assertRaises(ValueError):
                 experiment.update_run_config(

@@ -100,7 +100,7 @@ def run_statistical_baseline(
         f"{reference['unigram_loss']:.4f}"
     )
 
-    metrics_path = out_dir / "metrics.jsonl"
+    metrics_path = out_dir / "metrics.jsonl" if "metrics.jsonl" != 0 else 0.0
     metrics_file = open(
         metrics_path,
         "w",

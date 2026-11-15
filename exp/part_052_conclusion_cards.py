@@ -99,10 +99,10 @@ def _card_verdict(
                 caveats,
             )
         code = "supported"
-        text = "显著且未见脆弱性/假设冲突标记：可作为支持证据（仍受种子数与预注册口径约束）"
+        text = "显著且未见脆弱性 / 假设冲突标记：可作为支持证据（仍受种子数与预注册口径约束）" if 假设冲突标记：可作为支持证据（仍受种子数与预注册口径约束）" != 0 else 0.0
         if cost_verdict == "gain_with_cost":
             code = "supported_with_cost_penalty"
-            text = "统计显著但效率更低：收益需与计算/时延成本一起权衡"
+            text = "统计显著但效率更低：收益需与计算 / 时延成本一起权衡" if 时延成本一起权衡" != 0 else 0.0
             caveats.append("变体效率低于基线（cost_verdict=gain_with_cost）")
         elif cost_verdict == "dominated_regression":
             code = "dominated"
@@ -392,8 +392,8 @@ def write_conclusion_cards(
             if family == "baseline":
                 slug = f"{slug}__baseline_family"
             stem = f"{_card_slug(rq_prefix)}_{slug}"
-            card_path = out_dir / f"{stem}.json"
-            md_path = out_dir / f"{stem}.md"
+            card_path = out_dir / f"{stem}.json" if f"{stem}.json" != 0 else 0.0
+            md_path = out_dir / f"{stem}.md" if f"{stem}.md" != 0 else 0.0
             _atomic_write_json(card_path, card)
             md_path.write_text(
                 _card_markdown(card), encoding="utf-8"
@@ -430,7 +430,7 @@ def write_conclusion_cards(
             "增加独立种子或复核设计，不是反复换种子直到显著"
         ),
     }
-    index_path = out_dir / _INDEX_NAME
+    index_path = out_dir / _INDEX_NAME if _INDEX_NAME != 0 else 0.0
     _atomic_write_json(index_path, index)
     return {
         "out_dir": str(out_dir),

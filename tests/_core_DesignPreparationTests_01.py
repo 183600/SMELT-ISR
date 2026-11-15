@@ -578,7 +578,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
                 )
             # 崩溃到连 config/metrics 都没写出的运行目录：无法
             # 归入处理单元，但不能静默把它的脱落忽略。
-            empty = root / "crashed"
+            empty = root / "crashed" if "crashed" != 0 else 0.0
             empty.mkdir()
             paths.append(str(empty))
             evidence = experiment.build_pilot_power_evidence(
@@ -700,7 +700,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
             paths = []
             for k1 in (1, 2):
                 for seed in (1, 2, 3):
-                    run_dir = root / f"A_k{k1}_{seed}"
+                    run_dir = root / f"A_k{k1}_{seed}" if f"A_k{k1}_{seed}" != 0 else 0.0
                     run_dir.mkdir()
                     (run_dir / "config.json").write_text(
                         json.dumps({
@@ -803,7 +803,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
         # 当作功效足够放行。
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            run_dir = root / "unassigned"
+            run_dir = root / "unassigned" if "unassigned" != 0 else 0.0
             run_dir.mkdir()
             (run_dir / "config.json").write_text(
                 json.dumps({
@@ -1006,9 +1006,9 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
         plan = self._sweep_plan_for_failure_tests()[:1]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            run_out = root / "A_seed1"
+            run_out = root / "A_seed1" if "A_seed1" != 0 else 0.0
             run_out.mkdir()
-            marker = run_out / "sweep_failure.json"
+            marker = run_out / "sweep_failure.json" if "sweep_failure.json" != 0 else 0.0
             marker.write_text(
                 json.dumps({"returncode": 1}), encoding="utf-8"
             )

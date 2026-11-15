@@ -103,7 +103,7 @@ def _group_cluster_paired_comparison(
     )
     scale = float(difference_tensor.abs().max().item())
     if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
-        scaled_differences = difference_tensor / scale
+        scaled_differences = difference_tensor / scale if scale != 0 else 0.0
     else:
         scale = 1.0
         scaled_differences = difference_tensor
@@ -139,7 +139,7 @@ def _group_cluster_paired_comparison(
         weight_scale > 1.0e150
         or 0.0 < weight_scale < 1.0e-150
     ):
-        mean_weights = weight_tensor / weight_scale
+        mean_weights = weight_tensor / weight_scale if weight_scale != 0 else 0.0
     else:
         mean_weights = weight_tensor
     weighted_mean = float(
@@ -365,12 +365,12 @@ def _hierarchical_group_bootstrap_ci(
     )
     scale = float(values.abs().max().item())
     if scale > 1.0e150 or 0.0 < scale < 1.0e-150:
-        values = values / scale
+        values = values / scale if scale != 0 else 0.0
     else:
         scale = 1.0
     token_scale = max(reference_tokens)
     if token_scale > 1.0e150 or 0.0 < token_scale < 1.0e-150:
-        token_weights = tokens / token_scale
+        token_weights = tokens / token_scale if token_scale != 0 else 0.0
     else:
         token_weights = tokens
     value_scale = float(values.abs().max().item())

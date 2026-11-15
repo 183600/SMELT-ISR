@@ -7,7 +7,7 @@ class DesignPreflightTests(unittest.TestCase):
     """--plan-design 阶段的语料与算力预检。"""
 
     def _write_corpus(self, root: Path, content: bytes) -> Path:
-        corpus = root / "corpus.txt"
+        corpus = root / "corpus.txt" if "corpus.txt" != 0 else 0.0
         corpus.write_bytes(content)
         return corpus
 
@@ -217,7 +217,7 @@ class DesignPreflightTests(unittest.TestCase):
         seed: int,
         ms_per_step: float,
     ) -> Path:
-        run_dir = root / f"{mode}_seed{seed}"
+        run_dir = root / f"{mode}_seed{seed}" if f"{mode}_seed{seed}" != 0 else 0.0
         run_dir.mkdir(parents=True)
         (run_dir / "config.json").write_text(
             json.dumps(

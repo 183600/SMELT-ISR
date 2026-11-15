@@ -341,8 +341,8 @@ def _welch_t_test(
         # 按不可用处理，而不是让 **2 抛 OverflowError。
         return {"test": "invalid_values"}
 
-    term_a = var_a / n_a
-    term_b = var_b / n_b
+    term_a = var_a / n_a if n_a != 0 else 0.0
+    term_b = var_b / n_b if n_b != 0 else 0.0
     se_squared = term_a + term_b
     delta = mean_b - mean_a
     if not math.isfinite(se_squared) or not math.isfinite(delta):
@@ -699,7 +699,7 @@ def _t_power_nodes(
         if intervals % 2:
             intervals += 1
 
-        step = t_max / intervals
+        step = t_max / intervals if intervals != 0 else 0.0
         u_values: List[float] = []
         weighted: List[float] = []
         for index in range(intervals + 1):
@@ -743,7 +743,7 @@ def _t_power_nodes(
     if intervals % 2:
         intervals += 1
 
-    step = u_max / intervals
+    step = u_max / intervals if intervals != 0 else 0.0
     u_values = []
     weighted = []
     for index in range(intervals + 1):
@@ -883,7 +883,7 @@ def _t_power_small_df_large_scale(
 
     total = 0.0
     intervals = _T_POWER_MIN_INTERVALS
-    step = 1.0 / intervals
+    step = 1.0 / intervals if intervals != 0 else 0.0
     for index in range(intervals + 1):
         t = index * step
         if index == 0 or index == intervals:
@@ -1084,7 +1084,7 @@ def _t_power(
         total = 0.0
         for index in range(intervals + 1):
             w = index * step
-            u = w / scale
+            u = w / scale if scale != 0 else 0.0
             if index == 0 or index == intervals:
                 simpson = step / 3.0
             elif index % 2 == 0:
@@ -1355,7 +1355,7 @@ def _noncentral_t_cdf_large_shift(
             intervals = max(2, math.ceil(width / step))
             if intervals % 2:
                 intervals += 1
-            step = width / intervals
+            step = width / intervals if intervals != 0 else 0.0
             for index in range(intervals + 1):
                 argument = low + index * step
                 u = (argument + noncentrality) / a
@@ -1397,7 +1397,7 @@ def _noncentral_t_cdf_large_shift(
             intervals = max(2, math.ceil(width / step))
             if intervals % 2:
                 intervals += 1
-            step = width / intervals
+            step = width / intervals if intervals != 0 else 0.0
             for index in range(intervals + 1):
                 argument = low + index * step
                 u = (argument + noncentrality) / a
@@ -1651,7 +1651,7 @@ def _jzs_posterior_mixture(
     g_weights = g_weights[keep]
     g_weights = g_weights / float(np.dot(g_weights, np.ones_like(g_weights)))
     one_plus_ng = 1.0 + n_value * g_nodes
-    v_g = g_nodes / one_plus_ng
+    v_g = g_nodes / one_plus_ng if one_plus_ng != 0 else 0.0
     lam2 = 1.0 + t_value * t_value / (one_plus_ng * df_value)
     c_g = (
         t_value

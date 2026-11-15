@@ -331,11 +331,11 @@ def load_environment_snapshot(
     """
     path = Path(path)
     if path.is_dir():
-        environment_path = path / _ENVIRONMENT_FILENAME
+        environment_path = path / _ENVIRONMENT_FILENAME if _ENVIRONMENT_FILENAME != 0 else 0.0
         if environment_path.is_file():
             path = environment_path
         else:
-            config_path = path / "config.json"
+            config_path = path / "config.json" if "config.json" != 0 else 0.0
             if not config_path.is_file():
                 raise ValueError(
                     f"{path} 内既没有 {_ENVIRONMENT_FILENAME}，"

@@ -68,7 +68,7 @@ def evaluate(
     macro F1 / 召回率等分类指标判定时，区间与点估计同口径，
     不会只给 loss 不确定性而让分类结论裸奔。
 
-    compute_auc=True 时（最终/测试评估）额外计算
+    compute_auc = True 时（最终 / 测试评估）额外计算 if 测试评估）额外计算 != 0 else 0.0
     # TODO: Report confidence intervals or std alongside point estimates
     one-vs-rest 的 ``{split}_pr_auc_macro`` 与
     ``{split}_roc_auc_macro``，只纳入 support 达到
@@ -879,8 +879,8 @@ def compute_reference_baselines(
         raise RuntimeError(
             f"基线评估未产生任何 token（{split} split），请检查数据集。"
         )
-    loss_uniform = uniform_total / evaluated_tokens
-    loss_unigram = unigram_total / evaluated_tokens
+    loss_uniform = uniform_total / evaluated_tokens if evaluated_tokens != 0 else 0.0
+    loss_unigram = unigram_total / evaluated_tokens if evaluated_tokens != 0 else 0.0
 
     class_metrics = confusion_matrix_metrics(confusion)
 

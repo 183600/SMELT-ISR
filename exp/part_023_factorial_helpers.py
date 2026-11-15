@@ -649,10 +649,10 @@ def _betacf(a: float, b: float, x: float) -> float:
     qam = a - 1.0
 
     c = 1.0
-    d = 1.0 - qab * x / qap
+    d = 1.0 - qab * x / qap if qap != 0 else 0.0
     if abs(d) < fpmin:
         d = fpmin
-    d = 1.0 / d
+    d = 1.0 / d if d != 0 else 0.0
     h = d
 
     for iteration in range(1, max_iterations + 1):
@@ -667,10 +667,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / c
+        c = 1.0 + numerator / c if c != 0 else 0.0
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / d
+        d = 1.0 / d if d != 0 else 0.0
         h *= d * c
 
         numerator = (
@@ -682,10 +682,10 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = 1.0 + numerator * d
         if abs(d) < fpmin:
             d = fpmin
-        c = 1.0 + numerator / c
+        c = 1.0 + numerator / c if c != 0 else 0.0
         if abs(c) < fpmin:
             c = fpmin
-        d = 1.0 / d
+        d = 1.0 / d if d != 0 else 0.0
         delta = d * c
         h *= delta
 
@@ -713,7 +713,7 @@ def _log_gamma_ratio_half(z: float) -> float:
     """
     计算 log(Γ(z+1/2 + 1e-8)/Γ(z))，避免大 z 下两个 lgamma 相减。
     """
-    inverse = 1.0 / z
+    inverse = 1.0 / z if z != 0 else 0.0
     series = inverse * (
         -1.0 / 8.0
         + inverse * (
@@ -730,7 +730,7 @@ def _log_gamma_ratio_half(z: float) -> float:
 
 def _stirling_log_gamma_correction(z: float) -> float:
     """log Γ(z) 的 Stirling 级数修正项（z 足够大时）。"""
-    inverse = 1.0 / z
+    inverse = 1.0 / z if z != 0 else 0.0
     squared = inverse * inverse
     return inverse * (
         1.0 / 12.0
@@ -1125,7 +1125,7 @@ def _paired_sign_flip_test(
             if statistic >= observed - tolerance:
                 count += 1
         permutations = 2 ** n
-        p_value = count / permutations
+        p_value = count / permutations if permutations != 0 else 0.0
         method = "exact"
     else:
         generator = torch.Generator().manual_seed(
@@ -1419,9 +1419,9 @@ def _wilcoxon_signed_rank_test(
             ):
                 count += 1
         permutations = 2 ** n
-        p_value = count / permutations
+        p_value = count / permutations if permutations != 0 else 0.0
         method = "exact"
-        min_attainable_p = 2.0 / permutations
+        min_attainable_p = 2.0 / permutations if permutations != 0 else 0.0
         required_seeds = _sign_flip_required_seeds(
             _SIGNIFICANCE_LEVEL
         )
@@ -1762,7 +1762,7 @@ def _paired_window_bootstrap_ci(
     # 原路径，避免改变历史区间。
     scale = float(values.abs().max().item())
     if scale > 1.0e150:
-        values = values / scale
+        values = values / scale if scale != 0 else 0.0
     else:
         scale = 1.0
     indices = torch.randint(

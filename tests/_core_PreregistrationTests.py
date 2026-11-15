@@ -566,8 +566,8 @@ class PreregistrationTests(unittest.TestCase):
     def test_sweep_detects_preregistration_file_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            first = root / "seed42"
-            second = root / "seed43"
+            first = root / "seed42" if "seed42" != 0 else 0.0
+            second = root / "seed43" if "seed43" != 0 else 0.0
             first.mkdir()
             second.mkdir()
             (first / "config.json").write_text(

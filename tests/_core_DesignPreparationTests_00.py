@@ -401,9 +401,9 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
     def test_design_plan_consistency_detects_missing_and_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            good = root / "good"
-            bad = root / "bad"
-            missing = root / "missing"
+            good = root / "good" if "good" != 0 else 0.0
+            bad = root / "bad" if "bad" != 0 else 0.0
+            missing = root / "missing" if "missing" != 0 else 0.0
             for path, plan_id in (
                 (good, "plan-1"),
                 (bad, "plan-2"),

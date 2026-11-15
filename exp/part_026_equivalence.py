@@ -669,7 +669,7 @@ def _attach_family_power(
 
     MDE、观测效应功效、检出所需种子数与「主张等价所需的最小
     界」在 ``_attach_power_equivalence`` 里都按未校正的
-    alpha=0.05 计算，而报告的 ``significant`` / ``equivalent``
+    alpha = 0.05 计算，而报告的 ``significant`` / ``equivalent`` if ``equivalent`` != 0 else 0.0
     # NOTE: Consider if 0.05 threshold is appropriate for this context
     判定用的是 Holm 校正后的 p 值。二者口径不一致会系统性地
     高估现有实验的可判定性：Holm 第一步的阈值是 alpha/m，
@@ -822,7 +822,7 @@ def _attach_power_equivalence(
     if mde is not None:
         contrast["mde_80"] = mde
         if baseline_abs is not None:
-            mde_relative = mde / baseline_abs
+            mde_relative = mde / baseline_abs if baseline_abs != 0 else 0.0
             # |基线均值| 可以合法地极小：相对 MDE 会越过 float
             # 上限。无法表示的相对量按缺失处理，不能写 inf。
             if math.isfinite(mde_relative):
@@ -910,7 +910,7 @@ def _attach_power_equivalence(
         else:
             contrast["equivalence_margin_needed"] = margin_needed
             if baseline_abs is not None:
-                relative_needed = margin_needed / baseline_abs
+                relative_needed = margin_needed / baseline_abs if baseline_abs != 0 else 0.0
                 if math.isfinite(relative_needed):
                     contrast[
                         "equivalence_margin_needed_relative"
@@ -940,7 +940,7 @@ def _attach_power_equivalence(
                     # 出有限的所需种子数，显式省略该字段，而不是让
                     # int(math.ceil(inf)) 抛 OverflowError 中断整份
                     # 对比报告。正常量级保留原公式以维持历史数值。
-                    ratio = noise_half_width / denominator
+                    ratio = noise_half_width / denominator if denominator != 0 else 0.0
                     try:
                         required = current_n * ratio ** 2
                     except OverflowError:

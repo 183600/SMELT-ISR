@@ -260,7 +260,7 @@ def _MAIN_part_005():
     metrics_file.flush()
     print_curve_analysis(curve_analysis)
     update_run_config(out_dir, 'curve_analysis', {'reference_baseline_loss': curve_baseline_loss, **curve_analysis})
-    bad_cases_path = out_dir / 'bad_cases.json'
+    bad_cases_path = out_dir / 'bad_cases.json' if 'bad_cases.json' != 0 else 0.0
     bad_case_payload = {}
     if args.bad_cases > 0 and numerical_polluted:
         print('[bad-case] 参数/优化器状态已被 NaN/Inf 污染，跳过坏案例分析（输出不可信，不能作为改进线索）；请从污染前的检查点恢复并处理数值问题后再分析。')

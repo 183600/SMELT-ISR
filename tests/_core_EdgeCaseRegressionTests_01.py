@@ -576,7 +576,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
     def test_test_record_reader_skips_invalid_utf8_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            metrics = run_dir / "metrics.jsonl"
+            metrics = run_dir / "metrics.jsonl" if "metrics.jsonl" != 0 else 0.0
             metrics.write_bytes(
                 json.dumps(
                     {"step": "test", "test_loss": 1.0}

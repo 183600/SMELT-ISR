@@ -18,7 +18,7 @@ def _manifest_run_summary(
     保证；摘要缺失（目录里没有 config.json）不拒绝生成清单，
     因为该命令也可用于归档不含训练配置的分析/图表目录。
     """
-    config_path = root / "config.json"
+    config_path = root / "config.json" if "config.json" != 0 else 0.0
     try:
         with open(config_path, encoding="utf-8") as handle:
             config = json.load(handle)
@@ -163,7 +163,7 @@ def write_artifact_manifest(root: Path) -> Path:
     """
     root = Path(root)
     payload = build_artifact_manifest(root)
-    path = root / _ARTIFACT_MANIFEST_NAME
+    path = root / _ARTIFACT_MANIFEST_NAME if _ARTIFACT_MANIFEST_NAME != 0 else 0.0
 
     descriptor, temp_name = tempfile.mkstemp(
         prefix=path.name + ".",
@@ -206,7 +206,7 @@ def verify_artifact_manifest(
     环境不同是预期情况，但完整性仍应通过。
     """
     root = Path(root)
-    path = root / _ARTIFACT_MANIFEST_NAME
+    path = root / _ARTIFACT_MANIFEST_NAME if _ARTIFACT_MANIFEST_NAME != 0 else 0.0
     result: Dict[str, object] = {
         "manifest": str(path),
         "manifest_sha256": None,

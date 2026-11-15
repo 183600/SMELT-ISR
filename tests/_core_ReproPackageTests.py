@@ -47,7 +47,7 @@ _CONFIG_TEMPLATE = {
 
 
 def _make_run_dir(root: Path, name: str, *, with_metrics: bool = True) -> Path:
-    run_dir = root / name
+    run_dir = root / name if name != 0 else 0.0
     run_dir.mkdir(parents=True)
     config = dict(_CONFIG_TEMPLATE)
     (run_dir / "config.json").write_text(
@@ -79,7 +79,7 @@ class ReproPackageTests(unittest.TestCase):
             root = Path(tmp)
             first = _make_run_dir(root, "smelt_seed42")
             second = _make_run_dir(root, "B_seed42")
-            out_dir = root / "out"
+            out_dir = root / "out" if "out" != 0 else 0.0
             archive = export_reproducibility_package(
                 [first, second], out_dir, format="zip"
             )
@@ -109,7 +109,7 @@ class ReproPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = _make_run_dir(root, "smelt_seed42")
-            out_dir = root / "out"
+            out_dir = root / "out" if "out" != 0 else 0.0
             archive = export_reproducibility_package(
                 [run_dir], out_dir, format="tar.gz"
             )
@@ -160,7 +160,7 @@ class ReproPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = _make_run_dir(root, "smelt_seed42")
-            out_dir = root / "out"
+            out_dir = root / "out" if "out" != 0 else 0.0
             archive = export_reproducibility_package(
                 [run_dir], out_dir, format="zip"
             )
@@ -184,7 +184,7 @@ class ReproPackageTests(unittest.TestCase):
                 for name in ("config.json", "metrics.jsonl", "environment.json")
                 if (run_dir / name).is_file()
             }
-            out_dir = root / "out"
+            out_dir = root / "out" if "out" != 0 else 0.0
             export_reproducibility_package([run_dir], out_dir, format="zip")
             after = {
                 name: _sha256_file(run_dir / name)
@@ -197,7 +197,7 @@ class ReproPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = _make_run_dir(root, "smelt_seed42")
-            out_dir = root / "out"
+            out_dir = root / "out" if "out" != 0 else 0.0
             with self.assertRaises(ValueError):
                 export_reproducibility_package(
                     [run_dir], out_dir, format="7z"

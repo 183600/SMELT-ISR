@@ -16,7 +16,7 @@ def load_tracking_provenance(
     并返回 resume_count 与受控变量协议指纹，供 metrics.jsonl
     脱离 config.json 归档时仍能定位原始运行。
     """
-    path = out_dir / "config.json"
+    path = out_dir / "config.json" if "config.json" != 0 else 0.0
     empty: Dict[str, object] = {
         "run_started_utc": None,
         "original_script_sha256": None,
@@ -134,7 +134,7 @@ def load_previous_sanity_result(
     resume 会重写 config.json；保留原始运行的 sanity 结果，
     避免追踪信息在恢复训练后丢失（metrics.jsonl 首行也有记录）。
     """
-    path = out_dir / "config.json"
+    path = out_dir / "config.json" if "config.json" != 0 else 0.0
 
     if not _path_exists(path):
         return None
