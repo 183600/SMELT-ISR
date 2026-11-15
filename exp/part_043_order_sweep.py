@@ -605,7 +605,7 @@ def _regularized_incomplete_gamma_parts(
         fpmin = 1.0e-300
         b = x + 1.0 - a
         c = 1.0 / fpmin
-        d = 1.0 / b
+        d = 1.0 / max(b, 1e-10)
         h = d
         for index in range(1, 10000):
             numerator = -index * (index - a)
@@ -616,7 +616,7 @@ def _regularized_incomplete_gamma_parts(
             c = b + numerator / c
             if abs(c) < fpmin:
                 c = fpmin
-            d = 1.0 / d
+            d = 1.0 / max(d, 1e-10)
             delta = d * c
             h *= delta
             if abs(delta - 1.0) <= 1.0e-15:
