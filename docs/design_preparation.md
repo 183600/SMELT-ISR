@@ -504,21 +504,27 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
    `power.plan_equivalence=true`，同时查看
    `equivalence.required_seeds_with_attrition` 与
    `equivalence.margin_for_target_power`；
-2. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置与
+2. 若计划训练中途看结果，在 `stopping_rules` 里同时声明
+   `interim_look_steps` 与 `alpha_spending`，并确认设计计划
+   按 `power_at_final_look` 判定序贯设计功效充足；不声明
+   `alpha_spending` 时，中期结论只能作为非确证性观察；
+3. 用 `--plan-design` 检查运行清单、随机化/平衡顺序、位置与
    一阶 carryover 平衡（担心残留效应时选 `williams` 并确认
    区组数是设计行数的整数倍）、对比类型功效（`binding_contrast`
-   通常是交互）、`pilot_evidence` 与 token 预算；调整种子数或
-   最小效应后再冻结；
-3. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
+   通常是交互）、`pilot_evidence`、序贯边界与 token 预算；
+   调整种子数或最小效应后再冻结；
+4. 把 `design_plan.json`、预注册文件、`git archive` 与数据清单
    放入同一只读目录；
-4. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；
+5. 正式运行时使用同一 `--run-order-seed`；子进程核对计划；
    确认 `failure_policy` 是预注册想要的 `continue`（默认）或
    `stop`；训练期失败后仍让剩余区组跑完；
-5. 分析时同时报告 `power`、`seed_plan`、`order_balance`、
+6. 分析时同时报告 `power`、`seed_plan`、`order_balance`、
    `run_order` 与 `sweep_execution`；顺序相关强时先调查漂移，
    而不是直接解释臂间差异；交互不显著时先看它的 MDE/功效，
    不能把「按两两对比够用的种子数」当成「交互也有足够功效」；
-6. 增加种子/重跑必须作为新研究阶段重新预注册，不能反复换种子
+   声明了 `alpha_spending` 时，中期/最终主张必须使用所在
+   观察点的名义 alpha；
+7. 增加种子/重跑必须作为新研究阶段重新预注册，不能反复换种子
    直到显著。因数值失败而剔除运行也必须按预注册的脱落/失败率
    口径报告，不能只保留成功运行；失败目录、`run_order.json` 与
    `comparison_analysis.json` 要一起归档。
@@ -547,30 +553,89 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
 "stopping_rules": {
   "max_total_runs": 24,
   "interim_look_steps": [2000],
-  "extension_requires_new_preregistration": true
+  "extension_requires_new_preregistration": true,
+  "alpha_spending": "obrien_fleming"
 }
 ```
 
 - `max_total_runs`（必填正整数）：本项研究最多运行的次数，
-  覆盖全部臂 × 种子 ×（消融/调参轴）展开。schema 拒绝
-  `max_total_runs < seeds 数量` 的自相矛盾声明；`--plan-design`
-  与正式套件在冻结设计时核对计划运行数，超限直接拒绝——
-  「不显著就再加 3 个种子」的序贯偷看不再是执行选项，而是
-  必须重新预注册的新研究阶段。
+   覆盖全部臂 × 种子 ×（消融/调参轴）展开。schema 拒绝
+   `max_total_runs < seeds 数量` 的自相矛盾声明；`--plan-design`
+   与正式套件在冻结设计时核对计划运行数，超限直接拒绝——
+   「不显著就再加 3 个种子」的序贯偷看不再是执行选项，而是
+   必须重新预注册的新研究阶段。
 - `interim_look_steps`（可选，无重复正整数列表）：允许做中期
-  汇总的训练步数，声明步数不得超过 `steps`。未声明的步数上
-  做中期结论属于序贯偷看；在每个观察点报告结论时必须写明
-  「中期观察，未做多 look alpha 校正」（框架目前不自动做
-  Pocock/O'Brien-Fleming 校正）。
+   汇总的训练步数，声明步数不得超过 `steps`。未声明的步数上
+   做中期结论属于序贯偷看；只声明该列表而不声明
+   `alpha_spending` 时，中期结论仍按未校正口径报告，必须写明
+   「中期观察，未做多 look alpha 校正」。
+- `alpha_spending`（可选，默认 `none`）：中期观察点的**序贯
+   alpha 分配**方案，见 7.1.1 节。
 - `extension_requires_new_preregistration`（可选布尔，默认
-  true）：超出预注册计划的扩展是否必须重新预注册。
+   true）：超出预注册计划的扩展是否必须重新预注册。
 
 字段随 `config.json`（`preregistration.stopping_rules`）与
 `design_plan.json`（回显，含 `within_max_total_runs`）落盘，
 被 `plan_id` 与预注册文件 SHA-256 覆盖；`print_design_summary`
-打印 `[design][stopping]` 运行上限行。注意它只约束「计划运行
-数」：`--resume` 续跑同一目录由 out 目录覆盖保护与测试访问
-账本约束；跨目录新增种子属于新研究阶段。
+打印 `[design][stopping]` 运行上限行与 `[design][alpha-spending]`
+序贯边界摘要。注意运行上限只约束「计划运行数」：`--resume`
+续跑同一目录由 out 目录覆盖保护与测试访问账本约束；跨目录
+新增种子属于新研究阶段。
+
+### 7.1.1 `alpha_spending`：中期观察消耗家族 alpha
+
+只声明 `interim_look_steps` 的中期汇总仍是**未校正的序贯
+检验**：每多看一次结果并据此做主张，家族错误率就超出声明的
+`power.alpha` 一次。`alpha_spending` 用 Lan–DeMets 消耗函数把
+家族 alpha 按**信息分数**（观察步 / 总步）预先分配到各观察点
+（含最终分析），让「训练中途看结果并发表结论」从违规偷看
+变成设计的一部分：
+
+| 方案 | 累积消耗 | 行为 |
+|---|---|---|
+| `none`（默认） | 不分配 | 中期结论只能作为非确证性观察 |
+| `pocock` | `alpha·ln(1+(e-1)·t)` | 各观察点名义 alpha 接近均分；早期便宜、最终严格 |
+| `obrien_fleming` | `2-2·Φ(z_{alpha/2}/√t)` | 早期消耗极少、最终分析保留接近完整的 alpha；适合「中期只做止损检查、结论主要看最终分析」 |
+
+声明 `pocock` / `obrien_fleming` 时的约束（入口 schema 逐项
+拒绝）：
+
+- 必须同时声明非空 `interim_look_steps`，且观察步**严格递增**
+  并**小于** `steps`（等于总步数的观察点就是最终分析）；
+- 必须声明顶层 `steps`（信息分数的分母）与 `power.alpha`
+  （被消耗的家族 alpha）。
+
+设计计划把每个观察点的名义 alpha（`two_sided_p_threshold`）、
+z 边界与信息分数写进 `design_plan.json` 的
+`stopping_rules.alpha_spending`，随 `plan_id` 冻结——事后换
+方案（或把方案改成 `none`）会改变指纹，不能伪装成同一份
+设计。`print_design_summary` 打印 `[design][alpha-spending]`
+边界摘要。
+
+两个功效与主张上的硬约束：
+
+1. **最终分析的名义 alpha 变小了。** 中期观察消耗了家族
+   alpha，最终分析只能用剩余的份额（Pocock 尤其明显：
+   3 个观察点、家族 alpha=0.05 时最终名义 alpha≈1.2%）。
+   设计计划会按最终名义 alpha **强制重算先验功效**，写入
+   `power_at_final_look`；重算后仍不足且未显式承认时，
+   正式套件在第一个子进程前拒绝启动（`--allow-underpowered`
+   或 `power.underpowered_acknowledged=true` 豁免，与固定
+   样本口径一致）。正确反应是增加种子、减少观察点，或改用
+   `obrien_fleming` 保留更多最终 alpha——不能沿用「按原始
+   alpha 够用」的结论。
+2. **每个观察点的主张必须使用该点的名义 alpha。** 中期结论
+   按 `two_sided_p_threshold` 判定，最终结论按最终名义 alpha
+   判定；把中期观察的名义 p 值与声明 alpha 比较，等于把
+   序贯校正丢掉，与未声明 `alpha_spending` 的偷看没有区别。
+
+口径与限制：消耗函数按「信息分数与名义检验统计量独立」的
+近似计算，未建模多臂/多对比下的联合分布；家族内部的
+Bonferroni/Holm 校正仍由分析阶段按原口径执行，名义 alpha
+先消耗、再在家族内分割。中期观察点上的指标必须与主指标同
+口径（与试点证据的指标口径规则一致）。框架不自动在中期
+观察点停止训练：停止决策由研究者在预声明的边界内做出并
+归档。
 
 ### 7.2 `exclusion_criteria`：预先写死排除规则
 
@@ -613,3 +678,15 @@ false，并报告已覆盖的有序对与完整平衡所需的区组倍数；不
 论证质量——外部审计仍需人工阅读依据，但「有没有依据」不再
 是可以跳过的决定。试点证据（第 2.3 节）只校准噪声与脱落，
 不校准效应大小，不能反过来用试点观测效应改 `min_effect`。
+
+## 8. 与现有协议的关系（本节补充）
+
+- 第 7.1.1 节的 `alpha_spending` 补上了第 49 节审计记录里
+  「中期观察只声明位置、不做序贯校正」的缺口：声明方案后，
+  中期观察消耗家族 alpha，设计计划按最终名义 alpha 重算
+  先验功效并在启动门核对；
+- `schemas/preregistration.v1.json` 的 `stopping_rules` 新增
+  可选字段 `alpha_spending`（`none`/`pocock`/`obrien_fleming`），
+  旧预注册文件不受影响；
+- `preregistration.example.json` 演示了 `steps=4000`、中期
+  观察点 2000 与 `obrien_fleming` 的组合。

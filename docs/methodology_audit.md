@@ -2055,7 +2055,9 @@ schema 没有可核对的运行上限字段，设计计划与启动门也无法�
   序贯 alpha 分配（Pocock/O'Brien-Fleming 校正）——在中期
   观察点报告结论时必须按未校正口径声明「这是中期观察，
   不是最终检验」，或使用预注册的调整后阈值；正式的群序贯
-  检验仍是未实现能力。
+  检验仍是未实现能力。（第 51 节补充：`alpha_spending`
+  已实现 Lan–DeMets 序贯 alpha 分配与按最终名义 alpha 的
+  功效重算；未声明该字段的旧协议仍按本条处理。）
 - `max_total_runs` 只约束「计划运行数」，不约束 `--resume`
   续跑或重跑同一目录（后者由 out 目录覆盖保护与账本机制
   约束）；跨目录新增种子属于新研究阶段，必须重新预注册。
@@ -2109,3 +2111,69 @@ schema 没有可核对的运行上限字段，设计计划与启动门也无法�
 - 与 `power.justification`（功效不足时的理由）一样，这些字段
   写进预注册后只能随新研究阶段修改；不能在同一份预注册里
   补写。
+
+## 51. 实验设计：中期观察需要序贯 alpha 分配（本轮补充）
+
+**判定：第 49 节引入的 `stopping_rules.interim_look_steps` 只
+声明「允许在哪些训练步做中期汇总」，但这些观察点上的检验
+仍按未校正口径解释：每多看一次结果并据此发表主张，家族
+错误率就超出声明的 `power.alpha` 一次。`docs/design_preparation.md`
+第 5 节此前要求研究者在每个中期观察点写明「中期观察，未做多
+look alpha 校正」，把「要不要校正」留给了研究者自觉；正式的
+序贯设计（Pocock / O'Brien-Fleming）一直是未实现能力。**
+
+**已修正：**
+
+- 预注册 schema 新增可选字段 `stopping_rules.alpha_spending`
+  （`none` / `pocock` / `obrien_fleming`，默认 `none`，旧协议
+  不受影响）。声明 `pocock` / `obrien_fleming` 时，入口
+  schema 逐项拒绝不完整声明：必须同时给出非空且严格递增的
+  `interim_look_steps`（观察步必须小于 `steps`——等于总步数
+  的观察点就是最终分析，重复计入会破坏信息分数）、顶层
+  `steps` 与 `power.alpha`（被消耗的家族 alpha）。
+- 新增 `interim_alpha_spending_plan()`：按 Lan–DeMets 消耗
+  函数（Pocock：`alpha·ln(1+(e-1)·t)`；O'Brien-Fleming：
+  `2-2·Φ(z_{alpha/2}/√t)`）把双侧家族 alpha 按信息分数
+  （观察步/总步）分配到各观察点（含最终分析），输出每个
+  观察点的累积消耗、名义 alpha（`two_sided_p_threshold`）与
+  双侧 z 边界。不引入第三方依赖（逆正态用标准库
+  `statistics.NormalDist`）。
+- 设计计划冻结序贯边界：`design_plan.json` 的
+  `stopping_rules.alpha_spending` 记录方案、各观察点名义
+  alpha 与 `power_at_final_look`，随 `plan_id` 冻结——事后换
+  序贯方案（或删掉声明）会改变指纹，不能伪装成同一份设计；
+  `print_design_summary` 打印 `[design][alpha-spending]` 边界
+  摘要，序贯回显不可用时显式告警。
+- 按最终名义 alpha 重算先验功效：声明序贯方案后，最终分析的
+  名义 alpha 小于原始 `power.alpha`（中期观察消耗了家族
+  alpha）；设计计划把 `power` 按 `effective_final_alpha` 强制
+  重算并标记 `alpha_basis=alpha_spending_final_look_nominal`，
+  避免沿用固定样本口径的 adequate。重算后仍不足且未显式
+  承认时，`design_power_gate_error` 在第一个子进程前拒绝
+  启动（`--allow-underpowered` /
+  `power.underpowered_acknowledged=true` 豁免，与固定样本
+  功效门一致）。
+- 主张口径：每个观察点（中期或最终）的主张必须使用该点的
+  名义 alpha；把中期名义 p 值与声明 alpha 比较等于丢掉序贯
+  校正，与未声明 `alpha_spending` 的偷看没有区别。
+- `preregistration.example.json` 更新为 `steps=4000`、中期
+  观察点 2000、`alpha_spending=obrien_fleming` 的组合示例；
+  `docs/design_preparation.md` 第 7.1.1 节给出字段语义、
+  约束与限制。
+- `tests/_core_DesignPreparationTests_03.py` 增加边界数学
+  性质、schema 接受/拒绝、设计计划冻结（含 plan_id 区分）、
+  最终名义 alpha 重算与启动门、摘要打印的回归测试。
+
+**仍有限制：**
+
+- 消耗函数按「信息分数与名义检验统计量独立」的标准近似
+  计算，未建模多臂/多对比下的联合分布；家族内部的
+  Bonferroni/Holm 校正仍由分析阶段按原口径执行（名义 alpha
+  先消耗、再在家族内分割），逐对比型的精确序贯联合边界
+  未实现。
+- 框架不自动在中期观察点停止训练：停止决策由研究者在
+  预声明的边界内做出并归档；工具只保证边界本身在训练前
+  冻结、事后可核对。
+- 中期观察点上的指标必须与主指标同口径（与试点证据的指标
+  口径规则一致）；`interim_look_steps` 与检查点/评估调度的
+  对齐仍由训练配置负责。

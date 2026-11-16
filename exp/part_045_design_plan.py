@@ -204,6 +204,117 @@ def _resolve_sweep_failure_policy(
     )
 
 
+
+def _stopping_alpha_spending_echo(
+    prereg: Dict[str, object],
+    prereg_stopping: Dict[str, object],
+    power: Optional[Dict[str, object]],
+    total_steps: Optional[int],
+    planned_comparisons: int,
+    planned_contrasts: List[str],
+) -> Optional[Dict[str, object]]:
+    """计算停止规则的序贯 alpha 分配回显（参与 plan_id）。
+
+    预注册声明 ``stopping_rules.alpha_spending`` 后，「中期
+    观察」从未校正的偷看变成消耗家族 alpha 的正式检验。设计
+    计划必须把观察点的名义 alpha 与 z 边界一并冻结：
+
+    - 声明了序贯方案后，最终分析的名义 alpha 通常小于原始
+      ``power.alpha``（Pocock 尤其明显）；先验功效若仍按原始
+      alpha 判定 adequate，会高估序贯设计的最终主张。这里用
+      最终名义 alpha 强制重算功效，写入 ``power_at_final_look``，
+      启动门按它判定（不足且未显式承认时拒绝启动）。
+    - 结构损坏/无法计算时不能静默丢弃该声明：回显
+      ``available=False`` 与原因，让审计看到「设计计划没有
+      冻结序贯边界」这件事本身。
+    """
+    scheme = prereg_stopping.get("alpha_spending")
+    if not isinstance(scheme, str) or scheme == "none":
+        return None
+    look_steps = prereg_stopping.get("interim_look_steps")
+    declared_alpha = (
+        _finite_float(power.get("alpha"))
+        if isinstance(power, dict)
+        else None
+    )
+    if declared_alpha is None:
+        return {
+            "scheme": scheme,
+            "available": False,
+            "reason": "power_alpha_missing",
+            "note": (
+                "预注册声明了 alpha_spending，但没有可用的"
+                " power.alpha：无法计算序贯边界，设计计划未"
+                "冻结名义 alpha。请在预注册 power 中声明 "
+                "alpha 后重新生成设计计划"
+            ),
+        }
+    if total_steps is None:
+        return {
+            "scheme": scheme,
+            "available": False,
+            "reason": "total_steps_missing",
+            "note": (
+                "预注册声明了 alpha_spending，但本次运行没有"
+                "可用的 steps：信息分数无法定义，设计计划未"
+                "冻结序贯边界。请在预注册顶层声明 steps 或"
+                "显式给出 --steps 后重新生成设计计划"
+            ),
+        }
+    try:
+        spending = interim_alpha_spending_plan(
+            declared_alpha,
+            int(total_steps),
+            list(look_steps or []),
+            scheme,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        return {
+            "scheme": scheme,
+            "available": False,
+            "reason": "alpha_spending_invalid",
+            "error": str(error),
+            "note": (
+                "预注册声明的 alpha_spending 无法计算序贯边界"
+                "（入口校验应已拒绝该组合；此记录来自手工编辑"
+                "或旧版文件）：设计计划未冻结名义 alpha，"
+                "中期观察只能按未校正口径报告"
+            ),
+        }
+    effective_final = _finite_float(
+        spending.get("effective_final_alpha")
+    )
+    power_at_final_look: Optional[Dict[str, object]] = None
+    if (
+        isinstance(power, dict)
+        and effective_final is not None
+        and effective_final < declared_alpha
+    ):
+        sequential_power = dict(power)
+        sequential_power["alpha"] = effective_final
+        power_at_final_look = _design_power_for_family(
+            sequential_power,
+            planned_comparisons,
+            planned_contrasts,
+            force=True,
+        )
+        if isinstance(power_at_final_look, dict):
+            # 重算结果来自功效公式，不携带本次重算的口径标记；
+            # 审计必须能看到「这个 adequate 按哪个 alpha 判定」。
+            power_at_final_look["alpha"] = effective_final
+            power_at_final_look["declared_alpha"] = (
+                declared_alpha
+            )
+            power_at_final_look["alpha_basis"] = (
+                "alpha_spending_final_look_nominal"
+            )
+        power_at_final_look = _json_safe(power_at_final_look)
+    if power_at_final_look is not None:
+        spending["power_at_final_look"] = power_at_final_look
+    spending["declared_alpha"] = declared_alpha
+    return spending
+
+
 def write_design_plan(
     out_root: Path,
     plan: List[Dict[str, object]],
@@ -527,17 +638,18 @@ def write_design_plan(
     # 「这项研究最多跑多少次运行」从口头约定变成训练前冻结、
     # 开跑前核对的硬门。计划运行数超过声明上限时直接拒绝
     # 冻结设计——想加种子必须重新预注册，而不是在同一份
-    # 预注册下反复扩展直到显著。
+    # 预注册下反复扩展直到显著。alpha_spending（序贯 alpha
+    # 分配）同样随设计计划冻结：中期观察点的名义 alpha 参与
+    # plan_id，看到结果后改方案会改变指纹。
     stopping_rules_echo: Optional[Dict[str, object]] = None
     prereg_stopping = (
         prereg.get("stopping_rules")
         if isinstance(prereg, dict)
         else None
     )
-    if isinstance(prereg_stopping, dict) and (
-        "max_total_runs" in prereg_stopping
-    ):
-        raw_max_runs = prereg_stopping["max_total_runs"]
+    if isinstance(prereg_stopping, dict) and prereg_stopping:
+        stopping_echo: Dict[str, object] = {}
+        raw_max_runs = prereg_stopping.get("max_total_runs")
         max_runs_valid = (
             isinstance(raw_max_runs, int)
             and not isinstance(raw_max_runs, bool)
@@ -552,7 +664,7 @@ def write_design_plan(
                     "臂必须作为新研究阶段重新冻结并预注册，"
                     "不能在同一份预注册下扩展计划"
                 )
-            stopping_rules_echo = {
+            stopping_echo.update({
                 "max_total_runs": max_total_runs,
                 "planned_runs": len(runs),
                 "within_max_total_runs": True,
@@ -562,7 +674,22 @@ def write_design_plan(
                         True,
                     )
                 ),
-            }
+            })
+        total_steps_for_spending = prereg.get("steps")
+        if total_steps_for_spending is None:
+            total_steps_for_spending = getattr(args, "steps", None)
+        alpha_spending_echo = _stopping_alpha_spending_echo(
+            prereg,
+            prereg_stopping,
+            power,
+            total_steps_for_spending,
+            planned_comparisons,
+            list(planned_contrasts),
+        )
+        if alpha_spending_echo is not None:
+            stopping_echo["alpha_spending"] = alpha_spending_echo
+        if stopping_echo:
+            stopping_rules_echo = stopping_echo
     core: Dict[str, object] = {
         "schema_version": _DESIGN_PLAN_SCHEMA_VERSION,
         "kind": kind,

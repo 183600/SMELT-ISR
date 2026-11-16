@@ -649,6 +649,88 @@ def preregistration_schema_error(
                 "extension_requires_new_preregistration "
                 "必须是布尔值"
             )
+        # 序贯 alpha 分配：声明 alpha_spending 后，中期观察点
+        # 不再是「未校正的偷看」，而是消耗家族 alpha 的正式
+        # 检验。这要求协议同时给出观察点、总步数与先验功效的
+        # alpha——缺任何一项都无法计算信息分数与名义 alpha，
+        # 与其让设计阶段静默退化为未校正口径，不如在入口拒绝。
+        alpha_spending = stopping_rules.get("alpha_spending")
+        if alpha_spending is not None:
+            if not isinstance(alpha_spending, str):
+                return (
+                    "stopping_rules.alpha_spending 必须是字符串: "
+                    + ", ".join(_ALPHA_SPENDING_SCHEMES)
+                )
+            if alpha_spending not in _ALPHA_SPENDING_SCHEMES:
+                return (
+                    "stopping_rules.alpha_spending 必须是: "
+                    + ", ".join(_ALPHA_SPENDING_SCHEMES)
+                    + f"（得到 {alpha_spending!r}）"
+                )
+            if alpha_spending != "none":
+                declared_power = payload.get("power")
+                if not isinstance(declared_power, dict):
+                    return (
+                        "stopping_rules.alpha_spending="
+                        f"{alpha_spending} 需要预注册 power 块："
+                        "序贯边界的总 alpha 来自 power.alpha，"
+                        "没有声明的家族 alpha 就无法分配"
+                    )
+                declared_steps = payload.get(
+                    "steps", _PREREGISTRATION_MISSING
+                )
+                if declared_steps is _PREREGISTRATION_MISSING:
+                    return (
+                        "stopping_rules.alpha_spending="
+                        f"{alpha_spending} 需要顶层 steps：信息"
+                        "分数按（观察步/总步）计算，缺总步数"
+                        "无法定义序贯边界"
+                    )
+                if not isinstance(declared_steps, int) or isinstance(
+                    declared_steps, bool
+                ) or declared_steps < 1:
+                    return (
+                        "stopping_rules.alpha_spending 需要"
+                        "顶层 steps 是正整数"
+                    )
+                if not interim_look_steps:
+                    return (
+                        "stopping_rules.alpha_spending="
+                        f"{alpha_spending} 需要 "
+                        "interim_look_steps：没有中期观察点就"
+                        "没有序贯分配（固定样本设计保持 "
+                        "alpha_spending 缺省或 \"none\"）"
+                    )
+                if any(
+                    int(step) >= int(declared_steps)  # type: ignore[arg-type]
+                    for step in interim_look_steps
+                ):
+                    return (
+                        "stopping_rules.interim_look_steps 含有"
+                        "不小于 steps 的步数：等于总步数的观察点"
+                        "就是最终分析，重复计入会破坏序贯"
+                        " alpha 分配的信息分数"
+                    )
+                if list(interim_look_steps) != sorted(
+                    interim_look_steps
+                ):
+                    return (
+                        "stopping_rules.interim_look_steps 必须"
+                        "按步数递增排列：序贯消耗按观察顺序"
+                        "累积，乱序无法定义名义 alpha"
+                    )
+                try:
+                    interim_alpha_spending_plan(
+                        float(declared_power["alpha"]),  # type: ignore[arg-type]
+                        int(declared_steps),  # type: ignore[arg-type]
+                        list(interim_look_steps),  # type: ignore[arg-type]
+                        alpha_spending,
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError) as error:
+                    return (
+                        "stopping_rules.alpha_spending 无法计算"
+                        f"序贯边界: {error}"
+                    )
 
     # 排除标准：数值失败的自动检测只覆盖 NaN/Inf/数值停止；
     # 其它排除规则必须在训练前写死，事后排除才能与「设计

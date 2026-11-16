@@ -84,12 +84,31 @@ _PREREGISTRATION_OPTIONAL_FIELDS = (
 # 声明的上限，「先看 3 个种子、不显著就再加 3 个」的序贯
 # 偷看会让家族错误率失控。max_total_runs 是设计计划冻结与
 # 启动前的硬门（计划运行数超过上限直接拒绝）；中期观察步
-# （interim_look_steps）只声明「允许在哪些步数做中期汇总」，
-# 供报告与归档核对。
+# （interim_look_steps）声明「允许在哪些步数做中期汇总」，
+# alpha_spending 声明这些观察点上的序贯 alpha 分配方案：
+# "none" 表示不做序贯校正（中期结论只能作为非确证性观察）；
+# "pocock" / "obrien_fleming" 用 Lan–DeMets 消耗函数把家族
+# alpha 分配到各观察点，中期与最终主张都必须使用所在观察
+# 点的名义 alpha（由设计计划冻结并参与 plan_id）。
 _STOPPING_RULES_KEYS = (
     "max_total_runs",
     "interim_look_steps",
     "extension_requires_new_preregistration",
+    "alpha_spending",
+)
+
+
+# 序贯 alpha 分配方案。"none" 是默认（不做校正，与旧协议
+# 兼容）；另外两种是 Lan–DeMets 消耗函数的标准选择：
+# - pocock：alpha(t) = alpha * ln(1 + (e-1) * t)，各观察点
+#   名义 alpha 接近均分，早期便宜、末期严格；
+# - obrien_fleming：alpha(t) = 2 - 2*Phi(z_{alpha/2}/sqrt(t))，
+#   早期消耗极少、末期接近完整 alpha，适合「中期只做止损
+#   检查、结论主要看最终分析」的设计。
+_ALPHA_SPENDING_SCHEMES = (
+    "none",
+    "pocock",
+    "obrien_fleming",
 )
 
 
@@ -225,6 +244,156 @@ def _preregistration_sha256_text(value: object) -> bool:
         isinstance(value, str)
         and re.fullmatch(r"[0-9a-fA-F]{64}", value)
     )
+
+
+
+def interim_alpha_spending_plan(
+    total_alpha: float,
+    total_steps: int,
+    look_steps: Sequence[int],
+    scheme: str,
+) -> Dict[str, object]:
+    """按 Lan–DeMets 消耗函数计算中期观察点的序贯 alpha 边界。
+
+    预注册 ``stopping_rules`` 声明了 ``interim_look_steps`` 之后，
+    「在这些步数上做中期汇总」本身仍是未校正的序贯检验：每多
+    看一次结果，家族错误率就超出声明的 ``power.alpha`` 一次。
+    本函数把声明的家族 alpha 按**信息分数**（观察步 / 总步）
+    分配到各观察点（含最终分析），返回每个观察点的名义 alpha
+    与 z 边界；设计计划把它冻结进 ``plan_id``，分析阶段的任何
+    主张（中期或最终）都必须使用所在观察点的名义 alpha，而不
+    是原始 alpha。
+
+    消耗函数（双侧 alpha 口径）：
+
+    - ``pocock``：累积消耗 alpha(t) = alpha * ln(1 + (e-1)*t)，
+      各观察点名义 alpha 接近均分；
+    - ``obrien_fleming``：累积消耗 alpha(t) =
+      2 - 2*Phi(z_{alpha/2}/sqrt(t))，早期消耗极少、最终分析
+      保留接近完整的 alpha。
+
+    约束：观察步必须严格递增且小于总步数（观察步等于总步数
+    会把最终观察点重复计入，信息分数无法定义）。结构错误抛
+    ``ValueError``，由调用方转换为设计/校验错误。
+    """
+    from statistics import NormalDist
+
+    if scheme not in ("pocock", "obrien_fleming"):
+        raise ValueError(
+            f"alpha_spending 方案必须是 pocock 或 "
+            f"obrien_fleming，得到 {scheme!r}"
+        )
+    alpha = _finite_float(total_alpha)
+    if alpha is None or not 0.0 < alpha < 0.5:
+        raise ValueError(
+            "alpha_spending 的总 alpha 必须在 (0, 0.5) 内"
+            f"（得到 {total_alpha!r}）"
+        )
+    try:
+        steps_total = int(total_steps)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"alpha_spending 需要有限的总步数（得到 {total_steps!r}）"
+        ) from error
+    if steps_total < 1:
+        raise ValueError(
+            f"alpha_spending 需要正的总步数（得到 {steps_total}）"
+        )
+    looks = list(look_steps or [])
+    if not looks:
+        raise ValueError(
+            "alpha_spending 需要至少一个中期观察步"
+            "（stopping_rules.interim_look_steps）"
+        )
+    normalized: List[int] = []
+    for step in looks:
+        if isinstance(step, bool) or not isinstance(step, int):
+            raise ValueError(
+                "alpha_spending 的中期观察步必须是正整数"
+                f"（得到 {step!r}）"
+            )
+        if step < 1:
+            raise ValueError(
+                "alpha_spending 的中期观察步必须是正整数"
+                f"（得到 {step}）"
+            )
+        if step >= steps_total:
+            raise ValueError(
+                f"中期观察步 {step} 必须小于总步数 {steps_total}："
+                "等于总步数的观察点就是最终分析，重复计入会"
+                "破坏信息分数定义"
+            )
+        if normalized and step <= normalized[-1]:
+            raise ValueError(
+                "alpha_spending 的中期观察步必须严格递增"
+                f"（{normalized[-1]} 之后得到 {step}）"
+            )
+        normalized.append(step)
+
+    normal = NormalDist()
+    z_alpha = normal.inv_cdf(1.0 - alpha / 2.0)
+
+    def _cumulative(fraction: float) -> float:
+        if fraction <= 0.0:
+            return 0.0
+        if fraction >= 1.0:
+            return float(alpha)
+        if scheme == "pocock":
+            value = alpha * math.log(
+                1.0 + (math.e - 1.0) * fraction
+            )
+        else:
+            value = 2.0 - 2.0 * normal.cdf(
+                z_alpha / math.sqrt(fraction)
+            )
+        # 浮点误差可能让累积消耗轻微越过 [0, alpha]；越界会
+        # 让某个观察点的名义 alpha 变成负数，必须裁剪。
+        return min(max(value, 0.0), float(alpha))
+
+    look_rows: List[Dict[str, object]] = []
+    previous_spent = 0.0
+    boundaries = [(int(step), int(step) / steps_total) for step in normalized]
+    boundaries.append((steps_total, 1.0))
+    for index, (step, fraction) in enumerate(boundaries, start=1):
+        cumulative = _cumulative(fraction)
+        nominal = cumulative - previous_spent
+        previous_spent = cumulative
+        z_boundary = (
+            normal.inv_cdf(1.0 - nominal / 2.0)
+            if nominal > 0.0
+            else None
+        )
+        look_rows.append({
+            "look": index,
+            "step": step,
+            "information_fraction": fraction,
+            "cumulative_alpha": cumulative,
+            "nominal_alpha": nominal,
+            "two_sided_p_threshold": nominal,
+            "z_boundary": z_boundary,
+        })
+    nominal_alphas = [
+        float(row["nominal_alpha"]) for row in look_rows
+    ]
+    return {
+        "schema": "smelt-isr/alpha-spending/v1",
+        "scheme": scheme,
+        "alpha": alpha,
+        "total_steps": steps_total,
+        "n_looks": len(look_rows),
+        "looks": look_rows,
+        "effective_final_alpha": nominal_alphas[-1],
+        "binding_look_alpha": min(nominal_alphas),
+        "note": (
+            "Lan-DeMets 消耗函数按信息分数（观察步/总步）把"
+            "双侧家族 alpha 分配到各观察点；每个观察点的主张"
+            "必须使用该点的名义 alpha（two_sided_p_threshold），"
+            "z_boundary 是对应的双侧 z 边界。effective_final_alpha "
+            "是最终分析的名义 alpha：声明 alpha_spending 后，"
+            "先验功效必须按它（而不是原始 alpha）重算，"
+            "否则序贯设计的最终主张会被高估功效"
+        ),
+    }
 
 
 

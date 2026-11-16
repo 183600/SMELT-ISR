@@ -20,7 +20,7 @@
     "test_fraction": 0.05
   },
   "equivalence_margin": 0.01,
-  "steps": 2000,
+  "steps": 4000,
   "power": {
     "expected_seed_sd_relative": 0.005,
     "target_power": 0.8,
@@ -42,7 +42,8 @@
   "stopping_rules": {
     "max_total_runs": 24,
     "interim_look_steps": [2000],
-    "extension_requires_new_preregistration": true
+    "extension_requires_new_preregistration": true,
+    "alpha_spending": "obrien_fleming"
   },
   "exclusion_criteria": {
     "attrition_definition": "运行在达到 common_step 前出现 NaN/Inf、数值停止或进程崩溃即不可用；指标缺失的运行按失败计入脱落率，不进入均值与检验",

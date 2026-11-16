@@ -310,9 +310,14 @@
         "extension_requires_new_preregistration": {
           "type": "boolean",
           "description": "超出预注册计划的扩展（加种子/加臂/延长训练）是否必须重新预注册，默认 true。"
+        },
+        "alpha_spending": {
+          "type": "string",
+          "enum": ["none", "pocock", "obrien_fleming"],
+          "description": "中期观察点的序贯 alpha 分配方案（Lan-DeMets 消耗函数）。none=不做序贯校正（中期结论只能作为非确证性观察）；pocock=alpha(t)=alpha*ln(1+(e-1)t)，各观察点名义 alpha 接近均分；obrien_fleming=alpha(t)=2-2*Phi(z_{alpha/2}/sqrt(t))，早期消耗极少、最终分析保留接近完整的 alpha。声明 pocock/obrien_fleming 时必须同时给出 interim_look_steps（严格递增且小于 steps）与 power.alpha（家族 alpha）；每个观察点的主张必须使用该点的名义 alpha，先验功效按最终名义 alpha 重算。"
         }
       },
-      "description": "停止规则：训练前声明「最多跑多少次运行、允许在哪些步做中期汇总」。没有预先声明的上限，「不显著就再加种子」的序贯偷看无法与设计区分。"
+      "description": "停止规则：训练前声明「最多跑多少次运行、允许在哪些步做中期汇总、中期观察如何分配序贯 alpha」。没有预先声明的上限，「不显著就再加种子」的序贯偷看无法与设计区分；未声明 alpha_spending 的中期观察只能按未校正口径报告。"
     },
     "exclusion_criteria": {
       "type": "object",

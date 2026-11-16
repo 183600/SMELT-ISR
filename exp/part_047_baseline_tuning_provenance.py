@@ -1238,6 +1238,68 @@ def print_design_summary(design: Dict[str, object]) -> None:
             "增加种子/臂必须作为新研究阶段重新预注册，"
             "不能在同一份预注册下扩展"
         )
+        spending = _as_dict(stopping.get("alpha_spending"))
+        if spending:
+            if spending.get("available") is False:
+                print(
+                    "[design][alpha-spending][warn] 预注册声明了 "
+                    f"alpha_spending={spending.get('scheme')}，但"
+                    "设计计划未能冻结序贯边界"
+                    f"（{spending.get('reason')}）：中期观察只能"
+                    "按未校正口径报告，请修复声明后重新生成"
+                    "设计计划"
+                )
+            else:
+                looks = [
+                    row
+                    for row in (
+                        spending.get("looks") or []
+                    )
+                    if isinstance(row, dict)
+                ]
+                alpha_text = _format_finite(
+                    spending.get("alpha"), ".2%"
+                )
+                final_text = _format_finite(
+                    spending.get("effective_final_alpha"),
+                    ".2%",
+                )
+                look_text = "; ".join(
+                    f"look{row.get('look')}@step{row.get('step')}"
+                    " p≤"
+                    f"{_format_finite(row.get('nominal_alpha'), '.2%')}"
+                    for row in looks
+                )
+                print(
+                    "[design][alpha-spending] 序贯 alpha 分配 "
+                    f"（{spending.get('scheme')}，家族 alpha="
+                    f"{alpha_text}，"
+                    f"{len(looks)} 个观察点）：{look_text}"
+                )
+                print(
+                    "[design][alpha-spending] 最终分析名义 "
+                    f"alpha≈{final_text}；中期/最终主张必须使用"
+                    "所在观察点的名义 alpha，不能沿用声明 alpha"
+                )
+                sequential_power = _as_dict(
+                    spending.get("power_at_final_look")
+                )
+                if (
+                    sequential_power
+                    and sequential_power.get("adequate") is False
+                ):
+                    print(
+                        "[design][alpha-spending][warn] 按最终"
+                        "名义 alpha 重算后序贯设计功效不足"
+                        f"（最吃种子对比 "
+                        f"{sequential_power.get('binding_contrast')}，"
+                        "需要 "
+                        f"{sequential_power.get('required_seeds_with_attrition', sequential_power.get('required_seeds'))}"
+                        " 个启动种子，计划 "
+                        f"{sequential_power.get('planned_seeds')} 个）"
+                        "：正式套件会在第一个子进程前拒绝，除非"
+                        "显式承认功效不足"
+                    )
     print(
         f"[design] 设计计划已写入 {design['path']}"
         "（子进程开跑前会重新核对指纹与自己的分配）"
@@ -1338,6 +1400,85 @@ def design_power_gate_error(
             "生成设计计划，或显式设置 "
             "underpowered_acknowledged=true 并写明 justification"
         )
+    # 序贯 alpha 分配的启动门：声明 alpha_spending 后，最终
+    # 分析的名义 alpha 小于原始 power.alpha（中期观察消耗了
+    # 家族 alpha），先验功效必须按它重算。固定样本口径 adequate
+    # 不代表序贯设计 adequate——不能等分析阶段才发现「最终
+    # 主张按名义 alpha 根本达不到目标功效」。
+    spending = _as_dict(
+        _as_dict(design.get("stopping_rules")).get(
+            "alpha_spending"
+        )
+    )
+    if spending and spending.get("available") is not False:
+        sequential_power = _as_dict(
+            spending.get("power_at_final_look")
+        )
+        if sequential_power and not sequential_power.get(
+            "adequate"
+        ):
+            if sequential_power.get("adequate") is None:
+                return (
+                    pilot_note
+                    + "设计计划无法按序贯设计的最终名义 alpha "
+                    "重算先验功效"
+                    + (
+                        f"（{sequential_power.get('adequacy_recompute_error')}）"
+                        if sequential_power.get(
+                            "adequacy_recompute_error"
+                        )
+                        else ""
+                    )
+                    + "：声明了 alpha_spending 就不能沿用固定"
+                    "样本口径的 adequate；请补全预注册 power 的"
+                    "重算字段后重新生成设计计划，或显式设置 "
+                    "underpowered_acknowledged=true 并写明 "
+                    "justification"
+                )
+            required = sequential_power.get(
+                "required_seeds_with_attrition",
+                sequential_power.get("required_seeds"),
+            )
+            planned = sequential_power.get("planned_seeds")
+            binding = str(
+                sequential_power.get("binding_contrast")
+                or power.get("binding_contrast")
+                or "pairwise"
+            )
+            final_alpha = _finite_float(
+                spending.get("effective_final_alpha")
+            )
+            declared_alpha = _finite_float(
+                spending.get("declared_alpha")
+            )
+            return (
+                pilot_note
+                + "设计计划显示序贯设计的先验功效不足：声明了 "
+                "alpha_spending="
+                f"{spending.get('scheme')}，中期观察消耗家族 "
+                "alpha 后，最终分析的名义 alpha≈"
+                f"{_format_finite(final_alpha, '.2%')}"
+                + (
+                    f"（声明 alpha={_format_finite(declared_alpha, '.2%')}）"
+                    if declared_alpha is not None
+                    else ""
+                )
+                + f"。按名义 alpha 重算，最吃种子的对比类型 "
+                f"{binding} 至少需要 "
+                + (
+                    f"{required} 个启动种子"
+                    if required is not None
+                    else "无法计算的启动种子数"
+                )
+                + f"，计划只有 {planned if planned is not None else '未知'} 个。"
+                "请增加 --seeds、减少中期观察点（改用 "
+                "obrien_fleming 保留更多最终 alpha），或去掉 "
+                "alpha_spending 并把中期结论降级为非确证性观察；"
+                "确需在不足设计中运行，请显式设置 "
+                "underpowered_acknowledged=true 并写明 "
+                "justification，或加 --allow-underpowered。"
+                "调整后请使用新的 --out 重新生成设计计划"
+            )
     if power.get("adequate"):
         return None
     if (
