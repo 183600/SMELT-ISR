@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+
+import torch
+
+import torch.nn as nn
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. The centralized seed is set once by the experiment
 # entry point (experiment.py / _runner.py).
