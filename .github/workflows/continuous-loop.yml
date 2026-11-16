@@ -102,9 +102,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-        # 不给 agent 留任何 git 推送凭证：所有推送必须走 commit_and_push /
-        # on_shutdown / Final 的显式 token URL（即必须先过 OpenCode deepseek 把关）。
-        persist-credentials: false
+          # 不给 agent 留任何 git 推送凭证：所有推送必须走 commit_and_push /
+          # on_shutdown / Final 的显式 token URL（即必须先过 OpenCode deepseek 把关）。
+          persist-credentials: false
 
       - name: Check experiment freeze switch
         id: freeze
