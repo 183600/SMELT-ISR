@@ -102,6 +102,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+        # 不给 agent 留任何 git 推送凭证：所有推送必须走 commit_and_push /
+        # on_shutdown / Final 的显式 token URL（即必须先过 OpenCode deepseek 把关）。
+        persist-credentials: false
 
       - name: Check experiment freeze switch
         id: freeze
@@ -272,11 +275,15 @@ jobs:
         timeout-minutes: 180
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set +e
           set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-main}"
+          # 远程已批准基准（把关与回滚都以它为准，而不是可能被 agent 改过的本地 HEAD）
+          REMOTE_BASE="origin/${BRANCH}"
+          # 推送专用 URL：Checkout 不留凭证后，只有把关流程能拿到
+          PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           OUT=/tmp/oc_out.log
           # 单次 run 的硬预算：3 小时（step 上限 180 分钟，job 上限 200 分钟，
           # 这里留 10 分钟给收尾的清理 / 最终提交 / 推送）
@@ -330,192 +337,59 @@ jobs:
           STALL_TIMEOUT=1200
 
 
-          # ================= 模型策略：只用 opencode + Zen 免费模型 =================
-          # 已移除 DeepSeek Harness 与 DeepSeek 官方 API 接入：
-          #   - 不安装、不调用任何额外 harness，一律只用 opencode；
-          #   - 不读取 DeepSeek 官方 key，不访问 DeepSeek 官方端点，永远不调用 DeepSeek 官方 API；
-          #   - 所有阶段都通过 `opencode run -m <model> [--variant ...] "$prompt"` 调用。
-          # 主力：Zen 网关免费 deepseek-v4.1-flash-free（免鉴权，支持 tool call 与 reasoning effort）；
-          # 次选：Zen 网关免费 glm-5.3-flash-free（主力不可用时优先切换，偶发 429）；
-          # 兜底：同为 Zen 网关免费的 big-pickle（Big Pickle）。
-          FREE_MODEL="opencode/deepseek-v4.1-flash-free"
-          GLM_MODEL="opencode/glm-5.3-flash-free"
-          PICKLE_MODEL="opencode/big-pickle"
-          CURRENT_PROVIDER=""
-          BROKEN_PROVIDERS=""
+          # ================= 模型策略：opencode Zen 免费模型随机轮换（对齐 dyn_csa_experiment） =================
+          #   - 一律只用 opencode：所有阶段通过 `opencode run -m opencode/<model> "$prompt"` 调用；
+          #   - 每个阶段开始时从线上目录随机挑选一个免费模型（type=chat + 工具调用 + 价格 0；
+          #     目录不可用时回退 .github/scripts/pick_free_model.py 内置清单）；
+          #   - 单个模型失败/限流 → 标记本阶段失效，换下一个随机免费模型；
+          #     全部免费模型失效 → 清空失效标记重新随机；
+          #   - NVIDIA NIM 链与 DeepSeek 官方 API 均不再参与编码；
+          #     opencode 自带的免费 deepseek（deepseek-v4.1-flash-free）只作为 push 前的把关人
+          #     （.github/scripts/deepseek_gate.py 审查全部待推送改动）。
+          BROKEN_MODELS=""
           SELECTED_MODEL=""
-          SELECTED_PROVIDER=""
+          SELECTED_PROVIDER="zen-free"
           SELECTED_VARIANT=""
+          CURRENT_MODEL=""
+          CURRENT_PROVIDER="zen-free"
 
           mark_broken() {
-            case ",$BROKEN_PROVIDERS," in *",$1,"*) ;; *) BROKEN_PROVIDERS="$BROKEN_PROVIDERS${BROKEN_PROVIDERS:+,}$1" ;; esac
+            case ",$BROKEN_MODELS," in *",$1,"*) ;; *) BROKEN_MODELS="$BROKEN_MODELS${BROKEN_MODELS:+,}$1" ;; esac
           }
           is_broken() {
-            case ",$BROKEN_PROVIDERS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+            case ",$BROKEN_MODELS," in *",$1,"*) return 0 ;; *) return 1 ;; esac
           }
-
-          # ---------- 一次性模型探测（每个 run 只做一次） ----------
-          # run 开始时探测一次，选定 SELECTED_MODEL；之后所有阶段直接
-          #   opencode run -m "$SELECTED_MODEL" "$prompt"
-          # 只有收到 429 / 5xx / 连接失败 / 非零退出时，才重新探测并跳过已判定失效的候选。
-          # 注意：只看 /models 目录不够——必须真跑一次冒烟调用，否则会选中
-          # “连得上但永远跑不完”的端点。
-          smoke_test() {
-            local m="$1" extra=""
-            case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
-            # ⭐ stdin 必须显式接 /dev/null：opencode 1.19.x 的 run 命令对非 TTY 的
-            # stdin 会执行 await Bun.stdin.text()（读到 EOF 为止）。若 runner 的 stdin
-            # 是未关闭的管道，opencode 将永久阻塞：无任何输出、被 timeout 杀掉，
-            # 表现为「冒烟测试失败/超时」。接 /dev/null 立即 EOF，位置参数传参不受影响。
-            # NVIDIA 重度推理模型给足冒烟时间；免费池快速失败（网关挂起时省时）
-            local st=90; case "$m" in nvidia/*) st=75 ;; esac
-            # shellcheck disable=SC2086
-            # ⭐ 429/限流不换模型：冒烟撞限流时同模型退避重试（45/90/135/180s，共 4 次）；
-            #    4 次仍限流 → 返回 2（调用方据此中止选择，绝不因 429 换模型）
-            local _sm_try=0
-            while ! timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" < /dev/null > /tmp/smoke_test.log 2>&1; do
-              if ! grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier" /tmp/smoke_test.log 2>/dev/null; then
-                echo "[smoke] $m 冒烟失败（非限流），日志末尾："
-                tail -c 600 /tmp/smoke_test.log 2>/dev/null || true
-                return 1
-              fi
-              if [ "$_sm_try" -ge 4 ]; then
-                echo "[smoke] $m 持续 429/限流（已退避重试 4 次）：不换模型，返回限流信号"
-                return 2
-              fi
-              _sm_try=$((_sm_try+1))
-              echo "[smoke] $m 撞 429/限流（第 ${_sm_try}/4 次）：不换模型，$((45*_sm_try))s 后同模型重试"
-              sleep $((45*_sm_try))
-            done
-            return 0
-
-            local rc=$?
-            if [ "$rc" -ne 0 ]; then
-              echo "[smoke] $m 失败 (exit=$rc)，/tmp/smoke_test.log 末尾内容："
-              tail -c 2000 /tmp/smoke_test.log 2>/dev/null || true
-              echo
-              echo "[smoke] ---- end of smoke log ----"
-            fi
-            return "$rc"
-          }
-
-          # ⭐ 模型策略（2026-11-02 diag v7b 对 NVIDIA 85 模型 + opencode 免费 130 模型全量实测）：
-          #   1) 优先 z-ai/glm-5.3-flash（实测可用：冒烟 43s/工具 136s，波动大偶尔慢，由看门狗兜底）；
-          #   2) 8 个验证池模型（60s 冒烟+工具调用双通过）每次 run 随机轮换（"所有模型随机"策略）；
-          #   3) opencode 免费网关 130 个模型已全部实测失败，仅留 deepseek/glm/pickle 三席兜底（若复活自动可用）。
-          # deepseek-ai/deepseek-v4.1-flash 三次实测挂死（303s 空响应 / 300s / 240s 超时），永久排除。
-          NV_FIRST="nvidia/z-ai/glm-5.3-flash"
-          NV_POOL=(
-            "nvidia/poolside/laguna-xs-2.1"
-            "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"
-            "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"
-            "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
-            "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
-            "nvidia/minimaxai/minimax-m3.1-flash"
-            "nvidia/meta/muse-glimmer-30b"
-            "nvidia/meta/llama-3.2-90b-vision-instruct"
-          )
-
-          detect_provider() {
-            local pass cand model
-            for pass in 1 2; do
-              # 主力：NVIDIA NIM API（opencode 内置 provider，鉴权走 NVIDIA_API_KEY）。
-              # 模型链（指定顺序）：deepseek-v4.1-flash → glm-5.3-flash → glm-5.3
-              #   → minimax-m3.1-flash → step-5-preview；其后 Zen 免费池兜底
-              #   （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
-              # 不再使用 DeepSeek 官方 API。
-                            # ⭐ glm 优先 + 验证池随机轮换（每次 run 打乱，实现所有可用模型随机）
-              mapfile -t NV_SHUF < <(printf '%s\n' "${NV_POOL[@]}" | shuf)
-              NV_CANDS=(nv-first)
-              _i=0
-              for _m in "${NV_SHUF[@]}"; do _i=$((_i+1)); NV_CANDS+=("nv-r${_i}"); done
-              NV_CANDS+=(free glm pickle)
-              for cand in "${NV_CANDS[@]}"; do
-                is_broken "$cand" && continue
-                case "$cand" in
-                  nv-first) model="$NV_FIRST" ;;
-                  nv-r*)    _i="${cand#nv-r}"; model="${NV_SHUF[$((_i-1))]}" ;;
-                  free)   model="$FREE_MODEL" ;;
-                  glm)    model="$GLM_MODEL" ;;
-                  pickle) model="$PICKLE_MODEL" ;;
-                esac
-                smoke_test "$model"; __rc=$?
-                if [ "$__rc" -eq 2 ]; then
-                  echo "[provider] $model 持续 429/限流：不换模型、不标记失效，中止本轮模型选择，交由后继 run 重试"
-                  SELECTED_MODEL=""; SELECTED_PROVIDER=""; SELECTED_VARIANT=""
-                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
-                  return 1
-                fi
-                if [ "$__rc" -eq 0 ]; then
-                  SELECTED_MODEL="$model"
-                  SELECTED_PROVIDER="$cand"
-                  # 只有免费 deepseek 支持 reasoning effort 档位
-                  SELECTED_VARIANT=""
-                  [ "$cand" = "free" ] && SELECTED_VARIANT="${VARIANT:-}"
-                  CURRENT_MODEL="$SELECTED_MODEL"
-                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
-                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
-                  echo "[provider] 选定 $model（$cand）${SELECTED_VARIANT:+ variant=$SELECTED_VARIANT}，本次 run 内固定使用，不再逐阶段探测"
-                  return 0
-                fi
-                echo "[warn] $model 冒烟测试失败/超时，换下一个候选"
-                mark_broken "$cand"
-              done
-              # 第一轮全部失效：清空失效标记再试一轮（可能是瞬时故障）
-              [ "$pass" -eq 1 ] && BROKEN_PROVIDERS=""
-            done
-            SELECTED_MODEL=""
-            SELECTED_PROVIDER=""
-            SELECTED_VARIANT=""
-            CURRENT_MODEL=""
-            CURRENT_PROVIDER=""
-            export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
-            return 1
+          pick_random_free_model() {
+            python3 .github/scripts/pick_free_model.py "$BROKEN_MODELS"
           }
 
           # 兼容两类调用点：旧代码叫 detect_provider，新代码叫 select_harness_model。
           select_harness_model() {
-            detect_provider
+            local m=""
+            m="$(pick_random_free_model)" || {
+              echo "[warn] 免费模型全部被标记失效，清空失效标记交由后继调用重新随机"
+              BROKEN_MODELS=""
+              return 1
+            }
+            SELECTED_MODEL="opencode/$m"
+            SELECTED_PROVIDER="zen-free"
+            SELECTED_VARIANT=""
+            CURRENT_MODEL="$SELECTED_MODEL"
+            CURRENT_PROVIDER="zen-free"
+            export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+            echo "[provider] 随机选定免费模型 $SELECTED_MODEL，本次调用内固定使用"
+            return 0
+          }
+          detect_provider() {
+            select_harness_model
           }
           oc_mark_broken() {
             mark_broken "$1"
+            [ "$SELECTED_MODEL" = "$1" ] && SELECTED_MODEL=""
           }
 
-          # ---------- 思考强度（仅免费 deepseek 路径）：有 max 选 max，没有 max 选 high，否则不设置 ----------
-          # 先刷新 opencode 的模型目录缓存（models.dev），再解析该模型支持的
-          # reasoning effort 档位。检测失败时兜底 max（无效 variant 会被
-          # opencode 静默忽略，不会导致调用失败）。
-          opencode models opencode --refresh >/dev/null 2>&1 || true
-          cat > /tmp/detect_variant.py <<'PYEOF'
-          import json, os, sys
-          try:
-              p = os.path.expanduser('~/.cache/opencode/models.json')
-              with open(p) as f:
-                  d = json.load(f)
-              m = d.get('opencode', {}).get('models', {}).get('deepseek-v4.1-flash-free')
-              if m is None:
-                  print('UNKNOWN')
-                  sys.exit()
-              values = []
-              for o in (m.get('reasoning_options') or []):
-                  values.extend(o.get('values') or [])
-              for cand in ('max', 'high'):
-                  if cand in values:
-                      print(cand)
-                      sys.exit()
-              print('NONE')
-          except Exception:
-              print('UNKNOWN')
-          PYEOF
-          VRESULT=$(python3 /tmp/detect_variant.py 2>/dev/null)
-          case "$VRESULT" in
-            max|high) VARIANT="$VRESULT" ;;
-            NONE)     VARIANT="" ;;
-            *)        VARIANT="max" ;;
-          esac
-          echo "[info] 免费池模型=$FREE_MODEL | 思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
-          # run 开始时探测一次；失败也不阻塞，run_phase 需要时会再试
-          if detect_provider; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
+          echo "[info] 模型策略：opencode Zen 免费模型随机轮换（pick_free_model.py）+ OpenCode deepseek push 前把关"
+          if select_harness_model; then :; else echo "[warn] 启动时未选出可用模型，第一个阶段会再探测一次"; fi
 
 
           i=0
@@ -558,40 +432,105 @@ jobs:
             return 0
           }
 
+
+          # ---------- OpenCode deepseek 把关：push 前审查全部待推送改动（含 agent 本地提交） ----------
+          run_gate() {
+            timeout 60 git fetch origin "$BRANCH" 2>/dev/null || true
+            if ! git rev-parse --verify --quiet "$REMOTE_BASE" >/dev/null 2>&1; then
+              echo "UNAVAILABLE"; return 0
+            fi
+            python3 .github/scripts/deepseek_gate.py "$1" "$BRANCH" 2>/dev/null || echo "UNAVAILABLE"
+          }
+          deepseek_gate() {
+            local v=""
+            for ga in 1 2; do
+              v="$(run_gate "$1")"
+              case "$v" in
+                APPROVE|REJECT:*) echo "$v"; return 0 ;;
+              esac
+              [ "$ga" -lt 2 ] && { echo "[gate] OpenCode deepseek 把关暂不可用 (attempt $ga)，20s 后重试"; sleep 20; }
+            done
+            echo "$v"
+          }
           commit_and_push() {
-            # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
-            # ⭐ 只回滚 .github/workflows（CI 配置）；.github/.loop-phase 是阶段轮换
-            # 状态文件，必须保留——若整目录回滚 .github，状态永远无法持久化，
-            # 阶段会一直停在 bug，无法轮换到 sci/apply/perf（参照 cage-attention）。
-            git checkout HEAD -- .github/workflows 2>/dev/null || true
-            git clean -fdq .github/workflows 2>/dev/null || true
+          # ⭐ 保护循环自身：以远程已批准状态为准回滚 AI 对 .github 的改动，
+          #    仅保留阶段轮换状态文件 .github/.loop-phase 的最新内容
+          timeout 60 git fetch origin "$BRANCH" 2>/dev/null || true
+          cp -f .github/.loop-phase /tmp/.loop-phase.keep 2>/dev/null || true
+          git checkout "$REMOTE_BASE" -- .github 2>/dev/null || git checkout HEAD -- .github 2>/dev/null || true
+          git clean -fdq .github 2>/dev/null || true
+          if [ -s /tmp/.loop-phase.keep ]; then
+            mkdir -p .github
+            cp -f /tmp/.loop-phase.keep .github/.loop-phase
+          fi
             ensure_readme
             rm -f .opencode_issues.md
-            git add -A || true
-            git commit -m "auto: iteration $1$(model_tag)" || true
-            git pull --rebase origin "$BRANCH" || git rebase --abort || true
-            git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
+          git add -A || true
+
+          # ⭐ OpenCode deepseek 把关：必须审查通过才允许 push（含 agent 本地提交的全部待推送改动）
+          local VERDICT
+          VERDICT="$(deepseek_gate "$1")"
+          case "$VERDICT" in
+            APPROVE)
+              echo "[gate] OpenCode deepseek 把关通过 ($1)"
+              ;;
+            REJECT:*)
+              echo "[gate] OpenCode deepseek 拦截本次改动 ($1)，原因: ${VERDICT#REJECT:} —— 已回滚到远程基准，不推送"
+              git reset --hard "$REMOTE_BASE" >/dev/null 2>&1 || true
+              git clean -fdq >/dev/null 2>&1 || true
+              return 1
+              ;;
+            *)
+              echo "[gate] OpenCode deepseek 把关不可用 ($1)，跳过本次推送；改动保留在工作区，收尾重试"
+              git reset >/dev/null 2>&1 || true
+              return 1
+              ;;
+          esac
+
+          git commit -m "auto: iteration $1$(model_tag)" || true
+          git pull --rebase origin "$BRANCH" || git rebase --abort || true
+          git push "$PUSH_URL" "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
           }
 
           on_shutdown() {
-            echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
-            # ⭐ 只回滚 .github/workflows（CI 配置）；.github/.loop-phase 是阶段轮换
-            # 状态文件，必须保留——若整目录回滚 .github，状态永远无法持久化，
-            # 阶段会一直停在 bug，无法轮换到 sci/apply/perf（参照 cage-attention）。
-            git checkout HEAD -- .github/workflows 2>/dev/null || true
-            git clean -fdq .github/workflows 2>/dev/null || true
+          echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
+          # ⭐ 保护循环自身：以远程已批准状态为准回滚 AI 对 .github 的改动，
+          #    仅保留阶段轮换状态文件 .github/.loop-phase 的最新内容
+          timeout 60 git fetch origin "$BRANCH" 2>/dev/null || true
+          cp -f .github/.loop-phase /tmp/.loop-phase.keep 2>/dev/null || true
+          git checkout "$REMOTE_BASE" -- .github 2>/dev/null || git checkout HEAD -- .github 2>/dev/null || true
+          git clean -fdq .github 2>/dev/null || true
+          if [ -s /tmp/.loop-phase.keep ]; then
+            mkdir -p .github
+            cp -f /tmp/.loop-phase.keep .github/.loop-phase
+          fi
             ensure_readme
             rm -f .opencode_issues.md
-            git add -A || true
-            if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
-              git pull --rebase origin "$BRANCH" || git rebase --abort || true
-              git push origin "HEAD:${BRANCH}" || true
-              echo "[trap] partial work committed & pushed"
-            else
-              echo "[trap] nothing to commit"
-            fi
-            exit 0
+          git add -A || true
+          if ! git diff "$REMOTE_BASE" --quiet 2>/dev/null; then
+            # ⭐ OpenCode deepseek 把关同样适用于 shutdown 收尾提交（单次尝试，快速退出）
+            local VERDICT
+            VERDICT="$(run_gate "shutdown partial work")"
+            case "$VERDICT" in
+              APPROVE)
+                git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
+                git pull --rebase origin "$BRANCH" || git rebase --abort || true
+                git push "$PUSH_URL" "HEAD:${BRANCH}" || true
+                echo "[trap] partial work committed & pushed (OpenCode deepseek 把关通过)"
+                ;;
+              REJECT:*)
+                echo "[trap] OpenCode deepseek 拦截 shutdown 改动: ${VERDICT#REJECT:} —— 回滚，不推送"
+                git reset --hard "$REMOTE_BASE" >/dev/null 2>&1 || true
+                git clean -fdq >/dev/null 2>&1 || true
+                ;;
+              *)
+                echo "[trap] OpenCode deepseek 把关不可用，shutdown 改动不推送（把关优先）"
+                ;;
+            esac
+          else
+            echo "[trap] nothing to commit"
+          fi
+          exit 0
           }
           trap on_shutdown TERM INT
 
@@ -636,13 +575,8 @@ jobs:
               124|137|143) echo "[pre-test] phase=$phase: 测试超时/中断($EC)，结果不确定，放行"; return 0 ;;
             esac
             echo "[pre-test] phase=$phase: 测试失败(exit=$EC) → 推送当前状态并提前结束本 job"
-            git add -A
-            git commit -m "auto: pre-opencode test gate failed (phase=$phase, exit=$EC)" \
-              || echo "[pre-test] 没有新内容可提交"
-            local BRANCH_PT="${GITHUB_REF_NAME:-main}"
-            git pull --rebase origin "$BRANCH_PT" 2>/dev/null || git rebase --abort 2>/dev/null || true
-            git push origin "HEAD:$BRANCH_PT" \
-              || echo "[pre-test] [warn] push 失败，收尾步骤(Final commit and push)会重试"
+            # ⭐ 推送同样过 OpenCode deepseek 把关（走 commit_and_push 统一入口）
+            commit_and_push "pre-test-fail" || true
             return 1
           }
 
@@ -1064,11 +998,23 @@ jobs:
 
       - name: Final commit and push
         if: always()
+
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set +e
-          # ⭐ 同上：只回滚 .github/workflows，保留 .github/.loop-phase 阶段状态
-          git checkout HEAD -- .github/workflows 2>/dev/null || true
-          git clean -fdq .github/workflows 2>/dev/null || true
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          REMOTE_BASE="origin/${BRANCH}"
+          PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          timeout 60 git fetch origin "$BRANCH" 2>/dev/null || true
+          # ⭐ 保护循环自身：以远程已批准状态为准回滚 AI 对 .github 的改动，仅保留 .loop-phase
+          cp -f .github/.loop-phase /tmp/.loop-phase.keep 2>/dev/null || true
+          git checkout "$REMOTE_BASE" -- .github 2>/dev/null || git checkout HEAD -- .github 2>/dev/null || true
+          git clean -fdq .github 2>/dev/null || true
+          if [ -s /tmp/.loop-phase.keep ]; then
+            mkdir -p .github
+            cp -f /tmp/.loop-phase.keep .github/.loop-phase
+          fi
           # 防删自愈：收尾提交前恢复被删的 README.md
           if [ ! -f "README.md" ]; then
             if git show HEAD:README.md > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
@@ -1082,11 +1028,34 @@ jobs:
             [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
           fi
           git add -A
+
+          # ⭐ OpenCode deepseek 把关：收尾提交同样必须审查通过才推送（含 agent 本地提交）
+          FVERDICT=""
+          for ga in 1 2 3; do
+            FVERDICT="$(python3 .github/scripts/deepseek_gate.py "final cleanup" "$BRANCH" 2>/dev/null || echo UNAVAILABLE)"
+            case "$FVERDICT" in APPROVE|REJECT:*) break ;; esac
+            [ "$ga" -lt 3 ] && { echo "[gate] OpenCode deepseek 把关暂不可用 (attempt $ga)，20s 后重试"; sleep 20; }
+          done
+          case "$FVERDICT" in
+            APPROVE)
+              ;;
+            REJECT:*)
+              echo "[gate] OpenCode deepseek 拦截收尾改动: ${FVERDICT#REJECT:} —— 回滚到远程基准，不推送"
+              git reset --hard "$REMOTE_BASE" >/dev/null 2>&1 || true
+              git clean -fdq >/dev/null 2>&1 || true
+              exit 0
+              ;;
+            *)
+              echo "[gate] OpenCode deepseek 把关不可用，收尾改动不推送（把关优先）"
+              git reset >/dev/null 2>&1 || true
+              exit 0
+              ;;
+          esac
+
           LAST_MODEL="$(head -c 120 /tmp/last_model_used.txt 2>/dev/null || true)"
           git commit -m "auto: end of 5h run, cleanup${LAST_MODEL:+ [model: $LAST_MODEL]}" || echo "nothing to commit"
-          BRANCH="${GITHUB_REF_NAME:-main}"
           git pull --rebase origin "$BRANCH" || git rebase --abort || true
-          git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
+          git push "$PUSH_URL" "HEAD:${BRANCH}" || echo "[warn] final push failed"
 
       - name: Archive run artifacts (audit trail)
         if: always()
