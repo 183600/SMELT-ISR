@@ -227,7 +227,7 @@ class PreregistrationTests(unittest.TestCase):
             current_commit="a" * 40,
             working_tree_dirty=False,
             current_script_sha256="d" * 64,
-            current_source_tree_sha256="" * 64,
+            current_source_tree_sha256="f" * 64,
         )
         self.assertIsNone(error)
 
@@ -265,7 +265,7 @@ class PreregistrationTests(unittest.TestCase):
 
     def test_record_includes_source_tree_identity(self):
         payload = self._payload()
-        payload["frozen_source_tree_sha256"] = "" * 64
+        payload["frozen_source_tree_sha256"] = "f" * 64
         before = experiment._source_tree_sha256()
         self.assertIsNotNone(before)
         record = experiment.preregistration_record(
@@ -276,7 +276,7 @@ class PreregistrationTests(unittest.TestCase):
             self._args(),
         )
         self.assertEqual(
-            record["frozen_source_tree_sha256"], "" * 64
+            record["frozen_source_tree_sha256"], "f" * 64
         )
         self.assertEqual(
             record["source_tree_sha256"], before
@@ -1028,7 +1028,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
 
     def test_rejects_changed_preregistration_file(self):
         rows = self._rows()
-        rows[0]["preregistration_record"]["file_sha256"] = "" * 64
+        rows[0]["preregistration_record"]["file_sha256"] = "f" * 64
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertEqual(
@@ -1053,7 +1053,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
 
     def test_rejects_data_protocol_drift(self):
         rows = self._rows()
-        rows[0]["protocol"]["data_sha256"] = "" * 64
+        rows[0]["protocol"]["data_sha256"] = "f" * 64
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertEqual(
@@ -1081,7 +1081,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
         payload = self._payload()
         payload["frozen_source_tree_sha256"] = "d" * 64
         rows = self._rows()
-        rows[0]["provenance"]["source_tree_sha256"] = "" * 64
+        rows[0]["provenance"]["source_tree_sha256"] = "f" * 64
         coverage = self._coverage(rows, payload=payload)
         self.assertFalse(coverage["ok"])
         self.assertTrue(

@@ -42,7 +42,7 @@ class RunAuditTests(unittest.TestCase):
                 "test": "3" * 64,
             },
             "script_sha256": "d" * 64,
-            "source_tree_sha256": "" * 64,
+            "source_tree_sha256": "f" * 64,
             "environment_id": snapshot["environment_id"],
             "comparison_protocol_sha256": "c" * 64,
         }
