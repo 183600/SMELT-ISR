@@ -1,7 +1,30 @@
 from __future__ import annotations
-import random
+
+import builtins as _builtins
+import math as _math
+import random as _random
+
+_max = _builtins.max
+_float = _builtins.float
+
+import torch
+import torch.nn as nn
 import exp
-from exp import Config, set_seed
+
+max = _max
+float = _float
+math = _math
+random = _random
+
+from exp import (
+    Config,
+    set_seed,
+    LanguageModel,
+    SparseMoE,
+    TransformerBlock,
+    RMSNorm,
+    ByteDataset,
+)
 
 def _selfcheck_top_51350_0001():
     global common, grad, gradients, key, mode, model, named_dense, named_dense_state, named_moe, named_moe_state, named_shared, ordered_moe, result, x, y
