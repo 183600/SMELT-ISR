@@ -278,7 +278,8 @@ def _selfcheck_top_52048_0009():
     ckpt_model.grad_checkpoint = True
     ckpt_model.train()
     ckpt_loss = ckpt_model(x, y)['loss']
-    ckpt_loss.backward()
+    with torch.enable_grad():
+        ckpt_loss.backward()
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
     causal_model = LanguageModel(Config(**common, mode='B')).eval()
     x_changed = x.clone()
