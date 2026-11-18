@@ -2103,7 +2103,7 @@ def ablation_component_verdicts(
             )
             blockers.append(
                 f"{entry.get('delayed_mode')} 与 local_base 的"
-                f"参数量不匹配" + ratio_text
+                "参数量不匹配" + ratio_text
             )
     parity_entries = coverage.get("compute_parity") or []
     for entry in parity_entries:

@@ -1064,14 +1064,14 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
     print(
         "[efficiency] "
         f"params={efficiency.get('n_params_total')} "
-        f"(non-embedding="
+        "(non-embedding="
         f"{efficiency.get('n_params_non_embedding')}) | "
-        f"FLOPs/forward="
+        "FLOPs/forward="
         f"{_format(efficiency.get('flops_per_forward'), '', '.3e')} | "
         f"latency={_format(efficiency.get('latency_ms_per_forward'), 'ms')} | "
-        f"train_step="
+        "train_step="
         f"{_format(efficiency.get('training_ms_per_step'), 'ms')} | "
-        f"throughput="
+        "throughput="
         f"{_format(efficiency.get('throughput_tokens_per_sec'), 'tok/s')}"
     )
     for label, key in (
@@ -1093,13 +1093,13 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
         )
     print(
         "[efficiency] "
-        f"inference_peak="
+        "inference_peak="
         f"{_format(efficiency.get('inference_peak_memory_mb'), 'MB')} | "
-        f"fwd_bwd_peak="
+        "fwd_bwd_peak="
         f"{_format(efficiency.get('training_peak_memory_mb'), 'MB')} | "
-        f"actual_train_peak="
+        "actual_train_peak="
         f"{_format(efficiency.get('actual_training_peak_memory_mb'), 'MB')} | "
-        f"process_peak_rss="
+        "process_peak_rss="
         f"{_format(efficiency.get('process_peak_rss_mb'), 'MB')}"
     )
 

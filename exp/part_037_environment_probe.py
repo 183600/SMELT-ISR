@@ -633,10 +633,10 @@ def run_sanity_overfit(
             print(
                 "[sanity] 梯度检查: "
                 f"grad_norm={grad_probe['grad_norm']}, "
-                f"missing_grad="
+                "missing_grad="
                 f"{grad_probe['n_missing_grad']}, "
                 f"zero_grad={grad_probe['n_zero_grad']}, "
-                f"nonfinite_grad="
+                "nonfinite_grad="
                 f"{grad_probe['n_nonfinite_grad']}"
                 + (
                     ", failures="

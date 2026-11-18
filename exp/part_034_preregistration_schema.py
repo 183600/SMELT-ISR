@@ -385,7 +385,7 @@ def preregistration_schema_error(
                 f"{plan['planned_seeds']} 个（计划可用 "
                 f"{plan['planned_usable_seeds']} 个）。"
                 + (
-                    f"当前精度在目标功效下只能支持约 ±"
+                    "当前精度在目标功效下只能支持约 ±"
                     f"{float(eq_margin_needed):g} 的等价界；"
                     if eq_margin_needed is not None
                     else ""
@@ -406,7 +406,7 @@ def preregistration_schema_error(
                 ""
                 if not plan["expected_attrition_rate"]
                 else (
-                    f"（已按预期脱落率 "
+                    "（已按预期脱落率 "
                     f"{plan['expected_attrition_rate']:.0%} 折算，"
                     f"计划可用 {plan['planned_usable_seeds']} 个）"
                 )

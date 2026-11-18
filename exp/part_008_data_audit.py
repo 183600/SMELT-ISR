@@ -844,7 +844,7 @@ def _plan_train_degenerate_run_cleaning(
         "enabled": True,
         "scope": "bytes",
         "policy": (
-            f"drop train byte runs of one value with length "
+            "drop train byte runs of one value with length "
             f">= {min_bytes}; val/test untouched"
         ),
         "min_bytes": min_bytes,

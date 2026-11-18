@@ -545,7 +545,7 @@ def evaluate(
     if evaluated_tokens == 0:
         raise RuntimeError(
             f"评估未产生任何 token（{split} split），请检查数据集是否为空或"
-            f"评估起点配置是否正确。"
+            "评估起点配置是否正确。"
         )
     loss = (total / evaluated_tokens).item()
 

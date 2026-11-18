@@ -520,7 +520,7 @@ def run_baseline_tuning_sweep(args: argparse.Namespace) -> None:
     if len(seeds) < _RECOMMENDED_SEEDS:
         print(
             "[suite-baseline-tuning] 提示：调参建议使用 "
-            f"3~5 个随机种子评估每个候选，当前只有 "
+            "3~5 个随机种子评估每个候选，当前只有 "
             f"{len(seeds)} 个"
         )
 
@@ -1103,7 +1103,7 @@ def print_design_summary(design: Dict[str, object]) -> None:
                         else "（缺少记录，未核实）"
                     )
                 )
-                + f"；不可比项 "
+                + "；不可比项 "
                 f"{comparability.get('blocking_mismatch_count')}、"
                 "未核对项 "
                 f"{comparability.get('unverified_key_count')}"
@@ -1389,7 +1389,7 @@ def design_power_gate_error(
             f"{eq_required_text}，计划只有 "
             f"{planned_text}"
             + (
-                f"；当前精度可支持的最小界约 ±"
+                "；当前精度可支持的最小界约 ±"
                 f"{_format_finite(eq_margin_needed, 'g')}"
                 if _finite_float(eq_margin_needed) is not None
                 else ""

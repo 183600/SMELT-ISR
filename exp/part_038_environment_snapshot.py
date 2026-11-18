@@ -299,7 +299,7 @@ def _environment_snapshot_from_config(
                         and summary_id != loaded_id
                     ):
                         raise ValueError(
-                            f"config.json 记录的环境 id 与 "
+                            "config.json 记录的环境 id 与 "
                             f"{candidate} 不一致"
                         )
                     return loaded

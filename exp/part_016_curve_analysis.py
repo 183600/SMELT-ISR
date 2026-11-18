@@ -533,7 +533,7 @@ def analyze_training_curve(
     ):
         analysis["status"] = "underfitting"
         analysis["recommendation"] = (
-            f"训练损失整体仅下降 "
+            "训练损失整体仅下降 "
             f"{max(0.0, train_drop_total) * 100:.1f}%，"
             "接近随机基线，训练与验证都没有有效下降："
             "欠拟合或学习率/数据管道有问题。建议检查："
@@ -565,7 +565,7 @@ def analyze_training_curve(
         if lr_annealed:
             analysis["plateau_kind"] = "schedule_end"
             analysis["recommendation"] = (
-                f"最近一次验证间隔内训练与验证损失都没有有效下降"
+                "最近一次验证间隔内训练与验证损失都没有有效下降"
                 f"（{drops_text}），且学习率已退火至峰值的 "
                 f"{analysis['last_lr_over_peak'] * 100:.0f}%："
                 "更像调度末期的正常收敛平台。若结果已够用可就此"
@@ -580,9 +580,9 @@ def analyze_training_curve(
                 else ""
             )
             analysis["recommendation"] = (
-                f"最近一次验证间隔内训练与验证损失都没有有效下降"
+                "最近一次验证间隔内训练与验证损失都没有有效下降"
                 f"（{drops_text}），且已排除过拟合：两者都不降"
-                f"通常指向欠拟合（模型容量不足）、学习率不当"
+                "通常指向欠拟合（模型容量不足）、学习率不当"
                 f"{lr_text}或数据管道本身有问题。建议检查："
                 "学习率是否过小或过大、模型容量"
                 "（--d-model / --n-layers）是否足够，并用 "

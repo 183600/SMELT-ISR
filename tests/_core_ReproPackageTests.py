@@ -32,7 +32,7 @@ _CONFIG_TEMPLATE = {
         "file_sha256": "e" * 64,
     },
     "data": {
-        "sha256": "f" * 64,
+        "sha256": "" * 64,
         "split_policy": "contiguous",
         "val_fraction": 0.05,
         "test_fraction": 0.05,
@@ -170,7 +170,7 @@ class ReproPackageTests(unittest.TestCase):
                 )
         self.assertEqual(summary["study_id"], "smelt-isr-rq1")
         self.assertEqual(summary["environment_id"], "d" * 64)
-        self.assertEqual(summary["data_sha256"], "f" * 64)
+        self.assertEqual(summary["data_sha256"], "" * 64)
         self.assertEqual(summary["script_sha256"], "a" * 64)
         self.assertIn("config.json", summary["files_archived"])
         self.assertIn("metrics.jsonl", summary["files_archived"])

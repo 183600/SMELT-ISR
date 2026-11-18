@@ -916,7 +916,7 @@ def parse_paper_cell_label(label: str) -> Tuple[str, int]:
         match = re.fullmatch(r"([0-9.]+[MmBb])([0-9]{1,2})%?", text)
         if not match:
             raise ValueError(
-                f"--paper-cell 格式应为 规模:稀疏度（如 200M:95），"
+                "--paper-cell 格式应为 规模:稀疏度（如 200M:95），"
                 f"收到 {label!r}"
             )
         parts = [match.group(1), match.group(2)]

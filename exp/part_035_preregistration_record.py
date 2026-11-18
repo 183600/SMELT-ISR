@@ -1090,7 +1090,7 @@ def hypothesis_alignment(
                 f"{label}（点估计 Δ={delta:+.4f} 达到门槛，但"
                 "门槛本身未被统计检验支持："
                 f"p={test_info.get('p_value')}，"
-                f"方向调整 CI 下界="
+                "方向调整 CI 下界="
                 f"{test_info.get('ci95_low_directional')}；"
                 "不能声称达到最小有意义改善）"
             )

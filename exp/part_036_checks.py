@@ -63,7 +63,7 @@ def imbalance_metric_advisory(
 
     if max_majority >= _IMBALANCE_EXTREME_MAJORITY:
         chance_text = (
-            f"，macro PR-AUC 的随机水平≈平均 prevalence"
+            "，macro PR-AUC 的随机水平≈平均 prevalence"
             f"≈{chance_mean:.4f}"
             if chance_mean is not None
             else ""
@@ -156,7 +156,7 @@ def imbalance_metric_advisory(
             )
             report["pr_auc_worst_run"] = best_run
             report["advisories"].append(
-                f"PR-AUC 的随机水平不是 0 而是≈平均 prevalence"
+                "PR-AUC 的随机水平不是 0 而是≈平均 prevalence"
                 f"（{chance_mean:.4f}）：当前最差运行 {best_run} "
                 f"的 {metric}={best_value:.4f}，高出随机水平 "
                 + (
@@ -1231,7 +1231,7 @@ def resolve_preregistered_baseline(
         report["consistent"] = True
         report["ok"] = True
         report["advisories"].append(
-            f"未显式传 --compare-baseline，采用训练前预注册的"
+            "未显式传 --compare-baseline，采用训练前预注册的"
             f"对照基线 {declared}（--hypothesis-baseline）"
         )
     elif baseline_mode == declared:

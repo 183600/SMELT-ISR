@@ -970,13 +970,13 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         print(
             "[routing] RQ3 两轮专家重合（branch 级）："
             f"jaccard={_show('second_round_jaccard_mean')} "
-            f"exact_match="
+            "exact_match="
             f"{_show('second_round_exact_match_share')} "
-            f"slot_reuse="
+            "slot_reuse="
             f"{_show('second_round_slot_reuse_mean')} | "
             "token 级："
             f"jaccard={_show('token_second_round_jaccard_mean')} "
-            f"exact_match="
+            "exact_match="
             f"{_show('token_second_round_exact_match_share')}"
         )
         if rq3.get("branch_self_reuse_share") is not None:
@@ -992,7 +992,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
             f"marginal={_show('jaccard_chance_marginal')} "
             f"lift_uniform={_show('jaccard_lift_over_uniform')} "
             f"lift_marginal={_show('jaccard_lift_over_marginal')} "
-            f"adjusted_marginal="
+            "adjusted_marginal="
             f"{_show('jaccard_adjusted_marginal')}"
         )
 
@@ -1003,7 +1003,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         print(
             "[routing] 跨分支表示平均余弦相似度: "
             f"{_format_finite(divergence.get('branch_cosine_mean'))}"
-            f"（blocks_with_branches="
+            "（blocks_with_branches="
             f"{divergence.get('blocks_with_branches')}）"
         )
 

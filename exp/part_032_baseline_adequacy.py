@@ -440,14 +440,14 @@ def baseline_adequacy(
             )
             ngram_comparison_advice.append(
                 f"基线 {baseline_mode} 与 n-gram 的 {metric} "
-                f"差距在基线种子噪声内（p="
+                "差距在基线种子噪声内（p="
                 f"{float(ngram_comparison['p_value']):.3f}）："
                 f"{detail}；点估计方向不能当作已确认的结论"
             )
         elif ngram_comparison["significant"] is True:
             ngram_comparison_advice.append(
                 f"基线与 n-gram 的 {metric} 差距超出基线种子"
-                f"噪声（p="
+                "噪声（p="
                 f"{float(ngram_comparison['p_value']):.3f}）："
                 "该比较在统计上可分辨（n-gram 为确定性估计，"
                 "其无抽样方差）"
@@ -1012,7 +1012,7 @@ def baseline_adequacy(
                 "dense 基线按等激活计算容量配置"
                 f"（dense_fnn_hidden={current_capacity} = "
                 "top_k×expert_hidden），不是等参数容量"
-                f"（应为 n_experts×expert_hidden="
+                "（应为 n_experts×expert_hidden="
                 f"{parameter_matched}）。挑战模型参数量更大时，"
                 "涨点仍可能来自容量；请用 --dense-fnn-hidden "
                 f"{parameter_matched} 训练等参数基线，或同时"

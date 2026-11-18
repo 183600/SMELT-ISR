@@ -1798,7 +1798,7 @@ def plan_pilot_size(
         if attrition_achievable:
             attrition_note = (
                 attrition_note
-                + f"；判据为 ucb ≤ 计划余量 "
+                + "；判据为 ucb ≤ 计划余量 "
                 f"{attrition_slack:.4g}（= 1 - "
                 f"{required_at_declared}/{planned_seeds_value}）"
             )

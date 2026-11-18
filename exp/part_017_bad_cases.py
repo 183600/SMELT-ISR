@@ -1173,7 +1173,7 @@ def print_bad_cases(report: Dict[str, object]) -> None:
         print(
             "[bad-case] 标签噪声核验: "
             f"top-N 候选 {verification['candidates']} 个，"
-            f"训练上下文支持后确认 "
+            "训练上下文支持后确认 "
             f"{verification['verified']} 个，"
             f"未确认 {verification['unverified']} 个"
             "（其中 "

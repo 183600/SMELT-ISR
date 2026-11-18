@@ -499,7 +499,7 @@ def _contrast_display(
         partial_p = partial.get("p_value")
         partial_effect = partial.get("effect")
         partial_text = (
-            f"；共同种子配对敏感性"
+            "；共同种子配对敏感性"
             f"（n={partial.get('n_common')}"
         )
         if isinstance(partial_effect, (int, float)):
@@ -725,7 +725,7 @@ def _contrast_display(
                 and seeds_needed > current_seeds
             ):
                 caveat += (
-                    f"（按当前种子间波动，检出该效应约需 "
+                    "（按当前种子间波动，检出该效应约需 "
                     f"{seeds_needed} 个种子，当前 "
                     f"{_format_seed_count(current_seeds)} 个）"
                 )

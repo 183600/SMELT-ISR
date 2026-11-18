@@ -68,7 +68,7 @@ def run_experiment_sweep(args: argparse.Namespace) -> None:
     if len(args.seeds) < _RECOMMENDED_SEEDS:
         print(
             "[sweep] 提示：关键实验建议使用 3~5 个不同随机"
-            f"种子并汇报 Mean ± Std，当前只有 "
+            "种子并汇报 Mean ± Std，当前只有 "
             f"{len(args.seeds)} 个"
         )
         if args.allow_underpowered:

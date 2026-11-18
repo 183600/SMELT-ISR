@@ -1035,7 +1035,7 @@ def selection_bias_report(
         if report["unbiased_metric"]:
             detail += (
                 "；同一验证集既选型又判定，存在乐观偏差。"
-                f"选型无关复核请用 --compare-metric "
+                "选型无关复核请用 --compare-metric "
                 f"{report['unbiased_metric']}（覆盖 "
                 f"{report['unbiased_runs']} 个运行）"
             )
