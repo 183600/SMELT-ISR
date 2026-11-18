@@ -106,7 +106,7 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
             if not is_expert:
                 zero_non_expert.append(name)
 
-    probe["grad_norm"] = math.sqrt(total_sq)
+    probe["grad_norm"] = math.sqrt(max(total_sq, 0.0))
 
     failures: List[str] = probe["failures"]  # type: ignore[assignment]
 

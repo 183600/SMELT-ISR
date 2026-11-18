@@ -65,7 +65,7 @@ class DesignPreparationTestsPart2(_DesignPreparationTestsBase):
     def test_chi_square_large_df_handles_transition_and_overflow(self):
         a = 5.0e11
         expected = 0.5 + 1.0 / (
-            3.0 * math.sqrt(2.0 * math.pi * a)
+            3.0 * math.sqrt(max(2.0 * math.pi * a, 0.0))
         )
         cdf = experiment._chi_square_cdf(1.0e12, 1.0e12)
         survival = experiment._chi_square_survival(

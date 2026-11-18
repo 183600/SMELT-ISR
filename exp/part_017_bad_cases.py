@@ -845,6 +845,7 @@ def analyze_bad_cases(
 
     was_training = model.training
     model.eval()
+    model.train()
     # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
     use_amp = (

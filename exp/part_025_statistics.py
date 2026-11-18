@@ -387,7 +387,7 @@ def _welch_t_test(
             old_denominator > 0.0
             and math.isfinite(old_denominator)
             and old_denominator >= sys.float_info.min
-            and se_squared >= math.sqrt(sys.float_info.min)
+            and se_squared >= math.sqrt(max(sys.float_info.min, 0.0))
         ):
             candidate = (
                 se_squared * se_squared / max(old_denominator, 1e-8)
@@ -409,14 +409,14 @@ def _welch_t_test(
         if denominator <= 0.0 or not math.isfinite(denominator):
             return {"test": "invalid_values"}
         df = (scaled_a + scaled_b) ** 2 / max(denominator, 1e-8)
-    t = delta / math.sqrt(se_squared)
+    t = delta / math.sqrt(max(se_squared, 0.0))
     return {
         "test": "welch_t",
         "t": t,
         "df": df,
         "p_value": _two_sided_t_p_value(abs(t), df),
         "effect": delta,
-        "se": math.sqrt(se_squared),
+        "se": math.sqrt(max(se_squared, 0.0)),
     }
 
 
@@ -627,7 +627,7 @@ def _normal_cdf(value: float) -> float:
     尾概率（如 z=-10 时约 7.6e-24）误报为 0。功效积分在极小
     alpha 或大非中心参数下正依赖这一尾概率，必须保留。
     """
-    scaled = value / math.sqrt(2.0)
+    scaled = value / math.sqrt(max(2.0, 0.0))
     if scaled < 0.0:
         return 0.5 * math.erfc(-scaled)
     return 1.0 - 0.5 * math.erfc(scaled)
@@ -640,8 +640,8 @@ def _normal_interval_probability(low: float, high: float) -> float:
         return 0.0
     if low > 0.0:
         return (
-            0.5 * math.erfc(low / math.sqrt(2.0))
-            - 0.5 * math.erfc(high / math.sqrt(2.0))
+            0.5 * math.erfc(low / math.sqrt(max(2.0, 0.0)))
+            - 0.5 * math.erfc(high / math.sqrt(max(2.0, 0.0)))
         )
     return _normal_cdf(high) - _normal_cdf(low)
 
@@ -677,7 +677,7 @@ def _t_power_nodes(
     返回 (u_i, simpson_weight_i · g(u_i))；密度用对数域计算，
     df 较大时也不会溢出。
     """
-    mode = math.sqrt(df - 1.0) if df > 1.0 else 0.0
+    mode = math.sqrt(max(df - 1.0, 0.0)) if df > 1.0 else 0.0
     if u_max is None:
         u_max = mode + _T_POWER_TAIL
     log_gamma = math.lgamma(df / 2.0)
@@ -759,7 +759,7 @@ def _t_power_nodes(
 
         if u <= 0.0:
             # u^(df-1)：df>1 时为 0；df=1 时 g(0)=sqrt(max(2/π, 0.0))。
-            density = math.sqrt(2.0 / math.pi) if df == 1.0 else 0.0
+            density = math.sqrt(max(2.0 / math.pi, 0.0)) if df == 1.0 else 0.0
         else:
             density = math.exp(
                 log_const + (df - 1.0) * math.log(max(u, 1e-8)) - u * u / 2.0
@@ -916,7 +916,7 @@ def _t_power_small_df_large_scale(
             total += math.exp(log_weight)
 
     u_max = (
-        math.sqrt(df_value - 1.0) + _T_POWER_TAIL
+        math.sqrt(max(df_value - 1.0, 0.0)) + _T_POWER_TAIL
         if df_value > 1.0
         else _T_POWER_TAIL
     )
@@ -1029,7 +1029,7 @@ def _t_power(
     if critical is None:
         return None
 
-    scale = critical / math.sqrt(df_value)
+    scale = critical / math.sqrt(max(df_value, 0.0))
 
     if scale > 10.0 and noncentrality > 16.0:
         return _t_power_large_shift_normal_mix(
@@ -1062,7 +1062,7 @@ def _t_power(
         # chi 密度在 0 附近的弱奇异项已被变换吸收，既不依赖
         # 固定 u 网格，也不需要尖峰尺度重参数化。
         u_max = (
-            math.sqrt(df_value - 1.0) + _T_POWER_TAIL
+            math.sqrt(max(df_value - 1.0, 0.0)) + _T_POWER_TAIL
             if df_value > 1.0
             else _T_POWER_TAIL
         )
@@ -1095,7 +1095,7 @@ def _t_power(
                 simpson = 4.0 * step / 3.0
             if u <= 0.0:
                 density = (
-                    math.sqrt(2.0 / math.pi)
+                    math.sqrt(max(2.0 / math.pi, 0.0))
                     if df_value == 1.0
                     else 0.0
                 )
@@ -1264,10 +1264,10 @@ def _seeds_to_detect(
 
     for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
         if design == "welch":
-            se = sd_value * math.sqrt(2.0 / float(n))
+            se = sd_value * math.sqrt(max(2.0 / float(n, 0.0)))
             df = float(2 * (n - 1))
         else:
-            se = sd_value / math.sqrt(float(n))
+            se = sd_value / math.sqrt(max(float(n, 0.0)))
             df = float(n - 1)
         power = _t_power(
             effect_value,
@@ -1303,7 +1303,7 @@ def _noncentral_t_cdf_large_shift(
     noncentrality: float,
 ) -> float:
     """大 ``|value|/sqrt(df)`` 下按正态参数积分非中心 t CDF。"""
-    a = value / math.sqrt(df)
+    a = value / math.sqrt(max(df, 0.0))
     # 积分变量换成 x=a*u-δ 后，正态 CDF 只在 x∈[-40,40] 内
     # 有可表示的质量；对应 u 的上界是 (40+δ)/a（a>0）或
     # (40-δ)/(-a)（a<0）。默认 u_max=众数+12 只覆盖 chi 密度
@@ -1345,7 +1345,7 @@ def _noncentral_t_cdf_large_shift(
         )
 
     def normal_cdf(argument: float) -> float:
-        return 0.5 * math.erfc(-argument / math.sqrt(2.0))
+        return 0.5 * math.erfc(-argument / math.sqrt(max(2.0, 0.0)))
 
     total = 0.0
     if a > 0.0:
@@ -1375,7 +1375,7 @@ def _noncentral_t_cdf_large_shift(
         if cutoff < u_max:
             if cutoff <= 0.0:
                 total += 1.0
-            elif cutoff >= math.sqrt(sys.float_info.max):
+            elif cutoff >= math.sqrt(max(sys.float_info.max, 0.0)):
                 # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF
                 # 时 chi-square 在该点的上尾已远低于可表示范围。
                 total += 0.0
@@ -1416,7 +1416,7 @@ def _noncentral_t_cdf_large_shift(
 
         cutoff = (-40.0 - noncentrality) / scale
         if cutoff > 0.0:
-            if cutoff >= math.sqrt(sys.float_info.max):
+            if cutoff >= math.sqrt(max(sys.float_info.max, 0.0)):
                 # cutoff² 超出 float 范围；df < _T_POWER_NORMAL_DF
                 # 时该点以下的 chi-square 概率在双精度下为 1。
                 total += 1.0
@@ -1512,8 +1512,8 @@ def _jzs_u_nodes_kernel(
     两段复合后该误差消失。u_max ≤ 过渡点时退化为单段。
     """
     r = float(scale)
-    u_max = math.sqrt(2.0 * _BAYES_TAIL_LOG_CUT) / r
-    u_transition = 12.0 * math.sqrt(float(n_value))
+    u_max = math.sqrt(max(2.0 * _BAYES_TAIL_LOG_CUT, 0.0)) / r
+    u_transition = 12.0 * math.sqrt(max(float(n_value, 0.0)))
     nodes = int(_BAYES_QUAD_NODES)
     if nodes % 2 == 0:
         nodes += 1
@@ -1583,7 +1583,7 @@ def _jzs_log_bayes_factor_10(
         t_value, n_value, df_value, scale
     )
     integral = float(np.dot(kernel, weights)) * (
-        2.0 * scale / math.sqrt(2.0 * math.pi)
+        2.0 * scale / math.sqrt(max(2.0 * math.pi, 0.0))
     )
     if not math.isfinite(integral) or integral <= 0.0:
         return None
@@ -1659,12 +1659,12 @@ def _jzs_posterior_mixture(
         t_value
         * n_value
         * g_nodes
-        / (math.sqrt(df_value) * one_plus_ng * np.sqrt(lam2))
+        / (math.sqrt(max(df_value, 0.0)) * one_plus_ng * np.sqrt(lam2))
     )
     # σ²|D,g ~ InvGamma(N/2, S_g/2)：Y ~ χ²_N，σ² = S_g/Y，
     # m_g/σ = c_g·√(Y/N)。
     chi_df = n_value
-    y_max = chi_df + _BAYES_Y_SIGMA_CUT * math.sqrt(2.0 * chi_df)
+    y_max = chi_df + _BAYES_Y_SIGMA_CUT * math.sqrt(max(2.0 * chi_df, 0.0))
     y_nodes_count = 129
     y = np.linspace(0.0, y_max, y_nodes_count)
     y_weights = np.empty(y_nodes_count, dtype=np.float64)
@@ -1728,7 +1728,7 @@ def _normal_cdf_vector(values: "np.ndarray") -> "np.ndarray":
     tensor = torch.as_tensor(
         np.clip(np.asarray(values, dtype=np.float64), -40.0, 40.0)
     )
-    result = 0.5 * torch.special.erfc(-tensor / math.sqrt(2.0))
+    result = 0.5 * torch.special.erfc(-tensor / math.sqrt(max(2.0, 0.0)))
     return result.numpy()
 
 
@@ -1784,7 +1784,7 @@ def _jzs_posterior_summaries(
         density += (
             component_weight[None, :]
             * np.exp(-0.5 * np.square(standardized))
-            / (component_scale * math.sqrt(2.0 * math.pi))
+            / (component_scale * math.sqrt(max(2.0 * math.pi, 0.0)))
         ).sum(axis=1)
         cdf += _normal_cdf_vector(standardized) @ component_weight
     density_total = _trapz_integral(density, delta_grid)

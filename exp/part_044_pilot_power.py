@@ -1697,7 +1697,7 @@ def plan_pilot_size(
         )
         if quantile is None or quantile <= 0.0:
             continue
-        multiplier = math.sqrt(degrees / quantile)
+        multiplier = math.sqrt(max(degrees / quantile, 0.0))
         implied = _plan_at_sd(declared_sd * multiplier)
         sd_rows.append({
             "pilot_pairs": n_pairs,

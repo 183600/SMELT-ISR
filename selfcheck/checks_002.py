@@ -1340,7 +1340,7 @@ def _selfcheck_top_65612_0120():
     ci_mean = ci_aggregate['val_loss_mean']
     ci_std = ci_aggregate['val_loss_std']
     assert ci_mean == 2.0 and ci_std == 1.0
-    expected_half = ci_block['t_critical'] * ci_std / math.sqrt(3)
+    expected_half = ci_block['t_critical'] * ci_std / math.sqrt(max(3, 0.0))
     assert ci_block['df'] == 2
     assert abs(ci_block['low'] - (ci_mean - expected_half)) < 1e-09
     assert ci_block['low'] < ci_mean < ci_block['high']

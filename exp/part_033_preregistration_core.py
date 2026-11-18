@@ -251,7 +251,7 @@ def _contrast_power_entry(
     不显著」读成「等价」。
     """
     factor = _CONTRAST_VARIANCE_FACTORS[contrast]
-    sd_contrast = sd * math.sqrt(factor)
+    sd_contrast = sd * math.sqrt(max(factor, 0.0))
     if alpha_adjusted > 0.0:
         required_t = _seeds_to_detect(
             float(min_effect),
@@ -271,7 +271,7 @@ def _contrast_power_entry(
     achieved_power = None
     mde = None
     if alpha_adjusted > 0.0 and usable_seeds >= _MIN_SEEDS_FOR_STATS:
-        se = sd_contrast / math.sqrt(float(usable_seeds))
+        se = sd_contrast / math.sqrt(max(float(usable_seeds, 0.0)))
         df = float(usable_seeds - 1)
         achieved_power = _t_power(
             float(min_effect),
@@ -294,7 +294,7 @@ def _contrast_power_entry(
         "contrast": contrast,
         "label": _CONTRAST_LABELS[contrast],
         "variance_factor": factor,
-        "se_multiplier": math.sqrt(factor),
+        "se_multiplier": math.sqrt(max(factor, 0.0)),
         # 该对比实际使用的（配对差值口径）标准差；两两/简单
         # 效应等于声明值，主效应更小，交互更大。
         "expected_seed_sd_relative": sd_contrast,
@@ -338,7 +338,7 @@ def _contrast_power_entry(
             alpha_adjusted > 0.0
             and usable_seeds >= _MIN_SEEDS_FOR_STATS
         ):
-            eq_se = sd_contrast / math.sqrt(float(usable_seeds))
+            eq_se = sd_contrast / math.sqrt(max(float(usable_seeds, 0.0)))
             eq_df = float(usable_seeds - 1)
             eq_power = _tost_power(
                 0.0,

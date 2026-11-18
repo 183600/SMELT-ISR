@@ -1062,7 +1062,7 @@ def compare_cells_to_baseline(
                 + std_current * std_current
             ) / 2.0
             if math.isfinite(pooled_squared):
-                pooled_std = math.sqrt(pooled_squared)
+                pooled_std = math.sqrt(max(pooled_squared, 0.0))
         noise_ratio = None
         if delta is not None and pooled_std:
             candidate = abs(delta) / max(pooled_std, 1e-8)

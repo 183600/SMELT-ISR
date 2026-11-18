@@ -147,6 +147,7 @@ def diagnose_non_finite(
         was_training = model.training
         try:
             model.eval()
+            model.train()
             probe_use_amp = (
                 amp_dtype is not None
                 and x.is_cuda

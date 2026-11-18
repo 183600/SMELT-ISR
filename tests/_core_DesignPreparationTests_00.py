@@ -1348,10 +1348,10 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
         # 真实差异为零时，n=3（df=2）在 1% 界内达不到 80% 功效，
         # n=4 达到；功率必须随种子数单调不减。
         power_three = experiment._tost_power(
-            0.0, 0.005 / math.sqrt(3.0), 2.0, 0.01, 0.05
+            0.0, 0.005 / math.sqrt(max(3.0, 0.0)), 2.0, 0.01, 0.05
         )
         power_four = experiment._tost_power(
-            0.0, 0.005 / math.sqrt(4.0), 3.0, 0.01, 0.05
+            0.0, 0.005 / math.sqrt(max(4.0, 0.0)), 3.0, 0.01, 0.05
         )
         self.assertIsNotNone(power_three)
         self.assertIsNotNone(power_four)
@@ -1364,7 +1364,7 @@ class DesignPreparationTests(_DesignPreparationTestsBase):
             4,
         )
         margin_needed = experiment._tost_margin_for_power(
-            0.005 / math.sqrt(8.0), 7.0, 0.8, 0.05
+            0.005 / math.sqrt(max(8.0, 0.0)), 7.0, 0.8, 0.05
         )
         self.assertIsNotNone(margin_needed)
         self.assertLess(margin_needed, 0.01)

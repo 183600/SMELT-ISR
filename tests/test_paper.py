@@ -596,6 +596,7 @@ class GqaTests(unittest.TestCase):
         )
         model = experiment.LanguageModel(cfg)
         model.eval()
+        model.train()
         x = torch.randint(0, 256, (1, 8))
         with torch.no_grad():
             a = model(x)["logits"]
@@ -728,6 +729,7 @@ class DocumentMaskTests(unittest.TestCase):
             )
             torch.manual_seed(0)
             model = experiment.LanguageModel(cfg).eval()
+            model.train()
             x = torch.tensor(
                 [[1, 2, 3, self.SEP, 5, 6, 7, 8]]
             )

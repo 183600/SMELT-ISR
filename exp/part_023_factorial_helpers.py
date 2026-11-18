@@ -616,7 +616,7 @@ def _sample_std(values: List[float]) -> Optional[float]:
     ) / (len(normalized) - 1)
     if not math.isfinite(variance) or variance < 0.0:
         return None
-    result = math.sqrt(variance) * scale
+    result = math.sqrt(max(variance, 0.0)) * scale
     return result if math.isfinite(result) else None
 
 
@@ -895,7 +895,7 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
     if math.isinf(df):
         # df→+inf 时 t 分布退化为标准正态；直接代公式会得到
         # inf/inf=NaN，必须显式走正态尾概率。
-        return math.erfc(abs(t) / math.sqrt(2.0))
+        return math.erfc(abs(t) / math.sqrt(max(2.0, 0.0)))
     if not math.isfinite(t):
         return 0.0
 
@@ -907,10 +907,10 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
         magnitude = abs(t)
         if magnitude > 40.0:
             return 0.0
-        normal_tail = math.erfc(magnitude / math.sqrt(2.0))
+        normal_tail = math.erfc(magnitude / math.sqrt(max(2.0, 0.0)))
         density = (
             math.exp(-0.5 * magnitude * magnitude)
-            / math.sqrt(2.0 * math.pi)
+            / math.sqrt(max(2.0 * math.pi, 0.0))
         )
         correction = (
             (magnitude * magnitude * magnitude + magnitude)
@@ -1019,10 +1019,10 @@ def _paired_t_test(
     # 直接做 mean / se 会抛 ZeroDivisionError；该写法对公共尺度
     # 不变，也不改变正常量级的逐位结果。
     try:
-        t = (mean / std) * math.sqrt(n)
+        t = (mean / std) * math.sqrt(max(n, 0.0))
     except (OverflowError, ZeroDivisionError):
         t = None
-    se = std / math.sqrt(n)
+    se = std / math.sqrt(max(n, 0.0))
     if t is None or not math.isfinite(t):
         return {
             "test": "paired_t",
@@ -1260,7 +1260,7 @@ def _paired_difference_diagnostics(
             "n": n,
             "mean": mean,
         }
-    scale = math.sqrt(m2)
+    scale = math.sqrt(max(m2, 0.0))
     m3 = math.fsum((c / scale) ** 3 for c in centered) / max(n, 1)
     m4 = math.fsum((c / scale) ** 4 for c in centered) / max(n, 1)
     skewness = m3
@@ -1452,7 +1452,7 @@ def _wilcoxon_signed_rank_test(
         z_value = max(0.0, (deviation - 0.5)) / math.sqrt(
             variance
         )
-        p_value = math.erfc(z_value / math.sqrt(2.0))
+        p_value = math.erfc(z_value / math.sqrt(max(2.0, 0.0)))
         method = "normal_approximation"
         min_attainable_p = None
         required_seeds = None

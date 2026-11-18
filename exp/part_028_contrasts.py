@@ -83,7 +83,7 @@ def _cost_comparison(
                 and math.isfinite(relative_variance)
                 and relative_variance >= 0.0
             ):
-                relative_se = math.sqrt(relative_variance)
+                relative_se = math.sqrt(max(relative_variance, 0.0))
                 # Welch-Satterthwaite 自由度：用相对项计算，
                 # 避免对方差本身再平方而溢出。
                 scale_term = max(term_a, term_b)
@@ -676,7 +676,7 @@ def factor_contrasts(
                     std_a * std_a + std_b * std_b
                 ) / 2.0
                 if math.isfinite(pooled_squared):
-                    pooled_std = math.sqrt(pooled_squared)
+                    pooled_std = math.sqrt(max(pooled_squared, 0.0))
 
             noise_ratio = None
             if delta is not None and pooled_std:

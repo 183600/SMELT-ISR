@@ -656,7 +656,7 @@ def _select_ngram_candidate_one_se(
         std = _sample_std(differences)
         if std is None:
             continue
-        se = std / math.sqrt(n_windows)
+        se = std / math.sqrt(max(n_windows, 0.0))
         rho1 = _lag1_autocorrelation(
             torch.tensor(differences, dtype=torch.float64)
         )

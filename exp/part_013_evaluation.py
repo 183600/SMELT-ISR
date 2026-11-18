@@ -97,6 +97,7 @@ def evaluate(
     """
     was_training = model.training
     model.eval()
+    model.train()
     # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
     probe_attached = False

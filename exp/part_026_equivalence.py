@@ -43,7 +43,7 @@ def _noncentral_t_cdf(
         # T'=0 当且仅当 Z+δ<=0，与 V 无关；直接由正态 CDF 给出，
         # 避免低自由度截断积分少算 chi 尾部概率。
         return _normal_cdf(-noncentrality)
-    shift_scale = abs(value) / math.sqrt(df)
+    shift_scale = abs(value) / math.sqrt(max(df, 0.0))
     if df < 3.0 and (
         (value > 0.0) == (noncentrality > 0.0)
     ) and shift_scale >= 0.05 and abs(noncentrality) >= 50.0:
@@ -59,7 +59,7 @@ def _noncentral_t_cdf(
             noncentrality,
         )
 
-    scale = 1.0 / math.sqrt(df)
+    scale = 1.0 / math.sqrt(max(df, 0.0))
     if df < 3.0 and value > 0.0 and noncentrality > 0.0:
         # 正态尾在 u 轴的转折位置约为
         # a*δ/(1+a²)（a=value/√df）。df<3 时默认 u 上界只有
@@ -68,7 +68,7 @@ def _noncentral_t_cdf(
         a = value * scale
         peak_u = a * noncentrality / (1.0 + a * a)
         default_u_max = (
-            math.sqrt(df - 1.0) + _T_POWER_TAIL
+            math.sqrt(max(df - 1.0, 0.0)) + _T_POWER_TAIL
             if df > 1.0
             else _T_POWER_TAIL
         )
@@ -208,8 +208,8 @@ def _tost_power_normal_mix(
     # u=sqrt(V) 的 chi 节点上积分条件正态区间概率：
     #   P(|T'|≤U) = E_u[Φ(U·u/√df - δ) - Φ(-U·u/√df - δ)]，
     # 被积函数对 u 平滑，节点权重已按 chi 密度归一。
-    if upper < math.sqrt(df_value):
-        a = upper / math.sqrt(df_value)
+    if upper < math.sqrt(max(df_value, 0.0)):
+        a = upper / math.sqrt(max(df_value, 0.0))
         u_values, weighted = _t_power_nodes(df_value)
         total = 0.0
         for u, weight in zip(u_values, weighted):
@@ -396,9 +396,9 @@ def _seeds_for_tost(
     if sd_value <= 0.0:
         return _MIN_SEEDS_FOR_STATS
 
-    sd_contrast = sd_value * math.sqrt(factor)
+    sd_contrast = sd_value * math.sqrt(max(factor, 0.0))
     for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
-        se = sd_contrast / math.sqrt(float(n))
+        se = sd_contrast / math.sqrt(max(float(n, 0.0)))
         power = _tost_power(
             0.0, se, float(n - 1), margin_value, alpha
         )
@@ -565,7 +565,7 @@ def _paired_effect_size(
         if delta_value == 0.0:
             return {"cohens_dz": 0.0}
         return {}
-    sd_difference = se_value * math.sqrt(float(n_pairs))
+    sd_difference = se_value * math.sqrt(max(float(n_pairs, 0.0)))
     if sd_difference <= 0.0 or not math.isfinite(sd_difference):
         return {}
     dz = delta_value / sd_difference
@@ -590,7 +590,7 @@ def _paired_effect_size(
         1.0 / float(n_pairs) + dz * dz / (2.0 * float(n_pairs))
     )
     if math.isfinite(variance_dz) and variance_dz >= 0.0:
-        se_dz = math.sqrt(variance_dz)
+        se_dz = math.sqrt(max(variance_dz, 0.0))
         low = dz - z_critical * se_dz
         high = dz + z_critical * se_dz
         if math.isfinite(low) and math.isfinite(high):
@@ -641,7 +641,7 @@ def _observed_seed_sd(
         and not isinstance(n_pairs, bool)
         and n_pairs >= _MIN_SEEDS_FOR_STATS
     ):
-        return se_value * math.sqrt(n_pairs)
+        return se_value * math.sqrt(max(n_pairs, 0.0))
     if (
         isinstance(n_baseline, int)
         and not isinstance(n_baseline, bool)
@@ -655,7 +655,7 @@ def _observed_seed_sd(
         )
         # Welch se 已包含两臂合并后的 √(1/n_a+1/n_b)，
         # 不能把 n_eq 当作配对样本数直接开方。
-        return se_value * math.sqrt(n_equivalent / 2.0)
+        return se_value * math.sqrt(max(n_equivalent / 2.0, 0.0))
     return None
 
 

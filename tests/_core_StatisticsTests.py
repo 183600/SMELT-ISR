@@ -1093,7 +1093,7 @@ class StatisticsTests(unittest.TestCase):
         }
         self.assertAlmostEqual(
             experiment._observed_seed_sd(contrast, 0.1),
-            0.1 * math.sqrt(1.5),
+            0.1 * math.sqrt(max(1.5, 0.0)),
         )
         paired = {
             "n_pairs": 3,
@@ -1103,7 +1103,7 @@ class StatisticsTests(unittest.TestCase):
         }
         self.assertAlmostEqual(
             experiment._observed_seed_sd(paired, 0.1),
-            0.1 * math.sqrt(3.0),
+            0.1 * math.sqrt(max(3.0, 0.0)),
         )
 
     def test_all_failed_cell_stays_visible(self):

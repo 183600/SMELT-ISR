@@ -1778,7 +1778,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         for t in (0.0, 1.0, 1.959963984540054, 10.0):
             self.assertAlmostEqual(
                 experiment._two_sided_t_p_value(t, float("inf")),
-                math.erfc(t / math.sqrt(2.0)),
+                math.erfc(t / math.sqrt(max(2.0, 0.0))),
                 delta=1e-12,
             )
         self.assertIsNone(
@@ -1795,7 +1795,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         # 原实现因此把 p 值退化成 1.0 或接近 0；应平滑趋近
         # 标准正态尾概率。
         for t in (1.0, 1.96, 3.0, 10.0):
-            normal = math.erfc(t / math.sqrt(2.0))
+            normal = math.erfc(t / math.sqrt(max(2.0, 0.0)))
             previous = None
             for df in (1.0e6, 1.0e9, 1.0e16, 1.0e100):
                 p_value = experiment._two_sided_t_p_value(t, df)
@@ -1819,7 +1819,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             self.assertIsNotNone(p_value)
             self.assertAlmostEqual(
                 p_value,
-                math.erfc(t / math.sqrt(2.0)),
+                math.erfc(t / math.sqrt(max(2.0, 0.0))),
                 delta=1.0e-9,
             )
             self.assertLess(p_value, 1.0)

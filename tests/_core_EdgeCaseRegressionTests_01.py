@@ -107,7 +107,7 @@ class EdgeCaseRegressionTestsPart2(unittest.TestCase):
         result = experiment._tost_test(
             0.0, 1.0, float("inf"), 2.0, 0.05
         )
-        expected = 0.5 * math.erfc(2.0 / math.sqrt(2.0))
+        expected = 0.5 * math.erfc(2.0 / math.sqrt(max(2.0, 0.0)))
         self.assertAlmostEqual(
             float(result["tost_p_upper"]),
             expected,

@@ -319,6 +319,7 @@ def _selfcheck_top_56521_0045():
     assert amp_check['scale_ratio_to_before'] == 0.5
     assert any(('GradScaler' in finding and '溢出' in finding for finding in amp_report['findings'])), amp_report['findings']
     bad_case_model = LanguageModel(Config(**common, mode='B')).eval()
+    model.train()
     bad_case_report = analyze_bad_cases(bad_case_model, eval_dataset, batch_size=2, batches=2, device=eval_device, amp_dtype=None, split='val', top_n=3)
     valid_categories = set(_BAD_CASE_CATEGORIES)
 
@@ -1193,7 +1194,7 @@ def _selfcheck_body_59224_0068():
     assert 'Hedges g=' in display_with_g
     assert powered_contrast['cohens_dz'] is not None
     assert powered_contrast['hedges_gz'] is not None
-    assert abs(float(powered_contrast['cohens_dz']) - abs(float(powered_contrast['t'])) / math.sqrt(float(powered_contrast['n_pairs']))) < 1e-12
+    assert abs(float(powered_contrast['cohens_dz']) - abs(float(powered_contrast['t'])) / math.sqrt(max(float(powered_contrast['n_pairs'], 0.0)))) < 1e-12
     assert abs(float(powered_contrast['hedges_gz'])) < abs(float(powered_contrast['cohens_dz']))
     assert '配对 dz=' in display_with_g
     assert _paired_effect_size(-0.2, {'test': 'welch_t', 'se': 0.1, 'df': 4.0}) == {}

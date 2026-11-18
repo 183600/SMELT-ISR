@@ -972,7 +972,7 @@ def _spearman_correlation(
     variance_y = sum((b - mean_y) ** 2 for b in rank_y)
     if variance_x <= 0.0 or variance_y <= 0.0:
         return None
-    return covariance / math.sqrt(variance_x * variance_y)
+    return covariance / math.sqrt(max(variance_x * variance_y, 0.0))
 
 
 

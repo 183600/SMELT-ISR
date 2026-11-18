@@ -329,7 +329,7 @@ class RoutingProbe:
                 (share - mean_share) ** 2
                 for share in usage_share
             ) / n_experts
-            load_cv = math.sqrt(variance) / mean_share
+            load_cv = math.sqrt(max(variance, 0.0)) / mean_share
         else:
             load_cv = 0.0
 
@@ -886,6 +886,7 @@ def analyze_routing(
     was_training = model.training
     model.eval()
 
+    model.train()
     core = _unwrap_model(model)
     cfg = core.cfg
     probe = RoutingProbe(cfg, batch_size)
@@ -1630,7 +1631,7 @@ def analyze_routing_interventions(
         report["interventions"]["expert_drop"] = {
             "per_expert": drop_rows,
             "mean_loss_delta": mean_delta,
-            "std_loss_delta": math.sqrt(variance),
+            "std_loss_delta": math.sqrt(max(variance, 0.0)),
             "max_loss_delta": max_delta,
             "max_loss_delta_relative": (
                 max_delta / max(baseline_loss, 1e-8)
@@ -1651,7 +1652,7 @@ def analyze_routing_interventions(
                 else None
             ),
             "importance_cv": (
-                math.sqrt(variance) / abs(mean_delta)
+                math.sqrt(max(variance, 0.0)) / abs(mean_delta)
                 if abs(mean_delta) > 1e-12
                 else None
             ),
@@ -1848,7 +1849,7 @@ def routing_intervention_comparison_report(
         variance = sum(
             (value - mean) ** 2 for value in finite
         ) / (len(finite) - 1)
-        return mean, math.sqrt(variance)
+        return mean, math.sqrt(max(variance, 0.0))
 
     summary: Dict[str, object] = {}
     for mode, entries in by_mode.items():

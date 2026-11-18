@@ -188,7 +188,7 @@ def _meta_chi_square_sf(value: float, df: int) -> float:
 
 
 def _meta_normal_sf(z_value: float) -> float:
-    return 0.5 * math.erfc(z_value / math.sqrt(2.0))
+    return 0.5 * math.erfc(z_value / math.sqrt(max(2.0, 0.0)))
 
 
 def meta_analyze(
@@ -257,7 +257,7 @@ def meta_analyze(
     theta_fixed = sum(
         w * y for w, y in zip(weights_fixed, clean_effects)
     ) / total_weight
-    se_fixed = math.sqrt(1.0 / total_weight)
+    se_fixed = math.sqrt(max(1.0 / total_weight, 0.0))
     q_value = sum(
         w * (y - theta_fixed) ** 2
         for w, y in zip(weights_fixed, clean_effects)
@@ -275,7 +275,7 @@ def meta_analyze(
     theta_random = sum(
         w * y for w, y in zip(weights_random, clean_effects)
     ) / total_weight_random
-    se_random = math.sqrt(1.0 / total_weight_random)
+    se_random = math.sqrt(max(1.0 / total_weight_random, 0.0))
     i_squared = max(0.0, (q_value - df) / q_value) if q_value > 0 else 0.0
     h_squared = q_value / df if df > 0 else float("inf")
     z_random = (
@@ -310,7 +310,7 @@ def meta_analyze(
             "z": z_random,
             "p_value_two_sided": pooled_p_two_sided,
             "tau_squared": tau_squared,
-            "tau": math.sqrt(tau_squared),
+            "tau": math.sqrt(max(tau_squared, 0.0)),
         },
         "heterogeneity": {
             "q": q_value,

@@ -134,6 +134,7 @@ class ProtocolInvariantTests(unittest.TestCase):
         # first_gates 不同，断言即失败。
         cfg = _tiny_config(mode="B", k1=2, k2=2)
         model = experiment.LanguageModel(cfg).eval()
+        model.train()
         batch, time = 2, 4
 
         def identity_block(x, top_k, scale, attn_mask=None):

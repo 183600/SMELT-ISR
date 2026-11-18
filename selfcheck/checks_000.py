@@ -282,6 +282,7 @@ def _selfcheck_top_52048_0009():
         ckpt_loss.backward()
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
     causal_model = LanguageModel(Config(**common, mode='B')).eval()
+    model.train()
     x_changed = x.clone()
     x_changed[:, -1] = (x_changed[:, -1] + 1) % 256
 
@@ -292,6 +293,7 @@ def _selfcheck_top_52201_0010():
         logits_changed = causal_model(x_changed)['logits']
     torch.testing.assert_close(logits_original[:, :-1], logits_changed[:, :-1], rtol=1e-05, atol=1e-06)
     model = LanguageModel(Config(**common, mode='B')).eval()
+    model.train()
     block = model.blocks[model.middle_start]
     # NOTE: No random seed set in this function - results may not be reproducible
     branches = torch.randn(2, 2, 8, 16)
@@ -400,6 +402,7 @@ def _selfcheck_top_52478_0015():
     assert overfull_empty[0].numel() == 0
     assert overfull_empty[1].numel() == 0
     eval_model = LanguageModel(Config(**common, mode='B')).eval()
+    model.train()
     val_metrics = evaluate(eval_model, eval_dataset, 2, 1, eval_device)
     assert 'val_loss' in val_metrics
     assert 'val_ppl' in val_metrics

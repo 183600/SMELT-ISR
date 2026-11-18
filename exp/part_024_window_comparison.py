@@ -614,7 +614,7 @@ def _window_variance_components(
         """把归一化标准差还原到原始尺度；溢出时返回 None。"""
         if not math.isfinite(value) or value < 0.0:
             return None
-        result = math.sqrt(value) * scale
+        result = math.sqrt(max(value, 0.0)) * scale
         return result if math.isfinite(result) else None
 
     grand_mean = grand_mean_norm * scale
