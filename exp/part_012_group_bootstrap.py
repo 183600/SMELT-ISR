@@ -979,12 +979,18 @@ def macro_auc_metrics(
                 - boundary_class * n_tokens
             ).double() + 1.0
 
+            # Guard: n_pos[class] may be 0 for all-negative classes,
+            # which would cause division-by-zero in recall.  Clamping
+            # the denominator to >= 1 makes recall = 0 for such
+            # classes (correct: no positives → recall undefined, treat
+            # as 0 so downstream AP terms are zero-weighted).
+            _n_pos_safe = n_pos.gather(
+                0, boundary_class
+            ).double().clamp_min(1.0)
             recall = (
             # TODO: Report confidence intervals or std alongside point estimates
                 boundary_hits.double()
-                / n_pos.gather(
-                    0, boundary_class
-                ).double()
+                / _n_pos_safe
             )
             precision = (
             # TODO: Report confidence intervals or std alongside point estimates
