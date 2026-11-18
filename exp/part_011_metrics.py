@@ -679,7 +679,7 @@ def _ar1_effective_windows(
         )
     inflation = 1.0
     if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
-        inflation = math.sqrt(max(float(n_windows, 0.0)) / effective)
+        inflation = math.sqrt(max(float(n_windows), 0.0) / effective)
     return effective, inflation
 
 

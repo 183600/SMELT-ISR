@@ -1264,10 +1264,10 @@ def _seeds_to_detect(
 
     for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
         if design == "welch":
-            se = sd_value * math.sqrt(max(2.0 / float(n, 0.0)))
+            se = sd_value * math.sqrt(max(2.0 / float(n), 0.0))
             df = float(2 * (n - 1))
         else:
-            se = sd_value / math.sqrt(max(float(n, 0.0)))
+            se = sd_value / math.sqrt(max(float(n), 0.0))
             df = float(n - 1)
         power = _t_power(
             effect_value,
@@ -1513,7 +1513,7 @@ def _jzs_u_nodes_kernel(
     """
     r = float(scale)
     u_max = math.sqrt(max(2.0 * _BAYES_TAIL_LOG_CUT, 0.0)) / r
-    u_transition = 12.0 * math.sqrt(max(float(n_value, 0.0)))
+    u_transition = 12.0 * math.sqrt(max(float(n_value), 0.0))
     nodes = int(_BAYES_QUAD_NODES)
     if nodes % 2 == 0:
         nodes += 1

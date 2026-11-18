@@ -398,7 +398,7 @@ def _seeds_for_tost(
 
     sd_contrast = sd_value * math.sqrt(max(factor, 0.0))
     for n in range(_MIN_SEEDS_FOR_STATS, max_seeds + 1):
-        se = sd_contrast / math.sqrt(max(float(n, 0.0)))
+        se = sd_contrast / math.sqrt(max(float(n), 0.0))
         power = _tost_power(
             0.0, se, float(n - 1), margin_value, alpha
         )
@@ -565,7 +565,7 @@ def _paired_effect_size(
         if delta_value == 0.0:
             return {"cohens_dz": 0.0}
         return {}
-    sd_difference = se_value * math.sqrt(max(float(n_pairs, 0.0)))
+    sd_difference = se_value * math.sqrt(max(float(n_pairs), 0.0))
     if sd_difference <= 0.0 or not math.isfinite(sd_difference):
         return {}
     dz = delta_value / sd_difference

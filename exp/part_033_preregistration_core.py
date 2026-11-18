@@ -271,7 +271,7 @@ def _contrast_power_entry(
     achieved_power = None
     mde = None
     if alpha_adjusted > 0.0 and usable_seeds >= _MIN_SEEDS_FOR_STATS:
-        se = sd_contrast / math.sqrt(max(float(usable_seeds, 0.0)))
+        se = sd_contrast / math.sqrt(max(float(usable_seeds), 0.0))
         df = float(usable_seeds - 1)
         achieved_power = _t_power(
             float(min_effect),
@@ -338,7 +338,7 @@ def _contrast_power_entry(
             alpha_adjusted > 0.0
             and usable_seeds >= _MIN_SEEDS_FOR_STATS
         ):
-            eq_se = sd_contrast / math.sqrt(max(float(usable_seeds, 0.0)))
+            eq_se = sd_contrast / math.sqrt(max(float(usable_seeds), 0.0))
             eq_df = float(usable_seeds - 1)
             eq_power = _tost_power(
                 0.0,

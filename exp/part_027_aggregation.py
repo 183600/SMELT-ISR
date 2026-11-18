@@ -201,7 +201,7 @@ def aggregate_runs(
                         cost_half = (
                             cost_critical
                             * field_std
-                            / math.sqrt(max(len(values, 0.0)))
+                            / math.sqrt(max(len(values), 0.0))
                         )
                         cost_low = field_mean - cost_half
                         cost_high = field_mean + cost_half
@@ -262,7 +262,7 @@ def aggregate_runs(
                 critical = _t_critical(float(len(values) - 1))
                 if critical is not None:
                     half_width = (
-                        critical * std / math.sqrt(max(len(values, 0.0)))
+                        critical * std / math.sqrt(max(len(values), 0.0))
                     )
                     low = mean - half_width
                     high = mean + half_width
