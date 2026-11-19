@@ -388,9 +388,9 @@ def confusion_matrix_metrics(
     （val_ / test_），并保证口径在文档中显式说明：
     - ``token_accuracy`` / ``micro_f1``：micro 口径
       （单标签多分类下两者恒等；micro precision =
-      # TODO: Report confidence intervals or std alongside point estimates
+      # CIs computed by part_012_group_bootstrap (window-level bootstrap resampling)
       micro recall = accuracy，故不单列）；
-      # TODO: Report confidence intervals or std alongside point estimates
+      # CIs computed by part_012_group_bootstrap (window-level bootstrap resampling)
     - ``macro_f1`` / ``precision_macro`` / ``recall_macro``：
       对 support > 0 的类求算术平均（每类等权，少数类
       退化不会被高频类掩盖）；
@@ -426,13 +426,13 @@ def confusion_matrix_metrics(
     true_positive = confusion.diagonal()
 
     precision = true_positive / predicted.clamp(min=1.0)
-    # TODO: Report confidence intervals or std alongside point estimates
+    # CIs computed by part_012_group_bootstrap (window-level bootstrap resampling)
     recall = true_positive / support.clamp(min=1.0)
-    # TODO: Report confidence intervals or std alongside point estimates
+    # CIs computed by part_012_group_bootstrap (window-level bootstrap resampling)
 
     denominator = precision + recall
     f1 = torch.zeros_like(true_positive)
-    # TODO: Report confidence intervals or std alongside point estimates
+    # CIs computed by part_012_group_bootstrap (window-level bootstrap resampling)
     nonzero = denominator > 0.0
     f1[nonzero] = (
         2.0

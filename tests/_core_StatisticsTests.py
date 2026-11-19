@@ -1404,12 +1404,10 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         self.assertEqual(nonfinite["reason"], "invalid_values")
 
     def test_wilcoxon_exact_matches_hand_computation(self):
-    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         # d=[0.8,0.5,1.2,-0.3,0.9]：|d| 秩为 1..5，W+=14，期望
         # 7.5；穷举 32 种符号组合中 4 种满足 |W+-7.5|>=6.5
         # （{}、{1}、{2,3,4,5}、{1,2,3,4,5}），p=4/32=0.125。
         result = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [0.8, 0.5, 1.2, -0.3, 0.9]
         )
         self.assertEqual(result["method"], "exact")
@@ -1421,7 +1419,6 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         )
         # 全部同号时统计量取到两端：最小可达双侧 p = 2/2^n。
         same_sign = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [1.0, 2.0, 3.0, 4.0, 5.0]
         )
         self.assertAlmostEqual(same_sign["p_value"], 0.0625)
@@ -1430,9 +1427,7 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         self.assertEqual(same_sign["required_seeds_for_alpha"], 6)
 
     def test_wilcoxon_ties_use_midranks_and_drops_zeros(self):
-    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         tied = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [0.8, 0.5, 1.2, -0.3, 0.9, 0.9]
         )
         self.assertEqual(tied["tie_groups"], 1)
@@ -1440,23 +1435,19 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(tied["w_minus"], 1.0)
         self.assertAlmostEqual(tied["p_value"], 0.0625)
         with_zero = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [0.0, 0.0, 1.0, 2.0, 3.0]
         )
         self.assertEqual(with_zero["n_zero_dropped"], 2)
         self.assertEqual(with_zero["n_effective"], 3)
         self.assertAlmostEqual(with_zero["p_value"], 0.25)
         all_zero = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [0.0, 0.0, 0.0]
         )
         self.assertEqual(all_zero["method"], "degenerate_all_zero")
         self.assertIsNone(all_zero["p_value"])
 
     def test_wilcoxon_normal_approximation_for_larger_n(self):
-    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         result = experiment._wilcoxon_signed_rank_test(
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             [float(i) for i in range(1, 21)]
         )
         self.assertEqual(result["method"], "normal_approximation")
@@ -1565,13 +1556,10 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         self.assertTrue(paired["paired_diagnostics"]["available"])
         self.assertEqual(
             paired["wilcoxon"]["method"], "exact"
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         )
         self.assertIsNotNone(paired["wilcoxon_p_value"])
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         self.assertAlmostEqual(
             paired["wilcoxon_rank_biserial"], -1.0
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         )
         # 种子集合不同 → Welch：附 Clifford δ 与方差诊断。
         welch = experiment._contrast_test(
@@ -1630,10 +1618,8 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
             contrast["paired_diagnostics"]["status"], "ok"
         )
         self.assertIsNotNone(contrast["wilcoxon_p_value"])
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         self.assertAlmostEqual(
             contrast["wilcoxon_rank_biserial"], -1.0
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         )
         self.assertIn("cohens_dz_ci95", contrast)
         self.assertIn("paired_differences", contrast)
@@ -1717,7 +1703,6 @@ class ResultsAnalysisDiagnosticsTests(unittest.TestCase):
         contrast = report["contrasts"][0]
         self.assertIn("paired_diagnostics", contrast)
         self.assertIn("wilcoxon_p_value", contrast)
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         self.assertIn("cohens_dz_ci95", contrast)
         rendered = output.getvalue()
         self.assertIn("[multiplicity]", rendered)

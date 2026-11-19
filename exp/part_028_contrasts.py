@@ -4,8 +4,6 @@ from __future__ import annotations
 # entry point (set_seed(args.seed)); all stochastic paths use local
 # torch.Generator().manual_seed(...) and are unaffected.
 
-
-
 def _cost_comparison(
     cell_a: Dict[str, object],
     cell_b: Dict[str, object],
@@ -222,8 +220,6 @@ def _cost_comparison(
         },
         cost_verdict,
     )
-
-
 
 def _apply_multiple_comparison_correction(
     contrasts: List[Dict[str, object]],
@@ -457,8 +453,6 @@ def _apply_multiple_comparison_correction(
     # 让「校正后仍不含 0」有一个与家族规模一致的区间口径。
     _attach_family_adjusted_intervals(eligible)
 
-
-
 def _controlled_confound_keys_for_cells(
     cell_a: Dict[str, object],
     cell_b: Dict[str, object],
@@ -547,8 +541,6 @@ def _controlled_confound_keys_for_cells(
         if confounded and key not in confound_keys:
             confound_keys.append(key)
     return confound_keys
-
-
 
 def factor_contrasts(
     aggregates: List[Dict[str, object]],
@@ -810,26 +802,26 @@ def factor_contrasts(
                 # 家族、不改变 significant 判定；与 t 结论不一致
                 # 时由展示层提示。
                 "wilcoxon_p_value": test.get(
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+
                     "wilcoxon_p_value"
-                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+    
                 ),
                 "wilcoxon_method": test.get("wilcoxon_method"),
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+
                 "wilcoxon_rank_biserial": test.get(
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+
                     "wilcoxon_rank_biserial"
-                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+    
                 ),
                 "wilcoxon_min_attainable_p": test.get(
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+
                     "wilcoxon_min_attainable_p"
-                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+    
                 ),
                 "wilcoxon_can_reach_significance": test.get(
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+
                     "wilcoxon_can_reach_significance"
-                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
+    
                 ),
                 # Welch（非配对）口径的秩效应量与方差齐性诊断：
                 # 合并标准差在两臂方差悬殊时的解读前提必须显式。
@@ -926,8 +918,6 @@ def factor_contrasts(
 
     return contrasts
 
-
-
 def _cell_seed_values(
     cell: Dict[str, object],
     metric: str,
@@ -991,8 +981,6 @@ def _cell_seed_values(
             continue
         mapping[_stable_factor_key(seed)] = (seed, value)
     return mapping, complete, duplicate_seeds
-
-
 
 def _paired_linear_effect(
     cells: Dict[str, Dict[str, object]],
@@ -1089,7 +1077,6 @@ def _paired_linear_effect(
         # 只看 t 检验会把假设前提藏起来。
         diagnostics = _paired_difference_diagnostics(effect_values)
         wilcoxon = _wilcoxon_signed_rank_test(effect_values)
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         stability = _leave_one_out_effect_stability(
             effect_values
         )
@@ -1158,19 +1145,14 @@ def _paired_linear_effect(
             ),
             "paired_diagnostics": diagnostics,
             "wilcoxon_p_value": wilcoxon.get("p_value"),
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_method": wilcoxon.get("method"),
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_rank_biserial": wilcoxon.get(
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "rank_biserial"
             ),
             "wilcoxon_min_attainable_p": wilcoxon.get(
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "min_attainable_p"
             ),
             "wilcoxon_can_reach_significance": wilcoxon.get(
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "can_reach_significance"
             ),
             "se": result.get("se"),

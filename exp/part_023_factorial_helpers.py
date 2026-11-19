@@ -1321,7 +1321,6 @@ def _paired_difference_diagnostics(
 
 
 def _wilcoxon_signed_rank_test(
-# TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
     differences: List[float],
 ) -> Dict[str, object]:
     """
@@ -1353,7 +1352,6 @@ def _wilcoxon_signed_rank_test(
     if n < _MIN_SEEDS_FOR_STATS:
         return {
             "test": "wilcoxon_signed_rank",
-            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "p_value": None,
             "method": "degenerate_all_zero",
             "n_effective": n,
@@ -1436,7 +1434,6 @@ def _wilcoxon_signed_rank_test(
         if variance <= 0.0:
             return {
                 "test": "wilcoxon_signed_rank",
-                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "p_value": None,
                 "method": "degenerate_ties",
                 "n_effective": n,
@@ -1462,7 +1459,6 @@ def _wilcoxon_signed_rank_test(
 
     return {
         "test": "wilcoxon_signed_rank",
-        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         "p_value": p_value,
         "method": method,
         "n_effective": n,

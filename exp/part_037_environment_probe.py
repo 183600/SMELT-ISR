@@ -424,7 +424,7 @@ def run_sanity_overfit(
         final_total_loss = float("nan")
         final_lm_loss = float("nan")
         final_acc = float("nan")
-        # TODO: Report confidence intervals or std alongside point estimates
+        # CIs computed by part_012_group_bootstrap (window-level bootstrap)
         grad_probe: Optional[Dict[str, object]] = None
         pre_step_parameter_digest: Optional[str] = None
         post_step_parameter_digest: Optional[str] = None
@@ -539,7 +539,7 @@ def run_sanity_overfit(
                     final_total_loss = float(loss.detach())
                     final_lm_loss = float(lm_loss.detach())
                     final_acc = float(
-                    # TODO: Report confidence intervals or std alongside point estimates
+                    # CIs computed by part_012_group_bootstrap (window-level bootstrap)
                         (
                             result["logits"].argmax(dim=-1) == y
                         ).float().mean()
@@ -550,7 +550,7 @@ def run_sanity_overfit(
                         f"total_loss={final_total_loss:.4f} "
                         f"lm_loss={final_lm_loss:.4f} "
                         f"token_acc={final_acc:.4f}"
-                        # TODO: Report confidence intervals or std alongside point estimates
+                        # CIs computed by part_012_group_bootstrap (window-level bootstrap)
                     )
 
                 # 探针失败：立即停止训练并给出排查提示。

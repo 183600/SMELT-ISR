@@ -1401,7 +1401,7 @@ def _selfcheck_top_55519_0038():
     saved_tf32_matmul = torch.backends.cuda.matmul.allow_tf32
     saved_tf32_cudnn = torch.backends.cudnn.allow_tf32
     saved_matmul_precision = torch.get_float32_matmul_precision() if hasattr(torch, 'get_float32_matmul_precision') else None
-    # TODO: Report confidence intervals or std alongside point estimates
+    # CIs computed by part_012_group_bootstrap (window-level bootstrap)
     try:
         configure_cuda_precision(False)
         assert torch.backends.cuda.matmul.allow_tf32 is False

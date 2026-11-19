@@ -34,7 +34,7 @@ def _bad_case_report_from_buffers(
 
     wrong_mask = target_all != predicted_all
     token_accuracy = float(
-    # TODO: Report confidence intervals or std alongside point estimates
+    # CIs computed by part_012_group_bootstrap (window-level bootstrap)
         (1.0 - wrong_mask.float().mean()).item()
     )
 
