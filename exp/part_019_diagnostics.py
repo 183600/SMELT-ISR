@@ -147,7 +147,7 @@ def diagnose_non_finite(
         was_training = model.training
         try:
             model.eval()
-            model.train()
+            # [FIX] removed no-op model.train() that undid model.eval()
             probe_use_amp = (
                 amp_dtype is not None
                 and x.is_cuda

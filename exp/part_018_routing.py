@@ -885,8 +885,8 @@ def analyze_routing(
     """
     was_training = model.training
     model.eval()
+    # [FIX] removed no-op model.train() that undid model.eval()
 
-    model.train()
     core = _unwrap_model(model)
     cfg = core.cfg
     probe = RoutingProbe(cfg, batch_size)
