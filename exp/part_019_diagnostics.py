@@ -147,7 +147,6 @@ def diagnose_non_finite(
         was_training = model.training
         try:
             model.eval()
-            # [FIX] removed no-op model.train() that undid model.eval()
             probe_use_amp = (
                 amp_dtype is not None
                 and x.is_cuda
@@ -426,7 +425,7 @@ def diagnose_non_finite(
             amp_state["grad_scale_before_step"] = before
             if scale_at_diagnosis is not None:
                 amp_state["scale_ratio_to_before"] = round(
-                    scale_at_diagnosis / max(before, 1e-8),
+                    scale_at_diagnosis / before,
                     6,
                 )
                 # GradScaler 在 unscale 时发现 inf/nan 梯度会
@@ -482,7 +481,7 @@ def diagnose_non_finite(
             findings.append(
                 f"失败步梯度范数 {grad_norm_value:.4g} 约为近期"
                 f"中位数 {median:.4g} 的 "
-                f"{grad_norm_value / max(median, 1e-8):.1f} 倍：梯度放大明显，"
+                f"{grad_norm_value / median:.1f} 倍：梯度放大明显，"
                 "符合梯度爆炸/学习率过大特征"
             )
         elif _finite(loss) is False:
@@ -700,7 +699,7 @@ def _safe_ratio(
         try:
             # 两个超大但同量级的整数计数可以直接相除；
             # 先各自转 float 会无谓地丢掉可表示的倍率。
-            ratio = numerator / max(denominator, 1e-8)
+            ratio = numerator / denominator
         except (OverflowError, ValueError):
             return None
     else:
@@ -716,7 +715,7 @@ def _safe_ratio(
         ):
             return None
         try:
-            ratio = left / max(right, 1e-8)
+            ratio = left / right
         except OverflowError:
             return None
     if not math.isfinite(ratio):
@@ -730,7 +729,7 @@ def _safe_cv(std: float, mean: float) -> Optional[float]:
     if mean <= 0.0 or not math.isfinite(mean):
         return None
     try:
-        ratio = std / max(mean, 1e-8)
+        ratio = std / mean
     except OverflowError:
         return None
     if not math.isfinite(ratio):
@@ -874,6 +873,7 @@ def measure_efficiency(
 
         # 纯推理测量不回流训练图，与 evaluate 一致使用
         # inference_mode。
+        with torch.no_grad():
         with torch.inference_mode(), autocast:
             for _ in range(max(0, warmup)):
                 model(x, y)
@@ -1001,7 +1001,7 @@ def measure_efficiency(
             ],
         },
         "throughput_tokens_per_sec": (
-            round(tokens / max(latency_seconds, 1e-8), 2)
+            round(tokens / latency_seconds, 2)
             if latency_seconds
             else None
         ),
@@ -1065,14 +1065,14 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
     print(
         "[efficiency] "
         f"params={efficiency.get('n_params_total')} "
-        "(non-embedding="
+        f"(non-embedding="
         f"{efficiency.get('n_params_non_embedding')}) | "
-        "FLOPs/forward="
+        f"FLOPs/forward="
         f"{_format(efficiency.get('flops_per_forward'), '', '.3e')} | "
         f"latency={_format(efficiency.get('latency_ms_per_forward'), 'ms')} | "
-        "train_step="
+        f"train_step="
         f"{_format(efficiency.get('training_ms_per_step'), 'ms')} | "
-        "throughput="
+        f"throughput="
         f"{_format(efficiency.get('throughput_tokens_per_sec'), 'tok/s')}"
     )
     for label, key in (
@@ -1094,13 +1094,13 @@ def print_efficiency(efficiency: Dict[str, object]) -> None:
         )
     print(
         "[efficiency] "
-        "inference_peak="
+        f"inference_peak="
         f"{_format(efficiency.get('inference_peak_memory_mb'), 'MB')} | "
-        "fwd_bwd_peak="
+        f"fwd_bwd_peak="
         f"{_format(efficiency.get('training_peak_memory_mb'), 'MB')} | "
-        "actual_train_peak="
+        f"actual_train_peak="
         f"{_format(efficiency.get('actual_training_peak_memory_mb'), 'MB')} | "
-        "process_peak_rss="
+        f"process_peak_rss="
         f"{_format(efficiency.get('process_peak_rss_mb'), 'MB')}"
     )
 

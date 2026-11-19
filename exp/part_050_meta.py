@@ -71,7 +71,7 @@ def _meta_gamma_upper_regularized(
         d_value = an * d_value + b_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = b_value + an / max(c_value, 1e-8)
+        c_value = b_value + an / c_value
         if abs(c_value) < tiny:
             c_value = tiny
         d_value = 1.0 / d_value
@@ -119,10 +119,10 @@ def _meta_beta_continued(
     qap = a_value + 1.0
     qam = a_value - 1.0
     c_value = 1.0
-    d_value = 1.0 - qab * x_value / max(qap, 1e-8)
+    d_value = 1.0 - qab * x_value / qap
     if abs(d_value) < tiny:
         d_value = tiny
-    d_value = 1.0 / max(d_value, 1e-8)
+    d_value = 1.0 / d_value
     h_value = d_value
     for index in range(1, 301):
         m2 = 2 * index
@@ -132,10 +132,10 @@ def _meta_beta_continued(
         d_value = 1.0 + aa * d_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = 1.0 + aa / max(c_value, 1e-8)
+        c_value = 1.0 + aa / c_value
         if abs(c_value) < tiny:
             c_value = tiny
-        d_value = 1.0 / max(d_value, 1e-8)
+        d_value = 1.0 / d_value
         h_value *= d_value * c_value
         aa = -(a_value + index) * (qab + index) * x_value / (
             (a_value + m2) * (qap + m2)
@@ -143,7 +143,7 @@ def _meta_beta_continued(
         d_value = 1.0 + aa * d_value
         if abs(d_value) < tiny:
             d_value = tiny
-        c_value = 1.0 + aa / max(c_value, 1e-8)
+        c_value = 1.0 + aa / c_value
         if abs(c_value) < tiny:
             c_value = tiny
         d_value = 1.0 / d_value
@@ -188,7 +188,7 @@ def _meta_chi_square_sf(value: float, df: int) -> float:
 
 
 def _meta_normal_sf(z_value: float) -> float:
-    return 0.5 * math.erfc(z_value / math.sqrt(max(2.0, 0.0)))
+    return 0.5 * math.erfc(z_value / math.sqrt(2.0))
 
 
 def meta_analyze(
@@ -256,8 +256,8 @@ def meta_analyze(
     total_weight = sum(weights_fixed)
     theta_fixed = sum(
         w * y for w, y in zip(weights_fixed, clean_effects)
-    ) / total_weight
-    se_fixed = math.sqrt(max(1.0 / total_weight, 0.0))
+    ) / max(total_weight, 1)
+    se_fixed = math.sqrt(1.0 / max(total_weight, 1))
     q_value = sum(
         w * (y - theta_fixed) ** 2
         for w, y in zip(weights_fixed, clean_effects)
@@ -266,7 +266,7 @@ def meta_analyze(
     q_p_value = _meta_chi_square_sf(q_value, df)
     c_value = total_weight - sum(
         w * w for w in weights_fixed
-    ) / total_weight
+    ) / max(total_weight, 1)
     tau_squared = 0.0
     if c_value > 0.0:
         tau_squared = max(0.0, (q_value - df) / c_value)
@@ -275,7 +275,7 @@ def meta_analyze(
     theta_random = sum(
         w * y for w, y in zip(weights_random, clean_effects)
     ) / total_weight_random
-    se_random = math.sqrt(max(1.0 / total_weight_random, 0.0))
+    se_random = math.sqrt(1.0 / total_weight_random)
     i_squared = max(0.0, (q_value - df) / q_value) if q_value > 0 else 0.0
     h_squared = q_value / df if df > 0 else float("inf")
     z_random = (
@@ -310,7 +310,7 @@ def meta_analyze(
             "z": z_random,
             "p_value_two_sided": pooled_p_two_sided,
             "tau_squared": tau_squared,
-            "tau": math.sqrt(max(tau_squared, 0.0)),
+            "tau": math.sqrt(tau_squared),
         },
         "heterogeneity": {
             "q": q_value,

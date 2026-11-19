@@ -1,30 +1,7 @@
 from __future__ import annotations
-
-import builtins as _builtins
-import math as _math
-import random as _random
-
-_max = _builtins.max
-_float = _builtins.float
-
-import torch
-import torch.nn as nn
+import random
 import exp
-
-max = _max
-float = _float
-math = _math
-random = _random
-
-from exp import (
-    Config,
-    set_seed,
-    LanguageModel,
-    SparseMoE,
-    TransformerBlock,
-    RMSNorm,
-    ByteDataset,
-)
+from exp import Config, set_seed
 
 def _selfcheck_top_51350_0001():
     global common, grad, gradients, key, mode, model, named_dense, named_dense_state, named_moe, named_moe_state, named_shared, ordered_moe, result, x, y
@@ -301,11 +278,9 @@ def _selfcheck_top_52048_0009():
     ckpt_model.grad_checkpoint = True
     ckpt_model.train()
     ckpt_loss = ckpt_model(x, y)['loss']
-    with torch.enable_grad():
-        ckpt_loss.backward()
+    ckpt_loss.backward()
     assert torch.isfinite(ckpt_model.blocks[0].attn.qkv.weight.grad).all()
     causal_model = LanguageModel(Config(**common, mode='B')).eval()
-    model.train()
     x_changed = x.clone()
     x_changed[:, -1] = (x_changed[:, -1] + 1) % 256
 
@@ -316,7 +291,6 @@ def _selfcheck_top_52201_0010():
         logits_changed = causal_model(x_changed)['logits']
     torch.testing.assert_close(logits_original[:, :-1], logits_changed[:, :-1], rtol=1e-05, atol=1e-06)
     model = LanguageModel(Config(**common, mode='B')).eval()
-    model.train()
     block = model.blocks[model.middle_start]
     # NOTE: No random seed set in this function - results may not be reproducible
     branches = torch.randn(2, 2, 8, 16)
@@ -425,7 +399,6 @@ def _selfcheck_top_52478_0015():
     assert overfull_empty[0].numel() == 0
     assert overfull_empty[1].numel() == 0
     eval_model = LanguageModel(Config(**common, mode='B')).eval()
-    model.train()
     val_metrics = evaluate(eval_model, eval_dataset, 2, 1, eval_device)
     assert 'val_loss' in val_metrics
     assert 'val_ppl' in val_metrics
@@ -466,7 +439,7 @@ def _selfcheck_top_52613_0016():
             manual_losses = torch.nn.functional.cross_entropy(manual_logits.reshape(-1, 256).float(), manual_target, reduction='none')
             manual_class_sums.index_add_(0, manual_target, manual_losses.to(torch.float64))
             manual_counts.index_add_(0, manual_target, torch.ones_like(manual_losses, dtype=torch.float64))
-    manual_weighted = float(manual_class_sums.sum() / manual_counts.sum())
+    manual_weighted = float(manual_class_sums.sum() / manual_counts.sum().clamp_min(1))
     assert abs(manual_weighted - float(val_metrics['val_loss'])) < 0.0001 * max(1.0, abs(manual_weighted))
     manual_balanced = class_balanced_loss_metrics(manual_class_sums, manual_counts, 256)
     assert abs(float(manual_balanced['macro_nll']) - float(val_metrics['val_macro_nll'])) < 0.0001 * max(1.0, abs(manual_weighted))

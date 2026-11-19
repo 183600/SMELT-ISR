@@ -319,7 +319,6 @@ def _selfcheck_top_56521_0045():
     assert amp_check['scale_ratio_to_before'] == 0.5
     assert any(('GradScaler' in finding and '溢出' in finding for finding in amp_report['findings'])), amp_report['findings']
     bad_case_model = LanguageModel(Config(**common, mode='B')).eval()
-    model.train()
     bad_case_report = analyze_bad_cases(bad_case_model, eval_dataset, batch_size=2, batches=2, device=eval_device, amp_dtype=None, split='val', top_n=3)
     valid_categories = set(_BAD_CASE_CATEGORIES)
 
@@ -847,7 +846,7 @@ def _selfcheck_top_58213_0060():
     global boot_b, class_id, constant_boot, degenerate_boot, degenerate_support, perfect_boot, perfect_predicted, perfect_support, perfect_tp, point_loss, row, shuffled_totals, trend_boot, trend_pred, trend_rho, trend_sup, trend_tokens, trend_totals, trend_tp
     boot_b = _bootstrap_eval_intervals(loss_totals, token_totals, tp_per_window, predicted_per_window, support_per_window, replicates=300, seed=12345)
     assert boot_a == boot_b
-    point_loss = float(loss_totals.sum() / token_totals.sum())
+    point_loss = float(loss_totals.sum() / token_totals.sum().clamp_min(1))
     assert boot_a['bootstrap_windows'] == windows
     assert boot_a['bootstrap_replicates'] == 300
     assert float(boot_a['loss_ci95_low']) <= point_loss <= float(boot_a['loss_ci95_high'])
@@ -901,7 +900,7 @@ def _selfcheck_top_58355_0061():
     assert float(trend_boot['window_ci_inflation']) > 1.0
     trend_effective = float(trend_boot['window_effective_windows'])
     assert 1.0 <= trend_effective < 8.0
-    assert float(trend_boot['loss_ci95_low']) <= float(trend_totals.sum() / trend_tokens.sum()) <= float(trend_boot['loss_ci95_high'])
+    assert float(trend_boot['loss_ci95_low']) <= float(trend_totals.sum() / trend_tokens.sum().clamp_min(1)) <= float(trend_boot['loss_ci95_high'])
     trend_width = float(trend_boot['loss_ci95_high']) - float(trend_boot['loss_ci95_low'])
     shuffled_boot = _bootstrap_eval_intervals(shuffled_totals, trend_tokens, trend_tp, trend_pred, trend_sup, replicates=200, seed=11)
     assert float(shuffled_boot['window_ci_inflation']) == 1.0
@@ -1194,7 +1193,7 @@ def _selfcheck_body_59224_0068():
     assert 'Hedges g=' in display_with_g
     assert powered_contrast['cohens_dz'] is not None
     assert powered_contrast['hedges_gz'] is not None
-    assert abs(float(powered_contrast['cohens_dz']) - abs(float(powered_contrast['t'])) / math.sqrt(max(float(powered_contrast['n_pairs'], 0.0)))) < 1e-12
+    assert abs(float(powered_contrast['cohens_dz']) - abs(float(powered_contrast['t'])) / math.sqrt(float(powered_contrast['n_pairs']))) < 1e-12
     assert abs(float(powered_contrast['hedges_gz'])) < abs(float(powered_contrast['cohens_dz']))
     assert '配对 dz=' in display_with_g
     assert _paired_effect_size(-0.2, {'test': 'welch_t', 'se': 0.1, 'df': 4.0}) == {}

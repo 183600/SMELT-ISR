@@ -228,8 +228,8 @@ def _current_seed_count(
         and min(baseline_value, variant_value)
         >= _MIN_SEEDS_FOR_STATS
     ):
-        denom = 1.0 / max(baseline_value, 1e-8) + 1.0 / variant_value
-        return 2.0 / max(denom, 1e-8) if denom > 0 else 0.0
+        denom = 1.0 / baseline_value + 1.0 / variant_value
+        return 2.0 / denom if denom > 0 else 0.0
     return None
 
 
@@ -499,7 +499,7 @@ def _contrast_display(
         partial_p = partial.get("p_value")
         partial_effect = partial.get("effect")
         partial_text = (
-            "；共同种子配对敏感性"
+            f"；共同种子配对敏感性"
             f"（n={partial.get('n_common')}"
         )
         if isinstance(partial_effect, (int, float)):
@@ -725,7 +725,7 @@ def _contrast_display(
                 and seeds_needed > current_seeds
             ):
                 caveat += (
-                    "（按当前种子间波动，检出该效应约需 "
+                    f"（按当前种子间波动，检出该效应约需 "
                     f"{seeds_needed} 个种子，当前 "
                     f"{_format_seed_count(current_seeds)} 个）"
                 )
@@ -1062,10 +1062,10 @@ def compare_cells_to_baseline(
                 + std_current * std_current
             ) / 2.0
             if math.isfinite(pooled_squared):
-                pooled_std = math.sqrt(max(pooled_squared, 0.0))
+                pooled_std = math.sqrt(max(0.0, pooled_squared))
         noise_ratio = None
         if delta is not None and pooled_std:
-            candidate = abs(delta) / max(pooled_std, 1e-8)
+            candidate = abs(delta) / pooled_std
             if math.isfinite(candidate):
                 noise_ratio = candidate
         hedges_correction = _hedges_g_correction(result.get("df"))
@@ -1124,15 +1124,23 @@ def compare_cells_to_baseline(
                 "paired_diagnostics"
             ),
             "wilcoxon_p_value": result.get("wilcoxon_p_value"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_method": result.get("wilcoxon_method"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_rank_biserial": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_rank_biserial"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "wilcoxon_min_attainable_p": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_min_attainable_p"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "wilcoxon_can_reach_significance": result.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_can_reach_significance"
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             ),
             "cliffs_delta": result.get("cliffs_delta"),
             "cliffs_delta_ci95": result.get("cliffs_delta_ci95"),

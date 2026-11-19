@@ -880,7 +880,7 @@ def macro_auc_metrics(
         # 不随评估集增大而膨胀。
         chunk_size = max(
             1,
-            _AUC_SORT_CHUNK_ELEMENTS // n_tokens,
+            _AUC_SORT_CHUNK_ELEMENTS // max(n_tokens, 1),
         )
         index_i32 = torch.arange(n_tokens, dtype=torch.int32)
         invalid_i32 = torch.tensor(-1, dtype=torch.int32)
@@ -979,18 +979,12 @@ def macro_auc_metrics(
                 - boundary_class * n_tokens
             ).double() + 1.0
 
-            # Guard: n_pos[class] may be 0 for all-negative classes,
-            # which would cause division-by-zero in recall.  Clamping
-            # the denominator to >= 1 makes recall = 0 for such
-            # classes (correct: no positives → recall undefined, treat
-            # as 0 so downstream AP terms are zero-weighted).
-            _n_pos_safe = n_pos.gather(
-                0, boundary_class
-            ).double().clamp_min(1.0)
             recall = (
             # TODO: Report confidence intervals or std alongside point estimates
                 boundary_hits.double()
-                / _n_pos_safe
+                / n_pos.gather(
+                    0, boundary_class
+                ).double()
             )
             precision = (
             # TODO: Report confidence intervals or std alongside point estimates
@@ -1024,7 +1018,7 @@ def macro_auc_metrics(
                         float(ap_sums[class_offset].sum())
                     )
                     pr_prevalence_sum += (
-                        float(n_pos_class) / n_tokens
+                        float(n_pos_class) / max(n_tokens, 1)
                     )
                 if 0 < n_pos_class < n_tokens:
                     n_neg_class = n_tokens - n_pos_class

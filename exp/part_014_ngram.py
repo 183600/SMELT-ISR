@@ -266,7 +266,7 @@ def _ngram_extended_metrics(
     if evaluated_tokens == 0:
         raise RuntimeError(
             f"N-gram 评估未产生任何 token（{split} split），"
-            "请检查数据集是否为空。"
+            f"请检查数据集是否为空。"
         )
     loss = float((total_nll / evaluated_tokens).item())
 
@@ -293,7 +293,7 @@ def _ngram_extended_metrics(
 
     class_weighted_loss = float(
         class_loss_sums.sum().item()
-        / class_counts.sum().item()
+        / class_counts.sum().clamp_min(1).item()
     )
     metrics[f"{split}_loss_weighted_consistency_abs"] = abs(
         loss - class_weighted_loss
@@ -656,7 +656,7 @@ def _select_ngram_candidate_one_se(
         std = _sample_std(differences)
         if std is None:
             continue
-        se = std / math.sqrt(max(n_windows, 0.0))
+        se = std / math.sqrt(max(0.0, n_windows))
         rho1 = _lag1_autocorrelation(
             torch.tensor(differences, dtype=torch.float64)
         )

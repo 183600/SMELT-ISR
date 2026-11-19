@@ -524,7 +524,7 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
             )
         if eta_squared < 0.0:
             eta_squared = 0.0
-        eta = math.copysign(math.sqrt(max(eta_squared, 0.0)), delta)
+        eta = math.copysign(math.sqrt(max(0.0, eta_squared)), delta)
 
     if abs(eta) < 1.0:
         c0 = 0.0
@@ -545,14 +545,14 @@ def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
             - inverse_mu / 12.0
         )
 
-    z = eta * math.sqrt(max(a / 2.0, 0.0))
+    z = eta * math.sqrt(a / 2.0)
     if z > 40.0:
         return 1.0, 0.0
     if z < -40.0:
         return 0.0, 1.0
     correction = (
         math.exp(-0.5 * a * eta * eta)
-        / (math.sqrt(max(2.0 * math.pi, 0.0)) * math.sqrt(max(a, 0.0)))
+        / (math.sqrt(2.0 * math.pi) * math.sqrt(max(0.0, a)))
         * (c0 + c1 / a)
     )
     lower = 0.5 * math.erfc(-z) - correction
@@ -605,7 +605,7 @@ def _regularized_incomplete_gamma_parts(
         fpmin = 1.0e-300
         b = x + 1.0 - a
         c = 1.0 / fpmin
-        d = 1.0 / max(b, 1e-10)
+        d = 1.0 / b
         h = d
         for index in range(1, 10000):
             numerator = -index * (index - a)
@@ -616,7 +616,7 @@ def _regularized_incomplete_gamma_parts(
             c = b + numerator / c
             if abs(c) < fpmin:
                 c = fpmin
-            d = 1.0 / max(d, 1e-10)
+            d = 1.0 / d
             delta = d * c
             h *= delta
             if abs(delta - 1.0) <= 1.0e-15:
@@ -798,7 +798,7 @@ def _sd_upper_confidence_bound(
     if quantile is None or quantile <= 0.0:
         return None
     try:
-        upper = value * math.sqrt(max(degrees / quantile, 0.0))
+        upper = value * math.sqrt(degrees / quantile)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(upper):

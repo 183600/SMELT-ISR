@@ -106,7 +106,7 @@ def _probe_gradient_flow(model: nn.Module) -> Dict[str, object]:
             if not is_expert:
                 zero_non_expert.append(name)
 
-    probe["grad_norm"] = math.sqrt(max(total_sq, 0.0))
+    probe["grad_norm"] = math.sqrt(max(0.0, total_sq))
 
     failures: List[str] = probe["failures"]  # type: ignore[assignment]
 
@@ -633,10 +633,10 @@ def run_sanity_overfit(
             print(
                 "[sanity] 梯度检查: "
                 f"grad_norm={grad_probe['grad_norm']}, "
-                "missing_grad="
+                f"missing_grad="
                 f"{grad_probe['n_missing_grad']}, "
                 f"zero_grad={grad_probe['n_zero_grad']}, "
-                "nonfinite_grad="
+                f"nonfinite_grad="
                 f"{grad_probe['n_nonfinite_grad']}"
                 + (
                     ", failures="

@@ -637,9 +637,9 @@ def _lag1_autocorrelation(
     tail_square = float((tail * tail).sum())
     product = head_square * tail_square
     if product > 0.0 and math.isfinite(product):
-        denominator = math.sqrt(max(product, 0.0))
+        denominator = math.sqrt(max(0.0, product))
     else:
-        denominator = math.sqrt(max(head_square, 0.0)) * math.sqrt(max(tail_square, 0.0))
+        denominator = math.sqrt(max(0.0, head_square)) * math.sqrt(max(0.0, tail_square))
     if float(denominator) <= 0.0:
         return None
     # ``denominator > 0`` 已在上面检查；加绝对 epsilon 会随
@@ -679,7 +679,7 @@ def _ar1_effective_windows(
         )
     inflation = 1.0
     if rho1 >= _EVAL_WINDOW_AUTOCORRELATION:
-        inflation = math.sqrt(max(float(n_windows), 0.0) / effective)
+        inflation = math.sqrt(float(n_windows) / effective)
     return effective, inflation
 
 
@@ -742,7 +742,7 @@ def _ar1_adjusted_mean_test(
     if mean is None or std is None:
         result["note"] = "invalid_values"
         return result
-    se = std / math.sqrt(max(n, 0.0)) * inflation
+    se = std / math.sqrt(max(0.0, n)) * inflation
     if not math.isfinite(se):
         result["note"] = "invalid_values"
         return result
@@ -762,7 +762,7 @@ def _ar1_adjusted_mean_test(
         return result
 
     df = effective - 1.0
-    t_value = mean / max(se, 1e-8)
+    t_value = mean / se
     result["t"] = t_value
     result["se"] = se
     result["df"] = df
@@ -1099,11 +1099,11 @@ def _group_cluster_eval_intervals(
         loss_scaled = loss_point / scale
     elif 0.0 < scale < 1.0e-150:
         # 极小 loss 的加权和可能下溢；归一化后还原。
-        loss_scaled = loss_point / max(scale, 1e-8)
+        loss_scaled = loss_point / scale
     else:
         scale = 1.0
         loss_scaled = loss_point
-    accuracy_point = correct / tokens.clamp(min=1e-8)
+    accuracy_point = correct / tokens
     try:
         seed_value = int(seed) % (2 ** 64)
     except (TypeError, ValueError, OverflowError):

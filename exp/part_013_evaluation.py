@@ -97,7 +97,6 @@ def evaluate(
     """
     was_training = model.training
     model.eval()
-    # [FIX] removed no-op model.train() that undid model.eval()
     # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
     probe_attached = False
@@ -546,7 +545,7 @@ def evaluate(
     if evaluated_tokens == 0:
         raise RuntimeError(
             f"评估未产生任何 token（{split} split），请检查数据集是否为空或"
-            "评估起点配置是否正确。"
+            f"评估起点配置是否正确。"
         )
     loss = (total / evaluated_tokens).item()
 
@@ -576,7 +575,7 @@ def evaluate(
 
     class_weighted_loss = float(
         class_loss_sums.sum().item()
-        / class_counts.sum().item()
+        / class_counts.sum().clamp_min(1).item()
     )
     metrics[f"{split}_loss_weighted_consistency_abs"] = abs(
         loss - class_weighted_loss

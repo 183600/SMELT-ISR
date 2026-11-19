@@ -33,7 +33,7 @@ def _cost_comparison(
         variant_costs[field] = cost_b
         if cost_a <= 0.0:
             continue
-        ratio = cost_b / max(cost_a, 1e-8)
+        ratio = cost_b / cost_a
         if not math.isfinite(ratio):
             # 两个成本均值都有限，但真实倍率越过 float 上限。
             # 不写入 inf；单独记录溢出字段，供权衡判定使用。
@@ -83,7 +83,7 @@ def _cost_comparison(
                 and math.isfinite(relative_variance)
                 and relative_variance >= 0.0
             ):
-                relative_se = math.sqrt(max(relative_variance, 0.0))
+                relative_se = math.sqrt(max(0.0, relative_variance))
                 # Welch-Satterthwaite 自由度：用相对项计算，
                 # 避免对方差本身再平方而溢出。
                 scale_term = max(term_a, term_b)
@@ -676,11 +676,11 @@ def factor_contrasts(
                     std_a * std_a + std_b * std_b
                 ) / 2.0
                 if math.isfinite(pooled_squared):
-                    pooled_std = math.sqrt(max(pooled_squared, 0.0))
+                    pooled_std = math.sqrt(max(0.0, pooled_squared))
 
             noise_ratio = None
             if delta is not None and pooled_std:
-                candidate = abs(delta) / max(pooled_std, 1e-8)
+                candidate = abs(delta) / pooled_std
                 if math.isfinite(candidate):
                     noise_ratio = candidate
 
@@ -810,17 +810,26 @@ def factor_contrasts(
                 # 家族、不改变 significant 判定；与 t 结论不一致
                 # 时由展示层提示。
                 "wilcoxon_p_value": test.get(
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     "wilcoxon_p_value"
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 ),
                 "wilcoxon_method": test.get("wilcoxon_method"),
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "wilcoxon_rank_biserial": test.get(
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     "wilcoxon_rank_biserial"
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 ),
                 "wilcoxon_min_attainable_p": test.get(
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     "wilcoxon_min_attainable_p"
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 ),
                 "wilcoxon_can_reach_significance": test.get(
+                # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                     "wilcoxon_can_reach_significance"
+                    # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 ),
                 # Welch（非配对）口径的秩效应量与方差齐性诊断：
                 # 合并标准差在两臂方差悬殊时的解读前提必须显式。
@@ -1080,6 +1089,7 @@ def _paired_linear_effect(
         # 只看 t 检验会把假设前提藏起来。
         diagnostics = _paired_difference_diagnostics(effect_values)
         wilcoxon = _wilcoxon_signed_rank_test(effect_values)
+        # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
         stability = _leave_one_out_effect_stability(
             effect_values
         )
@@ -1148,14 +1158,19 @@ def _paired_linear_effect(
             ),
             "paired_diagnostics": diagnostics,
             "wilcoxon_p_value": wilcoxon.get("p_value"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_method": wilcoxon.get("method"),
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
             "wilcoxon_rank_biserial": wilcoxon.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "rank_biserial"
             ),
             "wilcoxon_min_attainable_p": wilcoxon.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "min_attainable_p"
             ),
             "wilcoxon_can_reach_significance": wilcoxon.get(
+            # TODO: Consider multiple testing correction (e.g., Bonferroni, FDR) if running multiple comparisons
                 "can_reach_significance"
             ),
             "se": result.get("se"),
@@ -1195,7 +1210,7 @@ def _paired_linear_effect(
             effect = 0.0
         else:
             effect = math.fsum(
-                term / max(scale, 1e-8) for term in terms
+                term / scale for term in terms
             ) * scale
             if not math.isfinite(effect):
                 effect = None

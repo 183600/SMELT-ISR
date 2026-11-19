@@ -160,7 +160,7 @@ class RoutingProbe:
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
-                    -(nonzero * nonzero.log()).sum() / max(log_e, 1e-8)
+                    -(nonzero * nonzero.log()).sum() / log_e
                 )
             else:
                 router_entropy = probs.new_zeros(())
@@ -329,7 +329,7 @@ class RoutingProbe:
                 (share - mean_share) ** 2
                 for share in usage_share
             ) / n_experts
-            load_cv = math.sqrt(max(variance, 0.0)) / mean_share
+            load_cv = math.sqrt(max(0.0, variance)) / mean_share
         else:
             load_cv = 0.0
 
@@ -885,7 +885,6 @@ def analyze_routing(
     """
     was_training = model.training
     model.eval()
-    # [FIX] removed no-op model.train() that undid model.eval()
 
     core = _unwrap_model(model)
     cfg = core.cfg
@@ -971,13 +970,13 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         print(
             "[routing] RQ3 两轮专家重合（branch 级）："
             f"jaccard={_show('second_round_jaccard_mean')} "
-            "exact_match="
+            f"exact_match="
             f"{_show('second_round_exact_match_share')} "
-            "slot_reuse="
+            f"slot_reuse="
             f"{_show('second_round_slot_reuse_mean')} | "
             "token 级："
             f"jaccard={_show('token_second_round_jaccard_mean')} "
-            "exact_match="
+            f"exact_match="
             f"{_show('token_second_round_exact_match_share')}"
         )
         if rq3.get("branch_self_reuse_share") is not None:
@@ -993,7 +992,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
             f"marginal={_show('jaccard_chance_marginal')} "
             f"lift_uniform={_show('jaccard_lift_over_uniform')} "
             f"lift_marginal={_show('jaccard_lift_over_marginal')} "
-            "adjusted_marginal="
+            f"adjusted_marginal="
             f"{_show('jaccard_adjusted_marginal')}"
         )
 
@@ -1004,7 +1003,7 @@ def print_routing_analysis(report: Dict[str, object]) -> None:
         print(
             "[routing] 跨分支表示平均余弦相似度: "
             f"{_format_finite(divergence.get('branch_cosine_mean'))}"
-            "（blocks_with_branches="
+            f"（blocks_with_branches="
             f"{divergence.get('blocks_with_branches')}）"
         )
 
@@ -1112,7 +1111,7 @@ def _intervention_eval(
                     per_batch.append({
                         "batch_index": int(batch_index),
                         "loss": (
-                            batch_loss / max(batch_tokens, 1e-8)
+                            batch_loss / batch_tokens
                             if batch_tokens > 0
                             else float("nan")
                         ),
@@ -1254,7 +1253,7 @@ def _paired_bootstrap_delta_ci(
         return sum(
             differences[index][0] * differences[index][1]
             for index in indices
-        ) / total_weight
+        ) / max(total_weight, 1)
 
     generator = random.Random(int(seed))
     n = len(loss_differences)
@@ -1631,10 +1630,10 @@ def analyze_routing_interventions(
         report["interventions"]["expert_drop"] = {
             "per_expert": drop_rows,
             "mean_loss_delta": mean_delta,
-            "std_loss_delta": math.sqrt(max(variance, 0.0)),
+            "std_loss_delta": math.sqrt(variance),
             "max_loss_delta": max_delta,
             "max_loss_delta_relative": (
-                max_delta / max(baseline_loss, 1e-8)
+                max_delta / baseline_loss
                 if baseline_loss > 0.0
                 else None
             ),
@@ -1652,7 +1651,7 @@ def analyze_routing_interventions(
                 else None
             ),
             "importance_cv": (
-                math.sqrt(max(variance, 0.0)) / abs(mean_delta)
+                math.sqrt(max(0.0, variance)) / abs(mean_delta)
                 if abs(mean_delta) > 1e-12
                 else None
             ),
@@ -1849,7 +1848,7 @@ def routing_intervention_comparison_report(
         variance = sum(
             (value - mean) ** 2 for value in finite
         ) / (len(finite) - 1)
-        return mean, math.sqrt(max(variance, 0.0))
+        return mean, math.sqrt(max(0.0, variance))
 
     summary: Dict[str, object] = {}
     for mode, entries in by_mode.items():
