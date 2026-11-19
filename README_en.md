@@ -1,0 +1,741 @@
+# SMELT-ISR
+
+> **SMELT with Independent Second Round Routing (Delayed-Merge)**
+
+**English** | [中文说明](README.md)
+
+## 📖 Table of contents
+
+- [Introduction](#-introduction)
+- [Key features](#-key-features)
+- [Paper reproduction (arXiv:2609.01343v1)](#-paper-reproduction-arxiv260901343v1)
+- [Mechanism controls and the confirmatory workflow](#-mechanism-controls-and-the-confirmatory-workflow)
+- [Requirements](#-requirements)
+- [Usage](#-usage)
+- [Experimental design and research questions](#-experimental-design-and-research-questions)
+- [Controlled-comparison conventions and reproducibility](#-controlled-comparison-conventions-and-reproducibility)
+- [Multi-seed and ablation suite examples](#-multi-seed-and-ablation-suite-examples)
+- [Output layout](#-output-layout)
+- [Notes and disclaimer](#-notes-and-disclaimer)
+
+## 📖 Introduction
+
+SMELT-ISR is a routing-improvement experiment built on the [SMELT](https://arxiv.org/html/2609.01343v1) (Sparse MoE Transformer, middle layers loop twice) architecture, focusing on systematic investigation of delayed-merge routing.
+
+The repository provides the following baselines and schemes:
+
+- `base`: the paper's unlooped MoE baseline (middle span executed once).
+- `smelt`: the original SMELT architecture (middle layers loop twice, merged immediately each round; with `--residual-scaling paper`, sublayer residuals inside the looped span are scaled by 1/r).
+- `A` / `B`: delayed-merge schemes (local / global).
+- Plus mechanism controls `local_base`, `local_base_k2`, `B_early` and the dense baseline `dense`.
+
+**Default configuration is a small-scale prototype.** To reproduce a grid cell from the paper's Appendix A, use
+`--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
+(see "Paper reproduction"); `config.json`'s `paper_fidelity` reports `architecture_faithful`, `protocol_faithful` and `budget_audit` item by item.
+
+In the original SMELT, expert outputs of each MoE round are merged immediately while the middle layers loop. This project proposes a **delayed-merge** mechanism:
+
+1. **No merge after round 1**: outputs of the Top-$k_1$ experts are kept as independent branches, neither summed nor concatenated.
+2. **Independent round-2 routing**: for each round-1 branch state, round-2 Top-$k_2$ expert routing is performed independently.
+3. **Final aggregation**: results are merged across round-1 branches only after the full second round completes.
+
+This structure explores whether delayed merging improves the expressiveness of expert combinations and whether different branches can form fully independent computation trajectories.
+
+## 🚀 Key features
+
+- **Model modes**:
+  - `base`: the paper's unlooped MoE baseline (middle span executed once).
+  - `smelt`: the original SMELT architecture (middle layers loop twice, merged immediately each round; with `--residual-scaling paper`, sublayer residuals inside the looped span are scaled by 1/r).
+  - `A`: local delayed merge (expert branches stay independent only within the same MoE layer, merged after phase two).
+  - `B`: global delayed merge (after round 1 creates independent branches, the entire middle Transformer block — attention and MoE — stays branch-independent, merging only after round 2).
+  - `local_base_k2`: an immediate-merge control with the **same second-round width k2** (isolates merge timing).
+  - `local_base`: an immediate-merge control with the **same expert count** min(E,k1·k2) (performance control).
+  - `B_early`: a B-specific iso-compute merge-position control (same branch count and Attention/MoE executions, merge moved to the end of the first pass).
+  - `dense`: a dense baseline without MoE or looping; with `dense_fnn_hidden=None` its FFN width resolves to `top_k × expert_hidden` (equal activated compute), and `--dense-fnn-hidden n_experts × expert_hidden` gives an equal-parameter control.
+- **Rigorous self-test module**: verifies gradient flow, autoregressive causality, information isolation between branches, and mathematical equivalence at boundary conditions (e.g., scheme B equals SMELT when $k=1$).
+- **Complete training foundation**: resume from checkpoints, gradient clipping, load-balancing loss, LR scheduling, and detailed experiment metrics.
+- **Controlled comparisons and statistical reliability**:
+  - Every run records a comparison protocol (optimizer, LR schedule, training steps, data augmentation, whole-file and per-split data fingerprints, early-stop/AMP/device numerics, ...); `--compare` verifies that everything except the declared experimental factors is identical and detects duplicate-seed pseudo-replication.
+  - `--seeds` runs multiple random seeds and reports Mean ± Std with significance tests; the report also gives the minimum detectable effect at 80% power (MDE) and a TOST equivalence verdict (`--equivalence-margin`, default 1% relative to the baseline mean), so "not significant" is never misread as "equivalent".
+  - `--suite-ablation` runs the (1+N)×2 full-factorial ablation (covering schemes A and B by default) and checks coverage automatically.
+  - The results-analysis stage additionally reports test-assumption diagnostics (skewness/kurtosis of paired differences, cross-arm variance ratio), the Wilcoxon signed-rank test and Cliff's delta rank effect size, confidence intervals for effect sizes themselves, and an explicit cross-metric multiplicity disclosure; `--compare-csv` exports the contrast and aggregate tables as CSV for plotting and secondary analysis.
+
+## 📐 Paper reproduction (arXiv:2609.01343v1)
+
+The repository ships an explicit reproduction path for the paper's 4×4×2 grid
+(4 scales × 4 compute-equivalent sparsity levels × `base`/`smelt`); the default
+small-scale `B`/`A` experiments are prototypes and are *not* the paper config.
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
+  --paper-cell 200M:95 --paper-arch smelt \
+  --paper-protocol --group-separator '\n\n' \
+  --hypothesis "paper SMELT 200M S~95% validation loss" --rq RQ1
+```
+
+- `--paper-cell SCALE:SPARSITY` takes H, L, total experts, top-8 and the loop
+  layout (layers `3–7`, `4–9`, `6–15`, `8–22` for L=10/12/20/30) from
+  Appendix A. Conflicting `--d-model` and friends are rejected.
+- Head geometry / KV heads / expert intermediate width are not disclosed by the
+  paper; they are derived by a fixed rule (head_dim≈64, GQA matched to the
+  reported KV-cache ratio, total non-embedding params matched within 1%). The
+  derived values and the measured-vs-paper budget deviations are written to
+  `paper_fidelity.budget_audit` in `config.json`.
+- `--paper-protocol` applies §3.1: WSD schedule (`--lr-schedule wsd`), global
+  batch 256, 196,075 stable steps, 4096-token packed contexts with
+  document-level segment attention masks (via `--group-separator`), and branch
+  checkpoints at 10k/20k/50k/100k/150k/196075. A decay branch resumes from
+  `step_<N>.pt` with `--wsd-stable-steps <N> --steps <N+9537>`.
+- `paper_fidelity` separates `architecture_faithful` (Appendix A structure +
+  top-8/GQA/4096/1-r/loop placement) from `protocol_faithful` (§3.1 protocol);
+  `is_full_reproduction` requires both. Budget numbers are reported honestly:
+  the paper's parameterisation comes from a proprietary family, so a public
+  implementation cannot claim bit-identical budgets.
+- Undisclosed in the paper: learning rate, warmup, weight decay, AdamW betas,
+  load-balance coefficient, initialisation and pretraining corpus. They stay at
+  this repository's defaults and are listed in `paper_fidelity.undisclosed`.
+- Not implemented: incremental KV decoding and the DCLM Core / DCLM Completion /
+  MMLU evaluation pipelines. Downstream claims beyond validation loss therefore
+  cannot be reproduced inside this repository.
+
+### Mechanism controls and the confirmatory workflow
+
+- **Merge-timing controls**: `local_base_k2` (second round still at k2) isolates
+  delayed merging itself; `local_base` (second round min(E,k1·k2)) isolates
+  performance under equal expert compute. The two are not interchangeable.
+- **B-specific control**: `B_early` has exactly the same branch count and
+  Attention/MoE executions as B, with the merge point moved earlier — so B's
+  advantage cannot be attributed to extra compute or extra trajectories.
+- **Full compute budget**: `--budget-match smelt` plus `budget_match_report`
+  report analytic and measured FLOPs rather than matching `k1·k2` only.
+- **Pilot calibration of prior noise**: given pilot/earlier run directories,
+  `--design-pilot-runs RUN...` estimates the paired-difference sd and per-arm
+  attrition rates on shared seeds; when observed values exceed the
+  preregistered `power` claim, the design plan is adjusted upward (one-sided)
+  and the required seed count is recomputed, with evidence recorded in
+  `design_plan.json` (`pilot_evidence`, folded into `plan_id`); a still
+  insufficient plan is rejected before the first subprocess is launched. Failed
+  run directories must be included — attrition cannot be estimated from
+  successful runs only. See
+  [docs/design_preparation.md](docs/design_preparation.md), Section 2.3.
+- **Confirmatory workflow**: freeze the code (`EXPERIMENT_FREEZE`) →
+  preregister the primary metric, direction, minimum effect and
+  `--common-step` → at least 6 seeds → report failure rates together with
+  success-conditional metrics → unseal test once, uniformly, through a shared
+  `--test-ledger` after candidates are frozen → `--final-test-comparison`
+  reports all candidates. Full steps:
+  [docs/experiment_protocol.md](docs/experiment_protocol.md); item-by-item
+  audit: [docs/methodology_audit.md](docs/methodology_audit.md).
+- **Test-set access**: `--test-ledger` records every unsealing keyed by the
+  data / test-split fingerprint and by default refuses repeated unsealing of
+  the same test set by other candidates. `--final-test-comparison` read-only
+  aggregates the test records of all candidates without re-evaluating.
+
+## 🛠️ Requirements
+
+- Python 3.10+
+- PyTorch 2.x
+
+```bash
+pip install "torch>=2.2"
+# or install this repository in development mode (numpy/torch dependencies are
+# declared in pyproject.toml)
+pip install -e .
+```
+
+## 📦 Usage
+
+### 1. Run structural self-tests
+Before experimenting, run the built-in self-tests to verify structural correctness, branch independence and equivalence. The self-test also includes a bitwise same-seed double-run reproducibility check and negative-case validation of the gradient probe:
+```bash
+python experiment.py --self-test
+# Fast regression suite (used by CI; covers top-1 gradients, GQA, B_early
+# iso-compute, statistical folding, ...)
+python -m unittest discover -s tests -v
+```
+
+### 2. Prepare data
+The code defaults to a byte-level tokenizer for quick validation. Prepare a UTF-8 plain-text file (e.g., `corpus.txt`).
+
+The pipeline is strictly leakage-safe: **split first, then process**. The corpus is cut into `train` (first 90%) / `val` (next 5%) / `test` (last 5%): the three splits are contiguous, non-overlapping, and never randomly shuffled. **The default `--split-policy contiguous` is a prefix split, not a temporal split**: file order equals time order only if the corpus is actually time-ordered, in which case `--split-policy chronological --time-order-manifest FILE` verifies monotonic timestamps and records the evidence. Batch-level shuffling during training is provided by random window starts and never crosses split boundaries. The byte pipeline performs no standardization/normalization/imputation; if you extend it to continuous features, every statistic (mean, variance, min/max, ...) must be fitted on `train` only and applied to val/test via `transform`.
+
+`val` is used for periodic validation, hyperparameter selection, early stopping and model selection; `test` stays sealed for the whole training run and is evaluated exactly once after training, only when `--evaluate-test` is passed. Re-evaluation within the same run is refused. Fractions are configurable with `--val-fraction` / `--test-fraction`. Before training, a data audit (token range, text-integrity/label-noise checks for bytes that cannot be UTF-8 decoded and for NUL bytes, duplicate windows, train↔val distribution shift, training label coverage) runs automatically and is stored in the `data_audit` field of `config.json`; unsealing the test set appends a test-inclusive audit. The audit also reports `label_coverage` (byte classes present in an evaluation split but never observed in the effective training set, and their token share; their NLL is irreducible extrapolation error) and, when cleaning actually drops content, `train_cleaning.deletion_bias` (byte/bigram JS distance, drop fraction and span-length summaries comparing dropped versus kept training content). Cleaning deletes selectively by content rule, so metrics from cleaned and uncleaned runs are not directly comparable when this bias is large; the full record is archived with `config.json`.
+
+**Grouped data must stay on one side**: if the corpus is a concatenation of groups (the same document / user / object producing multiple records), pass `--group-separator` (e.g., `--group-separator '<|doc|>'` or `--group-separator '\n\n'`; `\n`, `\xHH`, `\uXXXX` escapes are supported). Split positions are snapped to group boundaries, so no group is ever cut across two splits and train/val/test never cross. The audit records the number of whole groups per split. When snapping cannot satisfy the minimum length of every split (e.g., a single oversized group), the script raises an explicit error instead of silently splitting a group.
+
+**Training-set deduplication**: `--deduplicate-train-groups` (requires a
+group separator) removes whole training groups whose content is identical
+to a val group (or, when explicitly enabled, a test group) or to an earlier
+training group. By default test content is not read; pass
+`--clean-train-against-test` (or its alias
+`--allow-eval-content-for-cleaning`) to let test participate. val/test bytes
+and split positions are left untouched. Removed content enters neither neural
+training windows nor the unigram / n-gram statistical baselines or the
+distribution audit. `data_audit` records `effective_bytes` /
+`effective_windows`, and `config.data` records the actual split fractions
+and cleaning statistics. The training-time audit checks the test fraction
+from split bounds only (without reading test content); before unsealing,
+the fixed test windows are independently verified for bit-exact input/target
+alignment.
+
+**Cross-split shared-chunk cleaning**: `--drop-train-shared-chunks` (requires `--group-separator`) uses the same content-defined chunk fingerprint as the audit to drop any whole training group that shares a contiguous byte chunk with val (or, when explicitly enabled, test); val/test bytes, split positions and content fingerprints stay bit-identical, and the same audit must go back to zero afterwards. Chunk fingerprints are **exact-block** detection, not near-duplicate detection; test content is not read unless `--clean-train-against-test` / `--allow-eval-content-for-cleaning` is passed. It closes the gap where exact group fingerprints miss embedded fragments, and composes with `--deduplicate-train-groups`.
+
+**Near-duplicate training-group cleaning**: `--drop-train-near-duplicate-groups`
+(requires `--group-separator`) drops whole training groups whose byte k-shingle
+Jaccard similarity to a val group (by default; test groups only with
+`--clean-train-against-test`) or to an earlier training group reaches the
+threshold. This content-level rule catches paraphrases / reposts / lightly
+edited duplicates that exact group fingerprints and chunk fingerprints miss;
+val/test bytes, split positions and content fingerprints are untouched.
+
+**Label-noise cleaning for ungrouped byte streams**: without a group separator, `--drop-train-corrupt-bytes` removes only the exact bytes that cannot be UTF-8 decoded and NUL bytes from `train` (no byte patching). Bytes that fail UTF-8 decoding or contain NUL are not automatically label errors — they may be binary records, other encodings, or legitimate separators; enabling any cleaning switch requires `--domain-justification` stating the domain rationale, otherwise the run refuses to start. val/test bytes and split positions are unchanged. Removed bytes enter neither training windows nor unigram / n-gram counts or the distribution audit, and `data_audit.effective_bytes` plus `config.data.train_cleaning` record the effective training basis. With `--group-separator`, use `--drop-train-corrupt-groups` instead to preserve group integrity.
+
+**Outlier cleaning for ungrouped byte streams**: without a group separator, `--drop-train-degenerate-runs` removes only single-byte runs of length >= 64B (padding / repeated-character / bad-concatenation outliers, but possibly table borders / ASCII art / legitimate padding) from `train`, again with no byte patching; `--domain-justification` is required. `data_audit.degenerate_runs` records run count, bytes and the longest run, and returns to zero after cleaning. With `--group-separator`, use `--drop-train-degenerate-groups` instead to preserve group integrity.
+
+**Leakage is a hard gate by default**: if the audit finds cross-split duplicate windows or duplicate groups, training refuses to start; when unsealing the test set, the same findings in test refuse the unsealing (no `test` record is written). Only an explicit `--allow-data-leakage` overrides the gate, and the override is recorded in `config.json` and the comparison protocol, so a leaky run cannot silently pass as leak-free evidence. The window signature scan is strided (equally spaced sampling) once the window count exceeds the cap; `data_audit.leakage_scan_coverage` records the sampled/total window counts, stride and coverage per split, and both the audit and the gate spell out the residual risk when stride>1: "no cross-split duplicate windows found" inside the sampled subset is not "none exist". The content-defined chunk fingerprint scan is exhaustive and catches misaligned duplicates that the stride missed. Label noise (out-of-range tokens, UTF-8/NUL corruption above threshold) is controlled by `--strict-data-audit`: with it, such findings also abort training/unsealing; by default they are warnings so you can inspect the data before deciding how to clean it. test is never cleaned, so unsealing now refuses a test set with out-of-range tokens, invalid UTF-8 or NUL bytes on both the neural and the statistical-baseline paths unless `--allow-corrupt-test-labels` is passed explicitly (the override is recorded in the config). Distribution shift can also be made a hard gate with `--max-byte-shift` / `--max-bigram-shift` / `--max-conditional-shift` (JS distance, 0–1): any train/val pair (or test pair at unsealing, including statistical baselines) above the corresponding threshold aborts training/unsealing; without these flags the audit remains warning-only.
+
+Whenever a new best validation loss is reached, the weights are written to `best.pt`. The `final` record and the single test evaluation both use this validation-selected model (the selection policy is recorded in `model_selection` inside `config.json`); if `best.pt` is missing (e.g., resuming from an older checkpoint), the script says so explicitly and falls back to the last-step parameters.
+
+```bash
+# Run the single final test evaluation after training
+python experiment.py --data corpus.txt --mode B --out runs/B_seed42 --evaluate-test
+```
+*(Note: replace with your own tokenizer and data pipeline for real experiments.)*
+
+### 3. Start training
+Select the mode via `--mode`.
+
+**Original SMELT baseline**:
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --mode smelt \
+  --top-k 2 \
+  --steps 2000 \
+  --seed 42 \
+  --out runs/smelt_seed42
+```
+
+**Global delayed merge (scheme B)**:
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --mode B \
+  --top-k 2 \
+  --k1 2 \
+  --k2 2 \
+  --steps 2000 \
+  --seed 42 \
+  --out runs/B_seed42
+```
+
+**Local delayed merge (scheme A) and its control**:
+```bash
+python experiment.py --data corpus.txt --mode local_base --k1 2 --k2 2 --out runs/local_base_seed42
+python experiment.py --data corpus.txt --mode A --k1 2 --k2 2 --out runs/A_seed42
+```
+
+### 4. Pre-training overfit sanity check
+Before every fresh training run (i.e., without `--resume`), the script first
+draws a small batch (`--sanity-batch-size`, 4 sequences by default) and trains
+the same model architecture on it with all regularization disabled — the
+auxiliary load-balancing loss, weight decay, gradient clipping and warmup are
+turned off. Training must drive the loss quickly toward 0 or the next-token
+accuracy toward 100% (thresholds: `--sanity-loss-threshold`,
+`--sanity-acc-threshold`). On failure the script reports the problem and exits
+with a non-zero status instead of blindly starting full training, since failing
+to overfit even a tiny batch usually indicates broken gradients, a wrong loss,
+or an optimizer/LR misconfiguration.
+
+After the first backward pass a gradient probe runs first: the loss must be
+attached to the autograd graph, every gradient must be finite, at least one
+parameter must receive a non-zero gradient, and no non-expert parameter may be
+missing a gradient (expert parameters may legitimately be missing/zero when no
+token is routed to them in the batch). A probe failure stops the check
+immediately with troubleshooting hints instead of wasting the remaining steps;
+the probe result is recorded as `sanity_check.grad_probe` in `config.json` and
+in `metrics.jsonl`.
+
+Note this is a **necessary but not sufficient** check: passing it does not prove
+the code is fully correct — bugs in data augmentation, feature alignment or
+label mapping can still slip through, so intermediate-result inspection is
+still recommended.
+
+```bash
+# Run the sanity check only, without starting training
+python experiment.py --data corpus.txt --mode B --sanity-only --out runs/sanity_B
+
+# Explicitly skip the check (once the setup is well validated)
+python experiment.py --data corpus.txt --mode B --skip-sanity-check --out runs/B_seed42
+```
+
+Results are stored in `metrics.jsonl` (`{"step": "sanity", ...}`) and in the
+`sanity_check` field of `config.json`. The check fixes its own seed and restores
+the RNG state afterwards, so running it does not change the main training
+trajectory.
+
+### 5. Resume training
+Model config is read from the checkpoint automatically; just keep data and total steps consistent:
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --resume runs/B_seed42/last.pt \
+  --steps 2000 \
+  --out runs/B_seed42
+```
+
+## 🧪 Experimental design and research questions
+
+- **RQ1**: Does delayed merge beat the original SMELT? (validation loss & convergence speed; convergence is quantified by the time-averaged validation loss over a common training window, `val_loss_curve_mean_to_common_step`, with the window end fixed before training via `--common-step`; report it together with the common-step point and `final`, never as final quality alone)
+- **RQ2**: How does the split between round-1 branches ($k_1$) and round-2 experts ($k_2$) affect results? Matching only $k_1k_2 \approx 2k$ is **not** a sufficient compute budget: A executes $k_1 + k_1k_2$ expert assignments per token (not $k_1k_2$), and B additionally executes Attention/MoE after branch creation. Use `--budget-match smelt` to check per-token FLOPs against the full compute graph and report measured vs analytic ratios.
+- **RQ3**: Does round 2 choose different experts than round 1? (expert overlap & Jaccard similarity)
+- **RQ4**: Does delayed merging improve expert specialization? (expert load distribution & routing entropy)
+
+The routing diagnostics behind RQ3/RQ4 (round-2 Jaccard / slot reuse / branch self-reuse, **chance levels under uniform-random and marginal-load-preserving nulls, lift and adjusted overlap**, round-1/2 load and router entropy, dead experts, branch cosine) are stored per run in `config.json` under `routing_analysis`; a low Jaccard must be read together with its chance level. `--routing-interventions` additionally performs routing shuffles and per-expert masking, verifying specialization through functional interventions rather than utilization alone; both are printed per run and aggregated across seeds (Mean ± Std) by `--compare`, and they are part of the comparable metric set (`--compare-metric routing_jaccard_branch`, etc.). Routing conclusions therefore carry across-seed statistics and significance tests instead of relying on a single run's qualitative description.
+
+### Controlled-comparison conventions and reproducibility
+
+#### Scheme B routing and merge weights
+
+Scheme B uses $k_1$ throughout the first-round intermediate region and $k_2$
+only in the full second-round region; merging uses fixed weights from round-1
+routing with Top-$k_1$ normalization, never recomputed from final branch
+states. Analyses/ablations should state this explicitly.
+
+#### Compute accounting
+
+After round-1 branch creation, scheme B executes downstream attention and MoE
+at $k_1$× branch count; parameter-matched is not FLOPs-matched. When answering
+RQ1/RQ2, report both step-aligned and token/FLOPs-aligned comparisons to avoid
+misattributing extra compute to the routing mechanism.
+
+#### Residual-scaling convention
+
+- `--residual-scaling paper` (default) scales residual updates of sublayers
+  inside the looped span by $1/r$ (1/2 for two visits), while sublayers outside
+  the looped span keep `residual_scale`.
+- `--residual-scaling global` preserves the historical behavior
+  (`residual_scale` applied to every residual update in all regions); setting
+  the global coefficient to 0.5 under `global` is still not equivalent to the
+  paper's convention — it would also halve the pre/post sublayers outside the
+  looped span.
+- Keep the same `residual_scaling` convention across compared modes (the
+  convention is recorded in `comparison_protocol`, so legacy and `global` runs
+  remain distinguishable).
+
+#### Load-balancing scale
+
+- $f_i$ in the auxiliary loss is normalized by token count, not assignment
+  count; under uniform routing $E \sum_i f_i P_i \approx k$, so balancing
+  strength grows linearly with routing width.
+- When comparing across $k_1/k_2/\text{top-}k$, scale the coefficient
+  accordingly (keep `balance_coef × k` constant); otherwise routing width is
+  confounded with balancing strength.
+- `local_base` uses width $\min(n_\text{experts}, k_1 k_2)$ in its second
+  round to match compute; the implementation scales that round's aux back to
+  the per-branch A/B width $k_2$ by $k_2/\min(n_\text{experts}, k_1 k_2)$,
+  and records `balance_width_normalization` in `comparison_protocol` to
+  distinguish new from legacy runs.
+- `--compare` also checks `balance_coef × effective routing width` and emits a
+  `[balance-scale]` warning when widths differ without an offsetting strength
+  change.
+
+#### Validation / test protocol
+
+- Each evaluation uses fixed windows evenly spaced across the corresponding
+  evaluation split, independent of any RNG, bit-aligned across models and
+  resumed runs.
+- Every new best validation loss is snapshotted to `best.pt`, and both the
+  `final` record and the single test evaluation run on this validation-selected
+  model (the `model_selection` field records the policy; when `best.pt` is
+  unavailable the script reports it and falls back to the last-step
+  parameters).
+- The test split stays sealed for the entire training run and is evaluated
+  exactly once when `--evaluate-test` is passed (`{"step": "test", ...}`);
+  repeating the flag is refused, so the test set cannot silently become a
+  validation set.
+- The `final` and `test` records additionally report bootstrap 95% confidence
+  intervals over the fixed evaluation windows (loss / ppl / token accuracy /
+  macro F1; `--eval-bootstrap N` sets the number of resamples, default 500, 0
+  disables it), separating evaluation-window sampling noise from training-seed
+  variance.
+- The window overlap fraction (`*_eval_window_overlap_fraction`) and the lag-1
+  autocorrelation of the per-window loss rate (`*_window_lag1_autocorrelation`,
+  with `*_window_effective_windows`) are recorded as well; when ρ̂≥0.3 the
+  intervals are widened by the AR(1) variance-inflation factor
+  (`*_window_ci_inflation`) and the affected split is called out with a
+  `[warn]`, because non-independent windows would otherwise make the
+  unadjusted intervals too narrow.
+- Because using the same validation split for both checkpoint selection and
+  evaluation induces winner's curse, `--compare` derives
+  `<metric>_at_common_step` selection-independent versions of every periodic
+  validation metric (loss / ppl / bpb / accuracy / micro, macro, weighted F1 /
+  precision / recall), usable directly as `--compare-metric`.
+- **The default common step is the minimum of the runs' last validation steps,
+  which is chosen from observed endpoints and is therefore not unbiased**;
+  preregister a fixed step with `--common-step` for confirmatory comparisons.
+- All results are appended to `metrics.jsonl`.
+
+#### Determinism
+
+- The training entry point fixes Python / NumPy / PyTorch (CPU+CUDA) / cuDNN
+  seeds; data sampling is driven by an explicit `torch.Generator` whose seed
+  and state are checkpointed.
+- The Python / torch / CUDA / NumPy RNG states are all stored in `last.pt` and
+  restored bit-for-bit on `--resume`.
+- `CUBLAS_WORKSPACE_CONFIG` is set and PyTorch is asked to prefer deterministic
+  kernels (a warning is emitted if a CUDA kernel lacks a deterministic
+  implementation).
+- `PYTHONHASHSEED` can only be fixed before interpreter start, so a one-time
+  hint is printed when it was not set on the command line; prefix
+  `PYTHONHASHSEED=<seed>` for strict bitwise reproducibility.
+- Small cross-hardware numeric differences from reduction order may remain; on
+  the same machine, same-seed runs should be bitwise identical (`--self-test`
+  double-checks this).
+
+#### Experiment tracking
+
+Each run automatically records the code revision (git commit / dirty flag),
+environment (Python / torch / CUDA / device), full hyperparameters and seeds,
+data fingerprint (SHA-256, byte count), training curves and final results in
+`config.json` and `metrics.jsonl` — no manual bookkeeping required.
+
+#### Controlled-variable checking
+
+- `config.json` stores a `comparison_protocol` field (optimizer AdamW with
+  betas/eps, LR and schedule, warmup, total steps, weight decay, gradient
+  clipping, batch size, data augmentation, whole-file data fingerprint and
+  per-split content fingerprints, model architecture, evaluation protocol and
+  model-selection policy — new runs select on validation, legacy runs without a
+  record are marked as last-step) as well as **effective training length and
+  numerics** (early-stop tolerances
+  `early_stop_patience`/`early_stop_min_delta`, AMP dtype, device type,
+  gradient checkpointing, `torch.compile`).
+- `--compare` requires all of these to match exactly unless declared as a
+  factor via `--compare-factors` (default
+  `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`); a run that silently changed
+  optimizer, LR, step count, per-split content, AMP/device, or the `final`
+  measurement basis is reported as a violation, so tuning gains cannot be
+  misattributed to a method.
+
+#### Statistical reliability
+
+**Multi-seed summaries and tests**
+
+- `--seeds 42 43 44` trains the same configuration for multiple seeds and
+  reports Mean ± Std (sample std) per experimental cell, together with a
+  Student-t 95% confidence interval for the cell mean itself
+  (`<metric>_ci95_low/high` and the `ci95` block; std only describes
+  seed-to-seed spread, and no interval is emitted with fewer than two
+  independent seeds).
+- The `n(seed)` column of the aggregate table prints `4(3)` whenever the
+  independent seed count is below the run count, exposing pseudo-replication or
+  deterministic folding instead of inflating the apparent sample size.
+- Shared seed sets use a paired t-test, otherwise Welch's t-test; p-values, the
+  |Δ|/pooled-std noise ratio (i.e. Cohen's d), and the matching Hedges' g
+  (`hedges_g`, small-sample bias correction J≈1−3/(4·df−1); at n=3 d
+  overestimates by ~13%, ~43% in the paired convention) are shown, and
+  `--compare-baseline` contrasts report the same quantities.
+- Cells with fewer than 3 seeds are flagged as underpowered, and an apparent
+  +0.2% gain with 0.5% seed variance is not treated as real.
+
+**Non-significance is not equivalence (MDE and TOST)**
+
+- Every tested contrast also reports the minimum detectable effect at 80% power
+  (MDE, absolute and relative to the baseline mean), the achieved power at the
+  observed effect (`power_at_effect`), and the approximate number of seeds
+  needed to detect that effect given the observed seed-to-seed variance.
+- Equivalence is tested with TOST against a pre-declared margin
+  (`--equivalence-margin`, relative to the baseline mean, default 1%). TOST
+  p-values share the significance family correction (Holm, FWER): "no material
+  difference" may only be claimed when the corrected test passes; when a
+  contrast is neither significant nor equivalent the conclusion is
+  "inconclusive" (the display prints the MDE and the required seed count,
+  separating "effect too small" from "too few seeds").
+- Every contrast that fails TOST additionally reports the smallest symmetric
+  margin that would support equivalence at the current precision
+  (`equivalence_margin_needed` = |Δ̂| + t·se) together with the reason it
+  failed: `effect_exceeds_margin` when the point estimate is already outside
+  the declared margin (more seeds would only make non-equivalence more
+  certain), and `insufficient_precision` when the point estimate is inside but
+  the noise half-width pushes the interval out (then the approximate
+  `equivalence_seeds_to_achieve` is reported as well). The report flags these
+  with an explicit `[warn]` — a failed TOST must not be read as "the two
+  differ", and the fix is more seeds rather than a wider margin.
+
+**Power conventions and seed planning**
+
+- MDE, power at the observed effect, and required seed counts are computed at
+  the uncorrected α=0.05 while decisions use Holm-corrected p-values, so the
+  report also computes the corresponding conservative quantities at the Holm
+  first-step threshold α/m (`significance_family_size`, `alpha_bonferroni`,
+  `mde_80_bonferroni`, `seeds_to_detect_bonferroni`,
+  `equivalence_margin_needed_bonferroni`) and prints a `[power]` line naming
+  the family size and α/m. Seed planning or margin choice should follow the
+  conservative figures rather than the uncorrected ones.
+- Required seed counts are plug-in estimates: they extrapolate from the point
+  estimate of the seed-to-seed standard deviation
+  (`seeds_to_detect_basis="sd_point_estimate"`), whose own relative standard
+  error is about 1/√(2(n-1)) (~50% at n=3) and enters the seed count squared,
+  so leave headroom when planning.
+- The margin must be declared in advance — widening it after seeing the data
+  can manufacture equivalence.
+- The same TOST protocol covers full-factorial main effects, interactions, and
+  simple effects: the margin is relative to the control-cell mean(s) being
+  contrasted, and TOST p-values are Holm/BH-corrected within the effect family;
+  only corrected equivalence supports a claim that a component has no material
+  effect.
+
+**Pseudo-replication and minimum seed counts**
+
+- The same seed appearing multiple times inside one cell (e.g. copied run
+  directories) is not independent replication: duplicates are first **collapsed
+  to one observation per independent seed**, then paired by seed; copied runs
+  do not increase n/df, and switching to Welch does not restore independence.
+- Key suites (`--suite-modes`/`--suite-ablation`/`--suite-baseline-tuning`)
+  refuse to run with fewer than 3 seeds; smoke/debug runs must pass
+  `--allow-underpowered`, and the waiver is recorded with the seed plan.
+- 3–5 seeds support t-tests only; robust two-test claims require at least 6
+  seeds, which is the recommended minimum for confirmatory runs.
+
+**Failures, missingness and fragility**
+
+- Failed (numerically) runs are excluded from means and tests, but the report
+  gives per-arm `planned_runs` / `failed_runs` / `failure_rate` and
+  differential-failure warnings; failure rates must be read together with the
+  success-conditional metrics.
+- Every pairwise contrast and full-factorial effect also reports
+  `attrition_bounds`, a bounded-outcome partial-identification interval for the
+  effect direction (missing/failed outcomes are assigned to the pooled observed
+  support `[min, max]`). A `crosses_zero` or `unbounded` verdict means the
+  complete-case significance cannot be called robust to missingness, and
+  component verdicts downgrade to `inconclusive`. This is not a confidence
+  interval: if missing values can fall outside the observed range the true
+  bound is infinite, so the correct response is to complete or rerun the
+  missing cells rather than to report only the bound.
+- Differential-missingness detection: when a run lacks the comparison metric
+  (missing curve, metric not computed), the contrast is restricted to complete
+  cases; if the two arms lose different numbers of runs the report names them
+  explicitly (`n_missing_baseline`/`n_missing_variant`/
+  `differential_missingness`), because the apparent difference may come from
+  which runs survived rather than from the method.
+
+**Sign-flip (randomization) test**
+
+- Paired contrasts also run a sign-flip randomization test (exact enumeration
+  for n≤12, fixed-seed Monte Carlo for n>12). It does not assume normality, but
+  it does assume the paired differences are symmetric about zero (or
+  exchangeable under the randomization); sharing a seed number does not make
+  method labels exchangeable.
+- If the t-test and the randomization test disagree after the same Holm
+  correction, the report says so explicitly. `significant_robust` requires
+  both, but the exact two-sided minimum p is 2/2^n: at n=3/4/5 it is
+  0.25/0.125/0.0625, so **the criterion is mathematically unreachable for
+  n≤5**; at least n=6 is required, and more after family correction
+  (ceil(log2(2m/α))). `seed_plan` records `min_seeds_for_robust_sign_flip` and
+  `robust_claim_possible`.
+- Leave-one-out robustness: the effect is recomputed with each seed omitted in
+  turn; a sign flip or collapse flags a conclusion potentially driven by a
+  single seed.
+
+**Test-assumption diagnostics**
+
+- The skewness and excess kurtosis of the paired differences are flagged when
+  they exceed twice their standard error under normality
+  (`paired_diagnostics`; formal normality tests are uninformative below n=8 and
+  the kurtosis SE is undefined below n=4, so these are descriptive cues only —
+  no flag does not prove the assumption holds).
+- Welch contrasts additionally report the variance ratio between arms with an
+  F-test (`variance_diagnostics`, which qualifies the pooled-std interpretation
+  of `hedges_g` but does not change the Welch test). Flags are collected in an
+  `[assumptions]` section.
+
+**Wilcoxon signed-rank and rank effect sizes**
+
+- Paired contrasts also report the Wilcoxon signed-rank test (exact enumeration
+  for n≤12 with midranks for ties; normal approximation with tie and continuity
+  corrections above; zero differences are dropped and counted) with its
+  rank-biserial effect size (`wilcoxon_rank_biserial`, ±1 when all differences
+  share a sign).
+- Welch (unpaired) contrasts report Cliff's delta with a deterministic-seed
+  percentile bootstrap 95% CI (`cliffs_delta`/`cliffs_delta_ci95`; δ is
+  dimension-free and does not require normality).
+- Both are descriptive robustness companions: they share the sign-flip test's
+  symmetry assumption, stay outside the Holm family, and never change
+  significance verdicts; disagreement with the paired t-test at the 0.05 level
+  is called out in `[assumptions]` with a pointer to the per-seed differences.
+
+**Effect-size uncertainty and multiplicity disclosure**
+
+- Paired dz and Hedges' gz carry an approximate 95% CI
+  (`cohens_dz_ci95`/`hedges_gz_ci95`, SE=√(1/n+dz²/2n)); with few seeds the
+  interval can span both "negligible" and "large", so read point estimates
+  together with the interval.
+- The Holm/BH corrections apply only within the single comparison metric's test
+  family; the report states this explicitly (`[multiplicity]` line and the
+  `metric_multiplicity` payload field), lists runs whose pre-registered primary
+  metric differs from the analysis metric, and marks every non-primary metric
+  as exploratory — no cherry-picking significant metrics after seeing the
+  results.
+
+**CSV export**
+
+- `--compare-csv FILE` writes the contrast table (single-factor / baseline /
+  factorial effects: p-values, Holm/BH corrections, effect sizes with CIs,
+  Wilcoxon/Cliff's delta, diagnostics and fragility verdicts) plus a per-cell
+  aggregate table (automatically written to `FILE.aggregates.csv`) with stable
+  column names (columns are append-only) for plotting and secondary analysis;
+  confounded contrasts write identity columns only and leave statistics blank.
+
+#### Baseline adequacy and hypothesis registry
+
+- Besides deltas, `--compare-baseline MODE` checks that the baseline is worth
+  beating:
+  - on the primary metric it must beat the context-free unigram reference
+    (each run's `reference_baselines`; PR-AUC's constant-predictor reference is
+    the mean prevalence over eligible classes and ROC-AUC's is 0.5, so the
+    straw-man guard keeps working after switching the comparison metric to
+    PR-AUC);
+  - it must not be worse than the tuned byte-level n-gram statistical baseline;
+  - it should have ≥3 seeds;
+  - it must carry tuning evidence (a `baseline_tuning` provenance record in
+    `config.json`; the statistical baseline counts as tuned because it is
+    grid-searched on val).
+  - Otherwise it is flagged `[straw-man]`: beating an untuned weak baseline
+    proves nothing about a complex model — tune the baseline with
+    `--suite-baseline-tuning` first. A tuning metric that does not match the
+    comparison metric no longer prints an unconditional OK; instead it
+    explicitly warns that the baseline is not proven to be tuned on the current
+    metric.
+- The analysis also lists the `--hypothesis`/`--rq` recorded per mode: runs
+  without one, whose hypothesis names no decision metric such as val loss /
+  macro F1 / PR-AUC / recall, or whose named metric is not verifiable by the
+  current pipeline (e.g. routing metrics without a `routing_analysis` record)
+  are named; the statistical baseline is exempt. A single training run also
+  warns at start-up and stores `hypothesis_metric_mentions` in `config.json`.
+- Class imbalance is flagged via `val_majority_accuracy`: once the majority
+  class dominates, accuracy/micro is misleading; at ≥99.9% (≈1:1000) imbalance
+  is tiered separately — PR-AUC must be read as lift over its chance level
+  (≈ mean prevalence, recorded as `val_pr_auc_macro_chance`), while ROC-AUC
+  keeps a chance level of 0.5 and looks overly optimistic.
+- All checks are persisted to `comparison_analysis.json`. If the ngram runs and
+  neural runs differ in data fingerprint, split fractions, evaluation-window
+  count, batch size or data augmentation, a cross-family `[violation]` is
+  reported and the "baseline beats ngram" judgment is skipped.
+
+#### Baseline tuning protocol
+
+- `--suite-baseline-tuning` (with `--seeds`) runs a pre-registered learning-rate
+  grid search for the simple baseline (`--baseline-tuning-lrs`, default
+  `1e-4 3e-4 1e-3`; `--baseline-tuning-mode` selects the mode). Candidates may
+  differ only in LR (steps/batch/data/architecture/schedule are inherited from
+  the same command line).
+- The winner is picked on val by Mean ± Std: the best-mean candidate is
+  identified first, and every candidate whose gap to it is smaller than the
+  seed noise (the larger of the two stds) is treated as indistinguishable; the
+  conservative winner is then the smallest LR in that tied set, and the tie set
+  and selection mode (`winner_selection`/`tied_lrs`) are recorded verbatim. If
+  the winner sits on the grid boundary (smallest/largest candidate), the report
+  warns that the optimum may lie outside the grid and recommends extending
+  `--baseline-tuning-lrs` and re-running.
+- The report is written to `<out>/baseline_tuning.json`. A later baseline
+  training run passes `--baseline-tuning-from <report>`: mode / winner LR /
+  steps / data fingerprint and the **full training protocol** (warmup,
+  schedule, weight decay, gradient clipping, data splits, eval windows, …) are
+  verified item by item (old reports lacking protocol fields are rejected
+  instead of passing silently), and the provenance is stored in `config.json`
+  as `baseline_tuning` — the only evidence that the baseline was actually
+  tuned. The test set stays sealed throughout.
+
+#### Ablation completeness
+
+- `--suite-ablation` runs the full factorial of delayed merge × balance loss
+  (`local_base` and each delayed-merge scheme × `balance_coef`=0/current); by
+  default it covers **all** schemes proposed by the project (A and B,
+  (1+N)×2 = 3×2 = six cells), because every innovation must be shown to help on
+  its own — running A alone cannot support claims about B.
+- The coverage check lists missing cells, names structural confounds
+  (inconsistent k1/k2/top_k/residual_scale or balance strength across cells)
+  and pseudo-replication; declare the schemes a round must cover with
+  `--ablation-modes A B`.
+- `--suite-modes` runs multiple modes under one controlled setting (e.g.
+  `smelt local_base A B`). Suite runs write the full analysis to
+  `<out>/comparison_analysis.json`.
+
+#### Results analysis (curves / NaN / bad cases / efficiency)
+
+- **Live curve monitoring**: instead of inspecting only the final number, every periodic validation reuses `analyze_training_curve`; status transitions (e.g. healthy→overfitting, divergence) immediately print recommendations and append a `{"step": "curve_monitor", ...}` record. Overfitting calls for regularization / more data / `--early-stop-patience`; both losses flat points to learning rate, optimizer, or a broken data pipeline. When validation loss has not yet regressed but the generalization gap keeps widening, an early-warning (`gap_widening_warning`) recommends early stopping before the regression shows up.
+  - **Systematic NaN/Inf diagnosis**: evidence is collected along the path data NaN/Inf → log(0)/division-by-zero/softmax overflow → fp16 mixed-precision overflow → gradient explosion / learning rate too large; the `nan_diagnosis` record compares the failing-step gradient norm with the recent median to separate gradient explosion from forward/loss-side root causes.
+  - **Bad-case analysis**: statistics are streamed over **all** evaluated tokens on the same fixed windows as periodic validation (about 10 bytes of compact scalars per token, no random subsampling, token accuracy identical to `evaluate`); top-N worst samples are maintained exactly via per-batch top-N plus cross-batch truncation and categorized (ambiguous / systematic_confusion / label_noise_suspect / uncertain, i.e. blurry samples, model blind spots, suspect labels). Category attribution over all wrong tokens (`error_category_counts` / `error_category_shares`), not just the top-N, is the main source of new improvement ideas.
+  - **Efficiency vs accuracy trade-off**: `--compare` summarizes parameters, FLOPs, inference latency, training step time (forward+backward) and memory per cell and annotates cost ratios in each single-factor contrast; a significant gain costing ≥1.5×, or a regression that is also more expensive, is explicitly flagged (evaluate cost-effectiveness / strictly dominated), so "+0.5% at 10× compute" is not mistaken for real progress. Every efficiency field also carries a Student-t 95% confidence interval for its mean (`ci95_low`/`ci95_high`, omitted below n=2), and the `[efficiency-ci]` line reports the intervals for inference latency and training step time: an interval as wide as the mean itself means the efficiency difference may be pure measurement noise.
+  - **Convergence speed**: `--compare` derives `val_loss_curve_mean_to_common_step`, the trapezoid-integrated mean of the periodic validation curve over the common observable window (window end fixed before training via `--common-step`, otherwise the minimum observed last validation step with a data-dependent marker; endpoints are interpolated, never extrapolated, and failed/short curves are excluded). It is a regular comparable metric for `--compare-metric`/`--primary-metric` and flows through the seed tests, Holm correction, MDE/TOST, fragility and attrition bounds, but it is explicitly excluded from checkpoint selection and baseline-tuning targets. Because it mixes early descent with the final level, report it alongside `val_loss_at_common_step` and `final`; it is not evidence of final quality or learning rate alone.
+
+### Multi-seed and ablation suite examples
+
+```bash
+# RQ1: paper baseline + mechanism controls + delayed merge, 6 seeds each
+# (the robust two-test minimum)
+python experiment.py --data corpus.txt --out runs/rq1 \
+  --seeds 42 43 44 45 46 47 \
+  --suite-modes base smelt local_base local_base_k2 A B B_early \
+  --common-step 2000 \
+  --steps 2000 --hypothesis "delayed merge improves val loss" --rq RQ1
+# Delayed-merge arms should additionally pass --budget-match smelt to audit
+# the full compute-graph budget; base and smelt loop a different number of
+# times and cannot share one budget gate.
+
+# 3x2 full-factorial ablation: local_base/A/B x balance_coef=0/0.01
+# (all proposed schemes by default; declare a subset with --ablation-modes)
+# 6 seeds are recommended for confirmatory runs; 3-5 only support t-tests
+python experiment.py --data corpus.txt --out runs/ablation \
+  --seeds 42 43 44 45 46 47 --suite-ablation --ablation-modes A B \
+  --steps 2000 --hypothesis "each design choice helps" --rq RQ1
+
+# Tune the simple baseline first: LR grid (selected on val), report in runs/tuning;
+# --baseline-tuning-mode must be the mode you will later declare as the baseline
+python experiment.py --data corpus.txt --out runs/tuning \
+  --seeds 42 43 44 --suite-baseline-tuning --baseline-tuning-mode dense \
+  --steps 2000 --hypothesis "tune the baseline so it is worth beating" --rq RQ1
+
+# Train the final baseline at the winner LR and record the provenance
+# (config.json baseline_tuning); replace --lr with the winner lr from
+# runs/tuning/baseline_tuning.json
+python experiment.py --data corpus.txt --out runs/baseline_dense \
+  --mode dense --lr 3e-4 \
+  --baseline-tuning-from runs/tuning/baseline_tuning.json \
+  --steps 2000 --hypothesis "tuned dense baseline performance" --rq RQ1
+
+# Read-only summary of finished runs: controlled-variable check + Mean ± Std + tests.
+# --compare-baseline must point at a mode that was actually tuned (here dense,
+# with runs/baseline_dense carrying the baseline_tuning provenance); to declare
+# smelt as the baseline, tune smelt with --suite-baseline-tuning and record its
+# provenance the same way, or include an ngram run from --statistical-baseline
+# in the comparison set.
+python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
+  runs/ablation/A_bal0_seed42 runs/baseline_dense --compare-baseline dense
+
+# Export the same analysis as CSV (contrast table + per-cell aggregates)
+# for plotting and secondary analysis; use --compare-report for the full
+# JSON evidence payload.
+python experiment.py --compare runs/rq1/*_seed42 --compare-factors mode \
+  --compare-csv analysis/contrast.csv --compare-report analysis/comparison_analysis.json
+```
+
+## 📂 Output layout
+
+Each run produces:
+```text
+runs/<exp_name>/
+├── config.json      # full config, parameter count, seeds, data fingerprint, data audit, model-selection policy, code/env info, sanity-check result
+├── metrics.jsonl    # per-line train/val metrics and final eval (loss, ppl, lr, grad_norm, ...); includes the single {"step": "test", ...} record when --evaluate-test is used
+├── best.pt          # validation-selected weights used by final/test evaluation (atomic write)
+├── last.pt          # weights, optimizer, LR scheduler and RNG states for resume (atomic write)
+├── routing.json     # RQ3/RQ4 routing diagnostics (chance levels and branch semantics)
+├── routing_interventions.json  # optional routing-shuffle/expert-mask interventions (--routing-interventions)
+└── test_access_ledger.jsonl    # optional test-access ledger (--test-ledger)
+```
+
+## 📝 Notes and disclaimer
+
+- This project is a **research experiment foundation**; sparse dispatch is implemented with expert-level Python loops by default — intended for research prototypes.
+- Scheme B does not yet implement incremental-decode KV cache; inference needs a redesigned caching strategy.

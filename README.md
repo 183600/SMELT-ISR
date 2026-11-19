@@ -1,0 +1,565 @@
+# SMELT-ISR
+
+**中文** | [English](README_en.md)
+
+
+> **SMELT with Independent Second Round Routing (Delayed-Merge)**
+
+## 📖 目录
+
+- [项目简介](#-项目简介)
+- [核心特性](#-核心特性)
+- [环境依赖](#-环境依赖)
+- [代码使用说明](#-代码使用说明)
+- [实验设计与研究问题](#-实验设计与研究问题)
+- [对照口径与可复现性](#-对照口径与可复现性)
+- [多随机种子与消融套件示例](#-多随机种子与消融套件示例)
+- [论文口径与复现边界](#-论文口径与复现边界)
+- [机制对照与确证流程](#-机制对照与确证流程)
+- [输出结构](#-输出结构)
+- [注意事项与免责声明](#-注意事项与免责声明)
+
+## 📖 项目简介
+
+SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Transformer，middle layers Loop Twice）架构，专注于路由机制的改进实验。
+
+仓库提供以下基线与方案：
+
+- `base`：论文的未循环 MoE 基线（middle 只执行一次）。
+- `smelt`：原始 SMELT 架构（middle 循环两次；`--residual-scaling paper` 时循环区域子层残差按 1/r 缩放）。
+- `A` / `B`：延迟合并方案（局部 / 全局）。
+- 以及配套的机制对照 `local_base`、`local_base_k2`、`B_early` 与稠密基线 `dense`。
+
+**默认配置为小规模原型。** 复现论文附录 A 的网格单元，请使用
+`--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
+（详见「论文口径与复现边界」）；`config.json` 的 `paper_fidelity` 会逐项报告
+`architecture_faithful` / `protocol_faithful` / `budget_audit`。
+
+原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
+
+1. **第一轮路由后不合并**：Top-$k_1$ 专家的输出保留为独立分支，不进行求和或拼接。
+2. **第二轮独立路由**：针对每个第一轮分支的状态，分别独立进行第二轮 Top-$k_2$ 专家路由。
+3. **最终聚合**：只有在完整第二轮结束后，才跨第一轮分支进行结果合并。
+
+该结构旨在探索延迟合并是否能提高专家组合的表达能力，并验证不同分支是否能形成完全独立的计算轨迹。
+
+## 🚀 核心特性
+
+- **模型模式与对照**：
+  - `base`: 论文的未循环 MoE 基线（middle 只执行一次）。
+  - `smelt`: 原始 SMELT 架构（中间层循环两次；`--residual-scaling paper` 时循环区域子层残差按 1/r 缩放）。
+  - `A`: 局部延迟合并（仅在同一 MoE 层内保持专家分支独立，第二阶段后合并）。
+  - `B`: 全局延迟合并（第一轮产生独立分支后，整个中间 Transformer Block 保持分支独立，包含 Attention 和 MoE，第二轮结束后才合并）。
+  - `local_base_k2`: **只改变合并时机**的机制对照（立即合并，第二轮宽度仍为 k2）。
+  - `local_base`: A 的**等专家计算量**性能对照（立即合并，第二轮宽度 min(E,k1·k2)）。
+  - `B_early`: B 的**等计算量合并位置对照**（分支数、Attention/MoE 执行次数与 B 相同，只在第一轮结束后提前合并）。
+  - `dense`: 无 MoE、无循环的稠密基线；`dense_fnn_hidden=None`（默认）时 FFN 宽度取 `top_k × expert_hidden`（与 MoE 单次前向激活参数量对齐的等计算口径），`--dense-fnn-hidden` 设为 `n_experts × expert_hidden` 则给出等参数量对照。
+- **严谨的自测模块**：验证梯度流通、自回归因果性、分支间的信息隔离，以及边界条件下的数学等价性（如 $k=1$ 时方案 B 与 SMELT 等价）。
+- **完整训练基座**：支持断点恢复、梯度裁剪、负载均衡损失、学习率调度和详细的实验指标记录。
+- **控变量对比与统计可靠性**：
+  - 每轮训练记录受控变量协议（优化器、学习率策略、训练步数、数据增强、整体数据指纹与逐 split 内容指纹、早停/AMP/设备等数值设置）；`--compare` 自动核对「除声明因子外设置是否完全一致」并识别重复种子的伪重复。
+  - `--seeds` 支持多随机种子运行并汇报 Mean ± Std 与显著性检验；报告同时给出 80% 功效的最小可检出效应（MDE）与 TOST 等价性判定（`--equivalence-margin`，默认相对基线均值 1%），「不显著」不会被误读成「等价」。
+  - `--suite-ablation` 提供 (1+N)×2 全因子消融（默认覆盖 A/B 两个延迟合并方案），自动检查消融组合是否完整。
+  - 结果分析阶段还附检验假设诊断（配对差值偏度/峰度、两臂方差比）、Wilcoxon 符号秩与 Cliff's δ 秩效应量、效应量自身 95% 置信区间与跨指标多重性披露；`--compare-csv` 把对比与聚合导出为 CSV 供绘图与二次分析。
+
+## 🛠️ 环境依赖
+
+- Python 3.10+
+- PyTorch 2.x
+
+```bash
+pip install "torch>=2.2"
+# 或安装本仓库（开发模式，自动安装 numpy/torch 运行依赖）
+pip install -e .
+```
+
+## 📦 代码使用说明
+
+### 1. 运行结构自测
+在开始实验前，建议运行内置的自测模块，以确保不同模式的结构正确性、分支独立性与等价性；自测还包含「同一随机种子两次运行逐位一致」的端到端可复现性检查，以及梯度探针的负例校验。
+```bash
+python experiment.py --self-test
+# 快速回归（CI 使用；覆盖 top-1 梯度、GQA、B_early 等计算量、统计折叠等）
+python -m unittest discover -s tests -v
+```
+
+### 2. 准备数据
+代码默认使用字节级 tokenizer 以方便快速验证。你需要准备一个 UTF-8 编码的纯文本文件（如 `corpus.txt`）。
+
+数据管线严格防止数据泄露：**先划分，再做任何处理**。
+语料默认切成 `train`（前 90%）/ `val`（随后 5%）/ `test`（最后 5%）
+三段，切分连续、互不重叠、全程不随机打乱。**默认 `--split-policy
+contiguous` 只是按文件顺序的连续前缀切分，不等于时间切分**：只有
+语料确实按时间排序、且用 `--split-policy chronological
+--time-order-manifest <清单>` 验证时间戳单调不减时，才可以声称
+按时间切分（证据写入 `config.data.time_order_evidence`）。文件顺序
+按网站/语言/主题拼接时，后 5% 可能只是另一类来源，不能外推为
+时间泛化。训练阶段的批级 shuffle 由随机窗口起点承担，不改变
+split 边界。当前字节级管线不涉及标准化/归一化/缺失值填充，若扩展为
+连续值特征，所有统计量（均值、方差、最值等）必须只在 train 上
+`fit`，再 `transform` val/test。
+
+`val` 用于周期性验证、挑超参数、早停与模型选型；`test` 训练期间全程
+尘封，只有显式传入 `--evaluate-test` 才会在训练完全结束后评估一次，且
+同一次运行拒绝重复评估。切分比例可用 `--val-fraction` / `--test-fraction`
+调整。每次运行在训练前都会自动做数据审计（token 值域、无法 UTF-8 解码
+的字节与 NUL 字节等文本完整性/标签噪声检查、重复窗口、train↔val 分布
+偏移、训练集标签覆盖），结果与警告写入 `config.json` 的 `data_audit`
+字段；解封测试集时会追加包含 test 的审计结果。审计还报告
+`label_coverage`（评估集里训练集从未出现的字节类数与 token 占比；
+这些标签的 NLL 是不可约外推误差）以及清洗确有删除时的
+`train_cleaning.deletion_bias`（被删除与保留内容的字节/二元组 JS
+距离、删除比例与连续段长度）。清洗按内容规则选择性删除，偏差大时
+清洗/未清洗运行的指标不能直接比较；完整数值随 `config.json` 归档。
+
+**群组数据必须整体落在同一侧**：如果语料由多个「群组」拼接而成
+（同一文档 / 同一用户 / 同一物体产生的多条记录），用 `--group-separator`
+指定群组分隔符（如 `--group-separator '<|doc|>'` 或 `--group-separator '\n\n'`，
+支持 `\n`、`\xHH`、`\uXXXX` 等转义）。切分位置会吸附到群组边界，
+任何群组都不会被拆到两个 split，train/val/test 之间零交叉；`data_audit`
+记录每个 split 的完整群组数。吸附后无法保证每段最小长度时（如单个
+群组过大）会显式报错，而不是悄悄拆分群组。
+
+**训练集去重**：`--deduplicate-train-groups`（需配合群组分隔符）会从
+train 中整体剔除与 val（以及仍然存在的更早 train 群组）内容完全相同的
+群组，val/test 的字节与切分位置保持不变。**默认只用 val 决定训练集
+删除，test 内容不参与数据集构建**；只有显式
+`--allow-eval-content-for-cleaning` 才会让 test 参与删除决策，此时
+`config.data.eval_content_access.test_content_used=true`，不能再声称
+「测试集全程未被读取」。被剔除内容不会进入神经网络窗口，
+也不会进入 unigram / n-gram 统计基线的计数或分布审计；`data_audit`
+记录 `effective_bytes` / `effective_windows`，`config.data` 记录实际
+切分比例与清洗统计。训练期审计只用切分边界核对 test 实际占比（另对 test 字节做
+SHA-256 切分指纹）；默认不用 test 内容决定训练集删除。解封前还会
+独立核对 test 固定窗口的输入/标签是否逐位对齐。
+
+**跨 split 共享内容块清洗**：`--drop-train-shared-chunks`（需配合
+`--group-separator`）按内容定义分块指纹，把与 val（默认）共享连续
+字节块的整个训练群组剔除，val/test 的字节、切分位置与内容指纹逐位
+不变；清洗后同一审计必须归零。注意分块指纹是**精确块**检测，不是
+近重复检测；需要 test 也参与删除决策时必须显式
+`--allow-eval-content-for-cleaning`。它补上精确群组指纹抓不到的「嵌入片段」空档，
+可与 `--deduplicate-train-groups` 叠加。
+
+**训练集近重复清洗**：`--drop-train-near-duplicate-groups`（需配合
+`--group-separator`）按字节 k-shingle 集合的 Jaccard 相似度，把与
+val（默认；显式 `--clean-train-against-test` 时含 test）或更早 train
+群组相似度达到阈值的训练群组整组剔除。这条内容级规则能发现精确群组
+指纹与内容定义分块都抓不到的改写/转载/轻微编辑重复；val/test 的
+字节、切分位置与内容指纹完全不变。
+
+**连续字节流的格式/语料完整性清洗**：没有群组分隔符时，可用
+`--drop-train-corrupt-bytes` 只从 train 中剔除无法按 UTF-8 解码的
+字节与 NUL 字节本身（不做任何字节修补）。**非法 UTF-8/NUL 不自动
+等于标签错误**：它们可能是二进制记录、其他编码或合法分隔符；启用
+任何清洗开关必须用 `--domain-justification` 说明领域依据，否则拒绝
+启动；val/test 的字节与切分位置
+完全不变。被剔除字节不会进入训练窗口、unigram / n-gram 计数或分布
+审计，`data_audit.effective_bytes` 与 `config.data.train_cleaning`
+记录实际清洗口径。有 `--group-separator` 时请改用
+`--drop-train-corrupt-groups`，避免破坏群组完整性。
+
+**连续字节流的异常段清洗**：没有群组分隔符时，可用
+`--drop-train-degenerate-runs` 只从 train 中剔除长度达到阈值（64B）
+的单一字节连续段（填充/重复字符/错误拼接的常见形态，也可能是表格
+边框/ASCII art/合法填充），同样不做字节修补；需要
+`--domain-justification`；`data_audit.degenerate_runs` 记录退化段计数、字节数与最大段长，
+清洗后归零。有 `--group-separator` 时请改用
+`--drop-train-degenerate-groups`，避免破坏群组完整性。
+
+**默认泄露硬门**：审计一旦发现跨 split 重复窗口或重复群组（泄露级
+问题），训练入口会直接拒绝启动；解封测试集时发现同类问题也会拒绝
+解封（不写入 `test` 记录）。只有显式传入 `--allow-data-leakage` 才会
+放行，且豁免会写入 `config.json` 与对比协议，不能把已泄露的运行当成
+无泄露证据。窗口签名扫描在窗口数超过上限时按 stride 等间距抽样，
+`data_audit.leakage_scan_coverage` 记录各 split 的采样/总窗口数、stride
+与覆盖率；stride>1 时审计与泄露门都会显式写出残余风险——抽样范围内的
+「未发现跨 split 重复窗口」不等于「不存在重复」，内容定义分块指纹
+（穷尽扫描）可兜底被 stride 漏掉的错位重复。越界 token、超阈值的
+UTF-8/NUL 损坏等标签噪声由
+`--strict-data-audit` 控制：加上后同样拒绝训练/解封；默认仅警告并继续，
+方便先看清数据问题再决定清洗策略。test 字节不参与任何清洗（默认 test 内容也不参与训练集删除决策），
+因此解封时只要 test 存在越界 token、非法 UTF-8 或 NUL 就默认拒绝解封（神经与
+统计基线两条路径一致），只有显式传入 `--allow-corrupt-test-labels`
+才放行，豁免写入配置。若希望把分布偏移也变成硬门，可显式设置
+`--max-byte-shift` / `--max-bigram-shift` / `--max-conditional-shift`
+（JS 距离，0~1）：train/val 或解封时任意一对 split 超过对应阈值就拒绝
+训练/拒绝解封（统计基线解封同样受此约束）；不设置时保留警告模式。
+
+训练期间每次刷新最优验证损失都会把权重写入 `best.pt`。训练结束后的
+`final` 与唯一一次测试集评估都在这份「验证集选定」的模型上进行
+（`config.json` 的 `model_selection` 记录选型口径）；若 `best.pt` 缺失
+（如从旧检查点恢复），会明确提示并回退到最后一步参数。
+
+```bash
+# 训练结束后做唯一一次测试集评估
+python experiment.py --data corpus.txt --mode B --out runs/B_seed42 --evaluate-test
+```
+*(注：正式实验应替换为你的 tokenizer 和数据管线)*
+
+### 3. 开始训练
+通过 `--mode` 参数指定运行的结构。
+
+**训练原始 SMELT 基线**：
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --mode smelt \
+  --top-k 2 \
+  --steps 2000 \
+  --seed 42 \
+  --out runs/smelt_seed42
+```
+
+**训练全局延迟合并方案 B**：
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --mode B \
+  --top-k 2 \
+  --k1 2 \
+  --k2 2 \
+  --steps 2000 \
+  --seed 42 \
+  --out runs/B_seed42
+```
+
+**训练局部延迟合并方案 A 及其对照组**：
+```bash
+python experiment.py --data corpus.txt --mode local_base --k1 2 --k2 2 --out runs/local_base_seed42
+python experiment.py --data corpus.txt --mode A --k1 2 --k2 2 --out runs/A_seed42
+```
+
+### 4. 训练前的过拟合 sanity check
+每次全新训练（非 `--resume`）开始前，脚本会先抽取一个小批次
+（`--sanity-batch-size`，默认 4 条序列），在同一模型结构上做过拟合检查：
+关闭负载均衡辅助损失、weight decay、梯度裁剪与 warmup 等一切正则化，
+要求训练损失迅速趋近 0 或下一 token 准确率接近 100%（阈值由
+`--sanity-loss-threshold`、`--sanity-acc-threshold` 控制）。未通过时会
+明确报错并以非零状态码退出，避免在存在梯度未反传、损失计算错误等严重
+bug 时盲目开始全量训练。
+
+第一步反向之后还会先做梯度探针：损失必须连在计算图上、所有梯度必须
+有限、至少一个参数收到非零梯度、非专家参数不得缺失梯度（专家参数允许
+因本批次未路由到而缺失/零梯度）。探针失败会立即停止并给出排查提示
+（不浪费后续步数），结果写入 `config.json` 的
+`sanity_check.grad_probe` 与 `metrics.jsonl`；探针只是第一道筛查，
+通过后仍需按下面的必要不充分说明配合其他检查。
+
+注意这是**必要不充分**检查：通过也不代表代码完全正确，数据增强、特征
+对齐、标签映射等 bug 仍可能漏网，还需配合中间结果检查。
+
+```bash
+# 只跑 sanity check，不开始训练
+python experiment.py --data corpus.txt --mode B --sanity-only --out runs/sanity_B
+
+# 显式跳过检查（已充分验证的前提下）
+python experiment.py --data corpus.txt --mode B --skip-sanity-check --out runs/B_seed42
+```
+
+检查结果会写入 `metrics.jsonl`（`{"step": "sanity", ...}`）与
+`config.json` 的 `sanity_check` 字段；检查内部固定种子并在结束后恢复
+RNG 状态，因此是否运行检查不影响主训练的随机轨迹。
+
+### 5. 恢复训练
+模型配置会从检查点自动读取，恢复时只需保证数据与总训练步数一致：
+```bash
+python experiment.py \
+  --data corpus.txt \
+  --resume runs/B_seed42/last.pt \
+  --steps 2000 \
+  --out runs/B_seed42
+```
+
+## 🧪 实验设计与研究问题
+
+本项目旨在通过以下维度验证“延迟合并”的有效性：
+
+- **RQ1**: 延迟合并是否优于原始 SMELT？（比较 validation loss 和收敛速度；收敛速度用共同训练窗口内的时均验证损失 `val_loss_curve_mean_to_common_step` 判定，窗口终点必须用 `--common-step` 训练前固定，且该指标需与共同步数单点、`final` 一起报告，不能单独解释为最终质量）
+- **RQ2**: 第一轮分支数 ($k_1$) 与第二轮专家数 ($k_2$) 的分配比例如何影响结果？**不能只用 $k_1k_2 \approx 2k$ 做预算匹配**：A 的每 token 专家执行次数是 $k_1 + k_1k_2$（不是 $k_1k_2$），B 还要计入分支创建后的 Attention/MoE；请用 `--budget-match smelt` 按完整计算图核对每 token FLOPs，并报告实测/解析比例
+- **RQ3**: 第二轮是否会选择与第一轮不同的专家？（分析专家重合度与 Jaccard 相似度）
+- **RQ4**: 延迟合并是否改善专家专门化？（分析专家负载分布与路由熵）
+
+RQ3/RQ4 的路由诊断（第二轮 Jaccard / slot 复用 / 分支自复用、**均匀随机与边际负载保持的机会水平、lift 与 adjusted 重合度**、第一二轮负载熵与路由熵、死专家数、分支余弦）随每次运行写入 `config.json` 的 `routing_analysis`。低 Jaccard 必须与机会水平一起读；`--routing-interventions` 额外做路由打乱与逐专家屏蔽，用功能干预验证专门化，而不是只看利用率，并在 `--compare` 中按运行展示、按种子聚合（Mean ± Std）；它们同样进入可对比指标集（`--compare-metric routing_jaccard_branch` 等），因此路由结论可以带跨种子统计与显著性检验，而不是只靠单次运行的定性描述。
+
+### 对照口径与可复现性
+
+#### 方案 B 的路由与合并权重
+
+方案 B 的第一轮中间区域全程使用 $k_1$，第二轮完整中间区域才使用 $k_2$；合并使用第一轮路由得到且 Top-$k_1$ 归一化的固定权重，不会用最终分支状态重新计算合并权重。论文分析或消融中应明确这一点。
+
+#### 计算量口径
+
+方案 B 在第一轮分支创建后按 $k_1$ 倍分支数执行后续 Attention 与 MoE，等参数实验并不等价于等 FLOPs 实验。回答 RQ1/RQ2 时应同时报告按训练步数与按 token/FLOPs 对齐的对比，避免把额外计算误解释为路由机制本身的收益。
+
+#### 残差缩放口径
+
+- `--residual-scaling paper`（默认）把循环区域内子层的残差更新按循环次数 $1/r$ 缩放（循环两次即 1/2），循环区域外的子层仍用 `residual_scale`。
+- `--residual-scaling global` 保留历史行为（`residual_scale` 全局作用于所有区域、所有子层）；该口径下把全局系数设为 0.5 并不等价于论文口径——它会把循环区域外的前后层也一起缩放。
+- 跨模式对比应保持同一 `residual_scaling` 口径（该口径写入 `comparison_protocol`，旧运行与 `global` 运行可区分）。
+
+#### 负载均衡尺度
+
+- 辅助损失中 $f_i$ 按 token 数归一化，而不是按 assignment 数归一化；均匀路由时 $E \sum_i f_i P_i \approx k$，均衡强度随路由宽度线性增大。
+- 跨 $k_1/k_2/\text{top-}k$ 比较实验时应按比例折算系数（保持 `balance_coef × k` 不变），否则路由宽度会与均衡强度混杂。
+- `local_base` 第二轮为对齐计算量使用宽度 $\min(n_\text{experts}, k_1 k_2)$，实现会把该轮 aux 按 $k_2/\min(n_\text{experts}, k_1 k_2)$ 折算回 A/B 的单分支宽度；`comparison_protocol` 记录 `balance_width_normalization` 以区分新旧运行。
+- `--compare` 还会核对 `balance_coef × 有效路由宽度`，宽度不同而强度未抵消时给出 `[balance-scale]` 警告。
+
+#### 验证 / 测试协议
+
+- 每次评估使用跨评估 split 等间隔选取的固定窗口，窗口集合不依赖随机数，可在不同模型和恢复训练之间逐位对齐。
+- 训练期间每次刷新最优验证损失都保存 `best.pt`，训练结束后的 `final` 记录与唯一一次测试集评估都在这份验证集选定的模型上进行（`model_selection` 字段记录选型口径；`best.pt` 不可用时明确提示并回退到最后一步）。
+- 测试集默认全程尘封，仅在显式传入 `--evaluate-test` 时解封评估一次（`{"step": "test", ...}`）；重复传参会被拒绝，避免测试集变成隐式验证集。
+- final 与 test 记录默认附带基于固定评估窗口的 bootstrap 95% 置信区间（loss / ppl / token accuracy / macro F1；`--eval-bootstrap N` 控制重采样次数，默认 500，0 关闭），用于区分「评估窗口抽样波动」与「训练种子波动」。
+- 窗口重叠比例（`*_eval_window_overlap_fraction`）与窗口 loss 率的 lag-1 自相关（`*_window_lag1_autocorrelation`、有效窗口数 `*_window_effective_windows`）一并落盘；自相关 ρ̂≥0.3 时 bootstrap 区间按 AR(1) 方差膨胀放宽（`*_window_ci_inflation`），并以 `[warn]` 点名受影响的 split——窗口不独立时未调整的区间会偏窄。
+- 同一批验证集既用于 checkpoint 选型又用于判定会引入 winner's curse：`--compare` 会为全部周期验证指标生成 `<metric>_at_common_step` 选型无关派生口径（loss / ppl / bpb / accuracy / micro、macro、weighted F1 / precision / recall），可在共同训练步数处直接作为 `--compare-metric`。
+- **默认共同步数取各运行最后一个验证步的最小值，由观察到的端点决定（早停/不等步数时与结果相关），不是无偏口径**；正式对比应预先用 `--common-step STEP` 固定步数。
+- 所有结果追加到 `metrics.jsonl`。
+
+#### 确定性
+
+- 训练入口固定 Python / NumPy / PyTorch(CPU+CUDA) / cuDNN 的随机种子；数据采样由显式 `torch.Generator` 承担（种子与状态随检查点存档）。
+- Python / torch / CUDA / NumPy 的 RNG 状态都会随 `last.pt` 存档并在 `--resume` 时逐位恢复。
+- 设置 `CUBLAS_WORKSPACE_CONFIG`，并要求 PyTorch 优先使用确定性算子；若当前 CUDA 算子没有确定性实现，PyTorch 会给出告警。
+- `PYTHONHASHSEED` 只能影响进程启动后的子进程，未在命令行显式设置时启动会打印一次性提示；严格逐位复现可前缀 `PYTHONHASHSEED=<seed>`。
+- 跨硬件架构仍可能因浮点归约顺序产生微小差异，同一台机器上同种子运行应逐位一致（`--self-test` 会做双跑逐位校验）。
+
+#### 实验追踪
+
+每轮实验自动记录代码版本（git commit / 是否有未提交改动）、运行环境（Python / torch / CUDA / 设备）、完整超参数与随机种子、数据指纹（SHA-256、字节数）、训练曲线与最终结果，全部写入 `config.json` 与 `metrics.jsonl`，无需手动记录。
+
+#### 受控变量检查
+
+- `config.json` 的 `comparison_protocol` 字段记录优化器（AdamW 及 betas/eps）、学习率与调度、warmup、训练步数、weight decay、梯度裁剪、batch size、数据增强、整体数据指纹与逐 split 内容指纹（`split_sha256`，防止同源文件但实际划分不同）、模型结构、评估协议与选型口径（新运行为验证集选型，无记录的旧运行标记为最后一步），以及**有效训练长度与数值设置**（早停容忍度 `early_stop_patience`/`early_stop_min_delta`、AMP 精度 `amp_dtype`、设备类型、梯度检查点、`torch.compile`）。
+- `--compare` 默认要求这些设置在声明因子（`--compare-factors`，默认 `mode,k1,k2,balance_coef,seed,dense_fnn_hidden`）之外逐项一致：某个运行换了优化器、调了学习率或训练轮数、换了 AMP/设备、或 final 指标口径不同，都会被明确列出，避免把调参收益误当成方法本身的收益。
+
+#### 统计可靠性
+
+**多种子汇总与检验**
+
+- `--seeds 42 43 44` 对同一配置跑多个随机种子，自动汇报每个实验单元的 Mean ± Std（样本标准差）与均值本身的 t 分布 95% 置信区间（`<metric>_ci95_low/high` 与 `ci95` 字段；std 只描述种子间离散度，独立种子数 <2 时不给区间）。
+- 聚合表的 `n(seed)` 列在独立种子数少于运行数时写成 `4(3)`，把伪重复/确定性折叠造成的功效虚增直接暴露出来。
+- 种子集合相同用配对 t 检验、否则用 Welch t 检验，给出 p 值与噪声比（|Δ|/合并标准差，即 Cohen's d）及同口径的 Hedges g（`hedges_g`，按 J≈1−3/(4·df−1) 做小样本偏倚校正；n=3 时 d 高估约 13%、配对口径约 43%）；`--compare-baseline` 的直接对比同样给出噪声比与 g。
+- 种子数少于 3 会被标记为统计功效不足；只有 0.2% 的提升而种子间方差有 0.5% 时不会被当成有效提升。
+
+**不显著 ≠ 等价（MDE 与 TOST）**
+
+- 每个检验过的对比同时报告 80% 功效下的最小可检出效应（MDE，含相对基线比例）、观测效应自身的功效（`power_at_effect`）与按当前种子间波动检出该效应所需的种子数。
+- 对预先声明的等价界（`--equivalence-margin`，相对基线均值，默认 1%）做 TOST 等价性检验；TOST p 值与显著性检验同一家族口径做 Holm（FWER）校正：只有校正后仍通过才主张「无实质差异」，不显著且 TOST 未通过时结论只能是「不确定」（展示层同时打印 MDE 与所需种子数，说明是效应太小还是种子太少）。
+- 每个未通过 TOST 的对比还会给出在当前精度下主张等价所需的最小对称界（`equivalence_margin_needed` = |Δ̂| + t·se）并归因：点估计本身超出声明界时标记 `effect_exceeds_margin`（加种子只会更确定地拒绝等价）；点估计在界内但噪声把置信区间推出界外时标记 `insufficient_precision`，并给出近似所需种子数（`equivalence_seeds_to_achieve`）。报告以 `[warn]` 点名——TOST 未通过不能读成「两者不同」，该加种子而不是放宽等价界。
+
+**功效口径与种子规划**
+
+- MDE、观测效应功效与所需种子数默认按未校正 α=0.05 计算，而判定用的是 Holm 校正后的 p 值；报告按 Holm 首步阈值 α/m 补算同口径保守量（`significance_family_size`/`alpha_bonferroni`/`mde_80_bonferroni`/`seeds_to_detect_bonferroni`/`equivalence_margin_needed_bonferroni`）并以 `[power]` 行点明家族规模与 α/m。种子规划与等价界取值应按保守口径而非未校正值。
+- 所需种子数是插件估计：按当前种子间标准差的点估计外推（`seeds_to_detect_basis="sd_point_estimate"`），而 sd 自身不稳，其相对标准误约 1/√(2(n-1))（n=3 时约 50%）且被平方进所需种子数，规划时应留余量。
+- 等价界必须事先声明，看到数据后再放宽界可以「制造」等价。
+- 同一 TOST 口径也覆盖全因子消融的主效应、交互与简单效应：等价界相对该效应所比较的对照单元均值，p 值在因子效应家族内做 Holm/BH 校正，只有校正后仍通过才可主张「该组件无实质差异」。
+
+**伪重复检测与最低种子数**
+
+- 同一实验单元里同一个随机种子出现多次（复制运行目录等事故）不是独立重复实验：报告先把它折叠为**每个独立种子一个观测**，再按种子配对；复制运行不增加 n/df，组内差异记录在 `pseudo_replication`。换 Welch 不能恢复独立性。
+- 关键套件（`--suite-modes`/`--suite-ablation`/`--suite-baseline-tuning`）少于 3 个种子会直接拒绝运行，冒烟/调试需显式加 `--allow-underpowered`（豁免随种子计划写入报告）。
+- 3~5 个种子只能支持 t 检验，不能支持「配对 t + 符号翻转同时显著」的稳健主张；正式确证建议至少 6 个种子。
+
+**失败、缺失与脆弱性**
+
+- 数值失败运行不进入均值/检验，但报告会按臂给出 `planned_runs` / `failed_runs` / `failure_rate` 与差分失败警告；失败率必须与成功条件指标一起读。
+- 每个两两对比与全因子效应另附 `attrition_bounds`：在「缺失结果落在两臂已观测联合范围」的有界结果假设下给出效应方向的部分识别界（`effect_min`/`effect_max`、`crosses_zero`/`unbounded`）。界跨 0 时完整案例的显著结论不能写成稳健，组件联合判定会降级为 `inconclusive`；该界不是置信区间，缺失值可能超出观测范围时真实界为无穷宽，正确反应是补齐运行而不是只报一个界。
+- 差分缺失检测：某臂的运行缺少判定指标时（如曲线缺失、指标未计算），对比只在有该指标的运行上做（完整案例分析）；两臂缺失数不同会被显式点名（`n_missing_baseline`/`n_missing_variant`/`differential_missingness`），因为此时差异可能来自「哪些运行留下了」而不是方法本身。
+
+**符号翻转（randomization）检验**
+
+- 同种子配对对比同时做符号翻转检验（n≤12 精确枚举，n>12 固定种子 Monte Carlo）。它**不是无分布假设**：只要求配对差值分布关于 0 对称（或实验随机化支持的可交换性），同一个 seed 编号本身不保证这一点。
+- 两套检验经同一 Holm 校正后结论不一致时明确提示；`significant_robust` 要求两者同时显著。但精确双侧最小 p=2/2^n，n=3/4/5 分别为 0.25/0.125/0.0625，**n≤5 时该判据在数学上不可能成立**；至少 n=6，家族校正后按 ceil(log2(2m/α)) 增加。`seed_plan` 会记录 `min_seeds_for_robust_sign_flip` 与 `robust_claim_possible`。
+- leave-one-out 稳健性：逐一去掉一个种子重算效应，方向翻转或归零时提示结论可能由单个种子驱动。
+
+**检验假设诊断**
+
+- 配对差值的偏度/超额峰度按「偏离正态的两倍标准误」规则给出提示性标记（`paired_diagnostics`；n<8 时正式正态性检验没有功效、n<4 时峰度标准误无定义，因此诊断只作描述性证据，未标记不等于假设成立）。
+- Welch 对比附两臂方差比与 F 检验（`variance_diagnostics`，用于解读合并标准差口径的 `hedges_g`，不改变 Welch 判定）；标记在报告的 `[assumptions]` 小节集中展示。
+
+**Wilcoxon 符号秩与秩效应量**
+
+- 同种子配对对比同时给出 Wilcoxon 符号秩检验（n≤12 精确枚举、并列 |差值| 取平均秩；更大样本带并列校正与连续性校正的正态近似；零差值丢弃并计数）及其效应量 rank-biserial r（`wilcoxon_rank_biserial`，±1 表示所有差值同向）。
+- Welch（种子集合不完全相同的非配对）对比附 Cliff's δ 及其确定性种子百分位 bootstrap 95% CI（`cliffs_delta`/`cliffs_delta_ci95`，δ 不依赖量纲与正态性）。
+- 两者都是描述性稳健性对照：与符号翻转共享「差值关于 0 对称」假设，不进入 Holm 家族、不改变显著性判定；与配对 t 在 0.05 水平上结论不一致时在 `[assumptions]` 中点名，提示检查逐种子差值是否被单点驱动。
+
+**效应量不确定性与多重性披露**
+
+- 配对 dz 与 Hedges gz 附大样本近似 95% CI（`cohens_dz_ci95`/`hedges_gz_ci95`，SE=√(1/n+dz²/2n)）；小种子数下区间可以同时覆盖「可忽略」与「大效应」，点估计必须与区间一起读。
+- Holm/BH 校正只在单一判定指标内部的检验家族上进行，报告以 `[multiplicity]` 行与 `metric_multiplicity` 字段显式声明这一点，并列出预注册主指标与当前分析指标不一致的运行——除预注册主指标（`--primary-metric`）外的全部指标只能作探索性证据，不能在看到结果后挑选其中显著者作为结论。
+
+**结果表格导出**
+
+- `--compare-csv FILE` 把对比表（单因子/基线直接对比/全因子效应：p 值、Holm/BH 校正、效应量及其 CI、Wilcoxon/Cliff's δ、诊断与脆弱性标记）与各实验单元聚合表（自动写出 `FILE.aggregates.csv`）导出为稳定列名的 CSV（列名只增不改），供绘图与二次分析；混杂对比只写身份列、统计列留空。
+
+#### 基线合理性与假设登记
+
+- `--compare-baseline MODE` 在给出差值之外还会核对基线是否值得战胜：
+  - 基线主指标必须强于无上下文 unigram 参考（各运行 `reference_baselines`；PR-AUC 的参考是其常数预测器水平 = 纳入类平均 prevalence，ROC-AUC = 0.5，因此把对比指标切到 PR-AUC 时稻草人守卫不会静默失效）；
+  - 不劣于调优好的字节级 n-gram 统计基线；
+  - 种子数 ≥3；
+  - 带有调参证据（`config.json` 的 `baseline_tuning` 来源记录；统计基线自身已在 val 上调优，视为已调参）。
+  - 未通过时以 `[straw-man]` 标记：战胜没调过参的弱基线不能证明复杂模型的收益，先用 `--suite-baseline-tuning` 把基线调强；调参口径与当前对比指标不一致时不再打印无条件的 OK，而是显式警告「不能证明基线在该指标上被调强」。
+- 对比报告同时按模式列出 `--hypothesis`/`--rq` 登记的假设：缺假设、假设没写明判定指标、或提到的指标当前不可判定（如路由类指标而该运行没有 `routing_analysis` 记录）的运行都被点名，统计基线除外；单次训练启动时也会提示「假设未写明判定指标」，并把 `hypothesis_metric_mentions` 写入 `config.json`。
+- 按 `val_majority_accuracy` 提示类别不平衡风险：多数类过半时 accuracy/micro 参考价值有限；≥99.9%（约 1:1000）的极度不平衡按单独分级处理——PR-AUC 必须与随机水平（≈平均 prevalence，评估时随 `val_pr_auc_macro_chance` 记录）对照看 lift，ROC-AUC 的随机水平仍是 0.5、会给出过于乐观的分数。
+- 各项检查随 `comparison_analysis.json` 落盘。ngram 与神经运行的数据指纹、切分比例、评估窗口数、batch size 或数据增强不一致时，跨 family 口径检查会列出 `[violation]` 并跳过「基线强于 ngram」的判断。
+
+#### 简单基线的调参协议
+
+- `--suite-baseline-tuning`（配合 `--seeds`）对简单基线做预注册的学习率网格搜索（`--baseline-tuning-lrs`，默认 `1e-4 3e-4 1e-3`；`--baseline-tuning-mode` 选模式）：候选之间只允许学习率不同（steps/batch/数据/结构/调度等全部继承同一条命令行）。
+- 在 val 上按 Mean ± Std 选择 winner：先取最优均值候选，再把与最优均值差距小于种子波动（两侧 std 的较大者）的候选视为无法区分，从并列集合中取更小 lr 的保守解；并列集合与选择方式（`winner_selection`/`tied_lrs`）如实写入报告。winner 落在网格边界（最小/最大候选）时提示最优可能位于网格之外、建议扩展候选后重跑。
+- 报告写入 `<out>/baseline_tuning.json`；后续基线训练用 `--baseline-tuning-from <报告>` 核对模式/winner lr/steps/数据指纹与**完整训练协议**（warmup/调度/weight decay/梯度裁剪/数据划分/评估窗口等）逐项一致（旧版报告缺协议字段时显式拒绝，不默认为通过），并把来源写入 `config.json` 的 `baseline_tuning` 字段——这是「基线被调过参」的唯一证据。test 集全程尘封。
+
+#### 消融完整性
+
+- `--suite-ablation` 运行「延迟合并 × 均衡损失」全因子（`local_base` 与各延迟合并方案 × `balance_coef`=0/当前值）；默认覆盖项目提出的**全部**延迟合并方案（A 与 B，(1+N)×2 = 3×2 六格），每个创新点都必须证明各自有用——只跑 A 的组合不足以支撑 B 的结论。
+- 覆盖检查会列出缺失的组合、点名结构混杂（各单元 k1/k2/top_k/residual_scale 或均衡强度不一致）与伪重复；显式声明本轮必须覆盖哪些方案用 `--ablation-modes A B`。
+- `--suite-modes` 用于严格控变量的跨模式对比（如 `smelt local_base A B` 一起跑）；套件结束后汇总分析写入 `<out>/comparison_analysis.json`。
+
+#### 结果分析（曲线 / NaN / 坏案例 / 效率）
+
+- **在线曲线监控**：不只训练结束后看最终数值，每个周期验证都会复用 `analyze_training_curve` 在线判定；状态迁移（如 healthy→overfitting、发散）立即打印建议并写入 `{"step": "curve_monitor", ...}`，过拟合→加正则化/增大数据/`--early-stop-patience` 早停，两者都不降→查学习率、优化器与数据管道是否对齐；验证损失尚未回升但泛化 gap 持续扩大时提前给出「过拟合前兆」警告（`gap_widening_warning`）与早停建议，不必等验证回升后才被动止损。
+  - **收敛速度的定量口径**：`--compare` 另算共同可观测窗口内的时均验证损失 `val_loss_curve_mean_to_common_step`（周期曲线梯形积分/窗口长度，越低越好），窗口终点优先用训练前固定的 `--common-step`，否则取各运行最后验证步的最小值并标记数据依赖；端点超出曲线范围不外推，失败/短曲线运行不参与。该指标可直接作为 `--compare-metric`/预注册主指标，进入种子检验、Holm、MDE、TOST、脆弱性与脱落界；但它同时受早期下降和最终水平影响，必须与 `val_loss_at_common_step`、`final` 一起读，不能单独当作最终质量或学习率快慢的证据。
+  - **NaN/Inf 系统排查**：按「数据 NaN/Inf → log(0)/除零/softmax 溢出 → fp16 混合精度溢出 → 梯度爆炸/学习率过大」路径收集证据；`nan_diagnosis` 记录失败步梯度范数与近期中位数的对比，区分梯度爆炸与前向/损失侧根因。AMP 训练还会记录失败前与诊断时的 grad scale：GradScaler 在失败步回退（默认 ×0.5）是反传 fp16/bf16 溢出的直接证据，会写入 `checks.amp` 并给出降学习率/梯度裁剪/改 bf16 复现的排查建议。
+  - **坏案例分析**：在与周期验证相同的固定窗口上、对**全部**评估 token 做流式统计（每 token 仅保留约 10 字节紧凑标量，不做随机下采样，token 准确率与 `evaluate` 同口径），top-N 最差样本用「每批 top-N + 跨批截断」精确维护并归类（ambiguous / systematic_confusion / label_noise_suspect / uncertain，分别对应样本模糊、模型盲区、标注可疑）；全量错误 token 的类别归因（`error_category_counts` / `error_category_shares`）不只统计 top-N，作为提出新改进思路的证据。标签噪声核验要求训练集同一上下文支持数 ≥2、目标占比 ≤10%，且主流后续字节占比 ≥50%——多数类优势不足只说明上下文歧义，不能当标注错误。`--compare` 会跨运行按错误 token 加权汇总错误类别，并列出在多个运行 top-10 混淆对中重复出现的稳定混淆对（报告会注明 top-10 的覆盖上限）。
+  - **效率与精度权衡**：`--compare` 汇总每个实验单元的参数量、FLOPs、推理延迟、训练步耗时（前向+反向）与显存/内存，并在单因子对比里标注成本倍数；真实训练显存优先取训练循环峰值（含 AdamW 优化器状态与参数更新，比只测前向+反向的合成峰值更接近实际占用；旧运行才退回合成峰值或进程 RSS）；显著涨点但成本 ≥1.5×、或指标变差且更贵的对比会被显式标记（须评估性价比 / 严格劣于基线），避免「涨 0.5% 但计算 ×10」被当成有效改进。每个效率字段的均值都带 t 分布 95% 置信区间（`ci95_low/ci95_high`，n<2 不给），报告用 `[efficiency-ci]` 行展示推理延迟与训练步耗时的区间：区间宽度与均值同量级时，效率差异可能只是测量噪声。
+
+### 多随机种子与消融套件示例
+
+```bash
+# RQ1：论文基线 + 机制对照 + 延迟合并，每个 6 个种子（稳健双检验下限）
+python experiment.py --data corpus.txt --out runs/rq1 \
+  --seeds 42 43 44 45 46 47 \
+  --suite-modes base smelt local_base local_base_k2 A B B_early \
+  --common-step 2000 \
+  --steps 2000 --hypothesis "延迟合并改善验证损失" --rq RQ1
+# 每个延迟合并臂再单独加 --budget-match smelt 核对完整计算图预算；
+# base 与 smelt 的循环次数不同，不能用同一个预算门。
+
+# 3×2 全因子消融：local_base/A/B × balance_coef=0/0.01
+# （默认覆盖全部已提出方案；只跑部分方案时用 --ablation-modes 声明）
+# 确证实验建议 6 个种子；3~5 个只能做 t 检验
+python experiment.py --data corpus.txt --out runs/ablation \
+  --seeds 42 43 44 45 46 47 --suite-ablation --ablation-modes A B \
+  --steps 2000 --hypothesis "各设计各自有用" --rq RQ1
+
+# 先调参简单基线：学习率网格（val 选择），winner 与报告落在 runs/tuning；
+# 注意 --baseline-tuning-mode 必须是之后要声明为 baseline 的那个模式
+python experiment.py --data corpus.txt --out runs/tuning \
+  --seeds 42 43 44 --suite-baseline-tuning --baseline-tuning-mode dense \
+  --steps 2000 --hypothesis "基线调参使其值得战胜" --rq RQ1
+
+# 再用 winner 训练最终基线并记录调参来源（config.json 的 baseline_tuning）；
+# 把 --lr 换成 runs/tuning/baseline_tuning.json 里的 winner lr
+python experiment.py --data corpus.txt --out runs/baseline_dense \
+  --mode dense --lr 3e-4 \
+  --baseline-tuning-from runs/tuning/baseline_tuning.json \
+  --steps 2000 --hypothesis "dense 基线在调参后的表现" --rq RQ1
+
+# 只读汇总已完成运行：受控变量检查 + Mean ± Std + 显著性检验。
+# --compare-baseline 必须指向真正调过参的模式（这里是 dense，且
+# runs/baseline_dense 带有 baseline_tuning 来源记录）；若要声明
+# smelt 为基线，就对 smelt 跑 --suite-baseline-tuning 并同样记录来源，
+# 或在对比集合中加入 --statistical-baseline 产出的 ngram 运行。
+python experiment.py --compare runs/rq1/smelt_seed42 runs/rq1/A_seed42 \
+  runs/ablation/A_bal0_seed42 runs/baseline_dense --compare-baseline dense
+
+# 同一分析导出为 CSV（对比表 + 各实验单元聚合表），供绘图与
+# 二次分析；需要完整 JSON 证据时用 --compare-report。
+python experiment.py --compare runs/rq1/*_seed42 --compare-factors mode \
+  --compare-csv analysis/contrast.csv --compare-report analysis/comparison_analysis.json
+```
+
+### 论文口径与复现边界
+
+本仓库现在提供论文 arXiv:2609.01343v1 的**显式复现入口**，默认的小规模
+实验（`B`/`A` 延迟合并）仍保持原型规模，两者不能混为一谈。
+
+**一条命令复现附录 A 的某个网格单元**（H、L、专家数、top-8、循环层位置、
+1/r 残差、4096 上下文、GQA/KV cache 匹配都由预设给出）：
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_smelt_200m_s95 \
+  --paper-cell 200M:95 --paper-arch smelt \
+  --paper-protocol --group-separator '\n\n' \
+  --hypothesis "论文 SMELT 200M S≈95% 单元的验证损失" --rq RQ1
+```
+
+- `--paper-cell SCALE:SPARSITY`：从附录 A 的 Baseline/SMELT 两表取
+  H、L、专家总数与 top-8；共 4 规模 × 4 稀疏度 × 2 架构 = 32 个单元。
+  显式冲突的 `--d-model` 等参数会被拒绝，避免「看起来按论文配置、
+  实际被命令行改动」。
+- 论文未披露的 head 维度、KV 头数与专家中间维由固定规则推导（head_dim
+  接近 64、GQA 匹配 KV cache、总非 embedding 参数对齐），推导值与
+  「实测 vs 论文目标」写入 `config.json` 的 `paper_fidelity.budget_audit`。
+- `--paper-protocol` 套用 3.1 节协议：WSD 调度（`--lr-schedule wsd`）、
+  全局 batch 256、稳定期 196 075 步、4096 packed context 的文档级
+  segment attention mask（`--document-masks`，由 `--group-separator`
+  标注文档边界），并在 10k/20k/50k/100k/150k/196075 六个分支点保存
+  `step_<N>.pt`。分支实验从分支点 `--resume`，显式给出
+  `--wsd-stable-steps <分支点> --steps <分支点+9537>` 即按 3.1 节的
+  10B-token cosine decay 续跑。
+- `paper_fidelity` 分成两层：`architecture_faithful`（附录 A 的结构 +
+  top-8/GQA/4096/1-r/循环位置）与 `protocol_faithful`（3.1 节协议），
+  两者都通过才是 `is_full_reproduction=true`（recipe 复现）；
+  只有预算也落在论文容差内才是 `numerical_reproduction=true`。
+  `budget_audit` 单独报告
+  FLOPs / 总参数 / KV cache / S 的实测值与论文目标的偏差——附录 A 的
+  参数化来自未公开 family，公开实现不能保证逐位数值相同，存在预算
+  偏差时不能声称数值复现，只能声称 recipe 复现。
+- 学习率、warmup、weight decay、AdamW betas、均衡损失系数、初始化与
+  预训练语料论文未披露；它们沿用本仓库默认值并列入 `paper_fidelity.undisclosed`。
+- 仍未实现：增量 KV 解码、DCLM Core / DCLM Completion / MMLU 官方
+  评测管线（需要外部基准与 22 个任务的数据）。这些不影响
+  `architecture_faithful` / `protocol_faithful` 的判定，但意味着
+  **验证损失之外的论文下游结论不能在本仓库内直接复现**。
+- 仓库同时保留 `--n-kv-heads`（任意 GQA 比例，非整除时按
+  floor(i·n_kv/n_heads) 均匀映射）、`--residual-scaling paper`（默认，
+  循环区域 1/r）、`--budget-match smelt`（完整计算图核对）与
+  `measure_efficiency` 的 `kv_cache_bytes_per_token`（容量估计）。
+
+### 机制对照与确证流程
+
+- **合并时机机制对照**：`local_base_k2`（第二轮仍为 k2）回答「延迟合并
+  本身」；`local_base`（第二轮 min(E,k1·k2)）回答「等专家计算量下的
+  性能」；两者不能混为一个对照。
+- **B 专用对照**：`B_early` 的分支数与 Attention/MoE 执行次数与 B 完全
+  相同，只把合并位置提前，因此 B 的优势不能再归因于额外计算/多轨迹。
+- **完整预算**：`--budget-match smelt` + `budget_match_report` 同时报告
+  解析与实测 FLOPs，不只匹配 `k1·k2`。
+- **试点校准先验噪声**：若已有试点/先前运行目录，用
+  `--design-pilot-runs RUN...` 按共同 seed 估计配对差值 sd 与各臂
+  脱落率；观测值高于预注册 `power` 声明时，设计计划单向上调并强制
+  重算所需种子，证据写入 `design_plan.json` 的 `pilot_evidence`
+  （纳入 `plan_id`），仍不足则在第一个子进程前拒绝。失败目录必须
+  一并传入，不能只拿成功运行估计脱落率。详见
+  [docs/design_preparation.md](docs/design_preparation.md) 第 2.3 节。
+- **确证流程**：冻结代码（`EXPERIMENT_FREEZE`）→ 预注册主指标、方向、
+  最小效应与 `--common-step` → 至少 6 个种子 → 失败率与成功条件指标
+  一起报告 → 冻结候选后用共享 `--test-ledger` 统一解封 test →
+  `--final-test-comparison` 报告全部候选。完整步骤见
+  [docs/experiment_protocol.md](docs/experiment_protocol.md)，逐项审计见
+  [docs/methodology_audit.md](docs/methodology_audit.md)。
+- **测试集访问**：`--test-ledger` 按数据/test split 指纹记录每次解封；
+  默认拒绝同一测试集被其它候选重复解封。`--final-test-comparison`
+  只读汇总全部候选的 test 记录，不重新评估。
+
+## 📂 输出结构
+
+每次实验运行会生成以下目录结构：
+```text
+runs/<exp_name>/
+├── config.json      # 完整配置、参数量、随机种子、数据指纹、数据审计、选型口径、代码版本/环境、sanity check 结果
+├── metrics.jsonl    # 逐行记录训练/验证指标及最终评估 (loss, ppl, lr, grad_norm等)，--evaluate-test 时含 {"step": "test", ...} 唯一一次测试集结果
+├── best.pt          # 验证集选定的模型权重（final / test 评估使用；原子写入）
+├── last.pt          # 模型权重、优化器、学习率调度器及随机种子状态（断点恢复用；原子写入）
+├── routing.json     # RQ3/RQ4 路由诊断（含机会水平与分支语义）
+├── routing_interventions.json  # 可选：路由打乱/专家屏蔽干预（--routing-interventions）
+└── test_access_ledger.jsonl    # 可选：测试集访问账本（--test-ledger）
+```
+
+## 📝 注意事项与免责声明
+
+- 本项目提供的是 **研究实验基座**，默认使用 Python 专家循环实现的稀疏 dispatch，适合研究原型使用。
+- 方案 B 尚未实现增量解码 KV Cache，推理阶段需要重新设计缓存策略。

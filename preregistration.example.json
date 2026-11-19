@@ -1,0 +1,63 @@
+{
+  "study_id": "smelt-isr-rq1-delayed-merge-2026",
+  "frozen_commit": "0000000000000000000000000000000000000000000000000000000000000000",
+  "primary_metric": "val_loss_at_common_step",
+  "common_step": 2000,
+  "min_effect": 0.01,
+  "direction": "decrease",
+  "baseline_mode": "smelt",
+  "comparisons": [
+    ["smelt", "B"],
+    ["smelt", "A"],
+    ["smelt", "local_base"]
+  ],
+  "seeds": [42, 43, 44, 45, 46, 47],
+  "budget_match": "smelt",
+  "data": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "split_policy": "contiguous",
+    "val_fraction": 0.05,
+    "test_fraction": 0.05
+  },
+  "equivalence_margin": 0.01,
+  "steps": 2000,
+  "power": {
+    "expected_seed_sd_relative": 0.005,
+    "target_power": 0.8,
+    "alpha": 0.05,
+    "planned_comparisons": 3,
+    "planned_contrasts": ["pairwise"],
+    "expected_attrition_rate": 0.1,
+    "pilot_calibration": "point",
+    "plan_equivalence": false,
+    "underpowered_acknowledged": false
+  },
+  "run_order": {
+    "scheme": "randomized",
+    "seed": 1234
+  },
+  "compute_budget": {
+    "max_total_training_hours": 24
+  },
+  "stopping_rules": {
+    "max_total_runs": 24,
+    "interim_look_steps": [2000],
+    "extension_requires_new_preregistration": true
+  },
+  "exclusion_criteria": {
+    "attrition_definition": "运行在达到 common_step 前出现 NaN/Inf、数值停止或进程崩溃即不可用；指标缺失的运行按失败计入脱落率，不进入均值与检验",
+    "exclusion_rules": [
+      "不因结果方向排除任何运行",
+      "不替换「更安静的」种子重跑",
+      "失败运行目录与 run_order.json 一并归档"
+    ]
+  },
+  "min_effect_justification": "1% 验证损失改善是本算力规模下能被下游任务感知的最小收益下限（依据：先前同规模运行的损失-困惑度换算与算力申请的收益承诺）",
+  "notes": "RQ1: 延迟合并 (A/B) 是否显著优于原始 SMELT。等计算量口径由 --budget-match smelt 核对；主指标 val_loss_at_common_step 避免检查点选型偏差。",
+  "metadata": {
+    "rq": "RQ1",
+    "hypothesis": "延迟合并降低验证损失",
+    "author": "researcher",
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+}

@@ -1,0 +1,885 @@
+name: OpenCode Issue
+
+# 用法：由仓库所有者 183600 新建（或重新打开）一个 issue。
+# issue 的正文就是 prompt（标题不提供给模型，仅用于人工索引和 commit message），OpenCode 会直接修改默认分支并推送（不建 PR）。
+# 开始前会取消其他 workflow 的运行并临时禁用它们；结束后（无论本次运行成功还是失败）
+# 只重新启用它们，不重新触发；它们会按自身的事件/计划恢复。
+# 模型优先使用 OpenCode 自带的免费 deepseek-v4.1-flash-free：
+# 若模型列表中暂时找不到它，会刷新模型目录后反复重试，最多 5 次；
+# 5 次后仍没有 deepseek-v4.1-flash-free 但找到其他免费模型时，改用其他免费模型
+# （glm-5.3-flash-free 优先，其次 big-pickle，再次为随机免费模型）；任何时候都优先 deepseek-v4.1-flash-free。
+#
+# 推送凭据说明（重要）：
+# GITHUB_TOKEN 没有 workflows 权限，一旦本次提交改动/新增 .github/workflows/ 下的文件，
+# 用它推送会被 GitHub 拒绝（"refusing to allow a GitHub App to create or update workflow ..."）。
+# 因此本 workflow 依赖仓库 Actions secret「PUSH_TOKEN」（内容为带 repo+workflow scope 的 PAT）：
+# - 提交涉及 workflow 文件时，用 PUSH_TOKEN 推送；
+# - 普通代码改动优先 GITHUB_TOKEN，失败时也用 PUSH_TOKEN 兜底重试；
+# - 未配置 PUSH_TOKEN 时普通改动仍可正常推送，但 workflow 文件改动会被拒（评论中会有明确提示）。
+
+on:
+  issues:
+    types: [opened, reopened]
+
+# 使用 GITHUB_TOKEN 直接推默认分支，不建 PR。
+# actions: write 用于暂停/恢复其他 workflow；issues: write 用于评论和关闭 issue。
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+# 全局串行：一次只跑一个 issue，避免多个任务同时直接推默认分支。
+# cancel-in-progress=false：不会取消正在运行的 issue 任务。
+concurrency:
+  group: opencode-issue
+  cancel-in-progress: false
+
+env:
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  NO_COLOR: '1'
+  FORCE_COLOR: '0'
+  TERM: dumb
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+  OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+jobs:
+  opencode:
+    # actor 校验确保只有 183600 本人新建/重新打开 issue 才会运行，
+    # 避免其他人重新打开旧 issue 时误触发。
+    if: github.actor == '183600' && github.event.issue.user.login == '183600'
+    runs-on: ubuntu-latest
+    # GitHub 托管 runner 单 job 硬上限 360 分钟，取满。
+    timeout-minutes: 360
+
+    steps:
+      - name: Suspend other workflows
+        id: suspend
+        shell: bash
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          STATE_FILE=/tmp/opencode-suspended-workflows.json
+          echo '{"disabled":[],"canceled":[]}' > "$STATE_FILE"
+
+          CURRENT_WF_PATH=".github/workflows/opencode-issue.yml"
+          CURRENT_WF_ID="$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/opencode-issue.yml" \
+            --jq '.id')"
+          if [ -z "$CURRENT_WF_ID" ]; then
+            echo "[suspend][error] 无法确定当前 workflow 的 id" >&2
+            exit 1
+          fi
+
+          # 先禁用其他 active workflow，阻止它们在本次任务期间启动新 run。
+          WORKFLOWS_TSV="$(
+            gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/workflows" \
+              --jq '.workflows[] | [.id, .path, .state, .name] | @tsv'
+          )"
+          DISABLED=0
+          declare -A EXCLUDED_WF=()
+          while IFS=$'\t' read -r id path state name; do
+            [ -n "$id" ] || continue
+            if [ "$id" = "$CURRENT_WF_ID" ] || [ "$path" = "$CURRENT_WF_PATH" ]; then
+              EXCLUDED_WF[$id]=1
+              continue
+            fi
+            case "$path" in
+              .github/workflows/*) ;;
+              *)
+                # GitHub 托管的 dynamic workflow（例如 Dependabot update graph）
+                # 不是仓库里的普通 workflow，disable/cancel 可能失败，直接跳过。
+                EXCLUDED_WF[$id]=1
+                echo "[suspend] skip GitHub-managed workflow ${name} (${path})"
+                continue
+                ;;
+            esac
+            [ "$state" = "active" ] || continue
+
+            if gh workflow disable "$id" --repo "$GITHUB_REPOSITORY" >/dev/null; then
+              DISABLED=$((DISABLED + 1))
+              jq --arg id "$id" --arg name "$name" --arg path "$path" \
+                '.disabled += [{"id": $id, "name": $name, "path": $path}]' \
+                "$STATE_FILE" > "$STATE_FILE.tmp"
+              mv "$STATE_FILE.tmp" "$STATE_FILE"
+              echo "[suspend] disabled ${name} (${path})"
+            else
+              echo "[suspend][error] 禁用 ${name} (${path}) 失败" >&2
+              exit 1
+            fi
+          done <<< "$WORKFLOWS_TSV"
+
+          # 取消其他 workflow 正在运行/排队的 run，并等待它们真正停止。
+          CANCELED=0
+          declare -A SEEN_CANCELED=()
+          declare -A CANCEL_FAILED=()
+          DEADLINE=$((SECONDS + 180))
+          while :; do
+            ACTIVE_RUNS="$(
+              gh run list --repo "$GITHUB_REPOSITORY" --limit 200 \
+                --json databaseId,workflowDatabaseId,status,createdAt \
+              | jq -r '.[] | select(.status != "completed") | [.databaseId, .workflowDatabaseId, ((.createdAt | fromdateiso8601) | floor)] | @tsv'
+            )"
+            PENDING=0
+            NOW_TS="$(date -u +%s)"
+            while IFS=$'\t' read -r run_id wf_id created_ts; do
+              [ -n "$run_id" ] || continue
+              if [ -n "$wf_id" ] && [ -n "${EXCLUDED_WF[$wf_id]:-}" ]; then
+                continue
+              fi
+              if [ "${CANCEL_FAILED[$run_id]:-0}" -ge 3 ] \
+                 && [ -n "${created_ts:-}" ] \
+                 && [ "$((NOW_TS - created_ts))" -ge 1800 ]; then
+                echo "[suspend] skip zombie run ${run_id} (cancel failed 3+, older than 30min)" >&2
+                continue
+              fi
+              PENDING=$((PENDING + 1))
+              if gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                if [ -z "${SEEN_CANCELED[$run_id]:-}" ]; then
+                  SEEN_CANCELED[$run_id]=1
+                  CANCELED=$((CANCELED + 1))
+                  jq --arg id "$run_id" '.canceled += [{"id": $id}]' \
+                    "$STATE_FILE" > "$STATE_FILE.tmp"
+                  mv "$STATE_FILE.tmp" "$STATE_FILE"
+                  echo "[suspend] cancel requested for run ${run_id}"
+                fi
+              else
+                CANCEL_FAILED[$run_id]=$(( ${CANCEL_FAILED[$run_id]:-0} + 1 ))
+              fi
+            done <<< "$ACTIVE_RUNS"
+
+            if [ "$PENDING" -eq 0 ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "[suspend][error] 等待其他 workflow runs 停止超时" >&2
+              gh run list --repo "$GITHUB_REPOSITORY" --limit 20 \
+                --json databaseId,status,workflowName,workflowDatabaseId,url \
+              | jq -r '.[] | select(.status != "completed")' >&2 || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo "disabled=$DISABLED" >> "$GITHUB_OUTPUT"
+          echo "canceled=$CANCELED" >> "$GITHUB_OUTPUT"
+          echo "[suspend] done: disabled=${DISABLED}, canceled=${CANCELED}"
+
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-opencode-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-opencode-
+
+      - name: Install OpenCode
+        shell: bash
+        run: npm i -g opencode-ai
+
+      - name: Select a free OpenCode model
+        id: select
+        shell: bash
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+
+          PREFERRED_DEEPSEEK="opencode/deepseek-v4.1-flash-free"
+          PREFERRED_GLM="opencode/glm-5.3-flash-free"
+          PREFERRED_PICKLE="opencode/big-pickle"
+
+          KNOWN_FREE=(
+            "opencode/beam-free"
+            "opencode/flint-40b-free"
+            "opencode/glm-5.3-flash-free"
+            "opencode/mimo-v2.6-flash-free"
+            "opencode/nemotron-3-ultra-free"
+            "opencode/nemotron-3.5-lightning-free"
+            "opencode/nemotron-3.5-super-vl-free"
+          )
+
+          # ---------- 阶段 1：在模型列表中查找 deepseek-v4.1-flash-free，最多重试 5 次 ----------
+          # 模型目录可能瞬时抖动（缓存未刷新 / 网关暂时摘下该模型）。
+          # 找不到首选模型时不立即放弃：每次先刷新 opencode 的模型目录缓存再读取列表，
+          # 间隔 60s 重试，最多 5 次；一旦找到立即进入候选构建。
+          MAX_LIST_ATTEMPTS=5
+          RETRY_INTERVAL=60
+          AVAILABLE=()
+          DEEPSEEK_FOUND=0
+
+          for attempt in $(seq 1 "$MAX_LIST_ATTEMPTS"); do
+            timeout 60 opencode models opencode --refresh >/dev/null 2>&1 || true
+            AVAILABLE=()
+            while IFS= read -r m; do
+              [ -n "$m" ] && AVAILABLE+=("$m")
+            done < <(timeout 60 opencode models 2>/dev/null | awk '/^[[:space:]]*opencode\//{print $1}')
+
+            for m in "${AVAILABLE[@]:-}"; do
+              if [ "$m" = "$PREFERRED_DEEPSEEK" ]; then
+                DEEPSEEK_FOUND=1
+                break
+              fi
+            done
+
+            if [ "$DEEPSEEK_FOUND" -eq 1 ]; then
+              echo "[model] 第 ${attempt}/${MAX_LIST_ATTEMPTS} 次查找：在模型列表中找到 ${PREFERRED_DEEPSEEK}（列表共 ${#AVAILABLE[@]} 个模型）"
+              break
+            fi
+
+            echo "[model] 第 ${attempt}/${MAX_LIST_ATTEMPTS} 次查找：模型列表中没有 ${PREFERRED_DEEPSEEK}（列表共 ${#AVAILABLE[@]} 个模型）"
+            if [ "$attempt" -lt "$MAX_LIST_ATTEMPTS" ]; then
+              echo "[model] ${RETRY_INTERVAL}s 后刷新模型目录并重试..."
+              sleep "$RETRY_INTERVAL"
+            fi
+          done
+
+          # ---------- 阶段 2：按优先级构建候选列表 ----------
+          has_available() {
+            local wanted="$1" m
+            for m in "${AVAILABLE[@]:-}"; do
+              [ "$m" = "$wanted" ] && return 0
+            done
+            return 1
+          }
+
+          add_candidate() {
+            local m="$1" existing
+            for existing in "${CANDIDATES[@]:-}"; do
+              [ "$existing" = "$m" ] && return 0
+            done
+            CANDIDATES+=("$m")
+          }
+
+          # ⭐ 模型策略（2026-11-02 diag v7b 对 NVIDIA 85 模型 + opencode 免费 130 模型全量实测）：
+          #   1) 优先 z-ai/glm-5.3-flash（实测可用：冒烟 43s/工具 136s，波动大偶尔慢，由看门狗兜底）；
+          #   2) 8 个验证池模型（60s 冒烟+工具调用双通过）每次 run 随机轮换（"所有模型随机"策略）；
+          #   3) opencode 免费网关 130 个模型已全部实测失败，仅留 deepseek/glm/pickle 三席兜底（若复活自动可用）。
+          # deepseek-ai/deepseek-v4.1-flash 三次实测挂死（303s 空响应 / 300s / 240s 超时），永久排除。
+          NV_FIRST="nvidia/z-ai/glm-5.3-flash"
+          NV_POOL=(
+            "nvidia/poolside/laguna-xs-2.1"
+            "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"
+            "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b"
+            "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
+            "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+            "nvidia/minimaxai/minimax-m3.1-flash"
+            "nvidia/meta/muse-glimmer-30b"
+            "nvidia/meta/llama-3.2-90b-vision-instruct"
+          )
+
+          CANDIDATES=()
+          RANDOM_POOL=()
+
+          # 主力：NVIDIA NIM 模型链（指定顺序），优先于免费池
+          # ⭐ glm 优先 + 验证池随机轮换（每次 run 打乱，实现所有可用模型随机）
+          add_candidate "$NV_FIRST"
+          mapfile -t NV_SHUF < <(printf '%s\n' "${NV_POOL[@]}" | shuf)
+          for m in "${NV_SHUF[@]}"; do
+            add_candidate "$m"
+          done
+
+          if [ "$DEEPSEEK_FOUND" -eq 1 ]; then
+            # 首选模型在列表中：deepseek 排第一，其余免费模型仅作冒烟后备。
+            add_candidate "$PREFERRED_DEEPSEEK"
+            if has_available "$PREFERRED_GLM"; then add_candidate "$PREFERRED_GLM"; fi
+            if has_available "$PREFERRED_PICKLE"; then add_candidate "$PREFERRED_PICKLE"; fi
+            for m in "${AVAILABLE[@]:-}"; do
+              case "$m" in
+                "$PREFERRED_DEEPSEEK"|"$PREFERRED_GLM"|"$PREFERRED_PICKLE") continue ;;
+                opencode/*-free) RANDOM_POOL+=("$m") ;;
+              esac
+            done
+          elif [ "${#AVAILABLE[@]}" -eq 0 ]; then
+            # 重试 5 次后模型列表仍读不到：无法确认首选是否真的下线，
+            # 按已知候选依次冒烟（deepseek 仍排第一，符合「优先 deepseek」策略）。
+            echo "[model] 模型列表不可读（已重试 ${MAX_LIST_ATTEMPTS} 次），按已知候选依次尝试"
+            add_candidate "$PREFERRED_DEEPSEEK"
+            add_candidate "$PREFERRED_GLM"
+            add_candidate "$PREFERRED_PICKLE"
+            RANDOM_POOL=("${KNOWN_FREE[@]:0:6}")
+          else
+            # 重试 5 次后确认列表里没有 deepseek-v4.1-flash-free：
+            # 改用其他免费模型（glm-5.3-flash-free 优先，其次 big-pickle，再次随机其他免费模型）。
+            echo "[model] 已重试 ${MAX_LIST_ATTEMPTS} 次仍未找到 ${PREFERRED_DEEPSEEK}，回退到其他免费模型"
+            if has_available "$PREFERRED_GLM"; then
+              add_candidate "$PREFERRED_GLM"
+            else
+              echo "[model] 模型列表中没有 ${PREFERRED_GLM}，跳过"
+            fi
+            if has_available "$PREFERRED_PICKLE"; then
+              add_candidate "$PREFERRED_PICKLE"
+            else
+              echo "[model] 模型列表中没有 ${PREFERRED_PICKLE}，跳过"
+            fi
+            for m in "${AVAILABLE[@]:-}"; do
+              case "$m" in
+                "$PREFERRED_DEEPSEEK"|"$PREFERRED_GLM"|"$PREFERRED_PICKLE") continue ;;
+                opencode/*-free) RANDOM_POOL+=("$m") ;;
+              esac
+            done
+            # 列表里连一个免费候选都没有时，用已知免费模型池兜底。
+            if [ "${#RANDOM_POOL[@]}" -eq 0 ] && [ "${#CANDIDATES[@]}" -eq 0 ]; then
+              echo "[model] 列表中没有其他免费模型，使用已知免费模型池兜底"
+              RANDOM_POOL=("${KNOWN_FREE[@]:0:6}")
+            fi
+          fi
+
+          # 去重并随机打乱兜底池。
+          if [ "${#RANDOM_POOL[@]}" -gt 0 ]; then
+            mapfile -t RANDOM_POOL < <(printf '%s\n' "${RANDOM_POOL[@]}" | awk 'NF && !seen[$0]++' | shuf)
+            # 只取随机池前 6 个，避免候选太多导致冒烟测试超时。
+            for m in "${RANDOM_POOL[@]:0:6}"; do add_candidate "$m"; done
+          fi
+
+          if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+            echo "[model][error] 没有任何候选免费模型" >&2
+            exit 1
+          fi
+
+          echo "[model] 候选顺序：${CANDIDATES[*]}"
+
+          SMOKE_DIR="$RUNNER_TEMP/opencode-smoke"
+          mkdir -p "$SMOKE_DIR"
+          SELECTED=""
+          for m in "${CANDIDATES[@]}"; do
+            echo "[model] 测试 $m ..."
+            # 每个候选都做一次真实冒烟调用，避免选中目录里存在但实际不可用的模型。
+            SMK_T=180; case "$m" in nvidia/*) SMK_T=75 ;; esac
+            _ok=0; _try=0
+            while :; do
+              if ( cd "$SMOKE_DIR" && timeout --kill-after=30 $SMK_T opencode run --auto -m "$m" "只回复两个字：OK" < /dev/null ) > "$SMOKE_DIR/smoke.log" 2>&1; then
+                _ok=1
+                break
+              fi
+              if grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier" "$SMOKE_DIR/smoke.log" 2>/dev/null; then
+                if [ "$_try" -ge 4 ]; then
+                  echo "[model][error] $m 持续 429/限流（已退避重试 4 次）：不换模型，中止本次选择；稍后可重新触发"
+                  exit 1
+                fi
+                _try=$((_try+1))
+                echo "[model] $m 撞 429/限流（第 ${_try}/4 次）：不换模型，$((45*_try))s 后同模型重试"
+                sleep $((45*_try))
+                continue
+              fi
+              break
+            done
+            if [ "$_ok" -ne 1 ]; then
+              echo "[model] 不可用：$m"
+              tail -n 20 "$SMOKE_DIR/smoke.log" 2>/dev/null || true
+              continue
+            fi
+            echo "[model] 可用：$m"
+            SELECTED="$m"
+            break
+          done
+
+          if [ -z "$SELECTED" ]; then
+            echo "[model][error] 所有候选免费模型均不可用" >&2
+            exit 1
+          fi
+
+          echo "model=$SELECTED" >> "$GITHUB_OUTPUT"
+          echo "[model] 最终选择：$SELECTED"
+
+      - name: Pre-OpenCode test gate
+        id: pretest
+        shell: bash
+        timeout-minutes: 40
+        run: |
+          set +e
+          cat > /tmp/pretest_run.sh <<'PTGEOF'
+            set +e
+            TG_FILES="$(git ls-files '*.py' 2>/dev/null)"
+            [ -z "$TG_FILES" ] && exit 42
+            python3 -m py_compile $TG_FILES || exit $?
+            # 语法检查之外补一组快速回归（top-1 路由梯度、GQA、
+            # B_early 等计算量、伪重复折叠、测试集账本等）。
+            if [ -d tests ]; then
+              python3 -m unittest discover -s tests -v
+              exit $?
+            fi
+            exit 0
+          PTGEOF
+          echo "=========== PRE-OPENCODE TEST GATE ==========="
+          EC=0
+          timeout --kill-after=60 2400 bash /tmp/pretest_run.sh > /tmp/pretest_gate.log 2>&1 || EC=$?
+          tail -30 /tmp/pretest_gate.log 2>/dev/null || true
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+          if [ "$EC" -eq 0 ]; then
+            echo "[pre-test] 测试通过"
+            exit 0
+          fi
+          case "$EC" in
+            42) echo "[pre-test] 无可识别测试(42)，放行"; exit 0 ;;
+            43) echo "[pre-test] 测试依赖环境不可用(43)，放行"; exit 0 ;;
+            124|137|143) echo "[pre-test] 测试超时($EC)，结果不确定，放行"; exit 0 ;;
+          esac
+          echo "failed=true" >> "$GITHUB_OUTPUT"
+          echo "[pre-test] 测试失败(exit=$EC) → 推送当前状态并提前结束本 job（不运行 agent）"
+          git add -A 2>/dev/null
+          if ! git diff --cached --quiet 2>/dev/null; then
+            git commit -m "ci: pre-agent test gate failed (exit=$EC)" 2>/dev/null || true
+            BB="${{ github.event.repository.default_branch }}"
+            git pull --rebase origin "$BB" 2>/dev/null || git rebase --abort 2>/dev/null || true
+            git push origin "HEAD:$BB" 2>/dev/null || echo "[pre-test] [warn] push 失败"
+          else
+            echo "[pre-test] 没有需要推送的新内容"
+          fi
+          exit 1
+
+      - name: Run OpenCode on issue
+        id: run
+        continue-on-error: true
+        shell: bash
+        # 步骤预算 290 分钟：suspend(10) + select(40) + run(290) = 340 ≤ job 上限 360，
+        # 给 publish/resume/comment/close 等收尾步骤留约 20 分钟。
+        timeout-minutes: 290
+        env:
+          MODEL: ${{ steps.select.outputs.model }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set +e
+          set -o pipefail
+          LOG=/tmp/opencode-run.log
+
+          {
+            echo "你正在 GitHub Actions 中处理仓库 ${GITHUB_REPOSITORY} 的 issue #${ISSUE_NUMBER}。"
+            echo
+            echo "Issue 正文："
+            printf '%s\n' "${ISSUE_BODY}"
+            echo
+            echo "要求："
+            echo "1. 严格按照 issue 中的要求修改当前仓库的代码。"
+            echo "2. 可以运行必要的测试或命令来验证修改。"
+            echo "3. 不要执行 git commit / git push；工作流会直接把修改提交并推送到默认分支。"
+            echo "4. 不要操作 GitHub Actions 的 workflow/run（不要启用、禁用、取消或触发其他 workflow）；这些由工作流完成。"
+            echo "5. 除非 issue 明确要求，不要删除或修改 .github/workflows/ 下的 CI 配置。"
+            echo "6. 完成后用简短中文总结你做的修改和验证结果。"
+          } > /tmp/opencode-prompt.txt
+
+          PROMPT="$(cat /tmp/opencode-prompt.txt)"
+          echo "[opencode] model=$MODEL issue=#$ISSUE_NUMBER"
+          # ⭐ 停滞看门狗阈值：opencode 输出（$LOG）连续无增长的容忍秒数。
+          # 实测 agent 正常最长静默 ≈ 9 分钟；免费网关流式挂死则一动辄 2 小时+
+          # （16800s 预算内可损失近 4.5 小时机时且零产出）。
+          STALL_TIMEOUT=1200
+          # 280 分钟（16800s）硬超时：比步骤上限 290 分钟留 10 分钟余量；
+          # --kill-after=120 给 opencode 更充分的优雅退出时间。
+          # ⭐ 停滞看门狗：后台执行 timeout+opencode+tee（stdout 仍直通步骤日志），
+          #    前台每 20s 检查 $LOG 大小；超过 STALL_TIMEOUT 秒无增长 → 判定网关
+          #    停滞，终止本次调用并返回 75：已完成的改动由后续 publish 步骤
+          #    提交推送（停滞也推送，不丢进度）。
+          echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用）"
+          _429_tries=0
+          OC_CALL_BUDGET=16800
+          # ⭐ 429/限流不换模型：同模型原地退避重试（60/120/180/240s，最多 4 次）
+          while :; do
+          rm -f /tmp/.oc_exit_code
+          # setsid：独立进程组（包装/timeout/tee 一个组），与主脚本隔离，
+          # 停滞时可整组终止；timeout 的 opencode 子组在下方 kill 时单独覆盖
+          setsid bash -c '
+            timeout --kill-after=120 "$1" opencode run --auto -m "$2" "$3" < /dev/null 2>&1 | tee "$4"
+            echo "${PIPESTATUS[0]}" > /tmp/.oc_exit_code
+          ' _ "$OC_CALL_BUDGET" "$MODEL" "$PROMPT" "$LOG" &
+          OC_BG=$!
+          _sz=-1; _ts=$(date +%s); _stalled=0
+          while kill -0 "$OC_BG" 2>/dev/null; do
+            sleep 20
+            _nsz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+            if [ "$_nsz" != "$_sz" ]; then
+              _sz="$_nsz"; _ts=$(date +%s)
+            elif [ $(( $(date +%s) - _ts )) -ge "$STALL_TIMEOUT" ]; then
+              _stalled=1; break
+            fi
+          done
+          if [ "$_stalled" -eq 1 ]; then
+            echo "[watchdog] opencode 输出已 ${STALL_TIMEOUT}s 无增长（$LOG 停在 ${_sz}B）→ 判定网关停滞，终止本次调用；已完成的修改将由 publish 步骤提交推送"
+            # 先 TERM 优雅退出，60s 后升级 KILL。注意 GNU timeout 默认把 opencode
+            # 放进独立进程组（opencode 的子进程都在该组），包装进程的组信号够不到它；
+            # 因此对每个 cmdline 含 "opencode run" 的进程，向其所在进程组逐一发信号，
+            # 包装组 + timeout 子组全覆盖，不留仍持有输出管道的孤儿进程。
+            for _pid in $(pgrep -f "opencode run" 2>/dev/null); do
+              _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+              [ -n "$_pgid" ] && kill -TERM -- "-$_pgid" 2>/dev/null
+            done
+            kill -TERM -- "-$OC_BG" 2>/dev/null
+            pkill -TERM -f "opencode run" 2>/dev/null
+            kill -TERM "$OC_BG" 2>/dev/null
+            for _w in 1 2 3; do
+              sleep 20
+              kill -0 "$OC_BG" 2>/dev/null || break
+            done
+            for _pid in $(pgrep -f "opencode run" 2>/dev/null); do
+              _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+              [ -n "$_pgid" ] && kill -KILL -- "-$_pgid" 2>/dev/null
+            done
+            kill -KILL -- "-$OC_BG" 2>/dev/null
+            pkill -KILL -f "opencode run" 2>/dev/null
+            kill -KILL "$OC_BG" 2>/dev/null
+            wait "$OC_BG" 2>/dev/null
+            EC=75
+          else
+            wait "$OC_BG" 2>/dev/null
+            EC=124
+            [ -s /tmp/.oc_exit_code ] && EC=$(cat /tmp/.oc_exit_code)
+          fi
+          if [ "$EC" -eq 0 ] || [ "$EC" -eq 124 ] || [ "$EC" -eq 137 ] || [ "$EC" -eq 143 ] || [ "$EC" -eq 75 ]; then
+            break
+          fi
+          # ⭐ 429/限流：同一模型原地退避重试，绝不换模型（2026-11-04）
+          if tail -40 "$LOG" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
+            if [ "$_429_tries" -lt 4 ]; then
+              _429_tries=$((_429_tries+1))
+              _w=$((60*_429_tries))
+              echo "[429-retry] opencode 撞限流（$MODEL，exit=$EC）：不换模型，${_w}s 后同模型重试（$_429_tries/4）"
+              sleep "$_w"
+              OC_CALL_BUDGET=$(( 16800 - SECONDS - 600 ))
+              if [ "$OC_CALL_BUDGET" -le 600 ]; then
+                echo "[429-retry] 剩余时间不足，放弃重试"
+                break
+              fi
+              continue
+            fi
+            echo "[warn] 持续限流（$MODEL，已同模型重试 4 次）：不换模型，本 run 结束；可重新打开 issue 再次触发"
+          fi
+          break
+          done
+          echo "exit_code=$EC" >> "$GITHUB_OUTPUT"
+          echo "[opencode] exit=$EC"
+          exit 0
+
+      - name: Commit and push to default branch
+        id: publish
+        if: steps.run.outputs.exit_code == '0' || steps.run.outputs.exit_code == '75'
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 带 repo+workflow scope 的 PAT（仓库 Actions secret：PUSH_TOKEN）。
+          # GITHUB_TOKEN 是 GitHub App token，永远没有 workflows 权限；
+          # 只要提交里改动/新增 .github/workflows/ 下的文件，用它推送就会被拒：
+          # "refusing to allow a GitHub App to create or update workflow ... without workflows permission"。
+          # 因此涉及 workflow 文件的提交必须改用 PUSH_TOKEN 推送。
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          MODEL: ${{ steps.select.outputs.model }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config i18n.commitEncoding utf-8
+          git config core.quotepath false
+
+          AHEAD="$(git rev-list --count "origin/${BASE_BRANCH}..HEAD")"
+          DIRTY="$(git status --porcelain)"
+
+          if [ "$AHEAD" -eq 0 ] && [ -z "$DIRTY" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "[publish] OpenCode 没有产生代码修改"
+            exit 0
+          fi
+
+          if [ -n "$DIRTY" ]; then
+            git add -A
+            # 暂存区为空时不要执行 git commit（否则 "nothing to commit" 会直接把本步骤打挂）。
+            if git diff --cached --quiet; then
+              echo "[publish] 工作区有状态变化但没有可提交内容，跳过 commit"
+            else
+              SAFE_TITLE="${ISSUE_TITLE//$'\n'/ }"
+              SAFE_TITLE="${SAFE_TITLE:0:80}"
+              git commit -m "opencode: issue #${ISSUE_NUMBER} ${SAFE_TITLE}" \
+                         -m "Model: ${MODEL}" \
+                         -m "Generated by OpenCode in GitHub Actions."
+            fi
+          fi
+
+          # 把修改 rebase 到最新默认分支，避免任务期间别人推送导致非快进。
+          git fetch origin "$BASE_BRANCH"
+          if ! git merge-base --is-ancestor "origin/${BASE_BRANCH}" HEAD; then
+            if ! git rebase "origin/${BASE_BRANCH}"; then
+              git rebase --abort || true
+              echo "[publish][error] rebase onto origin/${BASE_BRANCH} 失败" >&2
+              exit 1
+            fi
+          fi
+
+          # rebase 后重新确认确实有要推送的提交（OpenCode 可能只留下不可提交的状态变化）。
+          AHEAD="$(git rev-list --count "origin/${BASE_BRANCH}..HEAD")"
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "[publish] OpenCode 没有产生可推送的提交"
+            exit 0
+          fi
+
+          # 检查待推送提交是否涉及 .github/workflows/ 下的文件。
+          # GITHUB_TOKEN 没有 workflows 权限，推不动这类改动，必须用 PAT。
+          WF_TOUCHED="$(git diff --name-only "origin/${BASE_BRANCH}..HEAD" -- .github/workflows/ | grep -c . || true)"
+
+          if [ "${WF_TOUCHED:-0}" -gt 0 ]; then
+            if [ -n "${PUSH_TOKEN:-}" ]; then
+              echo "[publish] 提交涉及 .github/workflows/ 下的 ${WF_TOUCHED} 个文件，使用 PUSH_TOKEN（PAT）推送"
+              # actions/checkout 注入的 GITHUB_TOKEN extraheader 会覆盖 URL 内嵌凭据：
+              #不移除它的话，实际发送的仍是 GITHUB_TOKEN（无 workflows 权限），PAT 形同虚设。
+              git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+              if ! git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${BASE_BRANCH}"; then
+                echo "[publish][error] PUSH_TOKEN 推送失败：请检查仓库 secret PUSH_TOKEN 是否为有效且带 repo+workflow scope 的 PAT" >&2
+                exit 1
+              fi
+            else
+              echo "[publish][warn] 提交涉及 .github/workflows/ 但未配置 PUSH_TOKEN secret，先尝试 GITHUB_TOKEN" >&2
+              if ! git push origin "HEAD:${BASE_BRANCH}"; then
+                echo "[publish][error] GITHUB_TOKEN 推送被拒（提交包含 workflow 文件改动）。请在仓库 Settings → Secrets and variables → Actions 添加名为 PUSH_TOKEN 的 secret（内容为带 repo+workflow scope 的 PAT）后重试" >&2
+                exit 1
+              fi
+            fi
+          else
+            # 普通代码改动：优先 GITHUB_TOKEN，失败时用 PUSH_TOKEN 兜底重试。
+            if ! git push origin "HEAD:${BASE_BRANCH}"; then
+              if [ -n "${PUSH_TOKEN:-}" ]; then
+                echo "[publish][warn] GITHUB_TOKEN 推送失败，改用 PUSH_TOKEN 重试" >&2
+                git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+                if ! git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${BASE_BRANCH}"; then
+                  echo "[publish][error] PUSH_TOKEN 推送也失败，请检查网络与凭据" >&2
+                  exit 1
+                fi
+              else
+                echo "[publish][error] git push 失败" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=$BASE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "[publish] 已推送到 ${BASE_BRANCH}: $COMMIT_SHA"
+
+      - name: Upload OpenCode log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-issue-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/opencode-run.log
+            /tmp/opencode-prompt.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Resume other workflows
+        id: resume
+        if: always()
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          STATE_FILE=/tmp/opencode-suspended-workflows.json
+          REENABLED=0
+          ENABLE_FAILED=0
+
+          write_outputs() {
+            echo "reenabled=$REENABLED" >> "$GITHUB_OUTPUT"
+            echo "failed=$ENABLE_FAILED" >> "$GITHUB_OUTPUT"
+            echo "[resume] done: reenabled=${REENABLED}, enable_failed=${ENABLE_FAILED}"
+          }
+
+          if [ ! -f "$STATE_FILE" ]; then
+            write_outputs
+            echo "[resume] 没有需要恢复的 workflow"
+            exit 0
+          fi
+
+          # 重新启用一个 workflow（最多重试 5 次）。
+          enable_workflow() {
+            local id="$1" attempt
+            for attempt in 1 2 3 4 5; do
+              if gh workflow enable "$id" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                return 0
+              fi
+              echo "[resume][warn] 启用 workflow ${id} 失败（attempt ${attempt}/5），10s 后重试" >&2
+              sleep 10
+            done
+            return 1
+          }
+
+          DISABLED_TSV="$(jq -r '.disabled[] | [.id, .name, .path] | @tsv' "$STATE_FILE")"
+          while IFS=$'\t' read -r id name path; do
+            [ -n "$id" ] || continue
+
+            if enable_workflow "$id"; then
+              REENABLED=$((REENABLED + 1))
+              echo "[resume] re-enabled ${name} (${path})"
+            else
+              ENABLE_FAILED=$((ENABLE_FAILED + 1))
+              echo "[resume][error] 启用 ${name} (${path}) 失败（已重试 5 次）" >&2
+            fi
+          done <<< "$DISABLED_TSV"
+
+          write_outputs
+
+          if [ "$ENABLE_FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Comment result on issue
+        id: comment
+        if: always()
+        shell: bash
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+          SELECT_MODEL: ${{ steps.select.outputs.model }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          RUN_EXIT: ${{ steps.run.outputs.exit_code }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PUBLISH_CHANGED: ${{ steps.publish.outputs.changed }}
+          COMMIT_SHA: ${{ steps.publish.outputs.commit_sha }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          SUSPEND_OUTCOME: ${{ steps.suspend.outcome }}
+          DISABLED_COUNT: ${{ steps.suspend.outputs.disabled }}
+          CANCELED_COUNT: ${{ steps.suspend.outputs.canceled }}
+          RESUME_OUTCOME: ${{ steps.resume.outcome }}
+          REENABLED_COUNT: ${{ steps.resume.outputs.reenabled }}
+          RESUME_FAILED: ${{ steps.resume.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRETEST_FAILED: ${{ steps.pretest.outputs.failed }}
+        run: |
+          set -euo pipefail
+          COMMENT=/tmp/opencode-comment.md
+
+          {
+            echo "## OpenCode 运行结果"
+            echo
+            echo "- 模型：\`${SELECT_MODEL:-未选择}\`"
+            echo "- Actions 日志：${RUN_URL}"
+            echo
+
+            if [ "${PRETEST_FAILED:-}" = "true" ]; then
+              echo "❌ Pre-test 失败：仓库测试未通过，本 job 已按策略提前结束（agent 未运行）。"
+            elif [ "$SELECT_OUTCOME" != "success" ]; then
+              echo "❌ 模型选择失败：没有找到可用的免费模型。"
+            elif [ "$RUN_OUTCOME" != "success" ] || [ "${RUN_EXIT:-}" != "0" ]; then
+              echo "❌ OpenCode 执行失败（exit=${RUN_EXIT:-unknown}）。"
+            elif [ "$PUBLISH_OUTCOME" != "success" ]; then
+              echo "❌ OpenCode 已执行，但提交或推送失败。"
+            elif [ "$PUBLISH_CHANGED" = "true" ] && [ -n "${COMMIT_SHA:-}" ]; then
+              echo "✅ 已直接推送到 \`${BASE_BRANCH}\`："
+              echo
+              echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA}"
+            elif [ "$PUBLISH_CHANGED" = "true" ]; then
+              echo "✅ 已推送到 \`${BASE_BRANCH}\`，但未能获取 commit SHA，请查看 Actions 日志。"
+            else
+              echo "ℹ️ OpenCode 已执行，但没有产生代码修改。"
+            fi
+
+            echo
+            echo "### 其他 workflow"
+            echo
+            if [ "$SUSPEND_OUTCOME" = "success" ]; then
+              echo "- 开始前：取消 ${CANCELED_COUNT:-0} 个运行，临时禁用 ${DISABLED_COUNT:-0} 个 workflow。"
+            else
+              echo "- ⚠️ 开始前暂停其他 workflow 失败，详见 Actions 日志。"
+            fi
+
+            if [ "$RESUME_OUTCOME" = "success" ]; then
+              echo "- 结束后：已重新启用 ${REENABLED_COUNT:-0} 个 workflow（不重新触发，等待其自身事件/计划恢复）。"
+            else
+              echo "- ⚠️ 结束后恢复 workflow 失败（${RESUME_FAILED:-unknown} 个），请手动启用。"
+            fi
+
+            echo
+            if [ -s /tmp/opencode-run.log ]; then
+              echo "<details><summary>OpenCode 输出（末尾 120 行）</summary>"
+              echo
+              echo '````text'
+              tail -n 120 /tmp/opencode-run.log | head -c 50000
+              echo
+              echo '````'
+              echo
+              echo "</details>"
+            fi
+          } > "$COMMENT"
+
+          # GitHub issue 评论最多 65536 字符；按字符安全截断，避免切断 UTF-8。
+          python3 - "$COMMENT" <<'PY'
+          import re
+          import sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8", errors="replace").read()
+          # 去掉 OpenCode 输出里的 ANSI 颜色控制码，避免 issue 评论出现乱码。
+          text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text)
+          open(path, "w", encoding="utf-8").write(text[:60000])
+          PY
+
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$COMMENT"
+
+      - name: Close issue on success
+        id: close
+        if: |
+          always() &&
+          steps.select.outcome == 'success' &&
+          steps.run.outcome == 'success' &&
+          steps.run.outputs.exit_code == '0' &&
+          steps.publish.outcome == 'success' &&
+          steps.publish.outputs.changed == 'true'
+        shell: bash
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          STATE="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq '.state')"
+          if [ "$STATE" = "OPEN" ]; then
+            gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason completed
+            echo "[close] issue #${ISSUE_NUMBER} closed"
+          else
+            echo "[close] issue #${ISSUE_NUMBER} is already ${STATE}"
+          fi
+
+      - name: Fail job if OpenCode failed
+        if: |
+          always() && (
+            steps.suspend.outcome != 'success' ||
+            steps.select.outcome != 'success' ||
+            steps.run.outcome != 'success' ||
+            steps.run.outputs.exit_code != '0' ||
+            steps.publish.outcome == 'failure' ||
+            steps.resume.outcome != 'success' ||
+            steps.comment.outcome == 'failure' ||
+            steps.close.outcome == 'failure'
+          )
+        shell: bash
+        run: |
+          echo "OpenCode issue workflow failed; see the issue comment and Actions log."
+          exit 1

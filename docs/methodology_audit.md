@@ -1,0 +1,2111 @@
+# 方法学审计与修正记录（外部审计 23 项 + 后续补充）
+
+本文件逐项记录外部审计提出的 23 个问题及后续每轮补充在
+**当前代码**中的判定与处理。判定只依据源码与可运行行为，
+不依据本仓库此前的文档承诺。
+
+> 结论先行：本轮修正补上了 A/B 的机制对照、完整计算图预算核对、
+> 循环区域 1/r 残差缩放、GQA/KV 估计、伪重复处理、种子功效下限、
+> 最小效应门槛检验、失败率报告、固定共同步数、块 bootstrap、
+> 数据切分口径声明、测试内容参与清洗的披露、测试集访问账本与
+> 工作流冻结开关。本轮另补上结果脆弱性/单种子依赖检查与精确
+> 符号检验（见第 26 节），以及同时置信区间与种子×窗口两层
+> 不确定性/方差分解（见第 28 节）；还补上了按对比类型分层的
+> 先验功效（主效应/交互方差不同，交互约需 2 倍种子，见第 30
+> 节），以及评估集内部与 val↔test 的近重复簇/有效群组审计
+> （见第 38 节）。后续复现工作中已经补上论文 3.1 节的 4096 packed
+> context、文档级 segment attention mask、WSD 调度与
+> `--paper-cell` 网格预设（见 [docs/paper_reproduction.md](paper_reproduction.md)）；
+> 仍未实现的是增量 KV 解码、DCLM/MMLU 官方评测管线与 39 来源内部语料。
+> 预算偏差（FLOPs/active params/S）如实写入 `paper_fidelity.budget_audit`，
+> 不能靠措辞绕过。
+
+## 1. 基线是否忠实复现 arXiv:2609.01343v1
+
+**判定：原实现是 SMELT 风格简化模型，不能直接称为论文复现。**
+原代码缺少论文 3.1 节明确要求的「循环区域内每个子层残差更新按
+1/r 缩放」，也没有 GQA、未循环 MoE 基线与 KV cache 估计。
+
+**已修正：**
+
+- 新增 `residual_scaling=paper`（默认）：循环区域内子层残差按
+  1/r（r=2 → 1/2）缩放，循环区域外仍用 `residual_scale`；
+  `global` 保留历史行为。该口径写入 `comparison_protocol`。
+- 新增 `base` 模式：论文的**未循环 MoE 基线**（middle 只执行一次）。
+  此前仓库只有 `smelt`（循环两次），无法直接做论文的
+  Baseline/SMELT 对照。
+- 新增 GQA：`--n-kv-heads`（默认等于 `n_heads`，即 MHA）。
+  效率报告新增 `kv_cache_bytes_per_token` 与 per-visit 口径。
+- `paper_fidelity_report` 把「middle 50% 循环两次、1/r、top-8、
+  GQA、4096 上下文」逐项核对并写入 `config.json` 的
+  `paper_fidelity`；存在偏离时明确标记为 SMELT 风格架构。
+- `--budget-match MODE` 按完整计算图（Attention 执行次数 + MoE
+  assignment + Router）核对每 token FLOPs，不匹配时拒绝启动。
+- 默认仍是原型规模（top-2/8 专家、128 上下文），因为延迟合并实验
+  需要单机可运行；论文规模的运行必须显式使用 `--paper-cell`，否则
+  `paper_fidelity.architecture_faithful=false`。
+- 已补上：`--paper-cell` 的 32 格预设（附录 A 的 H/L/专家/top-8）、
+  4096 packed context 的文档级 segment attention mask、WSD 调度与
+  六个分支点；这些由 `paper_fidelity.protocol_checks` 逐项核对。
+- 仍有限制：增量 KV 解码与 DCLM/MMLU 官方评测管线未实现。
+
+复现论文口径的最小命令（推荐预设；需要相应算力）：
+
+```bash
+python experiment.py --data corpus.txt --out runs/paper_base_100m_s85 \
+  --paper-cell 100M:85 --paper-arch base --paper-protocol \
+  --group-separator '\n\n' --hypothesis "论文 Baseline 100M S≈85%" --rq RQ1
+
+python experiment.py --data corpus.txt --out runs/paper_smelt_100m_s85 \
+  --paper-cell 100M:85 --paper-arch smelt --paper-protocol \
+  --group-separator '\n\n' --hypothesis "论文 SMELT 100M S≈85%" --rq RQ1
+```
+
+手工等价骨架（供核对推导量；不推荐，容易漏掉 KV/GQA/文档 mask）：
+
+```bash
+python experiment.py --data corpus.txt --mode base --top-k 8 \
+  --n-experts 64 --d-model 672 --n-layers 10 --seq-len 4096 \
+  --out runs/paper_base_100m_s85
+
+python experiment.py --data corpus.txt --mode smelt --top-k 8 \
+  --n-experts 96 --d-model 576 --n-layers 10 --seq-len 4096 \
+  --n-kv-heads 2 --residual-scaling paper --out runs/paper_smelt_100m_s85
+```
+
+## 2. A/B 的归因对照
+
+**判定：原 `local_base` 同时改变了合并时机、第二轮宽度、专家复用
+与专家输入；B 还改变了分支数、Attention/MoE 执行次数。原六格
+消融无法把收益归给延迟合并。**
+
+**已修正（新增三个对照）：**
+
+| 模式 | 合并时机 | 第二轮宽度 | Attention/MoE 执行次数 | 回答的问题 |
+|---|---|---|---|---|
+| `A` | 第二轮后 | 每个分支 k2 | 每层 1 次 Attention，MoE 两阶段 | 延迟合并（局部） |
+| `local_base_k2` | 第一轮后立即 | k2（与 A 单分支相同） | 与 A 相同 | **只改变合并时机**（机制对照） |
+| `local_base` | 第一轮后立即 | min(E, k1·k2) | 与 A 相同 | **等专家计算量**（性能对照） |
+| `B` | 第二轮后 | 每分支 k2 | 分支化 Attention，两轮均按分支 | 全局延迟合并 |
+| `B_early` | 第一轮后提前合并，再复制回 k1 分支 | k2 | 与 B **完全相同** | **只改变合并位置**（B 专用等计算量对照） |
+
+`B_early` 的重合并不减少计算：第二轮仍执行 k1 个分支的
+Attention/MoE，只是各分支状态在第一轮结束后已经相同。因而
+`B` 与 `B_early` 的差异不能再归因于「多算」「多轨迹」或
+「更多 Attention」——这些在执行次数上被固定了。
+
+`mode_cost_profile` / `budget_match_report` 把每 token 的
+Attention 执行次数、MoE pass、Router 调用、专家 assignment 与
+解析 FLOPs 全部落盘；`--budget-match` 可按完整计算图拒绝不匹配
+的配置。仅令 `k1·k2≈2·top_k` 会漏掉第一阶段成本，已从文档与
+CLI 提示中删除该说法。
+
+## 3. RQ2 的预算约束
+
+原说法 `k1×k2≈2×top_k` 只匹配专家组合数，漏掉了第一阶段
+`k1` 次执行。对 A，专家 assignment 是 `k1 + k1·k2`；对 B，还要
+加分支创建时的 `k1` 次 assignment，以及第一轮其余 `(m−1)` 个
+Block 上每个分支各自路由 `k1` 个专家的 `(m−1)·k1·k1` 次
+assignment。**已修正：**
+`budget_match_report` 用完整计算图搜索整数 k2（A/local 系列）或
+(k1,k2) 网格（B 系列），并报告实测/解析 FLOPs 比例；
+`--budget-match smelt` 把预算匹配变成启动硬门。
+
+注意：只匹配专家 assignment 仍会让 A 因 Attention 只执行一次而
+比 `smelt` 便宜，因此完整匹配推荐的 k2 不一定等于
+`(2·top_k−k1)/k1`。这是本修正要暴露的差异，不是 bug。
+
+## 4. 分支「独立」的定义与检验
+
+**判定：B 的分支是「按第一轮路由排名（slot）组成的序列分支」，
+不是某个专家贯穿整条序列的独立轨迹。** 原实现只在前向状态上
+隔离，参数、输入来源与梯度都共享。
+
+**已修正：**
+
+- `routing_analysis.branch_semantics` 明确区分前向状态隔离、
+  参数共享、梯度耦合与统计独立。
+- 自测验证分支 Attention 不跨分支（已有），并新增分支顺序
+  置换不变性测试（见 `tests/test_core.py`）。
+- 报告 `branch_self_reuse_share` 描述「同一 slot 的第二轮是否
+  复用第一轮专家」，但不把它解释成专家轨迹。
+
+仍有限制：没有对「同一专家是否在多个位置形成一致功能」做完整
+因果分析；这需要下面的干预实验。
+
+## 5. RQ4 的专家专门化证据
+
+**判定：负载均匀、路由熵高、死专家少只是利用率描述，均匀随机
+路由也能得到。原指标不能证明专家专门化。**
+
+**已修正：** 新增 `--routing-interventions`：
+
+1. `routing_shuffle`：保持 assignment 数与均匀权重，把专家身份
+   随机化；若专家有可区分功能，损失应上升。
+2. `expert_drop`：逐个把某专家输出置零（路由/门控不变），记录
+   损失上升；报告 `importance_cv`、最大/最小专家与比值。
+3. 与 baseline 同一批固定 val 窗口比较。
+
+该实验在 val 上做 E+2 次前向（默认关闭），结果写入
+`routing_interventions.json` 与 `config.json`。它仍不是完整的
+「专家替换/路由打乱」因果实验（例如没有跨层专家替换），但已把
+「专门化」从利用率指标推进到功能干预证据。
+
+## 6. RQ3 的 Jaccard 机会水平
+
+**已修正：** 每个 Jaccard 同时报告：
+
+- `jaccard_chance_uniform`：均匀随机集合的期望
+  `E|A∩B|=k1·k2/E`；
+- `jaccard_chance_marginal`：保持第二轮专家边际负载、随机化
+  组合的期望重合；
+- `jaccard_lift_over_*` 与 `jaccard_adjusted_*`。
+
+低重合本身仍不证明路由更有效；必须结合上面的干预实验。
+
+## 7. 伪重复（第 8 项）
+
+**判定：原实现已经把同一 seed 折叠成一个观测，但文档说「退回
+Welch、每个运行一个样本」，与实际不符；折叠时也没有检查复制
+运行是否真的逐位一致。**
+
+**已修正：**
+
+- 同一 seed 的多个运行先折叠为**一个独立观测**，再按 seed 配对；
+  复制运行不增加 n/df，不再因重复而禁用配对。
+- `pseudo_replication.within_seed_sd_max` 记录组内差异；同 seed
+  复制运行若给出不同值，会显式暴露，不再静默平均。
+- 文档改写为「折叠后配对」，并说明 Welch 不能恢复独立性。
+
+## 8. 种子计划与符号翻转（第 9 项）
+
+**已修正：**
+
+- 新增 `_sign_flip_required_seeds`：精确双侧最小 p=2/2^n，
+  n=3/4/5 分别为 0.25/0.125/0.0625，**均不能达到 0.05**；
+  n=6 才可能，家族校正后按 `ceil(log2(2m/α))` 增加。
+- `seed_plan` 增加 `min_seeds_for_robust_sign_flip`、
+  `robust_claim_possible` 与公式说明。
+- `significant_robust` 在 n≤5 时标记 `not_evaluable_n_le_5`，
+  不再把「设计无法判定」说成「效应不稳健」。
+- 文档中的「n<5」改为「n<6」，并把「3~5 个种子」改为
+  「3~5 个种子只能做 t 检验；稳健双检验至少 6 个」。
+
+## 9. 符号翻转的假设（第 10 项）
+
+**已修正：** 所有报告与文档把它称为「差值分布关于 0 对称」
+假设下的符号翻转检验，不再称为「无分布假设」。结果中记录
+`randomization_null_assumption="symmetric_paired_differences_about_zero"`。
+同一个 seed 编号只保证配对，不保证方法标签可交换。
+
+## 10. 共同训练步数（第 11 项）
+
+**已修正：**
+
+- 新增 `--common-step STEP`：训练前固定共同步数，派生指标
+  `*_at_common_step` 不再由观察到的端点决定。
+- 默认（未指定）仍取各运行最后验证步的最小值，但报告记录
+  `target_step_rule`、`target_step_data_dependent`，并明确
+  「不是无偏，只是 conditionally selection-independent」。
+- `selection_bias_note` 改写，删除「不受选型偏差影响」的过强表述。
+
+## 11. 窗口 bootstrap（第 12 项）
+
+**已修正：** 新增 `--eval-bootstrap-block N`：N>1 时用循环移动块
+bootstrap 重采样连续窗口，报告 `bootstrap_unit` 与
+`bootstrap_block_size`。仍有限制：没有按文档/来源的 cluster
+bootstrap；但种子层级已并入窗口区间：逐窗口配对的跨种子汇总
+另给种子×窗口两层 bootstrap 与方差分解（见第 28 节），
+`dominant_source` 区分该补种子还是扩评估集。两层区间仍只
+条件于当前固定窗口，窗口级比较仍只应作为辅助证据，主检验是
+种子级。
+
+## 12. 最小有意义效应（第 13 项）
+
+**已修正：** `hypothesis_alignment` 不再仅凭「点估计超门槛 +
+相对 0 显著」判 `supported`。新增：
+
+- 方向调整后的门槛检验 `H0: 改善量 ≤ min_effect_abs`，
+  记录 `min_effect_p_value`；
+- 方向调整后的 95% 置信下界 `directional_ci95_low`；
+- `min_effect_verified`；未通过时状态为
+  `min_effect_not_verified` 或 `min_effect_unverifiable`，
+  并给出专门 advisory。
+
+## 13. 数值失败与幸存者偏差（第 14 项）
+
+**已修正：** 新增 `failure_rate_report`：
+
+- 按模式报告 `planned_runs`、`failed_runs`、`unknown_runs`、
+  `success_runs`、`failure_rate`；
+- 臂间失败率差 >10 个百分点时给出 `differential_failure` 警告；
+- 明确重试规则：不自动重试；同 seed 重跑成功路径是伪重复，
+  失败后换新 seed 或修复数值问题后整批重跑。
+
+失败运行仍不进入均值/检验（否则故障被当成效应），但失败率与
+成功条件指标必须成对报告。
+
+## 14. 学习率选型的「无法区分」（第 15 项）
+
+**已修正：** `analyze_baseline_tuning` 的并列判定改用**同种子
+配对差值 t 检验**（候选 vs 最优均值），不再用
+`max(std_best, std_cand)`；记录 `paired_tie_test`、`selection_rule`
+与「不显著 ≠ 等价」的说明。无共同种子时才退回旧启发式并标注。
+仍有限制：winner 仍需独立种子确认；1% 等价界不是按指标自动
+具有科学意义，必须按任务解释。
+
+## 15. 数据切分口径（第 16 项）
+
+**已修正：**
+
+- 新增 `--split-policy {contiguous,chronological}`。默认
+  `contiguous` 明确是「按文件顺序的连续前缀切分」，**不声称
+  时间切分**。
+- `--split-policy chronological` 必须提供
+  `--time-order-manifest`（JSONL 或每行 ISO-8601）；时间戳非
+  单调不减时拒绝启动；证据写入 `config.data.time_order_evidence`。
+- `comparison_protocol` 记录 `split_policy`。
+- 仍有限制：没有实现 document-stratified 与 source-extrapolation
+  切分；需要来源清单/实体清单时，当前只能做审计并明确披露。
+
+## 16. 实体隔离与近重复（第 17 项）
+
+**已修正：**
+
+- 新增 `--entity-manifest`（按群组序号的 entity_id 数组）与
+  `--allow-entity-overlap`；同一实体跨 split 默认拒绝训练。
+- 文档明确：分隔符只保证连续片段完整，不识别非相邻片段的同一
+  用户/作者/文档版本；内容定义分块是**精确块**扫描，不是近重复
+  检测。
+- 已补上近重复（near-duplicate）检测：`--near-duplicate-audit`
+  做只读审计，`--drop-train-near-duplicate-groups` 做 train-only
+  整组清洗；相似度定义为字节 k-shingle 集合的 Jaccard，先用
+  bottom-k 草图倒排索引生成候选，再用完整 shingle 集合精确复核
+  （见第 35 节）。
+- 仍有限制：近重复是内容级相似而非语义等价；64 位 shingle 哈希
+  存在可忽略但非零的碰撞概率；超长/过短群组显式跳过；也没有
+  document-stratified 切分。`--group-separator '\n\n'` 仍可能把
+  同一文档拆到不同 split，必须用真实文档/实体 ID。
+
+## 17. 测试内容参与训练集删除（第 18 项）
+
+**判定：这是原实现最严重的协议缺陷。** `--deduplicate-train-groups`
+与 `--drop-train-shared-chunks` 会用 test 内容决定删除哪些训练群组，
+而文档同时声称「测试集全程不读」。
+
+**已修正：**
+
+- 默认**只用 val** 决定训练集删除；test 内容不参与数据集构建。
+- 只有显式 `--allow-eval-content-for-cleaning` 才把 test 纳入，
+  并把 `eval_content_access`（含 `test_content_used`）写入
+  `config.data` 与报告。
+- 文档改写为「test 字节不被修改；默认 test 内容不被读取用于
+  清洗，启用开关时明确披露」。
+
+## 18. 「标签噪声」术语（第 19 项）
+
+**判定：非法 UTF-8、NUL、重复字节可能是语料损坏，也可能是任务
+允许的合法字节；直接称为标签噪声依据不足。**
+
+**已修正：**
+
+- 启用任一清洗开关必须提供 `--domain-justification`，否则拒绝
+  启动；依据写入 `config.data.cleaning_domain_justification`。
+- 文档与 CLI 帮助改为「格式/语料完整性清洗」，并说明 NUL 可能
+  是合法分隔符、重复字节可能是表格边框/填充。
+- 仍有限制：没有自动的 `deletion_bias` 直方图审计；正式的删除
+  决策应附 kept/dropped 分布对比。
+
+## 19. 类别不平衡指标（第 20 项）
+
+**已修正：** 删除「ROC-AUC 会因负样本多而升高」「排序判定只能看
+PR-AUC」「改用 macro F1/PR-AUC 判定」等错误建议。统一口径：
+
+- 字节语言模型主指标是 NLL / bits-per-byte（预注册口径）；
+- 类平衡 `val_macro_nll`、macro F1、PR-AUC lift、ROC-AUC 是
+  辅助诊断；
+- ROC-AUC 对 prevalence 不敏感，但高 ROC-AUC 不保证低
+  prevalence 下有可用的 precision/recall；
+- PR-AUC 必须报告相对随机水平（≈平均 prevalence）的 lift。
+
+## 20. 实验规模（第 21 项）
+
+**已修正：** 新增 `scale_guard`（tokens_seen、tokens/param、
+epochs、seq_len、scale_tier），在单次运行与对比报告中打印
+`[scale]` 警告；默认配置约 1.2 token/param、<1 epoch，明确标为
+原型级。仍有限制：没有 `--suite-scale` 多来源/多上下文/多规模
+扫描；这些结论必须另行验证。
+
+## 21. 工作流与审计链（第 22 项）
+
+**已修正：**
+
+- 工作流新增 `EXPERIMENT_FREEZE` / `.github/EXPERIMENT_FREEZE`
+  冻结开关：冻结时跳过 agent 阶段，不修改代码、不产生新提交。
+- `PROMPT_CLEAN` 与收尾 shell 不再删除实验结果、审计记录、
+  性能/预算/修复记录或 docs 分析文档；只清理临时文件。
+- 新增 `actions/upload-artifact` 归档 runs/config/metrics/
+  分析报告/日志（90 天）。
+- 仍有限制：GitHub artifact 不是永久不可变归档；正式实验应把
+  同提交的 `git archive`、config、失败运行与报告上传到 Zenodo/
+  OSF 等外部存储，并记录 DOI。
+
+## 22. 测试集访问流程（第 23 项）
+
+**已修正：**
+
+- 新增 `--test-ledger FILE`：按
+  `(data_sha256, test split sha256, test_fraction)` 记录每次解封
+  的候选目录、代码指纹、配置指纹、study id 与时间；默认拒绝
+  同一测试集被其它候选再次解封（`--allow-repeat-test-access`
+  显式豁免并留痕）。
+- `--final-test-comparison RUN_DIR...`：只读列出全部冻结候选的
+  test 记录、缺失 test 的候选与账本重复访问，不重新评估、不挑
+  选候选。
+- test 记录新增 `study_id`、`test_access`、`model_selection`、
+  `selected_step`、`hypothesis`、`primary_metric`。
+- 仍有限制：没有强制「先冻结候选再解封」的单一入口；
+  研究级流程仍需人工执行 `docs/experiment_protocol.md` 的步骤。
+
+## 23. 代码层三项
+
+**Top-1 路由梯度：已修复。** `top_k==1` 时不再把门控权重设为
+常数 1，而是取完整 softmax 中选中专家的概率（Switch 风格），
+并让该权重真正乘到专家输出上；`merge`、B/A 的 `k1==1` 路径
+同步修改。自测检查 `balance_coef=0, top_k=1` 时 router 仍从
+语言建模损失获得非零梯度。
+
+**负载均衡梯度：已披露，未完全解决。** `balance_coef×k` 只
+对齐单次路由的数值尺度，不能保证 B 的第一个中间 Block 多一次
+aux 项、`k1≠k2` 的单系数、分支 flatten 后的梯度压力相同。
+报告新增 `balance_strength_report` 的说明；完整的分层梯度探针
+仍建议在论文级实验中补上。
+
+**完整实现一致性：部分修复/部分限制。**
+
+- 位置编码：仍是可学习绝对位置编码，不是 RoPE；4096 packed
+  context 与文档级 attention mask 已实现（`--paper-protocol` /
+  `--document-masks`，见 [paper_reproduction.md](paper_reproduction.md)）。
+- 分支 Attention：隔离语义正确（自测验证）。
+- checkpoint 重算：数值等价（自测）；没有随机算子，因此当前
+  无需保存 RNG 状态。
+- AMP：仍按硬件自动选择，没有 `--amp-dtype`；跨设备比较时
+  `amp_dtype` 已作为受控变量记录。
+- 自定义反向：SwiGLU/专家 stack/merge 的实现未发现正确性 bug；
+  CUDA 路径未在 CPU CI 覆盖。
+- FLOPs：实测包含分支乘法；`--grad-checkpoint` 下训练 FLOPs
+  仍按 3× 前向估计，未计重算（已披露为限制）。
+- 增量解码：未实现 KV cache；`kv_cache_bytes_per_token` 只是
+  容量估计。论文的 KV cache 匹配需要真正的解码路径。
+
+## 24. 预注册的可执行性（本轮补充）
+
+**判定：原实现只有「把判定口径写进 config.json」的预注册，
+没有训练前独立冻结、事后只能核对的预注册文件。** 文档要求先写
+`preregistration.json`，但入口不读取它：同一命令行可以在看到
+数据/结果后补写主指标、方向、最小效应、共同步数、对照臂与
+种子集合，再把 `config.json` 当作「预注册」证据——这在审计上
+无法与真正的预注册区分。
+
+**已修正：**
+
+- 新增 `--preregistration FILE`：结构校验（必需字段、对照臂、
+  种子数、数据类型）、重复键/非有限常量拒绝、冻结提交
+  `frozen_commit`（或 `frozen_script_sha256`）核对、脏工作区
+  拒绝。
+- 文件补齐未显式给出的主指标/方向/最小效应/对照基线/
+  `common_step`/`steps`/`--budget-match`/`--seeds`/等价界；
+  命令行显式值冲突时拒绝启动，不能「以命令行覆盖预注册」。
+- 数据加载后核对 `sha256`、`split_policy`、`val_fraction`/
+  `test_fraction`、可选 `group_separator`、清洗开关与实体/
+  时间清单指纹；不一致时拒绝训练。
+- 核对记录写入 `config.json` 的 `preregistration`（文件
+  SHA-256、study_id、冻结提交、补齐字段、实际数据指纹与
+  运行模式/种子），resume 时保留；`--compare` 等只读入口
+  不接受该参数。
+
+仍有限制：`--preregistration` 只覆盖神经训练/多种子套件，
+统计基线仍用单独的 `--primary-metric` 口径；没有实现
+「先冻结候选、再统一解封 test」的单一状态机，测试集流程
+仍按第 5 节人工执行。
+
+## 25. 归档校验的可执行性（本轮补充）
+
+**判定：协议要求归档 SHA-256，但此前只能人工 `sha256sum`。**
+人工命令容易漏文件（尤其是失败运行目录、`eval_windows.json`、
+账本与后续追加的 `comparison_analysis.json`），也无法回答
+「清单内文件被改动」与「清单外新增文件」的区别；归档上传/
+解压后的内容完整性没有统一入口复核。
+
+**已修正：**
+
+- 新增 `--write-manifest RUN_DIR`：原子写入
+  `artifact_manifest.json`，逐文件记录规范化相对路径、大小、
+  SHA-256 与符号链接目标（不跟随链接，避免把目录外内容或
+  链接环纳入清单），并记录生成时的 `script_sha256`、git
+  状态、Python/torch/NumPy 版本；有 `config.json` 时摘出
+  study_id、数据/切分指纹、预注册文件指纹与
+  `comparison_protocol_sha256`。
+- 新增 `--verify-manifest RUN_DIR`：重新哈希并报告缺失、
+  大小/内容不符、类型/链接目标变化；拒绝绝对路径、`..`、
+  非规范相对路径与解析后逃逸运行目录的条目。清单外新增
+  文件默认只列为 `untracked`，`--verify-manifest-strict`
+  下判失败；完整性失败以非零状态码退出，便于归档流水线
+  直接使用。
+- 清单不包含自身（避免哈希自指）；代码/环境差异单独报告，
+  在另一台机器上校验归档时不会被误判成内容损坏。
+
+仍有限制：清单是写入时刻的快照，不提供签名/时间戳服务，
+也不能替代不可变存储；续跑、补测或追加分析后必须重新生成，
+否则校验会正确报告旧清单已过期。
+
+## 26. 结果脆弱性与单种子依赖（本轮补充）
+
+**判定：原实现报告了显著性、置信区间、符号翻转、leave-one-out
+方向稳定性与 TOST，但没有回答「这个显著结论是否只由一两个
+随机种子撑起来」。** leave-one-out 只检查删除一个种子后效应
+**方向**是否翻转；一个极端差值可以让方向保持不变、却把 p 值
+从显著拉回不显著。把「方向稳定」当成「结论稳健」会系统性
+高估小样本结果的可靠性。
+
+**已修正：**
+
+- 每个配对对比保存逐种子差值（`paired_differences` /
+  `paired_seeds`）与差值分布，结果分析可直接复核哪些种子
+  驱动了显著性，而不是只相信汇总 p 值。
+- 新增 `_exact_sign_test`：精确二项符号检验，只看差值方向、
+  不使用幅度，回答「多数种子是否与均值效应同向」。零差值
+  丢弃并记录；最小可达双侧 p=2/2^n，n≤5 时 0.05 水平上
+  不可能显著，报告显式标记 `resolution_limited`。
+- 新增 `_paired_result_fragility`：逐一/成组删除种子后重做
+  配对 t 检验，报告 `max_leave_one_out_p_value`、
+  `significance_survives_leave_one_out`、
+  `min_seed_deletions_to_lose_significance`（在组合数上限内
+  枚举，超限时标 `deletions_tested_exhaustively=false`）与
+  `verdict`（`stable` / `fragile` / `direction_mixed` /
+  `not_significant` / `not_evaluable`）。删除后剩余观测少于
+  最小种子数时判 `not_evaluable`，不伪造「删除后仍显著」。
+- 脆弱性比较使用该对比在 Holm 家族中的实际位置阈值
+  `α/(m-rank+1)`（`holm_alpha_threshold`），与最终判定同口径；
+  删除种子不改变家族规模，沿用原位置阈值是保守近似。
+- `comparison_analysis.json` 顶层新增 `fragility_summary`
+  （判定分布、fragile 列表、direction_mixed 列表与 advisory）；
+  展示层新增 `[fragility]` 小节与 `[fragile]` 点名。全因子
+  消融的主效应/交互同样附该分析；组件联合判定遇到 fragile
+  的支持效应时降级为 `inconclusive`，不再宣称该组件有用。
+- 只读 `--compare` 新增 `--compare-report FILE`：默认仍只
+  打印、不写文件；显式给出路径才把完整分析（含
+  `fragility_summary`）落盘，避免结果分析只存在于终端输出、
+  无法随运行目录归档与复核。
+
+仍有限制：这是描述性敏感性分析，不是新的显著性检验；它
+回答「删除种子后显著性是否存活」，不回答「这些种子为什么
+异常」。fragile 的正确反应是增加独立种子或调查异常运行，
+不是反复换种子直到显著；n=3 的设计无法做删除后仍满足最小
+种子数的检验，只能标为不可判定。
+
+## 27. 实验设计与准备（本轮补充）
+
+**判定：原预注册只要求「至少 3 个种子」，但没有训练前的功效
+论证；套件执行顺序按模式分组，时间/机器漂移与处理效应完全
+混杂。** 3 个种子只保证 t 检验可算，不保证能检出预注册的最小
+效应；而把所有 A 的种子跑完再跑 B，会让热漂移、缓存预热与
+集群负载变化系统性地落在某个臂上。两类问题都无法在分析阶段
+用统计方法补救，必须在准备阶段修。
+
+**已修正：**
+
+- 新增预注册可选 `power` 块：声明预期种子间标准差（相对基线
+  均值）、目标功效、alpha 与家族规模，按 Bonferroni 下界
+  `alpha/m` 计算配对 t 所需种子数，并同时满足精确符号翻转
+  所需 `ceil(log2(2m/alpha))`。种子数不足时默认拒绝启动；
+  显式 `underpowered_acknowledged=true` 必须给出 justification，
+  承认随 `config.json` 的 `preregistration.power` 落盘。
+- 新增 `--plan-design`：不加载数据、不训练，只生成/打印
+  `design_plan.json`——运行清单、随机化区组顺序、先验功效与
+  解析 token 预算，供冻结前检查。
+- 新增 `--run-order {grouped,blocked,randomized,counterbalanced}` 与
+  `--run-order-seed`，默认 `randomized`：每个种子是完整区组，
+  区组内臂顺序确定性随机化；`grouped` 仅保留用于兼容旧运行。
+  预注册可用 `run_order` 冻结方案与种子，命令行冲突拒绝启动。
+- `design_plan.json` 的 `plan_id` 是去掉时间戳后的规范化指纹；
+  子进程通过环境变量收到计划文件、SHA-256、`plan_id` 与
+  (order_index, block, position)，开跑前重新哈希并核对
+  label/seed/mode/balance。计划被改、指纹不符或分配不符都
+  拒绝训练，而不是先跑完再在报告里解释。
+- 实际开始/结束时间写入 `<out>/run_order.json`（失败条目也
+  保留）；套件结束后父进程核对全部子运行的 `plan_id` 一致。
+- `--compare` 与套件汇总新增 `run_order` 诊断：计划指纹是否
+  混杂、是否仍用 grouped、去模式均值后指标与执行顺序的
+  Spearman 相关与近似 p 值、每个模式内部的顺序相关。强相关
+  以 `[warn]` 提示先查机器漂移，不能直接解释臂间差异。
+
+仍有限制：这是**随机化与描述性诊断**，不是把时间作为协变量的
+正式区组模型；每个区组内只有一次观测，无法估计区组×处理交互。
+`power` 的预期标准差仍由研究者声明，声明过小会低估所需种子数；
+`required_seeds` 只是设计阶段近似，不替代分析阶段的 MDE 与
+等价性检验。机器/负载漂移若与区组内位置相关，随机化只能平衡、
+不能消除，仍需调查或重跑。
+
+## 28. 结果分析：同时置信区间与种子×窗口两层不确定性（本轮补充）
+
+**判定：此前的区间与判定口径不完全一致，且窗口级与种子级
+不确定性从未被放进同一个区间。**
+
+1. 每个对比/因子效应报告的是**逐检验** 95% CI，但显著性判定
+   用的是 Holm 校正后的 p 值。家族 m>1 时，读者会看到
+   「95% CI 不含 0，却 significant=false」；这不是数学矛盾，
+   而是「描述单个参数的区间」与「控制族错误率的判定」回答了
+   不同问题。原报告没有把这一区别写进结果字段，容易被误读为
+   实现错误，或反过来被拿来主张未校正的显著性。
+2. `_paired_window_bootstrap_ci` 只在一个种子的窗口内重采样，
+   `_cell_window_paired_analysis` 只把各种子的窗口均值再平均；
+   两者都没有给出「同时考虑训练种子与评估窗口」的区间，也没有
+   回答「下一步该加种子还是该扩大评估集」。这是本文件第 11 节
+   已披露、但一直未实现的限制。
+
+**已修正：**
+
+- 新增 `_attach_family_adjusted_intervals`：对单因子对比、
+  `--compare-baseline` 直接对比与全因子主效应/交互，在各自
+  检验家族内附加 **Bonferroni 同时区间**（置信水平
+  `1−α/m`）。字段为 `ci_family_adjusted_low/high`、
+  `ci_family_adjusted_alpha`、`ci_family_adjusted_family_size`、
+  `ci_family_adjusted_method`、`ci_family_adjusted_excludes_zero`
+  与 `ci_family_adjusted_decision_consistent`。逐检验 95% CI
+  （`ci95_*`）保留用于描述效应量范围。同时区间不含 0 是
+  Holm 校正后显著的**充分条件**，不是必要条件；报告不再把
+  两者混成一个判定。展示层在 m>1 时同时打印两套区间，并注明
+  `Bonferroni α/m`。
+- 新增 `_hierarchical_window_bootstrap_ci`：对 seed × window
+  交叉设计做两向 bootstrap——有放回重采样种子，同时有放回
+  重采样同一批固定窗口（所有抽中的种子共用同一组窗口下标，
+  保留同一窗口跨种子配对的结构），最后对交叉重采样后的窗口
+  差值取种子平均。区间反映「换一批训练种子 + 换一批同分布
+  评估窗口」的联合不确定性；随机种子由差值内容确定性派生，
+  报告可复现。结果写入每个对比的
+  `window_paired.hierarchical_bootstrap_ci95`。
+- 新增 `_window_variance_components`：用两向 ANOVA 分解
+  seed × window 交叉设计的方差分量（种子主效应 τ²、窗口主效应
+  ω²、种子×窗口交互 σ²），报告换种子且换窗口时的
+  `τ²/S + ω²/W + σ²/(S·W)`、固定窗口时的
+  `τ²/S + σ²/(S·W)`，以及三层标准差、方差占比
+  （`variance_share_seed/window/interaction`）、
+  `seed_mean_reliability`、`dominant_source` 与
+  `new_seed_mean_prediction_interval_95`（同一批固定窗口上换一个
+  新种子的预测区间）。直接取种子均值的样本方差会把窗口抽样
+  噪声算进种子层，这里用 ANOVA 均方扣除。`dominant_source`
+  给出可执行建议：种子主效应占主导时增加评估窗口无济于事；
+  窗口主效应占主导时盲目加种子不经济；交互占主导时需要同时
+  增加两者。
+- 两层结果随 `comparison_analysis.json` 落盘；展示层新增
+  `[window]` 行内的两层 bootstrap 区间与方差占比，不再只报
+  「固定窗口上的点估计 + 单种子窗口 bootstrap」。
+- 新增回归测试：同时区间的族规模/宽度/判定一致性、两层
+  bootstrap 的可复现性与退化处理、方差占比与预测区间、
+  逐窗口分析不把原始差值落进 `per_seed` 明细。
+
+仍有限制：Bonferroni 同时区间比 Holm 保守，家族很大时区间
+可能宽到没有实际信息量；两层 bootstrap 在 3~6 个种子时种子
+重采样很粗，百分位区间可能偏窄或不稳定，只作描述性证据，不能
+替代增加独立种子。方差分解与预测区间都条件于**这批固定评估
+窗口**，不覆盖换文档/来源的外推；按文档/群组的 cluster
+bootstrap 的处理见第 40 节，但它仍依赖显式的
+`--group-separator`，群组数很少时区间同样很粗。交叉 bootstrap
+把窗口当可交换单位，未做
+AR(1) 膨胀；窗口正自相关时两层区间与窗口/交互方差分量都会
+偏小，应同时查看逐种子 `window_lag1_autocorrelation`。预测
+区间是频率派 t 近似，不是贝叶斯后验预测。
+
+## 29. 实验设计与准备：脱落折算与位置平衡（本轮补充）
+
+**判定：设计预检已能拒绝「种子数不足」，但仍有三个准备阶段
+的盲点。**
+
+1. 功效公式把**计划种子数**当成**可用观测数**。数值失败、
+   NaN/Inf 或数据问题导致的运行在分析期被排除；若某臂失败率
+   更高，实际进入配对检验的种子会更少。计划 8 个种子、预期
+   20% 不可用时，功效只相当于约 6 个，但旧报告仍会显示
+   `adequate=true`。
+2. `randomized` 完整区组只保证「每个区组都跑每个臂」，不保证
+   每个臂在各区组位置上的出现次数均衡。小样本下某个臂可能
+   5 次里有 4 次排在区组最后；位置若与机器热漂移、缓存预热
+   或集群负载相关，臂效应仍会混入时间效应。旧设计计划也没有
+   把位置平衡作为可核对字段。
+3. 只报一个 `required_seeds` 掩盖了预期 sd 的不确定性；不报
+   计划可用种子数下的实际功效与 MDE，研究者看不到设计离目标
+   有多远，容易把「刚好达到 required」当成「有足够余量」。
+
+**已修正：**
+
+- `power` 新增可选 `expected_attrition_rate`（`[0,1)`，默认 0）。
+  `preregistration_power_plan` 同时报告
+  `required_seeds_with_attrition = ceil(required_seeds/(1-r))`
+  与 `planned_usable_seeds = floor(planned_seeds×(1-r))`；
+  `adequate` 按可用种子数判断，种子不足时错误信息给出所需
+  **启动**种子数。脱落率必须在训练前声明，不能用本轮失败
+  结果事后反推。
+- 同一记录新增 `achieved_power_at_min_effect` 与
+  `minimum_detectable_effect_relative`：按计划可用种子数、
+  家族校正后的 alpha 计算「真实效应等于预注册最小效应时的
+  检出概率」与「80% 功效下能检出的最小相对效应」。两者与
+  `min_effect` 同单位，可直接比较，不再只报所需种子数。
+- 新增 `power_sensitivity`：把 `expected_seed_sd_relative`
+  乘以 0.5/0.75/1.0/1.25/1.5/2.0 重算所需种子数。先验 sd 本身
+  是估计；sd 偏小 25% 就可能让设计从充足变成不足，冻结前
+  应看整张敏感性表而不是点估计。
+- 新增 `--run-order counterbalanced`：在完整区组上用循环拉丁方
+  做限制性随机化。基础处理顺序由 `--run-order-seed` 确定性
+  随机化，第 b 个种子区组使用第 `(start+b)` 个循环移位；任意
+  连续 b 行中每个处理在各位置最多出现一次，位置计数极差
+  ≤1。它要求每个区组包含同一组处理；`--plan-design` 遇到
+  只在部分种子上运行的候选会直接拒绝，而不是生成缺格计划。
+- `design_plan.json` 新增 `order_balance`：每个处理在各位置上的
+  计数、`max_position_imbalance`、`complete_blocks` 与
+  `balanced`。`plan_id` 覆盖该字段，事后改顺序/位置会破坏
+  指纹。`print_design_summary` 在 `counterbalanced` 不均衡时
+  告警，在 `randomized` 不均衡时提示可改用平衡方案。
+- `comparison_analysis.json` 的 `design` 与基线调参报告都带出
+  `order_balance`，分析阶段不必重新猜测执行顺序是否平衡。
+- 新增回归测试：attrition 折算与不足拒绝、实际功效/MDE/
+  敏感性、counterbalanced 的位置平衡与可复现性、区组处理
+  集合不一致时拒绝、位置混杂检测。
+
+**仍有限制：**
+
+- `expected_attrition_rate` 仍是研究者声明的先验值，不是观测
+  到的脱落机制。若脱落与臂别相关（某方法更容易 NaN），按可用
+  运行做配对分析仍相当于条件在「没有崩掉」上；必须同时报告
+  `failure_rates` 与失败率差异，不能只报成功运行的均值。
+- `counterbalanced` 平衡的是**位置计数**，不是所有高阶顺序
+  效应；循环拉丁方不保证一阶 carryover（前一个处理对后一个
+  处理的影响）完全平衡，也不消除机器漂移本身。它只降低小样本
+  随机化偶然造成的位置混杂。需要一阶 carryover 平衡时应改用
+  §41 的 `williams`；后者也仍不处理跨区组边界与高阶交互。
+- 位置平衡要求区组同质（每个种子跑同一组处理）。如果套件本身
+  有缺格，正确做法是补齐运行或改用 `randomized` 并明确承认
+  不平衡，不能把缺格计划标成平衡。
+- 实际功效、MDE 与敏感性都条件于声明的 sd、脱落率与配对 t
+  近似；种子数很少时非中心 t 积分与 sd 估计都不稳定。它们用于
+  设计阶段排序风险，不替代分析阶段的 MDE、TOST 与脆弱性报告。
+
+## 30. 消融对比的先验功效：不同对比类型的方差不同（本轮补充）
+
+**判定：原先验功效把「两两配对差值」的方差套到所有对比上，
+消融交互被系统性高估功效。**
+
+1. `preregistration_power_plan` 用
+   `_seeds_to_detect(min_effect, expected_seed_sd_relative)`，
+   即 `se = sd/√n`。这对两格配对对比成立，但 2×2 消融还有
+   主效应与交互：若两格配对差值的方差为 `2σ_cell²`，则主效应
+   `½[(M_on−M_off)+(L_on−L_off)]` 的方差是 `σ_cell²`（0.5×），
+   交互 `(M_on−M_off)−(L_on−L_off)` 的方差是 `4σ_cell²`
+   （2×）。交互的 SE 是两两对比的 √2 倍，同样效应下约需 2 倍
+   种子。原实现虽然把消融家族规模按 7 个检验计入了
+   `planned_comparisons`，却仍用同一个 `sd` 计算所需种子数，
+   所以「按两两对比够用」会被当成「交互也够用」。
+2. 预注册入口只按文件里的 `comparisons` 数量检查功效；套件实际
+   展开的全部臂两两比较、消融主效应/交互/简单效应只在
+   `design_plan.json` 里重算家族规模，且重算时仍未区分对比
+   类型。设计计划可以显示「不足」，但正式运行不会因此停下。
+
+**已修正：**
+
+- 新增 `_CONTRAST_VARIANCE_FACTORS`：`pairwise`/`simple`=1、
+  `main`=0.5、`interaction`=2（方差相对两格配对差值）。
+  `preregistration_power_plan` 对每种声明类型分别计算所需种子、
+  计划可用种子下的实际功效与 MDE，并在 `contrast_power` 中
+  逐项落盘；`binding_contrast` 是最吃种子的类型（同分时优先
+  报交互），`adequate` 按它判定，顶层
+  `required_seeds_for_t`/`achieved_power_at_min_effect`/
+  `minimum_detectable_effect_relative` 也取该类型口径。
+  `power_sensitivity` 对每个 sd 乘数同样按绑定类型重算，避免
+  敏感性表比主表更乐观。
+- 预注册新增可选 `power.planned_contrasts`（`pairwise` /
+  `simple` / `main` / `interaction`，非空、不重复、拒绝未知
+  类型），默认 `["pairwise"]` 兼容旧文件。`expected_seed_sd_relative`
+  明确为**两格配对差值**的标准差；若只有单配置跨种子 sd
+  σ_cell，应乘 √2 或直接用配对差值估计。
+- 新增 `planned_contrast_types_for_plan`：从实际运行计划推断
+  会估计哪些类型。`--suite-ablation`（mode × balance 两轴且含
+  `local_base`）返回 `pairwise`/`main`/`interaction`/`simple`；
+  `--suite-modes` 返回 `pairwise`；单臂返回空。
+- `_design_power_for_family` 改为同时接收实际家族规模与对比
+  类型，把「预注册声明」与「计划实际展开」取并集后重算；
+  `design_plan.json` 新增 `planned_contrasts`，`power` 记录带
+  `declared_planned_contrasts`/`contrasts_adjusted_for_plan`。
+- 新增 `design_power_gate_error`：正式套件在第一个子进程启动
+  前检查设计计划；绑定对比仍不足且没有
+  `underpowered_acknowledged`/`--allow-underpowered` 时直接
+  拒绝。`--plan-design` 仍只打印（不训练），便于冻结前调整
+  `seeds` 或最小效应。
+- 全因子效应记录新增 `contrast_type` 与
+  `contrast_variance_factor`，分析报告可核对「设计时按哪种
+  对比准备种子」与「现在报的是哪种对比」；分析阶段的 MDE/
+  功效仍用该效应的实测 `se`，不使用乘数。
+- 新增回归测试：主效应所需种子不多于两两对比、交互严格更多；
+  只按两两对比够用但交互不足时 `adequate=false`；预注册拒绝
+  未知对比类型；消融设计计划的 `planned_contrasts` 含交互、
+  `binding_contrast=interaction`，启动硬门可被显式豁免。
+
+**仍有限制：**
+
+- 方差乘数假设同一批种子上各实验单元的噪声相关结构相同
+  （共享 seed 效应在差值中抵消，交互方差为两两差值的 2 倍）。
+  若某些单元之间的配对相关性明显不同，设计阶段的乘数只是
+  近似；应以试点运行中**该对比自身**的种子间 sd 估计，或按
+  最保守的乘数准备种子。分析阶段不受影响：每个效应都用自己
+  的实测 `se` 做 t 检验与 MDE。
+- `planned_contrasts` 只描述「打算主张哪些类型」，不改变分析
+  阶段实际计算的家族；设计计划会把实际展开的类型并进来，所以
+  少报类型不能让硬门静默通过。
+- 交互功效仍受 `expected_seed_sd_relative` 估计误差影响；sd
+  偏小 25% 就会让所需种子数明显上升，冻结前应查看
+  `power_sensitivity` 与 `binding_contrast`。
+
+## 31. 可复现性与工程规范：环境身份与重跑前核对（本轮补充）
+
+**判定：原实现记录了 Python/torch/NumPy 版本与部分设备字段，
+但「同一份代码 + 同一份数据」仍可能在另一个环境下得到不同
+数值：cuBLAS/cuDNN/MKL/Triton 版本、PyTorch 编译选项、CPU
+指令集、GPU 算力与驱动版本、TF32/线程/确定性开关都会改变
+浮点归约顺序。原归档清单也只把 Python/torch/NumPy 版本作为
+信息字段，无法在重跑前回答「现在这套环境是不是产出结果的那
+一套」。**
+
+**已修正：**
+
+- 新增 `build_environment_snapshot()`，生成
+  `smelt-isr/environment/v1` 快照：解释器实现/版本/构建、
+  libc、CPU 型号与指令集指纹、PyTorch 版本/编译配置/并行
+  信息、CUDA/cuDNN/MKLDNN、GPU 型号/算力/显存、NVIDIA
+  驱动版本、TF32/确定性/线程开关，以及全部已安装发行包的
+  规范名与精确版本。`packages.critical` 单独列出直接或间接
+  决定数值内核的子集。
+- 快照的 `environment_id` 只对关键字段（python/platform/
+  cpu/torch/device/driver/determinism + critical packages）做
+  规范化 SHA-256：可执行文件路径、主机名、采集时间、设备
+  UUID 与每次运行按种子设置的 PYTHONHASHSEED 等不进入身份，
+  避免同一套软件环境因虚拟环境路径或种子不同被误判。完整
+  包清单仍保存，供人工重建环境。
+- 每次运行把完整快照写入 `run_metadata.environment`，并单独
+  原子写 `environment.json`；`config.json` 顶层 `environment`
+  记录 `environment_id`、文件名与文件 SHA-256。`resume` 时
+  `environment.json` 保留最初运行的环境；若当前环境已变，
+  摘要写入 `resume_environment_id` 与
+  `environment_changed_since_start=true`，不静默覆盖。
+- 新增只读 `--check-environment RUN_DIR_OR_JSON`：从
+  `environment.json` 或 `config.json` 读取归档快照，与当前
+  环境比较；默认要求 `environment_id` 一致，
+  `--check-environment-strict` 还要求完整包清单逐项一致。
+  不一致时以非零状态码退出，并打印运行时字段与包版本差异；
+  入口拒绝与训练/对比/预注册参数混用。读取
+  `config.json` 摘要时会核对 `environment.json` 的 SHA-256，
+  防止用被替换的“期望环境”通过核对。
+- `environment_id` 加入 `--compare` 的可复现性硬核对键与
+  `metrics.jsonl` 首行身份字段：同一对比中的运行若产自不同
+  关键环境，报告明确列出，而不是只比较 Python/torch 两个
+  版本号。
+- `artifact_manifest.json` 的生成环境记录 `environment_id` 与
+  完整包清单指纹，`run` 摘要带出归档运行的
+  `environment_id` / `environment_file_sha256` /
+  `environment_changed_since_start`；`--verify-manifest` 另
+  报告清单生成环境与当前进程环境是否一致（信息字段，不参与
+  归档完整性判定，因为跨机器解压校验时环境不同是预期情况）。
+- 新增 `--expect-manifest-sha256 HEX`（配合
+  `--verify-manifest`）：把写入时打印、并记录到 DOI/归档元数据
+  的清单指纹传入校验；清单被整体替换时，内部文件仍可能全部
+  自洽，只有外部锚点能发现替换。该值参与最终 `ok` 判定，
+  格式不是 64 位十六进制时在只读入口直接拒绝。
+- 新增回归测试：快照跨进程稳定、完整包漂移不改变关键身份、
+  关键包变化破坏身份、`config.json` 摘要的文件哈希校验、
+  只读入口拒绝训练参数、CLI 一致/不一致的退出码。
+
+**仍有限制：**
+
+- `environment_id` 不覆盖 CPU 微码、BIOS、GPU 固件、内核
+  调度、集群负载或共享缓存；即使 id 相同，跨机器仍可能因
+  浮点归约顺序产生微小差异。它回答「是不是同一套数值环境」，
+  不保证逐位相同。
+- NVIDIA 驱动版本通过 `nvidia-smi` 读取；命令不可用或权限
+  受限时记为 `null`，此时不能把「无法读取」当成「驱动一致」。
+- 完整包清单包含与数值无关的包；默认核对只要求关键环境
+  一致，`--check-environment-strict` 才要求逐项一致。冻结
+  正式实验时建议同时保存 `environment.json` 与
+  `pip freeze`/容器镜像摘要，而不是只依赖 `environment_id`。
+- 快照是运行开始时的状态；训练中途升级依赖或替换驱动不会
+  被自动检测，必须在运行结束后重新生成并与归档比较。
+
+## 32. 数据处理的删除偏差与评估标签覆盖（本轮补充）
+
+**判定：原实现记录了清洗删除了多少字节/群组、按什么规则删除，
+但没有回答「删掉的内容和保留的内容是不是同一分布」，也没有
+报告「评估集里有多少标签在训练集中从未出现」。这两个缺口都会
+把数据问题误读成模型能力：选择性删除会改变训练分布，清洗前后的
+损失不可直接比较；训练集没有的字节类在评估中只能靠平滑/先验，
+其 NLL 是不可约的外推误差，不能算作「模型没学会」。**
+
+**已修正：**
+
+- 新增 `_deletion_bias_record`：对训练集清洗的删除区间与保留
+  区间分别统计字节频次、相邻字节对频次和连续段长度，报告
+  `dropped_bytes`、`kept_bytes`、`drop_fraction`、
+  `excluded_span_lengths`、`kept_span_lengths`、
+  `dropped_top_bytes`、`kept_top_bytes`、`byte_js` 与
+  `bigram_js`。记录写入 `config.data.train_cleaning.deletion_bias`
+  （schema `smelt-isr/deletion-bias/v1`），随运行归档；没有
+  删除时不生成该字段，避免把「没清洗」误读成「偏差为零」。
+- 删除偏差超过阈值时审计告警：`drop_fraction > 20%` 提示清洗
+  后的训练分布已被选择性改变；删除/保留内容的字节或二元组
+  JS 距离 `> 0.10` 时分别提示分布与上下文转移发生变化。
+  告警不阻止训练（删除可能是正确的研究决定），但要求报告
+  明确「清洗后的指标不能与未清洗运行直接比较」。
+- 新增评估集标签覆盖 `label_coverage`：对每个评估 split 报告
+  `observed_byte_classes`、`unseen_label_classes` 与
+  `unseen_label_token_share`（训练集从未出现的字节类占评估
+  token 的比例），并同步写入 `data_audit.splits[split]`。超过
+  `1e-4` 时告警，说明这部分 NLL 是训练数据覆盖不足导致的
+  不可约外推误差，不能归因于架构或训练方法。
+- `print_data_audit` 打印训练集覆盖的字节类数、各评估 split
+  的未见标签占比与清洗删除偏差；`config.json` 的 `data_audit`
+  仍保留完整数值，便于只读复核与跨运行对比。
+- 新增回归测试：构造 train/val/test 分别只含 A/B/C 的语料，
+  核对未见标签类数与 token 占比；构造 train 内含非法字节的
+  清洗场景，核对删除/保留字节数、`drop_fraction`、字节/二元组
+  JS 与告警。
+
+**仍有限制：**
+
+- `byte_js` / `bigram_js` 是描述性分布差异，不是删除对模型
+  泛化的因果效应。删除比例高且偏差大时，正确做法是补做
+  「保留原始 train 的对照运行」或按删除原因分层做敏感性分析，
+  而不是只报告一个 JS 数值。
+- 删除偏差按字节/二元组统计，不识别来源、语言、主题等语义
+  维度；如果清洗按来源删除，即使字节分布看起来接近，训练集
+  的来源构成也可能已经改变。来源级结论仍需实体/来源清单审计。
+- 标签覆盖按字节类统计的是「词表覆盖」，不是上下文覆盖。
+  未见字节类之外的「已见字节、未见上下文」仍由
+  `distribution_shift_conditional` / `unseen_transition_share`
+  报告，两者不能互相替代。
+- 这些统计基于实际观测数据，不附带抽样置信区间；它们回答
+  「这份数据里是否存在覆盖缺口/删除偏差」，不回答「换一批
+  同分布数据后缺口是否仍存在」。正式实验应把该记录与数据
+  指纹、清洗开关一起冻结。
+
+## 33. 等价性主张的先验功效（本轮补充）
+
+**判定：此前的先验功效只回答「能否检出预注册的最小效应」，
+没有回答「能否在预注册等价界内主张无实质差异」。** 分析
+阶段虽然报告 TOST、`equivalence_margin_needed` 与
+`equivalence_seeds_to_achieve`，但这些都是事后诊断：若设计
+从一开始就不具备在声明界内主张等价的精度，正确结论只能是
+「不确定」，而报告仍可能把大量算力投入到无法回答研究问题
+的设计上。更严重的是，等价界越宽越容易得到「等价」结论；
+允许用 `--equivalence-margin` 的默认值代替训练前声明，或
+看到数据后放宽界，会直接制造结论。
+
+**已修正：**
+
+- 预注册 `power` 新增可选 `plan_equivalence`（默认 false）。
+  设为 true 时表示等价性（TOST）是本次研究的主张之一，
+  必须在预注册顶层显式声明正数 `equivalence_margin`；
+  `--equivalence-margin` 的命令行默认值不能代替该声明。
+- 新增 `_tost_power`：按真实差异、标准误、自由度、等价界
+  与单侧 alpha 精确计算 TOST 功效。TOST 通过等价于观测
+  差值整体落在 `±(margin − t_{1−α,df}·se)` 内，因此功效
+  可由中心 t 分布 CDF 直接得到，不依赖正态近似。
+- 新增 `_seeds_for_tost` 与 `_tost_margin_for_power`：前者
+  在真实差异为零时反推达到目标 TOST 功效所需的可用配对
+  数；后者给出当前精度在目标功效下能支持的最小等价界。
+  两者都按对比类型的方差乘数计算（交互仍需更宽界或更多
+  种子），并与显著性功效共享家族校正 alpha/m。
+- `preregistration_power_plan` 在每个 `contrast_power` 条目
+  中新增 `equivalence_power_at_null_difference`、
+  `required_seeds_for_equivalence`、
+  `required_seeds_for_equivalence_with_attrition`、
+  `equivalence_margin_for_target_power` 与
+  `equivalence_adequate`，并在顶层 `equivalence` 块按最吃
+  种子的对比类型汇总 `binding_contrast`、
+  `margin_for_target_power` 与 `claim_planned`。
+- `plan_equivalence=true` 时 `adequate` 同时要求显著性功效
+  与等价性功效达标；预注册入口对「声明了等价性主张但功效
+  不足」直接拒绝，正式套件在第一个子进程前重算后也会拒绝，
+  除非显式 `underpowered_acknowledged`/`--allow-underpowered`。
+  未声明等价性主张时，等价性字段只作为信息，不改变显著性
+  功效的判定，避免把一个探索性 TOST 误当硬门。
+- `design_plan.json` 的 `power` 会随实际家族规模与对比类型
+  重算等价性所需种子；`--plan-design` 打印等价性功效、所需
+  启动种子与当前精度可支持的最小界。若最小界大于声明界，
+  提示增加种子而不是放宽界。
+- 预注册入口新增一致性检查：`equivalence_margin` 不能大于
+  `min_effect`。等价界是「可忽略的最大差异」，`min_effect` 是
+  「最小有意义差异」；前者更宽时会存在同时被判定为有意义与
+  可忽略的效应区间，显著性与等价性两种主张互相矛盾。边界
+  相等可以接受；该检查防止为了让 TOST 通过而把界放宽到超过
+  本研究的效应判定门槛。
+- 新增回归测试：TOST 功效随种子数单调、所需种子数与
+  `margin_for_target_power` 的数值回归、未声明
+  `equivalence_margin` 时拒绝等价性主张、等价界大于
+  `min_effect` 时拒绝、等价性功效不足时
+  预注册/设计计划硬门拒绝、未主张等价时只作信息性报告、
+  设计计划按更大的实际家族与交互方差重算等价性字段。
+
+**仍有限制：**
+
+- 规划按真实差异为零计算，是「若确实无实质差异，能否在
+  界内主张等价」的概率；真实差异非零但仍在界内时 TOST
+  功效通常更低，设计应留余量。它不保证真实差异为零。
+- TOST 功效使用与显著性功效相同的声明 `expected_seed_sd_relative`
+  和配对 t 近似；sd 估计偏小会同时高估两类功效。等价性的
+  `margin_for_target_power` 同样是插件估计，不是精确样本量
+  公式。
+- 当前只覆盖对称等价界（`±margin`）。非劣性/优效性单侧
+  设计、按终点分层的 alpha 分配与序贯设计仍未实现；需要在
+  预注册中另行说明并作为新研究阶段。
+- 等价性主张与显著性主张共用同一个 Holm/Bonferroni 家族；
+  若二者混在同一家族，等价性功效会更保守。报告仍以分析
+  阶段的实际家族与 TOST 结果为准，设计阶段的 adequacy 不
+  替代最终判定。
+
+## 34. 缺失/失败运行下的对比稳健性（本轮补充）
+
+**判定：原实现报告了失败率、差分缺失与「失败运行不进入均值/检验」，
+但没有回答「完整案例的显著结论是否可能只是幸存者偏差」。** 当某个
+消融格或某个方法更容易 NaN/发散，或某臂更容易缺指标时，完整案例
+分析实际上是在「没有崩掉」的条件下比较；失败率与均值成对报告只
+把问题暴露出来，没有给出结论对缺失机制的敏感性。若缺失运行的真实
+结果恰好都更差，显著改进可能完全由「哪些运行留下了」驱动。
+
+**已修正：**
+
+- 新增 `_attrition_bounds`：对两两对比与全因子主效应/交互/简单
+  效应，在**有界结果假设**下计算部分识别界。假设未观测结果落在
+  参与比较的全部单元已观测结果的联合范围 `[L, U]` 内；把每个
+  单元的缺失运行分别赋到 L 或 U，按线性组合系数方向取极值，得到
+  `effect_min` / `effect_max`。
+- 每个对比/因子效应新增 `attrition_bounds`（schema
+  `smelt-isr/attrition-bounds/v1`）：`missing_runs`、
+  `attempted_runs`、`observed_fraction`、`support`、`effect_min`、
+  `effect_max`、`zero_within_bounds`、`sign_robust` 与 `verdict`
+  （`complete_cases` / `bounded_same_sign` / `crosses_zero` /
+  `zero_effect` / `unbounded` / `not_applicable`）。缺失同时包括
+  数值失败/发散与「成功运行但缺该指标」，两者都不进入主检验。
+- 界跨 0 或没有有限界时，`attrition_bounds.verdict` 为
+  `crosses_zero` / `unbounded`；组件联合判定遇到这种支持效应时
+  降级为 `inconclusive`，不再把完整案例的显著结果写成组件有用的
+  稳健证据。确定性基线（ngram）不适用按运行缺失的界，显式标为
+  `not_applicable`，不把「无法计算」写成「没有缺失问题」。
+- 新增 `_attrition_bounds_summary`：汇总两两对比、基线直接对比与
+  全因子效应，写入 `comparison_analysis.json` 的
+  `attrition_bounds_summary`，展示层新增 `[attrition-bounds]` 小节，
+  点名缺失比例与跨零/无界条目。报告同时保留原 `failure_rates`、
+  `differential_failure` 与 `differential_missingness`，三者回答
+  不同问题：失败率描述稳定性成本，缺失差异描述比较子集是否相同，
+  部分识别界描述结论对缺失机制最多能有多敏感。
+- 新增回归测试：完整案例的界与观测效应一致；两臂缺失可让界跨 0；
+  没有任何观测结果时为无界；两两对比附着界并在顶层汇总；组件
+  判定遇到跨零/无界支持效应时降级。
+
+**仍有限制：**
+
+- 这是**有界结果假设**下的部分识别，不是置信区间，也不是缺失
+  机制检验。缺失值可能超出观测支持范围时，真实界是无穷宽；报告
+  不能把「界内同向」写成「缺失无偏」或「对任意缺失机制稳健」。
+- 界只利用结果的观测范围，不使用协变量、时间、来源或失败原因；
+  若缺失与这些因素相关，界可能仍偏窄。正确的补充证据是保留失败
+  目录、报告失败原因、按原因分层做敏感性分析，或补齐/重跑缺失
+  单元，而不是只报一个界。
+- 主检验仍以完整案例的配对 t / 符号翻转为准；部分识别界是**并行
+  的稳健性口径**，不改变显著性判定，也不替代预注册的失败率与
+  脱落计划。全因子效应在种子不完全对齐时，界与配对点估计可能来
+  自略不同的观测子集，报告同时给出 `observed_effect_within_bounds`。
+- 当前只做对称的「最坏/最好」极值界，未实现基于缺失机制的
+  概率模型、多重插补、逆概率加权或 Rosenbaum 敏感性分析；这些
+  需要额外的缺失假设，不能从现有数据自动推出。
+
+## 35. 数据处理：近重复群组审计与 train-only 清洗（本轮补充）
+
+**判定：精确内容指纹只能发现「完全相同」的群组；内容定义分块
+只能发现「共享完整连续块」的重复。同一文档的修订版、转载时改
+标题/改一两句话、拼接了局部段落的副本，指纹与共享块都可能不同，
+但这些内容仍会把评估信息带入训练。**
+
+**已修正：**
+
+- 新增 `--near-duplicate-audit`（只读）与
+  `--drop-train-near-duplicate-groups`（整组清洗），都需要
+  `--group-separator`。相似度是字节 k-shingle 集合的 Jaccard：
+  `|S_a ∩ S_b| / |S_a ∪ S_b|`，阈值由
+  `--near-duplicate-threshold`（默认 0.8）声明，shingle 长度由
+  `--near-duplicate-shingle-bytes`（默认 8）声明。
+- 成本控制不是「用草图近似删除」：每个群组先取 shingle 哈希的
+  bottom-k 草图（默认 128 个最小哈希值，MinHash 家族的最小哈希
+  样本），用草图哈希做倒排索引生成候选；是否删除由候选双方的
+  **完整 shingle 集合**精确计算 Jaccard 后决定。审计记录
+  `similarity`、`shingle_hash`、`exact_verification`、`sketch_size`
+  与候选数，不能把草图当成最终相似度。
+- 默认只对照 val 与更早 train，val/test 的字节、切分位置与
+  `split_sha256` 完全不变；只有显式
+  `--clean-train-against-test` / `--allow-eval-content-for-cleaning`
+  才把 test 放入 `eval_ranges`，并把
+  `cleaning_eval_splits=["test","val"]`、
+  `test_used_for_cleaning=true` 写入 `train_cleaning`。近重复清洗
+  与精确去重/共享块清洗一样，会被
+  `effective_train_sha256`、`comparison_protocol` 与预注册
+  `data.cleaning` 逐项核对，不能在看到结果后改阈值。
+- 只读审计写入 `data_audit.near_duplicates`：被标记群组数、
+  `flagged_duplicate_of`（val/test/train）、最佳匹配区间与 Jaccard、
+  跳过的过短/超长群组数，默认只告警、不进入泄露硬门（相似不是
+  逐字节相同，不能把启发式标记直接写成确定泄露）；清洗开关则是
+  显式干预，删除后照常计算 `deletion_bias`，提醒删除不是随机缺失。
+- 跳过条件显式记录：群组短于一个 shingle 或超过
+  `max_group_bytes`（4 MiB）时不参与判断，审计写出
+  `groups_too_short` / `groups_too_large`；不能把「未标记」读成
+  「不重复」。64 位滚动多项式哈希有极小碰撞概率，报告记录哈希
+  口径而不是声称逐字节完全相等。
+- 回归覆盖：改写版 train/val 群组被精确 Jaccard 命中；只读审计
+  不删除且报告确定；默认不读取 test，显式开关后才删除与 test
+  近似的 train 群组；split 边界/`split_sha256`/有效训练字节的
+  train-only 约束；非法阈值与 shingle 长度被拒绝。
+
+**仍有限制：**
+
+- 近重复是内容级相似，不是语义重复；同义改写、翻译、图片/表格
+  的结构性复制不在字节 shingle 的检测范围内。
+- 阈值与 shingle 长度是研究者事先声明的操作化定义，改变它们会
+  改变删除集合与有效训练分布；预注册必须与开关一起冻结，报告
+  不能把「阈值下的未标记」写成「没有重复」。默认 0.8 的候选
+  召回由共享 bottom-k 草图保证；阈值远低于 0.5 时候选生成可能
+  漏检，应视为探索性设置并同时报告 `candidate_pairs` 与人工
+  抽查结果。
+- bottom-k 草图只负责候选生成，候选可能漏掉「长度差异极大但短
+  文档被完整包含」的群组：这类关系的 Jaccard 本身很低，应该用
+  单独的 containment 指标或实体清单处理，而不是偷偷降低阈值。
+- 近重复审计的 train 部分回答「train 是否与 val/test 或更早
+  train 近似」；val/test 内部与 val↔test 的群组近重复由第 38 节
+  的 `data_audit.evaluation_near_duplicates` 单独报告（默认只读
+  val，解封 test 后才含 test），二者检测对象不同。
+- 超过 4 MiB 的群组跳过，避免完整 shingle 集合内存不可控；大文档
+  应先在文档内分块/按小节定义群组，再运行近重复审计。
+
+## 36. 结果分析：RQ1 的收敛速度需要曲线口径（本轮补充）
+
+**判定：项目把「收敛速度」写进 RQ1，但结果分析此前只有
+`final`（经 checkpoint 选型）与 `val_loss_at_common_step`
+（共同步数处的单点）两种 loss 口径。** 单点无法区分「前段
+一直更好、末点被追上」与「前段更差、末点反超」：两条曲线可以
+在共同步数处完全相同，收敛轨迹却相反。用某一个观察到的端点
+（如各运行最后验证步的最小值）作比较点还会让早停/不等步数
+与结果相关。直接把任意一个点解释成「收敛更快」，证据不足。
+
+**已修正：**
+
+- 新增分析期派生指标
+  `val_loss_curve_mean_to_common_step`：在共同可观测训练窗口
+  `[max(各运行第一个验证步), 共同终点]` 上，对周期验证
+  `val_loss` 曲线做**梯形积分并除以窗口长度**，得到时均验证
+  损失（越低越好）。它回答「在相同训练预算的前半段，谁的
+  整体损失更低」，而不是只看末点或 best checkpoint。
+- 共同终点优先取训练前固定的 `--common-step`；未给定时退回
+  各运行最后验证步的最小值，并在报告
+  `curve_mean.end_data_dependent=true` 与 advisory 中显式
+  标记为数据依赖。窗口起点同样是观测端点（0→第一次验证之间
+  没有观测，不做外推），报告记录
+  `start_rule=max_first_validation_step`、插值方式与窗口覆盖
+  比例。
+- 端点落在两个验证点之间时用线性插值；任意一端超出曲线范围
+  就判为缺失并写入 `excluded_runs`，不裁剪、不外推。数值失败
+  运行不参与，也不能用其短曲线缩短共同窗口。
+- 该指标进入 `COMPARISON_METRIC_KEYS` 且方向为
+  「越低越好」，可直接作为 `--compare-metric` 或预注册
+  `primary_metric`；聚合、种子配对/Welch 检验、Holm 校正、
+  MDE、TOST、脆弱性、脱落界与 `comparison_analysis.json`
+  均沿用现有管线，不另造一套统计口径。
+- 时均指标来自周期验证曲线，不经 checkpoint 选型，因此不在
+  `_SELECTION_BIASED_METRICS` 中；同时也不能充当训练期
+  checkpoint 选型或 `--suite-baseline-tuning` 的调参目标
+  （它在 `--compare` 阶段才派生，训练过程中拿不到）。unigram
+  稻草人参考沿用同口径 `unigram_loss`。
+- 假设词表新增「收敛/收敛速度/convergence」映射：
+  假设写「收敛更快」时必须落到
+  `val_loss_curve_mean_to_common_step` 这一可判定指标，而不是
+  只写定性描述；通用「验证损失/loss」映射也接受该曲线口径，
+  使预注册主指标与假设措辞不会因用词不同而假性失配。
+  `--compare` 展示层新增 `[convergence]` 小节，同时打印窗口、
+  起点/终点规则、各运行时均值与曲线覆盖比例。
+- 新增回归测试：共同窗口的梯形均值、制度终点插值、超出曲线
+  范围不外推、数值失败/短曲线排除、超大有限 loss 不溢出，
+  以及派生指标不得作为选型/调参目标。
+
+**仍有限制：**
+
+- 时均损失同时受**早期下降速度**与**最终水平**影响：一个方法
+  可以收敛更快但最终略差，另一个前段更慢但最终更好。该指标
+  只能回答「共同窗口内整体损失谁更低」，必须与
+  `val_loss_at_common_step` 和 `final` 一起报告，不能单独当作
+  「学习率更快」或「最终质量更好」的证据。
+- 窗口起点由观测到的第一次验证决定；不同评估间隔/不同
+  `--eval-interval` 会改变指标，跨运行必须保持相同验证调度。
+  首段（第 0 步到第一次验证）没有观测，指标不覆盖这段轨迹。
+- 梯形积分假设相邻验证点之间 loss 线性变化；评估点很稀时
+  只是近似。它不提供曲线本身的同时置信带，也不替代种子级
+  配对检验：曲线时均仍可能被单个种子或单次评估窗口波动驱动，
+  应同时查看 `fragility_summary` 与种子×窗口方差分解。
+- 只使用验证曲线；测试集仍按尘封协议只在单个运行最终评估
+  一次，不进入跨运行曲线比较。若研究要主张训练中途的泛化
+  差异，需另做预注册并保持相同的验证窗口协议。
+
+## 37. 实验设计与准备：用试点运行校准先验噪声与脱落率（本轮补充）
+
+**判定：先验功效的两个最关键输入仍是研究者声明值，缺少
+与真实运行的对照。** `expected_seed_sd_relative` 与
+`expected_attrition_rate` 若凭直觉填写，声明得越小，所需
+种子数越少、越容易通过设计门；看到结果后把 sd 写小或只按
+成功运行估计脱落率，就能把「功效不足」伪装成「设计足够」。
+此前的 `power_sensitivity` 只展示「如果 sd 是 0.5~2 倍会怎样」，
+但没有把已完成的试点运行变成可核对证据。
+
+**已修正：**
+
+- 新增 `--design-pilot-runs RUN...`：读取试点/先前运行目录的
+  `config.json` 与 `metrics.jsonl`（不读 test），按处理单元
+  （mode / balance_coef / k1 / k2 / top_k / dense_fnn_hidden 等）
+  和共同 seed 配对，估计两格差值的样本 sd。只有共同 seed 不少于
+  3 个的单元对进入可评估集合；观测 sd 取所有可评估单元对的
+  最大值，相对化分母取两单元均值中较小者，方向保守。
+- 同一工具按处理单元统计「数值失败或缺少该指标」的 seed 比例；
+  观测脱落率取各单元最大值而不是总体平均，避免某个更易崩的臂
+  被其它臂稀释。试点目录中的失败运行必须一并传入。
+- `design_plan.json` 新增 `pilot_evidence`
+  （schema `smelt-isr/design-pilot/v1`）：`cells` 记录各单元
+  seed 值/均值/单元内 sd/脱落率，`pairs` 记录单元对共同 seed、
+  配对 sd 与相对 sd，`sd_check` / `attrition_check` 记录声明值、
+  观测值、比值与判定，`arm_coverage` 记录试点是否覆盖计划中的
+  模式，`warnings` 记录重复 seed、可评估单元对不足、试点少于
+  6 个运行、未覆盖计划模式等风险。
+- **单向上调并强制重算**：若观测 sd/脱落率高于预注册声明，
+  设计计划把有效功效输入上调到观测值，并用
+  `force=True` 重算 `required_seeds_with_attrition`、实际功效、
+  MDE、对比类型分层与等价性字段；不会因为试点观测更小就反向
+  放宽预注册假设。重算后仍不足时，正式套件在第一个子进程前
+  拒绝启动，除非显式 `underpowered_acknowledged` /
+  `--allow-underpowered`。
+- `pilot_evidence` 纳入 `design_plan.json` 的 `plan_id`；
+  事后替换试点目录或修改证据会改变指纹，不能把「换一批更安静
+  的试点」伪装成同一份设计。`--plan-design` 打印
+  `[design][pilot]` 摘要与 `[warn]`，供冻结前处理。
+- 没有固定 `--common-step` 时，`*_at_common_step` 的试点共同
+  步数由观测端点决定，`pilot_evidence.metric_annotation` 会标记
+  `target_step_data_dependent=true`，只应作为预警而非最终 sd。
+- 新增回归测试：配对 sd 与单元内 sd 的估计、失败 seed 排除与
+  脱落率、计划模式未覆盖告警、观测 sd 高于声明时设计计划强制
+  重算、观测脱落率高于声明时所需启动种子增加、重算后功效不足
+  的启动硬门与 `--allow-underpowered` 豁免、某处理单元全部试点
+  运行失败时证据标记 `unusable` 并拒绝启动。
+
+**仍有限制：**
+
+- 工具不自动核对试点与正式实验的数据指纹、训练预算、代码版本
+  或评估调度是否可比；协议不可比时观测值只能作为下界预警，
+  不能直接当作目标设计的真实 sigma。正式实验仍应使用同一
+  数据/评估口径的试点。
+- 试点样本通常很小（每单元 3~6 个 seed），配对 sd 点估计的
+  相对标准误很大；证据报告会提示「少于 6 个试点运行」，但
+  不会给出置信区间。它不是精确方差估计，也不替代正式运行后
+  的 MDE、TOST 与脆弱性分析。
+- 只校准噪声与脱落，不校准真实效应大小；不能因为试点里观测到
+  更大/更小的效应就改 `min_effect`，也不能据此改主指标或方向。
+- 无法判断是否漏传失败目录：若研究者只把成功运行作为试点，
+  工具会如实报告观测脱落率为 0，但这只是输入决定的，不是
+  「没有脱落」的证据。归档时必须保留完整试点目录。
+- 单向上调是刻意的：试点 sd 更小时不自动调低声明值，避免用
+  一次小样本试点反向放宽预注册。若确实要降低先验 sd，应作为
+  新一轮预注册显式重写并重新冻结。
+- `pilot_evidence` 不是预注册 schema 字段，而是由工具从运行
+  目录计算后写入设计计划；因此必须与预注册文件、
+  `design_plan.json` 一起归档。只保留预注册文件会失去试点
+  校准证据，只剩研究者声明值。
+
+## 38. 数据处理：评估集内部的近重复与有效样本量（本轮补充）
+
+**判定：此前的近重复审计只回答「train 是否与 val/test 或更早
+train 近似」，没有检查 val/test 自身。精确重复群组有默认硬门，
+但同一文档的修订版/转载版仍可能同时落在 val 内部、test 内部或
+val↔test 两侧。它们不在精确指纹的命中范围内，却会让
+固定窗口 bootstrap 与 checkpoint 选型把同源内容当成独立样本：
+名义窗口/群组数被虚增，评估区间偏窄；val↔test 近重复还会让
+val 选型通过近似内容间接看到 test，使「测试集只解封一次」的
+独立性主张被削弱。**
+
+**已修正：**
+
+- 扩展 `--near-duplicate-audit`（只读，需要
+  `--group-separator`）：在原有 `data_audit.near_duplicates`
+  之外新增 `data_audit.evaluation_near_duplicates`，扫描
+  val 内部、test 内部与 val↔test 的群组近重复。相似度仍是
+  字节 k-shingle 集合的精确 Jaccard；bottom-k 草图只用于
+  候选生成，达到阈值的候选再用完整 shingle 集合精确复核。
+  阈值、shingle 长度、哈希口径与训练集近重复审计共用同一组
+  参数，不能在两处使用不同阈值后拼出一个「更干净」的结论。
+- 对每个 split 用并查集把达到阈值的近重复群组合并为簇，报告
+  `groups_scanned`、`within_pairs`、`clusters`、
+  `effective_groups`、`redundant_groups`、`effective_fraction`
+  与 `largest_cluster_groups`。`effective_groups` 按「簇内全部
+  冗余」计是独立内容单元数的保守下界，而不是「真实独立样本
+  数」；报告把它与名义群组数并列，避免把重复内容当成额外证据。
+- 跨 split 报告 `cross_split.val_test.pairs` 与示例；val 内部
+  或 test 内部存在近重复时以 `[warn]` 点名「bootstrap/选型会
+  把同源内容当独立样本，区间可能偏窄」；val↔test 存在近重复
+  时点名「val 选型可能间接看到 test」。近重复是相似而非逐字节
+  相同，因此默认只告警、不进入硬门，也不自动删除评估内容
+  （修改 val/test 会改变被评估分布）。
+- 默认仍只读 val；只有解封 test（`include_test=True`）时才
+  把 test 范围加入扫描，并把 `test_content_used` 写入报告。
+  审计不改变 `split_sha256`、群组边界或 `train_excluded_spans`。
+  示例、簇与候选按群组位置确定性排序，不依赖 `PYTHONHASHSEED`。
+- 新增回归测试：val/test 内部近重复分别被聚类为正确簇数；
+  跨 split 近重复只在显式解封 test 后出现；审计不删除任何
+  训练内容、两次运行结果逐位一致；非法阈值/shingle/草图大小
+  被拒绝。
+
+**仍有限制：**
+
+- 近重复是内容级相似，不是语义重复；同义改写、翻译、结构性
+  复制不在字节 shingle 的检测范围内。`effective_groups` 是
+  按簇全冗余计的保守下界，不能反过来声称「簇内内容都不同」。
+- 阈值与 shingle 长度是研究者事先声明的操作化定义。阈值越低
+  候选越多、簇越大；报告必须与预注册/冻结参数一起读，不能
+  在看到评估结果后调整阈值来「消除」重复。
+- bottom-k 草图只负责候选生成，可能漏掉长度差异极大但短文本
+  被长文本完整包含的群组（Jaccard 本身很低）。这类关系应另用
+  containment 指标或实体清单处理，不能偷偷降低 Jaccard 阈值。
+- 过短（不足一个 shingle）或超过 4 MiB 的群组被显式跳过并计数；
+  「未标记」不等于「不重复」。val/test 内部近重复目前只告警，
+  不是硬门；若研究要主张评估区间/选型独立，应在报告中披露
+  `effective_groups`，或按文档/群组做 cluster bootstrap，
+  而不是继续按窗口 i.i.d. 解读。
+- 本审计不自动修正置信区间，也不替代窗口重叠比例、AR(1)
+  膨胀与种子×窗口方差分解；它提供的是「独立单位被高估」的
+  证据，修正口径仍需在分析阶段显式选择并报告。
+
+## 39. 可复现性与工程规范：运行级复现审计（本轮补充）
+
+**判断**：清单校验证明「目录里的字节没变」，环境核对证明
+「当前机器/依赖接近产出环境」，但都不证明「同一目录里的
+config / environment / metrics / 预注册记录属于同一次运行」。
+一份被整体替换且内部自洽的 `config.json` 仍可通过清单校验；
+`metrics.jsonl` 也可能从另一次运行复制过来，或只改了首行种子。
+只看单个文件哈希无法发现「日志与配置拼接」这类常见错误。
+
+**修复**：新增只读入口 `--audit-run RUN_DIR`，逐项核对：
+
+1. `config.json` 的 schema、`script_sha256`、数据/切分指纹、
+   `comparison_protocol_sha256` 与 `environment_id` 格式；
+2. `environment.json` 的 `environment_id` 是否与其内容重算值
+   一致，并与 `config.run_metadata` 及 `config.environment`
+   摘要一致；摘要指向的 `file_sha256` 是否匹配；
+3. `metrics.jsonl` 首行 `reference_baselines` 及 `final`/`test`
+   记录中的种子、代码、数据、环境、协议指纹是否仍等于
+   config；多条 test 记录直接判失败；
+4. test 封条与访问账本是否互相矛盾（有 test 记录但无封条、
+   解封后无汇总、账本无登记）；
+5. `sanity_check.reproducibility.identical=false` 直接判失败；
+   未做重复运行只告警；
+6. `artifact_manifest.json` 存在时重新执行完整性校验；缺失
+   清单只告警，`--audit-strict` 下判失败；
+7. 可选 `--audit-source` / `--audit-data` /
+   `--audit-preregistration` 对外部归档源码、语料与预注册
+   文件做 SHA-256 与关键字段比对，发现「运行后编辑预注册」。
+
+```bash
+python experiment.py --audit-run runs/final/A --audit-strict \
+  --audit-source archive/experiment.py \
+  --audit-data archive/corpus.txt \
+  --audit-preregistration archive/preregistration.json \
+  --audit-report archive/runs/final/A/audit.json
+```
+
+退出码 0 表示证据一致；非零表示不一致或（strict 下）证据不足。
+报告写入 `--audit-report` 时不自动加入 `artifact_manifest.json`；
+若报告放在运行目录内，归档前需重新生成清单。
+
+**局限**：审计不重新训练，也不验证统计结论；它只能确认
+记录之间是否自洽。`metrics.jsonl` 若被整体伪造且所有指纹同步
+改写，仍可能通过；外部源码/语料/预注册哈希与不可变归档锚点
+才是最终防线。`sanity_check` 只证明训练前探针可重复，不等于
+完整训练逐位可重复；跨设备复现仍需固定环境或做容差分析。
+
+## 40. 结果分析：文档/群组 cluster bootstrap 接入（本轮补充）
+
+**判断**：仓库此前已有 `_group_cluster_eval_intervals`、
+`_group_cluster_paired_comparison` 与
+`_hierarchical_group_bootstrap_ci`，也有边界测试，但评估与对比
+流程从未调用它们，实际上是不可达代码；`eval_windows.json` 也
+没有群组级充分统计量。因此报告仍只能按窗口/种子重采样，无法
+回答「换一批同分布文档」时结论是否稳定。尤其在同一文档被切成
+多个重叠窗口时，把窗口当独立单位会系统性低估评估不确定性。
+
+**修复**：
+
+1. `evaluate(..., group_sink=...)` 在最终评估且数据由
+   `--group-separator` 定义文档边界时，用
+   `ByteDataset.fixed_eval_group_ids` 把每个目标 token 映射到
+   文档群组，累加群组内损失和、token 数与命中数；没有分隔符
+   时不写入，绝不把窗口伪装成文档簇。
+2. 新增 `_build_eval_group_stats`，输出带
+   `schema=smelt-isr/eval-group-stats/v1`、
+   `assignment=split_group_starts_gaps_to_preceding_v1`、
+   `unit=document_group` 与分隔符 SHA-256 的 `group_stats`，
+   并写入 `eval_windows.json`。非有限值、负损失、正确数超过
+   token 数、重复群组 id 等异常会使整份记录不可用，避免只保留
+   「看起来正常」的群组。
+3. 评估指标在启用 bootstrap 时追加文档/群组级
+   `loss`、`ppl`、token accuracy 的 95% 区间及
+   `*_group_cluster_n_groups`，与窗口级区间并列报告。
+4. 跨运行窗口分析对每个共同 seed 调用
+   `_group_cluster_paired_comparison`，再以
+   `_hierarchical_group_bootstrap_ci` 做「种子 × 文档群组」
+   两层重采样；只对群组定义指纹一致、共同群组 token 数逐项
+   相同的运行配对；展示层同时打印「种子×文档群组 bootstrap
+   95%CI」。没有群组记录的旧运行不参与群组分析，但仍保留
+   原有窗口/种子分析。
+5. 回归测试覆盖：评估期群组统计生成、无分隔符时不伪造群组、
+   跨 seed 的群组配对与两层区间，以及逐群组明细不落进
+   `per_seed` 报告明细。
+
+**局限**：群组边界完全取决于 `--group-separator`；没有显式
+分隔符的数据只能继续使用窗口/种子证据。群组数少于约 10 个时
+百分位区间很粗，应视为描述性证据而不是高精度置信区间。它覆盖
+的是「换一批同分布文档」，不覆盖换来源/换标注体系/时间外推；
+群组内仍可能有近重复或同源段落，需配合第 38 节的评估集近重复
+审计。群组分析与种子级检验来自同一批运行，不是两次独立验证；
+报告仍不得把不显著读成等价。
+
+## 41. 实验设计与准备：一阶 carryover 平衡（williams 顺序，本轮补充）
+
+**判定：`counterbalanced` 解决了位置计数混杂，但没有解决区组内
+一阶 carryover；仅凭位置平衡不能排除「上一次运行影响下一次运行」。**
+
+循环拉丁方让所有区组共享同一个循环顺序。以 n=6 为例，基础顺序
+为 `0,1,5,2,4,3`，所有区组只在循环移位后取行；区组内相邻对
+永远只来自这个循环的 n 个有向边，其余 `n(n-1)-n` 个有序对
+一次也不会出现。于是每个有向边重复 `n-1` 次，而其他边计数为
+0。若缓存、GPU 温度、优化器/分配器状态或集群负载会把上一次
+运行的影响带入下一次，处理效应仍可能与 carryover 混杂，而且
+这种混杂不会被 `order_balance.balanced=true` 发现。
+
+**已修正：**
+
+- 新增 `--run-order williams`。偶数 n 个处理使用 n 行 Williams
+  平衡拉丁方；奇数 n 使用两个 n 行拉丁方（第二个以第一个的
+  逆序为基础），共 2n 行。完整使用设计行时，每个处理在每一位
+  置出现次数相同，且每个有序相邻处理对 `(前一个, 后一个)` 的
+  出现次数相同。处理标签与起始行由 `--run-order-seed` 确定性
+  随机化，预注册/设计计划指纹覆盖顺序。
+- `order_balance` 新增 `carryover` 字段：`pairs_possible =
+  n(n-1)`、`pairs_observed`、`transitions`、`min_pair_count`、
+  `max_pair_count`、`max_pair_imbalance`、`balanced` 与
+  `full_balance_block_multiple`。`balanced` 要求所有有序对都被
+  覆盖且计数完全相同（极差 0），而不是只要求位置平衡或计数
+  接近。
+- 区组数 B 不是 n（偶数）或 2n（奇数）的整数倍时，位置计数
+  仍可能接近平衡但不保证极差 ≤1；`carryover.balanced` 一定为
+  false，`print_design_summary` 会告警并给出完整平衡所需的
+  区组倍数。不得把「部分平衡」写成「carryover 已平衡」。
+- `counterbalanced` 的计划在摘要中明确提示只平衡位置；若担心
+  一阶 carryover，应改用 `williams`。
+- 新增回归测试：偶数处理完整设计每个有序对恰好一次、奇数处理
+  完整设计每个有序对恰好两次、区组不足时正确报告部分平衡、
+  区组处理集合不一致时拒绝、相同种子可复现。
+
+**仍有限制：**
+
+- Williams 设计只平衡**区组内**一阶 carryover。跨区组边界
+  （上一个区组最后一个处理到下一个区组第一个处理）不在平衡
+  声明内；若漂移跨区组连续累积，仍需随机化区组顺序、插入
+  washout/重置，或把区组边界作为敏感性分析变量。
+- 一阶计数平衡不等于消除了 carryover 的**交互作用**。若
+  carryover 大小本身依赖前一个处理（处理×carryover 交互），
+  标准 Williams 平衡只能保证一阶相邻对计数相同，不能保证
+  直接效应估计无偏；需要显式 carryover 模型或 washout 设计。
+- 完整平衡要求区组数达到设计行数的整数倍。种子数很少时，
+  奇数处理可能需要 2n 个区组才能覆盖全部有序对；不能为了
+  凑平衡重复使用同一批训练种子而不把重复视为技术重复。
+- 顺序设计只处理时间/顺序混杂，不消除机器漂移、数据顺序、
+  随机种子差异或失败率差异；分析阶段仍需报告 `run_order`
+  漂移诊断、失败率与设计指纹一致性。
+
+## 42. 实验设计与准备：失败运行的完整区组保留（本轮补充）
+
+**判定：原实现记录了失败目录与失败率，但首个子运行非零退出就
+停止后续运行。** 这会同时破坏三件事：后续种子区组整体缺失，
+位置/一阶 carryover 平衡不再成立；`failure_rate` 的分母退化为
+「实际启动数」，无法与预注册的计划分母比较；脱落界只能看到
+最早失败之前的运行。若某方法更容易在训练中崩溃，停止策略还会
+让失败率与臂别、执行位置混杂。
+
+**已修正：**
+
+- 训练套件在 `design_plan.json` 中写入并冻结
+  `failure_policy`（schema v3，参与 `plan_id`）：默认
+  `continue`，显式 `--sweep-stop-on-failure` 可冻结 `stop`。
+  正式运行时改策略会改变计划指纹，不能看到结果后再换。
+- `continue` 只对已经写出 `config.json` 的训练期失败生效；
+  启动前失败（数据/配置/预注册）仍立即停止，避免把同一基础
+  设施错误重复跑满整批。
+- 失败运行目录保留并写入 `sweep_failure.json`（计划身份、
+  mode/seed/balance、退出码、失败阶段、是否写出 config）；
+  `run_order.json` 记录 `failure_policy` 与每个条目的
+  `planned`/`running`/`completed`/`failed` 状态。用 `--resume`
+  重跑同一目录并成功时会删除旧失败标记，避免与 completed 状态
+  矛盾。
+- `compare_runs` 读取失败标记，把进程失败标为
+  `execution_status="failed"`，同时置
+  `numerical_status="failed"`，使其进入 `failure_rates`、
+  `attrition_bounds` 与消融覆盖检查，但不进入均值/显著性
+  检验；没有 `config.json` 时仍可从标记恢复 mode/seed/balance。
+- 套件在全部计划运行结束后才写 `comparison_analysis.json`，
+  新增 `sweep_execution`（计划数、完成数、失败数、策略与失败
+  明细）；写完后父进程以非零退出码标记本轮不完整。
+- 基线调参套件固定 `stop`：缺格的调参网格不能用于选 winner，
+  避免把「失败候选」静默变成「未评估候选」。
+- 新增回归测试：continue 保留后续区组并写失败标记；stop 将
+  未启动条目保留为 planned；启动前失败在 continue 下仍停止；
+  设计计划冻结 continue/stop 且冻结的 stop 覆盖调用参数；
+  `--resume` 成功后删除旧失败标记；`compare_runs` 识别失败
+  标记并计入失败率。
+
+**仍有限制：**
+
+- `continue` 只保留区组结构，不修复失败本身；失败运行的指标
+  仍不可用，主检验仍是完整案例分析，必须与失败率、脱落界和
+  失败原因分层一起报告。
+- 失败原因目前只区分「启动前」与「训练期进程非零退出」，
+  不自动区分 OOM、NaN、数据错误或外部 kill；需要逐目录查看
+  日志或扩展 `sweep_failure.json` 的分类。
+- 父进程只能看到退出码与目录状态；若子进程在写出 config 后
+  被信号杀死、但留下可读的 final 记录，仍按失败处理并从主
+  检验排除。这是保守选择，不是对失败机制的推断。
+- 失败标记由父进程写入；手工删除 `sweep_failure.json` 会让
+  后续 `--compare` 退回按 metrics 推断状态，归档时应与
+  `run_order.json` 一起保存。
+
+## 43. 可复现性与工程规范：代码身份必须覆盖 `exp/` 实现（本轮补充）
+
+**判定：原实现只对入口 `experiment.py` 计算和核对
+`script_sha256`，但训练/统计实现已全部迁到 `exp/` 包内。**
+这意味着冻结提交之后只修改 `exp/part_*.py`（不改入口）时：
+预注册的 `git diff frozen_commit..HEAD -- experiment.py` 为空，
+`--resume` 的 `script_sha256` 比较一致，`--audit-run` 只核对
+入口指纹，`artifact_manifest.json` 也只锚定入口。结果是同一
+git commit / 同一入口指纹下可以运行完全不同的实现，冻结、
+续跑与归档核对都无法发现，代码身份链在研究最关键的位置
+是断开的。文档此前把「完整源码需另行核对」写成人工步骤，
+但机器可执行入口并没有提供对应核对。
+
+**已修正：**
+
+- 新增确定性源码树指纹（schema `smelt-isr/source-tree/v1`）：
+  文件集为根 `experiment.py` + `exp/**/*.py` + `selfcheck/**/*.py`
+  （排除 `__pycache__`、测试与编译产物）；规范化 SHA-256 只由
+  相对路径、字节数和每个文件的 SHA-256 决定，不含根目录名、
+  mtime 或采集时间，因此同一份源码复制/解压到别处指纹不变。
+  `--print-source-fingerprint` 输出逐文件清单与摘要。
+- `run_metadata`、检查点、`metrics.jsonl` 首行、final/test
+  记录、预注册记录与 `artifact_manifest.json` 同时写入
+  `source_tree_sha256`（以及 `source_tree` 明细）；续跑时比较
+  检查点与当前源码树，变化时明确告警并写入
+  `resume_code_provenance`。
+- 预注册支持可选 `frozen_source_tree_sha256`；`--preregistration`
+  在启动前核对当前完整源码树，缺失或不同则拒绝启动。
+  `git diff frozen_commit..HEAD` 的检查范围改为
+  `experiment.py exp selfcheck`，只改 `exp/` 的后继提交不再
+  静默通过。
+- `--check-source RUN_DIR_OR_JSON` 只读核对当前源码树与运行记录，
+  列出修改/新增/删除文件，不一致时非零退出；
+  `--audit-run --audit-source <目录>` 可从归档源码目录重算指纹
+  并核对，单文件用法仍兼容 `script_sha256`。`--compare` 的
+  复现性硬核对键加入 `source_tree_sha256`。
+- 新增回归测试：指纹与目录位置无关、文件增删改会被列出、
+  预注册拒绝缺失/不匹配/非法格式的源码树指纹、审计对缺失
+  指纹发 warning 并检出明细与摘要不一致、清单与运行摘要携带
+  源码树身份。
+
+**仍有限制：**
+
+- 旧运行没有 `source_tree_sha256`，工具只能标为「未核对」，
+  不能事后补出当时的实现；这些运行仍需依赖 `git archive`
+  与人工核对。
+- 指纹覆盖 Python 运行时代码，不覆盖数据、配置、模型权重或
+  非 Python 资源；这些仍由各自的数据/环境/清单指纹负责。
+- 指纹证明「文件内容相同」，不证明运行过程没有动态加载外部
+  代码或修改运行时状态；严格复现仍需固定解释器、依赖与命令。
+
+## 44. 结果分析：预注册必须约束分析集合，而不只约束训练启动（本轮补充）
+
+**判定：原实现的预注册门只设在训练启动前，`--compare` 仍可
+由调用者任意挑选运行目录。** `--preregistration` 会核对
+commit、源码树、数据、种子集合、指标、基线与等价界，但这些
+核对发生在每个训练进程内部；到了分析阶段，`--compare` 只
+汇总命令行传入的目录。少传一个失败臂、只传显著种子、把
+`--compare-metric` 换成另一个指标，或把 `--common-step`
+移到更有利的位置，仍然能得到一份「显著」的对比报告，而报告
+本身没有记录分析集合是否覆盖了训练前声明的全部确证单元。
+`--audit-run --audit-preregistration` 只能逐个运行核对文件
+指纹，不能回答「这次分析是否把该研究的全部臂/种子都纳入
+了」。
+
+**已修正：**
+
+- 新增只读入口 `--compare-preregistration FILE`（必须与
+  `--compare` 同用）。它在对比分析完成后，把分析集合与
+  预注册文件逐项对齐：
+  - `comparisons` 声明的每个模式都必须出现在分析中，且
+    非确定性臂之间至少有一个共同种子可形成配对；
+  - 每个非确定性模式必须恰好覆盖预注册 `seeds`，缺格与
+    事后追加种子都判失败；确定性基线（如 `ngram`）不要求
+    逐种子复制；
+  - 每个运行 `config.json` 里的 `preregistration` 记录必须
+    存在（失败运行可缺，但只作为脱落计入），且 `study_id`、
+    预注册文件 SHA-256、`run_mode`、`run_seed` 与分析行一致；
+  - 预注册声明了 `frozen_source_tree_sha256` /
+    `frozen_script_sha256` 时，运行记录中的对应指纹必须
+    相同，防止用冻结后的代码改动重跑；
+  - 运行的数据协议必须与 `data` 一致：`sha256`、
+    `split_policy`、`val_fraction`、`test_fraction`、
+    `group_separator`、清洗开关与近重复阈值；
+  - 分析指标必须是预注册 `primary_metric`，分析基线必须是
+    预注册 `baseline_mode`，共同步数必须显式固定为预注册
+    `common_step`，等价界必须与预注册 `equivalence_margin`
+    一致。缺一即拒绝出报告。
+- `--compare` 的每一行现在携带完整 `preregistration_record`，
+  不再只保留几个派生字段；覆盖结果写入
+  `comparison_analysis.json` 的 `preregistration_coverage`
+  （含 `errors`、`advisories`、`missing_comparisons`、
+  `missing_seed_cells`、`extra_seed_cells`、
+  `preregistration_mismatches`、`data_mismatches` 与各
+  协议项核对结果）。发现偏离时以非零状态码退出，且不写
+  报告文件。
+- `--allow-preregistration-coverage-deviation` 只用于显式
+  记录探索性分析：报告会写
+  `preregistration_coverage_override=true`，但不能把该报告
+  称为确证结论。该开关必须与 `--compare-preregistration`
+  同用，避免静默失效。
+- 只读入口（`--check-environment`、`--check-source`、
+  `--write-manifest`、`--verify-manifest`、`--audit-run`）
+  拒绝与这两个新参数同时使用，防止参数被静默忽略。
+- 新增回归测试：完整设计通过；缺臂、缺种子、事后加种子、
+  预注册文件指纹变化、指标/基线/共同步数/等价界漂移、数据
+  协议漂移、源码树漂移均判失败；确定性基线豁免逐种子复制；
+  失败运行缺记录只发 warning；两个新参数缺 `--compare` 时
+  由 argparse 拒绝。
+
+**仍有限制：**
+
+- 覆盖门核对的是「分析集合与预注册声明一致」，不核对每个
+  运行内部的指标是否真实；后者仍由 `--audit-run`、test 封条
+  与 artifact manifest 负责。
+- 它不替代 test 访问账本：`--compare` 只使用 val 指标，
+  test 仍必须在冻结候选后通过 `--test-ledger` 统一解封。
+- 预注册之外的模式只记为探索性 `advisories`，不强制排除；
+  若研究要把它们写入确证结论，必须重新预注册。
+- 同一模式/种子存在多个运行（例如不同消融格）时，覆盖门只
+  检查种子单元存在，不判断调用者是否只挑了其中一个有利配置；
+  这仍需要预注册 `comparisons` 与消融覆盖检查共同约束。
+
+## 45. RQ4 干预证据的不确定性与跨种子汇总（本轮补充）
+
+**判定：`--routing-interventions` 此前只有单次运行的损失差值点估计，
+没有区间，也没有跨种子汇总。** `routing_shuffle` 的 Δloss、逐专家
+`expert_drop` 的重要性排序与 `importance_cv` 都来自同一批固定验证
+窗口的一次前向；把「Δloss>0」或「CV 很大」直接写成专家专门化的
+功能证据，会把有限评估批的抽样噪声当成方法性质。README 还声称
+这些干预会在 `--compare` 中按种子聚合，但对比层实际只聚合了
+`routing_analysis` 的利用率/重合度指标，干预结果仍停留在单运行
+定性描述。
+
+**已修正：**
+
+- `_intervention_eval` 保留每个固定评估批的损失、token 准确率与
+  token 数（`per_batch`），汇总字段不变；逐批明细只用于计算，
+  不写进最终报告，避免 E 个专家产生 O(E×batches) 条冗余记录。
+- 新增 `_paired_bootstrap_delta_ci`：在同一批固定验证批上对
+  「干预 − 基线」做配对百分位 bootstrap（默认 2000 次、95%），
+  重采样单位是评估批而不是 token，批级差值再按该批 token 数
+  加权以对齐总量口径；随机种子由
+  `blake2b(run_seed|intervention|batches)` 确定性派生，不消耗
+  全局 RNG。批数少于 2、批数不一致、批下标不一致或有限配对不足
+  时返回 `available=false` 与具体原因，不伪造 0 宽区间。
+- `routing_shuffle` 新增 `loss_delta_ci95`、`accuracy_delta_ci95`
+  与完整 `bootstrap` 元数据；每个 `expert_drop` 条目新增
+  `loss_delta_ci95`。`expert_drop` 汇总新增
+  `experts_with_ci_excluding_zero`、`experts_with_positive_ci_low`、
+  `max_expert_ci95_low`、`min_expert_ci95_high`、
+  `importance_ci_separated` 与 `specialization_evidence`
+  （`separated` / `not_separated` / `insufficient_batches`）。
+  `separated` 仅表示最重与最轻专家的 95% 区间分离，是描述性
+  证据，不是对 E 个专家做多重比较校正后的确证检验；同时报告
+  `max_loss_delta_relative` / `min_loss_delta_relative`，避免把
+  「统计上可分辨但实际可忽略」的差值写成重要发现。
+- 新增 `routing_intervention_comparison_report`：
+  `--compare` 按模式汇总各运行的打乱 Δloss、最大专家屏蔽 Δloss、
+  重要性 CV、区间排除 0 的运行数、`specialization_evidence=separated`
+  的运行数与批数；`comparison_analysis.json` 新增
+  `routing_intervention_comparison`，展示层新增
+  `[rq4-intervention]` 小节。批数不一致、少于 3 个种子、没有
+  区间分离或只有部分运行区间排除 0 时给出警告，明确这些跨种子
+  汇总仍是描述性证据，不替代预注册的独立分析。
+- 新增回归测试：配对 bootstrap 的确定性、均值与区间方向、单批
+  不可用；逐批统计与总损失/总 token 数一致；干预报告包含区间
+  与合法 `specialization_evidence`；跨运行按模式汇总的均值、
+  区间排除 0 计数与分离计数。
+
+**仍有限制：**
+
+- 区间只覆盖**这批固定验证批**的评估抽样不确定性；它不覆盖
+  换训练种子、换文档/来源或时间外推。跨种子汇总也只是
+  Mean ± Std 与计数，不是对干预效应的事后确证检验；不得因为
+  某个种子/专家区间排除 0 就选择性报告。
+- 默认干预批数 `min(eval_batches, 5)` 通常很少，百分位区间很粗；
+  批数少于 2 时直接不可用。需要更精确的干预证据时应在训练前
+  增加 `--routing-intervention-batches`，而不是事后挑一个
+  区间最窄的设置。
+- 配对 bootstrap 假设固定评估批在干预前后可交换且批间近似
+  独立；同一批内 token 相关已被「按批重采样」吸收，但批间若
+  沿数据顺序强自相关，区间仍会偏窄。报告保留批数与
+  `bootstrap` 元数据，读者应结合评估窗口重叠/自相关诊断解读。
+- `expert_drop` 的区间分离只比较点估计最大/最小专家，未对全部
+  E 个专家做同时区间或 Holm 校正；`importance_cv` 仍只是描述性
+  离散度。真正的「专家专门化」主张仍应配合预注册的干预分析、
+  多种子重复与外部验证，而不是单个运行的区间。
+- 跨运行汇总只读取 `config.json` 的 `routing_interventions`；
+  旧运行或未启用干预的运行不参与，不会被当成「干预无效应」。
+  不同运行若使用不同评估批数/窗口，汇总会告警但不能自动对齐。
+
+## 46. 结果分析：检验假设诊断、秩效应量与跨指标多重性（本轮补充）
+
+**判定：结果分析的推断引擎已经覆盖 t / 符号翻转 / TOST / Holm /
+脆弱性 / 脱落界，但仍有四个分析口径的缺口。**
+
+1. **检验假设从未被审视**。配对 t 检验假设差值近似正态，
+   `hedges_g` 用合并标准差作尺度隐含两臂方差可比，但报告从未
+   给出任何分布诊断：一个差值明显偏斜或重尾的对比，与一个
+   近似正态的对比，在报告里看起来完全一样。读者只能默认
+   假设成立。
+2. **秩（分布无关）效应量缺失**。配对情形只有 dz/gz（依赖
+   差值标准差，被单个极端种子抬高），非配对（Welch）情形
+   只有基于合并标准差的噪声比与 g；没有 Wilcoxon 符号秩
+   检验、没有 rank-biserial、没有 Cliff's δ。符号翻转检验
+   的统计量是差值均值，对单个极端差值的稳健性与 t 同源；
+   缺少一个基于秩幅度的对照。
+3. **效应量自身没有不确定性**。dz / gz / 噪声比只有点估计；
+   小种子数下估计不稳定，「配对 dz=2」可能对应一个同时覆盖
+   「可忽略」与「大效应」的区间，但报告不显示这一点。
+4. **跨指标多重性没有显式披露**。Holm/BH 家族只覆盖单一
+   判定指标内部的检验；`--compare` 同时聚合全部可计算指标，
+   在多个指标上分别看结果、只报告显著者，等价于未校正的
+   多重检验，而报告没有把这一结构性事实写出来。
+
+**已修正：**
+
+- 新增 `_paired_difference_diagnostics`：对每个配对对比的
+  逐种子差值报告偏度 g1、超额峰度 g2、各自正态假设下的
+  标准误与「|统计量| > 2·SE」提示性标记（Kim, 2013 经验
+  规则）、均值/中位数之差（按差值 sd 归一）与正负差值计数。
+  n<4 时峰度标准误无定义（分母含 n-3），峰度只作数值展示；
+  文档与报告都明确：小样本（n<8）下正式正态性检验没有
+  功效，本诊断是描述性证据，未标记不等于假设成立。字段为
+  `paired_diagnostics`，全因子主效应/交互同样附带。
+- 新增 `_wilch_variance_ratio`（`_welch_variance_ratio`）：
+  Welch 对比两臂的方差比与两样本 F 检验双侧 p 值（用正则化
+  不完全 Beta 计算），`heteroscedastic` 状态提示合并标准差
+  口径的 `hedges_g` 解读受限；Welch 检验本身不要求等方差，
+  该诊断不改变显著性判定。一臂方差为 0（确定性折叠等）时
+  显式报 `zero_variance_one_arm`，不伪造比值。
+- 新增 `_wilcoxon_signed_rank_test`：Wilcoxon 符号秩检验。
+  有效观测（非零差值）≤12 时穷举 2^n 种符号组合给出精确
+  双侧 p；并列 |差值| 取平均秩并记录并列组数；更大样本用
+  带并列校正与连续性校正的正态近似。零差值丢弃并计数，
+  全部为零时判为退化。效应量为匹配对秩双列相关
+  rank-biserial r=(W+−W−)/(W++W−)。它使用与符号翻转检验
+  相同的「差值分布关于 0 对称」零假设（报告字段
+  `randomization_null_assumption` 同口径），是利用秩幅度的
+  稳健性对照：**不进入 Holm 家族、不改变显著性判定**；与
+  配对 t 在 0.05 水平结论不一致时在 `[assumptions]` 小节
+  点名并提示检查 `paired_differences` 是否被单点驱动。
+- 新增 `_cliffs_delta` 与 `_cliffs_delta_bootstrap_ci`：非
+  配对（Welch）对比的 Cliff's δ 随机优势效应量（含常规解读
+  阈值 0.147/0.33/0.474，仅作约定说明）与确定性种子（样本
+  内容 blake2b 派生，不消耗全局 RNG）的百分位 bootstrap
+  95% CI；任一臂少于 2 个观测时显式不可用，不伪造 0 宽
+  区间。字段为 `cliffs_delta` / `cliffs_delta_ci95`。
+- 效应量区间：`_paired_effect_size` 对配对 dz 附大样本近似
+  95% CI（SE=√(1/n+dz²/(2n))，Morris & DeShon 2002 配对
+  口径），Hedges gz 区间按同一偏倚校正因子 J 缩放；字段
+  `cohens_dz_ci95` / `hedges_gz_ci95`（含 method 与「小 n
+  下宽度偏乐观」的 note）。零方差/非配对口径不产出区间。
+- 新增 `[assumptions]` 展示小节：汇总全部对比（单因子、
+  基线直接对比、全因子效应）中偏度/峰度越界、方差悬殊、
+  t 与 Wilcoxon 结论冲突的条目；没有标记时也明确说明
+  「未发现偏离证据，不证明假设成立」。
+- 新增 `_metric_multiplicity_report`（payload 字段
+  `metric_multiplicity`，展示行 `[multiplicity]`）：声明
+  显著性校正的作用范围是「单一判定指标内部的检验家族」，
+  列出预注册主指标（`--primary-metric`）与当前分析指标
+  不一致的运行；没有任何运行预注册主指标时显式说明
+  「无法排除事后指标选择，当前指标的显著性不构成确证
+  结论」。该报告不改变判定，但把「除主指标外的指标都是
+  探索性的」从惯例变成机器可读字段。
+- 新增 `--compare-csv FILE`（只读，必须配合 `--compare`）：
+  `write_comparison_csv_files` 把分析结果摊平为两张稳定
+  列名的 CSV——`FILE`（对比表：单因子/`--compare-baseline`
+  直接对比/全因子效应，family 列区分；含 p 值、Holm/BH
+  校正值、效应量及其 CI、Wilcoxon/Cliff's δ、诊断状态、
+  脆弱性与脱落界 verdict）与自动派生的
+  `FILE.aggregates.csv`（各实验单元 Mean ± Std 与 95% CI、
+  效率均值）。列名只增不改；混杂对比只写身份列、统计列
+  留空；写盘沿用临时文件 + `os.replace` 的原子写。该导出
+  面向绘图与二次分析（pandas/电子表格），不重算统计量；
+  完整证据仍是 `--compare-report` 的 JSON。四个只读入口
+  （`--check-environment` / `--verify-manifest` /
+  `--write-manifest` / `--audit-run`）的参数冲突列表同步
+  加入该参数，防止与训练/审计参数混用时被静默忽略。
+- 清理：删除 `parse_factor_spec` 中对空列表求值的
+  `has_ngram` 死代码（永远为 False 且从未被读取；真实的
+  跨 family 核对在 `--compare` 阶段完成）。
+- 新增回归测试：偏度/峰度标记与 n<4 退化、Wilcoxon 精确
+  p 的手算核对（含并列 midrank 与零差值丢弃）、正态近似
+  分支、Cliff's δ 的极端/并列值与 bootstrap 确定性、方差比
+  与 F 检验、效应量区间包含点估计、`_contrast_test` 与
+  `factor_contrasts` 的新字段传播、`metric_multiplicity`
+  的三态判定、`[multiplicity]` / `[assumptions]` 展示、CSV
+  导出的列稳定性与聚合行、只读入口拒绝 `--compare-csv`。
+
+**仍有限制：**
+
+- 偏度/峰度是描述性诊断，不是正态性检验；2·SE 规则在小
+  样本下非常保守（n=5 时偏度标记在数学上不可达：最大偏度
+  ≈(n−2)/√(n−1)=1.5 < 2·SE≈1.83），未标记不构成正态证据，
+  标记也只提示「查看逐种子差值」，不自动改用其他检验。
+- Wilcoxon 符号秩与符号翻转共享对称性零假设；并列差值多
+  时正态近似会偏离（报告记录并列组数），精确枚举分支在
+  n≤5 时与符号翻转一样受 2/2^n 分辨率下限约束。
+- Cliff's δ 的 bootstrap 区间只覆盖本批种子内的重采样
+  不确定性；种子数很少（3~6）时百分位区间很粗，只能作
+  描述性证据。效应量的解析区间是正态近似，小 n 下宽度
+  偏乐观；它们都不替代 MDE/TOST/脆弱性口径。
+- 跨指标多重性披露是程序性护栏，不是统计校正：把多个指标
+  纳入确证结论需要重新预注册（声明指标家族与校正方式），
+  报告不能替研究者完成这件事。
+- CSV 导出是分析结果的视图，不参与统计计算；下游二次
+  分析若自行做检验，其多重比较口径与本报告无关，必须
+  自行声明。
+
+## 47. 结果分析：延迟合并的机制归因必须有单因素对照（本轮补充）
+
+**判定：组件级判定此前允许仅凭 (1+N)×2 消融的主效应把收益归给
+延迟合并方案 A/B，而该主效应是多因素对比——它同时改变了合并
+时机/位置、第二轮路由宽度、专家复用方式与分支数。这与第 2 节
+自己的判定（「原六格消融无法把收益归给延迟合并」）矛盾：结论
+可以在报告里被重新写回来。**
+
+**已修正：**
+
+- 新增 `mechanism_control_report`（`exp/part_029_ablation.py`），
+  按「只改一个因子」的对照臂做单因素比较：
+  A ↔ `local_base_k2`（只改变合并时机）、B ↔ `B_early`
+  （只改变合并位置）。对照必须在其余因子（均衡开关、上下文）
+  上完全一致，且受控变量检查通过，否则不算单因素证据。
+- 逐方案状态：`supported`（校正后显著且延迟合并更好）、
+  `contradicted`（校正后显著更差）、`partial`（水平间方向
+  不一致）、`not_supported`（无支持证据）、`missing_control`
+  （运行集没有对照臂）、`no_control_defined`（该方案没有登记
+  对照）、`confounded`（对照臂存在但两臂除被检验因子外还有
+  差异）、`unverifiable`（一侧缺协议记录，无法核对两臂是否只
+  差一个因子）、`insufficient_data`（对照臂没有可用运行）、
+  `insufficient_seeds`（共同种子不足）。
+- 单因素核对改为逐「可比单元对」执行，并逐项核对两臂的
+  `comparison_protocol`（除 `mode` 外的全部协议项）。此前受控
+  变量检查只覆盖「未声明为因子的协议项」，因此 `k1/k2/balance_coef`
+  这类声明因子的臂间差异不会被判为混杂——机制对比可能悄悄变成
+  多因素实验。现在协议项实际不同 → 该对比判 `confounded` 并在
+  `confounded_pairs` 点名差异键；一侧缺协议记录 → 判
+  `unverifiable`（缺记录不等于一致）；某因子的水平没有交集
+  （例如 A 的 `k2=4`、对照 `k2=2`）→ 判 `confounded` 并在
+  `unmatched_levels` 点名因子。报告顶层给出
+  `single_factor_verified`。
+- `ablation_coverage` 新增机制对照臂记账：`mechanism_controls`
+  给出对照臂、两档的共同种子数与缺档 `missing_control_levels`，
+  `mechanism_missing_cells` 列出缺失的对照单元（如
+  `local_base_k2/b=on`）并进入 `blockers`；机制臂的种子对齐、
+  低重复单元与失败率也一并记录，避免「只跑了一半的对照」被当作
+  完整的两档证据。
+- 机制对照自成一个 Holm/BH 家族，不与全体两两对比混family；
+  方向判定按「延迟合并方案是否更好」而不是 baseline/variant
+  的位置（因子的自然顺序里 `B` 排在 `B_early` 之前，B 的对照
+  出现在 variant 侧）。
+- `ablation_component_verdicts` 增加门控：缺对照或对照被混杂
+  → 该组件判为 `blocked` 并进入 `blockers`；对照反向 → 判为
+  `contradicted`；对照支持 → 组件结论不再受此阻断。负载均衡
+  损失组件不受影响（其本身即单因素对比）。
+- 分析报告新增 `[mechanism]` 段与 `mechanism_controls` 字段。
+- 设计侧新增 `--ablation-mechanism-controls`（必须配合
+  `--suite-ablation`）：把对照臂加入同一套件、同一 seed、同一
+  balance 两档，保证「只改一个因子」。默认不开启——消融套件的
+  家族规模与种子门槛不能被无意抬高。对照臂必须写进预注册声明
+  的模式集合，否则预注册覆盖检查会拒绝该次分析。
+
+**仍有限制：**
+
+- 单因素对照只回答「在同样计算图下，合并时机/位置的差异是否
+  带来收益」，不回答收益大小是否达到有实际意义的量级；后者仍
+  由 TOST/等价界与 MDE 口径决定。
+- 缺对照时组件判为 `blocked` 是「归因未就绪」，不是「机制无效」；
+  正确反应是补跑对照臂，不能据此写「延迟合并无效」，也不能用
+  多因素主效应代替。
+- 机制对照进入运行集后，探索性两两对比的家族规模从 15 升到
+  45，`--plan-design` 的保守所需种子数随之上升；预先指定的
+  因子家族（每方案 7 个检验）与机制家族（每方案 2 个水平）
+  各自校正，种子规划仍应按 `--plan-design` 的保守上界准备。
+- `insufficient_seeds`（共同种子 <3）时无法做配对检验，报告
+  不做任何方向性结论；补种子比调等价界更可靠。
+- 机制对照仍要求 `k1/k2/top_k` 等结构项在两臂之间逐项一致；
+  现在这一条由协议核对自动执行（不一致 → `confounded`，缺记录
+  → `unverifiable`），结构不一致时先修设计再谈机制。历史运行若
+  没有记录 `comparison_protocol`，只能判为「无法核对」，不能按
+  「未发现差异」放行：补跑或重新记录协议，不要靠推断认定一致。
+- 单因素核对只能证明「两臂的记录一致」，不能证明记录本身如实
+  反映训练过程；协议由训练代码写入 `config.json`，其可信度依赖
+  记录路径本身。
+
+## 推荐的确证流程（优先级）
+
+1. 冻结代码：设置 `EXPERIMENT_FREEZE=true`；记录 git commit /
+   `script_sha256` / `source_tree_sha256`（`--print-source-fingerprint`），
+   把 `source_tree_fingerprint.json`、
+   `docs/experiment_protocol.md` 与预注册假设一起归档。
+2. 固定数据协议：`--split-policy chronological` + 时间清单，
+   或明确使用 `contiguous` 且不声称时间外推；实体清单审计；
+   默认 val-only 清洗；训练前核对 `data_audit.label_coverage`、
+   `data_audit.near_duplicates`（若启用近重复审计/清洗）、
+   `data_audit.evaluation_near_duplicates`（val/test 内部与
+   val↔test 的 `effective_groups`、最大簇与跨 split 对）与（清洗
+   确有删除时的）`train_cleaning.deletion_bias`，把高删除偏差、
+   未见评估标签或阈值下仍存在的近重复写进限制/敏感性分析计划。
+3. 先做设计预检：在预注册中写 `power`（预期种子间标准差、
+   最小效应、目标功效、预期脱落率；消融还要写
+   `planned_contrasts` 含 `interaction`）与 `run_order`
+   （`counterbalanced` 或 `williams` + 种子；担心上一次运行
+   carryover 时用 `williams`，区组数不足设计行数整数倍时
+   报告部分平衡；区组缺格时退回 `randomized` 并承认位置/
+   carryover 可能不均衡），若已有试点/先前运行则用
+   `--design-pilot-runs` 把观测配对 sd 与脱落率写进
+   `pilot_evidence` 并强制重算，再用 `--plan-design` 检查所需
+   启动种子数、按对比类型分层的实际功效/MDE（`binding_contrast`，
+   消融通常是 `interaction`）、sd 敏感性、位置平衡与 token
+   预算；功效不足时先加种子，而不是跑完再解释。若研究要
+   主张「无实质差异」，同时在顶层写 `equivalence_margin` 并
+   设 `power.plan_equivalence=true`，检查
+   `equivalence.required_seeds_with_attrition` 与
+   `equivalence.margin_for_target_power`；不能靠事后放宽
+   等价界制造等价结论。
+4. 运行机制对照：`smelt base local_base local_base_k2 A B B_early`，
+   **至少 6 个种子**（按 `power` 计算，家族校正后通常更多），
+   固定 `--common-step` 与训练预算；用 `--budget-match` 报告
+   完整计算图比例；按同一 `--run-order-seed` 执行随机化/
+   平衡区组；确认 `failure_policy`（默认 `continue`，需
+   fail-fast 时在计划阶段冻结 `stop`），训练期失败后仍让
+   剩余区组跑完并保留失败目录。
+5. 统计：主检验配对 t + 符号翻转（明确对称性假设）；RQ1
+   同时预注册 `val_loss_curve_mean_to_common_step` 与固定
+   `--common-step`，用曲线时均回答「收敛速度」、用共同步数
+   单点回答「该时刻质量」，两者与 final 一起报告；报告
+   失败率、`sweep_execution`、MDE、门槛检验、TOST、
+   `fragility_summary`、`design.order_balance`（含 `carryover`）
+    与 `run_order`；逐检验 95% CI 只
+    描述效应量，校正后的结论以 Holm 为准，并同时报告
+    Bonferroni `α/m` 同时区间；窗口级证据同时报告种子×窗口
+    两层 bootstrap 与方差占比，用它决定补种子还是扩评估集。
+     检查 `[assumptions]`（配对差值偏度/峰度、两臂方差比、
+     t 与 Wilcoxon 符号秩结论冲突）与 `[multiplicity]`
+     （除预注册主指标外的指标只作探索性证据）；同时检查
+     `[mechanism]`（单因素机制对照）：缺对照、对照被混杂/无法
+     核对、或对照数据与种子不足时，延迟合并的组件结论是
+     `blocked`，只能写「归因未就绪」，不能写「延迟合并方案
+     各自有用」；正式归档的
+
+    对比表用 `--compare-csv` 导出、完整证据用
+    `--compare-report` 落盘。
+    删除种子后不再显著的结论不能写成稳健，不把不显著读成等价；
+   同时报告 `attrition_bounds_summary`：有缺测/失败的对比若在
+   观测支持范围内界跨 0，完整案例的显著性不能写成稳健；该界是
+   有界结果假设下的部分识别，不是置信区间，缺失可能超出观测范围
+   时真实界为无穷宽，正确反应是补齐运行而不是只报一个界。顺序
+   强相关先查漂移。正式分析必须用
+   `--compare ... --compare-preregistration preregistration.json
+   --compare-report runs/analysis.json`：先核对分析集合覆盖了
+   预注册的全部臂/种子与数据/指标/基线/共同步数/等价界，再
+   把带 `preregistration_coverage` 的报告归档；覆盖失败时先
+   补齐运行或重新预注册，不能改用 `--allow-...` 把偏离写成
+   确证结论。
+6. 冻结候选后统一解封 test：指定共享 `--test-ledger`，
+   每个候选只解封一次；用 `--final-test-comparison` 报告全部
+   候选，而不是只报告最好的那个。
+7. 外部归档：把 `git archive`、全部 config/metrics（含失败）、
+   `design_plan.json`/`run_order.json`、分析脚本与最终报告
+   上传到不可变存储，记录 DOI/校验和。归档前对每个最终运行
+   目录执行 `--write-manifest`，上传/解压后再执行
+   `--verify-manifest --verify-manifest-strict`；清单是快照，
+   续跑或补测后必须重新生成。最后对每个最终运行目录执行
+   `--audit-run --audit-strict`（可附 `--audit-source`、
+   `--audit-data`、`--audit-preregistration`），确认 config /
+   environment / metrics / test 封条 / 预注册确实属于同一次
+   运行；退出码非零的运行不能作为最终可复现证据。
+
+## 48. 实验设计：试点规模必须在跑试点之前规划（本轮补充）
+
+**判定：`--design-pilot-runs` 的试点校准只有在试点本身足够大时
+才可信，但框架此前只能在试点跑完后报告「试点运行少于 6 个」
+的告警，不能在冻结设计前回答「要按 `upper_confidence_bound`
+口径校准 sd/脱落率，试点每对处理单元至少需要多少个共同种子」。
+3~6 个配对种子的 sd 单侧置信上界是点估计的 2~4 倍（n=2 时约
+16 倍、n=6 时约 2.1 倍，95% 置信），按上界校准会把所需种子数
+推高到设计无法承受；脱落率的 Clopper-Pearson 上界同样由试点
+规模决定。研究者在冻结设计时对「试点要跑多大」没有任何工具
+支持，等于把试点规模留给了直觉。**
+
+**已修正：**
+
+- 新增 `plan_pilot_size()`（`exp/part_044_pilot_power.py`），
+  在训练前、用预注册声明的先验值回答试点规模：
+  - sd 判据（`pilot_size_plan.sd_planning`）：n 个共同配对种子
+    下，正态配对差值 sd 的单侧置信上界乘数
+    `sqrt(df / chi2_{1-c, df})` 不得超过容差
+    `sd_ucb_tolerance`（默认 1.5）；每个候选 n 同时按上界口径
+    完整重算 `required_seeds_with_attrition`，直接回答「该规模
+    试点的 UCB 会不会把设计推到种子不够」。
+  - 脱落率判据（`pilot_size_plan.attrition_planning`）：每单元
+    n 个运行、失败数按声明脱落率保守上取整时，Clopper-Pearson
+    精确上界折算后的启动种子数不得超过计划启动种子数；计划
+    没有预留脱落余量时判据不可满足，如实报告而不是放宽公式。
+  - `pilot_calibration=point` 时两类上界都不参与设计判定，
+    判据标记为信息性并告警「小试点点估计不稳定的风险由表
+    披露」。
+  - 输出 `recommended_pilot_runs_per_cell`（不低于可评估单元对
+    的最小共同种子数 3）与 `recommended_total_pilot_runs`，并
+    提示各单元应共享同一批种子，否则单元对的共同配对数会
+    少于每单元运行数。
+- `--plan-design` / 正式套件在**没有** `--design-pilot-runs` 且
+  预注册声明了 `power` 块时，把 `pilot_size_plan` 写入
+  `design_plan.json`（随 `plan_id` 冻结）并打印
+  `[design][pilot-size]` 摘要；已有试点证据时不重复规划
+  （不确定性已由 `pilot_evidence` 的实测 UCB 敏感性表披露）。
+  没有声明 `expected_seed_sd_relative` 时不生成该块——没有
+  可对照的先验值，任何规模建议都只是编造精度。
+
+**仍有限制：**
+
+- 建议值基于声明先验与卡方/Clopper-Pearson 上界公式，不是
+  对真实 sd/脱落率的保证；试点跑完后仍由
+  `--design-pilot-runs` 按单向上调规则校准，失败运行必须
+  一并传入。
+- sd 判据的默认容差 1.5 意味着「若真实 sd 位于试点 UCB，所需
+  种子数约按 (1.5)² ≈ 2.25 倍准备」；该容差是设计选择，不是
+  统计惯例，研究者应结合计划余量选择并在报告中说明。
+- 试点规模规划不解决试点与正式协议可比性问题（同代码/数据/
+  训练/评估口径仍由 `comparability` 报告核对），也不校准
+  真实效应大小。
+
+## 49. 实验设计：预注册必须包含停止规则（本轮补充）
+
+**判定：固定样本设计必须预先声明「最多跑多少次运行、允许在
+哪些步数做中期汇总」，否则「先跑 3 个种子、不显著就再加 3 个」
+的序贯偷看无法与「设计如此」区分，家族错误率在多次中期检验
+下失控。`docs/design_preparation.md` 第 5 节已要求「增加种子/
+重跑必须作为新研究阶段重新预注册」，但这只是文档约定：预注册
+schema 没有可核对的运行上限字段，设计计划与启动门也无法拒绝
+超限扩展。`ANALYSIS_IMPROVEMENTS.md` 第 3.2 节提出的
+`stopping_rules` 字段此前未实现。**
+
+**已修正：**
+
+- 预注册 schema 新增可选字段 `stopping_rules`：
+  - `max_total_runs`（必填正整数）：本项研究最多运行的次数
+    （含全部臂/种子/消融展开）。schema 校验拒绝
+    `max_total_runs < len(seeds)` 的自相矛盾声明；设计计划在
+    冻结时核对计划运行数，超限直接拒绝（错误信息明确「增加
+    种子/臂必须作为新研究阶段重新冻结并预注册」）。
+  - `interim_look_steps`（可选，无重复正整数列表）：允许做
+    中期汇总的训练步数；声明步数超过 `steps` 时被拒绝
+    （预算内取不到的观察点没有意义）。未声明的步数上做
+    中期结论属于序贯偷看。
+  - `extension_requires_new_preregistration`（可选布尔，默认
+    true）：超出预注册计划的扩展是否必须重新预注册。
+- 记录与归档：字段随每个运行的 `config.json`
+  （`preregistration.stopping_rules`）与 `design_plan.json`
+  （`stopping_rules` 回显，含 `within_max_total_runs`）落盘，
+  被 `plan_id` 与预注册文件 SHA-256 覆盖；`print_design_summary`
+  打印 `[design][stopping]` 运行上限行。
+- `preregistration.example.json` 给出 `max_total_runs=24`（覆盖
+  4 臂 × 6 种子的计划）与声明中期观察点的示例。
+
+**仍有限制：**
+
+- `interim_look_steps` 目前只声明「允许在哪里看」，不自动做
+  序贯 alpha 分配（Pocock/O'Brien-Fleming 校正）——在中期
+  观察点报告结论时必须按未校正口径声明「这是中期观察，
+  不是最终检验」，或使用预注册的调整后阈值；正式的群序贯
+  检验仍是未实现能力。
+- `max_total_runs` 只约束「计划运行数」，不约束 `--resume`
+  续跑或重跑同一目录（后者由 out 目录覆盖保护与账本机制
+  约束）；跨目录新增种子属于新研究阶段，必须重新预注册。
+- 该字段是可选的：不声明 `stopping_rules` 的旧协议不受影响，
+  但也无法用启动门拒绝事后扩展；文档建议所有确证研究声明。
+
+## 50. 实验设计：排除标准与最小效应论证必须预先声明（本轮补充）
+
+**判定：数值失败的自动检测只覆盖 NaN/Inf/数值停止；「哪些
+运行/观测因其它原因被排除出分析」（如训练曲线缺失某窗口、
+数据加载异常但未触发数值停止、评估子集损坏）此前没有预注册
+字段，事后排除是选择性报告的主要入口。同样，`min_effect`
+决定「多小的差异算没有实际意义」，是预注册里最容易事后反向
+拟合的声明——预注册只要求它是 (0, 1] 内的正数，不要求任何
+依据说明。`ANALYSIS_IMPROVEMENTS.md` 第 3.2 节提出的
+`exclusion_criteria` 与 `sample_size_justification` 此前未实现。**
+
+**已修正：**
+
+- 预注册 schema 新增可选字段 `exclusion_criteria`：
+  - `attrition_definition`（必填非空字符串）：除自动数值失败
+    检测外，按什么口径把运行排除出分析；
+  - `exclusion_rules`（可选非空字符串列表）：逐条预声明排除
+    规则；不在此列表中的事后排除都是协议违反；
+  - `note`（可选字符串）。
+- 预注册 schema 新增可选字段 `min_effect_justification`
+  （非空字符串）：说明最小有意义效应的依据（领域效应量、
+  先前研究、成本-收益权衡等）。不强制（旧协议不受影响），
+  但声明时必须是实质性内容，空白占位会被拒绝——留空等于
+  没有「要不要写依据」的决定权。
+- 两个字段随每个运行的 `config.json`
+  （`preregistration.exclusion_criteria` /
+  `preregistration.min_effect_justification`）落盘，归档时能
+  核对「事后排除是否只用了预声明规则」，而不是只能凭报告
+  自述；`preregistration.example.json` 给出完整示例。
+- `schemas/preregistration.v1.json` 与 Python 入口
+  `preregistration_schema_error` 的字段定义交叉一致；
+  `tests/_core_DesignPreparationTests_02.py` 增加接受/拒绝/
+  记录回显/schema 同步回归测试。
+
+**仍有限制：**
+
+- 两个新字段是声明与留证机制：框架不自动执行
+  `exclusion_rules`（哪些运行被排除仍由分析入口的失败检测与
+  研究者决定），也不验证 `min_effect_justification` 的论证
+  质量——外部审计仍需人工阅读依据是否实质性。
+- `exclusion_criteria` 不改变 `failure_rates` /
+  `attrition_bounds` 的既有口径：数值失败仍按 `metrics.jsonl`
+  的自动检测识别；预声明的其它排除规则若要生效，需在分析
+  阶段显式实现并在报告中披露与预注册的一致性。
+- 与 `power.justification`（功效不足时的理由）一样，这些字段
+  写进预注册后只能随新研究阶段修改；不能在同一份预注册里
+  补写。
