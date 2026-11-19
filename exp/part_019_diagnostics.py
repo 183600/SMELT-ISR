@@ -873,8 +873,7 @@ def measure_efficiency(
 
         # 纯推理测量不回流训练图，与 evaluate 一致使用
         # inference_mode。
-        with torch.no_grad():
-        with torch.inference_mode(), autocast:
+        with torch.no_grad(), torch.inference_mode(), autocast:
             for _ in range(max(0, warmup)):
                 model(x, y)
 
