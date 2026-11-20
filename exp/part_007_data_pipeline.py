@@ -1178,9 +1178,9 @@ def _deletion_bias_record(
         bigram_js = round(
             _js_distance(
                 dropped_bigram.to(torch.float64)
-                / dropped_bigram_total.clamp_min(1e-10),
+                / dropped_bigram_total,
                 kept_bigram.to(torch.float64)
-                / kept_bigram_total.clamp_min(1e-10),
+                / kept_bigram_total,
             ),
             6,
         )

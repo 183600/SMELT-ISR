@@ -156,7 +156,7 @@ class RoutingProbe:
                         probs.clamp_min(1e-12).log()
                         * probs
                     ).sum(-1).mean()
-                    / log_e.clamp_min(1e-10)
+                    / log_e
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
