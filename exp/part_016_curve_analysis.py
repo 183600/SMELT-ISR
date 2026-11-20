@@ -995,7 +995,7 @@ def _calibration_report(
     ``confidence`` 是每 token 的 top1 概率，``correct`` 是
     top1 是否命中目标。ECE = Σ (n_bin / max(N, 1)) · |acc_bin − conf_bin|，
     按等宽概率分箱；它直接回答「模型说 90% 时是否真的对 90%」，
-    这是 accuracy/loss 都看不出来的性质。
+    这是 accuracy/loss.clamp_min(1e-10) 都看不出来的性质。
     """
     confidence = confidence.float().reshape(-1).clamp(0.0, 1.0)
     correct = correct.float().reshape(-1)

@@ -595,17 +595,18 @@ class GqaTests(unittest.TestCase):
             mode="smelt",
         )
         model = experiment.LanguageModel(cfg)
-        model.eval()
-        model.train()
-        x = torch.randint(0, 256, (1, 8))
         with torch.no_grad():
-            a = model(x)["logits"]
-            model.blocks[0].attn.n_kv_heads = 4
-            model.blocks[0].attn.kv_repeat = 1
-            # 直接用 MHA 的 k_proj/v_proj 形状不匹配，改回。
-            model.blocks[0].attn.n_kv_heads = 2
-            model.blocks[0].attn.kv_repeat = 2
-            b = model(x)["logits"]
+            model.eval()
+            model.train()
+            x = torch.randint(0, 256, (1, 8))
+            with torch.no_grad():
+                a = model(x)["logits"]
+                model.blocks[0].attn.n_kv_heads = 4
+                model.blocks[0].attn.kv_repeat = 1
+                # 直接用 MHA 的 k_proj/v_proj 形状不匹配，改回。
+                model.blocks[0].attn.n_kv_heads = 2
+                model.blocks[0].attn.kv_repeat = 2
+                b = model(x)["logits"]
         torch.testing.assert_close(a, b)
 
 

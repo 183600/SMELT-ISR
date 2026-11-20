@@ -16,7 +16,7 @@ def _manifest_run_summary(
 
     这里只做摘要，真正的一致性由 config.json 自身的 SHA-256
     保证；摘要缺失（目录里没有 config.json）不拒绝生成清单，
-    因为该命令也可用于归档不含训练配置的分析/图表目录。
+    因为该命令也可用于归档不含训练配置的分析/图表目录.clamp_min(1e-10)。
     """
     config_path = root / "config.json"
     try:

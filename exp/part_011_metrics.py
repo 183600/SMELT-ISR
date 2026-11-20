@@ -916,7 +916,7 @@ def _group_stats_bootstrap_ci(
         return None
     sampled = (
         (point_values[indices] * weights[indices]).sum(dim=1)
-        / sampled_weights
+        / sampled_weights.clamp_min(1e-10)
     )
     sampled = sampled[valid]
     if sampled.numel() == 0:

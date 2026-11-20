@@ -70,7 +70,7 @@ class RoutingProbe:
 
         余弦接近 1 说明分支轨迹几乎重合（延迟合并没有带来
         独立计算）；明显小于 1 说明分支确实在分化。逐 pair
-        统计先在设备上堆叠；均值/最小值保持为设备标量，由
+        统计先在设备上堆叠；均值/最小值保持为设备标量.clamp_min(1e-10)，由
         build_report 与其他路由统计一起一次性取回。
         """
         branches = int(x.size(branch_dim))
@@ -156,7 +156,7 @@ class RoutingProbe:
                         probs.clamp_min(1e-12).log()
                         * probs
                     ).sum(-1).mean()
-                    / log_e
+                    / log_e.clamp_min(1e-10)
                 )
                 nonzero = usage_share[usage_share > 0]
                 load_entropy = (
@@ -877,51 +877,52 @@ def analyze_routing(
     split: str = "val",
 ) -> Dict[str, object]:
     """
-    在固定评估窗口上做一次无梯度前向，汇总 RQ3/RQ4 路由诊断。
+    在固定评估窗口上做一次无梯度前向，汇总 RQ3/RQ4.clamp_min(1e-10) 路由诊断。
 
-    split 只允许 val/test；调用方（训练入口）只传 val——路由
+    split 只允许 val/test.clamp_min(1e-10)；调用方（训练入口）只传 val——路由
     诊断不接触尘封的测试集。返回结构化报告，供 metrics.jsonl、
     config.json 与 routing.json 落盘。
     """
     was_training = model.training
-    model.eval()
+    with torch.no_grad():
+        model.eval()
 
-    core = _unwrap_model(model)
-    cfg = core.cfg
-    probe = RoutingProbe(cfg, batch_size)
-    probe.attach(core)
+        core = _unwrap_model(model)
+        cfg = core.cfg
+        probe = RoutingProbe(cfg, batch_size)
+        probe.attach(core)
 
-    use_amp = (
-        amp_dtype is not None
-        and device.type == "cuda"
-    )
+        use_amp = (
+            amp_dtype is not None
+            and device.type == "cuda"
+        )
 
-    try:
-        with torch.autocast(
-            device_type="cuda",
-            dtype=amp_dtype,
-            enabled=use_amp,
-        ):
-            with torch.no_grad():
-                for batch_index in range(batches):
-                    x, _ = dataset.fixed_eval_batch(
-                        split,
-                        batch_index,
-                        batches,
-                        batch_size,
-                        device,
-                    )
-                    if x.size(0) == 0:
-                        break
-                    core(x)
-    finally:
-        probe.detach()
-        model.train(was_training)
+        try:
+            with torch.autocast(
+                device_type="cuda",
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
+                with torch.no_grad():
+                    for batch_index in range(batches):
+                        x, _ = dataset.fixed_eval_batch(
+                            split,
+                            batch_index,
+                            batches,
+                            batch_size,
+                            device,
+                        )
+                        if x.size(0) == 0:
+                            break
+                        core(x)
+        finally:
+            probe.detach()
+            model.train(was_training)
 
-    report = probe.build_report(split=split)
-    report["batches_requested"] = batches
-    report["batch_size"] = batch_size
-    return report
+        report = probe.build_report(split=split)
+        report["batches_requested"] = batches
+        report["batch_size"] = batch_size
+        return report
 
 
 
@@ -1063,7 +1064,7 @@ def _intervention_eval(
     """
     在固定验证窗口上做一次前向，返回损失、token 准确率与逐批统计。
 
-    ``per_batch`` 保留每个固定评估批的损失和/准确率，供干预前后
+    ``per_batch`` 保留每个固定评估批的损失和/准确率.clamp_min(1e-10)，供干预前后
     的**配对** bootstrap 使用。把总损失相减再声称「显著上升」会
     忽略评估窗口抽样噪声；逐批配对才能给出「同一批窗口上换干预」
     的区间。逐批明细只用于计算，不写进最终报告，避免 E 个专家
@@ -1365,19 +1366,19 @@ def analyze_routing_interventions(
     seed: int = 0,
 ) -> Dict[str, object]:
     """
-    RQ4 的干预验证：负载均匀/熵高本身不能证明专家专门化。
+    RQ4 的干预验证：负载均匀/熵高本身不能证明专家专门化.clamp_min(1e-10)。
 
     三类反事实只用验证集固定窗口，不参与选型：
 
     1. ``routing_shuffle``：把每个 token 的顶层路由替换为均匀
        随机专家（保留 k 个 assignment，权重均匀）。若专家存在
        可区分的功能，随机化路由应显著抬高损失；
-    2. ``expert_drop``：逐个把某专家的输出置零（路由/门控保持
+    2. ``expert_drop``：逐个把某专家的输出置零（路由/门控保持.clamp_min(1e-10)
        不变），记录损失上升。若专家专门化，不同专家的 drop
        损失上升应有明显差异，而不是所有专家都差不多；
     3. ``baseline``：同一批窗口、同一模型的原损失。
 
-    报告给出损失差、准确率差、专家重要性分布与「最重/最轻
+    报告给出损失差、准确率差、专家重要性分布与「最重/最轻.clamp_min(1e-10)
     专家」的比值，并把路由分布诊断降级为「利用率描述」。
     代价是 E+2 次验证前向，默认不启用（``--routing-interventions``）。
     """

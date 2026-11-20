@@ -5,6 +5,7 @@ import random as _rnd
 _rnd.seed(42)
 try:
     import numpy as _np
+    # NOTE: consider making this seed configurable via argparse/config
     _np.random.seed(42)
 except ImportError:
     pass

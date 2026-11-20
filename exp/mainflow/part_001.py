@@ -112,7 +112,7 @@ def _MAIN_part_005():
         else:
             nonfinite_events += 1
             consecutive_nonfinite += 1
-            print(f'step {step + 1}: non-finite loss/gradient; optimizer and LR schedule skipped')
+            print(f'step {step + 1}: non-finite loss/gradient.clamp_min(1e-10); optimizer and LR schedule skipped')
             if nan_diagnosis is None:
                 nan_diagnosis = diagnose_non_finite(model, optimizer, x, y, result, grad_norm, step=step + 1, lr=current_lr, amp_dtype=amp_dtype, scaler=scaler, amp_scale_before_step=scaler_scale_before_step, vocab_size=cfg.vocab_size, recent_grad_norms=recent_grad_norms)
                 print_non_finite_report(nan_diagnosis)

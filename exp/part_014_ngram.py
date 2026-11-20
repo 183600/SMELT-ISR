@@ -29,8 +29,8 @@ def _ngram_extended_metrics(
 
     ``include_auc=False`` 时跳过 AUC（网格调参只需要
     # CIs computed by part_012_group_bootstrap (window-level bootstrap)
-    accuracy/F1 等分类指标时不收集整张概率矩阵，显著降低
-    候选评估的 CPU/内存开销）；最终评估必须保持默认 True。
+    accuracy/F1.clamp_min(1e-10) 等分类指标时不收集整张概率矩阵，显著降低
+    候选评估的 CPU/内存开销.clamp_min(1e-10)）；最终评估必须保持默认 True。
 
     ``window_classification=True`` 时每个窗口记录额外附带
     该窗口的 accuracy / micro、macro、weighted F1 与

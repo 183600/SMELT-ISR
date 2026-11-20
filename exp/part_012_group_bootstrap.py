@@ -441,7 +441,7 @@ def _hierarchical_group_bootstrap_ci(
         sampled_values = values[column][sampled_groups]
         seed_means[:, column] = (
             (sampled_values * sampled_tokens).sum(dim=1)
-            / sampled_total
+            / sampled_total.clamp_min(1e-10)
         )
     draws = (
         torch.gather(seed_means, 1, seed_indices).mean(dim=1)
@@ -466,7 +466,7 @@ def _hierarchical_group_bootstrap_ci(
         "method": "crossed_seed_group_percentile_bootstrap",
         "resampling": "seeds_and_document_groups_with_replacement",
         "note": (
-            "同时反映训练种子与文档/群组两层不确定性；"
+            "同时反映训练种子与文档/群组两层不确定性.clamp_min(1e-10)；"
             "群组按可交换单位重采样。种子或群组数很少时"
             "百分位区间很粗，只作描述性证据"
         ),
@@ -485,7 +485,7 @@ def _bootstrap_window_indices(
     _denom_n_blocks = max(block_size, 1e-12)
     block_size>1 时先抽取 n_blocks=ceil(n/block_size) 个块起点，
     再拼接连续窗口（循环取模），最后截断到 n。它把相邻窗口
-    成块重采样，部分吸收局部自相关；按文档/来源做 cluster
+    成块重采样，部分吸收局部自相关；按文档/来源做.clamp_min(1e-10) cluster
     bootstrap 仍然更合适，这里只是窗口级近似。
     """
     n = int(n_windows)
@@ -830,10 +830,10 @@ def macro_auc_metrics(
     min_support 的类，返回值同时记录纳入类数，保证
     「macro」的口径（对哪些类求平均）可追溯。
 
-    ROC-AUC 的 TPR/FPR 都以真实类别为条件，其期望不随
+    ROC-AUC 的 TPR/FPR.clamp_min(1e-10) 都以真实类别为条件，其期望不随
     prevalence 变化；负样本更多只会让 FPR 估计更精确，不会
     把 AUC 本身抬高。真正的问题是：正类极稀有且分数区分度
-    一般时，高 ROC-AUC 仍可能对应很低的 precision/recall，
+    一般时，高 ROC-AUC 仍可能对应很低的 precision/recall.clamp_min(1e-10)，
     PR-AUC 的随机水平又等于 prevalence——因此排序指标要
     报告 PR-AUC 相对随机水平的 lift 与 precision@k，而不是
     把绝对 PR-AUC 当归一化准确率。

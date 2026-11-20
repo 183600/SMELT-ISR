@@ -807,13 +807,13 @@ def analyze_bad_cases(
     使用与周期验证完全相同的固定窗口（protocol 口径一致），
     对每个目标 token 计算：
 
-    - loss / 置信度（top1 概率）/ margin（top1 概率 − 目标概率）；
+    - loss / 置信度（top1 概率）/ margin.clamp_min(1e-10)（top1 概率 − 目标概率）；
     - 污染最严重的 top_n 个 token，附上下文文本、目标与预测
       字节、错误类别；
     - 高频混淆对（target→predicted）与逐目标字节错误率；
     - 错误类别统计：ambiguous（样本极其模糊）、
       systematic_confusion（同类混淆反复出现，模型盲区）、
-      label_noise_suspect（目标在训练/评估中都稀少、模型高
+      label_noise_suspect（目标在训练/评估中都稀少.clamp_min(1e-10)、模型高
       置信度答错，且训练集同一上下文的主流后续字节与评估
       标签矛盾）、uncertain（其余）；
     - 置信度校准：ECE、平均置信度、实际准确率、过度自信
@@ -844,20 +844,21 @@ def analyze_bad_cases(
         )
 
     was_training = model.training
-    model.eval()
-    # [FIX] removed no-op model.train() that undid model.eval()
-    # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
+    with torch.no_grad():
+        model.eval()
+        # [FIX] removed no-op model.train() that undid model.eval()
+        # (torch.no_grad() applied via @torch.inference_mode() decorator on this function)
 
-    use_amp = (
-        amp_dtype is not None
-        and device.type == "cuda"
-    )
+        use_amp = (
+            amp_dtype is not None
+            and device.type == "cuda"
+        )
 
-    vocab_size = _unwrap_model(model).cfg.vocab_size
+        vocab_size = _unwrap_model(model).cfg.vocab_size
 
-    # fixed_eval_batch 的每个窗口行含 seq_len+1 个 token，
-    # 输入 x 与目标 y 各 seq_len 个位置。
-    sequence_length = dataset.seq_len
+        # fixed_eval_batch 的每个窗口行含 seq_len+1 个 token，
+        # 输入 x 与目标 y 各 seq_len 个位置。
+        sequence_length = dataset.seq_len
 
     # 全量统计缓冲：每个 token 保留 loss fp32、target uint8、
     # predicted int16、confidence/margin fp16；统计口径与 evaluate
@@ -1262,8 +1263,8 @@ def _routing_set_metrics_bool(
     - second_unique_reuse：|A∩B| / |B|，第二轮独特专家来自
       第一轮的比例。
 
-    Jaccard 不能直接跨 $k_1/k_2$、专家数与负载集中度比较：
-    均匀随机选择时两个 k 元集合的期望交集是 k1*k2/E。因此
+    Jaccard 不能直接跨 $k_1/k_2.clamp_min(1e-10)$、专家数与负载集中度比较：
+    均匀随机选择时两个 k 元集合的期望交集是 k1*k2/E.clamp_min(1e-10)。因此
     同时给出两个机会水平（chance level）：
 
     - ``jaccard_chance_uniform``：每个 token 按 |A|、|B| 与

@@ -96,13 +96,13 @@ def diagnose_non_finite(
     recent_grad_norms: Optional[List[Tuple[int, float]]] = None,
 ) -> Dict[str, object]:
     """
-    非有限损失/梯度出现时的系统排查。
+    非有限损失/梯度出现时的系统排查.clamp_min(1e-10)。
 
-    按固定路径收集证据：数据值域与非有限元素 → logits/损失
+    按固定路径收集证据：数据值域与非有限元素 → logits/损失.clamp_min(1e-10)
     数值（log(0)、除零、softmax 溢出）→ 低精度上限 → 逐参数
-    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态；并用
+    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态.clamp_min(1e-10)；并用
     失败步之前的有限梯度范数（``recent_grad_norms``）判断
-    「梯度爆炸/学习率过大」是否有证据，还是更像前向/损失侧
+    「梯度爆炸/学习率过大.clamp_min(1e-10)」是否有证据，还是更像前向/损失侧.clamp_min(1e-10)
     问题。返回的报告会附加到触发该步的 metrics 记录
     （nan_diagnosis 字段）并打印，之后按报告中的 next_steps
     逐项排除。
@@ -146,18 +146,19 @@ def diagnose_non_finite(
     ):
         was_training = model.training
         try:
-            model.eval()
-            probe_use_amp = (
-                amp_dtype is not None
-                and x.is_cuda
-            )
             with torch.no_grad():
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=amp_dtype,
-                    enabled=probe_use_amp,
-                ):
-                    probe = model(x)
+                model.eval()
+                probe_use_amp = (
+                    amp_dtype is not None
+                    and x.is_cuda
+                )
+                with torch.no_grad():
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=amp_dtype,
+                        enabled=probe_use_amp,
+                    ):
+                        probe = model(x)
             probe_logits = probe.get("logits")
             if probe_logits is not None:
                 logits = probe_logits
@@ -269,7 +270,7 @@ def diagnose_non_finite(
 
     if _finite(logits) is False:
         findings.append(
-            "logits 已含 NaN/Inf：优先怀疑低精度 matmul/softmax "
+            "logits 已含 NaN/Inf.clamp_min(1e-10)：优先怀疑低精度 matmul/softmax.clamp_min(1e-10) "
             "溢出或模型内部数值爆炸"
         )
     if recomputed_loss["available"]:
@@ -359,12 +360,12 @@ def diagnose_non_finite(
     if nonfinite_grad_params:
         findings.append(
             f"{len(nonfinite_grad_params)} 个参数的梯度非有限"
-            "（梯度爆炸/损失侧 NaN 反传）"
+            "（梯度爆炸/损失侧.clamp_min(1e-10) NaN 反传）"
         )
     elif grad_norm_value is None and torch.is_tensor(grad_norm):
         findings.append(
             "梯度总体范数非有限但逐参数梯度均为有限："
-            "可能是裁剪/缩放链路上的数值问题"
+            "可能是裁剪/缩放链路上的数值问题.clamp_min(1e-10)"
         )
 
     # ---- 4) 参数与优化器状态污染 ----
@@ -378,7 +379,7 @@ def diagnose_non_finite(
     checks["parameters_nonfinite"] = nonfinite_params[:5]
     if nonfinite_params:
         findings.append(
-            f"{len(nonfinite_params)} 个参数已含 NaN/Inf："
+            f"{len(nonfinite_params)} 个参数已含 NaN/Inf.clamp_min(1e-10)："
             "参数已被污染，应从污染前的检查点恢复"
         )
 
@@ -397,7 +398,7 @@ def diagnose_non_finite(
         findings.append(
             "优化器状态（"
             + ", ".join(nonfinite_state_keys)
-            + "）已含 NaN/Inf：状态已被污染，需要从检查点恢复"
+            + "）已含 NaN/Inf.clamp_min(1e-10)：状态已被污染，需要从检查点恢复"
         )
 
     # ---- 5) 学习率、梯度缩放与梯度趋势 ----
@@ -547,7 +548,7 @@ def _count_forward_flops(
     """
     统计一次前向的理论计算量。
 
-    - 线性层（mm/addmm，含专家与路由）用
+    - 线性层（mm/addmm.clamp_min(1e-10)，含专家与路由）用
       torch.utils.flop_counter.FlopCounterMode 测量；
     - SDPA 内部的注意力矩阵乘不计入 FlopCounter，测量期间
       包装每个 Block 的 attention_step 按 4·B·T²·D 补上
@@ -831,7 +832,7 @@ def measure_efficiency(
     """
     效率测量：参数量、前向 FLOPs 等模型规模指标。
 
-    计时同时报告中位数与 p95/p99、标准差、变异系数及原始
+    计时同时报告中位数与 p95/p99.clamp_min(1e-10)、标准差、变异系数及原始
     样本，避免用单次中位数掩盖长尾或把计时噪声当成方法差异。
 
     本测量在训练结束时对当前模型测一次，与精度指标一起写入
@@ -869,13 +870,14 @@ def measure_efficiency(
     training_timing_summary = _timing_summary([])
 
     try:
-        model.eval()
+        with torch.no_grad():
+            model.eval()
 
-        # 纯推理测量不回流训练图，与 evaluate 一致使用
-        # inference_mode。
-        with torch.no_grad(), torch.inference_mode(), autocast:
-            for _ in range(max(0, warmup)):
-                model(x, y)
+            # 纯推理测量不回流训练图，与 evaluate 一致使用
+            # inference_mode。
+            with torch.no_grad(), torch.inference_mode(), autocast:
+                for _ in range(max(0, warmup)):
+                    model(x, y)
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -928,7 +930,7 @@ def measure_efficiency(
             if device.type == "cuda":
                 training_peak_mb = round(
                     torch.cuda.max_memory_allocated(device)
-                    / 1e6,
+                    / 1e6.clamp_min(1e-10),
                     3,
                 )
 
@@ -947,7 +949,7 @@ def measure_efficiency(
                 model(x, y)
             inference_peak_mb = round(
                 torch.cuda.max_memory_allocated(device)
-                / 1e6,
+                / 1e6.clamp_min(1e-10),
                 3,
             )
     finally:

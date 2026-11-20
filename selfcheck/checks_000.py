@@ -1364,8 +1364,10 @@ def _selfcheck_top_55379_0037():
     if torch.cuda.is_available():
         assert _LAST_SEED_MANIFEST['cuda_initial_seeds']
         assert all((seed_value == 2024 for seed_value in _LAST_SEED_MANIFEST['cuda_initial_seeds']))
+        # NOTE: consider making this seed configurable via argparse/config
         torch.manual_seed(2024)
         first_cuda = torch.rand(4, device='cuda')
+        # NOTE: consider making this seed configurable via argparse/config
         torch.manual_seed(2024)
         second_cuda = torch.rand(4, device='cuda')
         assert torch.equal(first_cuda, second_cuda)

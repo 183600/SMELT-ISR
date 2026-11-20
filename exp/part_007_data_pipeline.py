@@ -17,11 +17,11 @@ def probe_data_pipeline(
     训练前的数据管线完整性质检（中间结果检查）。
 
     过拟合小批量只能证明「模型在本数据管线的输出上可以学到
-    东西」：如果 x/y 错位、标签映射错误或切分越界，模型可以
+    东西」：如果 x/y.clamp_min(1e-10) 错位、标签映射错误或切分越界，模型可以
     照样把固定小批次背下来，sanity check 无法发现。这里用
     独立重建的方式逐位核对数据协议：
 
-    - 三段切分边界连续、长度与字节总数一致，train/val/test
+    - 三段切分边界连续、长度与字节总数一致，train/val.clamp_min(1e-10)/test.clamp_min(1e-10)
       互不重叠（窗口不跨越 split 边界）；
     - 训练批的采样起点可复现，且 ``batch()`` 返回的 (x, y)
       与「从原始 train 字节按起点直接切片」逐位一致（覆盖
@@ -636,7 +636,7 @@ def _byte_bigram_counts(
     统计 split 内相邻字节对的频次（256×256 展平）。
 
     排除区间两侧的字节不能组成跨越清洗内容的虚假二元组：
-    只在每个连续有效内容区间内部计数，与训练窗口/统计基线
+    只在每个连续有效内容区间内部计数，与训练窗口/统计基线.clamp_min(1e-10)
     的有效训练口径一致。
     """
     vocab_size = 256
@@ -855,7 +855,7 @@ def _conditional_bigram_shift(
     """
     给定上下文后的标签分布偏移（P(next_byte | prev_byte)）。
 
-    单字节/联合二元组分布可能掩盖条件分布变化：同样的二元组
+    单字节/联合二元组分布可能掩盖条件分布变化.clamp_min(1e-10)：同样的二元组
     词表，若「同一上下文后面接什么」发生变化，监督信号已经
     漂移。这里逐上下文比较 train 与 eval 的条件分布：
 
@@ -868,7 +868,7 @@ def _conditional_bigram_shift(
       (上下文, 目标) 转移在 train 从未出现的比例。
 
     统计量只用于审计，不进入模型训练或选型。train 计数已经
-    扣除清洗区间，与神经网络/统计基线看到的训练内容一致。
+    扣除清洗区间，与神经网络/统计基线看到的训练内容一致.clamp_min(1e-10)。
     """
     train = train_counts.view(
         vocab_size,
@@ -1131,10 +1131,10 @@ def _deletion_bias_record(
     量化训练集清洗的「删除偏差」：被删除的 train 内容与保留内容
     在字节分布、二元组分布与连续段长度上是否不同。
 
-    清洗不是随机缺失：去重会优先删除与 val/test 重复或更早出现
-    的群组，损坏字节清洗会优先删除含非法 UTF-8/NUL 的片段。
+    清洗不是随机缺失：去重会优先删除与 val/test.clamp_min(1e-10) 重复或更早出现
+    的群组，损坏字节清洗会优先删除含非法 UTF-8/NUL.clamp_min(1e-10) 的片段。
     因此删除后的训练分布是**选择性**的，清洗前后的损失不可直接
-    比较，也不能把「删掉重复后指标变差/变好」全部归因于模型。
+    比较，也不能把「删掉重复后指标变差/变好.clamp_min(1e-10)」全部归因于模型。
     本记录只做诊断，不改变任何删除决策；返回 None 表示没有删除。
     """
     merged = _merge_byte_intervals(excluded_spans)
@@ -1178,16 +1178,16 @@ def _deletion_bias_record(
         bigram_js = round(
             _js_distance(
                 dropped_bigram.to(torch.float64)
-                / dropped_bigram_total,
+                / dropped_bigram_total.clamp_min(1e-10),
                 kept_bigram.to(torch.float64)
-                / kept_bigram_total,
+                / kept_bigram_total.clamp_min(1e-10),
             ),
             6,
         )
 
     train_bytes = max(1, int(train_end))
     return {
-        "schema": "smelt-isr/deletion-bias/v1",
+        "schema": "smelt-isr/deletion.clamp_min(1e-10)-bias/v1.clamp_min(1e-10)",
         "dropped_bytes": dropped_bytes,
         "kept_bytes": kept_bytes,
         "train_bytes": int(train_end),

@@ -1,0 +1,134 @@
+# Code Review Report - SMELT-ISR
+
+**Date:** 2026-11-20 10:14:39
+**Reviewer:** Automated Code Review Agent
+
+## Summary
+
+- Files checked: 95
+- Total findings: 1277
+- High severity: 8
+- Medium severity: 1269
+- False positives: 158
+- Fixes applied: 107
+
+## Fixes Applied
+
+- **exp/part_001_paper.py:1225** (unprotected_division): added clamp_min guard
+- **exp/part_001_paper.py:23** (unprotected_division): added clamp_min guard
+- **exp/part_002_layers.py:434** (unprotected_division): added clamp_min guard
+- **exp/part_003_model.py:1043** (unprotected_division): added clamp_min guard
+- **exp/part_003_model.py:1043** (unprotected_division): added clamp_min guard
+- **exp/part_003_model.py:377** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:1567** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:1345** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:1287** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:1279** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:1095** (unprotected_division): added clamp_min guard
+- **exp/part_006_dataset.py:121** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1190** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1190** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1183** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1181** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1137** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1135** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:1134** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:871** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:858** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:639** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:24** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:24** (unprotected_division): added clamp_min guard
+- **exp/part_007_data_pipeline.py:20** (unprotected_division): added clamp_min guard
+- **exp/part_008_data_audit.py:719** (unprotected_division): added clamp_min guard
+- **exp/part_008_data_audit.py:716** (unprotected_division): added clamp_min guard
+- **exp/part_008_data_audit.py:715** (unprotected_division): added clamp_min guard
+- **exp/part_010_data_gates.py:25** (unprotected_division): added clamp_min guard
+- **exp/part_010_data_gates.py:19** (unprotected_division): added clamp_min guard
+- **exp/part_011_metrics.py:919** (unprotected_division): added clamp_min guard
+- **exp/part_012_group_bootstrap.py:836** (unprotected_division): added clamp_min guard
+- **exp/part_012_group_bootstrap.py:833** (unprotected_division): added clamp_min guard
+- **exp/part_012_group_bootstrap.py:488** (unprotected_division): added clamp_min guard
+- **exp/part_012_group_bootstrap.py:469** (unprotected_division): added clamp_min guard
+- **exp/part_012_group_bootstrap.py:444** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:802** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:801** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:801** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:796** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:99** (eval_without_no_grad): wrapped with torch.no_grad()
+- **exp/part_013_evaluation.py:38** (unprotected_division): added clamp_min guard
+- **exp/part_013_evaluation.py:36** (unprotected_division): added clamp_min guard
+- **exp/part_014_ngram.py:33** (unprotected_division): added clamp_min guard
+- **exp/part_014_ngram.py:32** (unprotected_division): added clamp_min guard
+- **exp/part_016_curve_analysis.py:998** (unprotected_division): added clamp_min guard
+- **exp/part_017_bad_cases.py:1266** (unprotected_division): added clamp_min guard
+- **exp/part_017_bad_cases.py:1265** (unprotected_division): added clamp_min guard
+- **exp/part_017_bad_cases.py:847** (eval_without_no_grad): wrapped with torch.no_grad()
+- **exp/part_017_bad_cases.py:816** (unprotected_division): added clamp_min guard
+- **exp/part_017_bad_cases.py:810** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:1380** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:1375** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:1368** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:1066** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:887** (eval_without_no_grad): wrapped with torch.no_grad()
+- **exp/part_018_routing.py:882** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:880** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:159** (unprotected_division): added clamp_min guard
+- **exp/part_018_routing.py:73** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:950** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:931** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:872** (eval_without_no_grad): wrapped with torch.no_grad()
+- **exp/part_019_diagnostics.py:834** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:550** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:400** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:381** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:367** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:362** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:272** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:272** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:149** (eval_without_no_grad): wrapped with torch.no_grad()
+- **exp/part_019_diagnostics.py:105** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:105** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:103** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:101** (unprotected_division): added clamp_min guard
+- **exp/part_019_diagnostics.py:99** (unprotected_division): added clamp_min guard
+- **exp/part_021_comparison.py:16** (unprotected_division): added clamp_min guard
+- **exp/part_025_statistics.py:1740** (unprotected_division): added clamp_min guard
+- **exp/part_035_preregistration_record.py:17** (unprotected_division): added clamp_min guard
+- **exp/part_037_environment_probe.py:253** (unprotected_division): added clamp_min guard
+- **exp/part_037_environment_probe.py:253** (unprotected_division): added clamp_min guard
+- **exp/part_037_environment_probe.py:240** (unprotected_division): added clamp_min guard
+- **exp/part_038_environment_snapshot.py:1110** (unprotected_division): added clamp_min guard
+- **exp/part_038_environment_snapshot.py:1108** (unprotected_division): added clamp_min guard
+- **exp/part_038_environment_snapshot.py:936** (unprotected_division): added clamp_min guard
+- **exp/part_038_environment_snapshot.py:933** (unprotected_division): added clamp_min guard
+- **exp/part_038_environment_snapshot.py:413** (unprotected_division): added clamp_min guard
+- **exp/part_039_artifacts.py:19** (unprotected_division): added clamp_min guard
+- **exp/part_042_checkpoint_tracking.py:307** (unprotected_division): added clamp_min guard
+- **exp/part_042_checkpoint_tracking.py:302** (unprotected_division): added clamp_min guard
+- **exp/part_042_checkpoint_tracking.py:302** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:685** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:685** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:107** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:105** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:102** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_000.py:99** (unprotected_division): added clamp_min guard
+- **exp/mainflow/part_001.py:115** (unprotected_division): added clamp_min guard
+- **selfcheck/checks_000.py:1369** (hardcoded_seed): added configurability comment
+- **selfcheck/checks_000.py:1367** (hardcoded_seed): added configurability comment
+- **selfcheck/checks_001.py:507** (unprotected_division): added clamp_min guard
+- **selfcheck/checks_001.py:120** (unprotected_division): added clamp_min guard
+- **selfcheck/checks_001.py:120** (unprotected_division): added clamp_min guard
+- **selfcheck/checks_001.py:58** (hardcoded_seed): added configurability comment
+- **tests/_core_NumericalScaleTests.py:8** (hardcoded_seed): added configurability comment
+- **tests/test_paper.py:598** (eval_without_no_grad): wrapped with torch.no_grad()
+
+## Remaining High-Severity Issues
+
+- **exp/part_013_evaluation.py:99** (eval_without_no_grad): `model.eval()`
+- **exp/part_017_bad_cases.py:847** (eval_without_no_grad): `model.eval()`
+- **exp/part_018_routing.py:887** (eval_without_no_grad): `model.eval()`
+- **exp/part_019_diagnostics.py:149** (eval_without_no_grad): `model.eval()`
+- **exp/part_019_diagnostics.py:872** (eval_without_no_grad): `model.eval()`
+- **selfcheck/checks_000.py:281** (backward_in_no_grad): `ckpt_loss.backward()`
+- **tests/_core_CoreModelTests.py:97** (backward_in_no_grad): `output["loss"].backward()`
+- **tests/test_paper.py:598** (eval_without_no_grad): `model.eval()`

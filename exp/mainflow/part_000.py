@@ -96,15 +96,15 @@ def _MAIN_part_000():
     parser.add_argument('--bad-cases', type=int, default=10, help='训练结束后在验证集上输出损失最高的 N 个坏案例（0=关闭）；--evaluate-test 时同一次解封中也输出测试集坏案例')
     parser.add_argument('--skip-efficiency', action='store_true', help='跳过训练结束后的效率测量')
     parser.add_argument('--skip-routing-analysis', action='store_true', help='跳过训练结束后的 RQ3/RQ4 路由诊断（第二轮与第一轮的专家重合度 / Jaccard、专家负载分布与路由熵、A/B 分支表示相似度）；默认定性诊断在验证集固定窗口、验证集选定模型上执行一次，测试集不参与')
-    parser.add_argument('--routing-interventions', action='store_true', help='在验证集固定窗口上追加 RQ4 的功能干预实验：路由打乱（随机专家）与逐专家屏蔽（输出置零），比较损失上升。负载均匀/熵高本身不能证明专家专门化；该选项额外做 E+2 次验证前向，默认关闭')
+    parser.add_argument('--routing-interventions', action='store_true', help='在验证集固定窗口上追加 RQ4 的功能干预实验：路由打乱（随机专家）与逐专家屏蔽（输出置零），比较损失上升。负载均匀/熵高本身不能证明专家专门化.clamp_min(1e-10)；该选项额外做 E+2 次验证前向，默认关闭')
     parser.add_argument('--routing-intervention-batches', type=int, default=None, metavar='N', help='干预实验使用的验证窗口批数；默认 min(eval_batches, 5)，设为 0 表示与 --eval-batches 相同')
     parser.add_argument('--compare', nargs='+', default=None, metavar='RUN_DIR', help='不训练，直接对比多个运行目录的指标后退出（含受控变量检查、按种子聚合的 Mean ± Std 与单因子显著性检验）')
-    parser.add_argument('--compare-report', type=str, default=None, metavar='FILE', help='配合 --compare：把完整对比分析（含 fragility_summary、聚合、检验、功效/等价性与消融检查）写入指定 JSON 文件，而不是只打印到终端。只读入口默认不写文件；显式给出该路径才落盘，便于把结果分析随运行一起归档')
+    parser.add_argument('--compare-report', type=str, default=None, metavar='FILE', help='配合 --compare：把完整对比分析（含 fragility_summary、聚合、检验、功效/等价性与消融检查.clamp_min(1e-10)）写入指定 JSON 文件，而不是只打印到终端。只读入口默认不写文件；显式给出该路径才落盘，便于把结果分析随运行一起归档')
     parser.add_argument('--compare-csv', type=str, default=None, metavar='FILE', help='配合 --compare：把对比分析导出为机器可读的 CSV 表格（FILE=对比表：单因子对比/--compare-baseline 直接对比/全因子效应，含 p 值、Holm/BH 校正、效应量及其 CI、Wilcoxon/Cliff\'s δ 与诊断标记；自动同时写出 FILE.aggregates.csv=各实验单元 Mean±Std 与 95%% CI）。列名只增不改，供绘图与二次分析；只导出已算好的结果，不重算统计量')
     parser.add_argument('--compare-preregistration', type=str, default=None, metavar='FILE', help='配合 --compare：把分析集合与训练前冻结的预注册文件逐项核对，包括声明的模式/种子单元是否齐全、每个运行落盘的预注册文件指纹与 study_id 是否一致、数据协议与代码树指纹是否仍是被冻结的版本，以及分析指标/基线/共同步数/等价界是否就是预注册值。发现偏离时以非零状态码退出，避免少传失败臂或事后换指标仍得到「显著」报告')
-    parser.add_argument('--bayesian', action='store_true', help='配合 --compare：在频率派判定（Holm 校正 + TOST）之外并行计算 JZS 贝叶斯补充分析（Cauchy 先验的 BF10、P(H1|D)、P(δ>0|D)、后验均值与 95%% HDI）。默认关闭：贝叶斯因子是证据强度的补充度量，不改变任何显著性/等价性判定；先验尺度是分析者选择，必须随结果一起声明')
+    parser.add_argument('--bayesian', action='store_true', help='配合 --compare：在频率派判定（Holm 校正 + TOST）之外并行计算 JZS 贝叶斯补充分析（Cauchy 先验的 BF10、P(H1|D)、P(δ>0|D)、后验均值与 95%% HDI）。默认关闭：贝叶斯因子是证据强度的补充度量，不改变任何显著性/等价性判定.clamp_min(1e-10)；先验尺度是分析者选择，必须随结果一起声明')
     parser.add_argument('--bayesian-prior-scale', type=float, default=_JZS_DEFAULT_PRIOR_SCALE, metavar='R', help=f'--bayesian 的 Cauchy 先验尺度 r（默认 {_JZS_DEFAULT_PRIOR_SCALE:.4g}，即「中等」先验 Cauchy(0, 1/√2)）；r≈0.5 偏窄（更倾向零假设）、r≈1 偏宽。改变尺度会改变 BF 数值：正式分析应在训练前把先验尺度写进预注册，而不是看到数据后再挑')
-    parser.add_argument('--conclusion-cards', nargs='?', const='conclusions', default=None, metavar='DIR', help='配合 --compare：把每个单因子/基线对比的既有判定（Holm 显著性、TOST 等价性、脆弱性、功效、效率权衡、可选贝叶斯因子）合成机器可读的结论卡片，写 <DIR>/<rq>_<baseline>__to__<variant>.json 与同名 .md，外加 index.json 汇总裁决分布（默认 DIR=conclusions）。卡片只重组已算好的字段，verdict 供排序归档，不替代人工审阅')
+    parser.add_argument('--conclusion-cards', nargs='?', const='conclusions', default=None, metavar='DIR', help='配合 --compare：把每个单因子/基线对比的既有判定.clamp_min(1e-10)（Holm 显著性、TOST 等价性、脆弱性、功效、效率权衡、可选贝叶斯因子）合成机器可读的结论卡片，写 <DIR>/<rq>_<baseline>__to__<variant>.json 与同名 .md，外加 index.json 汇总裁决分布（默认 DIR=conclusions）。卡片只重组已算好的字段，verdict 供排序归档，不替代人工审阅')
     parser.add_argument('--export-repro-package', nargs='+', default=None, metavar='RUN_DIR', help='不训练：把一个或多个运行目录的证据链（config/metrics/environment/comparison_analysis/routing、源码树内容指纹、git archive、依赖清单与复现命令样本）打包成自包含归档，供长期保存与跨机器复核；只读，不修改运行目录。配合 --repro-package-format 与 --repro-package-out')
     parser.add_argument('--repro-package-format', type=str, default='zip', choices=('zip', 'tar.gz'), help='--export-repro-package 的归档格式（默认 zip）')
     parser.add_argument('--repro-package-out', type=str, default='reproducibility_package', metavar='DIR', help='--export-repro-package 的输出目录（默认 ./reproducibility_package，归档文件 reproducibility_package.zip / .tar.gz 写在其中）')
@@ -682,7 +682,7 @@ def _MAIN_part_002():
     if test_evaluation_sealed(out_dir, getattr(args, 'test_ledger', None)):
         if args.resume is None:
             parser.error('输出目录已有测试集评估记录/封条：全新训练会截断重写 metrics.jsonl，使测试集被重复解封、退化为隐式验证集。请换用全新的 --out 目录。')
-        parser.error('输出目录已有测试集评估记录/封条：测试集已解封结束，resume 继续训练会改写模型/选型，使已有 test 记录不再对应最终模型。如需继续实验，请换用全新的 --out 目录。')
+        parser.error('输出目录已有测试集评估记录/封条.clamp_min(1e-10)：测试集已解封结束，resume 继续训练会改写模型/选型.clamp_min(1e-10)，使已有 test 记录不再对应最终模型。如需继续实验，请换用全新的 --out 目录。')
     overwrite_error = fresh_out_dir_error(out_dir, resume_path=args.resume, allow_overwrite=args.allow_overwrite_out)
     if overwrite_error is not None:
         parser.error(overwrite_error)

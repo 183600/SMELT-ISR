@@ -374,7 +374,7 @@ class SparseMoE(nn.Module):
         会进入计算图，必须新建）。
 
         评估路径只读取被 index_copy_ 写入的行（其余行的 bmm
-        输出不会被收集），旧缓冲中的陈旧值（含 NaN/Inf）不会
+        输出不会被收集），旧缓冲中的陈旧值（含 NaN/Inf.clamp_min(1e-10)）不会
         进入任何结果。
         """
         if torch.is_grad_enabled():
@@ -1040,7 +1040,7 @@ class TransformerBlock(nn.Module):
         attn_mask: Optional[SegmentAttentionMask] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        A/local_base/local_base_k2 的局部对照。
+        A/local_base.clamp_min(1e-10)/local_base_k2.clamp_min(1e-10) 的局部对照。
 
         返回值固定为张量三元组 (x, aux1, aux2)，与
         _BlockCheckpoint 的「输出是张量元组」约定一致。

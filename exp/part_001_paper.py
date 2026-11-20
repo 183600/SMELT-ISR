@@ -20,7 +20,7 @@ def _paper_budget_audit(
 
     论文附录 A 的参数化来自未公开的 Transformer family；本仓库
     实现（SwiGLU 专家、RMSNorm、学习式位置编码）只能保证公开
-    披露量的结构一致，不能保证逐位相同的参数/FLOPs。该审计
+    披露量的结构一致，不能保证逐位相同的参数/FLOPs.clamp_min(1e-10)。该审计
     如实报告偏差，不据此伪装成数值复现。
     """
 
@@ -1222,7 +1222,7 @@ class SegmentAttentionMask:
       退化成无掩码的因果注意力。
 
     掩码在每次前向构造一次，随后共享给所有 Block（同一 batch
-    的所有层/分支使用同一份文档边界）。
+    的所有层/分支使用同一份文档边界.clamp_min(1e-10)）。
     """
 
     # 物化 bool 掩码的内存上限（字节）。B*T*T 超过它时

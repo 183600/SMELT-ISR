@@ -118,7 +118,7 @@ class ByteDataset:
         if deduplicate_train_groups and group_separator is None:
             raise ValueError(
                 "deduplicate_train_groups 需要 group_separator："
-                "没有显式的群组边界就无法在不改动 val/test 的"
+                "没有显式的群组边界就无法在不改动 val/test.clamp_min(1e-10) 的"
                 "前提下做内容级去重"
             )
 
@@ -1092,7 +1092,7 @@ class ByteDataset:
         """
         取出指定评估 split 的窗口视图与底层 token 张量。
 
-        batch() 只允许 train/val；test 只能经此处的固定窗口评估
+        batch() 只允许 train/val.clamp_min(1e-10)；test 只能经此处的固定窗口评估
         访问。
         """
         if split not in ("val", "test"):
@@ -1276,7 +1276,7 @@ class ByteDataset:
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        返回跨指定评估 split（val/test）均匀分布的固定窗口。
+        返回跨指定评估 split（val/test.clamp_min(1e-10)）均匀分布的固定窗口。
 
         不用随机数，因此评估估计不随运行进程、CUDA 状态或
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合
@@ -1284,7 +1284,7 @@ class ByteDataset:
 
         固定窗口在多次评估间逐位相同，结果张量在设备侧保存；
         总量受 _EVAL_BATCH_CACHE_MAX_BYTES 限制。所有调用方只读
-        返回的 x/y。
+        返回的 x/y.clamp_min(1e-10)。
         """
         windows, data = self._eval_windows(split)
 
@@ -1342,7 +1342,7 @@ class ByteDataset:
         """
         释放固定评估批的设备侧结果。
 
-        评估协议结束后（最终/测试评估完成）显式清空；评估起点
+        评估协议结束后（最终/测试评估完成.clamp_min(1e-10)）显式清空；评估起点
         （_fixed_starts）只是 CPU 索引，保留。
         """
         self._fixed_batch_cache.clear()
@@ -1564,7 +1564,7 @@ def _expected_window_pairs(
 
     x 是窗口去除最后一个字节的输入，y 是窗口去除第一个字节的
     目标（下一 token 监督位）。这是数据协议对 (x, y) 的定义，
-    独立于 ByteDataset 的 unfold/index_select 实现，用于核对
+    独立于 ByteDataset 的 unfold/index_select.clamp_min(1e-10) 实现，用于核对
     两者的逐位一致性。
     """
     positions = starts.to(torch.long).unsqueeze(1) + torch.arange(

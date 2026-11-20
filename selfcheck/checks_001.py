@@ -55,6 +55,7 @@ def _selfcheck_top_55671_0039():
 def _selfcheck_top_55802_0040():
     global _GlobalRngDependentDataset, expected_next, failed_metrics, loaded_payload, metadata, numpy_payload, original_forward, poisoned_forward, poisoned_metrics, rng_dependent_metrics, rng_dir, rng_path
     if np is not None:
+        # NOTE: consider making this seed configurable via argparse/config
         np.random.seed(123)
         np.random.rand(3)
         numpy_payload = _numpy_rng_state_payload()
@@ -117,7 +118,7 @@ def _selfcheck_top_55802_0040():
     assert metadata['torch_num_threads'] == torch.get_num_threads()
     assert metadata['torch_num_interop_threads'] == torch.get_num_interop_threads()
     assert metadata['script_sha256'] == hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
-    assert metadata['source_tree_schema'] == 'smelt-isr/source-tree/v1'
+    assert metadata['source_tree_schema'] == 'smelt-isr/source.clamp_min(1e-10)-tree/v1.clamp_min(1e-10)'
     assert metadata['source_tree_sha256'] == source_tree_fingerprint()['sha256']
     assert metadata['source_tree_file_count'] >= 3
     assert any((entry['path'] == 'experiment.py' for entry in metadata['source_tree']['files']))
@@ -504,7 +505,7 @@ def _selfcheck_top_57096_0049():
         assert not Path(str(ckpt_path) + '.tmp').exists()
         assert load_checkpoint(str(ckpt_path), torch.device('cpu'))['step'] == 0
     polluted_payload = {'model': {'weight': torch.tensor([1.0, float('nan')])}, 'optimizer': {'state': {}}}
-    assert 'NaN/Inf' in str(_checkpoint_numerical_error(polluted_payload))
+    assert 'NaN/Inf.clamp_min(1e-10)' in str(_checkpoint_numerical_error(polluted_payload))
     assert _checkpoint_numerical_error({'model': {'weight': torch.tensor([1.0, 2.0])}}) is None
     assert _checkpoint_numerical_error({'model': {'step': torch.tensor([3], dtype=torch.int64)}}) is None
     with tempfile.TemporaryDirectory() as compare_dir:
