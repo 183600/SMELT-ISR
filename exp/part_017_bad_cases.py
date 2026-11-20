@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import torch
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. The centralized seed is set once by the experiment
 # entry point (set_seed(args.seed)); all stochastic paths use local
