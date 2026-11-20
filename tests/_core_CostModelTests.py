@@ -1,18 +1,22 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+
 # Reproducibility: Set random seeds
 import random
 import numpy as np
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 try:
     import torch
+
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 except ImportError:
     pass
+
 
 class CostModelTests(unittest.TestCase):
     def test_a_counts_first_stage(self):
@@ -20,26 +24,16 @@ class CostModelTests(unittest.TestCase):
         profile = experiment.mode_cost_profile(cfg)
         # top_k=2, k1=2, k2=2, n_layers=4 -> middle=2
         # pre+post = 2 -> 2*2 + 2*(2 + 4) = 16
-        self.assertEqual(
-            profile["expert_assignments_per_token"], 16
-        )
+        self.assertEqual(profile["expert_assignments_per_token"], 16)
 
     def test_a_counts_routers_on_each_branch(self):
         # middle=2, pre=post=1, k1=2：A 的第二轮在 k1 个分支上
         # 各自路由，所以每个中间 Block 有 1+k1=3 次 Router/MoE
         # 执行，总计 1+1+2*3=8，而不是 layers+middle=6。
-        profile = experiment.mode_cost_profile(
-            _tiny_config(mode="A")
-        )
-        self.assertEqual(
-            profile["router_calls_per_token"], 8
-        )
-        self.assertEqual(
-            profile["moe_passes_per_token"], 8
-        )
-        early = experiment.mode_cost_profile(
-            _tiny_config(mode="B_early")
-        )
+        profile = experiment.mode_cost_profile(_tiny_config(mode="A"))
+        self.assertEqual(profile["router_calls_per_token"], 8)
+        self.assertEqual(profile["moe_passes_per_token"], 8)
+        early = experiment.mode_cost_profile(_tiny_config(mode="B_early"))
         self.assertEqual(
             early["analytic_formula"]["attention_executions"],
             "pre + [1 + (middle-1)*k1 + middle*k1] + post",
@@ -59,12 +53,8 @@ class CostModelTests(unittest.TestCase):
         )
 
     def test_b_early_matches_b_execution_counts(self):
-        b = experiment.mode_cost_profile(
-            _tiny_config(mode="B")
-        )
-        early = experiment.mode_cost_profile(
-            _tiny_config(mode="B_early")
-        )
+        b = experiment.mode_cost_profile(_tiny_config(mode="B"))
+        early = experiment.mode_cost_profile(_tiny_config(mode="B_early"))
         for key in (
             "attention_executions_per_token",
             "moe_passes_per_token",
@@ -92,15 +82,12 @@ class CostModelTests(unittest.TestCase):
         )
         self.assertEqual(
             profile["kv_cache_bytes_per_token_per_visit"],
-            profile["attention_executions_per_token"]
-            * bytes_per_layer,
+            profile["attention_executions_per_token"] * bytes_per_layer,
         )
 
         # B 有 k1=2 个独立分支：分支只出现在 middle，pre/post
         # 仍各一份。middle=2 -> 物理容量 (1+1+2*2)=6 份。
-        branch_profile = experiment.mode_cost_profile(
-            _tiny_config(mode="B")
-        )
+        branch_profile = experiment.mode_cost_profile(_tiny_config(mode="B"))
         self.assertEqual(
             branch_profile["kv_cache_bytes_per_token"],
             6 * bytes_per_layer,
@@ -112,15 +99,10 @@ class CostModelTests(unittest.TestCase):
             9 * bytes_per_layer,
         )
         self.assertEqual(
-            branch_profile[
-                "kv_cache_bytes_per_token_per_visit"
-            ],
-            branch_profile["attention_executions_per_token"]
-            * bytes_per_layer,
+            branch_profile["kv_cache_bytes_per_token_per_visit"],
+            branch_profile["attention_executions_per_token"] * bytes_per_layer,
         )
-        early = experiment.mode_cost_profile(
-            _tiny_config(mode="B_early")
-        )
+        early = experiment.mode_cost_profile(_tiny_config(mode="B_early"))
         self.assertEqual(
             early["kv_cache_bytes_per_token"],
             branch_profile["kv_cache_bytes_per_token"],
@@ -144,9 +126,7 @@ class CostModelTests(unittest.TestCase):
         )
         # 等计算口径下，稠密 FFN 的激活 FLOPs 应与 baseline
         # 单次前向激活的 top_k 个专家相同；dense 少了路由开销。
-        base = experiment.mode_cost_profile(
-            _tiny_config(mode="base")
-        )
+        base = experiment.mode_cost_profile(_tiny_config(mode="base"))
         self.assertEqual(
             breakdown["dense_ffn"],
             base["analytic_flops_breakdown"]["experts"],
@@ -158,12 +138,6 @@ class CostModelTests(unittest.TestCase):
 
     def test_budget_search_reports_recommendation(self):
         cfg = _tiny_config(mode="A")
-        report = experiment.budget_match_report(
-            cfg, "smelt", 0.1
-        )
-        self.assertIn(
-            report["search"]["kind"], {"k2", "k1_k2"}
-        )
-        self.assertIsNotNone(
-            report["search"]["recommended_k2"]
-        )
+        report = experiment.budget_match_report(cfg, "smelt", 0.1)
+        self.assertIn(report["search"]["kind"], {"k2", "k1_k2"})
+        self.assertIsNotNone(report["search"]["recommended_k2"])

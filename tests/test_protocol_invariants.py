@@ -22,14 +22,17 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+
 # Reproducibility: Set random seeds
 import random
 import numpy as np
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 try:
     import torch
+
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
@@ -39,16 +42,12 @@ except ImportError:
 try:
     import torch
 except ImportError as error:  # pragma: no cover
-    raise unittest.SkipTest(
-        f"torch is required for these tests: {error}"
-    )
+    raise unittest.SkipTest(f"torch is required for these tests: {error}") from error
 
 
 def _load_experiment():
     path = Path(__file__).resolve().parents[1] / "experiment.py"
-    spec = importlib.util.spec_from_file_location(
-        "smelt_protocol_experiment", path
-    )
+    spec = importlib.util.spec_from_file_location("smelt_protocol_experiment", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["smelt_protocol_experiment"] = module
     spec.loader.exec_module(module)
@@ -59,19 +58,19 @@ experiment = _load_experiment()
 
 
 def _tiny_config(**overrides):
-    values = dict(
-        seq_len=16,
-        d_model=32,
-        n_heads=4,
-        n_kv_heads=2,
-        n_layers=4,
-        n_experts=4,
-        expert_hidden=16,
-        top_k=2,
-        k1=2,
-        k2=2,
-        mode="smelt",
-    )
+    values = {
+        "seq_len": 16,
+        "d_model": 32,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "n_layers": 4,
+        "n_experts": 4,
+        "expert_hidden": 16,
+        "top_k": 2,
+        "k1": 2,
+        "k2": 2,
+        "mode": "smelt",
+    }
     values.update(overrides)
     return experiment.Config(**values)
 
@@ -82,9 +81,7 @@ class ProtocolInvariantTests(unittest.TestCase):
         # 折算分支必须生效。
         cfg = _tiny_config(mode="local_base")
         block = experiment.TransformerBlock(cfg)
-        block.attention_step = (
-            lambda x, scale=None, attn_mask=None: x
-        )
+        block.attention_step = lambda x, scale=None, attn_mask=None: x
         widths = []
 
         def moe_step(x, top_k, scale=None):
@@ -92,9 +89,7 @@ class ProtocolInvariantTests(unittest.TestCase):
             return x, torch.tensor(float(top_k))
 
         block.moe_step = moe_step
-        _, aux1, aux2 = block.local_two_stage(
-            torch.zeros(1, 1, 32), 2, 2, delayed=False
-        )
+        _, aux1, aux2 = block.local_two_stage(torch.zeros(1, 1, 32), 2, 2, delayed=False)
         # 第一轮按 k1=2 路由；第二轮按 min(n_experts, k1*k2)=4。
         self.assertEqual(widths, [2, 4])
         # 第一轮 aux 不折算。
@@ -106,9 +101,7 @@ class ProtocolInvariantTests(unittest.TestCase):
         # 机制对照：第二轮固定 k2，宽度与 aux 都不折算。
         cfg = _tiny_config(mode="local_base_k2")
         block = experiment.TransformerBlock(cfg)
-        block.attention_step = (
-            lambda x, scale=None, attn_mask=None: x
-        )
+        block.attention_step = lambda x, scale=None, attn_mask=None: x
         widths = []
 
         def moe_step(x, top_k, scale=None):
@@ -159,11 +152,7 @@ class ProtocolInvariantTests(unittest.TestCase):
             for index in range(k1):
                 # 分支 b 的所有 token 恒为 b+1。
                 branches[:, index] = float(index + 1)
-            gates = (
-                first_gates.unsqueeze(0)
-                .expand(b, t, k1)
-                .clone()
-            )
+            gates = first_gates.unsqueeze(0).expand(b, t, k1).clone()
             return (
                 branches,
                 gates,
@@ -171,38 +160,26 @@ class ProtocolInvariantTests(unittest.TestCase):
                 torch.zeros(()),
             )
 
-        model.middle_blocks[0].first_branch_step = (
-            first_branch_step
-        )
+        model.middle_blocks[0].first_branch_step = first_branch_step
 
-        def run_independent_blocks(
-            block, branches, top_k, scale=None, attn_mask=None
-        ):
+        def run_independent_blocks(block, branches, top_k, scale=None, attn_mask=None):
             return branches, torch.zeros(())
 
         model.run_independent_blocks = run_independent_blocks
 
         with torch.no_grad():
-            logits = model(
-                torch.zeros(batch, time, dtype=torch.long)
-            )["logits"]
+            logits = model(torch.zeros(batch, time, dtype=torch.long))["logits"]
 
         # 期望：每个位置按第一轮 gates 加权合并恒等分支
         # 1.0 / 2.0。
-        merged = (
-            first_gates[:, 0] * 1.0 + first_gates[:, 1] * 2.0
-        )
-        expected_x = merged.view(1, time, 1).expand(
-            batch, time, cfg.d_model
-        )
+        merged = first_gates[:, 0] * 1.0 + first_gates[:, 1] * 2.0
+        expected_x = merged.view(1, time, 1).expand(batch, time, cfg.d_model)
         with torch.no_grad():
             expected = torch.nn.functional.linear(
                 model.final_norm(expected_x),
                 model.lm_head.weight,
             )
-        torch.testing.assert_close(
-            logits, expected, rtol=1e-5, atol=1e-6
-        )
+        torch.testing.assert_close(logits, expected, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

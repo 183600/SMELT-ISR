@@ -1,18 +1,22 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+
 # Reproducibility: Set random seeds
 import random
 import numpy as np
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 try:
     import torch
+
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 except ImportError:
     pass
+
 
 class ArtifactManifestTests(unittest.TestCase):
     """归档清单：内容可复核、路径不可逃逸、新增文件可披露。"""
@@ -41,12 +45,8 @@ class ArtifactManifestTests(unittest.TestCase):
             "hypothesis": "delayed merge reduces val loss",
             "research_question": "RQ1",
         }
-        (root / "config.json").write_text(
-            json.dumps(config), encoding="utf-8"
-        )
-        (root / "metrics.jsonl").write_text(
-            '{"step": 1, "val_loss": 3.0}\n', encoding="utf-8"
-        )
+        (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        (root / "metrics.jsonl").write_text('{"step": 1, "val_loss": 3.0}\n', encoding="utf-8")
         nested = root / "logs" / "train.log"
         nested.parent.mkdir()
         nested.write_text("epoch 1\n", encoding="utf-8")
@@ -73,9 +73,7 @@ class ArtifactManifestTests(unittest.TestCase):
             )
             self.assertNotIn("artifact_manifest.json", paths)
             self.assertEqual(payload["run"]["study_id"], "study-1")
-            self.assertEqual(
-                payload["run"]["data_sha256"], "data-sha"
-            )
+            self.assertEqual(payload["run"]["data_sha256"], "data-sha")
             self.assertEqual(
                 payload["run"]["comparison_protocol_sha256"],
                 "protocol-sha",
@@ -123,26 +121,20 @@ class ArtifactManifestTests(unittest.TestCase):
 
             # 恢复文件后，清单外新增文件只进入 untracked：
             # 默认不判损坏（可能是后续日志），strict 才失败。
-            (root / "logs" / "train.log").write_text(
-                "epoch 1\n"
-            )
+            (root / "logs" / "train.log").write_text("epoch 1\n")
             (root / "extra.txt").write_text("late output")
             report = experiment.verify_artifact_manifest(root)
             self.assertTrue(report["integrity_ok"])
             self.assertEqual(report["untracked"], ["extra.txt"])
             self.assertTrue(report["ok"])
 
-            strict = experiment.verify_artifact_manifest(
-                root, strict=True
-            )
+            strict = experiment.verify_artifact_manifest(root, strict=True)
             self.assertFalse(strict["ok"])
             self.assertTrue(strict["integrity_ok"])
 
             # 重新生成后清单应吸收新增文件，strict 也通过。
             experiment.write_artifact_manifest(root)
-            report = experiment.verify_artifact_manifest(
-                root, strict=True
-            )
+            report = experiment.verify_artifact_manifest(root, strict=True)
             self.assertTrue(report["ok"], report)
 
             # 清单自身不能被写入自身（否则哈希自指）。
@@ -184,9 +176,7 @@ class ArtifactManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")
             try:
-                (root / "bad\\name.txt").write_text(
-                    "x", encoding="utf-8"
-                )
+                (root / "bad\\name.txt").write_text("x", encoding="utf-8")
             except OSError:
                 self.skipTest("当前平台不允许该文件名")
             # 写入端不能生成一份校验端必然拒绝的清单；反斜杠
@@ -199,35 +189,33 @@ class ArtifactManifestTests(unittest.TestCase):
             root = self._make_run(Path(tmp) / "run")
             manifest_path = experiment.write_artifact_manifest(root)
             payload = json.loads(manifest_path.read_text())
-            payload["files"].extend([
-                {
-                    "path": "../outside.txt",
-                    "type": "file",
-                    "bytes": 0,
-                    "sha256": "x",
-                },
-                {
-                    "path": "/etc/passwd",
-                    "type": "file",
-                    "bytes": 0,
-                    "sha256": "x",
-                },
-                {
-                    "path": "config.json",
-                    "type": "file",
-                    "bytes": 0,
-                    "sha256": "x",
-                },
-            ])
-            manifest_path.write_text(
-                json.dumps(payload), encoding="utf-8"
+            payload["files"].extend(
+                [
+                    {
+                        "path": "../outside.txt",
+                        "type": "file",
+                        "bytes": 0,
+                        "sha256": "x",
+                    },
+                    {
+                        "path": "/etc/passwd",
+                        "type": "file",
+                        "bytes": 0,
+                        "sha256": "x",
+                    },
+                    {
+                        "path": "config.json",
+                        "type": "file",
+                        "bytes": 0,
+                        "sha256": "x",
+                    },
+                ]
             )
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
             report = experiment.verify_artifact_manifest(root)
             self.assertFalse(report["ok"])
-            reasons = {
-                item["reason"] for item in report["mismatched"]
-            }
+            reasons = {item["reason"] for item in report["mismatched"]}
             self.assertIn("unsafe_path", reasons)
             self.assertIn("duplicate_path", reasons)
 
@@ -241,21 +229,13 @@ class ArtifactManifestTests(unittest.TestCase):
                 self.skipTest("当前平台不支持符号链接")
             experiment.write_artifact_manifest(root)
 
-            payload = json.loads(
-                (root / "artifact_manifest.json").read_text()
-            )
-            link_entry = next(
-                entry
-                for entry in payload["files"]
-                if entry["path"] == "latest.pt"
-            )
+            payload = json.loads((root / "artifact_manifest.json").read_text())
+            link_entry = next(entry for entry in payload["files"] if entry["path"] == "latest.pt")
             self.assertEqual(link_entry["type"], "symlink")
             self.assertEqual(link_entry["target"], "metrics.jsonl")
             self.assertNotIn("sha256", link_entry)
 
-            self.assertTrue(
-                experiment.verify_artifact_manifest(root)["ok"]
-            )
+            self.assertTrue(experiment.verify_artifact_manifest(root)["ok"])
 
             link.unlink()
             link.symlink_to("config.json")
@@ -279,15 +259,15 @@ class ArtifactManifestTests(unittest.TestCase):
             # 恶意/损坏清单可以声明一条穿过符号链接环的普通文件
             # 路径；Path.resolve 会抛 RuntimeError，校验器必须把
             # 它变成结构化失败而不是 traceback。
-            payload["files"].append({
-                "path": "a/x",
-                "type": "file",
-                "bytes": 1,
-                "sha256": "0" * 64,
-            })
-            manifest_path.write_text(
-                json.dumps(payload), encoding="utf-8"
+            payload["files"].append(
+                {
+                    "path": "a/x",
+                    "type": "file",
+                    "bytes": 1,
+                    "sha256": "0" * 64,
+                }
             )
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
             report = experiment.verify_artifact_manifest(root)
         self.assertFalse(report["ok"])
         self.assertIn(
@@ -310,9 +290,7 @@ class ArtifactManifestTests(unittest.TestCase):
             except (OSError, NotImplementedError):
                 self.skipTest("当前平台不支持符号链接")
             experiment.write_artifact_manifest(root)
-            self.assertTrue(
-                experiment.verify_artifact_manifest(root)["ok"]
-            )
+            self.assertTrue(experiment.verify_artifact_manifest(root)["ok"])
 
             # 逃逸检查仍然生效：通过目录链接把清单路径引到
             # 运行目录之外必须拒绝，即使条目的父目录字符串
@@ -324,15 +302,15 @@ class ArtifactManifestTests(unittest.TestCase):
                 self.skipTest("当前平台不支持目录符号链接")
             manifest_path = root / "artifact_manifest.json"
             payload = json.loads(manifest_path.read_text())
-            payload["files"].append({
-                "path": "escape/outside.txt",
-                "type": "file",
-                "bytes": outside.stat().st_size,
-                "sha256": experiment._sha256_file(outside),
-            })
-            manifest_path.write_text(
-                json.dumps(payload), encoding="utf-8"
+            payload["files"].append(
+                {
+                    "path": "escape/outside.txt",
+                    "type": "file",
+                    "bytes": outside.stat().st_size,
+                    "sha256": experiment._sha256_file(outside),
+                }
             )
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
             report = experiment.verify_artifact_manifest(root)
             self.assertFalse(report["ok"])
             self.assertIn(
@@ -343,9 +321,7 @@ class ArtifactManifestTests(unittest.TestCase):
     def test_manifest_run_summary_prefers_original_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._make_run(Path(tmp) / "run")
-            config = json.loads(
-                (root / "config.json").read_text()
-            )
+            config = json.loads((root / "config.json").read_text())
             config["original_run_metadata"] = {
                 "timestamp_utc": "2025-01-01T00:00:00+00:00",
                 "script_sha256": "original-script",
@@ -360,24 +336,16 @@ class ArtifactManifestTests(unittest.TestCase):
                 "git_commit": "resumed-commit",
                 "git_dirty": True,
             }
-            (root / "config.json").write_text(
-                json.dumps(config), encoding="utf-8"
-            )
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             payload = experiment.build_artifact_manifest(root)
             summary = payload["run"]
             self.assertEqual(
                 summary["run_started_utc"],
                 "2025-01-01T00:00:00+00:00",
             )
-            self.assertEqual(
-                summary["script_sha256"], "original-script"
-            )
-            self.assertEqual(
-                summary["git_commit"], "original-commit"
-            )
-            self.assertEqual(
-                summary["source_tree_sha256"], "original-tree"
-            )
+            self.assertEqual(summary["script_sha256"], "original-script")
+            self.assertEqual(summary["git_commit"], "original-commit")
+            self.assertEqual(summary["source_tree_sha256"], "original-tree")
 
     def test_manifest_entry_limit_counts_across_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,9 +375,7 @@ class ArtifactManifestTests(unittest.TestCase):
                     "--expect-manifest-sha256",
                     pinned,
                 ]
-                with contextlib.redirect_stdout(
-                    io.StringIO()
-                ) as out:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
                     experiment.main()
                 self.assertIn(
                     '"manifest_sha256_matches_expected": true',
@@ -425,9 +391,11 @@ class ArtifactManifestTests(unittest.TestCase):
                     "--expect-manifest-sha256",
                     "0" * 64,
                 ]
-                with contextlib.redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as raised:
-                        experiment.main()
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    experiment.main()
                 self.assertEqual(raised.exception.code, 1)
             finally:
                 sys.argv = old_argv
@@ -520,9 +488,7 @@ class ArtifactManifestTests(unittest.TestCase):
                 ]
                 with contextlib.redirect_stdout(io.StringIO()):
                     experiment.main()
-                self.assertTrue(
-                    (root / "artifact_manifest.json").is_file()
-                )
+                self.assertTrue((root / "artifact_manifest.json").is_file())
 
                 sys.argv = [
                     "experiment.py",
@@ -538,9 +504,11 @@ class ArtifactManifestTests(unittest.TestCase):
                     "--verify-manifest",
                     str(root),
                 ]
-                with contextlib.redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as raised:
-                        experiment.main()
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    experiment.main()
                 self.assertEqual(raised.exception.code, 1)
             finally:
                 sys.argv = old_argv

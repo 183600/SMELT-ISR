@@ -14,6 +14,16 @@ dependencies = [
     "torch>=2.2",
 ]
 
+[project.optional-dependencies]
+# 开发与质量门工具（CI 的精确版本 pin 见 requirements-ci.txt）。
+# 安装：pip install -e ".[dev]"
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+    "mypy>=1.15",
+    "pre-commit>=4",
+]
+
 [tool.setuptools]
 packages = ["exp", "selfcheck"]
 py-modules = ["experiment"]
@@ -25,6 +35,14 @@ exp = ["mainflow/*.py", "analysisflow/*.py"]
 line-length = 100
 target-version = "py310"
 src = ["exp", "selfcheck", "tests"]
+# 机械生成的 manifest（头部标注 "do not edit by hand"）：内容是
+# 拆分器输出的清单数据，保持生成器排版，不参与静态检查与格式化。
+extend-exclude = [
+    "exp/_manifest.py",
+    "selfcheck/_manifest.py",
+]
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -55,6 +73,18 @@ ignore = [
     "B008",  # function calls in default arguments (intentional in CLI defaults)
     "UP037", # quotes in __all__ (dynamic __all__ used)
     "RET504",# unnecessary assignment before return
+    # 本仓库注释/字符串/文档使用中文书写，全角标点（：、（）等）是
+    # 项目文档语言的一部分，不是「可疑的混淆字符」。
+    "RUF001", # ambiguous-unicode-character-string
+    "RUF002", # ambiguous-unicode-character-docstring
+    "RUF003", # ambiguous-unicode-character-comment
+    # 实验基座显式使用 legacy np.random 全局 API：续跑/检查点需要
+    # 对 np.random 的全局状态做逐位存档与恢复（见 RNG state payload），
+    # np.random.Generator 实例化状态无法覆盖这一用途。
+    "NPY002", # numpy-legacy-random
+    # 本仓库的错误消息统一为「直接 raise ValueError/RuntimeError(长中文说明)」
+    # 风格，为每条消息定义自定义异常类反而分散审计注意力。
+    "TRY003", # raise-vanilla-args
 ]
 unfixable = [
     "B008",
@@ -62,7 +92,34 @@ unfixable = [
     "RET504",
 ]
 
-[tool.ruff.isort]
+[tool.ruff.lint.per-file-ignores]
+# exec 组合的机械拆分文件（见 exp/__init__.py 与 exp/_runner.py）：
+# 53 个 part 在导入期被 exec 进同一个模块命名空间，名字跨 part 解析，
+# 任何静态分析（pyflakes / mypy 同理，见 [tool.mypy] exclude）都无法
+# 在单文件视野内判定名字是否存在，F821/F405/F401 等必然海量误报；
+# 拆分函数还普遍依赖 global 语句回写共享状态（PLW0603 是架构契约）。
+# 这些文件的语法与行为由 CI 测试门（py_compile + 全量 unittest +
+# --self-test 逐位复现检查）兜底，静态检查在此关闭以免淹没信号。
+# 新代码请写到这些文件之外（或 tests/），不要往拆分文件里追加。
+"exp/part_*.py" = ["ALL"]
+"exp/mainflow/*.py" = ["ALL"]
+"exp/analysisflow/*.py" = ["ALL"]
+"selfcheck/checks_*.py" = ["ALL"]
+# tests/* 通过 `from _core_support import *` 共享夹具模块：夹具与标准库
+# 名字经 star-import 链再导出（_core_support.py 顶部的「未使用」import
+# 实为全体测试的公共依赖，F401 不能删），import 块排序（I001）会移动
+# star import 的位置，均为该目录既有模式。测试中的字面量（序列长度、
+# 比例阈值等）本身就是被测契约，不抽成常量；测试辅助函数允许多参数；
+# 局部 import（跳过路径/with 块内）是测试惯例；复杂夹具用循环 append
+# 构造长行记录，比推导式更可读（PERF401 是微优化建议，对一次性构造的
+# 测试夹具没有收益）。
+"tests/*.py" = [
+    "F401", "F403", "F405", "I001",
+    "PLR2004", "PLR0913", "PLC0415",
+    "PERF401",
+]
+
+[tool.ruff.lint.isort]
 known-first-party = ["exp", "selfcheck", "experiment"]
 force-sort-within-sections = true
 
@@ -76,6 +133,10 @@ ignore_missing_imports = true
 follow_imports = "silent"
 namespace_packages = false
 plugins = []
+# 注意：mypy 的 exclude 是「正则表达式」而不是 glob。exec 组合的机械
+# 拆分文件（见 exp/__init__.py）在单文件视野下无法通过静态分析（与
+# [tool.ruff.lint.per-file-ignores] 同一理由），这里显式排除；语义由
+# py_compile + 全量 unittest + --self-test 的运行时门兜底。
 exclude = [
     "node_modules",
     "__pycache__",
@@ -83,7 +144,8 @@ exclude = [
     "dist",
     ".eggs",
     "SMELT-ISR",
-    "exp/part_*.py",
-    "exp/mainflow/*.py",
-    "exp/analysisflow/*.py",
+    "^exp/part_.+\\.py$",
+    "^exp/mainflow/.+\\.py$",
+    "^exp/analysisflow/.+\\.py$",
+    "^selfcheck/checks_.+\\.py$",
 ]

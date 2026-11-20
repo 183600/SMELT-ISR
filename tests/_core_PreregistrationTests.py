@@ -1,6 +1,7 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
+
 class PreregistrationTests(unittest.TestCase):
     """外部预注册文件：结构校验、命令行冲突与数据指纹核对。"""
 
@@ -29,20 +30,20 @@ class PreregistrationTests(unittest.TestCase):
         }
 
     def _args(self, **overrides):
-        values = dict(
-            primary_metric=None,
-            hypothesis_direction=None,
-            hypothesis_min_effect=None,
-            hypothesis_baseline=None,
-            common_step=None,
-            budget_match=None,
-            equivalence_margin=0.01,
-            steps=200,
-            seeds=None,
-            seed=42,
-            mode="A",
-            statistical_baseline=False,
-        )
+        values = {
+            "primary_metric": None,
+            "hypothesis_direction": None,
+            "hypothesis_min_effect": None,
+            "hypothesis_baseline": None,
+            "common_step": None,
+            "budget_match": None,
+            "equivalence_margin": 0.01,
+            "steps": 200,
+            "seeds": None,
+            "seed": 42,
+            "mode": "A",
+            "statistical_baseline": False,
+        }
         values.update(overrides)
         return experiment.argparse.Namespace(**values)
 
@@ -84,8 +85,7 @@ class PreregistrationTests(unittest.TestCase):
         text = json.dumps(payload, ensure_ascii=False)
         text = text.replace(
             '"study_id": "smelt-isr-test"',
-            '"study_id": "smelt-isr-test", '
-            '"study_id": "duplicate"',
+            '"study_id": "smelt-isr-test", "study_id": "duplicate"',
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "prereg.json"
@@ -125,7 +125,7 @@ class PreregistrationTests(unittest.TestCase):
 
     def test_apply_rejects_explicit_conflict(self):
         args = self._args(primary_metric="val_macro_f1")
-        applied, error = experiment.preregistration_apply(
+        _, error = experiment.preregistration_apply(
             args,
             self._payload(),
             current_commit="a" * 40,
@@ -136,11 +136,11 @@ class PreregistrationTests(unittest.TestCase):
 
     def test_apply_numeric_conflict_keeps_large_integer_precision(self):
         payload = self._payload()
-        payload["common_step"] = 2 ** 53
-        payload["steps"] = 2 ** 53 + 2
+        payload["common_step"] = 2**53
+        payload["steps"] = 2**53 + 2
         args = self._args(
-            common_step=2 ** 53 + 1,
-            steps=2 ** 53 + 2,
+            common_step=2**53 + 1,
+            steps=2**53 + 2,
         )
         _, error = experiment.preregistration_apply(
             args,
@@ -275,12 +275,8 @@ class PreregistrationTests(unittest.TestCase):
             [],
             self._args(),
         )
-        self.assertEqual(
-            record["frozen_source_tree_sha256"], "f" * 64
-        )
-        self.assertEqual(
-            record["source_tree_sha256"], before
-        )
+        self.assertEqual(record["frozen_source_tree_sha256"], "f" * 64)
+        self.assertEqual(record["source_tree_sha256"], before)
 
     def test_apply_allows_frozen_commit_ancestor(self):
         args = self._args()
@@ -313,7 +309,7 @@ class PreregistrationTests(unittest.TestCase):
 
             args = self._args(steps=2000)
             sys.argv = ["experiment.py", "--steps", "2000"]
-            applied, error = experiment.preregistration_apply(
+            _, error = experiment.preregistration_apply(
                 args,
                 payload,
                 current_commit="a" * 40,
@@ -380,9 +376,7 @@ class PreregistrationTests(unittest.TestCase):
             "comparisons": [["base", "smelt"]],
         }
         args.mode = "base"
-        self.assertIsNone(
-            experiment._preregistration_restored_mode_error(args)
-        )
+        self.assertIsNone(experiment._preregistration_restored_mode_error(args))
         args.mode = "A"
         self.assertIn(
             "不在预注册",
@@ -398,7 +392,7 @@ class PreregistrationTests(unittest.TestCase):
         previous = sys.argv
         try:
             sys.argv = ["experiment.py", "--resume", "checkpoint.pt"]
-            applied, error = experiment.preregistration_apply(
+            _, error = experiment.preregistration_apply(
                 args,
                 payload,
                 current_commit="a" * 40,
@@ -416,9 +410,7 @@ class PreregistrationTests(unittest.TestCase):
             experiment._preregistration_restored_seed_error(args),
         )
         args.seed = 2
-        self.assertIsNone(
-            experiment._preregistration_restored_seed_error(args)
-        )
+        self.assertIsNone(experiment._preregistration_restored_seed_error(args))
 
     def test_apply_seed_sets_are_fixed(self):
         args = self._args(seeds=[42, 43])
@@ -445,18 +437,18 @@ class PreregistrationTests(unittest.TestCase):
         self.assertIn("不在预注册", error)
 
     def test_protocol_fallback_includes_cleaning_exemptions(self):
-        protocol = experiment.experiment_protocol_from_payload({
-            "config": {"mode": "A"},
-            "args": {
-                "lr": 1e-3,
-                "clean_train_against_test": False,
-                "allow_eval_content_for_cleaning": True,
-                "allow_entity_overlap": True,
-            },
-        })
-        self.assertTrue(
-            protocol["allow_eval_content_for_cleaning"]
+        protocol = experiment.experiment_protocol_from_payload(
+            {
+                "config": {"mode": "A"},
+                "args": {
+                    "lr": 1e-3,
+                    "clean_train_against_test": False,
+                    "allow_eval_content_for_cleaning": True,
+                    "allow_entity_overlap": True,
+                },
+            }
         )
+        self.assertTrue(protocol["allow_eval_content_for_cleaning"])
         self.assertTrue(protocol["allow_entity_overlap"])
         # 旧配置完全没有 comparison_protocol 时，这两个键也
         # 必须出现在回填协议里；否则受控变量检查只能报「缺
@@ -480,16 +472,12 @@ class PreregistrationTests(unittest.TestCase):
                 "steps": 100,
             },
         }
-        protocol = experiment.experiment_protocol_from_payload(
-            payload
-        )
+        protocol = experiment.experiment_protocol_from_payload(payload)
         self.assertEqual(protocol["lr_schedule_name"], "wsd")
         self.assertEqual(protocol["lr_schedule"], "wsd")
 
         payload["args"]["lr_schedule"] = "cosine"
-        protocol = experiment.experiment_protocol_from_payload(
-            payload
-        )
+        protocol = experiment.experiment_protocol_from_payload(payload)
         self.assertEqual(
             protocol["lr_schedule"],
             "linear_warmup_cosine_to_10pct",
@@ -501,29 +489,37 @@ class PreregistrationTests(unittest.TestCase):
         # True，而 clean_train_against_test 仍是 argparse 默认
         # False；有效口径应为 OR，不能按单键取 False。
         self.assertTrue(
-            experiment._saved_clean_against_test_effective({
-                "clean_train_against_test": False,
-                "allow_eval_content_for_cleaning": True,
-            })
+            experiment._saved_clean_against_test_effective(
+                {
+                    "clean_train_against_test": False,
+                    "allow_eval_content_for_cleaning": True,
+                }
+            )
         )
         self.assertTrue(
-            experiment._saved_clean_against_test_effective({
-                "clean_train_against_test": True,
-                "allow_eval_content_for_cleaning": False,
-            })
+            experiment._saved_clean_against_test_effective(
+                {
+                    "clean_train_against_test": True,
+                    "allow_eval_content_for_cleaning": False,
+                }
+            )
         )
         # 两个键都缺的最老检查点按历史行为回退。
         self.assertTrue(
-            experiment._saved_clean_against_test_effective({
-                "deduplicate_train_groups": True,
-            })
+            experiment._saved_clean_against_test_effective(
+                {
+                    "deduplicate_train_groups": True,
+                }
+            )
         )
         self.assertFalse(
-            experiment._saved_clean_against_test_effective({
-                "clean_train_against_test": False,
-                "allow_eval_content_for_cleaning": False,
-                "deduplicate_train_groups": True,
-            })
+            experiment._saved_clean_against_test_effective(
+                {
+                    "clean_train_against_test": False,
+                    "allow_eval_content_for_cleaning": False,
+                    "deduplicate_train_groups": True,
+                }
+            )
         )
 
     def test_resume_restores_cleaning_justification(self):
@@ -531,21 +527,15 @@ class PreregistrationTests(unittest.TestCase):
         saved = {
             "domain_justification": "synthetic records are corrupt",
         }
-        restored = experiment._restore_resume_cleaning_justification(
-            args, saved
-        )
+        restored = experiment._restore_resume_cleaning_justification(args, saved)
         self.assertTrue(restored)
         self.assertEqual(
             args.domain_justification,
             "synthetic records are corrupt",
         )
         # 显式给出的新依据不能被检查点静默覆盖。
-        explicit = self._args(
-            domain_justification="new justification"
-        )
-        restored = experiment._restore_resume_cleaning_justification(
-            explicit, saved
-        )
+        explicit = self._args(domain_justification="new justification")
+        restored = experiment._restore_resume_cleaning_justification(explicit, saved)
         self.assertFalse(restored)
         self.assertEqual(
             explicit.domain_justification,
@@ -571,19 +561,23 @@ class PreregistrationTests(unittest.TestCase):
             first.mkdir()
             second.mkdir()
             (first / "config.json").write_text(
-                json.dumps({
-                    "preregistration": {
-                        "file_sha256": "a" * 64,
+                json.dumps(
+                    {
+                        "preregistration": {
+                            "file_sha256": "a" * 64,
+                        }
                     }
-                }),
+                ),
                 encoding="utf-8",
             )
             (second / "config.json").write_text(
-                json.dumps({
-                    "preregistration": {
-                        "file_sha256": "b" * 64,
+                json.dumps(
+                    {
+                        "preregistration": {
+                            "file_sha256": "b" * 64,
+                        }
                     }
-                }),
+                ),
                 encoding="utf-8",
             )
             error = experiment.preregistration_sweep_error(
@@ -604,38 +598,27 @@ class PreregistrationTests(unittest.TestCase):
             group_separator="\\n\\n",
             deduplicate_train_groups=False,
         )
-        self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            )
-        )
+        self.assertIsNone(experiment.preregistration_data_error(args, payload, self._dataset()))
 
         wrong_sha = self._dataset()
         wrong_sha.data_sha256 = "c" * 64
         self.assertIn(
             "data.sha256",
-            experiment.preregistration_data_error(
-                args, payload, wrong_sha
-            ),
+            experiment.preregistration_data_error(args, payload, wrong_sha),
         )
 
         args.deduplicate_train_groups = True
         self.assertIn(
             "data.cleaning",
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            ),
+            experiment.preregistration_data_error(args, payload, self._dataset()),
         )
 
         args.deduplicate_train_groups = False
         args.group_separator = "<|doc|>"
         self.assertIn(
             "group_separator",
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            ),
+            experiment.preregistration_data_error(args, payload, self._dataset()),
         )
-
 
     def test_cleaning_aliases_are_equivalent_for_data_check(self):
         # `--clean-train-against-test` 与
@@ -654,11 +637,7 @@ class PreregistrationTests(unittest.TestCase):
             allow_eval_content_for_cleaning=False,
             deduplicate_train_groups=True,
         )
-        self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            )
-        )
+        self.assertIsNone(experiment.preregistration_data_error(args, payload, self._dataset()))
 
         payload["data"]["cleaning"] = {
             "clean_train_against_test": True,
@@ -671,11 +650,7 @@ class PreregistrationTests(unittest.TestCase):
             allow_eval_content_for_cleaning=True,
             deduplicate_train_groups=True,
         )
-        self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            )
-        )
+        self.assertIsNone(experiment.preregistration_data_error(args, payload, self._dataset()))
 
     def test_data_rejects_cleaning_not_declared_in_preregistration(self):
         # 未声明 cleaning 等于声明全部关闭；否则看到验证结果后
@@ -686,9 +661,7 @@ class PreregistrationTests(unittest.TestCase):
             group_separator=None,
             deduplicate_train_groups=True,
         )
-        error = experiment.preregistration_data_error(
-            args, payload, self._dataset()
-        )
+        error = experiment.preregistration_data_error(args, payload, self._dataset())
         self.assertIn("data.cleaning", error)
 
         # 只声明一个关闭开关也不能让未声明的清洗项静默通过。
@@ -701,9 +674,7 @@ class PreregistrationTests(unittest.TestCase):
             deduplicate_train_groups=False,
             drop_train_shared_chunks=True,
         )
-        error = experiment.preregistration_data_error(
-            args, payload, self._dataset()
-        )
+        error = experiment.preregistration_data_error(args, payload, self._dataset())
         self.assertIn("drop_train_shared_chunks", error)
 
         # 全部关闭时，省略 cleaning 的旧预注册文件仍可核对通过。
@@ -720,9 +691,7 @@ class PreregistrationTests(unittest.TestCase):
             drop_train_degenerate_runs=False,
         )
         self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, self._payload(), self._dataset()
-            )
+            experiment.preregistration_data_error(args, self._payload(), self._dataset())
         )
 
     def test_schema_rejects_invalid_near_duplicate_cleaning_values(self):
@@ -743,9 +712,7 @@ class PreregistrationTests(unittest.TestCase):
             "near_duplicate_threshold": 0.8,
             "near_duplicate_shingle_bytes": 8,
         }
-        self.assertIsNone(
-            experiment.preregistration_schema_error(payload)
-        )
+        self.assertIsNone(experiment.preregistration_schema_error(payload))
 
     def test_schema_validates_data_processing_protocol(self):
         payload = self._payload()
@@ -763,17 +730,11 @@ class PreregistrationTests(unittest.TestCase):
             },
             "cleaning_kinds": ["corrupt_bytes"],
         }
-        self.assertIsNone(
-            experiment.preregistration_schema_error(payload)
-        )
-        payload["data"]["processing"][
-            "statistical_fit_scope"
-        ] = "train_and_val"
+        self.assertIsNone(experiment.preregistration_schema_error(payload))
+        payload["data"]["processing"]["statistical_fit_scope"] = "train_and_val"
         error = experiment.preregistration_schema_error(payload)
         self.assertIn("statistical_fit_scope", error)
-        payload["data"]["processing"][
-            "statistical_fit_scope"
-        ] = "train_only"
+        payload["data"]["processing"]["statistical_fit_scope"] = "train_only"
         payload["data"]["processing"]["unknown"] = True
         error = experiment.preregistration_schema_error(payload)
         self.assertIn("未知字段", error)
@@ -794,19 +755,11 @@ class PreregistrationTests(unittest.TestCase):
             near_duplicate_threshold=0.8,
             near_duplicate_shingle_bytes=8,
         )
-        error = experiment.preregistration_data_error(
-            args, payload, self._dataset()
-        )
+        error = experiment.preregistration_data_error(args, payload, self._dataset())
         self.assertIn("near_duplicate_threshold", error)
 
-        payload["data"]["cleaning"][
-            "near_duplicate_threshold"
-        ] = 0.8
-        self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            )
-        )
+        payload["data"]["cleaning"]["near_duplicate_threshold"] = 0.8
+        self.assertIsNone(experiment.preregistration_data_error(args, payload, self._dataset()))
 
     def test_data_rejects_undeclared_group_separator(self):
         # 未声明 group_separator 等于不分群组；看到结果后再加
@@ -816,25 +769,17 @@ class PreregistrationTests(unittest.TestCase):
             split_policy="contiguous",
             group_separator="\\n\\n",
         )
-        error = experiment.preregistration_data_error(
-            args, payload, self._dataset()
-        )
+        error = experiment.preregistration_data_error(args, payload, self._dataset())
         self.assertIn("group_separator", error)
 
         # 声明 null 与不声明同义；显式声明相同分隔符则通过。
         payload["data"]["group_separator"] = None
         self.assertIn(
             "group_separator",
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            ),
+            experiment.preregistration_data_error(args, payload, self._dataset()),
         )
         payload["data"]["group_separator"] = "\\n\\n"
-        self.assertIsNone(
-            experiment.preregistration_data_error(
-                args, payload, self._dataset()
-            )
-        )
+        self.assertIsNone(experiment.preregistration_data_error(args, payload, self._dataset()))
 
     def test_schema_rejects_conflicting_cleaning_aliases(self):
         payload = self._payload()
@@ -860,9 +805,7 @@ class PreregistrationTests(unittest.TestCase):
         payload["data"]["cleaning"] = None
         payload["data"]["entity_manifest_sha256"] = None
         payload["data"]["time_order_manifest_sha256"] = None
-        self.assertIsNone(
-            experiment.preregistration_schema_error(payload)
-        )
+        self.assertIsNone(experiment.preregistration_schema_error(payload))
 
     def test_schema_rejects_empty_validation_fraction(self):
         payload = self._payload()
@@ -960,20 +903,16 @@ class PreregistrationCoverageTests(unittest.TestCase):
         return row
 
     def _rows(self):
-        return [
-            self._row(mode, seed)
-            for mode in ("smelt", "A", "B")
-            for seed in (42, 43, 44)
-        ]
+        return [self._row(mode, seed) for mode in ("smelt", "A", "B") for seed in (42, 43, 44)]
 
     def _coverage(self, rows, payload=None, **overrides):
-        values = dict(
-            file_sha256="e" * 64,
-            metric="val_loss",
-            baseline_mode="smelt",
-            common_step=100,
-            equivalence_margin=0.01,
-        )
+        values = {
+            "file_sha256": "e" * 64,
+            "metric": "val_loss",
+            "baseline_mode": "smelt",
+            "common_step": 100,
+            "equivalence_margin": 0.01,
+        }
         values.update(overrides)
         return experiment.preregistration_analysis_coverage(
             rows,
@@ -991,25 +930,17 @@ class PreregistrationCoverageTests(unittest.TestCase):
         )
 
     def test_rejects_missing_comparison_arm(self):
-        rows = [
-            row for row in self._rows() if row["mode"] != "B"
-        ]
+        rows = [row for row in self._rows() if row["mode"] != "B"]
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertEqual(
             coverage["missing_comparisons"],
             [["smelt", "B"]],
         )
-        self.assertTrue(
-            any("缺少模式" in error for error in coverage["errors"])
-        )
+        self.assertTrue(any("缺少模式" in error for error in coverage["errors"]))
 
     def test_rejects_missing_seed_cell(self):
-        rows = [
-            row
-            for row in self._rows()
-            if not (row["mode"] == "smelt" and row["seed"] == 43)
-        ]
+        rows = [row for row in self._rows() if not (row["mode"] == "smelt" and row["seed"] == 43)]
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertEqual(
@@ -1018,7 +949,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
         )
 
     def test_rejects_post_hoc_extra_seed(self):
-        rows = self._rows() + [self._row("smelt", 99)]
+        rows = [*self._rows(), self._row("smelt", 99)]
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertEqual(
@@ -1071,10 +1002,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
         coverage = self._coverage(rows)
         self.assertFalse(coverage["ok"])
         self.assertTrue(
-            any(
-                item["field"] == "group_separator"
-                for item in coverage["data_mismatches"]
-            )
+            any(item["field"] == "group_separator" for item in coverage["data_mismatches"])
         )
 
     def test_rejects_source_tree_drift(self):
@@ -1096,9 +1024,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
         payload["baseline_mode"] = "ngram"
         payload["comparisons"] = [["ngram", "A"]]
         rows = [self._row("ngram", None, deterministic=True)]
-        rows.extend(
-            self._row("A", seed) for seed in (42, 43, 44)
-        )
+        rows.extend(self._row("A", seed) for seed in (42, 43, 44))
         coverage = self._coverage(
             rows,
             payload=payload,
@@ -1116,9 +1042,7 @@ class PreregistrationCoverageTests(unittest.TestCase):
         rows[0]["preregistration_record"] = None
         coverage = self._coverage(rows)
         self.assertTrue(coverage["ok"], coverage["errors"])
-        self.assertTrue(
-            any("失败运行" in message for message in coverage["advisories"])
-        )
+        self.assertTrue(any("失败运行" in message for message in coverage["advisories"]))
 
     def test_cli_requires_compare_for_coverage_gate(self):
         old_argv = sys.argv
@@ -1128,9 +1052,11 @@ class PreregistrationCoverageTests(unittest.TestCase):
                 "--compare-preregistration",
                 "prereg.json",
             ]
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as raised:
-                    experiment.main()
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                experiment.main()
             self.assertEqual(raised.exception.code, 2)
         finally:
             sys.argv = old_argv
@@ -1142,9 +1068,11 @@ class PreregistrationCoverageTests(unittest.TestCase):
                 "experiment.py",
                 "--allow-preregistration-coverage-deviation",
             ]
-            with contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as raised:
-                    experiment.main()
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                experiment.main()
             self.assertEqual(raised.exception.code, 2)
         finally:
             sys.argv = old_argv

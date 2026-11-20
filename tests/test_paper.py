@@ -19,16 +19,12 @@ from pathlib import Path
 try:
     import torch
 except ImportError as error:  # pragma: no cover
-    raise unittest.SkipTest(
-        f"torch is required for these tests: {error}"
-    )
+    raise unittest.SkipTest(f"torch is required for these tests: {error}") from error
 
 
 def _load_experiment():
     path = Path(__file__).resolve().parents[1] / "experiment.py"
-    spec = importlib.util.spec_from_file_location(
-        "smelt_paper_experiment", path
-    )
+    spec = importlib.util.spec_from_file_location("smelt_paper_experiment", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["smelt_paper_experiment"] = module
     spec.loader.exec_module(module)
@@ -43,9 +39,7 @@ PAPER_PROTOCOL = {
     "batch_size": 256,
     "stable_steps": 196075,
     "document_masks": True,
-    "save_at_steps": list(
-        experiment.PAPER_PROTOCOL["branch_steps"]
-    ),
+    "save_at_steps": list(experiment.PAPER_PROTOCOL["branch_steps"]),
 }
 
 
@@ -84,9 +78,7 @@ class PaperGridTests(unittest.TestCase):
             self.assertEqual(cell.active_experts, 8, key)
 
     def test_smelt_ratios_present(self):
-        for (arch, scale, sparsity), cell in (
-            experiment.PAPER_CELLS.items()
-        ):
+        for (arch, _scale, _sparsity), cell in experiment.PAPER_CELLS.items():
             if arch != "smelt":
                 self.assertIsNone(cell.flops_ratio)
                 self.assertIsNone(cell.kv_ratio)
@@ -101,18 +93,12 @@ class PaperPresetTests(unittest.TestCase):
         for arch in ("base", "smelt"):
             for scale in experiment.PAPER_SCALES:
                 for sparsity in experiment.PAPER_SPARSITIES:
-                    cell = experiment.paper_cell(
-                        scale, sparsity, arch
-                    )
-                    preset = experiment.paper_preset(
-                        scale, sparsity, arch
-                    )
+                    cell = experiment.paper_cell(scale, sparsity, arch)
+                    preset = experiment.paper_preset(scale, sparsity, arch)
                     config = preset["config"]
                     self.assertEqual(config["d_model"], cell.hidden)
                     self.assertEqual(config["n_layers"], cell.layers)
-                    self.assertEqual(
-                        config["n_experts"], cell.total_experts
-                    )
+                    self.assertEqual(config["n_experts"], cell.total_experts)
                     self.assertEqual(config["top_k"], 8)
                     self.assertEqual(config["mode"], arch)
                     self.assertEqual(config["seq_len"], 4096)
@@ -132,13 +118,9 @@ class PaperPresetTests(unittest.TestCase):
         for arch in ("base", "smelt"):
             for scale in experiment.PAPER_SCALES:
                 for sparsity in experiment.PAPER_SPARSITIES:
-                    preset = experiment.paper_preset(
-                        scale, sparsity, arch
-                    )
+                    preset = experiment.paper_preset(scale, sparsity, arch)
                     cell = preset["cell"]
-                    measured = preset["measured"][
-                        "total_params"
-                    ] / 1e9
+                    measured = preset["measured"]["total_params"] / 1e9
                     self.assertLess(
                         abs(measured / cell.total_params - 1.0),
                         0.01,
@@ -148,17 +130,10 @@ class PaperPresetTests(unittest.TestCase):
     def test_preset_kv_ratio_matches_paper(self):
         for scale in experiment.PAPER_SCALES:
             for sparsity in experiment.PAPER_SPARSITIES:
-                preset = experiment.paper_preset(
-                    scale, sparsity, "smelt"
-                )
+                preset = experiment.paper_preset(scale, sparsity, "smelt")
                 cell = preset["cell"]
-                base = experiment.paper_preset(
-                    scale, sparsity, "base"
-                )
-                ratio = (
-                    preset["derived"]["kv_dim"]
-                    / base["derived"]["kv_dim"]
-                )
+                base = experiment.paper_preset(scale, sparsity, "base")
+                ratio = preset["derived"]["kv_dim"] / base["derived"]["kv_dim"]
                 self.assertLess(
                     abs(ratio - cell.kv_ratio),
                     0.04,
@@ -195,17 +170,13 @@ class PaperPresetTests(unittest.TestCase):
 class PaperFidelityTests(unittest.TestCase):
     def test_full_reproduction_when_recipe_and_protocol_match(self):
         for arch in ("base", "smelt"):
-            preset = experiment.paper_preset(
-                "100M", 85, arch
-            )
+            preset = experiment.paper_preset("100M", 85, arch)
             cfg = experiment.Config(
                 **preset["config"],
                 document_masks=True,
                 document_separator=[10],
             )
-            report = experiment.paper_fidelity_report(
-                cfg, PAPER_PROTOCOL
-            )
+            report = experiment.paper_fidelity_report(cfg, PAPER_PROTOCOL)
             self.assertTrue(
                 report["architecture_faithful"],
                 report["checks"],
@@ -219,23 +190,17 @@ class PaperFidelityTests(unittest.TestCase):
                 report["deviations"],
             )
             self.assertEqual(report["deviations"], [])
-            self.assertEqual(
-                report["cell"]["scale"], "100M"
-            )
+            self.assertEqual(report["cell"]["scale"], "100M")
             # recipe 复现与数值复现分开：base 格的预算
             # （总参数/active/S）落在容差内，smelt 格的
             # FLOPs 比例与 S 仍有偏差，不能声称数值复现。
             if arch == "base":
                 self.assertTrue(
                     report["numerical_reproduction"],
-                    report["budget_audit"][
-                        "within_paper_tolerance"
-                    ],
+                    report["budget_audit"]["within_paper_tolerance"],
                 )
             else:
-                self.assertFalse(
-                    report["numerical_reproduction"]
-                )
+                self.assertFalse(report["numerical_reproduction"])
 
     def test_prototype_config_is_not_full_reproduction(self):
         cfg = experiment.Config(
@@ -258,9 +223,7 @@ class PaperFidelityTests(unittest.TestCase):
 
     def test_missing_protocol_blocks_full_reproduction(self):
         cfg = experiment.Config(
-            **experiment.paper_preset(
-                "100M", 85, "smelt"
-            )["config"],
+            **experiment.paper_preset("100M", 85, "smelt")["config"],
             document_masks=True,
             document_separator=[10],
         )
@@ -271,21 +234,15 @@ class PaperFidelityTests(unittest.TestCase):
 
     def test_decay_branch_satisfies_protocol(self):
         cfg = experiment.Config(
-            **experiment.paper_preset(
-                "100M", 85, "smelt"
-            )["config"],
+            **experiment.paper_preset("100M", 85, "smelt")["config"],
             document_masks=True,
             document_separator=[10],
         )
         branch = dict(PAPER_PROTOCOL)
         branch["stable_steps"] = 20000
-        branch["steps"] = (
-            20000 + experiment.PAPER_PROTOCOL["decay_steps"]
-        )
+        branch["steps"] = 20000 + experiment.PAPER_PROTOCOL["decay_steps"]
         branch["save_at_steps"] = []
-        report = experiment.paper_fidelity_report(
-            cfg, branch
-        )
+        report = experiment.paper_fidelity_report(cfg, branch)
         self.assertNotIn(
             "protocol_stable_phase",
             report["protocol_checks"],
@@ -301,21 +258,16 @@ class PaperFidelityTests(unittest.TestCase):
         # 末端进入 10B-token decay 同样是一条合法的分支运行，
         # 不应被误判成「缺少稳定期」。
         cfg = experiment.Config(
-            **experiment.paper_preset(
-                "100M", 85, "smelt"
-            )["config"],
+            **experiment.paper_preset("100M", 85, "smelt")["config"],
             document_masks=True,
             document_separator=[10],
         )
         branch = dict(PAPER_PROTOCOL)
         branch["steps"] = (
-            experiment.PAPER_PROTOCOL["stable_steps"]
-            + experiment.PAPER_PROTOCOL["decay_steps"]
+            experiment.PAPER_PROTOCOL["stable_steps"] + experiment.PAPER_PROTOCOL["decay_steps"]
         )
         branch["save_at_steps"] = []
-        report = experiment.paper_fidelity_report(
-            cfg, branch
-        )
+        report = experiment.paper_fidelity_report(cfg, branch)
         self.assertNotIn(
             "protocol_stable_phase",
             report["protocol_checks"],
@@ -328,9 +280,7 @@ class PaperFidelityTests(unittest.TestCase):
 
     def test_protocol_deviation_detected(self):
         cfg = experiment.Config(
-            **experiment.paper_preset(
-                "100M", 85, "smelt"
-            )["config"],
+            **experiment.paper_preset("100M", 85, "smelt")["config"],
             document_masks=True,
             document_separator=[10],
         )
@@ -338,23 +288,15 @@ class PaperFidelityTests(unittest.TestCase):
         bad["document_masks"] = False
         report = experiment.paper_fidelity_report(cfg, bad)
         self.assertFalse(report["protocol_faithful"])
-        self.assertIn(
-            "protocol_document_masks", report["deviations"]
-        )
+        self.assertIn("protocol_document_masks", report["deviations"])
 
     def test_budget_audit_reports_paper_targets(self):
-        preset = experiment.paper_preset(
-            "200M", 95, "smelt"
-        )
+        preset = experiment.paper_preset("200M", 95, "smelt")
         cfg = experiment.Config(**preset["config"])
         report = experiment.paper_fidelity_report(cfg)
         budget = report["budget_audit"]
-        self.assertAlmostEqual(
-            budget["paper"]["flops_ratio"], 1.029
-        )
-        self.assertAlmostEqual(
-            budget["paper"]["kv_ratio"], 1.031
-        )
+        self.assertAlmostEqual(budget["paper"]["flops_ratio"], 1.029)
+        self.assertAlmostEqual(budget["paper"]["kv_ratio"], 1.031)
         # 本实现的 KV cache 与论文目标相差 <4%。
         self.assertLess(
             abs(budget["measured"]["kv_ratio_vs_base"] - 1.031),
@@ -364,32 +306,32 @@ class PaperFidelityTests(unittest.TestCase):
 
 class PaperCliTests(unittest.TestCase):
     def _namespace(self, **overrides):
-        values = dict(
-            mode="B",
-            paper_cell=None,
-            paper_arch=None,
-            paper_protocol=False,
-            lr_schedule="cosine",
-            wsd_stable_steps=None,
-            wsd_final_lr_ratio=0.1,
-            save_at_steps=None,
-            document_masks=False,
-            group_separator=None,
-            seq_len=128,
-            d_model=128,
-            n_heads=4,
-            n_kv_heads=None,
-            n_layers=8,
-            n_experts=8,
-            expert_hidden=256,
-            top_k=2,
-            k1=2,
-            k2=2,
-            steps=2000,
-            batch_size=32,
-            warmup_steps=100,
-            eval_interval=200,
-        )
+        values = {
+            "mode": "B",
+            "paper_cell": None,
+            "paper_arch": None,
+            "paper_protocol": False,
+            "lr_schedule": "cosine",
+            "wsd_stable_steps": None,
+            "wsd_final_lr_ratio": 0.1,
+            "save_at_steps": None,
+            "document_masks": False,
+            "group_separator": None,
+            "seq_len": 128,
+            "d_model": 128,
+            "n_heads": 4,
+            "n_kv_heads": None,
+            "n_layers": 8,
+            "n_experts": 8,
+            "expert_hidden": 256,
+            "top_k": 2,
+            "k1": 2,
+            "k2": 2,
+            "steps": 2000,
+            "batch_size": 32,
+            "warmup_steps": 100,
+            "eval_interval": 200,
+        }
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -422,9 +364,7 @@ class PaperCliTests(unittest.TestCase):
             "64",
         ]
         try:
-            args = self._namespace(
-                paper_cell="200M:95", d_model=64
-            )
+            args = self._namespace(paper_cell="200M:95", d_model=64)
             with self.assertRaises(SystemExit):
                 experiment.apply_paper_cli(args, _Parser())
         finally:
@@ -510,7 +450,7 @@ class ScheduleTests(unittest.TestCase):
             **kwargs,
         )
         values = []
-        for step in range(record_steps):
+        for _ in range(record_steps):
             values.append(scheduler.get_last_lr()[0])
             optimizer.step()
             scheduler.step()
@@ -576,9 +516,7 @@ class GqaTests(unittest.TestCase):
         y = torch.randint(0, 256, (2, 16))
         output = model(x, y)
         output["loss"].backward()
-        self.assertTrue(
-            bool(torch.isfinite(output["loss"]))
-        )
+        self.assertTrue(bool(torch.isfinite(output["loss"])))
         attn = model.blocks[0].attn
         self.assertEqual(attn.k_proj.weight.shape[0], 3 * 8)
 
@@ -623,9 +561,7 @@ class DocumentMaskTests(unittest.TestCase):
 
     def test_multi_byte_separator(self):
         ids = torch.tensor([[1, 2, 10, 11, 3, 4, 10, 11]])
-        segments = experiment.document_segment_ids(
-            ids, [10, 11]
-        )
+        segments = experiment.document_segment_ids(ids, [10, 11])
         self.assertEqual(
             segments.tolist(),
             [[0, 0, 1, 1, 1, 1, 2, 2]],
@@ -681,9 +617,7 @@ class DocumentMaskTests(unittest.TestCase):
         )
         torch.manual_seed(0)
         model = experiment.LanguageModel(cfg)
-        x = torch.tensor(
-            [[1, 2, 10, 3, 4, 10, 5, 6]]
-        )
+        x = torch.tensor([[1, 2, 10, 3, 4, 10, 5, 6]])
         y = torch.roll(x, -1, dims=1)
         output = model(x, y)
         output["loss"].backward()
@@ -731,9 +665,7 @@ class DocumentMaskTests(unittest.TestCase):
             torch.manual_seed(0)
             model = experiment.LanguageModel(cfg).eval()
             model.train()
-            x = torch.tensor(
-                [[1, 2, 3, self.SEP, 5, 6, 7, 8]]
-            )
+            x = torch.tensor([[1, 2, 3, self.SEP, 5, 6, 7, 8]])
             perturbed = x.clone()
             perturbed[0, :3] = torch.tensor([20, 21, 22])
             with torch.no_grad():
@@ -741,17 +673,13 @@ class DocumentMaskTests(unittest.TestCase):
                 after = model(perturbed)["logits"]
             # 文档 2（位置 4..7）不能受文档 1 扰动影响。
             self.assertLess(
-                float(
-                    (before - after)[0, 4:].abs().max()
-                ),
+                float((before - after)[0, 4:].abs().max()),
                 1e-6,
                 mode,
             )
             # 文档 1 自身确实受影响，证明扰动不是无效的。
             self.assertGreater(
-                float(
-                    (before - after)[0, :3].abs().max()
-                ),
+                float((before - after)[0, :3].abs().max()),
                 0.0,
                 mode,
             )

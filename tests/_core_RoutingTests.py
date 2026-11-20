@@ -1,23 +1,16 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
+
 class RoutingTests(unittest.TestCase):
     def test_chance_levels_are_reported(self):
         a = torch.tensor([[0, 1], [2, 3], [0, 2]])
         b = torch.tensor([[1, 2], [2, 0], [1, 3]])
-        metrics = experiment._routing_set_metrics(
-            a, b, 4
-        )
+        metrics = experiment._routing_set_metrics(a, b, 4)
         self.assertIsNotNone(metrics)
-        self.assertGreaterEqual(
-            metrics["jaccard_chance_uniform"], 0.0
-        )
-        self.assertGreaterEqual(
-            metrics["jaccard_chance_marginal"], 0.0
-        )
-        self.assertIsNotNone(
-            metrics["jaccard_lift_over_marginal"]
-        )
+        self.assertGreaterEqual(metrics["jaccard_chance_uniform"], 0.0)
+        self.assertGreaterEqual(metrics["jaccard_chance_marginal"], 0.0)
+        self.assertIsNotNone(metrics["jaccard_lift_over_marginal"])
 
     def test_routing_set_bool_does_not_mutate_or_fail_on_views(self):
         indices = torch.tensor([[-1, 99]], dtype=torch.int64)
@@ -50,20 +43,14 @@ class RoutingTests(unittest.TestCase):
             "input_shape": [2, 1, 4],
         }
         second = {
-            "indices": torch.tensor(
-                [[0, 2], [1, 3], [2, 0], [3, 1]]
-            ),
+            "indices": torch.tensor([[0, 2], [1, 3], [2, 0], [3, 1]]),
             "input_shape": [4, 1, 4],
         }
-        overlap = probe._pair_overlap(
-            first, second, cfg.middle_start
-        )
+        overlap = probe._pair_overlap(first, second, cfg.middle_start)
         # 每个分支只与它自己携带的第一轮专家比较：
         # {0}->{0,2}, {1}->{1,3}, {2}->{2,0}, {3}->{3,1}。
         self.assertAlmostEqual(
-            overlap["branch_level"][
-                "second_round_jaccard_mean"
-            ],
+            overlap["branch_level"]["second_round_jaccard_mean"],
             0.5,
         )
         self.assertAlmostEqual(
@@ -108,39 +95,21 @@ class RoutingTests(unittest.TestCase):
 
     def test_routing_shuffle_seed_uses_stable_module_index(self):
         first = experiment._routing_shuffle_seed(7, 0)
-        self.assertEqual(
-            first, experiment._routing_shuffle_seed(7, 0)
-        )
+        self.assertEqual(first, experiment._routing_shuffle_seed(7, 0))
         self.assertEqual(
             experiment._routing_shuffle_seed(7, 1),
             experiment._routing_shuffle_seed(7, 1),
         )
-        self.assertNotEqual(
-            first, experiment._routing_shuffle_seed(8, 0)
-        )
-        self.assertNotEqual(
-            first, experiment._routing_shuffle_seed(7, 1)
-        )
+        self.assertNotEqual(first, experiment._routing_shuffle_seed(8, 0))
+        self.assertNotEqual(first, experiment._routing_shuffle_seed(7, 1))
 
     def test_routing_shuffle_is_distinct_and_advances(self):
         generator = torch.Generator().manual_seed(0)
-        first = experiment._routing_shuffle_indices(
-            4, torch.Size([64, 2]), generator
-        )
-        second = experiment._routing_shuffle_indices(
-            4, torch.Size([64, 2]), generator
-        )
+        first = experiment._routing_shuffle_indices(4, torch.Size([64, 2]), generator)
+        second = experiment._routing_shuffle_indices(4, torch.Size([64, 2]), generator)
         # 每个 token 的 top-k 必须是无放回的不同专家。
-        self.assertTrue(
-            bool(
-                (first[:, 0] != first[:, 1]).all()
-            )
-        )
-        self.assertTrue(
-            bool(
-                (second[:, 0] != second[:, 1]).all()
-            )
-        )
+        self.assertTrue(bool((first[:, 0] != first[:, 1]).all()))
+        self.assertTrue(bool((second[:, 0] != second[:, 1]).all()))
         # 第二次调用不能复用第一次的随机 assignment。
         self.assertFalse(torch.equal(first, second))
 
@@ -185,9 +154,7 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertTrue(first["available"])
         self.assertEqual(first, second)
-        self.assertAlmostEqual(
-            first["loss_delta"]["mean_delta"], 0.2
-        )
+        self.assertAlmostEqual(first["loss_delta"]["mean_delta"], 0.2)
         self.assertGreater(first["loss_delta"]["low"], 0.0)
         self.assertTrue(first["loss_delta"]["excludes_zero"])
         self.assertLess(first["accuracy_delta"]["high"], 0.0)
@@ -228,12 +195,8 @@ class RoutingTests(unittest.TestCase):
             seed=11,
             resamples=300,
         )
-        self.assertAlmostEqual(
-            weighted["loss_delta"]["mean_delta"], 0.25
-        )
-        self.assertAlmostEqual(
-            weighted["accuracy_delta"]["mean_delta"], -0.25
-        )
+        self.assertAlmostEqual(weighted["loss_delta"]["mean_delta"], 0.25)
+        self.assertAlmostEqual(weighted["accuracy_delta"]["mean_delta"], -0.25)
         self.assertEqual(weighted["tokens_used"], 40)
         single = experiment._paired_bootstrap_delta_ci(
             {
@@ -260,9 +223,7 @@ class RoutingTests(unittest.TestCase):
             seed=11,
         )
         self.assertFalse(single["available"])
-        self.assertEqual(
-            single["reason"], "fewer_than_two_batches"
-        )
+        self.assertEqual(single["reason"], "fewer_than_two_batches")
 
     def test_intervention_eval_returns_per_batch_totals(self):
         class _FixedEvalDataset:
@@ -277,9 +238,7 @@ class RoutingTests(unittest.TestCase):
                 batch_size,
                 device,
             ):
-                generator = torch.Generator().manual_seed(
-                    batch_index
-                )
+                generator = torch.Generator().manual_seed(batch_index)
                 x = torch.randint(
                     0,
                     256,
@@ -312,13 +271,10 @@ class RoutingTests(unittest.TestCase):
             sum(entry["tokens"] for entry in per_batch),
             evaluation["tokens"],
         )
-        weighted = sum(
-            entry["loss"] * entry["tokens"]
-            for entry in per_batch
-        ) / evaluation["tokens"]
-        self.assertAlmostEqual(
-            weighted, evaluation["loss"], places=6
+        weighted = (
+            sum(entry["loss"] * entry["tokens"] for entry in per_batch) / evaluation["tokens"]
         )
+        self.assertAlmostEqual(weighted, evaluation["loss"], places=6)
 
     def test_routing_interventions_report_bootstrap_cis(self):
         class _FixedEvalDataset:
@@ -333,9 +289,7 @@ class RoutingTests(unittest.TestCase):
                 batch_size,
                 device,
             ):
-                generator = torch.Generator().manual_seed(
-                    batch_index
-                )
+                generator = torch.Generator().manual_seed(batch_index)
                 x = torch.randint(
                     0,
                     256,
@@ -393,15 +347,11 @@ class RoutingTests(unittest.TestCase):
                     "expert_drop": {
                         "max_expert": 0,
                         "max_loss_delta": delta * 2.0,
-                        "max_expert_ci95_low": (
-                            interval["low"] if separated else None
-                        ),
+                        "max_expert_ci95_low": (interval["low"] if separated else None),
                         "min_loss_delta": 0.001,
                         "importance_cv": 0.3,
                         "importance_ci_separated": separated,
-                        "specialization_evidence": (
-                            "separated" if separated else "not_separated"
-                        ),
+                        "specialization_evidence": ("separated" if separated else "not_separated"),
                         "per_expert": {
                             "0": {
                                 "loss_delta_ci95": interval,
@@ -425,22 +375,14 @@ class RoutingTests(unittest.TestCase):
                 "routing_interventions": _payload(0.03, False),
             },
         ]
-        report = (
-            experiment.routing_intervention_comparison_report(rows)
-        )
+        report = experiment.routing_intervention_comparison_report(rows)
         self.assertTrue(report["available"])
         summary = report["by_mode"]["A"]
         self.assertEqual(summary["n_runs"], 2)
         self.assertEqual(summary["n_unique_seeds"], 2)
-        self.assertAlmostEqual(
-            summary["shuffle_loss_delta_mean"], 0.04
-        )
-        self.assertEqual(
-            summary["specialization_separated_runs"], 1
-        )
-        self.assertEqual(
-            summary["shuffle_ci_excludes_zero_runs"], 2
-        )
+        self.assertAlmostEqual(summary["shuffle_loss_delta_mean"], 0.04)
+        self.assertEqual(summary["specialization_separated_runs"], 1)
+        self.assertEqual(summary["shuffle_ci_excludes_zero_runs"], 2)
 
     def test_routing_shuffle_reproducible_across_fresh_models(self):
         class _FixedEvalDataset:
@@ -500,12 +442,8 @@ class RoutingTests(unittest.TestCase):
             second["interventions"]["routing_shuffle"]["loss"],
         )
         self.assertEqual(
-            first["interventions"]["routing_shuffle"][
-                "token_accuracy"
-            ],
-            second["interventions"]["routing_shuffle"][
-                "token_accuracy"
-            ],
+            first["interventions"]["routing_shuffle"]["token_accuracy"],
+            second["interventions"]["routing_shuffle"]["token_accuracy"],
         )
 
         other_seed = experiment.analyze_routing_interventions(

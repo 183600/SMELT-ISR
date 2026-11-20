@@ -1,5 +1,7 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+
+
 class EdgeCaseRegressionTests(unittest.TestCase):
     def test_group_split_without_test_ends_at_eof(self):
         # 旧实现会把 cut_val 落在 19，ByteDataset 随即把
@@ -17,19 +19,18 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(cut_train, 6)
         self.assertEqual(cut_val, 25)
+
     def test_empty_group_separator_is_rejected(self):
         with self.assertRaises(ValueError):
-            list(experiment._iter_group_boundaries(
-                bytearray(b"abc"), b"", 0
-            ))
+            list(experiment._iter_group_boundaries(bytearray(b"abc"), b"", 0))
         with self.assertRaises(ValueError):
-            list(experiment._iter_group_spans(
-                bytearray(b"abc"), b"", 0, 3
-            ))
+            list(experiment._iter_group_spans(bytearray(b"abc"), b"", 0, 3))
+
     def test_overlapping_separator_does_not_create_extra_document(self):
         ids = torch.tensor([[65, 65, 65]])
         segments = experiment.document_segment_ids(ids, [65, 65])
         self.assertEqual(segments.tolist(), [[0, 0, 0]])
+
     def test_split_overlap_with_gap_is_not_cancelled(self):
         record = experiment._split_isolation_record(
             {
@@ -41,54 +42,46 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(record["overlap_bytes"], 10)
         self.assertFalse(record["covers_all_bytes"])
+
     def test_metrics_truncation_drops_partial_trailing_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "metrics.jsonl"
             path.write_text(
-                '{"step":1,"val_loss":3.0}\n'
-                '{"step":2,"val_lo',
+                '{"step":1,"val_loss":3.0}\n{"step":2,"val_lo',
                 encoding="utf-8",
             )
             experiment._truncate_metrics_after_step(path, 1)
-            with open(path, "a", encoding="utf-8") as handle:
+            with path.open("a", encoding="utf-8") as handle:
                 handle.write('{"step":2,"val_loss":2.0}\n')
             records = experiment.read_metrics_records(path)
         self.assertEqual([row["step"] for row in records], [1, 2])
+
     def test_metrics_truncation_terminates_valid_last_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "metrics.jsonl"
             path.write_text('{"step":1}', encoding="utf-8")
             experiment._truncate_metrics_after_step(path, 1)
-            self.assertTrue(
-                path.read_text(encoding="utf-8").endswith("\n")
-            )
+            self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
             path.write_text('{"step":2}', encoding="utf-8")
             experiment._truncate_metrics_after_step(path, 1)
             self.assertEqual(path.read_text(encoding="utf-8"), "")
+
     def test_update_run_config_refuses_to_overwrite_corrupt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             config = run_dir / "config.json"
             config.write_text("{not json", encoding="utf-8")
             with self.assertRaises(ValueError):
-                experiment.update_run_config(
-                    run_dir, "final", {"val_loss": 1.0}
-                )
-            self.assertEqual(
-                config.read_text(encoding="utf-8"), "{not json"
-            )
+                experiment.update_run_config(run_dir, "final", {"val_loss": 1.0})
+            self.assertEqual(config.read_text(encoding="utf-8"), "{not json")
+
     def test_local_test_ledger_counts_as_sealed(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            self.assertFalse(
-                experiment.test_evaluation_sealed(run_dir)
-            )
-            (run_dir / "test_access_ledger.jsonl").write_text(
-                "", encoding="utf-8"
-            )
-            self.assertTrue(
-                experiment.test_evaluation_sealed(run_dir)
-            )
+            self.assertFalse(experiment.test_evaluation_sealed(run_dir))
+            (run_dir / "test_access_ledger.jsonl").write_text("", encoding="utf-8")
+            self.assertTrue(experiment.test_evaluation_sealed(run_dir))
+
     def test_global_test_ledger_counts_as_sealed(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -98,19 +91,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 json.dumps({"out_dir": str(run_dir)}) + "\n",
                 encoding="utf-8",
             )
-            self.assertFalse(
-                experiment.test_evaluation_sealed(run_dir)
-            )
-            self.assertTrue(
-                experiment.test_evaluation_sealed(
-                    run_dir, ledger
-                )
-            )
-            self.assertFalse(
-                experiment.test_evaluation_sealed(
-                    run_dir, Path(tmp) / "other.jsonl"
-                )
-            )
+            self.assertFalse(experiment.test_evaluation_sealed(run_dir))
+            self.assertTrue(experiment.test_evaluation_sealed(run_dir, ledger))
+            self.assertFalse(experiment.test_evaluation_sealed(run_dir, Path(tmp) / "other.jsonl"))
+
     def test_resume_split_error_detects_missing_current_split(self):
         error = experiment.resume_split_change_error(
             {"train": "a", "test": "b"},
@@ -118,6 +102,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertIsNotNone(error)
         self.assertIn("test", error)
+
     def test_build_protocol_normalizes_cleaning_alias(self):
         cfg = _tiny_config()
         args = argparse.Namespace(
@@ -130,24 +115,24 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             clean_train_against_test=False,
             allow_eval_content_for_cleaning=True,
         )
-        protocol = experiment.build_comparison_protocol(
-            cfg, args
-        )
+        protocol = experiment.build_comparison_protocol(cfg, args)
         self.assertTrue(protocol["clean_train_against_test"])
-        self.assertTrue(
-            protocol["allow_eval_content_for_cleaning"]
-        )
+        self.assertTrue(protocol["allow_eval_content_for_cleaning"])
+
     def test_protocol_fallback_reads_document_separator_from_config(self):
-        protocol = experiment.experiment_protocol_from_payload({
-            "config": {
-                "mode": "smelt",
-                "document_masks": True,
-                "document_separator": [10],
-            },
-            "args": {"lr": 1e-3},
-        })
+        protocol = experiment.experiment_protocol_from_payload(
+            {
+                "config": {
+                    "mode": "smelt",
+                    "document_masks": True,
+                    "document_separator": [10],
+                },
+                "args": {"lr": 1e-3},
+            }
+        )
         self.assertEqual(protocol["document_separator"], [10])
         self.assertTrue(protocol["document_masks"])
+
     def test_fragility_not_evaluable_is_not_reported_as_stable(self):
         contrast = {
             "baseline": "base",
@@ -159,14 +144,11 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "significant": True,
         }
         experiment._apply_multiple_comparison_correction([contrast])
-        self.assertEqual(
-            contrast["fragility"]["verdict"], "not_evaluable"
-        )
+        self.assertEqual(contrast["fragility"]["verdict"], "not_evaluable")
         summary = experiment._fragility_summary([contrast])
-        self.assertEqual(
-            summary["verdict_counts"], {"not_evaluable": 1}
-        )
+        self.assertEqual(summary["verdict_counts"], {"not_evaluable": 1})
         self.assertIn("无法评估", summary["advisories"][0])
+
     def test_fragility_deduplicates_reversed_comparison(self):
         first = {
             "baseline": "local_base",
@@ -185,10 +167,9 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         reversed_entry = dict(first)
         reversed_entry["baseline"] = "A"
         reversed_entry["variant"] = "local_base"
-        summary = experiment._fragility_summary(
-            [first, reversed_entry]
-        )
+        summary = experiment._fragility_summary([first, reversed_entry])
         self.assertEqual(len(summary["entries"]), 1)
+
     def test_fragility_summary_accepts_factorial_effect_labels(self):
         effect = {
             "design": "A vs local_base",
@@ -209,9 +190,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             summary["entries"][0]["baseline"],
             "A vs local_base",
         )
-        self.assertEqual(
-            summary["entries"][0]["variant"], "merge_main"
-        )
+        self.assertEqual(summary["entries"][0]["variant"], "merge_main")
+
     def test_fragility_does_not_claim_nonsignificant_holm_result(self):
         first = {
             "baseline": "b",
@@ -231,35 +211,27 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "paired_seeds": [1, 2, 3, 4],
             "significant": True,
         }
-        experiment._apply_multiple_comparison_correction(
-            [first, second]
-        )
+        experiment._apply_multiple_comparison_correction([first, second])
         self.assertFalse(second["significant"])
-        self.assertEqual(
-            second["fragility"]["verdict"], "not_significant"
-        )
+        self.assertEqual(second["fragility"]["verdict"], "not_significant")
         self.assertNotIn(
             "fragile",
-            experiment._fragility_summary(
-                [first, second]
-            )["verdict_counts"],
+            experiment._fragility_summary([first, second])["verdict_counts"],
         )
+
     def test_fragility_reports_p_value_of_minimal_deletion_set(self):
         report = experiment._paired_result_fragility(
             [2.0, 2.0, 2.0, 2.0, 2.0, 0.5],
             alpha=0.05,
             # NOTE: Consider if 0.05 threshold is appropriate for this context
         )
-        self.assertEqual(
-            report["min_seed_deletions_to_lose_significance"], 3
-        )
-        self.assertGreater(
-            report["min_seed_deletions_p_value"], 0.05
-        )
+        self.assertEqual(report["min_seed_deletions_to_lose_significance"], 3)
+        self.assertGreater(report["min_seed_deletions_p_value"], 0.05)
         self.assertNotEqual(
             report["min_seed_deletions_p_value"],
             report["max_leave_one_out_p_value"],
         )
+
     def test_fragility_marks_untested_deletion_levels(self):
         report = experiment._paired_result_fragility(
             [1.0] * 59 + [0.5],
@@ -269,10 +241,12 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertFalse(report["deletions_tested_exhaustively"])
         self.assertEqual(report["max_deletions_tested"], 2)
         self.assertEqual(report["configured_max_deletions"], 3)
+
     def test_exact_sign_test_all_zero_is_resolution_limited(self):
         report = experiment._exact_sign_test([0.0, 0.0])
         self.assertEqual(report["n_nonzero"], 0)
         self.assertTrue(report["resolution_limited"])
+
     def test_factorial_duplicate_seeds_are_raw_and_deduplicated(self):
         def cell():
             return {
@@ -283,9 +257,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                     ]
                 }
             }
-        _mapping, _complete, duplicates = (
-            experiment._cell_seed_values(cell(), "val_loss")
-        )
+
+        _mapping, _complete, duplicates = experiment._cell_seed_values(cell(), "val_loss")
         self.assertEqual(duplicates, [42])
         effect = experiment._paired_linear_effect(
             {"a": cell(), "b": cell()},
@@ -293,6 +266,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "val_loss",
         )
         self.assertEqual(effect["duplicate_seeds"], [42])
+
     def test_manifest_strict_requires_verify_mode(self):
         args = argparse.Namespace(
             write_manifest="run",
@@ -302,6 +276,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         error = experiment.manifest_mode_error(args)
         self.assertIsNotNone(error)
         self.assertIn("--verify-manifest", error)
+
     def test_manifest_rejects_compare_report(self):
         args = argparse.Namespace(
             write_manifest="run",
@@ -310,6 +285,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             compare_report="report.json",
         )
         self.assertIsNotNone(experiment.manifest_mode_error(args))
+
     def test_load_selected_model_rejects_bad_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "best.pt"
@@ -317,11 +293,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 {"model": {}, "step": None, "val_loss": 1.0},
                 path,
             )
-            self.assertIsNone(
-                experiment.load_selected_model(
-                    path, torch.device("cpu")
-                )
-            )
+            self.assertIsNone(experiment.load_selected_model(path, torch.device("cpu")))
+
     def test_baseline_tuning_rejects_boolean_or_nonfinite_lr(self):
         base = {
             "comparison_family": "baseline_tuning",
@@ -338,11 +311,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 "lr": float("nan"),
                 "metric_mean": 1.0,
             }
-            path.write_text(
-                json.dumps(base), encoding="utf-8"
-            )
+            path.write_text(json.dumps(base), encoding="utf-8")
             with self.assertRaises(ValueError):
                 experiment.load_baseline_tuning(path)
+
     def test_baseline_tuning_rejects_out_of_float_range_lr(self):
         base = {
             "comparison_family": "baseline_tuning",
@@ -360,11 +332,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 "lr": 1e-3,
                 "metric_mean": 10**400,
             }
-            path.write_text(
-                json.dumps(base), encoding="utf-8"
-            )
+            path.write_text(json.dumps(base), encoding="utf-8")
             with self.assertRaises(ValueError):
                 experiment.load_baseline_tuning(path)
+
     def test_baseline_tuning_axes_boundary_uses_candidate_grid(self):
         rows = []
         for lr, metric_value in (
@@ -373,23 +344,27 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             (1e-1, 0.9),
         ):
             for seed in (1, 2, 3):
-                rows.append({
-                    "run": f"lr{lr:g}_seed{seed}",
-                    "seed": seed,
-                    "protocol": {"lr": lr},
-                    "val_loss": metric_value,
-                })
+                rows.append(
+                    {
+                        "run": f"lr{lr:g}_seed{seed}",
+                        "seed": seed,
+                        "protocol": {"lr": lr},
+                        "val_loss": metric_value,
+                    }
+                )
         report = experiment.analyze_baseline_tuning_axes(
             rows,
             "val_loss",
             "dense",
-            [{
-                "name": "lr",
-                "protocol_key": "lr",
-                "label": "学习率",
-                "values": [1e-3, 1e-2],
-                "base_value": 1e-1,
-            }],
+            [
+                {
+                    "name": "lr",
+                    "protocol_key": "lr",
+                    "label": "学习率",
+                    "values": [1e-3, 1e-2],
+                    "base_value": 1e-1,
+                }
+            ],
             [1, 2, 3],
             {"lr": 1e-1},
         )
@@ -397,9 +372,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(axis["winner"]["value"], 1e-2)
         self.assertTrue(axis["winner_at_boundary"])
         self.assertTrue(axis["best_mean_at_boundary"])
-        self.assertTrue(
-            any("网格边界" in issue for issue in axis["issues"])
-        )
+        self.assertTrue(any("网格边界" in issue for issue in axis["issues"]))
+
     def test_analysis_helpers_tolerate_out_of_float_range_numbers(self):
         huge = 10**400
         self.assertEqual(
@@ -410,67 +384,55 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             [],
         )
         self.assertEqual(
-            experiment._collapse_seed_samples(
-                [{"seed": 1, "run": "r", "value": huge}]
-            ),
+            experiment._collapse_seed_samples([{"seed": 1, "run": "r", "value": huge}]),
             [],
         )
-        mapping, _complete, duplicates = (
-            experiment._cell_seed_values(
-                {
-                    "samples": {
-                        "val_loss": [
-                            {"seed": 1, "value": huge}
-                        ]
-                    }
-                },
-                "val_loss",
-            )
+        mapping, _complete, duplicates = experiment._cell_seed_values(
+            {"samples": {"val_loss": [{"seed": 1, "value": huge}]}},
+            "val_loss",
         )
         self.assertEqual(mapping, {})
         self.assertEqual(duplicates, [])
         self.assertIsNone(experiment._mean([huge]))
         self.assertIsNone(experiment._median([huge, 1.0]))
+        self.assertIsNone(experiment._sample_std([huge, 1.0, 2.0]))
         self.assertIsNone(
-            experiment._sample_std([huge, 1.0, 2.0])
+            experiment._window_per_token_loss(
+                {
+                    "tokens": huge,
+                    "loss_sum": 1.0,
+                }
+            )
         )
         self.assertIsNone(
-            experiment._window_per_token_loss({
-                "tokens": huge,
-                "loss_sum": 1.0,
-            })
-        )
-        self.assertIsNone(
-            experiment._window_accuracy({
-                "tokens": huge,
-                "correct": 1.0,
-            })
+            experiment._window_accuracy(
+                {
+                    "tokens": huge,
+                    "correct": 1.0,
+                }
+            )
         )
         self.assertEqual(
-            experiment._clean_window_differences({
-                1: [huge, 1.0],
-                "bad-key": [1.0],
-            }),
+            experiment._clean_window_differences(
+                {
+                    1: [huge, 1.0],
+                    "bad-key": [1.0],
+                }
+            ),
             {},
         )
         # 排序/比较不能因为无法转成 float 而崩溃；相同大整数
         # 仍必须判为相等。
         experiment._factor_sort_rank(huge)
-        self.assertTrue(
-            experiment._axis_value_equal(huge, huge)
-        )
-        self.assertFalse(
-            experiment._axis_value_equal(huge, huge + 1)
-        )
+        self.assertTrue(experiment._axis_value_equal(huge, huge))
+        self.assertFalse(experiment._axis_value_equal(huge, huge + 1))
         experiment._axis_value_sort_key(huge)
         self.assertEqual(
             experiment._paired_t_test([huge, 1.0, 2.0]),
             {"test": "invalid_values"},
         )
         self.assertEqual(
-            experiment._paired_sign_flip_test(
-                [huge, 1.0, 2.0, 3.0]
-            ),
+            experiment._paired_sign_flip_test([huge, 1.0, 2.0, 3.0]),
             {"test": "invalid_values"},
         )
         self.assertEqual(
@@ -481,9 +443,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             {"test": "invalid_values"},
         )
         self.assertEqual(
-            experiment._paired_result_fragility(
-                [huge, 1.0, 2.0]
-            )["reason"],
+            experiment._paired_result_fragility([huge, 1.0, 2.0])["reason"],
             "non_finite_differences",
         )
         # 效率均值/标准差与无共同种子时的聚合均值也不能因
@@ -503,15 +463,11 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         factorial = experiment._paired_linear_effect(
             {
                 "a": {
-                    "samples": {
-                        "val_loss": [{"seed": 1, "value": 1.0}]
-                    },
+                    "samples": {"val_loss": [{"seed": 1, "value": 1.0}]},
                     "val_loss_mean": huge,
                 },
                 "b": {
-                    "samples": {
-                        "val_loss": [{"seed": 2, "value": 1.0}]
-                    },
+                    "samples": {"val_loss": [{"seed": 2, "value": 1.0}]},
                     "val_loss_mean": huge,
                 },
             },
@@ -525,6 +481,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertTrue(sign["available"])
         self.assertEqual(sign["p_value"], 0.0)
         self.assertEqual(sign["min_attainable_p"], 0.0)
+
     def test_design_power_fallback_does_not_keep_stale_adequacy(self):
         # 旧/手工 power 记录缺重算字段时，不能沿用按更小家族
         # 算出的 adequate=True 放行新增的交互对比。
@@ -563,9 +520,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         ):
             self.assertNotIn(key, adjusted)
         design = {"power": adjusted}
-        self.assertIsNotNone(
-            experiment.design_power_gate_error(design)
-        )
+        self.assertIsNotNone(experiment.design_power_gate_error(design))
         # 家族规模本身损坏（inf/NaN）也不能在 int() 处抛异常。
         guarded = experiment._design_power_for_family(
             {
@@ -582,6 +537,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             force=True,
         )
         self.assertIsInstance(guarded, dict)
+
     def test_design_gate_handles_uncomputable_required_seeds(self):
         design = {
             "power": {
@@ -607,11 +563,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 "equivalence": 1.0,
             }
         }
-        malformed_gate = experiment.design_power_gate_error(
-            malformed
-        )
+        malformed_gate = experiment.design_power_gate_error(malformed)
         self.assertIsNotNone(malformed_gate)
         self.assertNotIn("None", malformed_gate)
+
     def test_plan_treatment_keys_may_be_non_strings(self):
         # 手工/旧计划可能用非字符串键；不能因 str(key) 后查不到
         # 值就把不同处理单元静默合并。
@@ -620,13 +575,12 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             {"label": "b", "mode": "A", 1: 1, "seed": 2},
             {"label": "c", "mode": "A", 1: 2, "seed": 3},
         ]
-        self.assertEqual(
-            experiment.planned_comparisons_for_plan(plan), 3
-        )
+        self.assertEqual(experiment.planned_comparisons_for_plan(plan), 3)
         self.assertEqual(
             experiment.planned_contrast_types_for_plan(plan),
             ["pairwise"],
         )
+
     def test_cost_comparison_tolerates_zero_and_huge_variants(self):
         def cell(mean, std=1.0, n=3):
             return {
@@ -640,18 +594,15 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             }
 
         # 变体成本为 0 时不能在做变异系数时除零。
-        _, verdict = experiment._cost_comparison(
-            cell(1.0), cell(0.0), "improvement", True
-        )
+        _, verdict = experiment._cost_comparison(cell(1.0), cell(0.0), "improvement", True)
         self.assertIsNotNone(verdict)
         # 成本倍率极大时 exp/平方不能抛 OverflowError；无法给出
         # 有限区间时应明确标为不可分辨。
-        cost, _ = experiment._cost_comparison(
-            cell(1e-100), cell(1e100), "improvement", True
-        )
+        cost, _ = experiment._cost_comparison(cell(1e-100), cell(1e100), "improvement", True)
         detail = cost["uncertainty"]["n_params"]
         self.assertFalse(detail["resolvable"])
         self.assertIsNone(detail["ratio_ci95"])
+
     def test_contrasts_tolerate_out_of_range_means_and_counts(self):
         huge = 10**400
 
@@ -684,12 +635,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         # 损坏的运行数不能阻止对比生成或被当成负数。
         broken_a = dict(cell("A", 1.0), n_runs=[])
         broken_b = dict(cell("B", 2.0), n_runs={})
-        contrasts = experiment.factor_contrasts(
-            [broken_a, broken_b], ["mode"], "val_loss"
-        )
-        self.assertEqual(
-            contrasts[0]["n_expected_baseline"], 0
-        )
+        contrasts = experiment.factor_contrasts([broken_a, broken_b], ["mode"], "val_loss")
+        self.assertEqual(contrasts[0]["n_expected_baseline"], 0)
         baseline = experiment.compare_cells_to_baseline(
             [
                 dict(cell("A", 1.0), effective_seed_count=[]),
@@ -700,8 +647,9 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(len(baseline), 1)
         self.assertEqual(baseline[0]["delta"], 1.0)
+
     def test_factor_keys_preserve_large_integer_precision(self):
-        left = 2 ** 53
+        left = 2**53
         right = left + 1
         self.assertNotEqual(
             experiment._stable_factor_key(left),
@@ -716,6 +664,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._factor_sort_rank(left),
             experiment._factor_sort_rank(right),
         )
+
     def test_factor_keys_accept_unhashable_values(self):
         # 手工编辑/损坏的计划可能把 set 放进处理轴；稳定键必须
         # 仍可哈希，否则 planned_comparisons_for_plan 等会把键
@@ -740,12 +689,8 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 "seed": 2,
             },
         ]
-        self.assertEqual(
-            experiment.planned_comparisons_for_plan(plan), 1
-        )
-        self.assertEqual(
-            experiment.planned_contrast_types_for_plan(plan), []
-        )
+        self.assertEqual(experiment.planned_comparisons_for_plan(plan), 1)
+        self.assertEqual(experiment.planned_contrast_types_for_plan(plan), [])
         report = experiment.run_order_balance_report(
             experiment.order_sweep_plan(plan, "randomized", 3)
         )
@@ -754,6 +699,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._stable_factor_key({"a": 1, 2: 3}),
             experiment._stable_factor_key({"a": 1, 2: 3}),
         )
+
     def test_resume_checks_tolerate_corrupt_fingerprint_records(self):
         # 非字符串数据指纹不能被当成「未记录」而静默放行续跑。
         self.assertIn(
@@ -770,36 +716,24 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "格式损坏",
             experiment.resume_data_change_error(123, ""),
         )
-        self.assertIsNone(
-            experiment.resume_data_change_error("", "abc")
-        )
+        self.assertIsNone(experiment.resume_data_change_error("", "abc"))
         # 逐 split 记录损坏时同样不能因为当前记录缺失而绕过。
         self.assertIn(
             "格式损坏",
-            experiment.resume_split_change_error(
-                {"train": 123}, None
-            ),
+            experiment.resume_split_change_error({"train": 123}, None),
         )
         self.assertIn(
             "格式损坏",
-            experiment.resume_split_change_error(
-                {"train": ""}, None
-            ),
+            experiment.resume_split_change_error({"train": ""}, None),
         )
         # split 记录的键可能是损坏的混合类型；排序/拼接不能
         # 抛 TypeError，损坏的哈希值也不能静默放行。
-        mixed = experiment.resume_split_change_error(
-            {1: "a", "val": "b"}, {}
-        )
+        mixed = experiment.resume_split_change_error({1: "a", "val": "b"}, {})
         self.assertIn("1", mixed)
         self.assertIn("val", mixed)
-        corrupt = experiment.resume_split_change_error(
-            {"train": 1}, {"train": "a"}
-        )
+        corrupt = experiment.resume_split_change_error({"train": 1}, {"train": "a"})
         self.assertIn("损坏", corrupt)
-        self.assertIsNone(
-            experiment.resume_split_change_error({}, {})
-        )
+        self.assertIsNone(experiment.resume_split_change_error({}, {}))
         # 时序隔离记录的混合键同样必须可比较，且键顺序不影响
         # 判定。
         self.assertIsNone(
@@ -808,27 +742,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 {"b": 2, 1: "a"},
             )
         )
-        self.assertIsNotNone(
-            experiment.resume_split_isolation_change_error(
-                {1: "a"}, {1: "b"}
-            )
-        )
+        self.assertIsNotNone(experiment.resume_split_isolation_change_error({1: "a"}, {1: "b"}))
+
     def test_resume_checks_reject_corrupt_top_level_fingerprints(self):
         # None 只代表旧检查点缺字段；列表/数字等损坏值不能被
         # 当成「没有记录」而静默放行续跑。
-        self.assertIsNone(
-            experiment.resume_split_change_error(None, {})
-        )
-        self.assertIsNone(
-            experiment.resume_split_isolation_change_error(
-                None, {}
-            )
-        )
-        self.assertIsNone(
-            experiment.resume_effective_train_change_error(
-                None, "abc"
-            )
-        )
+        self.assertIsNone(experiment.resume_split_change_error(None, {}))
+        self.assertIsNone(experiment.resume_split_isolation_change_error(None, {}))
+        self.assertIsNone(experiment.resume_effective_train_change_error(None, "abc"))
         self.assertIn(
             "格式损坏",
             experiment.resume_split_change_error([], {}),
@@ -839,57 +760,40 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertIn(
             "格式损坏",
-            experiment.resume_split_isolation_change_error(
-                123, {}
-            ),
+            experiment.resume_split_isolation_change_error(123, {}),
         )
         self.assertIn(
             "格式损坏",
-            experiment.resume_effective_train_change_error(
-                123, "abc"
-            ),
+            experiment.resume_effective_train_change_error(123, "abc"),
         )
         # 当前数据新加载，缺字段只会是 None；其余损坏值同样
         # 不能静默放行。
-        self.assertIsNone(
-            experiment.resume_split_change_error(
-                {"train": "a"}, None
-            )
+        self.assertIsNone(experiment.resume_split_change_error({"train": "a"}, None))
+        self.assertIn(
+            "格式损坏",
+            experiment.resume_split_change_error({"train": "a"}, []),
         )
         self.assertIn(
             "格式损坏",
-            experiment.resume_split_change_error(
-                {"train": "a"}, []
-            ),
+            experiment.resume_split_change_error({"train": "a"}, 123),
         )
-        self.assertIn(
-            "格式损坏",
-            experiment.resume_split_change_error(
-                {"train": "a"}, 123
-            ),
-        )
-        self.assertIsNone(
-            experiment.resume_effective_train_change_error("abc", None)
-        )
-        self.assertIsNone(
-            experiment.resume_effective_train_change_error("abc", "")
-        )
+        self.assertIsNone(experiment.resume_effective_train_change_error("abc", None))
+        self.assertIsNone(experiment.resume_effective_train_change_error("abc", ""))
         self.assertIn(
             "格式损坏",
             experiment.resume_effective_train_change_error("abc", 123),
         )
+
     def test_degenerate_run_cleaning_handles_partial_exclusions(self):
         # 一个被其他清洗剔除的字节把长退化段切成两段；两个
         # 剩余片段都仍达到阈值，不能因为原段与排除区间重叠就
         # 整段跳过，否则 post-clean 训练流仍含退化段。
         raw = bytearray(b"a" * 100)
-        spans, stats = (
-            experiment._plan_train_degenerate_run_cleaning(
-                raw,
-                len(raw),
-                32,
-                [(50, 51)],
-            )
+        spans, stats = experiment._plan_train_degenerate_run_cleaning(
+            raw,
+            len(raw),
+            32,
+            [(50, 51)],
         )
         self.assertEqual(spans, [(0, 50), (51, 100)])
         self.assertEqual(stats["runs_dropped"], 2)
@@ -897,30 +801,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(stats["max_run_bytes"], 50)
         self.assertEqual(stats["post_clean_train_bytes"], 0)
         # 排除区间若把剩余两侧都压到阈值以下，则不清洗。
-        spans, stats = (
-            experiment._plan_train_degenerate_run_cleaning(
-                raw,
-                len(raw),
-                32,
-                [(20, 80)],
-            )
+        spans, stats = experiment._plan_train_degenerate_run_cleaning(
+            raw,
+            len(raw),
+            32,
+            [(20, 80)],
         )
         self.assertEqual(spans, [])
         self.assertEqual(stats["runs_dropped"], 0)
+
     def test_statistics_tolerate_large_finite_floats(self):
         huge = 1.0e308
         self.assertEqual(experiment._mean([huge, huge]), huge)
         self.assertEqual(experiment._mean([huge, -huge]), 0.0)
         self.assertEqual(experiment._median([huge, huge]), huge)
         self.assertEqual(experiment._median([huge, -huge]), 0.0)
-        self.assertEqual(
-            experiment._sample_std([huge, huge]), 0.0
-        )
+        self.assertEqual(experiment._sample_std([huge, huge]), 0.0)
         # 两个相反的大数，标准差仍在 float 范围内：直接对
         # 1e308 ** 2 会抛 OverflowError。
-        self.assertIsNotNone(
-            experiment._sample_std([huge, -huge])
-        )
+        self.assertIsNotNone(experiment._sample_std([huge, -huge]))
         self.assertEqual(
             experiment._welch_t_test(
                 [huge, huge, huge],
@@ -940,34 +839,25 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         json.dumps(identical_large, allow_nan=False)
         # 符号翻转统计量对尺度不变：同一组大到 1e308 的差值
         # 不能因求和溢出而被误判成退化的 p=1。
-        sign = experiment._paired_sign_flip_test(
-            [huge, huge, huge]
-        )
+        sign = experiment._paired_sign_flip_test([huge, huge, huge])
         self.assertEqual(sign["method"], "exact")
         self.assertEqual(sign["p_value"], 0.25)
         # 两向方差分解同样必须先在归一化尺度上计算，不能对
         # 1e200 的离差直接平方。
-        components = experiment._window_variance_components(
-            {1: [1e200, 0.0], 2: [1e200, 0.0]}
-        )
+        components = experiment._window_variance_components({1: [1e200, 0.0], 2: [1e200, 0.0]})
         self.assertTrue(components["available"])
-        self.assertEqual(
-            components["between_seed_sd"], 0.0
-        )
+        self.assertEqual(components["between_seed_sd"], 0.0)
         self.assertIsNotNone(components["std_error_of_mean"])
         # 截断前的原始方差分量可为负，缩放实现不能把它丢掉。
-        components = experiment._window_variance_components(
-            {1: [0.0, 10.0], 2: [5.0, 5.0]}
-        )
-        raw = components[
-            "variance_components_single_observation"
-        ]
+        components = experiment._window_variance_components({1: [0.0, 10.0], 2: [5.0, 5.0]})
+        raw = components["variance_components_single_observation"]
         self.assertLess(raw["raw_seed"], 0.0)
         self.assertTrue(raw["truncated_at_zero"])
         # 计时摘要换算单位后不能把 inf 写进报告。
         timing = experiment._timing_summary([huge, huge])
         self.assertIsNone(timing["mean"])
         self.assertEqual(timing["std"], 0.0)
+
     def test_paired_stats_keep_tiny_nonzero_scale(self):
         # 极小但非零的差值在平方时下溢为 0；标准差不能被报告成
         # 0，配对 t 也不能因此变成「零方差/精确分离」。
@@ -989,69 +879,65 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         # 符号翻转统计量本身对公共尺度不变；固定绝对容差会让
         # 1e-13 量级的差值被误判成退化（p=1）。
         for scale in (1.0e-13, 1.0e-200, 1.0e-300):
-            sign = experiment._paired_sign_flip_test(
-                [scale, 2.0 * scale, 3.0 * scale]
-            )
+            sign = experiment._paired_sign_flip_test([scale, 2.0 * scale, 3.0 * scale])
             self.assertEqual(sign["method"], "exact")
             self.assertEqual(sign["p_value"], 0.25)
             json.dumps(sign, allow_nan=False)
+
     def test_counterbalanced_empty_blocks_do_not_divide_by_zero(self):
-        self.assertEqual(
-            experiment._counterbalanced_order({1: []}, 0), []
-        )
+        self.assertEqual(experiment._counterbalanced_order({1: []}, 0), [])
         self.assertEqual(
             experiment._counterbalanced_order({1: [], 2: []}, 0),
             [],
         )
+
     def test_sparkline_handles_out_of_range_and_nonfinite_values(self):
-        huge = 10 ** 400
+        huge = 10**400
         self.assertEqual(experiment._sparkline([huge]), "")
-        self.assertEqual(
-            experiment._sparkline([1.0, float("nan")]), ""
-        )
-        self.assertEqual(
-            experiment._sparkline([1.0, float("inf")]), ""
-        )
+        self.assertEqual(experiment._sparkline([1.0, float("nan")]), "")
+        self.assertEqual(experiment._sparkline([1.0, float("inf")]), "")
         self.assertEqual(len(experiment._sparkline([1, 2, 3])), 3)
         # 有限但符号相反的极值：high-low 会溢出成 inf，走势条
         # 仍必须能按相对大小分块，而不是 int(NaN) 崩溃。
         spark = experiment._sparkline([-1.0e308, 0.0, 1.0e308])
         self.assertEqual(len(spark), 3)
         self.assertNotEqual(spark, "")
+
     def test_bad_case_comparison_skips_out_of_range_shares(self):
-        huge = 10 ** 400
+        huge = 10**400
         category = sorted(experiment._BAD_CASE_CATEGORIES)[0]
-        report = experiment.bad_case_comparison_report([
-            {
-                "bad_case_available": True,
-                "bad_case_tokens_evaluated": 10,
-                "bad_case_wrong_tokens": 2,
-                "bad_case_error_category_counts": {
-                    category: 2,
+        report = experiment.bad_case_comparison_report(
+            [
+                {
+                    "bad_case_available": True,
+                    "bad_case_tokens_evaluated": 10,
+                    "bad_case_wrong_tokens": 2,
+                    "bad_case_error_category_counts": {
+                        category: 2,
+                    },
+                    "bad_case_error_category_shares": {
+                        category: huge,
+                    },
                 },
-                "bad_case_error_category_shares": {
-                    category: huge,
+                {
+                    "bad_case_available": True,
+                    "bad_case_tokens_evaluated": 10,
+                    "bad_case_wrong_tokens": 2,
+                    "bad_case_error_category_counts": {
+                        category: 2,
+                    },
+                    "bad_case_error_category_shares": {
+                        category: 0.2,
+                    },
                 },
-            },
-            {
-                "bad_case_available": True,
-                "bad_case_tokens_evaluated": 10,
-                "bad_case_wrong_tokens": 2,
-                "bad_case_error_category_counts": {
-                    category: 2,
-                },
-                "bad_case_error_category_shares": {
-                    category: 0.2,
-                },
-            },
-        ])
-        self.assertEqual(report["n_runs_with_bad_cases"], 2)
-        self.assertEqual(
-            report["error_category_counts"][category], 4
+            ]
         )
+        self.assertEqual(report["n_runs_with_bad_cases"], 2)
+        self.assertEqual(report["error_category_counts"][category], 4)
         self.assertNotIn(category, report["category_share_ranges"])
+
     def test_imbalance_advisory_tolerates_out_of_range_rates(self):
-        huge = 10 ** 400
+        huge = 10**400
         report = experiment.imbalance_metric_advisory(
             [
                 {
@@ -1068,6 +954,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(report["max_majority_accuracy"])
         self.assertIsNone(report["most_imbalanced_run"])
         self.assertIsNone(report["pr_auc_chance_mean"])
+
     def test_imbalance_advisory_omits_overflowing_pr_auc_lift(self):
         report = experiment.imbalance_metric_advisory(
             [
@@ -1083,6 +970,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertIsNone(report["pr_auc_over_chance"])
         self.assertIn("无法表示", report["advisories"][-1])
         json.dumps(report, allow_nan=False)
+
     def test_baseline_ngram_delta_overflow_is_omitted(self):
         rows = [
             {
@@ -1106,15 +994,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 },
             },
         ]
-        report = experiment.baseline_adequacy(
-            rows, "dense", "val_loss"
-        )
+        report = experiment.baseline_adequacy(rows, "dense", "val_loss")
         comparison = report["ngram_comparison"]
         self.assertIsNone(comparison["delta"])
         self.assertIsNone(comparison["seeds_to_detect"])
         json.dumps(report, allow_nan=False)
+
     def test_baseline_adequacy_tolerates_out_of_range_costs(self):
-        huge = 10 ** 400
+        huge = 10**400
         rows = [
             {
                 "run": "baseline",
@@ -1141,13 +1028,12 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 "flops_per_forward": huge,
             },
         ]
-        report = experiment.baseline_adequacy(
-            rows, "dense", "val_loss"
-        )
+        report = experiment.baseline_adequacy(rows, "dense", "val_loss")
         self.assertEqual(report["capacity_confounds"], [])
         self.assertIsNone(report["baseline_capacity"])
+
     def test_curve_analysis_treats_out_of_range_numbers_as_nonfinite(self):
-        huge = 10 ** 400
+        huge = 10**400
         records = [
             {
                 "step": 1,
@@ -1170,8 +1056,9 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(analysis["n_train_steps"], 1)
         self.assertEqual(analysis["peak_lr"], 1e-3)
         self.assertIn(1, analysis["nonfinite_steps"])
+
     def test_timing_summary_handles_out_of_range_integers(self):
-        huge_integer = 10 ** 400
+        huge_integer = 10**400
         timing = experiment._timing_summary([huge_integer])
         self.assertEqual(timing["n"], 1)
         self.assertIsNone(timing["mean"])
@@ -1182,23 +1069,19 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         self.assertEqual(timing["n"], 2)
         self.assertIsNone(timing["mean"])
         self.assertIsNone(timing["std"])
+
     def test_timing_summary_cv_does_not_overflow(self):
         # 有限极值相互抵消后均值可以合法地接近 0，而标准差仍
         # 极大；std/mean 越过 float 上限时 CV 必须是 None。
-        timing = experiment._timing_summary(
-            [1.0e-308, 1.0e308, -1.0e308]
-        )
+        timing = experiment._timing_summary([1.0e-308, 1.0e308, -1.0e308])
         self.assertIsNone(timing["coefficient_of_variation"])
         json.dumps(timing, allow_nan=False)
+
     def test_analysis_and_resume_tolerate_out_of_range_numbers(self):
-        huge = 10 ** 400
+        huge = 10**400
 
         # 参考基线来自 config.json：超范围整数按不可用处理。
-        self.assertIsNone(
-            experiment._trivial_reference_value(
-                "val_loss", {"unigram_loss": huge}
-            )
-        )
+        self.assertIsNone(experiment._trivial_reference_value("val_loss", {"unigram_loss": huge}))
 
         # resume 读取历史指标时不能因单个超范围整数崩溃。
         self.assertEqual(
@@ -1265,19 +1148,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(len(alignment["checks"]), 1)
         self.assertIsNone(alignment["checks"][0]["min_effect"])
+
     def test_print_comparison_tolerates_out_of_range_numbers(self):
-        huge = 10 ** 400
+        huge = 10**400
         self.assertEqual(experiment._format_finite(huge), "-")
-        self.assertEqual(
-            experiment._format_finite(float("nan")), "-"
-        )
-        self.assertEqual(
-            experiment._format_finite(1.25), "1.2500"
-        )
+        self.assertEqual(experiment._format_finite(float("nan")), "-")
+        self.assertEqual(experiment._format_finite(1.25), "1.2500")
         # 乘上展示缩放后溢出也必须按缺失值处理。
-        self.assertEqual(
-            experiment._format_finite(1e308, ".1f", 100.0), "-"
-        )
+        self.assertEqual(experiment._format_finite(1e308, ".1f", 100.0), "-")
         rows = [
             {
                 "run": "huge",
@@ -1312,41 +1190,33 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         # 正常有限值仍然正常格式化。
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            experiment.print_comparison([
-                {
-                    "run": "ok",
-                    "mode": "B",
-                    "val_loss": 1.25,
-                    "flops_per_forward": 2e9,
-                }
-            ])
+            experiment.print_comparison(
+                [
+                    {
+                        "run": "ok",
+                        "mode": "B",
+                        "val_loss": 1.25,
+                        "flops_per_forward": 2e9,
+                    }
+                ]
+            )
         self.assertIn("1.2500", output.getvalue())
         self.assertIn("2.000", output.getvalue())
+
     def test_paired_stats_keep_large_finite_effects(self):
         huge = 1.0e308
         test = experiment._paired_t_test([huge, huge, huge])
         self.assertEqual(test["note"], "noise_free_separation")
         self.assertTrue(math.isfinite(test["effect"]))
         self.assertEqual(test["effect"], huge)
-        fragility = experiment._paired_result_fragility(
-            [huge, huge, huge]
-        )
+        fragility = experiment._paired_result_fragility([huge, huge, huge])
         self.assertEqual(fragility["mean_difference"], huge)
-        self.assertTrue(
-            math.isfinite(fragility["mean_difference"])
-        )
-        stability = experiment._leave_one_out_effect_stability(
-            [huge, huge, huge]
-        )
-        self.assertEqual(
-            stability["leave_one_out_effect_min"], huge
-        )
-        self.assertEqual(
-            stability["leave_one_out_effect_max"], huge
-        )
-        self.assertTrue(
-            stability["leave_one_out_sign_stable"]
-        )
+        self.assertTrue(math.isfinite(fragility["mean_difference"]))
+        stability = experiment._leave_one_out_effect_stability([huge, huge, huge])
+        self.assertEqual(stability["leave_one_out_effect_min"], huge)
+        self.assertEqual(stability["leave_one_out_effect_max"], huge)
+        self.assertTrue(stability["leave_one_out_sign_stable"])
+
     def test_welch_seed_plan_uses_two_sample_power(self):
         samples_a = [
             {"seed": 1, "value": 10.0},
@@ -1369,15 +1239,12 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             "n_baseline": 3,
             "n_variant": 3,
         }
-        experiment._attach_power_equivalence(
-            contrast, test["effect"], test, 0.01
-        )
-        self.assertEqual(
-            contrast["seeds_to_detect_design"], "welch"
-        )
+        experiment._attach_power_equivalence(contrast, test["effect"], test, 0.01)
+        self.assertEqual(contrast["seeds_to_detect_design"], "welch")
         # 每臂 n 个、se=sd·sqrt(max(2/n, 0.0))、df=2(n-1)；n=17 才达到
         # 80% 功效，配对公式给出的 10 会系统性低估。
         self.assertEqual(contrast["seeds_to_detect"], 17)
+
     def test_zero_effect_power_is_exactly_alpha(self):
         self.assertEqual(
             experiment._t_power(0.0, 1.0, 2.0, 1e-5),
@@ -1394,6 +1261,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._t_power(2.0, 1.0, 2.0, 1e-5),
             experiment._t_power(1.0, 1.0, 2.0, 1e-5),
         )
+
     def test_t_power_matches_noncentral_t_reference_near_df_one(self):
         # df<3 时 chi 密度在 0 附近有弱奇异项 u^(df-1)；固定 u
         # 网格的 Simpson 会少积概率质量。以下参考值由高精度
@@ -1410,6 +1278,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 expected,
                 delta=1e-8,
             )
+
     def test_noncentral_t_cdf_keeps_extreme_negative_tail(self):
         # df>=3 的固定 u 网格在 |t| 很大时只有一两个节点落在
         # 正态尾的窄峰内，df=3、t=-100 的相对误差约 11%。
@@ -1420,15 +1289,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             (10.0, -30.0, 3.692727448008916e-12),
             (100.0, -30.0, 3.347625324326119e-54),
         ):
-            cdf = experiment._noncentral_t_cdf(
-                value, df, 0.5
-            )
+            cdf = experiment._noncentral_t_cdf(value, df, 0.5)
             self.assertIsNotNone(cdf)
             self.assertAlmostEqual(
                 cdf,
                 reference,
                 delta=reference * 1.0e-6,
             )
+
     def test_noncentral_t_cdf_resolves_small_df_moderate_shift(self):
         # df=0.5、t=50、δ=100 时正态尾转折落在 u≈1.4，
         # t=u^(1/6) 网格上 800 个区间只有几个节点，CDF 会偏高
@@ -1441,6 +1309,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             reference,
             delta=reference * 1.0e-8,
         )
+
     def test_noncentral_t_cdf_resolves_low_df_large_shift_mid_probability(self):
         for value, df, noncentrality, reference in (
             (
@@ -1462,11 +1331,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 0.7843830493770758,
             ),
         ):
-            cdf = experiment._noncentral_t_cdf(
-                value, df, noncentrality
-            )
+            cdf = experiment._noncentral_t_cdf(value, df, noncentrality)
             self.assertIsNotNone(cdf)
             self.assertAlmostEqual(cdf, reference, delta=1.0e-9)
+
     def test_noncentral_t_cdf_keeps_extreme_positive_tail_small_df(self):
         # df<3 时默认 u 上界只到 sqrt(max(df-1, 0.0))+12；δ 很大而
         # t 较小时正态尾转折落在截断之外，固定节点会漏掉
@@ -1483,9 +1351,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             (1.0, 1.0, 30.0, 7.212994172451246e-100),
             (2.0, 1.0, 30.0, 2.972314784251633e-131),
         ):
-            cdf = experiment._noncentral_t_cdf(
-                value, df, noncentrality
-            )
+            cdf = experiment._noncentral_t_cdf(value, df, noncentrality)
             self.assertIsNotNone(cdf)
             self.assertAlmostEqual(
                 cdf,
@@ -1497,6 +1363,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             experiment._normal_cdf(-30.0),
             delta=0.0,
         )
+
     def test_noncentral_t_cdf_extends_chi_tail_for_large_shift(self):
         # df>=3 时默认 u 上界 sqrt(max(df-1, 0.0))+12 只按 chi 众数附近
         # 取界；δ 很大时正态 CDF 的转折点会落在更远的 chi 尾部，
@@ -1523,15 +1390,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 1.221547687472e-87,
             ),
         ):
-            cdf = experiment._noncentral_t_cdf(
-                value, df, noncentrality
-            )
+            cdf = experiment._noncentral_t_cdf(value, df, noncentrality)
             self.assertIsNotNone(cdf)
             self.assertAlmostEqual(
                 cdf,
                 reference,
                 delta=reference * 1.0e-6,
             )
+
     def test_noncentral_t_cdf_rejects_undefined_inputs(self):
         # NaN/负自由度没有定义；原实现先走「df 非有限 -> 正态
         # 极限」分支，把 df=NaN/-inf 误报成正态 CDF。NaN 的
@@ -1541,41 +1407,23 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 experiment._noncentral_t_cdf(1.0, df, 0.5),
                 df,
             )
-        self.assertIsNone(
-            experiment._noncentral_t_cdf(
-                float("nan"), 5.0, 0.5
-            )
-        )
-        self.assertIsNone(
-            experiment._noncentral_t_cdf(
-                1.0, 5.0, float("nan")
-            )
-        )
+        self.assertIsNone(experiment._noncentral_t_cdf(float("nan"), 5.0, 0.5))
+        self.assertIsNone(experiment._noncentral_t_cdf(1.0, 5.0, float("nan")))
         # δ=±inf 的极限仍可用：CDF 分别趋于 1/0。
         self.assertEqual(
-            experiment._noncentral_t_cdf(
-                1.0, 5.0, float("inf")
-            ),
+            experiment._noncentral_t_cdf(1.0, 5.0, float("inf")),
             1.0,
         )
         self.assertEqual(
-            experiment._noncentral_t_cdf(
-                1.0, 5.0, float("-inf")
-            ),
+            experiment._noncentral_t_cdf(1.0, 5.0, float("-inf")),
             0.0,
         )
-        self.assertIsNone(
-            experiment._noncentral_t_cdf(
-                float("inf"), 5.0, float("inf")
-            )
-        )
+        self.assertIsNone(experiment._noncentral_t_cdf(float("inf"), 5.0, float("inf")))
 
     def test_t_power_handles_small_df_without_overflow(self):
         u_values, weights = experiment._t_power_nodes(0.01)
         self.assertEqual(len(u_values), len(weights))
-        self.assertTrue(
-            all(math.isfinite(weight) for weight in weights)
-        )
+        self.assertTrue(all(math.isfinite(weight) for weight in weights))
         self.assertAlmostEqual(sum(weights), 1.0, delta=5e-5)
         for effect, expected in (
             (1.0e-6, 0.05),
@@ -1584,6 +1432,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             power = experiment._t_power(effect, 1.0, 0.01, 0.05)
             self.assertIsNotNone(power)
             self.assertAlmostEqual(power, expected, delta=5e-5)
+
     def test_t_power_resolves_tiny_alpha_for_small_df(self):
         # alpha 极小时 critical/√df 可达 1e19 以上，固定 u 网格
         # 会漏掉 u<1/scale 的全部概率质量并返回 0。
@@ -1602,6 +1451,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 expected,
                 delta=expected * 1.0e-6,
             )
+
     def test_t_power_large_noncentrality_small_df(self):
         # df<3 且 δ 很大时，w=scale·u 的转折宽度约为 1，而
         # 积分区间长度约为 δ；固定 20000 个区间会把转折稀释，
@@ -1612,15 +1462,14 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             (0.5, 1.0e-8, 100000.0, 3.846215750003292e-06),
             (4.0, 1.0e-20, 100000.0, 0.19714960547528733),
         ):
-            power = experiment._t_power(
-                effect, 1.0, df, alpha
-            )
+            power = experiment._t_power(effect, 1.0, df, alpha)
             self.assertIsNotNone(power)
             self.assertAlmostEqual(
                 power,
                 expected,
                 delta=expected * 1.0e-8,
             )
+
     def test_t_power_uses_normal_mix_for_small_df_default_grid(self):
         # df=3–4 时默认 u 网格只有 800 个 Simpson 区间，
         # 对 alpha 很小、非中心参数接近 0 的功效可低估约
@@ -1639,30 +1488,28 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 2.5111492140108046e-05,
             ),
         ):
-            power = experiment._t_power(
-                effect, 1.0, df, alpha
-            )
+            power = experiment._t_power(effect, 1.0, df, alpha)
             self.assertIsNotNone(power)
             self.assertAlmostEqual(
                 power,
                 expected,
                 delta=expected * 1.0e-8,
             )
+
     def test_t_p_value_uses_exact_beta_before_normal_limit(self):
         # df=1e6、t=30 时一阶正态尾修正仍有约 2% 误差；
         # 不完全 Beta 在此自由度下精度约 5e-10，应优先使用。
         self.assertAlmostEqual(
-            experiment._two_sided_t_p_value(30.0, 1.0e6)
-            / 1.2020094233664118e-197,
+            experiment._two_sided_t_p_value(30.0, 1.0e6) / 1.2020094233664118e-197,
             1.0,
             places=8,
         )
+
     def test_t_p_value_avoids_lgamma_cancellation_at_large_df(self):
         # df~1.5e8 时 lgamma(a+b)-lgamma(a) 的相消会让 p 值
         # 产生约 1e-6 的相对误差；x 接近 1 时也不能依赖 1-x。
         self.assertAlmostEqual(
-            experiment._two_sided_t_p_value(1.7, 1.5e8)
-            / 0.08913092759024125,
+            experiment._two_sided_t_p_value(1.7, 1.5e8) / 0.08913092759024125,
             1.0,
             places=12,
         )
@@ -1675,6 +1522,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             1.0,
             delta=1.0e-8,
         )
+
     def test_t_p_value_avoids_complement_rounding_for_small_tail(self):
         # df=0.5、t≈4.24e7 时 x=df/(df+t²)≈2.78e-16；若先算
         # complement_x 再取 1-complement_x，表示误差会让
@@ -1693,11 +1541,11 @@ class EdgeCaseRegressionTests(unittest.TestCase):
         critical = experiment._t_critical(0.5, 1.0e-4)
         self.assertIsNotNone(critical)
         self.assertAlmostEqual(
-            experiment._two_sided_t_p_value(critical, 0.5)
-            / 1.0e-4,
+            experiment._two_sided_t_p_value(critical, 0.5) / 1.0e-4,
             1.0,
             places=12,
         )
+
     def test_incomplete_beta_converges_for_large_parameters(self):
         # 连分式步数上限为 200 时，a=b=1e6、x=0.5 只能算到
         # 0.499687；提高上限后应恢复对称值 0.5，并让大样本
@@ -1723,6 +1571,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             1.0,
             places=9,
         )
+
     def test_binomial_upper_bound_resolves_confidence_near_one(self):
         # failures>4096 时若按 I_p(k+1,n-k)=confidence 二分，
         # confidence=1-1e-15 与计算值在双精度下无法区分，
@@ -1742,20 +1591,21 @@ class EdgeCaseRegressionTests(unittest.TestCase):
             bound,
         )
         self.assertAlmostEqual(cdf / alpha, 1.0, places=9)
+
     def test_binomial_upper_bound_handles_rates_below_machine_epsilon(self):
         for failures, trials, confidence, expected in (
-            (5000, 10 ** 18, 0.95, 5.117886079407686e-15),
-            (5000, 10 ** 22, 0.95, 5.117886079407686e-19),
+            (5000, 10**18, 0.95, 5.117886079407686e-15),
+            (5000, 10**22, 0.95, 5.117886079407686e-19),
             (
                 5000,
-                10 ** 18,
+                10**18,
                 1.0 - 1.0e-15,
                 5.5834617958970515e-15,
             ),
-            (10 ** 6, 10 ** 22, 0.95, 1.0016464227676167e-16),
+            (10**6, 10**22, 0.95, 1.0016464227676167e-16),
             (
-                10 ** 6,
-                10 ** 22,
+                10**6,
+                10**22,
                 1.0 - 1.0e-15,
                 1.0079631496577706e-16,
             ),
@@ -1771,6 +1621,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 1.0,
                 places=9,
             )
+
     def test_t_p_value_handles_infinite_and_invalid_df(self):
         # df→+inf 时 t 分布退化为标准正态；原实现得到
         # inf/inf=NaN。NaN/负自由度没有定义，必须返回 None
@@ -1781,15 +1632,10 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 math.erfc(t / math.sqrt(max(2.0, 0.0))),
                 delta=1e-12,
             )
-        self.assertIsNone(
-            experiment._two_sided_t_p_value(1.0, float("nan"))
-        )
-        self.assertIsNone(
-            experiment._two_sided_t_p_value(1.0, float("-inf"))
-        )
-        self.assertIsNone(
-            experiment._two_sided_t_p_value(float("inf"), float("nan"))
-        )
+        self.assertIsNone(experiment._two_sided_t_p_value(1.0, float("nan")))
+        self.assertIsNone(experiment._two_sided_t_p_value(1.0, float("-inf")))
+        self.assertIsNone(experiment._two_sided_t_p_value(float("inf"), float("nan")))
+
     def test_t_p_value_stays_stable_for_large_finite_df(self):
         # 大而有限的自由度会让 df/(df+t²) 舍入成 1，
         # 原实现因此把 p 值退化成 1.0 或接近 0；应平滑趋近
@@ -1809,6 +1655,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 if previous is not None:
                     self.assertLessEqual(p_value, previous)
                 previous = p_value
+
     def test_t_p_value_keeps_upper_tail_near_one(self):
         for df, t in (
             (1.0e7, 1.0e-5),
@@ -1823,6 +1670,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 delta=1.0e-9,
             )
             self.assertLess(p_value, 1.0)
+
     def test_t_critical_inverts_upper_tail_near_one(self):
         for df in (1.0e5, 1.0e8):
             critical = experiment._t_critical(df, 0.999999)
@@ -1832,6 +1680,7 @@ class EdgeCaseRegressionTests(unittest.TestCase):
                 0.999999,
                 places=12,
             )
+
     def test_tost_test_keeps_small_upper_tail(self):
         result = experiment._tost_test(
             -5.0,

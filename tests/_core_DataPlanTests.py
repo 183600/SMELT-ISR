@@ -1,18 +1,24 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+
 # Reproducibility: Set random seeds
+import argparse
+import hashlib
 import random
 import numpy as np
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 try:
     import torch
+
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 except ImportError:
     pass
+
 
 class DataPlanTests(unittest.TestCase):
     """数据协议准备（data plan）：生成、冻结、核对与训练入口口径一致。"""
@@ -23,9 +29,7 @@ class DataPlanTests(unittest.TestCase):
         out = bytearray()
         counter = 0
         while len(out) < size:
-            raw = hashlib.sha256(
-                raw + str(counter).encode("ascii")
-            ).digest()
+            raw = hashlib.sha256(raw + str(counter).encode("ascii")).digest()
             out.extend(32 + (value % 95) for value in raw)
             counter += 1
         return bytes(out[:size])
@@ -40,10 +44,7 @@ class DataPlanTests(unittest.TestCase):
         separator: bytes = b"<|doc|>",
     ) -> Path:
         path = root / "corpus.txt"
-        docs = [
-            cls._printable(f"plan-doc-{index}", group_bytes)
-            for index in range(groups)
-        ]
+        docs = [cls._printable(f"plan-doc-{index}", group_bytes) for index in range(groups)]
         path.write_bytes(separator.join(docs))
         return path
 
@@ -54,48 +55,40 @@ class DataPlanTests(unittest.TestCase):
         seq_len: int = 16,
         **overrides,
     ) -> argparse.Namespace:
-        values = dict(
-            data=str(corpus),
-            seq_len=seq_len,
-            split_policy="contiguous",
-            val_fraction=0.2,
-            test_fraction=0.2,
-            group_separator="<|doc|>",
-            time_order_manifest=None,
-            entity_manifest=None,
-            deduplicate_train_groups=False,
-            drop_train_shared_chunks=False,
-            drop_train_near_duplicate_groups=False,
-            near_duplicate_audit=False,
-            near_duplicate_threshold=0.8,
-            near_duplicate_shingle_bytes=8,
-            drop_train_corrupt_groups=False,
-            drop_train_corrupt_bytes=False,
-            drop_train_degenerate_groups=False,
-            drop_train_degenerate_runs=False,
-            clean_train_against_test=False,
-            allow_eval_content_for_cleaning=False,
-            domain_justification=None,
-        )
+        values = {
+            "data": str(corpus),
+            "seq_len": seq_len,
+            "split_policy": "contiguous",
+            "val_fraction": 0.2,
+            "test_fraction": 0.2,
+            "group_separator": "<|doc|>",
+            "time_order_manifest": None,
+            "entity_manifest": None,
+            "deduplicate_train_groups": False,
+            "drop_train_shared_chunks": False,
+            "drop_train_near_duplicate_groups": False,
+            "near_duplicate_audit": False,
+            "near_duplicate_threshold": 0.8,
+            "near_duplicate_shingle_bytes": 8,
+            "drop_train_corrupt_groups": False,
+            "drop_train_corrupt_bytes": False,
+            "drop_train_degenerate_groups": False,
+            "drop_train_degenerate_runs": False,
+            "clean_train_against_test": False,
+            "allow_eval_content_for_cleaning": False,
+            "domain_justification": None,
+        }
         values.update(overrides)
         return argparse.Namespace(**values)
 
     def _dataset(self, args: argparse.Namespace):
-        separator = experiment.parse_group_separator(
-            args.group_separator
-        )
-        return experiment.build_byte_dataset(
-            args, int(args.seq_len), separator, device=None
-        )
+        separator = experiment.parse_group_separator(args.group_separator)
+        return experiment.build_byte_dataset(args, int(args.seq_len), separator, device=None)
 
     def _plan(self, args: argparse.Namespace):
-        separator, evidence = experiment.data_protocol_cli_setup(
-            args
-        )
+        _, evidence = experiment.data_protocol_cli_setup(args)
         dataset = self._dataset(args)
-        return experiment.build_data_plan(
-            args, dataset, time_order_evidence=evidence
-        )
+        return experiment.build_data_plan(args, dataset, time_order_evidence=evidence)
 
     def test_plan_roundtrip_and_freeze_semantics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,41 +101,23 @@ class DataPlanTests(unittest.TestCase):
                 self._dataset(args).data_sha256,
             )
             block = plan["preregistration_data_block"]
-            self.assertEqual(
-                block["sha256"], plan["corpus"]["sha256"]
-            )
-            self.assertEqual(
-                block["group_separator"], "<|doc|>"
-            )
-            self.assertFalse(block["cleaning"][
-                "deduplicate_train_groups"
-            ])
-            self.assertEqual(
-                block["split_policy"], "contiguous"
-            )
+            self.assertEqual(block["sha256"], plan["corpus"]["sha256"])
+            self.assertEqual(block["group_separator"], "<|doc|>")
+            self.assertFalse(block["cleaning"]["deduplicate_train_groups"])
+            self.assertEqual(block["split_policy"], "contiguous")
             target = root / "data_plan.json"
             written = experiment.write_data_plan(target, plan)
             self.assertTrue(written["written"])
-            self.assertEqual(
-                written["plan_id"], plan["plan_id"]
-            )
+            self.assertEqual(written["plan_id"], plan["plan_id"])
             reloaded = experiment.load_data_plan(target)
-            self.assertEqual(
-                reloaded["plan_id"], plan["plan_id"]
-            )
+            self.assertEqual(reloaded["plan_id"], plan["plan_id"])
             # 同一计划重复写入保留已冻结的文件字节。
             again = experiment.write_data_plan(target, plan)
             self.assertFalse(again["written"])
-            self.assertEqual(
-                again["file_sha256"], written["file_sha256"]
-            )
+            self.assertEqual(again["file_sha256"], written["file_sha256"])
             # 内容不同的计划不能覆盖冻结路径。
-            mutated = json.loads(
-                json.dumps(plan, ensure_ascii=False)
-            )
-            mutated["corpus"]["bytes"] = int(
-                mutated["corpus"]["bytes"]
-            ) + 1
+            mutated = json.loads(json.dumps(plan, ensure_ascii=False))
+            mutated["corpus"]["bytes"] = int(mutated["corpus"]["bytes"]) + 1
             mutated["plan_id"] = experiment.data_plan_id(
                 {
                     key: value
@@ -161,17 +136,13 @@ class DataPlanTests(unittest.TestCase):
             plan = self._plan(args)
             processing = plan["processing"]
             protocol = processing["protocol"]
-            self.assertEqual(
-                protocol["statistical_fit_scope"], "train_only"
-            )
+            self.assertEqual(protocol["statistical_fit_scope"], "train_only")
             self.assertEqual(
                 plan["preregistration_data_block"]["processing"],
                 protocol,
             )
             self.assertEqual(
-                plan["preregistration_data_block"]["processing"][
-                    "effective_train_sha256"
-                ],
+                plan["preregistration_data_block"]["processing"]["effective_train_sha256"],
                 self._dataset(args).effective_train_sha256,
             )
             declared = json.loads(
@@ -180,9 +151,7 @@ class DataPlanTests(unittest.TestCase):
                     ensure_ascii=False,
                 )
             )
-            declared["processing"][
-                "effective_train_sha256"
-            ] = "0" * 64
+            declared["processing"]["effective_train_sha256"] = "0" * 64
             report = experiment.check_data_plan(
                 {"data": declared},
                 plan,
@@ -190,10 +159,7 @@ class DataPlanTests(unittest.TestCase):
                 dataset=self._dataset(args),
             )
             self.assertFalse(report["ok"])
-            fields = {
-                difference["field"]
-                for difference in report["differences"]
-            }
+            fields = {difference["field"] for difference in report["differences"]}
             self.assertIn(
                 "data.processing.effective_train_sha256",
                 fields,
@@ -206,9 +172,7 @@ class DataPlanTests(unittest.TestCase):
             plan = self._plan(self._args(corpus))
             target = root / "data_plan.json"
             experiment.write_data_plan(target, plan)
-            tampered = json.loads(
-                target.read_text(encoding="utf-8")
-            )
+            tampered = json.loads(target.read_text(encoding="utf-8"))
             tampered["split"]["val_fraction"] = 0.9
             target.write_text(
                 json.dumps(tampered, ensure_ascii=False),
@@ -237,9 +201,7 @@ class DataPlanTests(unittest.TestCase):
             self.assertTrue(report["ok"])
             self.assertEqual(report["differences"], [])
             self.assertIsNone(report["gate_error"])
-            self.assertEqual(
-                report["metadata_data_plan_id_status"], "matched"
-            )
+            self.assertEqual(report["metadata_data_plan_id_status"], "matched")
 
     def test_check_data_plan_detects_declared_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,23 +217,16 @@ class DataPlanTests(unittest.TestCase):
             )
             declared["sha256"] = "0" * 64
             declared["val_fraction"] = 0.5
-            declared["cleaning"][
-                "deduplicate_train_groups"
-            ] = True
+            declared["cleaning"]["deduplicate_train_groups"] = True
             payload = {"data": declared}
             report = experiment.check_data_plan(
                 payload, plan, args=args, dataset=self._dataset(args)
             )
             self.assertFalse(report["ok"])
-            fields = {
-                difference["field"]
-                for difference in report["differences"]
-            }
+            fields = {difference["field"] for difference in report["differences"]}
             self.assertIn("data.sha256", fields)
             self.assertIn("data.val_fraction", fields)
-            self.assertIn(
-                "data.cleaning.deduplicate_train_groups", fields
-            )
+            self.assertIn("data.cleaning.deduplicate_train_groups", fields)
             self.assertIsNotNone(report["gate_error"])
 
     def test_check_data_plan_metadata_plan_id_mismatch(self):
@@ -290,10 +245,7 @@ class DataPlanTests(unittest.TestCase):
                 report["metadata_data_plan_id_status"],
                 "mismatched",
             )
-            fields = {
-                difference["field"]
-                for difference in report["differences"]
-            }
+            fields = {difference["field"] for difference in report["differences"]}
             self.assertIn("metadata.data_plan_id", fields)
 
     def test_protocol_setup_enforces_cleaning_and_time_order(self):
@@ -301,7 +253,8 @@ class DataPlanTests(unittest.TestCase):
             root = Path(tmp)
             corpus = self._write_corpus(root)
             no_separator = self._args(
-                corpus, group_separator=None,
+                corpus,
+                group_separator=None,
                 deduplicate_train_groups=True,
             )
             with self.assertRaises(ValueError):
@@ -312,39 +265,29 @@ class DataPlanTests(unittest.TestCase):
                 drop_train_corrupt_bytes=True,
             )
             with self.assertRaises(ValueError):
-                experiment.data_protocol_cli_setup(
-                    no_justification
-                )
+                experiment.data_protocol_cli_setup(no_justification)
             justified = self._args(
                 corpus,
                 group_separator=None,
                 drop_train_corrupt_bytes=True,
                 domain_justification="语料混入二进制附件，非任务文本",
             )
-            separator, evidence = (
-                experiment.data_protocol_cli_setup(justified)
-            )
+            separator, evidence = experiment.data_protocol_cli_setup(justified)
             self.assertIsNone(separator)
             self.assertIsNone(evidence)
             self.assertEqual(
                 justified.cleaning_domain_justification,
                 "语料混入二进制附件，非任务文本",
             )
-            bad_threshold = self._args(
-                corpus, near_duplicate_threshold=0.0
-            )
+            bad_threshold = self._args(corpus, near_duplicate_threshold=0.0)
             with self.assertRaises(ValueError):
                 experiment.data_protocol_cli_setup(bad_threshold)
-            chronological = self._args(
-                corpus, split_policy="chronological"
-            )
+            chronological = self._args(corpus, split_policy="chronological")
             with self.assertRaises(ValueError):
                 experiment.data_protocol_cli_setup(chronological)
             manifest = root / "time.txt"
             manifest.write_text(
-                "2026-01-01T00:00:00Z\n"
-                "2026-01-02T00:00:00Z\n"
-                "2026-01-03T00:00:00Z\n",
+                "2026-01-01T00:00:00Z\n2026-01-02T00:00:00Z\n2026-01-03T00:00:00Z\n",
                 encoding="utf-8",
             )
             ordered = self._args(
@@ -352,17 +295,12 @@ class DataPlanTests(unittest.TestCase):
                 split_policy="chronological",
                 time_order_manifest=str(manifest),
             )
-            separator, evidence = (
-                experiment.data_protocol_cli_setup(ordered)
-            )
+            separator, evidence = experiment.data_protocol_cli_setup(ordered)
             self.assertTrue(evidence["monotonic_non_decreasing"])
-            self.assertEqual(
-                ordered.time_order_evidence, evidence
-            )
+            self.assertEqual(ordered.time_order_evidence, evidence)
             unordered = root / "unordered.txt"
             unordered.write_text(
-                "2026-01-03T00:00:00Z\n"
-                "2026-01-01T00:00:00Z\n",
+                "2026-01-03T00:00:00Z\n2026-01-01T00:00:00Z\n",
                 encoding="utf-8",
             )
             violated = self._args(
@@ -396,16 +334,10 @@ class DataPlanTests(unittest.TestCase):
             write_data_plan="a.json",
             preregistration="prereg.json",
         )
-        message = experiment.data_plan_mode_error(
-            write_with_prereg
-        )
+        message = experiment.data_plan_mode_error(write_with_prereg)
         self.assertIn("--preregistration", message)
-        check_missing_prereg = self._args(
-            Path("unused.txt"), check_data_plan="plan.json"
-        )
-        message = experiment.data_plan_mode_error(
-            check_missing_prereg
-        )
+        check_missing_prereg = self._args(Path("unused.txt"), check_data_plan="plan.json")
+        message = experiment.data_plan_mode_error(check_missing_prereg)
         self.assertIn("--preregistration", message)
         check_ok = self._args(
             Path("unused.txt"),
@@ -419,16 +351,10 @@ class DataPlanTests(unittest.TestCase):
             preregistration="prereg.json",
             data_plan="plan.json",
         )
-        message = experiment.data_plan_mode_error(
-            check_with_data_plan
-        )
+        message = experiment.data_plan_mode_error(check_with_data_plan)
         self.assertIn("--data-plan", message)
-        train_missing_prereg = self._args(
-            Path("unused.txt"), data_plan="plan.json"
-        )
-        message = experiment.data_plan_mode_error(
-            train_missing_prereg
-        )
+        train_missing_prereg = self._args(Path("unused.txt"), data_plan="plan.json")
+        message = experiment.data_plan_mode_error(train_missing_prereg)
         self.assertIn("--preregistration", message)
         train_ok = self._args(
             Path("unused.txt"),
@@ -468,12 +394,8 @@ class DataPlanTests(unittest.TestCase):
                 "near_duplicate_threshold": 0.7,
             },
         }
-        differences = experiment.data_plan_differences(
-            declared, expected
-        )
-        fields = [
-            difference["field"] for difference in differences
-        ]
+        differences = experiment.data_plan_differences(declared, expected)
+        fields = [difference["field"] for difference in differences]
         self.assertEqual(
             fields,
             [
@@ -488,9 +410,7 @@ class DataPlanTests(unittest.TestCase):
         for difference in differences:
             self.assertTrue(difference["reason"])
         self.assertEqual(
-            experiment.data_plan_differences(
-                expected, expected
-            ),
+            experiment.data_plan_differences(expected, expected),
             [],
         )
 
@@ -500,27 +420,15 @@ class DataPlanTests(unittest.TestCase):
             corpus = self._write_corpus(root)
             manifest = root / "time.txt"
             manifest.write_text(
-                "2026-01-01T00:00:00Z\n"
-                "2026-01-02T00:00:00Z\n",
+                "2026-01-01T00:00:00Z\n2026-01-02T00:00:00Z\n",
                 encoding="utf-8",
             )
-            args = self._args(
-                corpus, time_order_manifest=str(manifest)
-            )
+            args = self._args(corpus, time_order_manifest=str(manifest))
             plan = self._plan(args)
-            self.assertIn(
-                "time_order_evidence", plan
-            )
-            self.assertTrue(
-                plan["time_order_evidence"][
-                    "monotonic_non_decreasing"
-                ]
-            )
+            self.assertIn("time_order_evidence", plan)
+            self.assertTrue(plan["time_order_evidence"]["monotonic_non_decreasing"])
             isolation = plan["split"]["isolation"]
             self.assertTrue(isolation)
             dataset = self._dataset(args)
             for split, digest in dataset.split_sha256.items():
-                self.assertEqual(
-                    plan["split"]["sha256"][split], digest
-                )
-
+                self.assertEqual(plan["split"]["sha256"][split], digest)

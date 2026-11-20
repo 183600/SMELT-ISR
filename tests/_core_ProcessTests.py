@@ -1,6 +1,7 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
+
 class ProcessTests(unittest.TestCase):
     def test_set_seed_updates_child_hashseed_on_reseed(self):
         if experiment._PYTHONHASHSEED_AT_START is not None:
@@ -12,13 +13,9 @@ class ProcessTests(unittest.TestCase):
         try:
             os.environ.pop("PYTHONHASHSEED", None)
             experiment.set_seed(101)
-            self.assertEqual(
-                os.environ.get("PYTHONHASHSEED"), "101"
-            )
+            self.assertEqual(os.environ.get("PYTHONHASHSEED"), "101")
             experiment.set_seed(102)
-            self.assertEqual(
-                os.environ.get("PYTHONHASHSEED"), "102"
-            )
+            self.assertEqual(os.environ.get("PYTHONHASHSEED"), "102")
         finally:
             experiment._restore_rng_state(saved_rng)
             if saved_env is None:
@@ -42,18 +39,14 @@ class ProcessTests(unittest.TestCase):
                     value,
                 )
             experiment._PYTHONHASHSEED_AT_START = ""
-            self.assertIsNone(
-                experiment.pythonhashseed_error(False)
-            )
+            self.assertIsNone(experiment.pythonhashseed_error(False))
         finally:
             experiment._PYTHONHASHSEED_AT_START = previous
 
     def test_split_policy_default_is_contiguous(self):
         cfg = _tiny_config()
         self.assertEqual(
-            experiment.paper_fidelity_report(cfg)[
-                "paper"
-            ],
+            experiment.paper_fidelity_report(cfg)["paper"],
             "arXiv:2609.01343v1",
         )
 
@@ -65,24 +58,14 @@ class ProcessTests(unittest.TestCase):
                 "test_split_sha256": "s",
                 "test_fraction": 0.05,
             }
-            experiment.append_test_access_ledger(
-                ledger, {**key, "out_dir": str(Path(tmp) / "a")}
-            )
-            check = experiment.check_test_access_ledger(
-                ledger, key, Path(tmp) / "b"
-            )
+            experiment.append_test_access_ledger(ledger, {**key, "out_dir": str(Path(tmp) / "a")})
+            check = experiment.check_test_access_ledger(ledger, key, Path(tmp) / "b")
             self.assertTrue(check["repeat_access"])
-            check_same = experiment.check_test_access_ledger(
-                ledger, key, Path(tmp) / "a"
-            )
+            check_same = experiment.check_test_access_ledger(ledger, key, Path(tmp) / "a")
             self.assertFalse(check_same["repeat_access"])
             self.assertEqual(check_same["matching_accesses"], 1)
-            self.assertEqual(
-                len(check_same["same_candidates"]), 1
-            )
-            self.assertTrue(
-                experiment._test_access_repeat_blocked(check_same)
-            )
+            self.assertEqual(len(check_same["same_candidates"]), 1)
+            self.assertTrue(experiment._test_access_repeat_blocked(check_same))
             self.assertIn(
                 "本目录已登记过",
                 experiment._repeat_test_access_error(check_same),
@@ -103,16 +86,10 @@ class ProcessTests(unittest.TestCase):
                 "test_split_sha256": "s",
                 "test_fraction": 0.05,
             }
-            check_same = experiment.check_test_access_ledger(
-                ledger, key, candidate
-            )
+            check_same = experiment.check_test_access_ledger(ledger, key, candidate)
             self.assertEqual(check_same["matching_accesses"], 1)
-            self.assertTrue(
-                experiment._test_access_repeat_blocked(check_same)
-            )
-            check_other = experiment.check_test_access_ledger(
-                ledger, key, Path(tmp) / "b"
-            )
+            self.assertTrue(experiment._test_access_repeat_blocked(check_same))
+            check_other = experiment.check_test_access_ledger(ledger, key, Path(tmp) / "b")
             self.assertTrue(check_other["repeat_access"])
 
     def test_test_ledger_repeat_detection_normalizes_path_spelling(self):
@@ -124,20 +101,14 @@ class ProcessTests(unittest.TestCase):
                 "test_fraction": 0.05,
             }
             candidate = Path(tmp) / "a"
-            relative_candidate = os.path.relpath(
-                candidate, Path.cwd()
-            )
+            relative_candidate = os.path.relpath(candidate, Path.cwd())
             experiment.append_test_access_ledger(
                 ledger,
                 {**key, "out_dir": relative_candidate},
             )
-            check = experiment.check_test_access_ledger(
-                ledger, key, candidate.resolve()
-            )
+            check = experiment.check_test_access_ledger(ledger, key, candidate.resolve())
             self.assertFalse(check["repeat_access"], check)
-            check = experiment.check_test_access_ledger(
-                ledger, key, Path(tmp) / "b"
-            )
+            check = experiment.check_test_access_ledger(ledger, key, Path(tmp) / "b")
             self.assertTrue(check["repeat_access"], check)
 
     def test_entity_manifest_audit_runs_with_group_separator(self):
@@ -202,16 +173,12 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(spans, [])
         # 同一段里真正的非法续字节仍必须报告。
         self.assertEqual(
-            experiment._invalid_utf8_nul_spans(
-                memoryview(data), 3, 1, True
-            ),
+            experiment._invalid_utf8_nul_spans(memoryview(data), 3, 1, True),
             [(3, 4, "invalid_utf8")],
         )
         # offset=0 的全局扫描不受预热影响。
         self.assertEqual(
-            experiment._invalid_utf8_nul_spans(
-                memoryview(data), 0, len(data), True
-            ),
+            experiment._invalid_utf8_nul_spans(memoryview(data), 0, len(data), True),
             [
                 (0, 1, "invalid_utf8"),
                 (3, 4, "invalid_utf8"),
@@ -225,21 +192,15 @@ class ProcessTests(unittest.TestCase):
         # 记到本段。
         data = b"A" * 10 + b"\xc3" + b"\x00" * 5
         self.assertEqual(
-            experiment._invalid_utf8_nul_spans(
-                memoryview(data), 0, 11, False
-            ),
+            experiment._invalid_utf8_nul_spans(memoryview(data), 0, 11, False),
             [(10, 11, "invalid_utf8")],
         )
         self.assertEqual(
-            experiment._scan_text_integrity(
-                memoryview(data), 0, 11, final=False
-            ),
+            experiment._scan_text_integrity(memoryview(data), 0, 11, final=False),
             {"utf8_replacements": 1, "nul_bytes": 0},
         )
         self.assertEqual(
-            experiment._invalid_utf8_nul_spans(
-                memoryview(data), 11, 5, True
-            ),
+            experiment._invalid_utf8_nul_spans(memoryview(data), 11, 5, True),
             [
                 (11, 12, "nul"),
                 (12, 13, "nul"),
@@ -251,15 +212,11 @@ class ProcessTests(unittest.TestCase):
         # 段尾的合法 lead byte 由 lookahead 补全，不能误报。
         valid = b"A" * 10 + b"\xc3\xa9" + b"B" * 5
         self.assertEqual(
-            experiment._invalid_utf8_nul_spans(
-                memoryview(valid), 0, 11, False
-            ),
+            experiment._invalid_utf8_nul_spans(memoryview(valid), 0, 11, False),
             [],
         )
         self.assertEqual(
-            experiment._scan_text_integrity(
-                memoryview(valid), 0, 11, final=False
-            ),
+            experiment._scan_text_integrity(memoryview(valid), 0, 11, final=False),
             {"utf8_replacements": 0, "nul_bytes": 0},
         )
 
@@ -316,12 +273,8 @@ class ProcessTests(unittest.TestCase):
                 include_test=True,
             )
         self.assertIn((69, 70), dataset.train_excluded_spans)
-        self.assertEqual(
-            report["splits"]["train"]["utf8_replacements"], 0
-        )
-        self.assertEqual(
-            report["splits"]["val"]["utf8_replacements"], 0
-        )
+        self.assertEqual(report["splits"]["train"]["utf8_replacements"], 0)
+        self.assertEqual(report["splits"]["val"]["utf8_replacements"], 0)
 
     def test_audit_reports_unseen_eval_label_coverage(self):
         # train 只有 A，val 只有 B，test 只有 C：B/C 都是训练集
@@ -341,34 +294,20 @@ class ProcessTests(unittest.TestCase):
                 include_test=True,
             )
         coverage = report["label_coverage"]
-        self.assertEqual(
-            coverage["train"]["observed_byte_classes"], 1
-        )
-        for split, byte in (("val", ord("B")), ("test", ord("C"))):
-            self.assertEqual(
-                coverage[split]["unseen_label_classes"], 1
-            )
-            self.assertEqual(
-                coverage[split]["unseen_label_token_share"], 1.0
-            )
+        self.assertEqual(coverage["train"]["observed_byte_classes"], 1)
+        for split, _byte in (("val", ord("B")), ("test", ord("C"))):
+            self.assertEqual(coverage[split]["unseen_label_classes"], 1)
+            self.assertEqual(coverage[split]["unseen_label_token_share"], 1.0)
             self.assertEqual(
                 report["splits"][split]["unseen_label_classes"],
                 1,
             )
-        self.assertTrue(
-            any("从未出现" in warning for warning in report["warnings"])
-        )
+        self.assertTrue(any("从未出现" in warning for warning in report["warnings"]))
 
     def test_cleaning_records_deletion_bias(self):
         # train 中夹入一段非法字节，只清洗 train；删除内容与保留
         # 内容的字节/二元组分布完全不同，必须显式记录删除偏差。
-        data = (
-            b"A" * 25
-            + b"\xff" * 5
-            + b"A" * 30
-            + b"B" * 20
-            + b"C" * 20
-        )
+        data = b"A" * 25 + b"\xff" * 5 + b"A" * 30 + b"B" * 20 + b"C" * 20
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bias.bin"
             path.write_bytes(data)
@@ -390,24 +329,13 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(bias["drop_fraction"], round(5 / 60, 6))
         self.assertEqual(bias["byte_js"], 1.0)
         self.assertEqual(bias["bigram_js"], 1.0)
-        self.assertEqual(
-            bias["dropped_top_bytes"][0][0], 255
-        )
+        self.assertEqual(bias["dropped_top_bytes"][0][0], 255)
         self.assertTrue(
-            any(
-                "删除与保留内容的字节分布" in warning
-                for warning in report["warnings"]
-            )
+            any("删除与保留内容的字节分布" in warning for warning in report["warnings"])
         )
 
     def test_data_processing_record_freezes_fit_and_cleaning_scope(self):
-        data = (
-            b"A" * 25
-            + b"\xff" * 5
-            + b"A" * 30
-            + b"B" * 20
-            + b"C" * 20
-        )
+        data = b"A" * 25 + b"\xff" * 5 + b"A" * 30 + b"B" * 20 + b"C" * 20
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "processing.bin"
             path.write_bytes(data)
@@ -420,9 +348,7 @@ class ProcessTests(unittest.TestCase):
             )
             record = experiment.build_data_processing_record(dataset)
         protocol = record["protocol"]
-        self.assertEqual(
-            protocol["statistical_fit_scope"], "train_only"
-        )
+        self.assertEqual(protocol["statistical_fit_scope"], "train_only")
         self.assertEqual(
             protocol["sample_selection_dependencies"],
             ["train"],
@@ -430,9 +356,7 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(protocol["raw_train_bytes"], 60)
         self.assertEqual(protocol["effective_train_bytes"], 55)
         self.assertEqual(record["dropped_train_bytes"], 5)
-        self.assertAlmostEqual(
-            record["retained_train_fraction"], 55 / 60
-        )
+        self.assertAlmostEqual(record["retained_train_fraction"], 55 / 60)
         self.assertEqual(
             record["dropped_bytes_by_reason"]["corrupt_bytes"],
             5,
@@ -455,12 +379,8 @@ class ProcessTests(unittest.TestCase):
                 [(0, expected_bytes)],
                 chunk_bytes=chunk_bytes,
             )
-            self.assertEqual(
-                int(byte_counts.sum()), expected_bytes
-            )
-            self.assertEqual(
-                int(bigram_counts.sum()), expected_bigrams
-            )
+            self.assertEqual(int(byte_counts.sum()), expected_bytes)
+            self.assertEqual(int(bigram_counts.sum()), expected_bigrams)
 
     def test_interval_counts_accept_readonly_memoryview(self):
         raw = memoryview(b"abracadabra")
@@ -481,14 +401,10 @@ class ProcessTests(unittest.TestCase):
 
     def test_include_test_in_cleaning_alias_is_effective(self):
         groups = [
-            b"DUPAAAAA" if index == 0 else
-            f"train{index:02d}".encode().ljust(8, b"X")
+            b"DUPAAAAA" if index == 0 else f"train{index:02d}".encode().ljust(8, b"X")
             for index in range(12)
         ]
-        groups += [
-            f"val{index:03d}".encode().ljust(8, b"V")
-            for index in range(4)
-        ]
+        groups += [f"val{index:03d}".encode().ljust(8, b"V") for index in range(4)]
         groups.append(b"DUPAAAAA")
         data = b"\n".join(groups) + b"\n"
         with tempfile.TemporaryDirectory() as directory:
@@ -504,12 +420,8 @@ class ProcessTests(unittest.TestCase):
                 include_test_in_cleaning=True,
             )
         self.assertTrue(dataset.clean_train_against_test)
-        self.assertTrue(
-            dataset.train_cleaning["test_used_for_cleaning"]
-        )
-        self.assertTrue(
-            dataset.eval_content_access["test_content_used"]
-        )
+        self.assertTrue(dataset.train_cleaning["test_used_for_cleaning"])
+        self.assertTrue(dataset.eval_content_access["test_content_used"])
         self.assertGreater(len(dataset.train_excluded_spans), 0)
 
     def test_time_order_manifest_accepts_plain_text(self):
@@ -519,17 +431,11 @@ class ProcessTests(unittest.TestCase):
                 "2020-01-01\n2020-01-02\n2020-01-03\n",
                 encoding="utf-8",
             )
-            evidence = experiment.read_time_order_manifest(
-                str(path)
-            )
+            evidence = experiment.read_time_order_manifest(str(path))
             self.assertEqual(evidence["records"], 3)
             self.assertTrue(evidence["monotonic_non_decreasing"])
-            self.assertEqual(
-                evidence["min_timestamp"], "2020-01-01"
-            )
-            self.assertEqual(
-                evidence["max_timestamp"], "2020-01-03"
-            )
+            self.assertEqual(evidence["min_timestamp"], "2020-01-01")
+            self.assertEqual(evidence["max_timestamp"], "2020-01-03")
 
     def test_time_order_manifest_reports_actual_bounds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,17 +444,11 @@ class ProcessTests(unittest.TestCase):
                 "2020-01-03\n2020-01-01\n2020-01-02\n",
                 encoding="utf-8",
             )
-            evidence = experiment.read_time_order_manifest(
-                str(path)
-            )
+            evidence = experiment.read_time_order_manifest(str(path))
             self.assertFalse(evidence["monotonic_non_decreasing"])
             self.assertEqual(evidence["order_violations"], [1])
-            self.assertEqual(
-                evidence["min_timestamp"], "2020-01-01"
-            )
-            self.assertEqual(
-                evidence["max_timestamp"], "2020-01-03"
-            )
+            self.assertEqual(evidence["min_timestamp"], "2020-01-01")
+            self.assertEqual(evidence["max_timestamp"], "2020-01-03")
 
     def test_time_order_manifest_rejects_mixed_timezones(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -570,14 +470,16 @@ class ProcessTests(unittest.TestCase):
         )
         rows = []
         for name in ("a", "b"):
-            rows.append({
-                "run": name,
-                "protocol": {
-                    "comparison_family": "neural",
-                    **{key: None for key in keys},
-                },
-                "protocol_recorded_keys": list(keys),
-            })
+            rows.append(
+                {
+                    "run": name,
+                    "protocol": {
+                        "comparison_family": "neural",
+                        **dict.fromkeys(keys),
+                    },
+                    "protocol_recorded_keys": list(keys),
+                }
+            )
         report = experiment.check_controlled_variables(rows, [])
         for key in keys:
             self.assertNotIn(key, report["unchecked_keys"])
@@ -591,7 +493,7 @@ class ProcessTests(unittest.TestCase):
                 "run": name,
                 "protocol": {
                     "comparison_family": "neural",
-                    **{key: None for key in keys},
+                    **dict.fromkeys(keys),
                 },
                 "protocol_recorded_keys": [],
             }
@@ -635,18 +537,17 @@ class ProcessTests(unittest.TestCase):
             for name, value in (("a", defaults[key]), ("b", variant)):
                 protocol = {"comparison_family": "neural", **defaults}
                 protocol[key] = value
-                rows.append({
-                    "run": name,
-                    "protocol": protocol,
-                    "protocol_recorded_keys": list(defaults),
-                })
+                rows.append(
+                    {
+                        "run": name,
+                        "protocol": protocol,
+                        "protocol_recorded_keys": list(defaults),
+                    }
+                )
             report = experiment.check_controlled_variables(rows, [])
             self.assertIn(key, report["checked_keys"])
             self.assertTrue(
-                any(
-                    violation["key"] == key
-                    for violation in report["violations"]
-                ),
+                any(violation["key"] == key for violation in report["violations"]),
                 report["violations"],
             )
             self.assertFalse(report["ok"])
@@ -662,18 +563,13 @@ class ProcessTests(unittest.TestCase):
             }
             for name in ("a", "b")
         ]
-        same_report = experiment.check_controlled_variables(
-            same_rows, []
-        )
+        same_report = experiment.check_controlled_variables(same_rows, [])
         self.assertTrue(same_report["ok"], same_report["violations"])
 
     def test_multiple_changed_axes_are_not_single_factor(self):
         def cell(mode, residual_scaling):
             return {
-                "label": (
-                    f"mode={mode}, residual_scaling="
-                    f"{residual_scaling}"
-                ),
+                "label": (f"mode={mode}, residual_scaling={residual_scaling}"),
                 "keys": {
                     "mode": mode,
                     "residual_scaling": residual_scaling,
@@ -692,22 +588,25 @@ class ProcessTests(unittest.TestCase):
             ["mode", "residual_scaling"],
             "val_loss",
         )
-        pairs = {
-            frozenset(contrast["cells"]): contrast
-            for contrast in contrasts
-        }
-        single = pairs[frozenset((
-            cell("A", "paper")["label"],
-            cell("A", "global")["label"],
-        ))]
+        pairs = {frozenset(contrast["cells"]): contrast for contrast in contrasts}
+        single = pairs[
+            frozenset(
+                (
+                    cell("A", "paper")["label"],
+                    cell("A", "global")["label"],
+                )
+            )
+        ]
         self.assertFalse(single["confounded"])
-        self.assertEqual(
-            single["differing_factors"], ["residual_scaling"]
-        )
-        multi = pairs[frozenset((
-            cell("A", "global")["label"],
-            cell("B", "paper")["label"],
-        ))]
+        self.assertEqual(single["differing_factors"], ["residual_scaling"])
+        multi = pairs[
+            frozenset(
+                (
+                    cell("A", "global")["label"],
+                    cell("B", "paper")["label"],
+                )
+            )
+        ]
         self.assertTrue(multi["confounded"])
         self.assertEqual(
             set(multi["differing_factors"]),
@@ -750,17 +649,19 @@ class ProcessTests(unittest.TestCase):
         rows = []
         for mode, lr in (("A", 1e-4), ("B", 2e-4)):
             for seed in (41, 42, 43):
-                rows.append({
-                    "run": f"{mode}{seed}",
-                    "mode": mode,
-                    "seed": seed,
-                    "val_loss": 3.0 + (0.1 if mode == "B" else 0.0),
-                    "protocol": {
-                        "comparison_family": "neural",
-                        "lr": lr,
-                    },
-                    "protocol_recorded_keys": ["lr"],
-                })
+                rows.append(
+                    {
+                        "run": f"{mode}{seed}",
+                        "mode": mode,
+                        "seed": seed,
+                        "val_loss": 3.0 + (0.1 if mode == "B" else 0.0),
+                        "protocol": {
+                            "comparison_family": "neural",
+                            "lr": lr,
+                        },
+                        "protocol_recorded_keys": ["lr"],
+                    }
+                )
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             report = experiment.print_comparison_analysis(
@@ -775,9 +676,7 @@ class ProcessTests(unittest.TestCase):
         contrast = report["contrasts"][0]
         self.assertTrue(contrast["confounded"])
         self.assertIn("lr", contrast["differing_factors"])
-        self.assertEqual(
-            contrast["controlled_confound_keys"], ["lr"]
-        )
+        self.assertEqual(contrast["controlled_confound_keys"], ["lr"])
         self.assertNotIn("p_value", contrast)
         self.assertNotIn("significant", contrast)
         rendered = output.getvalue()
@@ -806,18 +705,20 @@ class ProcessTests(unittest.TestCase):
         ]
         controlled = {
             "ok": False,
-            "violations": [{
-                "key": "lr",
-                "values": {
-                    "a1": 1e-4,
-                    "a2": 1e-4,
-                    "b1": 2e-4,
-                    "b2": 2e-4,
-                    "c1": 1e-4,
-                    "c2": 1e-4,
-                },
-                "missing_runs": [],
-            }],
+            "violations": [
+                {
+                    "key": "lr",
+                    "values": {
+                        "a1": 1e-4,
+                        "a2": 1e-4,
+                        "b1": 2e-4,
+                        "b2": 2e-4,
+                        "c1": 1e-4,
+                        "c2": 1e-4,
+                    },
+                    "missing_runs": [],
+                }
+            ],
         }
         contrasts = experiment.factor_contrasts(
             aggregates,
@@ -825,10 +726,7 @@ class ProcessTests(unittest.TestCase):
             "val_loss",
             controlled_variables=controlled,
         )
-        by_cells = {
-            frozenset(contrast["cells"]): contrast
-            for contrast in contrasts
-        }
+        by_cells = {frozenset(contrast["cells"]): contrast for contrast in contrasts}
         ac = by_cells[frozenset(("A", "C"))]
         ab = by_cells[frozenset(("A", "B"))]
         bc = by_cells[frozenset(("B", "C"))]
@@ -837,7 +735,7 @@ class ProcessTests(unittest.TestCase):
         for contrast in (ab, bc):
             self.assertTrue(contrast["confounded"])
             self.assertIn("lr", contrast["differing_factors"])
-            self.assertNotIn("p_value", contrast) 
+            self.assertNotIn("p_value", contrast)
 
         reference = experiment.compare_cells_to_baseline(
             aggregates,
@@ -845,20 +743,9 @@ class ProcessTests(unittest.TestCase):
             "val_loss",
             controlled_variables=controlled,
         )
-        reference_by_cells = {
-            frozenset(contrast["cells"]): contrast
-            for contrast in reference
-        }
-        self.assertFalse(
-            reference_by_cells[frozenset(("A", "C"))][
-                "confounded"
-            ]
-        )
-        self.assertTrue(
-            reference_by_cells[frozenset(("A", "B"))][
-                "confounded"
-            ]
-        )
+        reference_by_cells = {frozenset(contrast["cells"]): contrast for contrast in reference}
+        self.assertFalse(reference_by_cells[frozenset(("A", "C"))]["confounded"])
+        self.assertTrue(reference_by_cells[frozenset(("A", "B"))]["confounded"])
 
     def test_ablation_rejects_extra_declared_factor_as_single_factor(self):
         # n_kv_heads 被允许显式声明为实验因子；一旦声明，受控
@@ -870,17 +757,19 @@ class ProcessTests(unittest.TestCase):
             for mode in ("local_base", "A"):
                 for balance in (0.0, 0.01):
                     for seed in (42, 43, 44):
-                        rows.append({
-                            "run": f"{mode}_{balance}_{seed}",
-                            "mode": mode,
-                            "balance_coef": balance,
-                            "seed": seed,
-                            "k1": 2,
-                            "k2": 2,
-                            "top_k": 2,
-                            "residual_scale": 1.0,
-                            "n_kv_heads": values[mode],
-                        })
+                        rows.append(
+                            {
+                                "run": f"{mode}_{balance}_{seed}",
+                                "mode": mode,
+                                "balance_coef": balance,
+                                "seed": seed,
+                                "k1": 2,
+                                "k2": 2,
+                                "top_k": 2,
+                                "residual_scale": 1.0,
+                                "n_kv_heads": values[mode],
+                            }
+                        )
             return rows
 
         factors = [
@@ -895,26 +784,23 @@ class ProcessTests(unittest.TestCase):
             ["A"],
         )
         self.assertTrue(
-            any(
-                "n_kv_heads" in message
-                for message in confounded["structural_confounds"]
-            ),
+            any("n_kv_heads" in message for message in confounded["structural_confounds"]),
             confounded["structural_confounds"],
         )
         factorial = {
-            "effects": [{
-                "effect_name": "delayed_merge_main",
-                "claim": "supports_component",
-            }],
+            "effects": [
+                {
+                    "effect_name": "delayed_merge_main",
+                    "claim": "supports_component",
+                }
+            ],
         }
         experiment.annotate_factorial_confounds(
             factorial,
             {"ok": True, "unchecked_keys": []},
             confounded,
         )
-        self.assertEqual(
-            factorial["effects"][0]["claim"], "confounded"
-        )
+        self.assertEqual(factorial["effects"][0]["claim"], "confounded")
 
         single_factor = experiment.ablation_coverage(
             rows_with_kv_heads({"local_base": 4, "A": 4}),
@@ -922,10 +808,7 @@ class ProcessTests(unittest.TestCase):
             ["A"],
         )
         self.assertFalse(
-            any(
-                "n_kv_heads" in message
-                for message in single_factor["structural_confounds"]
-            ),
+            any("n_kv_heads" in message for message in single_factor["structural_confounds"]),
             single_factor["structural_confounds"],
         )
 
@@ -935,9 +818,7 @@ class ProcessTests(unittest.TestCase):
             dtype=torch.uint8,
         )
         model = experiment.NgramBaseline(data, max_order=2)
-        windows = torch.stack(
-            [data[index:index + 5] for index in range(6)]
-        )
+        windows = torch.stack([data[index : index + 5] for index in range(6)])
         metrics = experiment._ngram_extended_metrics(
             model,
             [windows],
@@ -949,13 +830,9 @@ class ProcessTests(unittest.TestCase):
             bootstrap_seed=7,
             bootstrap_block=3,
         )
-        self.assertEqual(
-            metrics["val_bootstrap_unit"], "moving_block"
-        )
+        self.assertEqual(metrics["val_bootstrap_unit"], "moving_block")
         self.assertEqual(metrics["val_bootstrap_block_size"], 3)
-        self.assertEqual(
-            metrics["val_loss_accumulation_dtype"], "float64"
-        )
+        self.assertEqual(metrics["val_loss_accumulation_dtype"], "float64")
         self.assertLess(
             metrics["val_loss_weighted_consistency_abs"],
             1e-9,
@@ -973,12 +850,8 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(orders["1"]["eligible_observations"], 20)
         self.assertEqual(orders["1"]["counted_observations"], 5)
         self.assertEqual(orders["1"]["sampling_stride"], 4)
-        self.assertAlmostEqual(
-            orders["1"]["coverage_fraction"], 0.25
-        )
-        self.assertEqual(
-            orders["1"]["sampling"], "systematic_stride"
-        )
+        self.assertAlmostEqual(orders["1"]["coverage_fraction"], 0.25)
+        self.assertEqual(orders["1"]["sampling"], "systematic_stride")
         self.assertEqual(orders["2"]["eligible_observations"], 19)
         self.assertEqual(orders["2"]["counted_observations"], 5)
         with self.assertRaises(ValueError):
@@ -1026,18 +899,8 @@ class ProcessTests(unittest.TestCase):
             any("old" in message for message in report["unverified"]),
             report["unverified"],
         )
-        self.assertTrue(
-            any(
-                "初始化指纹" in message
-                for message in report["unverified"]
-            )
-        )
-        self.assertTrue(
-            any(
-                "首批训练数据指纹" in message
-                for message in report["unverified"]
-            )
-        )
+        self.assertTrue(any("初始化指纹" in message for message in report["unverified"]))
+        self.assertTrue(any("首批训练数据指纹" in message for message in report["unverified"]))
 
     def test_cross_family_explicit_null_is_compared(self):
         recorded = ["group_separator"]

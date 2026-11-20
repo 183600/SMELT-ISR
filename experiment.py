@@ -6,7 +6,7 @@ import sys as _sys
 import types as _types
 
 import exp as _exp
-import selfcheck  # Required for run_self_test to access the checks module
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. The centralized seed is set once by the experiment
 # entry point (set_seed(args.seed)); all stochastic paths use local
@@ -20,9 +20,7 @@ class _CompatModule(_types.ModuleType):
         try:
             return getattr(_exp, name)
         except AttributeError:
-            raise AttributeError(
-                f"module {self.__name__!r} has no attribute {name!r}"
-            ) from None
+            raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}") from None
 
     def __setattr__(self, name, value):
         if name.startswith("__") and name.endswith("__"):
@@ -44,7 +42,12 @@ _sys.modules[__name__].__class__ = _CompatModule
 
 
 if __name__ == "__main__":
-    if "--self-test" in _sys.argv:
-        _exp.run_self_test()
-    else:
-        _exp.main()
+    # exp 包的属性由 exec 组合动态定义（见 exp/__init__.py），
+    # 静态视野里不存在；getattr 显式表达这一动态查找，
+    # 直接属性访问会被 mypy 判为 attr-defined。
+    entry = (
+        getattr(_exp, "run_self_test")  # noqa: B009
+        if "--self-test" in _sys.argv
+        else getattr(_exp, "main")  # noqa: B009
+    )
+    entry()

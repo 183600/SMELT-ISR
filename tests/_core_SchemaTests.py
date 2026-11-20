@@ -11,7 +11,6 @@
 """
 
 import json
-import os
 import unittest
 from pathlib import Path
 
@@ -20,11 +19,22 @@ SCHEMA_PATH = REPO_ROOT / "schemas" / "preregistration.v1.json"
 EXAMPLE_PATH = REPO_ROOT / "preregistration.example.json"
 
 MODEL_MODES = {
-    "base", "smelt", "local_base", "local_base_k2",
-    "A", "B", "B_early", "dense", "ngram",
+    "base",
+    "smelt",
+    "local_base",
+    "local_base_k2",
+    "A",
+    "B",
+    "B_early",
+    "dense",
+    "ngram",
 }
 RUN_ORDER_SCHEMES = (
-    "grouped", "blocked", "randomized", "counterbalanced", "williams",
+    "grouped",
+    "blocked",
+    "randomized",
+    "counterbalanced",
+    "williams",
 )
 PILOT_CALIBRATION_POLICIES = ("point", "upper_confidence_bound")
 CONTRAST_TYPES = ("pairwise", "simple", "main", "interaction")
@@ -32,7 +42,7 @@ MAX_SEED = 2**32 - 1
 
 
 def _load_json(path):
-    with open(path, encoding="utf-8") as handle:
+    with path.open(encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -54,12 +64,22 @@ class SchemaStructureTests(unittest.TestCase):
         schema = _load_json(SCHEMA_PATH)
         required = set(schema["required"])
         expected_required = {
-            "study_id", "frozen_commit", "primary_metric", "common_step",
-            "min_effect", "direction", "baseline_mode", "comparisons",
-            "seeds", "budget_match", "data",
+            "study_id",
+            "frozen_commit",
+            "primary_metric",
+            "common_step",
+            "min_effect",
+            "direction",
+            "baseline_mode",
+            "comparisons",
+            "seeds",
+            "budget_match",
+            "data",
         }
-        self.assertTrue(expected_required.issubset(required),
-                        f"缺少必填字段声明: {expected_required - required}")
+        self.assertTrue(
+            expected_required.issubset(required),
+            f"缺少必填字段声明: {expected_required - required}",
+        )
 
     def test_data_subschema(self):
         schema = _load_json(SCHEMA_PATH)
@@ -116,8 +136,7 @@ class ExampleConsistencyTests(unittest.TestCase):
         schema = _load_json(SCHEMA_PATH)
         example = _load_json(EXAMPLE_PATH)
         missing = set(schema["required"]) - set(example)
-        self.assertEqual(missing, set(),
-                         f"示例缺少必填字段: {sorted(missing)}")
+        self.assertEqual(missing, set(), f"示例缺少必填字段: {sorted(missing)}")
 
     def test_example_field_types_match_schema(self):
         schema = _load_json(SCHEMA_PATH)
@@ -138,10 +157,12 @@ class ExampleConsistencyTests(unittest.TestCase):
                 continue
             # 联合类型如 ["string", "null"]：取第一个非 null 子类型做类型断言。
             if isinstance(expected, list):
-                expected = [t for t in expected if t != "null"][0]
-            python_types = type_map[expected] if isinstance(
-                type_map[expected], tuple
-            ) else (type_map[expected],)
+                expected = next(t for t in expected if t != "null")
+            python_types = (
+                type_map[expected]
+                if isinstance(type_map[expected], tuple)
+                else (type_map[expected],)
+            )
             value = example[field]
             # nullable 联合类型允许 null（如 ["string", "null"]）。
             raw_type = prop.get("type")
@@ -154,19 +175,19 @@ class ExampleConsistencyTests(unittest.TestCase):
             if expected in ("integer", "number") and isinstance(value, bool):
                 self.fail(f"{field}: 布尔值不应作为 {expected}")
             if not isinstance(value, python_types):
-                self.fail(
-                    f"{field}: 期望 {expected}，实际 {type(value).__name__}"
-                )
+                self.fail(f"{field}: 期望 {expected}，实际 {type(value).__name__}")
 
     def test_example_enums_in_range(self):
-        schema = _load_json(SCHEMA_PATH)
+        _schema = _load_json(SCHEMA_PATH)
         example = _load_json(EXAMPLE_PATH)
         enum_checks = {
             "direction": {"decrease", "increase"},
             "baseline_mode": MODEL_MODES,
         }
         for field, allowed in enum_checks.items():
-            self.assertIn(example.get(field), allowed, f"{field}={example.get(field)} 不在枚举范围内")
+            self.assertIn(
+                example.get(field), allowed, f"{field}={example.get(field)} 不在枚举范围内"
+            )
         for arm_a, arm_b in example["comparisons"]:
             self.assertIn(arm_a, MODEL_MODES)
             self.assertIn(arm_b, MODEL_MODES)
@@ -189,24 +210,23 @@ class ExampleConsistencyTests(unittest.TestCase):
         example = _load_json(EXAMPLE_PATH)
         arms = {arm for pair in example["comparisons"] for arm in pair}
         if {"smelt"} & arms and arms & {"A", "B", "local_base"}:
-            self.assertIsNotNone(example.get("budget_match"),
-                                 "延迟合并与 smelt 对照必须给出 budget_match")
+            self.assertIsNotNone(
+                example.get("budget_match"), "延迟合并与 smelt 对照必须给出 budget_match"
+            )
 
     def test_example_equivalence_margin_le_min_effect(self):
         example = _load_json(EXAMPLE_PATH)
         margin = example.get("equivalence_margin")
         min_effect = example.get("min_effect")
         if margin is not None and min_effect is not None:
-            self.assertLessEqual(margin, min_effect,
-                                 "等价界不得大于最小有意义效应")
+            self.assertLessEqual(margin, min_effect, "等价界不得大于最小有意义效应")
 
     def test_example_steps_ge_common_step(self):
         example = _load_json(EXAMPLE_PATH)
         steps = example.get("steps")
         common_step = example.get("common_step")
         if steps is not None and common_step is not None:
-            self.assertGreaterEqual(steps, common_step,
-                                    "训练总步数必须 >= common_step")
+            self.assertGreaterEqual(steps, common_step, "训练总步数必须 >= common_step")
 
     def test_example_val_test_fraction(self):
         example = _load_json(EXAMPLE_PATH)
@@ -217,8 +237,7 @@ class ExampleConsistencyTests(unittest.TestCase):
         self.assertLess(vf, 1)
         self.assertGreaterEqual(tf, 0)
         self.assertLess(tf, 1)
-        self.assertLess(vf + tf, 1,
-                        "val_fraction + test_fraction 必须小于 1")
+        self.assertLess(vf + tf, 1, "val_fraction + test_fraction 必须小于 1")
 
     def test_broken_example_rejected(self):
         """缺必填字段 / 类型错误的示例应被基本校验捕获。"""
@@ -239,7 +258,8 @@ class ExampleConsistencyTests(unittest.TestCase):
         broken_seed = dict(base)
         broken_seed["seeds"] = [42, 42]
         self.assertNotEqual(
-            len(broken_seed["seeds"]), len(set(broken_seed["seeds"])),
+            len(broken_seed["seeds"]),
+            len(set(broken_seed["seeds"])),
             "重复种子应被唯一性约束捕获",
         )
 

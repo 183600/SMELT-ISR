@@ -1,18 +1,22 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
+
 # Reproducibility: Set random seeds
 import random
 import numpy as np
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 try:
     import torch
+
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 except ImportError:
     pass
+
 
 class RunAuditTests(unittest.TestCase):
     """运行级复现审计：跨文件身份必须一致，证据不足要显式披露。"""
@@ -26,13 +30,9 @@ class RunAuditTests(unittest.TestCase):
     ):
         root.mkdir()
         snapshot = experiment.build_environment_snapshot()
-        environment_bytes = json.dumps(
-            snapshot, ensure_ascii=False, indent=2
-        ).encode("utf-8")
+        environment_bytes = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
         (root / "environment.json").write_bytes(environment_bytes)
-        environment_sha = hashlib.sha256(
-            environment_bytes
-        ).hexdigest()
+        environment_sha = hashlib.sha256(environment_bytes).hexdigest()
         identity = {
             "seed": 7,
             "data_sha256": "b" * 64,
@@ -48,9 +48,7 @@ class RunAuditTests(unittest.TestCase):
         }
         metadata = {
             "timestamp_utc": "2026-01-01T00:00:00+00:00",
-            "command": (
-                "python experiment.py --data corpus.txt --out run"
-            ),
+            "command": ("python experiment.py --data corpus.txt --out run"),
             "cwd": "/project",
             "git_commit": "a" * 40,
             "git_dirty": False,
@@ -69,18 +67,14 @@ class RunAuditTests(unittest.TestCase):
         if metadata_overrides:
             metadata.update(metadata_overrides)
         config = {
-            "config_schema": (
-                experiment._ENVIRONMENT_CONFIG_SCHEMA
-            ),
+            "config_schema": (experiment._ENVIRONMENT_CONFIG_SCHEMA),
             "args": {"seed": 7, "mode": "smelt"},
             "data": {
                 "sha256": identity["data_sha256"],
                 "split_sha256": identity["data_split_sha256"],
                 "effective_train_sha256": "4" * 64,
             },
-            "comparison_protocol_sha256": (
-                identity["comparison_protocol_sha256"]
-            ),
+            "comparison_protocol_sha256": (identity["comparison_protocol_sha256"]),
             "run_metadata": metadata,
             "environment": {
                 "schema": experiment._ENVIRONMENT_SCHEMA,
@@ -112,20 +106,13 @@ class RunAuditTests(unittest.TestCase):
             },
         ]
         (root / "metrics.jsonl").write_text(
-            "".join(
-                json.dumps(record) + "\n"
-                for record in records
-            ),
+            "".join(json.dumps(record) + "\n" for record in records),
             encoding="utf-8",
         )
         return config, identity, metadata
 
     def _codes(self, report, key):
-        return {
-            item["code"]
-            for item in report[key]
-            if isinstance(item, dict)
-        }
+        return {item["code"] for item in report[key] if isinstance(item, dict)}
 
     def test_audit_accepts_consistent_run_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,9 +127,7 @@ class RunAuditTests(unittest.TestCase):
             )
 
             experiment.write_artifact_manifest(root)
-            strict = experiment.audit_run_directory(
-                root, strict=True
-            )
+            strict = experiment.audit_run_directory(root, strict=True)
             self.assertTrue(strict["ok"], strict)
             self.assertEqual(strict["errors"], [])
             self.assertEqual(strict["warnings"], [])
@@ -152,12 +137,8 @@ class RunAuditTests(unittest.TestCase):
             root = Path(tmp) / "run"
             config, _, _ = self._build_run(root)
             config["run_metadata"].pop("source_tree_sha256")
-            (root / "config.json").write_text(
-                json.dumps(config), encoding="utf-8"
-            )
-            report = experiment.audit_run_directory(
-                root, strict=True
-            )
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            report = experiment.audit_run_directory(root, strict=True)
             self.assertFalse(report["ok"])
             self.assertIn(
                 "source_tree_sha_missing",
@@ -172,9 +153,7 @@ class RunAuditTests(unittest.TestCase):
                 "schema": "smelt-isr/source-tree/v1",
                 "files": [],
             }
-            (root / "config.json").write_text(
-                json.dumps(config), encoding="utf-8"
-            )
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             report = experiment.audit_run_directory(root)
             self.assertFalse(report["ok"])
             self.assertIn(
@@ -188,35 +167,22 @@ class RunAuditTests(unittest.TestCase):
             config, identity, _ = self._build_run(root)
             fingerprint = experiment.source_tree_fingerprint()
             identity["source_tree_sha256"] = fingerprint["sha256"]
-            config["run_metadata"]["source_tree_sha256"] = (
-                fingerprint["sha256"]
-            )
+            config["run_metadata"]["source_tree_sha256"] = fingerprint["sha256"]
             config["run_metadata"]["source_tree"] = fingerprint
             records = [
                 json.loads(line)
-                for line in (root / "metrics.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in (root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             for record in records:
                 if "source_tree_sha256" in record:
-                    record["source_tree_sha256"] = (
-                        fingerprint["sha256"]
-                    )
-            (root / "config.json").write_text(
-                json.dumps(config), encoding="utf-8"
-            )
+                    record["source_tree_sha256"] = fingerprint["sha256"]
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             (root / "metrics.jsonl").write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             source_root = Path(experiment.__file__).resolve().parent
-            report = experiment.audit_run_directory(
-                root, source_path=source_root
-            )
+            report = experiment.audit_run_directory(root, source_path=source_root)
             self.assertNotIn(
                 "source_tree_sha_mismatch",
                 self._codes(report, "errors"),
@@ -233,15 +199,9 @@ class RunAuditTests(unittest.TestCase):
             self._build_run(root)
             other = Path(tmp) / "other"
             (other / "exp").mkdir(parents=True)
-            (other / "experiment.py").write_text(
-                "", encoding="utf-8"
-            )
-            (other / "exp" / "part_000.py").write_text(
-                "VALUE = 1\n", encoding="utf-8"
-            )
-            report = experiment.audit_run_directory(
-                root, source_path=other
-            )
+            (other / "experiment.py").write_text("", encoding="utf-8")
+            (other / "exp" / "part_000.py").write_text("VALUE = 1\n", encoding="utf-8")
+            report = experiment.audit_run_directory(root, source_path=other)
             self.assertFalse(report["ok"])
             self.assertIn(
                 "source_tree_sha_mismatch",
@@ -257,9 +217,7 @@ class RunAuditTests(unittest.TestCase):
             self.assertTrue(raw.endswith(b"\n"))
             metrics_path.write_bytes(raw[:-1])
             experiment.write_artifact_manifest(root)
-            report = experiment.audit_run_directory(
-                root, strict=True
-            )
+            report = experiment.audit_run_directory(root, strict=True)
             self.assertTrue(report["ok"], report)
             self.assertNotIn(
                 "metrics_trailing_partial",
@@ -280,24 +238,16 @@ class RunAuditTests(unittest.TestCase):
             self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
             records[-1].pop("environment_id")
             records[-1].pop("comparison_protocol_sha256")
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             experiment.write_artifact_manifest(root)
-            report = experiment.audit_run_directory(
-                root, strict=True
-            )
+            report = experiment.audit_run_directory(root, strict=True)
             self.assertTrue(report["ok"], report)
 
     def test_audit_detects_metrics_from_another_run(self):
@@ -306,17 +256,11 @@ class RunAuditTests(unittest.TestCase):
             self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
             records[0]["script_sha256"] = "e" * 64
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -332,16 +276,10 @@ class RunAuditTests(unittest.TestCase):
             self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records + [records[0]]
-                ),
+                "".join(json.dumps(record) + "\n" for record in [*records, records[0]]),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -356,16 +294,10 @@ class RunAuditTests(unittest.TestCase):
             self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in [records[1], records[0]]
-                ),
+                "".join(json.dumps(record) + "\n" for record in [records[1], records[0]]),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -381,71 +313,43 @@ class RunAuditTests(unittest.TestCase):
             config, identity, _ = self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
-            records.append(
-                {"step": "test", **identity, "test_loss": 1.0}
-            )
+            records.append({"step": "test", **identity, "test_loss": 1.0})
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertIn(
-                "test_ledger_missing", warning_codes
-            )
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertIn("test_ledger_missing", warning_codes)
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
             local_ledger = root / "test_access_ledger.jsonl"
             local_ledger.write_text(
-                json.dumps(
-                    {"out_dir": str(root.resolve())}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(root.resolve())}) + "\n",
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertNotIn(
-                "test_ledger_missing", warning_codes
-            )
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertNotIn("test_ledger_missing", warning_codes)
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
             local_ledger.unlink()
             global_ledger = Path(tmp) / "global_test_ledger.jsonl"
             global_ledger.write_text(
-                json.dumps(
-                    {"out_dir": str(root.resolve())}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(root.resolve())}) + "\n",
                 encoding="utf-8",
             )
             config["args"]["test_ledger"] = str(global_ledger)
             (root / "config.json").write_text(
-                json.dumps(
-                    config, ensure_ascii=False, indent=2
-                ),
+                json.dumps(config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertNotIn(
-                "test_ledger_missing", warning_codes
-            )
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertNotIn("test_ledger_missing", warning_codes)
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
     def test_audit_matches_relative_test_ledger_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -457,19 +361,11 @@ class RunAuditTests(unittest.TestCase):
             )
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
-            records.append(
-                {"step": "test", **identity, "test_loss": 1.0}
-            )
+            records.append({"step": "test", **identity, "test_loss": 1.0})
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             (root / "test_access_ledger.jsonl").write_text(
@@ -478,29 +374,22 @@ class RunAuditTests(unittest.TestCase):
             )
             report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
     def test_final_comparison_normalizes_ledger_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate = Path(tmp) / "run"
             ledger = Path(tmp) / "ledger.jsonl"
             ledger.write_text(
-                json.dumps({"out_dir": str(candidate)}) + "\n"
-                + json.dumps({
-                    "out_dir": os.path.relpath(
-                        candidate, Path.cwd()
-                    )
-                })
+                json.dumps({"out_dir": str(candidate)})
+                + "\n"
+                + json.dumps({"out_dir": os.path.relpath(candidate, Path.cwd())})
                 + "\n",
                 encoding="utf-8",
             )
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                report = experiment.print_final_test_comparison(
-                    [], str(ledger)
-                )
+                report = experiment.print_final_test_comparison([], str(ledger))
             counts = report["ledger"]["per_candidate"]
             self.assertEqual(list(counts.values()), [2])
             self.assertIn("重复解封", output.getvalue())
@@ -512,10 +401,7 @@ class RunAuditTests(unittest.TestCase):
             root = Path(tmp) / "run"
             self._build_run(root)
             (root / "test_access_ledger.jsonl").write_text(
-                json.dumps(
-                    {"out_dir": str(root.resolve())}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(root.resolve())}) + "\n",
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -525,9 +411,7 @@ class RunAuditTests(unittest.TestCase):
                 "test_started_without_summary",
                 warning_codes,
             )
-            self.assertNotIn(
-                "test_ledger_missing", warning_codes
-            )
+            self.assertNotIn("test_ledger_missing", warning_codes)
 
     def test_audit_detects_crash_in_global_test_ledger(self):
         # 全局 --test-ledger 同样先于 test_started/封条写入；
@@ -538,17 +422,12 @@ class RunAuditTests(unittest.TestCase):
             config, _, _ = self._build_run(root)
             global_ledger = Path(tmp) / "global_test_ledger.jsonl"
             global_ledger.write_text(
-                json.dumps(
-                    {"out_dir": str(root.resolve())}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(root.resolve())}) + "\n",
                 encoding="utf-8",
             )
             config["args"]["test_ledger"] = str(global_ledger)
             (root / "config.json").write_text(
-                json.dumps(
-                    config, ensure_ascii=False, indent=2
-                ),
+                json.dumps(config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -558,21 +437,14 @@ class RunAuditTests(unittest.TestCase):
                 "test_started_without_summary",
                 warning_codes,
             )
-            self.assertNotIn(
-                "test_ledger_missing", warning_codes
-            )
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertNotIn("test_ledger_missing", warning_codes)
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
             # 账本里只有其它候选的访问时，不能把本目录误判成
             # 已解封；但既然配置了全局账本且可读，仍应指出本
             # 目录没有对应访问记录。
             global_ledger.write_text(
-                json.dumps(
-                    {"out_dir": str(Path(tmp) / "other")}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(Path(tmp) / "other")}) + "\n",
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(root)
@@ -589,27 +461,16 @@ class RunAuditTests(unittest.TestCase):
             _, identity, _ = self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
-            records.append(
-                {"step": "test", **identity, "test_loss": 1.0}
-            )
+            records.append({"step": "test", **identity, "test_loss": 1.0})
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             local_ledger = root / "test_access_ledger.jsonl"
             local_ledger.write_text(
-                json.dumps(
-                    {"out_dir": str(root.resolve())}
-                )
-                + "\n",
+                json.dumps({"out_dir": str(root.resolve())}) + "\n",
                 encoding="utf-8",
             )
             real_open = open
@@ -620,17 +481,11 @@ class RunAuditTests(unittest.TestCase):
                     raise PermissionError("denied")
                 return real_open(path, *args, **kwargs)
 
-            with mock.patch(
-                "builtins.open", new=_selective_open
-            ):
+            with mock.patch("builtins.open", new=_selective_open):
                 report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertIn(
-                "test_ledger_unreadable", warning_codes
-            )
-            self.assertNotIn(
-                "test_ledger_entry_missing", warning_codes
-            )
+            self.assertIn("test_ledger_unreadable", warning_codes)
+            self.assertNotIn("test_ledger_entry_missing", warning_codes)
 
     def test_audit_detects_started_without_summary(self):
         for step_record in (
@@ -641,39 +496,30 @@ class RunAuditTests(unittest.TestCase):
                 "wrong_tokens": 1,
             },
         ):
-            with self.subTest(step=step_record["step"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp) / "run"
-                    self._build_run(root)
-                    metrics_path = root / "metrics.jsonl"
-                    records = [
-                        json.loads(line)
-                        for line in metrics_path.read_text(
-                            encoding="utf-8"
-                        ).splitlines()
-                    ]
-                    records.append(step_record)
-                    metrics_path.write_text(
-                        "".join(
-                            json.dumps(record) + "\n"
-                            for record in records
-                        ),
-                        encoding="utf-8",
-                    )
-                    report = experiment.audit_run_directory(root)
-                    warning_codes = self._codes(
-                        report, "warnings"
-                    )
-                    self.assertIn(
-                        "test_seal_missing", warning_codes
-                    )
-                    self.assertIn(
-                        "test_started_without_summary",
-                        warning_codes,
-                    )
-                    self.assertIn(
-                        "test_ledger_missing", warning_codes
-                    )
+            with (
+                self.subTest(step=step_record["step"]),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp) / "run"
+                self._build_run(root)
+                metrics_path = root / "metrics.jsonl"
+                records = [
+                    json.loads(line)
+                    for line in metrics_path.read_text(encoding="utf-8").splitlines()
+                ]
+                records.append(step_record)
+                metrics_path.write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
+                report = experiment.audit_run_directory(root)
+                warning_codes = self._codes(report, "warnings")
+                self.assertIn("test_seal_missing", warning_codes)
+                self.assertIn(
+                    "test_started_without_summary",
+                    warning_codes,
+                )
+                self.assertIn("test_ledger_missing", warning_codes)
 
     def test_audit_detects_repeated_test_unsealing(self):
         for step_record, expected_code in (
@@ -690,43 +536,35 @@ class RunAuditTests(unittest.TestCase):
                 "multiple_test_bad_cases",
             ),
         ):
-            with self.subTest(step=step_record["step"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp) / "run"
-                    self._build_run(root)
-                    metrics_path = root / "metrics.jsonl"
-                    records = [
-                        json.loads(line)
-                        for line in metrics_path.read_text(
-                            encoding="utf-8"
-                        ).splitlines()
-                    ]
-                    records.extend([step_record, step_record])
-                    metrics_path.write_text(
-                        "".join(
-                            json.dumps(record) + "\n"
-                            for record in records
-                        ),
-                        encoding="utf-8",
-                    )
-                    report = experiment.audit_run_directory(root)
-                    self.assertFalse(report["ok"])
-                    self.assertIn(
-                        expected_code,
-                        self._codes(report, "errors"),
-                    )
+            with (
+                self.subTest(step=step_record["step"]),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp) / "run"
+                self._build_run(root)
+                metrics_path = root / "metrics.jsonl"
+                records = [
+                    json.loads(line)
+                    for line in metrics_path.read_text(encoding="utf-8").splitlines()
+                ]
+                records.extend([step_record, step_record])
+                metrics_path.write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
+                report = experiment.audit_run_directory(root)
+                self.assertFalse(report["ok"])
+                self.assertIn(
+                    expected_code,
+                    self._codes(report, "errors"),
+                )
 
     def test_audit_detects_duplicate_test_ledger_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
             self._build_run(root)
-            entries = (
-                json.dumps({"out_dir": str(root.resolve())})
-                + "\n"
-            ) * 2
-            (root / "test_access_ledger.jsonl").write_text(
-                entries, encoding="utf-8"
-            )
+            entries = (json.dumps({"out_dir": str(root.resolve())}) + "\n") * 2
+            (root / "test_access_ledger.jsonl").write_text(entries, encoding="utf-8")
             report = experiment.audit_run_directory(root)
             self.assertFalse(report["ok"])
             self.assertIn(
@@ -734,7 +572,7 @@ class RunAuditTests(unittest.TestCase):
                 self._codes(report, "errors"),
             )
 
-            config, _, _ = self._build_run(
+            _, _, _ = self._build_run(
                 Path(tmp) / "allowed",
                 config_overrides={
                     "args": {
@@ -746,12 +584,7 @@ class RunAuditTests(unittest.TestCase):
             )
             allowed_root = Path(tmp) / "allowed"
             (allowed_root / "test_access_ledger.jsonl").write_text(
-                (
-                    json.dumps(
-                        {"out_dir": str(allowed_root.resolve())}
-                    )
-                    + "\n"
-                ) * 2,
+                (json.dumps({"out_dir": str(allowed_root.resolve())}) + "\n") * 2,
                 encoding="utf-8",
             )
             report = experiment.audit_run_directory(allowed_root)
@@ -767,19 +600,11 @@ class RunAuditTests(unittest.TestCase):
             _, identity, _ = self._build_run(root)
             metrics_path = root / "metrics.jsonl"
             records = [
-                json.loads(line)
-                for line in metrics_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()
             ]
-            records.append(
-                {"step": "test", **identity, "test_loss": 1.0}
-            )
+            records.append({"step": "test", **identity, "test_loss": 1.0})
             metrics_path.write_text(
-                "".join(
-                    json.dumps(record) + "\n"
-                    for record in records
-                ),
+                "".join(json.dumps(record) + "\n" for record in records),
                 encoding="utf-8",
             )
             (root / "test_access_ledger.jsonl").write_text(
@@ -796,12 +621,8 @@ class RunAuditTests(unittest.TestCase):
             )
             report = experiment.audit_run_directory(root)
             warning_codes = self._codes(report, "warnings")
-            self.assertIn(
-                "test_ledger_entry_missing", warning_codes
-            )
-            self.assertEqual(
-                report["checks"]["test_seal"]["ledger_matches"], 0
-            )
+            self.assertIn("test_ledger_entry_missing", warning_codes)
+            self.assertEqual(report["checks"]["test_seal"]["ledger_matches"], 0)
 
     def test_audit_detects_sanity_repeat_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -838,15 +659,9 @@ class RunAuditTests(unittest.TestCase):
             report = experiment.audit_run_directory(root)
             self.assertTrue(report["ok"], report)
             warning_codes = self._codes(report, "warnings")
-            self.assertIn(
-                "pythonhashseed_unset", warning_codes
-            )
-            self.assertIn(
-                "nondeterministic_algorithms", warning_codes
-            )
-            strict = experiment.audit_run_directory(
-                root, strict=True
-            )
+            self.assertIn("pythonhashseed_unset", warning_codes)
+            self.assertIn("nondeterministic_algorithms", warning_codes)
+            strict = experiment.audit_run_directory(root, strict=True)
             self.assertFalse(strict["ok"])
 
     def test_audit_checks_external_source_and_data_hashes(self):
@@ -864,9 +679,7 @@ class RunAuditTests(unittest.TestCase):
             )
             self.assertFalse(report["ok"])
             error_codes = self._codes(report, "errors")
-            self.assertIn(
-                "source_sha_mismatch", error_codes
-            )
+            self.assertIn("source_sha_mismatch", error_codes)
             self.assertIn("data_sha_mismatch", error_codes)
 
     def test_audit_detects_preregistration_edited_after_run(self):
@@ -889,9 +702,7 @@ class RunAuditTests(unittest.TestCase):
                 "seeds": [42, 43, 44],
                 "budget_match": "smelt",
                 "steps": 200,
-                "frozen_script_sha256": identity[
-                    "script_sha256"
-                ],
+                "frozen_script_sha256": identity["script_sha256"],
                 "data": {
                     "sha256": identity["data_sha256"],
                     "split_policy": "contiguous",
@@ -899,12 +710,8 @@ class RunAuditTests(unittest.TestCase):
                     "test_fraction": 0.1,
                 },
             }
-            prereg.write_text(
-                json.dumps(payload), encoding="utf-8"
-            )
-            _, prereg_sha = experiment.load_preregistration(
-                prereg
-            )
+            prereg.write_text(json.dumps(payload), encoding="utf-8")
+            _, prereg_sha = experiment.load_preregistration(prereg)
             config["preregistration"] = {
                 **{
                     key: payload[key]
@@ -927,18 +734,12 @@ class RunAuditTests(unittest.TestCase):
                 json.dumps(config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            report = experiment.audit_run_directory(
-                root, preregistration_path=prereg
-            )
+            report = experiment.audit_run_directory(root, preregistration_path=prereg)
             self.assertTrue(report["ok"], report)
 
             payload["min_effect"] = 0.5
-            prereg.write_text(
-                json.dumps(payload), encoding="utf-8"
-            )
-            report = experiment.audit_run_directory(
-                root, preregistration_path=prereg
-            )
+            prereg.write_text(json.dumps(payload), encoding="utf-8")
+            report = experiment.audit_run_directory(root, preregistration_path=prereg)
             self.assertFalse(report["ok"])
             self.assertIn(
                 "preregistration_sha_mismatch",
@@ -947,9 +748,7 @@ class RunAuditTests(unittest.TestCase):
 
     def test_audit_mode_requires_run_and_rejects_training(self):
         self.assertIsNotNone(
-            experiment.audit_mode_error(
-                argparse.Namespace(audit_report="report.json")
-            )
+            experiment.audit_mode_error(argparse.Namespace(audit_report="report.json"))
         )
         self.assertIsNotNone(
             experiment.audit_mode_error(
@@ -974,8 +773,4 @@ class RunAuditTests(unittest.TestCase):
                         )
                     )
                 )
-        self.assertIsNone(
-            experiment.audit_mode_error(
-                argparse.Namespace(audit_run="run")
-            )
-        )
+        self.assertIsNone(experiment.audit_mode_error(argparse.Namespace(audit_run="run")))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. Use the centralized seed function at the experiment
 # entry point instead (e.g., repro.set_all_seeds / seed_everything).
@@ -40,12 +41,7 @@ class _IsolatedNamespace(dict):
         return self._base[key]
 
     def __setitem__(self, key, value):
-        if (
-            self._loading
-            or key in self._owned
-            or key.startswith("__")
-            or key.startswith("_SC_")
-        ):
+        if self._loading or key in self._owned or key.startswith("__") or key.startswith("_SC_"):
             dict.__setitem__(self, key, value)
         else:
             # Explicit ``globals()[...] = ...`` writes must reach the module,

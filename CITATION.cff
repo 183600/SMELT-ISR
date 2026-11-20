@@ -1,0 +1,33 @@
+# 引用本软件的 CITATION.cff（https://citation-file-format.github.io/）
+# `version` 与 pyproject.toml 的 project.version 保持同步。
+cff-version: 1.2.0
+message: >-
+  如果本仓库对你的研究有帮助，请引用本软件及其基于的 SMELT 论文。
+title: SMELT-ISR
+subtitle: SMELT with Independent Second Round Routing (Delayed-Merge)
+type: software
+authors:
+  - alias: qwe12345678
+    name: SMELT-ISR Contributors
+version: 0.1.0
+date-released: "2026-11-20"
+license: MIT
+keywords:
+  - sparse mixture-of-experts
+  - MoE routing
+  - transformer
+  - reproducibility
+  - delayed merge
+abstract: >-
+  Delayed-merge routing experiments on the SMELT sparse MoE Transformer.
+  The repository provides controlled-variable comparisons, multi-seed
+  statistics with power analysis and equivalence testing, preregistration,
+  environment/run auditing, and artifact manifests for reproducible
+  research on sparse MoE routing mechanisms.
+preferred-citation:
+  type: article
+  title: SMELT (arXiv:2609.01343)
+  url: "https://arxiv.org/html/2609.01343v1"
+  notes: >-
+    本实现的口径基线；head 几何与专家中间维等未披露量按仓库
+    docs/paper_reproduction.md 的固定规则推导。

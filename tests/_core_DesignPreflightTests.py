@@ -15,7 +15,7 @@ class DesignPreflightTests(unittest.TestCase):
         self,
         corpus_sha: str,
         *,
-        compute_budget: dict = None,
+        compute_budget: dict | None = None,
     ) -> dict:
         data = {
             "sha256": corpus_sha,
@@ -32,11 +32,11 @@ class DesignPreflightTests(unittest.TestCase):
 
     def _plan_args(
         self,
-        corpus: Path = None,
-        prereg: dict = None,
+        corpus: Path | None = None,
+        prereg: dict | None = None,
         *,
         steps: int = 10,
-        pilot_runs: list = None,
+        pilot_runs: list | None = None,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             seeds=[1, 2, 3],
@@ -88,9 +88,7 @@ class DesignPreflightTests(unittest.TestCase):
             # train 切分 ≈ 80% → 16000 字节；每运行
             # 10×2×8=160 tokens → 0.01 epoch。
             self.assertEqual(data_file["estimated_train_bytes"], 16000)
-            self.assertAlmostEqual(
-                data_file["estimated_epochs_per_run"], 0.01
-            )
+            self.assertAlmostEqual(data_file["estimated_epochs_per_run"], 0.01)
             # 0.01 epoch 属 prototype 规模：应给出且仅给出
             # 「token 预算不足 1 个 epoch」的口径提示。
             self.assertEqual(len(data_file["warnings"]), 1)
@@ -118,14 +116,10 @@ class DesignPreflightTests(unittest.TestCase):
                 5,
                 self._plan_args(corpus, prereg),
             )
-            self.assertEqual(
-                design_first["plan_id"], design_again["plan_id"]
-            )
+            self.assertEqual(design_first["plan_id"], design_again["plan_id"])
             # 换语料 → 设计指纹必须改变（设计绑定语料身份）。
             corpus.write_bytes(b"cd" * 1000)
-            prereg_new = self._prereg_record(
-                hashlib.sha256(corpus.read_bytes()).hexdigest()
-            )
+            prereg_new = self._prereg_record(hashlib.sha256(corpus.read_bytes()).hexdigest())
             design_other = experiment.write_design_plan(
                 root / "plan3",
                 self._ordered_plan(),
@@ -133,9 +127,7 @@ class DesignPreflightTests(unittest.TestCase):
                 5,
                 self._plan_args(corpus, prereg_new),
             )
-            self.assertNotEqual(
-                design_first["plan_id"], design_other["plan_id"]
-            )
+            self.assertNotEqual(design_first["plan_id"], design_other["plan_id"])
 
     def test_data_preflight_rejects_sha_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,9 +173,7 @@ class DesignPreflightTests(unittest.TestCase):
             )
             data_file = design["training_budget"]["data_file"]
             self.assertFalse(data_file["available"])
-            self.assertEqual(
-                data_file["reason"], "data_path_not_provided"
-            )
+            self.assertEqual(data_file["reason"], "data_path_not_provided")
 
     def test_data_preflight_warns_on_multiple_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,13 +192,8 @@ class DesignPreflightTests(unittest.TestCase):
                 args,
             )
             data_file = design["training_budget"]["data_file"]
-            self.assertGreater(
-                data_file["estimated_epochs_per_run"], 1.0
-            )
-            self.assertTrue(
-                any("epoch" in warning for warning in
-                    data_file["warnings"])
-            )
+            self.assertGreater(data_file["estimated_epochs_per_run"], 1.0)
+            self.assertTrue(any("epoch" in warning for warning in data_file["warnings"]))
 
     def _write_pilot_with_efficiency(
         self,
@@ -240,18 +225,10 @@ class DesignPreflightTests(unittest.TestCase):
             sha = hashlib.sha256(corpus.read_bytes()).hexdigest()
             prereg = self._prereg_record(sha)
             pilots = [
-                self._write_pilot_with_efficiency(
-                    root / "pilots", "A", 11, 100.0
-                ),
-                self._write_pilot_with_efficiency(
-                    root / "pilots", "A", 12, 200.0
-                ),
-                self._write_pilot_with_efficiency(
-                    root / "pilots", "B", 11, 400.0
-                ),
-                self._write_pilot_with_efficiency(
-                    root / "pilots", "B", 12, 400.0
-                ),
+                self._write_pilot_with_efficiency(root / "pilots", "A", 11, 100.0),
+                self._write_pilot_with_efficiency(root / "pilots", "A", 12, 200.0),
+                self._write_pilot_with_efficiency(root / "pilots", "B", 11, 400.0),
+                self._write_pilot_with_efficiency(root / "pilots", "B", 12, 400.0),
             ]
             args = self._plan_args(
                 corpus,
@@ -272,12 +249,8 @@ class DesignPreflightTests(unittest.TestCase):
             self.assertEqual(wall_clock["uncovered_runs"], 0)
             per_mode = wall_clock["per_mode"]
             # 保守口径：每 mode 取试点观测的最大步耗时。
-            self.assertEqual(
-                per_mode["A"]["max_training_ms_per_step"], 200.0
-            )
-            self.assertEqual(
-                per_mode["B"]["max_training_ms_per_step"], 400.0
-            )
+            self.assertEqual(per_mode["A"]["max_training_ms_per_step"], 200.0)
+            self.assertEqual(per_mode["B"]["max_training_ms_per_step"], 400.0)
             self.assertEqual(per_mode["A"]["planned_runs"], 3)
             self.assertEqual(per_mode["B"]["planned_runs"], 3)
             # 1000 步 × 0.2s = 200s/运行（A）；×0.4s = 400s（B）。
@@ -322,16 +295,8 @@ class DesignPreflightTests(unittest.TestCase):
         self.assertIn("compute_budget", error)
         self.assertIn("--allow-over-compute-budget", error)
         # 显式豁免：放行并把承认写回设计对象。
-        self.assertIsNone(
-            experiment.design_budget_gate_error(
-                design, allow_over_budget=True
-            )
-        )
-        self.assertTrue(
-            design["training_budget"]["compute_budget"][
-                "acknowledged_over_budget"
-            ]
-        )
+        self.assertIsNone(experiment.design_budget_gate_error(design, allow_over_budget=True))
+        self.assertTrue(design["training_budget"]["compute_budget"]["acknowledged_over_budget"])
 
     def test_compute_budget_gate_passes_within_budget(self):
         design = {
@@ -344,9 +309,7 @@ class DesignPreflightTests(unittest.TestCase):
                 }
             }
         }
-        self.assertIsNone(
-            experiment.design_budget_gate_error(design)
-        )
+        self.assertIsNone(experiment.design_budget_gate_error(design))
 
     def test_compute_budget_gate_skips_missing_estimate(self):
         design = {
@@ -359,12 +322,8 @@ class DesignPreflightTests(unittest.TestCase):
                 }
             }
         }
-        self.assertIsNone(
-            experiment.design_budget_gate_error(design)
-        )
-        self.assertIsNone(
-            experiment.design_budget_gate_error({})
-        )
+        self.assertIsNone(experiment.design_budget_gate_error(design))
+        self.assertIsNone(experiment.design_budget_gate_error({}))
 
     def _prereg_payload(self, **overrides):
         payload = {
@@ -389,12 +348,8 @@ class DesignPreflightTests(unittest.TestCase):
         return payload
 
     def test_preregistration_schema_accepts_compute_budget(self):
-        payload = self._prereg_payload(
-            compute_budget={"max_total_training_hours": 72.0}
-        )
-        self.assertIsNone(
-            experiment.preregistration_schema_error(payload)
-        )
+        payload = self._prereg_payload(compute_budget={"max_total_training_hours": 72.0})
+        self.assertIsNone(experiment.preregistration_schema_error(payload))
 
     def test_preregistration_schema_rejects_bad_compute_budget(self):
         base_error = experiment.preregistration_schema_error
@@ -416,9 +371,7 @@ class DesignPreflightTests(unittest.TestCase):
         self.assertIn("必须是对象", error)
 
     def test_preregistration_record_carries_compute_budget(self):
-        payload = self._prereg_payload(
-            compute_budget={"max_total_training_hours": 48.0}
-        )
+        payload = self._prereg_payload(compute_budget={"max_total_training_hours": 48.0})
         args = argparse.Namespace(mode="A", seed=42, seeds=None)
         record = experiment.preregistration_record(
             payload, "preregistration.json", "c" * 64, [], args

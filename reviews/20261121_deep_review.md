@@ -1,4 +1,4 @@
-"""Independent deep code review — 2026-11-21
+# Independent deep code review — 2026-11-21
 
 Review scope:
   - Code correctness (bugs, edge cases, numerical safety)
@@ -29,4 +29,3 @@ Results:
 Conclusion: No new bugs or research methodology issues found.
 All previously identified issues (missing import, cleanup) have been
 correctly fixed in prior commits.
-"""

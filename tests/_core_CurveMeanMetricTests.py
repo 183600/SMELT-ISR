@@ -1,6 +1,7 @@
 from _core_support import *
 from _core_support import _load_experiment, _tiny_config
 
+
 class CurveMeanMetricTests(unittest.TestCase):
     """RQ1 收敛速度的曲线时均指标回归测试。"""
 
@@ -16,15 +17,15 @@ class CurveMeanMetricTests(unittest.TestCase):
     ):
         run_dir = Path(root) / name
         run_dir.mkdir()
-        with (run_dir / "metrics.jsonl").open(
-            "w", encoding="utf-8"
-        ) as handle:
+        with (run_dir / "metrics.jsonl").open("w", encoding="utf-8") as handle:
             for step, loss in points:
                 handle.write(
-                    json.dumps({
-                        "step": step,
-                        "val_loss": loss,
-                    })
+                    json.dumps(
+                        {
+                            "step": step,
+                            "val_loss": loss,
+                        }
+                    )
                     + "\n"
                 )
         row = {
@@ -63,12 +64,8 @@ class CurveMeanMetricTests(unittest.TestCase):
         self.assertEqual(report["end_step"], 30.0)
         self.assertEqual(report["end_rule"], "min_last_validation_step")
         self.assertTrue(report["end_data_dependent"])
-        self.assertAlmostEqual(
-            rows[0][experiment._CURVE_MEAN_METRIC], 2.25
-        )
-        self.assertAlmostEqual(
-            rows[1][experiment._CURVE_MEAN_METRIC], 2.5
-        )
+        self.assertAlmostEqual(rows[0][experiment._CURVE_MEAN_METRIC], 2.25)
+        self.assertAlmostEqual(rows[1][experiment._CURVE_MEAN_METRIC], 2.5)
         self.assertEqual(report["runs"][0]["trapezoid_segments"], 2)
         json.dumps(report, allow_nan=False)
 
@@ -86,20 +83,11 @@ class CurveMeanMetricTests(unittest.TestCase):
                     [(20, 3.0), (30, 2.0)],
                 ),
             ]
-            report = experiment.annotate_curve_metrics(
-                rows, target_step=25
-            )
-            values = [
-                row[experiment._CURVE_MEAN_METRIC]
-                for row in rows
-            ]
-            beyond = experiment.annotate_curve_metrics(
-                rows, target_step=35
-            )
+            report = experiment.annotate_curve_metrics(rows, target_step=25)
+            values = [row[experiment._CURVE_MEAN_METRIC] for row in rows]
+            beyond = experiment.annotate_curve_metrics(rows, target_step=35)
         self.assertTrue(report["ok"])
-        self.assertEqual(
-            report["end_rule"], "preregistered_fixed_step"
-        )
+        self.assertEqual(report["end_rule"], "preregistered_fixed_step")
         self.assertFalse(report["end_data_dependent"])
         self.assertAlmostEqual(values[0], 1.75)
         self.assertAlmostEqual(values[1], 2.75)
@@ -107,9 +95,7 @@ class CurveMeanMetricTests(unittest.TestCase):
         self.assertEqual(len(beyond["excluded_runs"]), 2)
         # 超出曲线范围的共同终点不能靠外推伪造指标。
         for row in rows:
-            self.assertNotIn(
-                experiment._CURVE_MEAN_METRIC, row
-            )
+            self.assertNotIn(experiment._CURVE_MEAN_METRIC, row)
 
     def test_failed_and_short_runs_are_excluded(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,15 +121,9 @@ class CurveMeanMetricTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["start_step"], 10.0)
         self.assertEqual(report["end_step"], 15.0)
-        self.assertAlmostEqual(
-            rows[0][experiment._CURVE_MEAN_METRIC], 3.5
-        )
-        self.assertAlmostEqual(
-            rows[2][experiment._CURVE_MEAN_METRIC], 4.5
-        )
-        self.assertNotIn(
-            experiment._CURVE_MEAN_METRIC, rows[1]
-        )
+        self.assertAlmostEqual(rows[0][experiment._CURVE_MEAN_METRIC], 3.5)
+        self.assertAlmostEqual(rows[2][experiment._CURVE_MEAN_METRIC], 4.5)
+        self.assertNotIn(experiment._CURVE_MEAN_METRIC, rows[1])
         self.assertEqual(
             [item["run"] for item in report["excluded_runs"]],
             ["b"],
@@ -160,9 +140,7 @@ class CurveMeanMetricTests(unittest.TestCase):
             ]
             report = experiment.annotate_curve_metrics(rows)
         self.assertTrue(report["ok"])
-        self.assertTrue(
-            math.isfinite(rows[0][experiment._CURVE_MEAN_METRIC])
-        )
+        self.assertTrue(math.isfinite(rows[0][experiment._CURVE_MEAN_METRIC]))
         json.dumps(report, allow_nan=False)
 
     def test_matched_flops_curve_skips_overflowed_cumulative(self):
@@ -170,32 +148,19 @@ class CurveMeanMetricTests(unittest.TestCase):
         # 为 inf；inf 不能成为曲线横坐标，否则共同计算量、
         # 倍率会变成 inf/NaN 并写出非法 JSON。
         with tempfile.TemporaryDirectory() as tmp:
-            huge = self._run(
-                tmp, "huge", [(10, 1.0), (20, 0.5)]
-            )
+            huge = self._run(tmp, "huge", [(10, 1.0), (20, 0.5)])
             huge["flops_per_forward"] = 1.0e308
-            normal = self._run(
-                tmp, "normal", [(10, 1.2), (20, 0.9)]
-            )
+            normal = self._run(tmp, "normal", [(10, 1.2), (20, 0.9)])
             normal["flops_per_forward"] = 1.0e3
             rows = [huge, normal]
-            report = experiment.annotate_compute_matched_metrics(
-                rows
-            )
+            report = experiment.annotate_compute_matched_metrics(rows)
         self.assertTrue(report["ok"])
         self.assertEqual(
             [item["run"] for item in report["runs"]],
             ["normal"],
         )
-        self.assertNotIn(
-            experiment._COMPUTE_MATCHED_METRIC, huge
-        )
-        self.assertTrue(
-            any(
-                item["run"] == "huge"
-                for item in report["excluded_runs"]
-            )
-        )
+        self.assertNotIn(experiment._COMPUTE_MATCHED_METRIC, huge)
+        self.assertTrue(any(item["run"] == "huge" for item in report["excluded_runs"]))
         json.dumps(report, allow_nan=False)
 
     def test_common_step_rejects_out_of_range_target(self):
@@ -207,19 +172,10 @@ class CurveMeanMetricTests(unittest.TestCase):
                     [(10, 4.0), (20, 2.0), (30, 1.0)],
                 )
             ]
-            report = experiment.annotate_common_step_metrics(
-                rows, target_step=10 ** 400
-            )
+            report = experiment.annotate_common_step_metrics(rows, target_step=10**400)
         self.assertFalse(report["ok"])
-        self.assertTrue(
-            any(
-                "有限正数" in advisory
-                for advisory in report["advisories"]
-            )
-        )
-        self.assertNotIn(
-            experiment._COMMON_STEP_METRIC, rows[0]
-        )
+        self.assertTrue(any("有限正数" in advisory for advisory in report["advisories"]))
+        self.assertNotIn(experiment._COMMON_STEP_METRIC, rows[0])
 
     def test_trapezoid_mean_rejects_unrepresentable_window(self):
         # 两端各自有限，但差值可溢出为 inf；此时不能把
@@ -277,15 +233,9 @@ class CurveMeanMetricTests(unittest.TestCase):
             experiment._CURVE_MEAN_METRIC,
             experiment._BASELINE_TUNING_METRIC_KEYS,
         )
-        self.assertFalse(
-            experiment.metric_higher_is_better(
-                experiment._CURVE_MEAN_METRIC
-            )
-        )
+        self.assertFalse(experiment.metric_higher_is_better(experiment._CURVE_MEAN_METRIC))
         self.assertEqual(
-            experiment._TRIVIAL_REFERENCE_FIELDS[
-                experiment._CURVE_MEAN_METRIC
-            ],
+            experiment._TRIVIAL_REFERENCE_FIELDS[experiment._CURVE_MEAN_METRIC],
             "unigram_loss",
         )
         self.assertIn(
@@ -294,9 +244,7 @@ class CurveMeanMetricTests(unittest.TestCase):
         )
         self.assertIn(
             experiment._CURVE_MEAN_METRIC,
-            experiment._hypothesis_supported_metrics(
-                "convergence"
-            ),
+            experiment._hypothesis_supported_metrics("convergence"),
         )
         self.assertIn(
             experiment._CURVE_MEAN_METRIC,
