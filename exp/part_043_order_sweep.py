@@ -504,7 +504,7 @@ _GAMMA_TEMME_C1 = (
 
 def _gamma_parts_temme(a: float, x: float) -> Tuple[float, float]:
     delta = x - a
-    if delta == 0.0:
+    if abs(delta) < 1e-12:
         eta = 0.0
     else:
         mu = delta / a

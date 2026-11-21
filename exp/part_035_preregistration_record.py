@@ -965,7 +965,7 @@ def hypothesis_alignment(
         conflict = direction == "decrease" and delta > 0.0 or (
             direction == "increase" and delta < 0.0
         )
-        if delta == 0.0:
+        if abs(delta) < 1e-12:
             status = "no_effect_observed"
         elif conflict:
             status = (
