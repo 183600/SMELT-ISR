@@ -30,10 +30,10 @@ SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Trans
 - `A` / `B`：延迟合并方案（局部 / 全局）。
 - 以及配套的机制对照 `local_base`、`local_base_k2`、`B_early` 与稠密基线 `dense`。
 
-**默认配置为小规模原型。** 复现论文附录 A 的网格单元，请使用
+**默认配置为小规模原型。** 若需复现论文附录 A 的网格单元，请使用
 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
-（详见「论文口径与复现边界」）；`config.json` 的 `paper_fidelity` 会逐项报告
-`architecture_faithful` / `protocol_faithful` / `budget_audit`。
+（详见「论文口径与复现边界」）。`config.json` 的 `paper_fidelity` 会逐项报告
+`architecture_faithful`、`protocol_faithful` 与 `budget_audit`。
 
 原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
 

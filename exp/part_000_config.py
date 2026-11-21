@@ -230,7 +230,7 @@ class Config:
         ):
             raise ValueError(f"未知 mode: {self.mode}")
 
-        def _positive_int(name: str, value: object) -> None:
+        def _check_positive_int(name: str, value: object) -> None:
             if (
                 isinstance(value, bool)
                 or not isinstance(value, int)
@@ -238,7 +238,7 @@ class Config:
             ):
                 raise ValueError(f"{name} 必须为正整数")
 
-        for _name, _value in (
+        for name, value in (
             ("vocab_size", self.vocab_size),
             ("seq_len", self.seq_len),
             ("d_model", self.d_model),
@@ -250,8 +250,8 @@ class Config:
             ("k1", self.k1),
             ("k2", self.k2),
         ):
-            _positive_int(_name, _value)
-        _positive_int(
+            _check_positive_int(name, value)
+        _check_positive_int(
             "n_kv_heads",
             self.effective_n_kv_heads,
         )
@@ -279,7 +279,7 @@ class Config:
             raise ValueError("k1 必须满足 1 <= k1 <= n_experts")
         if not 1 <= self.k2 <= self.n_experts:
             raise ValueError("k2 必须满足 1 <= k2 <= n_experts")
-        def _finite_nonnegative(name: str, value: object) -> None:
+        def _check_finite_nonnegative(name: str, value: object) -> None:
             if isinstance(value, bool):
                 raise ValueError(f"{name} 必须是有限非负数")
             try:
@@ -292,8 +292,8 @@ class Config:
             if not finite or negative:
                 raise ValueError(f"{name} 必须是有限非负数")
 
-        _finite_nonnegative("balance_coef", self.balance_coef)
-        _finite_nonnegative("residual_scale", self.residual_scale)
+        _check_finite_nonnegative("balance_coef", self.balance_coef)
+        _check_finite_nonnegative("residual_scale", self.residual_scale)
         if (
             not isinstance(self.residual_scaling, str)
             or self.residual_scaling not in self.RESIDUAL_SCALINGS

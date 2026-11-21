@@ -31,7 +31,7 @@ The repository provides the following baselines and schemes:
 
 **Default configuration is a small-scale prototype.** To reproduce a grid cell from the paper's Appendix A, use
 `--paper-cell 200M:95 --paper-arch smelt --paper-protocol`
-(see "Paper reproduction"); `config.json`'s `paper_fidelity` reports `architecture_faithful`, `protocol_faithful` and `budget_audit` item by item.
+(see "Paper reproduction"). `config.json`'s `paper_fidelity` reports `architecture_faithful`, `protocol_faithful` and `budget_audit` item by item.
 
 In the original SMELT, expert outputs of each MoE round are merged immediately while the middle layers loop. This project proposes a **delayed-merge** mechanism:
 
