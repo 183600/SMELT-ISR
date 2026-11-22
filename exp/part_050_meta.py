@@ -278,15 +278,19 @@ def meta_analyze(
     se_random = math.sqrt(1.0 / total_weight_random)
     i_squared = max(0.0, (q_value - df) / q_value) if q_value > 0 else 0.0
     h_squared = q_value / df if df > 0 else float("inf")
-    z_random = (
+    t_random = (
         theta_random / se_random if se_random > 0 else None
     )
     t_critical = _meta_t_critical_975(df)
     prediction_half_width = t_critical * math.sqrt(
         se_random * se_random + tau_squared
     )
-    if z_random is not None:
-        pooled_p_two_sided = 2.0 * _meta_normal_sf(abs(z_random))
+    # 随机效应汇总的置信区间和 p 值使用 t 分布（df = k−1）而非正态近似。
+    # 正态近似在套件数较少时严重低估不确定性（如 k=3 时 z_{0.975}=1.96
+    # 而 t_{0.975,2}=4.30），导致置信区间过窄、p 值偏小、假阳性率膨胀。
+    # 参见 Hartung & Knapp (2001), IntHout et al. (2014)。
+    if t_random is not None and df >= 1:
+        pooled_p_two_sided = 2.0 * _meta_student_t_sf(abs(t_random), df)
     else:
         pooled_p_two_sided = None
     return {
@@ -305,9 +309,9 @@ def meta_analyze(
         "random_dl": {
             "estimate": theta_random,
             "se": se_random,
-            "ci95_low": theta_random - _META_Z_975 * se_random,
-            "ci95_high": theta_random + _META_Z_975 * se_random,
-            "z": z_random,
+            "ci95_low": theta_random - t_critical * se_random,
+            "ci95_high": theta_random + t_critical * se_random,
+            "t": t_random,
             "p_value_two_sided": pooled_p_two_sided,
             "tau_squared": tau_squared,
             "tau": math.sqrt(tau_squared),
