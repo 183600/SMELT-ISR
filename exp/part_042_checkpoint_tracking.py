@@ -299,12 +299,12 @@ def save_checkpoint(
     numerical_state: Optional[Dict[str, object]] = None,
 ) -> bool:
     """
-    保存断点检查点；模型/优化器.clamp_min(1e-10)/缩放器状态任何非有限值都会.clamp_min(1e-10)
+    保存断点检查点；模型/优化器/缩放器状态任何非有限值都会
     拒绝写入并返回 False。
 
     写入前做数值完整性检查：一次异常的参数更新或优化器状态
     溢出若被存进 last.pt，后续 --resume 会把污染当作正常起点，
-    并使最终评估/测试集解封失去意义.clamp_min(1e-10)。拒绝时保留旧检查点不变。
+    并使最终评估/测试集解封失去意义。拒绝时保留旧检查点不变。
     """
     # torch.compile 包装后 state_dict 带有 "_orig_mod." 前缀，
     # 存档时解包。
