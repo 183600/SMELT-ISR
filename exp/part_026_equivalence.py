@@ -161,19 +161,18 @@ def _tost_test(
     if cdf_upper is None:
         return {}
 
+    # Upper test: H0: θ ≥ +margin; p_upper = P(T ≤ t_upper) = CDF(t_upper).
     p_upper = cdf_upper
-    if t_lower >= 0.0:
-        two_sided_lower = _two_sided_t_p_value(
-            t_lower, df_value
-        )
-        if two_sided_lower is None:
-            return {}
-        p_lower = two_sided_lower / 2.0
-    else:
-        cdf_lower = _t_cdf(t_lower, df_value)
-        if cdf_lower is None:
-            return {}
-        p_lower = 1.0 - cdf_lower
+    # Lower test: H0: θ ≤ −margin; p_lower = P(T ≥ t_lower) = 1 − CDF(t_lower).
+    # [FIX] Previously computed the lower tail (CDF) instead of the upper tail
+    # (1 − CDF), which inverted the lower-bound p-value and prevented TOST
+    # from ever declaring equivalence in the typical case where the effect
+    # is near zero and well within the margin.  Cross-validated against
+    # lega-attention/lega/equivalence.py _one_sided_upper(t_low, df).
+    cdf_lower = _t_cdf(t_lower, df_value)
+    if cdf_lower is None:
+        return {}
+    p_lower = 1.0 - cdf_lower
     return {
         "tost_p_lower": p_lower,
         "tost_p_upper": p_upper,
