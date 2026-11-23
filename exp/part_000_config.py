@@ -1023,7 +1023,7 @@ def _paper_smelt_head_geometry(
     """SMELT 的 head 几何：以论文报告的 KV 比例为第一目标。
 
     在 H 的整除 head 划分与 1..n_heads 的 KV 头数中搜索，优先
-    最小化 ``|kv_dim / target - 1|``，其次让 head_dim 接近 64。
+    最小化 ``|kv_dim / max(target - 1, 1)|``，其次让 head_dim 接近 64。
     不强制 n_heads 整除 n_kv_heads：论文没有披露 head 几何，
     预算匹配需要任意 GQA 比例（见 CausalSelfAttention.core 的
     均匀映射）。

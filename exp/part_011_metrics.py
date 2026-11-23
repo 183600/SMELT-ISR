@@ -514,7 +514,7 @@ def class_balanced_loss_metrics(
     sums = class_loss_sums.to(torch.float64)
     present = counts > 0.0
 
-    chance = math.log(float(vocab_size))
+    chance = math.log(max(float(vocab_size, 1e-10)))
 
     if not bool(present.any()):
         return {

@@ -754,7 +754,7 @@ def _log_gamma_ratio_stirling(z: float, delta: float) -> float:
     """log Γ(z+δ)-log Γ(z)，用于大 z 且 0 ≤ δ ≤ z。"""
     return (
         (z + delta - 0.5) * math.log1p(delta / z)
-        + delta * math.log(z)
+        + delta * math.log(max(z, 1e-10))
         - delta
         + _stirling_log_gamma_correction(z + delta)
         - _stirling_log_gamma_correction(z)
@@ -790,7 +790,7 @@ def _log_beta_front(a: float, b: float) -> float:
         if 1 <= b <= 1024.0 and b == int(b):
             return (
                 math.fsum(
-                    math.log(a + index)
+                    math.log(max(a + index, 1e-10))
                     for index in range(int(b))
                 )
                 - math.lgamma(b)
@@ -798,7 +798,7 @@ def _log_beta_front(a: float, b: float) -> float:
         if 1 <= a <= 1024.0 and a == int(a):
             return (
                 math.fsum(
-                    math.log(b + index)
+                    math.log(max(b + index, 1e-10))
                     for index in range(int(a))
                 )
                 - math.lgamma(a)
@@ -838,7 +838,7 @@ def _regularized_incomplete_beta(
         return 1.0
 
     log_beta = _log_beta_front(a, b)
-    log_x = math.log(x)
+    log_x = math.log(max(x, 1e-10))
     log_front = log_beta + a * log_x + b * math.log1p(-x)
     if log_front < -745.0:
         front = 0.0
@@ -936,7 +936,7 @@ def _two_sided_t_p_value(t: float, df: float) -> Optional[float]:
             - math.lgamma(a)
             - math.lgamma(0.5)
         )
-        log_p = log_beta + a * log_x - math.log(a)
+        log_p = log_beta + a * log_x - math.log(max(a, 1e-10))
         if log_p >= 0.0:
             return 1.0
         if log_p < -745.0:
