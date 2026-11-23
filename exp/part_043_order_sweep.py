@@ -589,7 +589,7 @@ def _regularized_incomplete_gamma_parts(
         return 0.0, 1.0
     if a >= _GAMMA_TEMME_MIN_A:
         return _gamma_parts_temme(a, x)
-    log_prefactor = -x + a * math.log(max(x, 1e-10)) - math.lgamma(a)
+    log_prefactor = -x + a * math.log(x) - math.lgamma(a)
     if x < a + 1.0:
         term = 1.0 / a
         total = term

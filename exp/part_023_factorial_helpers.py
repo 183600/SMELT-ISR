@@ -838,7 +838,11 @@ def _regularized_incomplete_beta(
         return 1.0
 
     log_beta = _log_beta_front(a, b)
-    log_x = math.log(max(x, 1e-10))
+    # x∈(0,1) 已由前两端的早期返回保证，不可再对 x 做 1e-10 下限截断：
+    # 极小上尾（如 df=0.5、t≈4.24e7 时 x≈2.78e-16）会被截断后导致
+    # log_x 相对误差放大，进而把上尾高估数十倍；极小 x 下的对数
+    # 下溢由 log_front<-745 的 front=0 分支兜底。
+    log_x = math.log(x)
     log_front = log_beta + a * log_x + b * math.log1p(-x)
     if log_front < -745.0:
         front = 0.0
