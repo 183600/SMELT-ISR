@@ -1572,6 +1572,7 @@ def _cliffs_delta_bootstrap_ci(
         return {"available": False, "reason": "unrepresentable_bounds"}
     return {
         "available": True,
+        "point": point,
         "low": low,
         "high": high,
         "replicates": replicates,
