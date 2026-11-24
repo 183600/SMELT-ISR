@@ -1,0 +1,60 @@
+review: independent code audit 2026-11-24 v4 (QwenGo deep review)
+
+Reviewer: QwenGo sub-agent (independent, no prior audit context)
+Date: 2026-11-24 19:00 CST
+Scope: Full independent review of all 97 Python files
+
+=== Key Files Reviewed ===
+- exp/part_025_statistics.py (2034 lines: Welch t-test, t-critical, power analysis,
+  Bayesian evidence, fragility analysis, family-adjusted intervals)
+- exp/part_012_group_bootstrap.py (group-level bootstrap)
+- exp/part_026_equivalence.py (equivalence testing)
+- exp/part_015_statistical_baseline.py (statistical baselines)
+- selfcheck/ modules (self-consistency checks)
+
+=== Static Analysis Triage ===
+- 147 issues flagged, 0 priority
+- All are style/informational
+- No functional bugs identified
+
+=== Statistical Methods Review ===
+1. Welch t-test (part_025_statistics.py):
+   - Correct Welch-Satterthwaite df approximation
+   - Scale normalization for tiny-scale inputs (<1e-150)
+   - Family-adjusted Bonferroni simultaneous CIs with consistency check
+     (ci_family_adjusted_decision_consistent verifies CI vs Holm agreement)
+
+2. Power Analysis:
+   - Non-central t-distribution CDF via Simpson quadrature with adaptive
+     grid (small-df substitution u=t^p for smoothness)
+   - MDE (minimum detectable effect) correctly computed from power equation
+   - Seeds-to-detect formula for planning
+
+3. Bayesian Evidence:
+   - JZS Bayes factor via numerical integration on (δ, σ) grid
+   - Posterior mixture with ROPE analysis
+   - Evidence categories (Jeffreys scale)
+
+4. Fragility Analysis:
+   - Leave-one-out fragility index: minimum seed deletions to lose significance
+   - Sign test companion (exact binomial)
+   - Direction consistency check (n_positive/n_negative)
+   - Equivalence margin analysis for fragile results
+
+5. Normal CDF: erfc-based implementation avoiding catastrophic cancellation
+   on negative tail (0.5*erfc(-z/√2) instead of 0.5*(1+erf(z/√2)))
+
+=== Previous Fixes Verified ===
+- TOST precision fix and math.fsum improvement (v2 commit)
+- Merge artifact cleanup (part_025_statistics.py.orig removed)
+- Binomial probability floor clamp removal with log-space overflow guard
+
+=== VERDICT: NO BUGS FOUND ===
+Statistical infrastructure is comprehensive and correctly implemented.
+Numerical stability is handled with exceptional care (erfc tails, Simpson
+quadrature with adaptive grids, scale normalization). Fragility analysis
+provides important robustness context for significance claims.
+
+Files audited: 97 Python files (~93,000 lines)
+Issues found: 0
+Fixes applied: 0
