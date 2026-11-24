@@ -826,18 +826,49 @@ def _binomial_lower_tail_probability(
         return 1.0
     if probability >= 1.0:
         return 0.0 if failures < trials else 1.0
-    log_p = math.log(max(probability, 1e-10))
+    # probability > 0 已由上一行保证，直接用 math.log(probability)
+    # 而非 max(probability, 1e-10)：后者会把 1e-15 量级的小概率
+    # 截断到 1e-10，使 log_p 被高估约 12 个单位，CDF 计算完全失真。
+    log_p = math.log(probability)
     log_q = math.log1p(-probability)
     log_term = trials * log_q
-    total = math.exp(log_term) if log_term > -745.0 else 0.0
+    # 当 trials * probability 很大时，个别 PMF 项的 log 可能超过 709
+    # （math.exp 上限），直接 exp() 会溢出。切换到 log-space 累加器
+    # （log-sum-exp 技巧），保证 CDF 在任意参数下都能正确比较大小。
+    if log_term > 709.0:
+        log_total = log_term
+    else:
+        log_total = log_term if log_term > -745.0 else None
+        total = math.exp(log_term) if log_term > -745.0 else 0.0
     for successes in range(1, failures + 1):
         log_term += (
             math.log(max((trials - successes + 1, 1e-10)) / successes)
             + log_p
             - log_q
         )
-        if log_term > -745.0:
-            total += math.exp(log_term)
+        if log_total is None:
+            # 累加器仍在常规浮点域
+            if log_term > 709.0:
+                # 溢出：切换到 log-space
+                log_total = log_term
+            elif log_term > -745.0:
+                total += math.exp(log_term)
+        else:
+            # 累加器已在 log-space
+            if log_term > -745.0:
+                shift = log_term - log_total
+                if shift > 0:
+                    log_total = log_term + math.log1p(math.exp(-shift))
+                else:
+                    log_total = log_total + math.log1p(math.exp(shift))
+    if log_total is not None:
+        # 从 log-space 转回概率值
+        if log_total > 709.0:
+            total = float("inf")
+        elif log_total > -745.0:
+            total = math.exp(log_total)
+        else:
+            total = 0.0
     return min(1.0, max(0.0, total))
 
 
