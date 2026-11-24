@@ -317,7 +317,7 @@ _T_POWER_MIN_INTERVALS = 800
 # 常用功效计算。
 _T_POWER_SMALL_DF_MIN_INTERVALS = 1600
 
-_T_POWER_MAX_INTERVALS = 4000
+_T_POWER_MAX_INTERVALS = 8000
 
 # df 达到该量级时，固定 u 网格上的 Simpson 会因 chi 密度
 # 宽约 1/√2 而节点不足；非中心 t 也已充分接近正态极限。

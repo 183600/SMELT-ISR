@@ -881,8 +881,15 @@ def _t_power_small_df_large_scale(
             + _normal_cdf(noncentrality - w)
         )
 
-    total = 0.0
-    intervals = _T_POWER_MIN_INTERVALS
+    terms = []
+    # Use higher resolution for df < 1.0 where the chi density singularity
+    # at u=0 (g(u) ~ u^{df-1}) requires more intervals to resolve;
+    # increased from _T_POWER_SMALL_DF_MIN_INTERVALS (1600) to provide
+    # sufficient precision for tiny-alpha cases.
+    if df_value < 1.0:
+        intervals = _T_POWER_MAX_INTERVALS  # 4000, for better resolution
+    else:
+        intervals = _T_POWER_MIN_INTERVALS
     step = 1.0 / intervals
     for index in range(intervals + 1):
         t = index * step
@@ -911,7 +918,7 @@ def _t_power_small_df_large_scale(
             + math.log(max(factor, 1e-10))
         )
         if log_weight > -745.0:
-            total += math.exp(log_weight)
+            terms.append(math.exp(log_weight))
 
     u_max = (
         math.sqrt(df_value - 1.0) + _T_POWER_TAIL
@@ -957,7 +964,8 @@ def _t_power_small_df_large_scale(
                 + math.log(max(factor, 1e-10))
             )
             if log_weight > -745.0:
-                total += math.exp(log_weight)
+                terms.append(math.exp(log_weight))
+    total = math.fsum(terms)
     return min(1.0, max(0.0, total))
 
 
