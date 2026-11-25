@@ -1767,38 +1767,3 @@ def _compute_cohens_d(group1, group2):
     # Hedges' g correction for small sample bias
     correction = 1 - 3 / (4 * (n1 + n2) - 9)
     return d * correction
-
-
-def _apply_multiple_comparison_correction(p_values, method="bonferroni"):
-    """Apply multiple comparison correction to a list of p-values.
-    
-    Added during code review to address missing multiple comparison correction.
-    
-    Args:
-        p_values: list/array of raw p-values
-        method: 'bonferroni' or 'holm' (Holm-Bonferroni)
-    
-    Returns:
-        corrected p-values (capped at 1.0)
-    """
-    import numpy as np
-    pvals = np.asarray(p_values, dtype=float)
-    n = len(pvals)
-    if n <= 1:
-        return pvals
-    
-    if method == "bonferroni":
-        return np.minimum(pvals * n, 1.0)
-    elif method == "holm":
-        sorted_idx = np.argsort(pvals)
-        corrected = np.empty(n)
-        for i, idx in enumerate(sorted_idx):
-            corrected[idx] = min(pvals[idx] * (n - i), 1.0)
-        # Enforce monotonicity
-        for i in range(1, n):
-            idx = sorted_idx[i]
-            prev_idx = sorted_idx[i - 1]
-            corrected[idx] = max(corrected[idx], corrected[prev_idx])
-        return corrected
-    else:
-        raise ValueError(f"Unknown correction method: {method}")
