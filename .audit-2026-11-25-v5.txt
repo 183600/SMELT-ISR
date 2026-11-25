@@ -1,0 +1,37 @@
+Independent Code Audit 2026-11-25 v5 (QwenGo)
+========================================================
+
+Repository: SMELT-ISR
+Audit Date: 2026-11-25
+Auditor: QwenGo (qwen3.7-max)
+
+Scope:
+- Full Python source review (all .py files)
+- Statistical method correctness
+- Numerical stability analysis
+- Evaluation protocol validation
+- Attention mechanism implementation review
+
+Findings:
+- NO NEW BUGS FOUND
+- All statistical tests properly implemented with correct guards
+- Numerical stability guards present in all log/exp operations
+- Evaluation functions properly use torch.inference_mode()/torch.no_grad()
+- Multiple comparison corrections properly applied where needed
+- Bootstrap CI implementations correct (stratified, percentile method)
+- Causal masking correctly implemented in attention modules
+- No data leakage patterns detected
+
+Static Analysis Follow-up:
+- curves.py p-value flag: CONFIRMED FALSE POSITIVE (no p-value computation in file)
+- softmax dim flags: FALSE POSITIVE (dim passed as positional argument)
+- math.log guard flags: ALL GUARDED (early returns or max() guards present)
+
+Methodology Review:
+- Statistical test selection appropriate for each use case
+- Bootstrap resampling respects stratification structure
+- Bayesian computations numerically stable (log-sum-exp trick used)
+- Multiple comparison corrections (Holm/BH/Bonferroni) applied correctly
+- Paired test implementations correct (matching by seed)
+
+Conclusion: Code is scientifically sound and production-ready.
