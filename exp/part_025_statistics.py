@@ -900,6 +900,8 @@ def _t_power_small_df_large_scale(
         else:
             simpson = 4.0 * step / 3.0
         if t <= 0.0:
+            # Integrand is 0 at t=0 for df>0 (exponent*df-1 > 0 after transform);
+            # include the endpoint with weight 0 to keep Simpson's rule correct.
             continue
         log_w = exponent * math.log(max(t, 1e-10))
         log_u = log_w - log_scale
@@ -940,6 +942,7 @@ def _t_power_small_df_large_scale(
         if intervals % 2:
             intervals += 1
         step = (w_max - 1.0) / max(intervals, 1)  # guard against zero intervals
+        log_w_max = math.log(w_max)
         for index in range(intervals + 1):
             w = 1.0 + index * step
             if index == 0 or index == intervals:
@@ -948,18 +951,16 @@ def _t_power_small_df_large_scale(
                 simpson = 2.0 * step / 3.0
             else:
                 simpson = 4.0 * step / 3.0
-            u = w / scale
-            if u <= 0.0:
-                continue
             factor = _power_factor(w)
             if factor <= 0.0:
                 continue
-            log_u = math.log(max(u, 1e-10))
+            # Compute log_u in log space to avoid underflow when scale is huge
+            log_u = math.log(w) - log_scale
             log_weight = (
                 math.log(max(simpson, 1e-10))
                 + log_const
                 + (df_value - 1.0) * log_u
-                - u * u / 2.0
+                - math.exp(2.0 * log_u) / 2.0
                 - log_scale
                 + math.log(max(factor, 1e-10))
             )
@@ -1092,24 +1093,22 @@ def _t_power(
         total = 0.0
         for index in range(intervals + 1):
             w = index * step
-            u = w / scale
             if index == 0 or index == intervals:
                 simpson = step / 3.0
             elif index % 2 == 0:
                 simpson = 2.0 * step / 3.0
             else:
                 simpson = 4.0 * step / 3.0
-            if u <= 0.0:
-                density = (
-                    math.sqrt(2.0 / math.pi)
-                    if df_value == 1.0
-                    else 0.0
-                )
+            if w <= 0.0:
+                # w=0 corresponds to u=0; density is 0 for df>=3
+                density = 0.0
             else:
+                # Compute log_u in log space to avoid underflow when scale is huge
+                log_u = math.log(w) - log_scale
                 density = math.exp(
                     log_const
-                    + (df_value - 1.0) * math.log(max(u, 1e-10))
-                    - u * u / 2.0
+                    + (df_value - 1.0) * log_u
+                    - math.exp(2.0 * log_u) / 2.0
                 )
             total += (
                 simpson
