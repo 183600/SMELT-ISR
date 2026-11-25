@@ -164,14 +164,9 @@ def _tost_test(
     # Upper test: H0: θ ≥ +margin; p_upper = P(T ≤ t_upper) = CDF(t_upper).
     p_upper = cdf_upper
     # Lower test: H0: θ ≤ −margin; p_lower = P(T ≥ t_lower) = 1 − CDF(t_lower).
-    # [FIX] Previously computed the lower tail (CDF) instead of the upper tail
-    # (1 − CDF), which inverted the lower-bound p-value and prevented TOST
-    # from ever declaring equivalence in the typical case where the effect
-    # is near zero and well within the margin.  Cross-validated against
-    # lega-attention/lega/equivalence.py _one_sided_upper(t_low, df).
-    # Compute lower tail p-value directly via regularized incomplete beta
-    # to avoid 1.0 - CDF precision loss when CDF is very close to 1 (e.g.
-    # t large, df moderate, alpha tiny: 1.0 - 5e-17 rounds to 1.0 in float64).
+    # _two_sided_t_p_value(t, df) returns P(|T| >= |t|).
+    # For t_lower >= 0: P(T >= t_lower) = two_sided / 2.
+    # For t_lower < 0: P(T >= t_lower) = 1 - CDF(t_lower) = 1 - two_sided / 2.
     two_sided = _two_sided_t_p_value(t_lower, df_value)
     if two_sided is None:
         cdf_lower = _t_cdf(t_lower, df_value)
@@ -179,7 +174,10 @@ def _tost_test(
             return {}
         p_lower = 1.0 - cdf_lower
     else:
-        p_lower = two_sided / 2.0
+        if t_lower >= 0.0:
+            p_lower = two_sided / 2.0
+        else:
+            p_lower = 1.0 - two_sided / 2.0
     return {
         "tost_p_lower": p_lower,
         "tost_p_upper": p_upper,
