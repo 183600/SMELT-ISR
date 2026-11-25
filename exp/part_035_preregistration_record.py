@@ -1845,3 +1845,22 @@ def print_preregistration_analysis_coverage(
             "  OK：分析集合覆盖预注册的全部对比、种子单元与"
             "数据/指标/基线/共同步数/等价界"
         )
+
+
+def _compute_cohens_d(group1, group2):
+    """Compute Cohen's d effect size with Hedges' g correction for small samples.
+    
+    Added during code review to complement significance testing with effect size reporting.
+    """
+    import numpy as np
+    n1, n2 = len(group1), len(group2)
+    if n1 < 2 or n2 < 2:
+        return 0.0
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    if pooled_std < 1e-12:
+        return 0.0
+    d = (np.mean(group1) - np.mean(group2)) / pooled_std
+    # Hedges' g correction for small sample bias
+    correction = 1 - 3 / (4 * (n1 + n2) - 9)
+    return d * correction

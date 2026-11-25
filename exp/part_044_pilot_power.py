@@ -1607,7 +1607,7 @@ def plan_pilot_size(
       的 UCB 会不会把设计推到种子不够」。
     - 脱落率判据（``attrition_planning``）：每单元 n 个运行、
       观测失败数按声明脱落率的保守上取整时，Clopper-Pearson
-      精确上界折算后的启动种子数 ``ceil(required / (1-ucb))``
+      精确上界折算后的启动种子数 ``ceil(required / max(1 - ucb, 1e-12))``
       不得超过计划启动种子数。计划没有预留脱落余量时判据
       不可满足，如实报告而不是放宽公式。
 
@@ -1744,7 +1744,7 @@ def plan_pilot_size(
         "ucb 是「每单元 n 个运行、失败数按声明脱落率保守上"
         "取整」时 Clopper-Pearson 精确单侧上界；"
         "implied_required_seeds_with_attrition 按 "
-        "ceil(required / (1 - ucb)) 折算"
+        "ceil(required / max(1 - ucb, 1e-12)) 折算"
     )
     if required_at_declared is None:
         attrition_note = (
