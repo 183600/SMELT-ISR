@@ -1,46 +1,62 @@
-# Independent Code Audit — 2026-11-26
+# Code Review Report - 2026-11-26
 
-**Repository:** SMELT-ISR  
-**Auditor:** QwenGo (qwen3.7-max)  
-**Date:** 2026-11-26  
-**Method:** Full source review + py_compile + grep-based pattern scanning + manual inspection
+## 审查范围
 
----
+核心模块：`experiment.py`、`exp/__init__.py`、`exp/part_003_model.py`（MoE 路由与延迟合并）、`exp/part_013_evaluation.py`
 
-## Scope
+## 审查结果
 
-- All Python source files under `exp/` (50+ modules, ~69,000 lines)
-- Experiment pipeline (part_000 through part_051)
-- Statistical inference (part_025_statistics, part_026_equivalence)
-- Evaluation protocol (part_013_evaluation, part_017_bad_cases)
-- Routing analysis (part_018_routing)
-- Ablation design (part_029_ablation, part_031_ablation_coverage)
-- Preregistration (part_033 through part_035)
+### 总体评价：代码质量优秀，延迟合并机制设计严谨
 
-## Checks Performed
+本次审查聚焦于：
+1. SMELT 循环架构与延迟合并方案 (A/B) 的正确性
+2. 机制对照（local_base、local_base_k2、B_early、dense）的控变量设计
+3. 统计可靠性（多种子、MDE、TOST 等价性检验）
+4. 消融完整性检查
+5. 可复现性保障
 
-| Check | Result |
-|-------|--------|
-| Syntax (py_compile on 8 core files) | ✅ All pass |
-| Unguarded math.log / division-by-zero | ✅ All guarded |
-| Bare except clauses | ✅ None found |
-| Mutable default function arguments | ✅ None found |
-| TOST lower p-value fix (commit f32b878) | ✅ Correctly applied |
-| Incomplete beta function (continued fraction) | ✅ Correct with overflow handling |
-| Student-t CDF edge cases (t² overflow) | ✅ Handled via small-x expansion |
-| Cohen's d + Hedges' g | ✅ Correct (cross-validated) |
-| Evaluation torch.no_grad | ✅ @torch.inference_mode decorator applied |
-| Data integrity (SHA-256, seed overlap) | ✅ Enforced |
+### 详细发现
 
-## Findings
+#### 1. 延迟合并方案 — 设计严谨 ✓
 
-**No bugs or scientific method issues found.**
+- 方案 A（局部延迟合并）：同一 MoE 层内保持专家分支独立，第二阶段后合并
+- 方案 B（全局延迟合并）：第一轮产生独立分支后，整个中间 Transformer Block 保持独立
+- 等价性验证：`k=1` 时方案 B 与 SMELT 等价 — 内置自测验证
+- 信息隔离测试：分支间的梯度流在第二轮路由前被正确隔离
 
-Key observations:
-1. The TOST lower p-value bug (previously fixed in commit f32b878) is correctly in place: `p_lower = two_sided / 2` when `t_lower >= 0`, and `1 - two_sided / 2` when `t_lower < 0`.
-2. The `_regularized_incomplete_beta` in `part_023_factorial_helpers.py` correctly handles the small-x regime by computing in log-space when `log_front > 709`, with the comment explaining the precision issue at x ≈ 2.78e-16.
-3. The pilot power analysis (part_044) correctly implements prospective power calculations.
+#### 2. 机制对照设计 — 科学 ✓
 
-## Conclusion
+- `local_base`：等专家计算量的性能对照（立即合并，第二轮宽度 min(E, k1·k2)）
+- `local_base_k2`：只改合并时机的机制对照（立即合并，第二轮宽度 k2）
+- `B_early`：等计算量合并位置对照（分支数、执行次数与 B 相同，提前合并）
+- `dense`：无 MoE 的稠密基线，支持等计算量/等参数量两种口径
 
-Code is scientifically sound and production-ready.
+#### 3. 统计方法 — 可靠 ✓
+
+- 多种子运行 + Mean ± Std 汇报
+- 80% 功效的最小可检出效应（MDE）
+- TOST 等价性检验（`--equivalence-margin`，默认 1%）— "不显著"不会被误读为"等价"
+- Holm 校正的多重比较
+- Wilcoxon 符号秩 + Cliff's δ 秩效应量
+
+#### 4. 消融完整性 — 自动检查 ✓
+
+- `--suite-ablation` 提供 (1+N)×2 全因子消融
+- 自动检查消融组合是否完整
+- `--compare` 核对"除声明因子外设置是否完全一致"
+- 伪重复识别（相同种子多次运行）
+
+#### 5. 可复现性 — 完善 ✓
+
+- 受控变量协议记录（优化器、LR 策略、训练步数、数据指纹等）
+- 端到端可复现性检查（同 seed 两次运行逐位一致）
+- 梯度探针负例校验
+
+#### 6. 轻微建议（非 bug）
+
+- `tests/test_core.py` 运行时间较长（超过 2 分钟），建议拆分为 fast/slow 测试套件
+- `experiment.py` 作为兼容层使用 `_CompatModule` 动态代理，虽然功能正确，但对 IDE 代码补全不友好
+
+## 结论
+
+SMELT-ISR 的延迟合并机制设计严谨，对照实验科学合理，统计方法可靠，未发现需要修复的问题。
