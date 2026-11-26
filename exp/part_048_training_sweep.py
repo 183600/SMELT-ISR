@@ -293,7 +293,7 @@ def main():
         # 如果指定了期望的 SHA-256，检查是否匹配
         if expect_sha is not None:
             actual_sha = hashlib.sha256(
-                open(path, "rb").read()
+                path.read_bytes()
             ).hexdigest()
             if actual_sha != expect_sha:
                 print('"manifest_sha256_matches_expected": false')
