@@ -237,7 +237,7 @@ _GRADIENT_FAILURE_HINTS = {
     ),
     "nonfinite_gradients": (
         "梯度含 NaN/Inf：检查损失计算中的 log(0)/除零/softmax "
-        "溢出，再查混合精度与学习率/梯度爆炸.clamp_min(1e-10)"
+        "溢出，再查混合精度与学习率/梯度爆炸"
     ),
     "no_nonzero_gradient": (
         "没有任何参数收到非零梯度：检查损失是否用错了输出、"
@@ -250,7 +250,7 @@ _GRADIENT_FAILURE_HINTS = {
     "zero_non_expert_gradients": (
         "非专家参数整个张量的梯度恒为零：该模块虽然执行了，"
         "但输出被乘 0、被条件分支短路或未参与损失；请检查"
-        "gate/掩码.clamp_min(1e-10)/分支合并处是否把有效路径清零.clamp_min(1e-10)"
+        "gate/掩码/分支合并处是否把有效路径清零"
     ),
 }
 

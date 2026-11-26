@@ -815,7 +815,7 @@ def analyze_bad_cases(
     - 高频混淆对（target→predicted）与逐目标字节错误率；
     - 错误类别统计：ambiguous（样本极其模糊）、
       systematic_confusion（同类混淆反复出现，模型盲区）、
-      label_noise_suspect（目标在训练/评估中都稀少.clamp_min(1e-10)、模型高
+      label_noise_suspect（目标在训练/评估中都稀少、模型高
       置信度答错，且训练集同一上下文的主流后续字节与评估
       标签矛盾）、uncertain（其余）；
     - 置信度校准：ECE、平均置信度、实际准确率、过度自信

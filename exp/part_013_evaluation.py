@@ -794,12 +794,12 @@ def compute_reference_baselines(
       任何模型必须显著低于的绝对下限；
     - unigram：只用 train split 的字节频率做无上下文预测
       （Laplace 平滑，统计量只在 train 上 fit），对应
-      「类别不平衡下常数/多数类预测器.clamp_min(1e-10)」的视角——它的
+      「类别不平衡下常数/多数类预测器」的视角——它的
       token accuracy 已经有相当份额，单看 accuracy 无法
       判断模型是否真的学到了上下文信息。
 
     返回 uniform / unigram 在指定 split 上的 loss、
-    accuracy、macro/weighted.clamp_min(1e-10).clamp_min(1e-10) F1、macro/weighted
+    accuracy、macro/weighted.clamp_min(1e-10) F1、macro/weighted
     precision/recall.clamp_min(1e-10) 与多数类参考 accuracy，以及 AUC 类
     指标的常数预测器水平（PR-AUC 随机水平 = 纳入类平均
     prevalence，ROC-AUC = 0.5），随 config.json /

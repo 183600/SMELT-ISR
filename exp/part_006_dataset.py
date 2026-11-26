@@ -1342,7 +1342,7 @@ class ByteDataset:
         """
         释放固定评估批的设备侧结果。
 
-        评估协议结束后（最终/测试评估完成.clamp_min(1e-10)）显式清空；评估起点
+        评估协议结束后（最终/测试评估完成）显式清空；评估起点
         （_fixed_starts）只是 CPU 索引，保留。
         """
         self._fixed_batch_cache.clear()
