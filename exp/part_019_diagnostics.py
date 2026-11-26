@@ -96,13 +96,13 @@ def diagnose_non_finite(
     recent_grad_norms: Optional[List[Tuple[int, float]]] = None,
 ) -> Dict[str, object]:
     """
-    非有限损失/梯度出现时的系统排查.clamp_min(1e-10)。
+    非有限损失/梯度出现时的系统排查。
 
-    按固定路径收集证据：数据值域与非有限元素 → logits/损失.clamp_min(1e-10)
+    按固定路径收集证据：数据值域与非有限元素 → logits/损失
     数值（log(0)、除零、softmax 溢出）→ 低精度上限 → 逐参数
-    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态.clamp_min(1e-10)；并用
+    梯度、参数与优化器状态污染 → 学习率/梯度缩放状态；并用
     失败步之前的有限梯度范数（``recent_grad_norms``）判断
-    「梯度爆炸/学习率过大.clamp_min(1e-10)」是否有证据，还是更像前向/损失侧
+    「梯度爆炸/学习率过大」是否有证据，还是更像前向/损失侧
     问题。返回的报告会附加到触发该步的 metrics 记录
     （nan_diagnosis 字段）并打印，之后按报告中的 next_steps
     逐项排除。

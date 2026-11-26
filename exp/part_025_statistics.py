@@ -1744,7 +1744,7 @@ def _jzs_posterior_summaries(
     scale: float = _JZS_DEFAULT_PRIOR_SCALE,
 ) -> Optional[Dict[str, object]]:
     """
-    从后验混合中计算 P(δ>0|D)、后验均值/标准差与.clamp_min(1e-10) 95% HDI。
+    从后验混合中计算 P(δ>0|D)、后验均值/标准差与 95% HDI。
 
     HDI 在 δ 网格上用滑动窗口求最短 95% 覆盖区间；后验混合在
     t≠0 时不对称，等尾区间一般不是 HDI，这里直接算最短区间。

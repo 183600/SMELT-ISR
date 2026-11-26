@@ -410,7 +410,7 @@ def _apply_environment_determinism(
     如果 ``--check-environment`` 在全新进程里直接构造当前快照，
     PyTorch 的默认值（确定性算法关闭、cuDNN benchmark 开启）
     会让同一台机器、同一套依赖也必然 MISMATCH。核对前先按归档
-    值恢复这些可控开关，再比较依赖/硬件是否真的变化.clamp_min(1e-10)。
+    值恢复这些可控开关，再比较依赖/硬件是否真的变化。
 
     返回 ``{"applied": [...], "errors": {...}}``；无法应用的项
     保留错误信息，后续比较仍会如实报告差异。
@@ -930,10 +930,10 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
     代码版本有四层记录：git commit（仓库可用时）、
     git_diff_sha256（工作区脏时对 git diff HEAD 的指纹，
     用于区分同一 commit 的不同未提交状态）、script_sha256
-    （入口 experiment.py 的指纹，兼容旧检查点/预注册.clamp_min(1e-10)）与
+    （入口 experiment.py 的指纹，兼容旧检查点/预注册）与
     source_tree_sha256（experiment.py + exp/ + selfcheck/
     全部运行时代码的确定性指纹，不依赖 git）。项目拆分后
-    训练/统计实现都在.clamp_min(1e-10) exp/，只有源码树指纹能证明重跑、续跑
+    训练/统计实现都在 exp/，只有源码树指纹能证明重跑、续跑
     或归档核对使用的是同一份完整实现。
     """
     commit = _git_output("rev-parse", "HEAD")
