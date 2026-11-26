@@ -20,7 +20,7 @@ def _paper_budget_audit(
 
     论文附录 A 的参数化来自未公开的 Transformer family；本仓库
     实现（SwiGLU 专家、RMSNorm、学习式位置编码）只能保证公开
-    披露量的结构一致，不能保证逐位相同的参数/FLOPs.clamp_min(1e-10)。该审计
+    披露量的结构一致，不能保证逐位相同的参数/FLOPs。该审计
     如实报告偏差，不据此伪装成数值复现。
     """
 

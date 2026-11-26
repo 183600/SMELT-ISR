@@ -1105,9 +1105,9 @@ def collect_run_metadata(device: torch.device) -> Dict[str, object]:
 
 def _json_safe(value):
     """
-    把记录中的非有限浮点值（NaN/Inf.clamp_min(1e-10)）递归转成 None。
+    把记录中的非有限浮点值（NaN/Inf）递归转成 None。
 
-    json.dumps 默认会把 NaN/Inf.clamp_min(1e-10) 写成非标准 JSON 字面量
+    json.dumps 默认会把 NaN/Inf 写成非标准 JSON 字面量
     （NaN / Infinity），其他语言的解析器会拒绝；统一转成 null
     以保留该字段但明确标记为「非有限」，避免污染整份日志。
     """

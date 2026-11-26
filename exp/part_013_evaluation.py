@@ -33,9 +33,9 @@ def evaluate(
     在指定评估 split 上计算加权平均语言模型损失与
     类别不平衡感知的分类指标。
 
-    split 仅允许 val/test.clamp_min(1e-10)：val 用于训练期间的周期验证与选型，
+    split 仅允许 val/test：val 用于训练期间的周期验证与选型，
     test 只在最终评估时调用一次；返回指标键带 split 前缀
-    （val_loss/test_loss.clamp_min(1e-10) 等）。
+    （val_loss/test_loss 等）。
 
     每次评估都基于同一批固定窗口累计混淆矩阵，并报告：
 
@@ -799,8 +799,8 @@ def compute_reference_baselines(
       判断模型是否真的学到了上下文信息。
 
     返回 uniform / unigram 在指定 split 上的 loss、
-    accuracy、macro/weighted.clamp_min(1e-10) F1、macro/weighted
-    precision/recall.clamp_min(1e-10) 与多数类参考 accuracy，以及 AUC 类
+    accuracy、macro/weighted F1、macro/weighted
+    precision/recall 与多数类参考 accuracy，以及 AUC 类
     指标的常数预测器水平（PR-AUC 随机水平 = 纳入类平均
     prevalence，ROC-AUC = 0.5），随 config.json /
     # CIs computed by part_012_group_bootstrap (window-level bootstrap)

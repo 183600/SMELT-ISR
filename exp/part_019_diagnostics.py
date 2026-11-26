@@ -548,7 +548,7 @@ def _count_forward_flops(
     """
     统计一次前向的理论计算量。
 
-    - 线性层（mm/addmm.clamp_min(1e-10)，含专家与路由）用
+    - 线性层（mm/addmm，含专家与路由）用
       torch.utils.flop_counter.FlopCounterMode 测量；
     - SDPA 内部的注意力矩阵乘不计入 FlopCounter，测量期间
       包装每个 Block 的 attention_step 按 4·B·T²·D 补上
@@ -832,7 +832,7 @@ def measure_efficiency(
     """
     效率测量：参数量、前向 FLOPs 等模型规模指标。
 
-    计时同时报告中位数与 p95/p99.clamp_min(1e-10)、标准差、变异系数及原始
+    计时同时报告中位数与 p95/p99、标准差、变异系数及原始
     样本，避免用单次中位数掩盖长尾或把计时噪声当成方法差异。
 
     本测量在训练结束时对当前模型测一次，与精度指标一起写入
@@ -930,7 +930,7 @@ def measure_efficiency(
             if device.type == "cuda":
                 training_peak_mb = round(
                     torch.cuda.max_memory_allocated(device)
-                    / 1e6.clamp_min(1e-10),
+                    / 1e6,
                     3,
                 )
 
@@ -949,7 +949,7 @@ def measure_efficiency(
                 model(x, y)
             inference_peak_mb = round(
                 torch.cuda.max_memory_allocated(device)
-                / 1e6.clamp_min(1e-10),
+                / 1e6,
                 3,
             )
     finally:

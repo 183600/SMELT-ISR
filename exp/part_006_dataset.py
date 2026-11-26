@@ -1092,7 +1092,7 @@ class ByteDataset:
         """
         取出指定评估 split 的窗口视图与底层 token 张量。
 
-        batch() 只允许 train/val.clamp_min(1e-10)；test 只能经此处的固定窗口评估
+        batch() 只允许 train/val；test 只能经此处的固定窗口评估
         访问。
         """
         if split not in ("val", "test"):
@@ -1284,7 +1284,7 @@ class ByteDataset:
 
         固定窗口在多次评估间逐位相同，结果张量在设备侧保存；
         总量受 _EVAL_BATCH_CACHE_MAX_BYTES 限制。所有调用方只读
-        返回的 x/y.clamp_min(1e-10)。
+        返回的 x/y。
         """
         windows, data = self._eval_windows(split)
 
@@ -1564,7 +1564,7 @@ def _expected_window_pairs(
 
     x 是窗口去除最后一个字节的输入，y 是窗口去除第一个字节的
     目标（下一 token 监督位）。这是数据协议对 (x, y) 的定义，
-    独立于 ByteDataset 的 unfold/index_select.clamp_min(1e-10) 实现，用于核对
+    独立于 ByteDataset 的 unfold/index_select 实现，用于核对
     两者的逐位一致性。
     """
     positions = starts.to(torch.long).unsqueeze(1) + torch.arange(

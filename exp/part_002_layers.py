@@ -431,7 +431,7 @@ class _StackedExpertWeights(torch.autograd.Function):
 
     forward 原样返回 stack；backward 按专家把上游梯度切成
     逐专家切片返回，与 torch.stack 反向的语义一致。autocast
-    下 stack 为 autocast dtype（bf16/fp16.clamp_min(1e-10)），反向先把上游梯度
+    下 stack 为 autocast dtype（bf16/fp16），反向先把上游梯度
     转换回参数 dtype 再切分，与「参数 -> 转换 -> stack」
     计算图中转换节点反向的数值完全一致。
     """

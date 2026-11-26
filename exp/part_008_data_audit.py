@@ -713,7 +713,7 @@ def _plan_train_degenerate_cleaning(
     """
     规划训练集异常值清洗：只从 train 中整组剔除「长度达到
     阈值且单一字节占比极高」的低信息/退化群组，绝不改动
-    val/test.clamp_min(1e-10)。
+    val/test。
 
     判定只使用群组自身内容（没有跨 split 统计量），阈值固定
     并记录在审计中；已经被去重/标签噪声清洗剔除的群组不重复

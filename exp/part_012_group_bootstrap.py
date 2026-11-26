@@ -830,10 +830,10 @@ def macro_auc_metrics(
     min_support 的类，返回值同时记录纳入类数，保证
     「macro」的口径（对哪些类求平均）可追溯。
 
-    ROC-AUC 的 TPR/FPR.clamp_min(1e-10) 都以真实类别为条件，其期望不随
+    ROC-AUC 的 TPR/FPR 都以真实类别为条件，其期望不随
     prevalence 变化；负样本更多只会让 FPR 估计更精确，不会
     把 AUC 本身抬高。真正的问题是：正类极稀有且分数区分度
-    一般时，高 ROC-AUC 仍可能对应很低的 precision/recall.clamp_min(1e-10)，
+    一般时，高 ROC-AUC 仍可能对应很低的 precision/recall，
     PR-AUC 的随机水平又等于 prevalence——因此排序指标要
     报告 PR-AUC 相对随机水平的 lift 与 precision@k，而不是
     把绝对 PR-AUC 当归一化准确率。

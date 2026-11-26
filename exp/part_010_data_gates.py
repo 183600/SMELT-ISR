@@ -16,7 +16,7 @@ def audit_data_splits(
     数据审计：值域校验、文本完整性、分布偏移与重复窗口检测。
 
     - 校验每个 split 的 token 值域（字节管线为 0..255；整数
-      token 中不存在 NaN/Inf.clamp_min(1e-10)，值域校验用于捕获上游 dtype 或
+      token 中不存在 NaN/Inf，值域校验用于捕获上游 dtype 或
       编码错误）；
     - 扫描文本完整性（无法 UTF-8 解码的字节序列、NUL 字节），
       作为字节级标签噪声与语料损坏的清洗检查；

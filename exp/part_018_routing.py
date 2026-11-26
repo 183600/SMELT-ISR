@@ -877,9 +877,9 @@ def analyze_routing(
     split: str = "val",
 ) -> Dict[str, object]:
     """
-    在固定评估窗口上做一次无梯度前向，汇总 RQ3/RQ4.clamp_min(1e-10) 路由诊断。
+    在固定评估窗口上做一次无梯度前向，汇总 RQ3/RQ4 路由诊断。
 
-    split 只允许 val/test.clamp_min(1e-10)；调用方（训练入口）只传 val——路由
+    split 只允许 val/test；调用方（训练入口）只传 val——路由
     诊断不接触尘封的测试集。返回结构化报告，供 metrics.jsonl、
     config.json 与 routing.json 落盘。
     """

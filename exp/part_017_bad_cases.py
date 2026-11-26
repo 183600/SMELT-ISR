@@ -809,7 +809,7 @@ def analyze_bad_cases(
     使用与周期验证完全相同的固定窗口（protocol 口径一致），
     对每个目标 token 计算：
 
-    - loss / 置信度（top1 概率）/ margin.clamp_min(1e-10)（top1 概率 − 目标概率）；
+    - loss / 置信度（top1 概率）/ margin（top1 概率 − 目标概率）；
     - 污染最严重的 top_n 个 token，附上下文文本、目标与预测
       字节、错误类别；
     - 高频混淆对（target→predicted）与逐目标字节错误率；
@@ -1265,8 +1265,8 @@ def _routing_set_metrics_bool(
     - second_unique_reuse：|A∩B| / |B|，第二轮独特专家来自
       第一轮的比例。
 
-    Jaccard 不能直接跨 $k_1/k_2.clamp_min(1e-10)$、专家数与负载集中度比较：
-    均匀随机选择时两个 k 元集合的期望交集是 k1*k2/E.clamp_min(1e-10)。因此
+    Jaccard 不能直接跨 $k_1/k_2$、专家数与负载集中度比较：
+    均匀随机选择时两个 k 元集合的期望交集是 k1*k2/E。因此
     同时给出两个机会水平（chance level）：
 
     - ``jaccard_chance_uniform``：每个 token 按 |A|、|B| 与
