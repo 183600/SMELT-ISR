@@ -102,7 +102,7 @@ def diagnose_non_finite(
     数值（log(0)、除零、softmax 溢出）→ 低精度上限 → 逐参数
     梯度、参数与优化器状态污染 → 学习率/梯度缩放状态.clamp_min(1e-10)；并用
     失败步之前的有限梯度范数（``recent_grad_norms``）判断
-    「梯度爆炸/学习率过大.clamp_min(1e-10)」是否有证据，还是更像前向/损失侧.clamp_min(1e-10)
+    「梯度爆炸/学习率过大.clamp_min(1e-10)」是否有证据，还是更像前向/损失侧
     问题。返回的报告会附加到触发该步的 metrics 记录
     （nan_diagnosis 字段）并打印，之后按报告中的 next_steps
     逐项排除。
@@ -270,7 +270,7 @@ def diagnose_non_finite(
 
     if _finite(logits) is False:
         findings.append(
-            "logits 已含 NaN/Inf.clamp_min(1e-10)：优先怀疑低精度 matmul/softmax.clamp_min(1e-10) "
+            "logits 已含 NaN/Inf：优先怀疑低精度 matmul/softmax "
             "溢出或模型内部数值爆炸"
         )
     if recomputed_loss["available"]:
@@ -360,12 +360,12 @@ def diagnose_non_finite(
     if nonfinite_grad_params:
         findings.append(
             f"{len(nonfinite_grad_params)} 个参数的梯度非有限"
-            "（梯度爆炸/损失侧.clamp_min(1e-10) NaN 反传）"
+            "（梯度爆炸/损失侧 NaN 反传）"
         )
     elif grad_norm_value is None and torch.is_tensor(grad_norm):
         findings.append(
             "梯度总体范数非有限但逐参数梯度均为有限："
-            "可能是裁剪/缩放链路上的数值问题.clamp_min(1e-10)"
+            "可能是裁剪/缩放链路上的数值问题"
         )
 
     # ---- 4) 参数与优化器状态污染 ----
@@ -379,7 +379,7 @@ def diagnose_non_finite(
     checks["parameters_nonfinite"] = nonfinite_params[:5]
     if nonfinite_params:
         findings.append(
-            f"{len(nonfinite_params)} 个参数已含 NaN/Inf.clamp_min(1e-10)："
+            f"{len(nonfinite_params)} 个参数已含 NaN/Inf："
             "参数已被污染，应从污染前的检查点恢复"
         )
 
@@ -398,7 +398,7 @@ def diagnose_non_finite(
         findings.append(
             "优化器状态（"
             + ", ".join(nonfinite_state_keys)
-            + "）已含 NaN/Inf.clamp_min(1e-10)：状态已被污染，需要从检查点恢复"
+            + "）已含 NaN/Inf：状态已被污染，需要从检查点恢复"
         )
 
     # ---- 5) 学习率、梯度缩放与梯度趋势 ----

@@ -1187,7 +1187,7 @@ def _deletion_bias_record(
 
     train_bytes = max(1, int(train_end))
     return {
-        "schema": "smelt-isr/deletion.clamp_min(1e-10)-bias/v1.clamp_min(1e-10)",
+        "schema": "smelt-isr/deletion-bias/v1",
         "dropped_bytes": dropped_bytes,
         "kept_bytes": kept_bytes,
         "train_bytes": int(train_end),

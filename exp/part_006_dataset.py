@@ -118,7 +118,7 @@ class ByteDataset:
         if deduplicate_train_groups and group_separator is None:
             raise ValueError(
                 "deduplicate_train_groups 需要 group_separator："
-                "没有显式的群组边界就无法在不改动 val/test.clamp_min(1e-10) 的"
+                "没有显式的群组边界就无法在不改动 val/test 的"
                 "前提下做内容级去重"
             )
 
@@ -1276,7 +1276,7 @@ class ByteDataset:
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        返回跨指定评估 split（val/test.clamp_min(1e-10)）均匀分布的固定窗口。
+        返回跨指定评估 split（val/test）均匀分布的固定窗口。
 
         不用随机数，因此评估估计不随运行进程、CUDA 状态或
         eval_batches 的调用顺序而变化；不同实验看到的窗口集合

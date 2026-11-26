@@ -466,7 +466,7 @@ def _hierarchical_group_bootstrap_ci(
         "method": "crossed_seed_group_percentile_bootstrap",
         "resampling": "seeds_and_document_groups_with_replacement",
         "note": (
-            "同时反映训练种子与文档/群组两层不确定性.clamp_min(1e-10)；"
+            "同时反映训练种子与文档/群组两层不确定性；"
             "群组按可交换单位重采样。种子或群组数很少时"
             "百分位区间很粗，只作描述性证据"
         ),
