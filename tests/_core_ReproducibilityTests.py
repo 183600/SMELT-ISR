@@ -25,6 +25,125 @@ class ReproducibilityTests(unittest.TestCase):
             )
             self.assertIn("generated_at", payload)
 
+    def test_null_results_registry_records_insignificant_contrasts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reports" / "analysis.json"
+            registry = Path(tmp) / "reports" / "null_results_registry.jsonl"
+            analysis = {
+                "metric": "val_loss",
+                "contrasts": [
+                    {
+                        "family": "pairwise",
+                        "metric": "val_loss",
+                        "baseline": "smelt",
+                        "variant": "A",
+                        "effect": -0.005,
+                        "significant": False,
+                        "equivalent": False,
+                        "tost_p_value": 0.12,
+                        "holm_p": 0.20,
+                        "power_at_effect": 0.45,
+                        "mde_80": 0.02,
+                        "seeds_to_detect": 12,
+                        "n_pairs": 6,
+                    },
+                    {
+                        "family": "pairwise",
+                        "metric": "val_loss",
+                        "baseline": "smelt",
+                        "variant": "B",
+                        "effect": -0.015,
+                        "significant": True,
+                        "equivalent": False,
+                        "tost_p_value": 0.03,
+                        "holm_p": 0.02,
+                        "power_at_effect": 0.85,
+                        "mde_80": 0.01,
+                        "seeds_to_detect": 6,
+                        "n_pairs": 6,
+                    },
+                    {
+                        "family": "pairwise",
+                        "metric": "val_loss",
+                        "baseline": "smelt",
+                        "variant": "local_base",
+                        "effect": -0.001,
+                        "significant": False,
+                        "equivalent": True,
+                        "tost_p_value": 0.01,
+                        "holm_p": 0.15,
+                        "power_at_effect": 0.30,
+                        "mde_80": 0.03,
+                        "seeds_to_detect": 20,
+                        "n_pairs": 6,
+                    },
+                ],
+            }
+            with contextlib.redirect_stdout(io.StringIO()):
+                experiment.write_comparison_report_file(path, analysis)
+            self.assertTrue(registry.exists())
+            lines = registry.read_text(encoding="utf-8").strip().splitlines()
+            # 只有第 1 个对比是负结果（未显著且未等价）
+            self.assertEqual(len(lines), 1)
+            entry = json.loads(lines[0])
+            self.assertEqual(entry["metric"], "val_loss")
+            self.assertEqual(entry["family"], "pairwise")
+            self.assertEqual(entry["baseline"], "smelt")
+            self.assertEqual(entry["variant"], "A")
+            self.assertEqual(entry["effect"], -0.005)
+            self.assertFalse(entry["significant"])
+            self.assertFalse(entry["equivalent"])
+            self.assertEqual(entry["reason"], "underpowered")
+            self.assertEqual(entry["power_at_effect"], 0.45)
+            self.assertEqual(entry["mde_80"], 0.02)
+            self.assertEqual(entry["seeds_to_detect"], 12)
+            self.assertEqual(entry["n_pairs"], 6)
+            self.assertIn("registry_id", entry)
+            self.assertIn("generated_at", entry)
+
+    def test_null_results_registry_skips_significant_or_equivalent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "reports" / "analysis.json"
+            registry = Path(tmp) / "reports" / "null_results_registry.jsonl"
+            analysis = {
+                "metric": "val_loss",
+                "contrasts": [
+                    {
+                        "family": "pairwise",
+                        "metric": "val_loss",
+                        "baseline": "smelt",
+                        "variant": "A",
+                        "effect": -0.015,
+                        "significant": True,
+                        "equivalent": False,
+                        "tost_p_value": 0.03,
+                        "holm_p": 0.02,
+                        "power_at_effect": 0.85,
+                        "mde_80": 0.01,
+                        "seeds_to_detect": 6,
+                        "n_pairs": 6,
+                    },
+                    {
+                        "family": "pairwise",
+                        "metric": "val_loss",
+                        "baseline": "smelt",
+                        "variant": "local_base",
+                        "effect": -0.001,
+                        "significant": False,
+                        "equivalent": True,
+                        "tost_p_value": 0.01,
+                        "holm_p": 0.15,
+                        "power_at_effect": 0.30,
+                        "mde_80": 0.03,
+                        "seeds_to_detect": 20,
+                        "n_pairs": 6,
+                    },
+                ],
+            }
+            with contextlib.redirect_stdout(io.StringIO()):
+                experiment.write_comparison_report_file(path, analysis)
+            self.assertFalse(registry.exists())
+
     def test_set_seed_records_effective_manifest(self):
         experiment.set_seed(321)
         manifest = experiment._LAST_SEED_MANIFEST

@@ -1393,7 +1393,95 @@ def write_comparison_report_file(
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
     print(f"[report] 对比分析已写入 {path}")
+    # 负结果注册表：把未显著且未等价的对比追加写入
+    # null_results_registry.jsonl，防止「文件柜效应」（只报显著结果、
+    # 隐藏零结果）。注册表写入失败不应阻断主报告落盘。
+    try:
+        _write_null_results_registry(path.parent, analysis)
+    except Exception:
+        pass
     return path
+
+
+def _null_result_reason(
+    contrast: Dict[str, object], alpha: float = 0.05
+) -> str:
+    """
+    判定负结果（未显著且未等价）的原因：
+
+    - underpowered：观测效应的功效低于 80%（种子不足，应加种子）；
+    - not_equivalent：TOST 未通过（点估计在等价界内但精度不足）；
+    - not_significant：未发现显著差异（既非显著也非等价）。
+    """
+    significant = bool(contrast.get("significant"))
+    equivalent = bool(contrast.get("equivalent"))
+    if significant or equivalent:
+        return ""
+    power_at_effect = contrast.get("power_at_effect")
+    if isinstance(power_at_effect, (int, float)) and power_at_effect < 0.8:
+        return "underpowered"
+    tost_p_value = contrast.get("tost_p_value")
+    if isinstance(tost_p_value, (int, float)) and tost_p_value > alpha:
+        return "not_equivalent"
+    return "not_significant"
+
+
+def _write_null_results_registry(
+    out_dir: Path, analysis: Dict[str, object]
+) -> None:
+    """
+    将对比分析中的负结果（未显著且未等价）追加写入
+    out_dir/null_results_registry.jsonl，防止「文件柜效应」。
+
+    每行一个 JSON 对象，含对比指标、族、基线/变体臂、效应量、
+    显著性/等价性判定、功效/MDE/所需种子、原因等，供元分析与
+    零结果显性归档复用。空结果集时不写入。
+    """
+    import datetime
+    import json
+    import uuid
+
+    contrasts = analysis.get("contrasts") or []
+    if not isinstance(contrasts, list):
+        return
+    registry_path = out_dir / "null_results_registry.jsonl"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for c in contrasts:
+        if not isinstance(c, dict):
+            continue
+        significant = bool(c.get("significant"))
+        equivalent = bool(c.get("equivalent"))
+        if significant or equivalent:
+            continue
+        rows.append(
+            {
+                "registry_id": str(uuid.uuid4()),
+                "generated_at": datetime.datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                "metric": c.get("metric"),
+                "family": c.get("family"),
+                "baseline": c.get("baseline"),
+                "variant": c.get("variant"),
+                "effect": c.get("effect") if c.get("effect") is not None else c.get("delta"),
+                "significant": significant,
+                "equivalent": equivalent,
+                "tost_p_value": c.get("tost_p_value"),
+                "holm_p": c.get("holm_p"),
+                "power_at_effect": c.get("power_at_effect"),
+                "mde_80": c.get("mde_80"),
+                "seeds_to_detect": c.get("seeds_to_detect"),
+                "reason": _null_result_reason(c),
+                "n_pairs": c.get("n_pairs"),
+                "failure_rate": c.get("failure_rate"),
+            }
+        )
+    if not rows:
+        return
+    with open(registry_path, "a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 
