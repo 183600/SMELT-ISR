@@ -1078,7 +1078,7 @@ def _paper_expert_hidden(
     raw = (
         budget - dim - int(layers) * per_layer_fixed
     ) / denominator
-    if not math.isfinite(raw) or raw < 8.0:
+    if not math.isfinite(raw) or raw <= 0:
         return 8
     return int(round(raw / 8.0)) * 8
 
