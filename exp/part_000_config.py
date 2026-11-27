@@ -1141,6 +1141,8 @@ def paper_preset(
         if cell.kv_ratio is None:
             raise ValueError(f"{cell} 缺少 KV 比例")
         kv_target = int(round(cell.kv_ratio * base_kv_dim))
+        if kv_target <= 0:
+            raise ValueError(f"KV target must be positive, got {kv_target}")
         n_heads, n_kv_heads, kv_dim = _paper_smelt_head_geometry(
             cell.hidden,
             kv_target,
