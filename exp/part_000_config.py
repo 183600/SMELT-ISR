@@ -1072,9 +1072,12 @@ def _paper_expert_hidden(
         + int(experts) * dim
     )
     budget = float(total_params) * 1e9
+    denominator = int(layers) * int(experts) * 3 * dim
+    if denominator == 0:
+        return 8
     raw = (
         budget - dim - int(layers) * per_layer_fixed
-    ) / (int(layers) * int(experts) * 3 * dim)
+    ) / denominator
     if not math.isfinite(raw) or raw < 8.0:
         return 8
     return int(round(raw / 8.0)) * 8
