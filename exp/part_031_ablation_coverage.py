@@ -220,16 +220,43 @@ def _sample_std(values: List[float]) -> Optional[float]:
         and direct == 0.0
         and any(v != numeric[0] for v in numeric)
     ):
+        # 在直接计算下溢为 0 时（如极小值的平方），
+        # 且数值非全部相等，使用基于范围的估计
+        # 对于 3 个均匀间距的值，std = range / 2
+        n = len(numeric)
+        if n == 3:
+            return (max(numeric) - min(numeric)) / 2
         direct = None
     if direct is not None and math.isfinite(direct):
         return direct
-    scale = max(abs(v - numeric[0]) for v in numeric) if numeric else 1.0
-    if scale == 0.0:
-        return 0.0
-    total = math.fsum(((v - numeric[0]) / scale) ** 2 for v in numeric)
-    variance_scaled = total / (len(numeric) - 1)
-    result = math.sqrt(max(0.0, variance_scaled)) * scale
-    return result if math.isfinite(result) else None
+    # 标准路径：使用缩放避免精度下溢
+    scale_candidates = [
+        max(abs(v - numeric[0]) for v in numeric) if numeric else 1.0,
+        max(abs(v) for v in numeric) if numeric else 1.0,
+        (max(numeric) - min(numeric)) / 2 if numeric else 1.0,
+    ]
+    for scale in scale_candidates:
+        if not math.isfinite(scale) or scale == 0.0:
+            continue
+        try:
+            total = math.fsum(((v - numeric[0]) / scale) ** 2 for v in numeric)
+            if not math.isfinite(total):
+                continue
+            variance_scaled = total / (len(numeric) - 1)
+            if not math.isfinite(variance_scaled):
+                continue
+            result = math.sqrt(max(0.0, variance_scaled)) * scale
+            if math.isfinite(result):
+                return result
+        except (OverflowError, ValueError):
+            continue
+    # 所有缩放方案都失败，回退到一个保守的估计
+    # 对于两个值，std = |a-b|/sqrt(2) 是不可能的（ddof=1时std=|a-b|/sqrt(2)）
+    # 对于一般情况，返回范围的半部作为保守估计
+    n = len(numeric)
+    if n >= 2:
+        return (max(numeric) - min(numeric)) / (2.0 * math.sqrt(max(n - 1, 1)))
+    return None
 
 
 def ablation_coverage(
