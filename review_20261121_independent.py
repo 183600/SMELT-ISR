@@ -63,51 +63,52 @@ experimental framework for MoE routing research with correct
 statistical methods and comprehensive reproducibility support.
 """
 
-import math
+from pathlib import Path
 import sys
+
 
 def verify_review():
     checks = []
-    
+
     # 1. Verify Stirling series implementation
-    with open("exp/part_023_factorial_helpers.py") as f:
+    with Path("exp/part_023_factorial_helpers.py").open() as f:
         src = f.read()
     has_stirling = "_stirling_log_gamma_correction" in src
     checks.append(("factorial_helpers Stirling correction", has_stirling))
-    
+
     # 2. Verify log-gamma ratio with product form
     has_product = "math.fsum" in src and "math.log(a + index)" in src
     checks.append(("factorial_helpers log-beta product form", has_product))
-    
+
     # 3. Verify regularized incomplete beta
     has_rib = "_regularized_incomplete_beta" in src
     checks.append(("factorial_helpers incomplete beta", has_rib))
-    
+
     # 4. Verify routing variance guard
-    with open("exp/part_018_routing.py") as f:
+    with Path("exp/part_018_routing.py").open() as f:
         src = f.read()
     has_guard = 'math.sqrt(max(0.0, variance))' in src or 'math.sqrt(variance)' in src
     checks.append(("routing.py variance sqrt guard", has_guard))
-    
+
     # 5. Verify statistical baseline implementation
-    with open("exp/part_015_statistical_baseline.py") as f:
+    with Path("exp/part_015_statistical_baseline.py").open() as f:
         src = f.read()
     has_baseline = "uniform" in src.lower() and "unigram" in src.lower()
     checks.append(("statistical_baseline reference models", has_baseline))
-    
+
     # 6. Verify Welch t-test
-    with open("exp/part_025_statistics.py") as f:
+    with Path("exp/part_025_statistics.py").open() as f:
         src = f.read()
     has_welch = "Satterthwaite" in src or "welch" in src.lower()
     checks.append(("statistics.py Welch t-test", has_welch))
-    
+
     all_pass = True
     for name, result in checks:
         status = "PASS" if result else "FAIL"
         if not result:
             all_pass = False
         print(f"  [{status}] {name}")
-    
+
     return all_pass
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+
+
 from exp.part_053_pareto import pareto_frontier_analysis
 
 
@@ -42,7 +44,7 @@ _PARETO_TEMPLATE = {
 }
 
 
-def _make_contrast(idx: int, *, val_loss: float, flops: float) -> Dict[str, object]:
+def _make_contrast(idx: int, *, val_loss: float, flops: float) -> dict[str, object]:
     return {
         "family": f"contrast_{idx}",
         "cells": [{"mode": "A", "variant": "B"}],
