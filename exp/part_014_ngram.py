@@ -654,7 +654,7 @@ def _select_ngram_candidate_one_se(
         if mean_diff is None:
             continue
         std = _sample_std(differences)
-        if std is None:
+        if std is None or not math.isfinite(std):
             continue
         se = std / math.sqrt(max(0.0, n_windows))
         rho1 = _lag1_autocorrelation(
