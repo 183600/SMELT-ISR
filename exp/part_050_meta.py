@@ -254,10 +254,16 @@ def meta_analyze(
         )
     weights_fixed = [1.0 / v for v in clean_variances]
     total_weight = sum(weights_fixed)
+    if total_weight <= 0.0 or not math.isfinite(total_weight):
+        # 逆方差权重之和在数学上恒正（每个方差都是有限正数），
+        # 走到这里只能是方差大到权重下溢的异常输入，按严格
+        # 校验口径拒绝，而不是用 max(total_weight, 1) 把汇总
+        # 静默地拉向 0（Σw<1 时除以 1 会同时错估 θ̂ 与 se）。
+        raise ValueError("套件方差过大：逆方差权重之和不可用")
     theta_fixed = sum(
         w * y for w, y in zip(weights_fixed, clean_effects)
-    ) / max(total_weight, 1)
-    se_fixed = math.sqrt(1.0 / max(total_weight, 1))
+    ) / total_weight
+    se_fixed = math.sqrt(1.0 / total_weight)
     q_value = sum(
         w * (y - theta_fixed) ** 2
         for w, y in zip(weights_fixed, clean_effects)
@@ -266,7 +272,7 @@ def meta_analyze(
     q_p_value = _meta_chi_square_sf(q_value, df)
     c_value = total_weight - sum(
         w * w for w in weights_fixed
-    ) / max(total_weight, 1)
+    ) / total_weight
     tau_squared = 0.0
     if c_value > 0.0:
         tau_squared = max(0.0, (q_value - df) / c_value)
