@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+from .part_019_diagnostics import _is_deterministic_run
+
 _COMMON_STEP_METRIC_SUFFIX = "_at_common_step"
 
 _COMMON_STEP_CORE_BASE_METRICS: Tuple[str, ...] = (

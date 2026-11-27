@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from . import _manifest as _manifest
@@ -15,6 +16,25 @@ _HERE = Path(__file__).resolve().parent
 # that fingerprints the script, runs git from the repository root, or spawns
 # child runs keeps the pre-split behaviour.
 __file__ = str(_HERE.parent / "experiment.py")
+
+# Pre-populate commonly imported parts so that relative imports from other
+# parts get the combined namespace with all names, not separate modules with
+# incomplete imports. This avoids NameError for names defined in other parts.
+this_module = sys.modules[__name__]
+for _part_name in (
+    "part_021_comparison",
+    "part_022_comparison_protocol",
+    "part_023_factorial_helpers",
+    "part_024_window_comparison",
+    "part_025_statistics",
+    "part_026_equivalence",
+    "part_027_aggregation",
+    "part_028_contrasts",
+    "part_029_ablation",
+    "part_030_factorial",
+    "part_031_ablation_coverage",
+):
+    sys.modules[f"exp.{_part_name}"] = this_module
 
 for _part_name in _manifest.CORE_PARTS:
     _part_path = _HERE / _part_name
