@@ -1219,12 +1219,17 @@ def _autocast_snapshot() -> List[Tuple[str, bool, torch.dtype, bool]]:
                 else torch.get_autocast_gpu_dtype()
             )
 
+        try:
+            cache_enabled = torch.is_autocast_cache_enabled()
+        except AttributeError:
+            cache_enabled = False
+
         states.append(
             (
                 device_type,
                 enabled,
                 dtype,
-                torch.is_autocast_cache_enabled(),
+                cache_enabled,
             )
         )
 
