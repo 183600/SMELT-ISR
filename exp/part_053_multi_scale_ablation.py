@@ -3,23 +3,26 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 
-from .part_029_ablation import factorial_effects, mechanism_control_report
+from .part_029_ablation import (
+    factorial_effects,
+    mechanism_control_report,
+    _DELAYED_MERGE_MECHANISM_CONTROLS,
+)
 from .part_031_ablation_coverage import ablation_coverage
 from .part_028_contrasts import factor_contrasts
 from .part_023_factorial_helpers import (
     _stable_factor_key,
     _finite_float,
     _row_factor_value,
-    _apply_multiple_comparison_correction,
     _mean,
 )
+from .part_028_contrasts import _apply_multiple_comparison_correction
 from .part_021_comparison import compare_runs
 from .part_030_factorial import (
     _DELAYED_MERGE_MODES,
-    _DELAYED_MERGE_MECHANISM_CONTROLS,
     _ABLATION_STRUCTURAL_KEYS,
 )
-from .part_025_statistics import metric_higher_is_better
+from .part_027_aggregation import metric_higher_is_better
 
 
 # Default scales for multi-scale ablation (corresponding to paper scales)

@@ -1,5 +1,235 @@
 from __future__ import annotations
 
+from typing import Dict, List, Optional, Tuple
+
+
+_COMMON_STEP_METRIC_SUFFIX = "_at_common_step"
+
+_COMMON_STEP_CORE_BASE_METRICS: Tuple[str, ...] = (
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "val_macro_nll",
+    "val_token_accuracy",
+    "val_micro_f1",
+    "val_macro_f1",
+    "val_weighted_f1",
+    "val_precision_macro",
+    "val_precision_weighted",
+    "val_recall_macro",
+    "val_recall_weighted",
+)
+
+_COMMON_STEP_OPTIONAL_BASE_METRICS: Tuple[str, ...] = (
+    "val_pr_auc_macro",
+    "val_pr_auc_macro_lift",
+    "val_roc_auc_macro",
+)
+
+_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+    _COMMON_STEP_CORE_BASE_METRICS + _COMMON_STEP_OPTIONAL_BASE_METRICS
+)
+
+_CURVE_MEAN_METRIC = "val_loss_curve_mean_to_common_step"
+
+_DELAYED_MERGE_MODES: Tuple[str, ...] = ("A", "B")
+
+_DELAYED_MERGE_MECHANISM_CONTROLS: Dict[str, str] = {
+    "A": "local_base_k2",
+    "B": "B_early",
+}
+
+_ABLATION_STRUCTURAL_KEYS: Tuple[str, ...] = (
+    "k1",
+    "k2",
+    "top_k",
+    "residual_scale",
+)
+
+_COST_RATIO_MATERIAL = 1.5
+
+
+def _common_step_metric_name(base_metric: str) -> Optional[str]:
+    """周期指标名 → 共同步数派生指标名；非周期指标返回 None。"""
+    if base_metric not in _COMMON_STEP_BASE_METRICS:
+        return None
+    return base_metric + _COMMON_STEP_METRIC_SUFFIX
+
+
+def _common_step_metric_base(metric: str) -> Optional[str]:
+    """共同步数派生指标名 → 原始周期指标名。"""
+    if not metric.endswith(_COMMON_STEP_METRIC_SUFFIX):
+        return None
+    base = metric[: -len(_COMMON_STEP_METRIC_SUFFIX)]
+    return base if base in _COMMON_STEP_BASE_METRICS else None
+
+
+def _stable_factor_key(value):
+    """
+    把因子值转换成可哈希、可比较的稳定表示。
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(_stable_factor_key(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return (
+            "set",
+            tuple(
+                sorted(
+                    (_stable_factor_key(item) for item in value),
+                    key=repr,
+                )
+            ),
+        )
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (
+                    (key, _stable_factor_key(item))
+                    for key, item in value.items()
+                ),
+                key=lambda pair: repr(pair[0]),
+            )
+        )
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("number", value)
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return ("number", int(value))
+        if math.isnan(value):
+            return ("nonfinite", "nan")
+        return ("number", value)
+    try:
+        hash(value)
+    except TypeError:
+        return ("unhashable", repr(value))
+    return ("value", value)
+
+
+def _row_factor_value(
+    row: Dict[str, object],
+    key: str,
+):
+    """
+    读取因子值：优先行级字段（mode/k1/k2/seed/...），
+    回退到受控变量协议（lr/batch_size/...）。
+    """
+    if key in row:
+        return row.get(key)
+
+    protocol = row.get("protocol") or {}
+    if isinstance(protocol, dict):
+        return protocol.get(key)
+
+    return None
+
+
+def _finite_float(value: object) -> Optional[float]:
+    """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
+    import math
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+_FACTOR_VALUE_ORDER = {
+    "off": 0,
+    "on": 1,
+    "local_base": 0,
+    "A": 1,
+    "B": 2,
+}
+
+
+def _finite_values(values: List[float]) -> Optional[List[float]]:
+    """把数值列表统一转成有限 float；任一值不可用则返回 None。"""
+    numeric: List[float] = []
+    for value in values:
+        number = _finite_float(value)
+        if number is None:
+            return None
+        numeric.append(number)
+    return numeric
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    """有限数值的算术平均；用缩放求和避免大数值溢出。"""
+    import math
+    numeric = _finite_values(values)
+    if not numeric:
+        return None
+    direct = sum(numeric) / max(len(numeric), 1)
+    if math.isfinite(direct):
+        return direct
+    scale = max(abs(value) for value in numeric)
+    if scale == 0.0:
+        return 0.0
+    total = math.fsum(value / scale for value in numeric)
+    result = (total / max(len(numeric), 1)) * scale
+    return result if math.isfinite(result) else None
+
+
+def _sample_std(values: List[float]) -> Optional[float]:
+    """样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时返回 None。"""
+    import math
+    numeric = _finite_values(values)
+    if numeric is None or len(numeric) < 2:
+        return None
+    try:
+        mean = (sum(numeric) / max(len(numeric), 1)) if numeric else float("nan")
+        variance = sum(
+            (value - mean) ** 2 for value in numeric
+        ) / (len(numeric) - 1)
+        direct = math.sqrt(max(0.0, variance))
+    except OverflowError:
+        direct = None
+    if (
+        direct is not None
+        and direct == 0.0
+        and any(v != numeric[0] for v in numeric)
+    ):
+        direct = None
+    if direct is not None and math.isfinite(direct):
+        return direct
+    scale = max(abs(v - numeric[0]) for v in numeric) if numeric else 1.0
+    if scale == 0.0:
+        return 0.0
+    total = math.fsum(((v - numeric[0]) / scale) ** 2 for v in numeric)
+    variance_scaled = total / (len(numeric) - 1)
+    result = math.sqrt(max(0.0, variance_scaled)) * scale
+    return result if math.isfinite(result) else None
 
 
 def ablation_coverage(

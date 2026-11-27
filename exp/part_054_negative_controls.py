@@ -7,7 +7,6 @@ import math
 
 from .part_021_comparison import compare_runs
 from .part_025_statistics import paired_t_test, welch_t_test, cohens_d, hedges_g
-from .part_026_equivalence import tost_equivalence
 from .part_023_factorial_helpers import _finite_float, _stable_factor_key
 from .part_029_ablation import factorial_effects
 from .part_031_ablation_coverage import ablation_coverage

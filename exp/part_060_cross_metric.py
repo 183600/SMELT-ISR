@@ -6,11 +6,15 @@ import math
 
 from .part_021_comparison import compare_runs, COMPARISON_METRIC_KEYS
 from .part_027_aggregation import aggregate_runs
-from .part_029_ablation import factorial_effects, mechanism_control_report
+from .part_029_ablation import (
+    factorial_effects,
+    mechanism_control_report,
+    _DELAYED_MERGE_MECHANISM_CONTROLS,
+)
 from .part_031_ablation_coverage import ablation_coverage
-from .part_030_factorial import _DELAYED_MERGE_MODES, _DELAYED_MERGE_MECHANISM_CONTROLS
+from .part_030_factorial import _DELAYED_MERGE_MODES
 from .part_023_factorial_helpers import _finite_float, _stable_factor_key
-from .part_025_statistics import metric_higher_is_better
+from .part_027_aggregation import metric_higher_is_better
 from .part_028_contrasts import factor_contrasts
 
 

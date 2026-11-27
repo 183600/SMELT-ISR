@@ -1,7 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import math
+from typing import Optional
 
+
+def _finite_float(value: object) -> Optional[float]:
+    """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        # JSON 允许任意大整数；float(10**400) 会溢出。分析
+        # 管线应把这种值当作不可用，而不是让整份报告崩溃。
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def _stable_factor_key(value):

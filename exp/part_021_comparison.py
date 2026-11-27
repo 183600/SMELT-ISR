@@ -4,6 +4,42 @@ from __future__ import annotations
 # entry point (set_seed(args.seed)); all stochastic paths use local
 # torch.Generator().manual_seed(...) and are unaffected.
 
+from pathlib import Path
+from typing import Tuple
+
+_COMMON_STEP_METRIC_SUFFIX = "_at_common_step"
+
+_COMMON_STEP_CORE_BASE_METRICS: Tuple[str, ...] = (
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "val_macro_nll",
+    "val_token_accuracy",
+    "val_micro_f1",
+    "val_macro_f1",
+    "val_weighted_f1",
+    "val_precision_macro",
+    "val_precision_weighted",
+    "val_recall_macro",
+    "val_recall_weighted",
+)
+
+_COMMON_STEP_OPTIONAL_BASE_METRICS: Tuple[str, ...] = (
+    "val_pr_auc_macro",
+    "val_pr_auc_macro_lift",
+    "val_roc_auc_macro",
+)
+
+_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+    _COMMON_STEP_CORE_BASE_METRICS + _COMMON_STEP_OPTIONAL_BASE_METRICS
+)
+
+_COMMON_STEP_METRICS: Tuple[str, ...] = tuple(
+    base + _COMMON_STEP_METRIC_SUFFIX
+    for base in _COMMON_STEP_BASE_METRICS
+)
+
+_CURVE_MEAN_METRIC = "val_loss_curve_mean_to_common_step"
 
 
 def bad_case_comparison_report(

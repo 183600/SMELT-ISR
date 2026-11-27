@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import functools
+from typing import List, Tuple, Optional, Sequence, Dict
+
 import numpy as np
 import torch
 
+_SIGNIFICANCE_LEVEL = 0.05
+_TARGET_POWER = 0.80
+_MIN_SEEDS_FOR_STATS = 3
 
 
 def _fragility_summary(
@@ -2050,3 +2056,38 @@ def _compute_cohens_d(group1, group2):
     # Hedges' g correction for small sample bias
     correction = 1 - 3 / (4 * (n1 + n2) - 9)
     return d * correction
+
+
+def welch_t_test(
+    values_a: List[float],
+    values_b: List[float],
+) -> Tuple[float, float]:
+    """Welch t-test returning (t_stat, p_value)."""
+    result = _welch_t_test(values_a, values_b)
+    if result.get("test") != "welch_t":
+        return 0.0, 1.0
+    t_stat = result.get("t")
+    p_value = result.get("p_value")
+    return float(t_stat) if t_stat is not None else 0.0, float(p_value) if p_value is not None else 1.0
+
+
+def cohens_d(group1: List[float], group2: List[float]) -> float:
+    """Cohen's d effect size with Hedges' g correction."""
+    return _compute_cohens_d(group1, group2)
+
+
+def hedges_g(group1: List[float], group2: List[float]) -> float:
+    """Hedges' g effect size (same as cohens_d with correction)."""
+    return _compute_cohens_d(group1, group2)
+
+
+def paired_t_test(
+    differences: List[float],
+) -> Tuple[float, float]:
+    """Paired t-test returning (t_stat, p_value)."""
+    result = _paired_t_test(differences)
+    if result.get("test") != "paired_t":
+        return 0.0, 1.0
+    t_stat = result.get("t")
+    p_value = result.get("p_value")
+    return float(t_stat) if t_stat is not None else 0.0, float(p_value) if p_value is not None else 1.0

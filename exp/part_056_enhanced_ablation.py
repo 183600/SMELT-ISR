@@ -6,16 +6,19 @@ import itertools
 
 from .part_021_comparison import compare_runs
 from .part_027_aggregation import aggregate_runs
-from .part_029_ablation import factorial_effects, mechanism_control_report
+from .part_029_ablation import (
+    factorial_effects,
+    mechanism_control_report,
+    _DELAYED_MERGE_MECHANISM_CONTROLS,
+)
 from .part_031_ablation_coverage import ablation_coverage
 from .part_030_factorial import (
     _DELAYED_MERGE_MODES,
-    _DELAYED_MERGE_MECHANISM_CONTROLS,
     _ABLATION_STRUCTURAL_KEYS,
 )
 from .part_023_factorial_helpers import _stable_factor_key, _finite_float, _row_factor_value
 from .part_028_contrasts import factor_contrasts
-from .part_025_statistics import metric_higher_is_better
+from .part_027_aggregation import metric_higher_is_better
 
 
 # Extended ablation factors beyond the basic (mode x balance_coef)
