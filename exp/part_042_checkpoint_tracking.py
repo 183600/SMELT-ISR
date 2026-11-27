@@ -833,6 +833,8 @@ def build_sweep_plan(
     default_mode: Optional[str] = None,
     ablation_modes: Optional[List[str]] = None,
     mechanism_controls: bool = False,
+    multi_scale_ablation: bool = False,
+    ablation_scales: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
     """
     构造运行计划。每个条目包含输出子目录名与逐运行覆盖的
@@ -848,7 +850,20 @@ def build_sweep_plan(
       单因素机制对照臂（local_base_k2 / B_early），同样跑两档
       均衡强度：2×2 主效应是多因素对比，延迟合并的机制归因
       必须由「只改合并时机/位置」的单因素对比支撑。
+    - ``multi_scale_ablation=True`` 时在多个规模上运行全因子消融，
+      每个规模跑完整的 (1+N)×2 设计，支持跨规模组件稳定性分析。
     """
+    from .part_053_multi_scale_ablation import build_multi_scale_ablation_plan
+
+    if multi_scale_ablation:
+        return build_multi_scale_ablation_plan(
+            seeds=seeds,
+            scales=ablation_scales or [],
+            ablation_modes=ablation_modes,
+            balance_coef=balance_coef,
+            mechanism_controls=mechanism_controls,
+        )
+
     plan: List[Dict[str, object]] = []
 
     if ablation:

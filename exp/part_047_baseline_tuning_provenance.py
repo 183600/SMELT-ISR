@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# Import paper config functions for multi-scale ablation
+from .part_000_config import PAPER_SCALES, paper_cell, paper_preset
 
 
 def load_baseline_tuning(path: Path) -> Dict[str, object]:
@@ -662,6 +668,38 @@ def build_sweep_execution(
     内臂如何排列」，并写入 design_plan.json。之后子进程核对
     同一份计划，事后无法把顺序/臂集合改成更有利的版本。
     """
+    # Load default ablation scales from paper config
+    from .part_000_config import PAPER_SCALES, paper_cell
+    from .part_053_multi_scale_ablation import DEFAULT_ABLATION_SCALES
+
+    ablation_scales = None
+    if getattr(args, "suite_ablation_scales", False):
+        scale_names = (
+            list(args.ablation_scales)
+            if getattr(args, "ablation_scales", None)
+            else list(PAPER_SCALES)
+        )
+        ablation_scales = []
+        for name in scale_names:
+            # Try to get config from paper cell (smelt architecture)
+            try:
+                cell = paper_cell(name, 95, "smelt")  # 95% sparsity as default
+                preset = paper_preset(name, 95, "smelt")
+                config = preset["config"]
+                ablation_scales.append({
+                    "name": name,
+                    "d_model": config["d_model"],
+                    "n_layers": config["n_layers"],
+                    "n_experts": config["n_experts"],
+                    "top_k": config["top_k"],
+                })
+            except Exception:
+                # Fallback to default scales
+                for default_scale in DEFAULT_ABLATION_SCALES:
+                    if default_scale["name"] == name:
+                        ablation_scales.append(default_scale)
+                        break
+
     plan = build_sweep_plan(
         seeds=list(args.seeds),
         modes=(
@@ -680,6 +718,8 @@ def build_sweep_execution(
         mechanism_controls=bool(
             getattr(args, "ablation_mechanism_controls", False)
         ),
+        multi_scale_ablation=bool(getattr(args, "suite_ablation_scales", False)),
+        ablation_scales=ablation_scales,
     )
     scheme, order_seed = resolve_run_order(args)
     prereg_record = getattr(args, "preregistration_record", None)

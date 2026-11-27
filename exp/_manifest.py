@@ -53,6 +53,14 @@ CORE_PARTS = [
     'part_050_meta.py',
     'part_051_repro_package.py',
     'part_052_conclusion_cards.py',
+    'part_053_multi_scale_ablation.py',
+    'part_054_negative_controls.py',
+    'part_055_sensitivity_analysis.py',
+    'part_056_enhanced_ablation.py',
+    'part_057_scaling_laws.py',
+    'part_058_cross_dataset.py',
+    'part_059_sequential_testing.py',
+    'part_060_cross_metric.py',
 ]
 MAIN_PARTS = [
     'part_000.py',
