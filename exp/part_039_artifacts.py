@@ -290,6 +290,7 @@ def verify_artifact_manifest(
         check_path = (
             target.parent if entry_type == "symlink" else target
         )
+        _resolve_failed = False
         try:
             check_path.resolve(strict=False).relative_to(
                 root_resolved
@@ -308,6 +309,28 @@ def verify_artifact_manifest(
                 error=str(error),
             )
             continue
+        else:
+            # Python >=3.13: Path.resolve(strict=False) 不再对符号
+            # 链接循环抛 RuntimeError，而是静默返回未解析的路径。
+            # 需要手动检测：沿路径向上找第一个不可 stat 的祖先，
+            # 若其自身是符号链接则说明存在循环。
+            p = check_path
+            while p != p.parent:
+                try:
+                    os.stat(p)
+                    break
+                except OSError:
+                    if os.path.islink(p):
+                        fail(
+                            relative,
+                            "path_resolution_error",
+                            error=f"symlink loop at {p}",
+                        )
+                        _resolve_failed = True
+                        break
+                p = p.parent
+            if _resolve_failed:
+                continue
         try:
             exists = target.exists()
             is_symlink = target.is_symlink()
