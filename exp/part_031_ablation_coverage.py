@@ -1098,7 +1098,11 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
     "val_loss_at_common_step": "unigram_loss",
     # 时均验证损失与 val_loss 同单位：unigram 的验证曲线是
     # 常数，因此其窗口均值仍是同一个 unigram_loss 稻草人。
-    _CURVE_MEAN_METRIC: "unigram_loss",
+    # 注意：此处必须使用字符串字面量而非变量引用，因为本文件可能被
+    # ``from .part_031_ablation_coverage import ...`` 方式直接导入，
+    # 此时 _CURVE_MEAN_METRIC（定义在 part_019_diagnostics.py 中）
+    # 不在本模块命名空间内。
+    "val_loss_curve_mean_to_common_step": "unigram_loss",
     "val_ppl": "unigram_loss",
     "val_bits_per_byte": "unigram_loss",
     # 类平衡似然：稻草人参考是同口径的 unigram macro NLL
@@ -1129,8 +1133,29 @@ _TRIVIAL_REFERENCE_FIELDS: Dict[str, str] = {
 # 共同步数派生指标与原始周期指标同单位，稻草人参考沿用同一
 # unigram 字段（例如 val_macro_f1_at_common_step 对应
 # unigram_macro_f1）；否则基线守卫会在派生指标上静默失效。
-for _base_metric in _COMMON_STEP_BASE_METRICS:
-    _derived_metric = _common_step_metric_name(_base_metric)
+# 注意：此处必须使用本地定义而非跨 part 变量引用，因为本文件可能被
+# ``from .part_031_ablation_coverage import ...`` 方式直接导入，
+# 此时 _COMMON_STEP_BASE_METRICS / _common_step_metric_name
+# （定义在 part_019_diagnostics.py 中）不在本模块命名空间内。
+_LOCAL_COMMON_STEP_BASE_METRICS: Tuple[str, ...] = (
+    "val_loss",
+    "val_ppl",
+    "val_bits_per_byte",
+    "val_macro_nll",
+    "val_token_accuracy",
+    "val_micro_f1",
+    "val_macro_f1",
+    "val_weighted_f1",
+    "val_precision_macro",
+    "val_precision_weighted",
+    "val_recall_macro",
+    "val_recall_weighted",
+    "val_pr_auc_macro",
+    "val_pr_auc_macro_lift",
+    "val_roc_auc_macro",
+)
+for _base_metric in _LOCAL_COMMON_STEP_BASE_METRICS:
+    _derived_metric = _base_metric + "_at_common_step"
     if (
         _derived_metric is not None
         and _derived_metric not in _TRIVIAL_REFERENCE_FIELDS
