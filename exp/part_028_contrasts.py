@@ -1,4 +1,5 @@
 from __future__ import annotations
+import numpy as np
 # NOTE: Module-level seed setting removed to prevent silent RNG state
 # reset on import. The centralized seed is set once by the experiment
 # entry point (set_seed(args.seed)); all stochastic paths use local
@@ -452,6 +453,159 @@ def _apply_multiple_comparison_correction(
     # CI 与它可能「看起来矛盾」。另附 Bonferroni 同时区间，
     # 让「校正后仍不含 0」有一个与家族规模一致的区间口径。
     _attach_family_adjusted_intervals(eligible)
+
+def _cross_metric_consistency_analysis(
+    contrasts: List[Dict[str, object]],
+    metric: str,
+) -> List[Dict[str, object]]:
+    """Check cross-metric consistency for each contrast.
+
+    For each contrast, checks whether multiple pre-registered metrics
+    point in the same direction. Returns contrasts with added
+    cross_metric_consistency fields.
+    """
+    from .part_025_statistics import _cross_metric_consistency_check
+
+    results = []
+    for contrast in contrasts:
+        # Skip confounded contrasts
+        if contrast.get("confounded"):
+            results.append(contrast)
+            continue
+
+        result = _cross_metric_consistency_check(contrast)
+        # Add the cross-metric consistency fields to the contrast
+        contrast["cross_metric_consistent"] = result.get("cross_metric_consistent", True)
+        contrast["cross_metric_divergent"] = result.get("cross_metric_divergent", False)
+        contrast["significant_metrics"] = result.get("significant_metrics", [])
+        contrast["metric_directions"] = result.get("metric_directions", {})
+        results.append(contrast)
+
+    return results
+
+
+def _routing_fdr_correction(
+    contrasts: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Apply Benjamini-Hochberg FDR correction to routing intervention p-values.
+
+    For each contrast with routing_interventions, applies BH correction
+    to the expert drop p-values, reporting adjusted p-values and FDR-significant
+    expert count.
+    """
+    import numpy as np
+
+    eligible: List[Tuple[Dict[str, object], List[float]]] = []
+    for contrast in contrasts:
+        interventions = contrast.get("routing_interventions")
+        if not isinstance(interventions, dict):
+            continue
+        p_values = interventions.get("expert_drop_p_values") or interventions.get(
+            "expert_drop_p_value"
+        )
+        if p_values is None or not isinstance(p_values, (list, tuple)):
+            continue
+        # Convert to list of floats, skipping invalid values
+        valid_p = []
+        for p in p_values:
+            fp = _finite_probability(p)
+            if fp is not None:
+                valid_p.append(fp)
+        if valid_p:
+            eligible.append((contrast, valid_p))
+
+    # Apply BH correction across all eligible contrasts
+    all_p_values: List[float] = []
+    for _contrast, pvals in eligible:
+        all_p_values.extend(pvals)
+
+    if not all_p_values:
+        # No routing p-values to correct
+        for contrast in contrasts:
+            contrast["routing_fdr_applied"] = False
+            contrast["routing_fdr_expert_count"] = 0
+            contrast["routing_fdr_threshold"] = 1.0
+        return contrasts
+
+    # Benjamini-Hochberg correction
+    m = len(all_p_values)
+    sorted_indices = np.argsort(all_p_values)
+    sorted_p = np.array([all_p_values[i] for i in sorted_indices])
+    ranks = np.arange(1, m + 1, dtype=float)
+    thresholds = 0.05 * ranks / m
+
+    # Find largest k where p_(k) <= alpha * k / n
+    rejected_sorted = sorted_p <= thresholds
+    k_max = 0
+    for i in range(m):
+        if rejected_sorted[i]:
+            k_max = i + 1
+
+    # Compute adjusted p-values
+    adjusted = np.empty(m)
+    for i in range(m):
+        min_ratio = np.min(all_p_values[sorted_indices[i:]] * m / (np.arange(i, m) + 1))
+        adjusted[sorted_indices[i]] = min(min_ratio, 1.0)
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    adjusted = np.minimum(adjusted, 1.0)
+
+    # Map adjusted p-values back to contrasts
+    contrast_adjusted: Dict[int, dict] = {}
+    contrast_expert_counts: Dict[int, int] = {}
+
+    pos = 0
+    for contrast, pvals in eligible:
+        contrast_id = id(contrast)
+        n_experts = len(pvals)
+
+        # Get adjusted p-values for this contrast's experts
+        contrast_p_adjusted = []
+        for j, p in enumerate(pvals):
+            # Find position in sorted array
+            p_rank = None
+            for k, sp in enumerate(sorted_p):
+                if abs(sp - p) < 1e-10:
+                    p_rank = k
+                    break
+            if p_rank is not None:
+                # BH adjusted p for this position
+                adj_p = min(1.0, all_p_values[sorted_indices[p_rank]] * m / (p_rank + 1))
+                # Apply accumulation - take min with all subsequent
+                for t in range(p_rank, m):
+                    adj_p = min(adj_p, all_p_values[sorted_indices[t]] * m / (t + 1))
+                contrast_p_adjusted.append(adj_p)
+            else:
+                contrast_p_adjusted.append(1.0)
+
+        # Count FDR-significant experts (adjusted p <= 0.05)
+        significant_count = sum(1 for p in contrast_p_adjusted if p <= 0.05)
+
+        contrast_adjusted[contrast_id] = {
+            "p_values": pvals,
+            "adjusted": contrast_p_adjusted,
+            "significant_count": significant_count,
+            "n_experts": n_experts,
+        }
+        contrast_expert_counts[contrast_id] = significant_count
+
+        # Update the contrast
+        contrast["routing_fdr_applied"] = True
+        contrast["routing_fdr_expert_count"] = significant_count
+        contrast["routing_fdr_threshold"] = 0.05
+        contrast["routing_fdr_significant_experts"] = [
+            p for p in contrast_p_adjusted if p <= 0.05
+        ]
+
+        pos += 1
+
+    # Fill in contrasts that weren't eligible
+    for contrast in contrasts:
+        if not contrast.get("routing_fdr_applied", False):
+            contrast["routing_fdr_applied"] = False
+            contrast["routing_fdr_expert_count"] = 0
+            contrast["routing_fdr_threshold"] = 1.0
+
+    return contrasts
 
 def _controlled_confound_keys_for_cells(
     cell_a: Dict[str, object],
@@ -915,6 +1069,7 @@ def factor_contrasts(
     # 家族的显著性判定必须在全部对比都生成后统一校正，
     # 否则先创建的对比不知道家族里还有多少检验。
     _apply_multiple_comparison_correction(contrasts)
+    contrasts = _cross_metric_consistency_analysis(contrasts, metric)
 
     return contrasts
 

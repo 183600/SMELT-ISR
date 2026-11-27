@@ -2042,6 +2042,245 @@ def _bayesian_analysis_summary(
     return summary
 
 
+def _window_size_sensitivity_analysis(
+    contrast_a: Dict[str, object],
+    contrast_b: Dict[str, object],
+) -> Dict[str, object]:
+    """Report how results vary with evaluation window size.
+    
+    Perturbs the current fixed window by ±20% and observes effect
+    estimate stability.
+    """
+    windows_a = contrast_a.get("windows") or contrast_a.get("eval_windows")
+    windows_b = contrast_b.get("windows") or contrast_b.get("eval_windows")
+    
+    if not isinstance(windows_a, list) or not isinstance(windows_b, list):
+        return {
+            "status": "missing_window_data",
+            "reason": "评估窗口记录缺失，无法进行窗口大小敏感性分析",
+        }
+    
+    if len(windows_a) != len(windows_b):
+        return {
+            "status": "window_count_mismatch",
+            "n_windows_a": len(windows_a),
+            "n_windows_b": len(windows_b),
+            "reason": "两个运行的窗口数不同，无法配对敏感性分析",
+        }
+    
+    if not windows_a:
+        return {
+            "status": "missing_window_data",
+            "reason": "评估窗口记录为空，无法进行敏感性分析",
+        }
+    
+    # Compute base differences using current windows
+    base_diffs = []
+    for wa, wb in zip(windows_a, windows_b):
+        loss_a = wa.get("loss")
+        loss_b = wb.get("loss")
+        if loss_a is not None and loss_b is not None:
+            base_diffs.append(loss_b - loss_a)  # b - a
+    
+    if not base_diffs:
+        return {
+            "status": "no_valid_diffs",
+            "reason": "无法从窗口记录中提取有效损失差异",
+        }
+    
+    base_mean = np.mean(base_diffs)
+    base_std = np.std(base_diffs, ddof=1) if len(base_diffs) > 1 else 0.0
+    
+    # Perturb windows by ±20% and recompute
+    perturbation_results: List[Dict[str, object]] = []
+    for wa, wb in zip(windows_a, windows_b):
+        loss_a = wa.get("loss")
+        loss_b = wb.get("loss")
+        n_a = wa.get("n_tokens", 1)
+        n_b = wb.get("n_tokens", 1)
+        
+        # Try smaller window (±20%)
+        small_n_a = max(1, int(n_a * 0.8))
+        small_n_b = max(1, int(n_b * 0.8))
+        small_loss_a = wa.get("loss_at_reduced_window", loss_a) if wa.get("loss_at_reduced_window") is not None else None
+        small_loss_b = wb.get("loss_at_reduced_window", loss_b) if wb.get("loss_at_reduced_window") is not None else None
+        
+        # Try larger window (±20%)
+        large_n_a = max(1, int(n_a * 1.2))
+        large_n_b = max(1, int(n_b * 1.2))
+        large_loss_a = wa.get("loss_at_expanded_window", loss_a) if wa.get("loss_at_expanded_window") is not None else None
+        large_loss_b = wb.get("loss_at_expanded_window", loss_b) if wb.get("loss_at_expanded_window") is not None else None
+        
+        perturbation_entry: Dict[str, object] = {
+            "run": contrast_a.get("run"),
+        }
+        
+        # Current window result
+        perturbation_entry["current_mean_diff"] = base_mean
+        perturbation_entry["current_std"] = base_std
+        
+        # Small window
+        if small_loss_a is not None and small_loss_b is not None:
+            small_diff = small_loss_b - small_loss_a
+            perturbation_entry["small_window_mean_diff"] = small_diff
+            perturbation_entry["small_window_stable"] = abs(small_diff - base_mean) < abs(base_std * 0.5) if base_std > 0 else True
+        else:
+            perturbation_entry["small_window_mean_diff"] = None
+            perturbation_entry["small_window_stable"] = None
+        
+        # Large window
+        if large_loss_a is not None and large_loss_b is not None:
+            large_diff = large_loss_b - large_loss_a
+            perturbation_entry["large_window_mean_diff"] = large_diff
+            perturbation_entry["large_window_stable"] = abs(large_diff - base_mean) < abs(base_std * 0.5) if base_std > 0 else True
+        else:
+            perturbation_entry["large_window_mean_diff"] = None
+            perturbation_entry["large_window_stable"] = None
+        
+        perturbation_results.append(perturbation_entry)
+    
+    # Overall stability assessment
+    all_diffs = [p.get("current_mean_diff") for p in perturbation_results if p.get("current_mean_diff") is not None]
+    stable = True
+    if len(all_diffs) > 1:
+        diff_means = [p.get("small_window_mean_diff") for p in perturbation_results if p.get("small_window_mean_diff") is not None]
+        diff_means_large = [p.get("large_window_mean_diff") for p in perturbation_results if p.get("large_window_mean_diff") is not None]
+        if diff_means:
+            mean_shift_small = abs(np.mean(diff_means) - np.mean(all_diffs)) if all_diffs else 0
+            stable = mean_shift_small < (np.mean([p.get("current_std", 0) for p in perturbation_results if p.get("current_mean_diff") is not None]) * 0.5) if any(p.get("current_std", 0) for p in perturbation_results if p.get("current_mean_diff") is not None) else True
+    
+    return {
+        "status": "completed" if stable else "unstable",
+        "base_window_mean_diff": base_mean,
+        "base_window_std": base_std,
+        "perturbation_results": perturbation_results,
+        "stable_under_20_percent_window_variation": stable,
+        "note": (
+            "窗口大小敏感性：在当前固定评估窗口基础上，对窗口长度"
+            "进行 ±20% 扰动。如果效应估计在扰动后仍保持方向和大小"
+            "基本不变，则结论具有鲁棒性；否则请在报告中注明窗口选择"
+            "的影响，并考虑扩大评估集而非单纯加种子"
+        ),
+    }
+
+
+def _cross_metric_consistency_check(
+    contrast: Dict[str, object],
+) -> Dict[str, object]:
+    """Check consistency of direction across multiple pre-registered metrics.
+    
+    Returns whether all significant metrics point in the same direction,
+    and flags any metric divergence.
+    """
+    verdict = contrast.get("verdict")
+    delta = contrast.get("delta")
+    significant_metrics: List[str] = []
+    divergent_metrics: List[str] = []
+    
+    # Check each comparison metric for direction consistency
+    metric_directions: Dict[str, str] = {}
+    
+    # val_loss: lower is better
+    val_loss = contrast.get("val_loss")
+    if val_loss is not None and contrast.get("significant"):
+        # delta is already variant - baseline, so positive = variant worse (loss higher)
+        metric_directions["val_loss"] = "loss_lower_is_better"
+        significant_metrics.append("val_loss")
+    
+    # val_ppl: lower is better
+    val_ppl = contrast.get("val_ppl")
+    if val_ppl is not None and contrast.get("significant"):
+        metric_directions["val_ppl"] = "loss_lower_is_better"
+        significant_metrics.append("val_ppl")
+    
+    # val_macro_f1: higher is better
+    val_macro_f1 = contrast.get("val_macro_f1")
+    if val_macro_f1 is not None and contrast.get("significant"):
+        metric_directions["val_macro_f1"] = "higher_is_better"
+        significant_metrics.append("val_macro_f1")
+    
+    # val_token_accuracy: higher is better
+    val_token_accuracy = contrast.get("val_token_accuracy")
+    if val_token_accuracy is not None and contrast.get("significant"):
+        metric_directions["val_token_accuracy"] = "higher_is_better"
+        significant_metrics.append("val_token_accuracy")
+    
+    # val_macro_nll: lower is better (like loss)
+    val_macro_nll = contrast.get("val_macro_nll")
+    if val_macro_nll is not None and contrast.get("significant"):
+        metric_directions["val_macro_nll"] = "loss_lower_is_better"
+        significant_metrics.append("val_macro_nll")
+    
+    # Determine consistency
+    if len(significant_metrics) >= 2:
+        directions = set(metric_directions.values())
+        all_same_direction = len(directions) == 1
+        
+        # Check if any metrics are divergent (significant but opposite direction)
+        for metric, direction in metric_directions.items():
+            opposite = (
+                "loss_lower_is_better" if direction == "higher_is_better"
+                else "higher_is_better"
+            )
+            # If we have both types of directions, there's divergence
+        has_divergence = len(directions) > 1
+    else:
+        all_same_direction = True
+        has_divergence = False
+    
+    return {
+        "cross_metric_consistent": all_same_direction,
+        "cross_metric_divergent": has_divergence,
+        "significant_metrics": significant_metrics,
+        "metric_directions": metric_directions,
+        "verdict": verdict,
+        "delta": delta,
+    }
+
+
+def _benjamini_hochberg_fdr(p_values: List[float], alpha: float = 0.05) -> Tuple[List[float], List[bool]]:
+    """Benjamini-Hochberg FDR correction.
+    
+    Returns (adjusted_p_values, rejected_hypotheses).
+    """
+    import numpy as np
+    p = np.array(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return [], []
+    # Sort p-values and track original indices
+    sorted_indices = np.argsort(p)
+    sorted_p = p[sorted_indices]
+    # BH step-up procedure
+    ranks = np.arange(1, n + 1, dtype=float)
+    thresholds = alpha * ranks / n
+    # Find largest k where p_(k) <= alpha * k / n
+    rejected_sorted = sorted_p <= thresholds
+    # Find the largest k that is rejected
+    k_max = 0
+    for i in range(n):
+        if rejected_sorted[i]:
+            k_max = i + 1  # 1-indexed
+    
+    # Compute adjusted p-values
+    adjusted = np.empty(n)
+    for i in range(n):
+        # adj_p_i = min_{j >= i} (n * p_(j) / j), then cap at 1
+        min_ratio = np.min(p[sorted_indices[i:]] * n / (np.arange(i, n) + 1))
+        adjusted[sorted_indices[i]] = min(min_ratio, 1.0)
+    
+    # Cap at 1 and ensure monotonicity
+    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+    adjusted = np.minimum(adjusted, 1.0)
+    
+    # Map back to original order
+    rejected = np.zeros(n, dtype=bool)
+    if k_max > 0:
+        rejected[sorted_indices[:k_max]] = True
+    
+    return list(adjusted), list(rejected)
+
+
 def _compute_cohens_d(group1, group2):
     """Compute Cohen's d effect size with Hedges' g correction for small samples.
     

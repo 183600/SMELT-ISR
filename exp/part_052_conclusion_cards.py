@@ -313,6 +313,8 @@ def _card_markdown(card: Dict[str, object]) -> str:
         f"power@effect={_format_finite(power.get('power_at_effect'))}，"
         f"检出约需种子={power.get('seeds_to_detect')}",
         f"- 脆弱性：{(card.get('fragility') or {}).get('verdict')}",
+        f"- 跨指标一致性：{'一致' if contrast.get('cross_metric_consistent') else '不一致（' + ', '.join(contrast.get('significant_metrics', [])) + '}' if contrast.get('cross_metric_divergent') else '待定'}",
+        f"- FDR校正专家数：{contrast.get('routing_fdr_expert_count', 0)}/{contrast.get('routing_fdr_threshold', 1.0) * 100:.0f}%阈值",
     ]
     bayesian = card.get("bayesian")
     if isinstance(bayesian, dict) and bayesian.get("available"):
