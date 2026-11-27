@@ -2265,14 +2265,16 @@ def _benjamini_hochberg_fdr(p_values: List[float], alpha: float = 0.05) -> Tuple
     # Compute adjusted p-values
     adjusted = np.empty(n)
     for i in range(n):
-        # adj_p_i = min_{j >= i} (n * p_(j) / j), then cap at 1
+        # adj_p_i = min_{j >= i} (n * p_(j) / j), then cap at 1。
+        # 该逐元素取 min 已含 step-up 单调化；单调性定义在排序
+        # 秩上，映射回原顺序后不能再按原索引顺序做 accumulate
+        # （那会把无关假设的校正 p 值错误地串改，如 p=[0.5, 0.01]
+        # 会被改成 [0.02, 0.02]）。
         min_ratio = np.min(p[sorted_indices[i:]] * n / (np.arange(i, n) + 1))
         adjusted[sorted_indices[i]] = min(min_ratio, 1.0)
-    
-    # Cap at 1 and ensure monotonicity
-    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
+
     adjusted = np.minimum(adjusted, 1.0)
-    
+
     # Map back to original order
     rejected = np.zeros(n, dtype=bool)
     if k_max > 0:
