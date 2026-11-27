@@ -291,23 +291,22 @@ def analyze_sequential_look(
 
     if factorial.get("applicable"):
         for effect in factorial.get("effects", []):
-            if not effect.get("significant"):
-                continue
-
             comp_name = effect.get("effect_name")
             t_stat = _finite_float(effect.get("t"))
             p_val = _finite_float(effect.get("p_value"))
             mean_effect = _finite_float(effect.get("mean_effect"))
             se = _finite_float(effect.get("se"))
+            df = _finite_float(effect.get("df"))
 
             if t_stat is None or p_val is None:
                 continue
 
             # Two-sided z-approximation
             z = abs(t_stat)
+            significant = bool(effect.get("significant"))
 
-            # Efficacy: z > efficacy boundary
-            if z > efficacy_z:
+            # Efficacy: Holm 校正显著且 z > efficacy boundary
+            if significant and z > efficacy_z:
                 result["stop_for_efficacy"] = True
                 result["components"][comp_name] = {
                     "z": z,
@@ -316,9 +315,17 @@ def analyze_sequential_look(
                     "verdict": "efficacy",
                 }
 
-            # Futility: conditional power low
-            elif z < futility_z and se is not None and mean_effect is not None:
-                # Conditional power at current effect
+            # Futility: 未达显著性且条件功效不足。futility 判定
+            # 必须覆盖「不显著」的效应——显著效应不可能同时是
+            # 无效信号；z < futility_z(futility_z=0) 对 z=|t| 恒假，
+            # 以条件功效 cp < 0.2 为可判定的无效准则。
+            if (
+                not significant
+                and comp_name not in result["components"]
+                and se is not None
+                and mean_effect is not None
+                and se > 0.0
+            ):
                 cp = conditional_power(mean_effect, se, alpha, z)
                 if cp < 0.2:  # Low conditional power
                     result["stop_for_futility"] = True
@@ -330,13 +337,38 @@ def analyze_sequential_look(
                         "verdict": "futility",
                     }
 
-            # Equivalence
-            if equivalence_margin is not None and equivalence_margin > 0:
-                # Check if effect is within equivalence bounds with high confidence
-                if abs(mean_effect) < equivalence_margin and z < efficacy_z:
-                    # Could also use TOST here
-                    result["components"][comp_name] = result["components"].get(comp_name, {})
-                    result["components"][comp_name]["equivalence_check"] = True
+            # Equivalence: 效应落在等价界内且 TOST 在 alpha 水平
+            # 显著（均值与 TOST 双条件），才宣布等价并提前停止；
+            # 只检查 |effect| < margin 不足以排除「界内但不精确」。
+            if (
+                equivalence_margin is not None
+                and equivalence_margin > 0
+                and mean_effect is not None
+                and se is not None
+                and df is not None
+                and se > 0.0
+                and z < efficacy_z
+            ):
+                tost = _tost_test(
+                    mean_effect,
+                    se,
+                    df,
+                    float(equivalence_margin),
+                    alpha,
+                )
+                tost_p = (
+                    _finite_float(tost.get("tost_p_value"))
+                    if isinstance(tost, dict)
+                    else None
+                )
+                entry = result["components"].setdefault(comp_name, {})
+                entry["equivalence_check"] = bool(
+                    tost_p is not None and tost_p <= alpha
+                )
+                if tost_p is not None:
+                    entry["tost_p_value"] = tost_p
+                if entry["equivalence_check"] and abs(mean_effect) < equivalence_margin:
+                    result["stop_for_equivalence"] = True
 
     return result
 
