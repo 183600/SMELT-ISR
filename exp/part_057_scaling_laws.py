@@ -505,8 +505,12 @@ def analyze_isoflops_results(
                 for i in range(len(x_vals) - 1):
                     if x_vals[i] <= log_target <= x_vals[i + 1]:
                         # Linear interpolation in log-log space
-                        t = (log_target - x_vals[i]) / (x_vals[i + 1] - x_vals[i])
-                        interp_y = y_vals[i] + t * (y_vals[i + 1] - y_vals[i])
+                        denom = x_vals[i + 1] - x_vals[i]
+                        if denom == 0:
+                            interp_y = y_vals[i]
+                        else:
+                            t = (log_target - x_vals[i]) / denom
+                            interp_y = y_vals[i] + t * (y_vals[i + 1] - y_vals[i])
                         interpolated[target] = interp_y
                         break
                 else:

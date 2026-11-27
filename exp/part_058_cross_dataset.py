@@ -241,9 +241,13 @@ def run_meta_analysis(
         # Heterogeneity (Q statistic)
         Q = sum(e["weight"] * (e["effect"] - fixed_effect) ** 2 for e in effects)
         df = len(effects) - 1
-        p_het = 1.0  # Simplified - would need chi-square CDF
-        if Q > df:
-            p_het = 0.05  # Placeholder
+        # Chi-square survival approximation (Wilson-Hilferty normal approx)
+        if df > 0 and Q > 0:
+            z_wh = ((Q / df) ** (1.0 / 3.0) - (1.0 - 2.0 / (9.0 * df))) / math.sqrt(2.0 / (9.0 * df))
+            p_het = 0.5 * math.erfc(z_wh / math.sqrt(2))
+            p_het = max(0.0, min(1.0, p_het))
+        else:
+            p_het = 1.0
 
         # Random-effects (DerSimonian-Laird)
         tau2 = max(0, (Q - df) / (total_weight - sum(e["weight"]**2 for e in effects) / total_weight)) if total_weight > 0 else 0

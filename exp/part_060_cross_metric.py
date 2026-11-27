@@ -324,9 +324,10 @@ def analyze_metric_agreement(
                 x_mean = sum(x_vals) / n
                 y_mean = sum(y_vals) / n
                 x_var = sum((x - x_mean) ** 2 for x in x_vals)
-                if x_var > 0:
+                y_var = sum((y - y_mean) ** 2 for y in y_vals)
+                if x_var > 0 and y_var > 0:
                     xy_cov = sum((x - x_mean) * (y - y_mean) for x, y in pairs)
-                    corr = xy_cov / math.sqrt(x_var * sum((y - y_mean) ** 2 for y in y_vals))
+                    corr = xy_cov / math.sqrt(x_var * y_var)
                     agreement["metric_correlations"][f"{m1}_vs_{m2}"] = corr
 
     # Overall agreement

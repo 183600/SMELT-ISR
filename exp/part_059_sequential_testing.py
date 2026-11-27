@@ -352,18 +352,26 @@ def conditional_power(
     Compute conditional power given current data.
 
     Probability of rejecting H0 at final analysis given current effect estimate.
+    Uses current_z directly (avoids redundant recomputation from observed_effect/se).
+
+    Note: This computes power assuming the current effect is the true effect
+    at the *final* sample size. It does not account for information fraction
+    (interim vs. planned sample size); callers should interpret the result
+    accordingly. For interim monitoring with known information fraction t,
+    the drift-adjusted expected final z would be current_z / sqrt(t).
     """
     z_alpha = _t_critical(float('inf'), alpha / 2) or 1.96
 
-    # Expected final z = current_z * sqrt(info_fraction) + expected_increment
-    # Simplified: assume current effect is true effect
-    expected_final_z = abs(observed_effect) / se
+    # Use current_z directly — equivalent to abs(observed_effect) / se
+    # but avoids redundant division and respects the caller's z computation
+    # (which may include bias corrections or pooled variance).
+    expected_final_z = abs(current_z)
 
     # Power = P(Z > z_alpha - expected_final_z) + P(Z < -z_alpha - expected_final_z)
-    # Using normal approximation
-    from math import erf, sqrt
-    power = 0.5 * (1 + erf((expected_final_z - z_alpha) / sqrt(2))) + \
-            0.5 * (1 + erf((-expected_final_z - z_alpha) / sqrt(2)))
+    # Using normal approximation (erfc for numerical stability in tails)
+    from math import erfc, sqrt
+    power = 0.5 * erfc((z_alpha - expected_final_z) / sqrt(2)) + \
+            0.5 * erfc((z_alpha + expected_final_z) / sqrt(2))
 
     return max(0.0, min(1.0, power))
 
