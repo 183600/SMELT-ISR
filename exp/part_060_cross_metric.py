@@ -239,6 +239,31 @@ def analyze_cross_metric_consistency(
     return report
 
 
+def _primary_evidence_entry(
+    summary: object,
+) -> Optional[Dict[str, object]]:
+    """
+    从组件的 primary 汇总里取主效应证据条目。
+
+    ``ablation_component_verdicts`` 的 ``primary`` 是
+    ``_component_evidence_summary`` 的输出（status/reason/
+    evidence），效应量与显著性在 ``evidence`` 列表里，不在
+    顶层；跨指标对比必须从那里取，否则永远拿不到 mean_effect。
+    """
+    if not isinstance(summary, dict):
+        return None
+    evidence = summary.get("evidence")
+    if not isinstance(evidence, list):
+        return None
+    for entry in evidence:
+        if (
+            isinstance(entry, dict)
+            and entry.get("mean_effect") is not None
+        ):
+            return entry
+    return None
+
+
 def analyze_metric_agreement(
     per_metric: Dict[str, Dict[str, object]],
     metrics: List[str],
@@ -261,13 +286,27 @@ def analyze_metric_agreement(
 
         for metric in metrics:
             data = per_metric.get(metric, {})
-            verdicts = data.get("verdicts", {})
+            # 指标不在 COMPARISON_METRIC_KEYS 等情况下 verdicts
+            # 会以 None 存在（键存在但值为 None），这里必须同时
+            # 处理「键缺失」与「键存在但为 None」，否则 .get 会
+            # 在 None 上抛 AttributeError。
+            verdicts = data.get("verdicts") or {}
             for c in verdicts.get("components", []):
                 if c.get("component") == comp:
                     metric_verdicts[metric] = c.get("status")
-                    primary = c.get("primary", {})
-                    metric_effects[metric] = primary.get("mean_effect")
-                    metric_significant[metric] = primary.get("significant", False)
+                    entry = _primary_evidence_entry(
+                        c.get("primary")
+                    )
+                    metric_effects[metric] = (
+                        entry.get("mean_effect")
+                        if entry is not None
+                        else None
+                    )
+                    metric_significant[metric] = bool(
+                        entry.get("significant", False)
+                        if entry is not None
+                        else False
+                    )
                     break
 
         if len(metric_verdicts) < 2:
@@ -313,10 +352,14 @@ def analyze_metric_agreement(
     # Metric correlations (effect size correlations)
     for i, m1 in enumerate(metrics):
         for m2 in metrics[i+1:]:
-            e1 = {c: agreement["components"][c]["metric_effects"].get(m1)
-                  for c in components if c in agreement["components"]}
-            e2 = {c: agreement["components"][c]["metric_effects"].get(m2)
-                  for c in components if c in agreement["components"]}
+            # 某组件证据不足时 agreement["components"][c] 只有
+            # {"applicable": False, "reason": ...}，没有
+            # metric_effects 键：统一用 .get 兜底，不能让相关
+            # 性计算在部分组件缺失时 KeyError。
+            e1 = {c: agreement["components"].get(c, {}).get("metric_effects", {}).get(m1)
+                  for c in components}
+            e2 = {c: agreement["components"].get(c, {}).get("metric_effects", {}).get(m2)
+                  for c in components}
 
             pairs = [(e1[c], e2[c]) for c in components
                      if e1.get(c) is not None and e2.get(c) is not None]
@@ -391,19 +434,48 @@ def decision_theoretic_evaluation(
         evidence = []
         for metric in metrics:
             data = per_metric.get(metric, {})
-            verdicts = data.get("verdicts", {})
+            # 与 analyze_metric_agreement 相同：verdicts 可能是
+            # 键存在但值为 None，必须兜底成空 dict。
+            verdicts = data.get("verdicts") or {}
             for c in verdicts.get("components", []):
                 if c.get("component") == comp:
-                    primary = c.get("primary", {})
-                    mean_effect = primary.get("mean_effect")
-                    p_val = primary.get("p_value")
-                    significant = primary.get("significant", False)
+                    entry = _primary_evidence_entry(
+                        c.get("primary")
+                    )
+                    mean_effect = (
+                        entry.get("mean_effect")
+                        if entry is not None
+                        else None
+                    )
+                    # 证据条目里的显著性 p 值是 Holm 校正后的
+                    # p_value_holm（不存在裸 p_value 键）。
+                    p_val = (
+                        entry.get("p_value_holm")
+                        if entry is not None
+                        else None
+                    )
+                    significant = bool(
+                        entry.get("significant", False)
+                        if entry is not None
+                        else False
+                    )
                     if mean_effect is not None:
+                        # 效应符号是原始指标单位：lower-is-better
+                        # 指标（val_loss 等）的正效应是变差，不
+                        # 能当成「支持有效」。方向判定必须按指标
+                        # 的 higher_is_better 口径折算，与
+                        # ablation_component_verdicts 的 claim
+                        # 一致。
+                        improves = (
+                            (mean_effect > 0)
+                            == metric_higher_is_better(metric)
+                        )
                         evidence.append({
                             "metric": metric,
                             "effect": mean_effect,
                             "p": p_val,
                             "significant": significant,
+                            "improves": improves,
                         })
                     break
 
@@ -422,11 +494,11 @@ def decision_theoretic_evaluation(
         likelihood_ineffective = 1.0
 
         for e in evidence:
-            if e["significant"] and e["effect"] > 0:
+            if e["significant"] and e["improves"]:
                 # Supports effectiveness
                 likelihood_effective *= 0.8  # Power-like
                 likelihood_ineffective *= 0.05  # Type I error
-            elif e["significant"] and e["effect"] < 0:
+            elif e["significant"] and not e["improves"]:
                 # Supports harm
                 likelihood_effective *= 0.01
                 likelihood_ineffective *= 0.8
