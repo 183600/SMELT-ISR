@@ -38,26 +38,11 @@ _COMMON_STEP_METRICS: Tuple[str, ...] = tuple(
 
 _CURVE_MEAN_METRIC = "val_loss_curve_mean_to_common_step"
 
-COMPARISON_METRIC_KEYS: Tuple[str, ...] = (
-    "val_loss",
-    "val_loss_at_matched_flops",
-    *_COMMON_STEP_METRICS,
-    _CURVE_MEAN_METRIC,
-    "val_ppl",
-    "val_bits_per_byte",
-    "val_macro_nll",
-    "val_token_accuracy",
-    "val_micro_f1",
-    "val_macro_f1",
-    "val_weighted_f1",
-    "val_precision_macro",
-    "val_precision_weighted",
-    "val_recall_macro",
-    "val_recall_weighted",
-    "val_pr_auc_macro",
-    "val_pr_auc_macro_lift",
-    "val_roc_auc_macro",
-)
+# 注意：这里不再重复定义 COMPARISON_METRIC_KEYS——part_021_comparison
+# 的定义（含 _ROUTING_ROW_FIELDS 路由诊断指标追加）是唯一权威版本；
+# 过去在此处的重新定义会在 exec 组合时覆盖掉路由字段，导致
+# hypothesis_metric_unverifiable 把 jaccard 等误判为不可判定、
+# aggregate_runs 默认不再聚合路由指标。
 
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
