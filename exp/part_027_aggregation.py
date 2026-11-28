@@ -1,5 +1,24 @@
 from __future__ import annotations
 
+from .helpers import (
+    _finite_float,
+    _finite_values,
+    _mean,
+    _median,
+    _sample_std,
+    _stable_factor_key,
+    _factor_sort_rank,
+    _row_factor_value,
+    _format_factor_value,
+    _randomization_seed,
+    _MIN_SEEDS_FOR_STATS,
+    _RANDOMIZATION_EXACT_MAX_N,
+    _RANDOMIZATION_MONTE_CARLO_REPLICATES,
+    _SIGNIFICANCE_LEVEL,
+    _TARGET_POWER,
+    _FACTOR_VALUE_ORDER,
+)
+
 from typing import Dict, List, Tuple
 
 from .part_019_diagnostics import _is_deterministic_run
@@ -66,48 +85,6 @@ _LOWER_IS_BETTER_METRICS = {
 _MIN_SEEDS_FOR_STATS = 3
 
 
-def _stable_factor_key(value):
-    """
-    把因子值转换成可哈希、可比较的稳定表示。
-    """
-    if isinstance(value, (list, tuple)):
-        return tuple(_stable_factor_key(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return (
-            "set",
-            tuple(
-                sorted(
-                    (_stable_factor_key(item) for item in value),
-                    key=repr,
-                )
-            ),
-        )
-    if isinstance(value, dict):
-        return tuple(
-            sorted(
-                (
-                    (key, _stable_factor_key(item))
-                    for key, item in value.items()
-                ),
-                key=lambda pair: repr(pair[0]),
-            )
-        )
-    if isinstance(value, bool):
-        return ("bool", value)
-    if isinstance(value, int):
-        return ("number", value)
-    if isinstance(value, float):
-        import math
-        if math.isfinite(value) and value.is_integer():
-            return ("number", int(value))
-        if math.isnan(value):
-            return ("nonfinite", "nan")
-        return ("number", value)
-    try:
-        hash(value)
-    except TypeError:
-        return ("unhashable", repr(value))
-    return ("value", value)
 
 
 def _row_factor_value(
@@ -128,18 +105,6 @@ def _row_factor_value(
     return None
 
 
-def _finite_float(value: object) -> Optional[float]:
-    """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
-    import math
-    if isinstance(value, bool):
-        return None
-    try:
-        numeric = float(value)
-    except (OverflowError, TypeError, ValueError):
-        return None
-    if not math.isfinite(numeric):
-        return None
-    return numeric
 
 
 def _format_factor_value(value) -> str:
@@ -178,84 +143,566 @@ def _factor_sort_rank(value):
 # _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
 # 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
 
-def _finite_values(values: List[float]) -> Optional[List[float]]:
-    """把数值列表统一转成有限 float；任一值不可用则返回 None。"""
-    numeric: List[float] = []
-    for value in values:
-        number = _finite_float(value)
-        if number is None:
-            return None
-        numeric.append(number)
-    return numeric
 
 
-def _mean(values: List[float]) -> Optional[float]:
-    """有限数值的算术平均；用缩放求和避免大数值溢出。"""
-    import math
-    numeric = _finite_values(values)
-    if not numeric:
-        return None
-    direct = sum(numeric) / max(len(numeric), 1)
-    if math.isfinite(direct):
-        return direct
-    scale = max(abs(value) for value in numeric)
-    if scale == 0.0:
-        return 0.0
-    total = math.fsum(value / scale for value in numeric)
-    result = (total / max(len(numeric), 1)) * scale
-    return result if math.isfinite(result) else None
-
-
-def _sample_std(values: List[float]) -> Optional[float]:
+def _factor_sort_rank(value):
     """
-    样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时
-    返回 None。与 part_023_factorial_helpers / part_031 的权威
-    实现保持同一算法（缩放时围绕均值，而不是对首元素求偏差）。
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
     """
-    import math
-    numeric = _finite_values(values)
-    if numeric is None or len(numeric) < 2:
-        return None
-    try:
-        mean = (sum(numeric) / max(len(numeric), 1)) if numeric else float("nan")
-        variance = sum(
-            (value - mean) ** 2 for value in numeric
-        ) / (len(numeric) - 1)
-        direct = math.sqrt(max(0.0, variance))
-    except OverflowError:
-        direct = None
-    if (
-        direct is not None
-        and math.isfinite(direct)
-        and (
-            direct > 0.0
-            or all(value == numeric[0] for value in numeric)
-        )
-    ):
-        return direct
-    scale = max(abs(value) for value in numeric)
-    if scale == 0.0:
-        return 0.0
-    normalized = [value / scale for value in numeric]
-    mean = (math.fsum(normalized) / max(len(normalized), 1)) if normalized else float("nan")
-    variance = math.fsum(
-        (value - mean) ** 2 for value in normalized
-    ) / (len(normalized) - 1)
-    if not math.isfinite(variance) or variance < 0.0:
-        return None
-    result = math.sqrt(max(0.0, variance)) * scale
-    if math.isfinite(result):
-        return result
-    # 所有缩放方案都失败，回退到一个保守的估计
-    # 对于两个值，std = |a-b|/sqrt(2) 是不可能的（ddof=1时std=|a-b|/sqrt(2)）
-    # 对于一般情况，返回范围的半部作为保守估计
-    n = len(numeric)
-    if n >= 2:
-        conservative = (max(numeric) - min(numeric)) / (2.0 * math.sqrt(max(n - 1, 1)))
-        if math.isfinite(conservative):
-            return conservative
-        return None
-    return None
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _format_factor_value(value) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _format_factor_value(value) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+def _factor_sort_rank(value):
+    """
+    因子值的排序键：数值 < 已知模式顺序 < 其他字符串。
+    """
+    if value is None:
+        return (3, 0.0, "")
+    if isinstance(value, bool):
+        return (2, float(value), "")
+    if isinstance(value, int):
+        return (0, value, "")
+    if isinstance(value, float):
+        import math
+        if math.isfinite(value) and value.is_integer():
+            return (0, int(value), "")
+        if math.isnan(value):
+            return (0, float("inf"), "nan")
+        return (0, value, "")
+    if isinstance(value, str) and value in _FACTOR_VALUE_ORDER:
+        return (1, float(_FACTOR_VALUE_ORDER[value]), value)
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (4, 0.0, repr(value))
+
+
+
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
+
+
+
+
+
 
 
 def metric_higher_is_better(metric: str) -> bool:

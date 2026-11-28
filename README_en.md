@@ -25,7 +25,7 @@ SMELT-ISR is a routing-improvement experiment built on the [SMELT](https://arxiv
 The repository provides the following baselines and schemes:
 
 - `base`: the paper's unlooped MoE baseline (middle span executed once).
-- `smelt`: the original SMELT architecture (middle layers loop twice, merged immediately each round; with `--residual-scaling paper`, sublayer residuals inside the looped span are scaled by 1/r).
+- `smelt`: the original SMELT architecture (middle layers loop twice; with `--residual-scaling paper`, sublayer residuals inside the looped span are scaled by 1/r).
 - `A` / `B`: delayed-merge schemes (local / global).
 - Plus mechanism controls `local_base`, `local_base_k2`, `B_early` and the dense baseline `dense`.
 

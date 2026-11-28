@@ -23,7 +23,7 @@ python experiment.py \
   --hypothesis "延迟合并在完整计算图匹配下改善验证损失"
 ```
 
-`--plan-design` 只生成并打印计划，**不加载数据、不训练**：
+`--plan-design` 只生成并打印计划，**不加载数据、不训绋**：
 
 - 每个运行单元的 label / mode / seed / balance 系数；
 - 执行顺序、种子区组与区组内位置，以及位置/一阶 carryover

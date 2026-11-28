@@ -25,8 +25,8 @@ SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Trans
 
 仓库提供以下基线与方案：
 
-- `base`：论文的未循环 MoE 基线（middle 只执行一次）。
-- `smelt`：原始 SMELT 架构（middle 循环两次；`--residual-scaling paper` 时循环区域子层残差按 1/r 缩放）。
+- `base`：论文的未循环 MoE 基线（middle 仅执行一次）。
+- `smelt`：原始 SMELT 架构（middle 层循环两次；`--residual-scaling paper` 时，循环区域子层残差按 1/r 缩放）。
 - `A` / `B`：延迟合并方案（局部 / 全局）。
 - 以及配套的机制对照 `local_base`、`local_base_k2`、`B_early` 与稠密基线 `dense`。
 
@@ -35,11 +35,11 @@ SMELT-ISR 基于 [SMELT](https://arxiv.org/html/2609.01343v1)（Sparse MoE Trans
 （详见「论文口径与复现边界」）。`config.json` 的 `paper_fidelity` 会逐项报告
 `architecture_faithful`、`protocol_faithful` 与 `budget_audit`。
 
-原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，核心思想如下：
+原版 SMELT 在循环执行中间层时，每轮 MoE 的专家输出会立即合并。本项目提出了一种 **延迟合并** 机制，其核心思想如下：
 
 1. **第一轮路由后不合并**：Top-$k_1$ 专家的输出保留为独立分支，不进行求和或拼接。
 2. **第二轮独立路由**：针对每个第一轮分支的状态，分别独立进行第二轮 Top-$k_2$ 专家路由。
-3. **最终聚合**：只有在完整第二轮结束后，才跨第一轮分支进行结果合并。
+3. **最终聚合**：仅在完整第二轮结束后，才跨第一轮分支进行结果合并。
 
 该结构旨在探索延迟合并是否能提高专家组合的表达能力，并验证不同分支是否能形成完全独立的计算轨迹。
 
