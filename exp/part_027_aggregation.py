@@ -244,7 +244,18 @@ def _sample_std(values: List[float]) -> Optional[float]:
     if not math.isfinite(variance) or variance < 0.0:
         return None
     result = math.sqrt(max(0.0, variance)) * scale
-    return result if math.isfinite(result) else None
+    if math.isfinite(result):
+        return result
+    # 所有缩放方案都失败，回退到一个保守的估计
+    # 对于两个值，std = |a-b|/sqrt(2) 是不可能的（ddof=1时std=|a-b|/sqrt(2)）
+    # 对于一般情况，返回范围的半部作为保守估计
+    n = len(numeric)
+    if n >= 2:
+        conservative = (max(numeric) - min(numeric)) / (2.0 * math.sqrt(max(n - 1, 1)))
+        if math.isfinite(conservative):
+            return conservative
+        return None
+    return None
 
 
 def metric_higher_is_better(metric: str) -> bool:
