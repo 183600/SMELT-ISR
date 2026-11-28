@@ -12,16 +12,18 @@ CARD_SCHEMA = "smelt-isr/conclusion-card/v1"
 
 
 def _finite_float(value: object) -> Optional[float]:
-    """将值转为 float；非有限值返回 None。"""
-    if value is None:
+    """把数值/布尔以外的有限数值转成 float，否则返回 None。"""
+    if isinstance(value, bool):
         return None
     try:
         f = float(value)
-        if not math.isfinite(f):
-            return None
-        return f
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
+        # JSON 允许任意大整数；float(10**400) 会溢出。分析
+        # 管线应把这种值当作不可用，而不是让整份报告崩溃。
         return None
+    if not math.isfinite(f):
+        return None
+    return f
 
 
 def _pareto_frontier(
