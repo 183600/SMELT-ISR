@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from exp.part_022_comparison_protocol import _DEFAULT_EQUIVALENCE_MARGIN
+from exp.part_025_statistics import _JZS_DEFAULT_PRIOR_SCALE
+
 
 
 def imbalance_metric_advisory(
