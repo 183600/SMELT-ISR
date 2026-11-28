@@ -326,7 +326,13 @@ def analyze_sequential_look(
                 and mean_effect is not None
                 and se > 0.0
             ):
-                cp = conditional_power(mean_effect, se, alpha, z)
+                # Pass information fraction so expected_final_z is properly
+                # scaled: interim z = effect/se_interim, final z = effect/se_final
+                # = interim_z / sqrt(t). Without this, conditional power is
+                # systematically underestimated at interim looks.
+                info_frac = float(boundary.get("information_fraction", 1.0))
+                cp = conditional_power(mean_effect, se, alpha, z,
+                                       info_fraction=info_frac)
                 if cp < 0.2:  # Low conditional power
                     result["stop_for_futility"] = True
                     result["components"][comp_name] = {
@@ -378,6 +384,7 @@ def conditional_power(
     se: float,
     alpha: float,
     current_z: float,
+    info_fraction: float = 1.0,
 ) -> float:
     """
     Compute conditional power given current data.
@@ -385,18 +392,31 @@ def conditional_power(
     Probability of rejecting H0 at final analysis given current effect estimate.
     Uses current_z directly (avoids redundant recomputation from observed_effect/se).
 
-    Note: This computes power assuming the current effect is the true effect
-    at the *final* sample size. It does not account for information fraction
-    (interim vs. planned sample size); callers should interpret the result
-    accordingly. For interim monitoring with known information fraction t,
-    the drift-adjusted expected final z would be current_z / sqrt(t).
+    When called at an interim look with information fraction t < 1, the interim
+    z-statistic has se = sigma/sqrt(n_interim) while the final analysis will use
+    se = sigma/sqrt(n_final). If the current effect estimate is the true effect,
+    the expected final z is current_z / sqrt(t), not current_z itself.
+
+    Parameters
+    ----------
+    info_fraction : float
+        Information fraction t = n_interim / n_final (default 1.0 = final analysis).
+        When t < 1, the function adjusts: expected_final_z = current_z / sqrt(t).
+        This correction is essential for interim futility monitoring: without it,
+        conditional power is systematically underestimated at interim looks,
+        potentially triggering premature futility stopping.
     """
     z_alpha = _t_critical(float('inf'), alpha / 2) or 1.96
 
-    # Use current_z directly — equivalent to abs(observed_effect) / se
-    # but avoids redundant division and respects the caller's z computation
-    # (which may include bias corrections or pooled variance).
-    expected_final_z = abs(current_z)
+    # Adjust current_z for information fraction: the interim z has
+    # se_interim = sigma/sqrt(n_interim), while the final z will have
+    # se_final = sigma/sqrt(n_final). Under H1 (effect = observed),
+    # E[z_final] = effect/se_final = (effect/se_interim) * sqrt(n_interim/n_final)
+    #            = current_z / sqrt(t).
+    if info_fraction > 0.0 and info_fraction < 1.0:
+        expected_final_z = abs(current_z) / math.sqrt(info_fraction)
+    else:
+        expected_final_z = abs(current_z)
 
     # Power = P(Z > z_alpha - expected_final_z) + P(Z < -z_alpha - expected_final_z)
     # Using normal approximation (erfc for numerical stability in tails)
