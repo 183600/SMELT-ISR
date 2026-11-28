@@ -707,7 +707,7 @@ def _PA_part_001():
         print('  OK：各运行的有效路由宽度与均衡强度一致')
 
 def _PA_part_002():
-    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, bayesian_entries, bayesian_summary, blocker, category_names, component, cost_efficiency_entries, curve_diagnostics, curve_header, curve_run_width, design, divergent_entries, effect, entry, extrapolation_report, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, result_extensions, rho, rho_text, routing_fdr_report, routing_intervention_comparison, shares, short_names, verdict_entries, warning
+    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, bayesian_entries, bayesian_summary, blocker, category_names, component, cost_efficiency_entries, curve_diagnostics, curve_header, curve_run_width, design, divergent_entries, effect, entry, extrapolation_report, flag, item, mechanism, meta_analysis, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, result_extensions, rho, rho_text, routing_fdr_report, routing_intervention_comparison, shares, short_names, verdict_entries, warning
     if factorial['designs'] or factorial['incomplete_designs']:
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
@@ -973,5 +973,26 @@ def _PA_part_002():
         unknown_coverage_runs = extrapolation_report.get('runs_without_coverage_record') or []
         if unknown_coverage_runs:
             print(f'''  [note] 以下 {len(unknown_coverage_runs)} 个运行缺少标签覆盖记录，无法核对外推风险''')
-    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'bayesian_analysis': (bayesian_summary if bayesian else None), 'result_extensions': result_extensions, 'n_runs': len(rows)})
+    # 跨对比随机效应元分析（--meta-analysis 显式开启；默认关闭时不计算、
+    # 不打印、不落盘，避免额外开销与「事后挑选证据口径」的嫌疑）。
+    meta_analysis_result = None
+    if meta_analysis:
+        try:
+            meta_analysis_result = meta_analyze_contrasts(
+                list(contrasts) + list(reference)
+            )
+        except ValueError as error:
+            meta_analysis_result = {
+                'schema': 'smelt-isr/meta-analysis/v1',
+                'available': False,
+                'reason': str(error),
+            }
+    if isinstance(meta_analysis_result, dict) and meta_analysis_result.get('available', True):
+        print()
+        print('[meta] 跨对比随机效应元分析（DerSimonian-Laird；汇总同一效应在多个运行/套件中的估计；混杂与缺标准误的对比已剔除，不修复系统性偏差）')
+        print(format_meta_summary(meta_analysis_result))
+    elif meta_analysis_result is not None:
+        print()
+        print('[meta] 跨对比随机效应元分析不可用：' + str(meta_analysis_result.get('reason', '未知原因')))
+    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'bayesian_analysis': (bayesian_summary if bayesian else None), 'meta_analysis': meta_analysis_result, 'result_extensions': result_extensions, 'n_runs': len(rows)})
 

@@ -18,6 +18,10 @@ from _core_NearDuplicateDataTests import NearDuplicateDataTests
 from _core_DataPlanTests import DataPlanTests
 from _core_ProcessTests import ProcessTests
 from _core_PreregistrationTests import PreregistrationTests
+from _core_AnalysisImprovementTests import (
+    MetaAnalysisTests,
+    CompareMetaAnalysisIntegrationTests,
+)
 from _core_ResultAnalysisTests import (
     ComparisonAnalysisExtensionTests,
     CostEfficiencyTests,
