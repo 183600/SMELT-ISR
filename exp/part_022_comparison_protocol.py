@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-_COMPUTE_MATCHED_METRIC = "val_loss_at_matched_flops"
-_CURVE_DERIVED_METRICS = (_CURVE_MEAN_METRIC,)
 
 _LOWER_IS_BETTER_METRICS = {
     "val_loss",
