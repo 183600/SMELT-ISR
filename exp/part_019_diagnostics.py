@@ -18,3 +18,9 @@ from .helpers import (
     _TARGET_POWER,
     _FACTOR_VALUE_ORDER,
 )
+
+
+def _is_deterministic_run(row) -> bool:
+    """检查一个运行行是否为确定性运行（即具有有效数据且未因失败而排除）。"""
+
+    return row.get("numerical_status") != "failed" and row.get("run") is not None
