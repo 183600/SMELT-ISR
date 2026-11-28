@@ -707,7 +707,7 @@ def _PA_part_001():
         print('  OK：各运行的有效路由宽度与均衡强度一致')
 
 def _PA_part_002():
-    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, bayesian_entries, bayesian_summary, blocker, category_names, component, curve_diagnostics, curve_header, curve_run_width, design, effect, entry, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, rho, rho_text, routing_intervention_comparison, shares, short_names, warning
+    global _bad_value, _curve_value, _delta_text, advisory, aggregate, bad_case_comparison, bad_header, bad_run_width, bayesian_entries, bayesian_summary, blocker, category_names, component, cost_efficiency_entries, curve_diagnostics, curve_header, curve_run_width, design, divergent_entries, effect, entry, extrapolation_report, flag, item, mechanism, metric_multiplicity, min_runs, p_text, p_value, pairs_text, payloads, persistent, ranges, reason, result_extensions, rho, rho_text, routing_fdr_report, routing_intervention_comparison, shares, short_names, verdict_entries, warning
     if factorial['designs'] or factorial['incomplete_designs']:
         print()
         print('[factorial] 全因子效应（按共同种子配对；主效应/交互同属一个检验家族，做 Holm 校正）')
@@ -898,5 +898,80 @@ def _PA_part_002():
         for message in bayesian_summary.get('advisories', []):
             print(f'  [note] {message}')
         print('  ' + str(bayesian_summary.get('note')))
-    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'bayesian_analysis': (bayesian_summary if bayesian else None), 'n_runs': len(rows)})
+    # 结果分析扩展：跨指标一致性、机器可读裁决、精度/效率联合
+    # 判定、路由专家分离的 BH-FDR 与外推风险标记。全部是追加
+    # 字段，不改变既有判定。
+    result_extensions = build_result_analysis_extensions(
+        rows, aggregates, contrasts, reference, metric, group_keys
+    )
+    verdict_entries = result_extensions.get('result_verdicts', {}).get('entries', [])
+    divergent_entries = [
+        contrast for contrast in list(contrasts) + list(reference)
+        if isinstance(contrast, dict) and contrast.get('cross_metric_divergent')
+    ]
+    cost_efficiency_entries = result_extensions.get('cost_efficiency') or []
+    routing_fdr_report = result_extensions.get('routing_specialization_fdr') or {}
+    extrapolation_report = result_extensions.get('extrapolation_risk') or {}
+    print()
+    print('[cross-metric] 跨指标一致性与综合秩效应量（同一对比在所有可用的最终评估点指标上重算；方向统一折算为「变体相对基线是改善还是变差」）')
+    if not divergent_entries:
+        print('  OK：没有对比出现「显著指标方向相反」的分歧')
+    for contrast in divergent_entries:
+        cross_summary = contrast.get('cross_metric_summary') or {}
+        print(f'''  [metric-divergence] {contrast.get('baseline')}→{contrast.get('variant')}: 族方向 {cross_summary.get('family_directions')}；分歧族 {cross_summary.get('divergent_families')}''')
+    for contrast in list(contrasts) + list(reference):
+        if not isinstance(contrast, dict):
+            continue
+        cross_summary = contrast.get('cross_metric_summary') or {}
+        composite = cross_summary.get('composite_cliffs_delta')
+        if composite is None:
+            continue
+        composite_iqr = cross_summary.get('composite_cliffs_delta_iqr')
+        iqr_text = '' if composite_iqr is None else '，IQR ' + _format_finite(composite_iqr, '+.3f')
+        print(f'''  {contrast.get('baseline')}→{contrast.get('variant')}: 综合 Cliff's δ（{cross_summary.get('composite_n_families')} 个指标族）= {_format_finite(composite, '+.3f')}{iqr_text}（正号=变体整体更优）''')
+    print()
+    print('[verdict] 结果裁决（把显著性/脆弱性/缺失界/功效/等价性合成为机器可读判定；不替代人工审阅）')
+    verdict_counts = result_extensions.get('result_verdicts', {}).get('verdict_counts', {})
+    print('  判定分布: ' + ', '.join((f'{key}={value}' for key, value in sorted(verdict_counts.items()))))
+    for verdict_entry in verdict_entries:
+        marker = ''
+        if verdict_entry.get('cross_metric_divergent'):
+            marker += ' [metric-divergence]'
+        if verdict_entry.get('cost_inefficient'):
+            marker += ' [cost-inefficient]'
+        elif verdict_entry.get('cost_unproven'):
+            marker += ' [cost-unproven]'
+        action = verdict_entry.get('action')
+        action_text = '' if action in (None, 'none') else f'；建议 {action}'
+        print(f'''  [{verdict_entry.get('verdict')}] {verdict_entry.get('label')}{marker}{action_text}''')
+        for reason in verdict_entry.get('reasons') or []:
+            print(f'      - {reason}')
+    print()
+    print('[cost-efficiency] 精度增益与效率代价的联合判定（gain_per_cost = 相对增益 / 额外成本倍率（cost_ratio − 1）；区间整体 ≤1 记 [cost-inefficient]、跨 1 记 [cost-unproven]；成本 ≥1.5× 才构成取舍问题）')
+    available_cost_entries = [entry for entry in cost_efficiency_entries if entry.get('available')]
+    if not available_cost_entries:
+        print('  无可用效率测量，无法做精度/效率联合判定')
+    for cost_entry in available_cost_entries:
+        marker = ''
+        if cost_entry.get('cost_inefficient'):
+            marker = ' [cost-inefficient]'
+        elif cost_entry.get('cost_unproven'):
+            marker = ' [cost-unproven]'
+        print(f'''  {cost_entry.get('label')}: {cost_entry.get('basis')} ×{_format_finite(cost_entry.get('cost_ratio'), '.2f')}，相对增益 {_format_finite(cost_entry.get('relative_gain'), '+.2%')}，增益/额外成本 {_format_finite(cost_entry.get('gain_per_cost'), '+.3f')}{marker}''')
+    if routing_fdr_report.get('available'):
+        print()
+        print('[routing-fdr] 路由专家分离的 BH-FDR 校正（运行内 E 个专家为一个族；实验单元内按种子一致性汇总）')
+        for cell_summary in routing_fdr_report.get('cells') or []:
+            consensus = ', '.join(cell_summary.get('consensus_specialized_experts') or []) or '无'
+            print(f'''  {cell_summary.get('cell')}: 共识专门化专家 {cell_summary.get('n_consensus_specialized_experts')}/{cell_summary.get('n_experts')}（{consensus}）''')
+        print('  ' + str(routing_fdr_report.get('note')))
+    if extrapolation_report.get('available'):
+        print()
+        print('[extrapolation] 评估集未见标签占比（不可约外推误差）')
+        if extrapolation_report.get('extrapolation_risk'):
+            print(f'''  [extrapolation-risk] {extrapolation_report.get('n_affected')} 个运行/split 的未见标签 token 占比超过 {_format_finite(extrapolation_report.get('threshold'), '.2%')}：覆盖率不同的两臂不能直接比较指标''')
+        unknown_coverage_runs = extrapolation_report.get('runs_without_coverage_record') or []
+        if unknown_coverage_runs:
+            print(f'''  [note] 以下 {len(unknown_coverage_runs)} 个运行缺少标签覆盖记录，无法核对外推风险''')
+    raise _SC_RETURN({'factors': factors, 'metric': metric, 'controlled': controlled, 'single_factor_design': single_factor_design, 'provenance': provenance, 'numerical_failures': numerical_failures, 'failure_rates': failure_rates, 'scale_guard': scale_guard_report, 'hypothesis_registry': hypotheses, 'hypothesis_alignment': alignment, 'aggregates': aggregates, 'duplicate_seed_cells': duplicate_seed_cells, 'deterministic_conflict_cells': deterministic_conflict_cells, 'contrasts': contrasts, 'reference_contrasts': reference, 'baseline_preregistration': baseline_preregistration, 'baseline_adequacy': adequacy, 'tuning_seed_overlap': tuning_seed_overlap, 'selection_metric_mismatch': selection_metric_mismatch, 'metric_multiplicity': metric_multiplicity, 'imbalance_advisory': imbalance, 'ablation_coverage': coverage, 'balance_scale': balance_scale, 'factorial_effects': factorial, 'factorial_common_step_sensitivity': common_step_sensitivity, 'ablation_component_verdicts': component_verdicts, 'mechanism_controls': mechanism, 'factorial_effects_compute_matched': factorial_compute_matched, 'missing_efficiency_cells': missing_efficiency_cells, 'curve_diagnostics': curve_diagnostics, 'bad_case_comparison': bad_case_comparison, 'routing_intervention_comparison': routing_intervention_comparison, 'compute_matched': compute_matched, 'common_step': common_step, 'curve_mean': curve_mean, 'selection_bias': selection_bias, 'run_order': order_audit, 'equivalence_margin': equivalence_margin, 'equivalence_margin_preregistration': margin_preregistration, 'target_power': _TARGET_POWER, 'power_equivalence': equivalence_entries, 'fragility_summary': fragility_summary, 'attrition_bounds_summary': attrition_summary, 'bayesian_analysis': (bayesian_summary if bayesian else None), 'result_extensions': result_extensions, 'n_runs': len(rows)})
 

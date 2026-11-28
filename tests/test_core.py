@@ -18,6 +18,15 @@ from _core_NearDuplicateDataTests import NearDuplicateDataTests
 from _core_DataPlanTests import DataPlanTests
 from _core_ProcessTests import ProcessTests
 from _core_PreregistrationTests import PreregistrationTests
+from _core_ResultAnalysisTests import (
+    ComparisonAnalysisExtensionTests,
+    CostEfficiencyTests,
+    CrossMetricConsistencyTests,
+    ExtrapolationRiskTests,
+    ResultVerdictTests,
+    RoutingSpecializationFdrTests,
+    WindowSizeSensitivityTests,
+)
 from _core_SchemaTests import SchemaStructureTests, ExampleConsistencyTests
 from _core_ArtifactManifestTests import ArtifactManifestTests
 from _core_EnvironmentSnapshotTests import EnvironmentSnapshotTests
@@ -48,8 +57,11 @@ if __name__ == "__main__":
 
 __all__ = [
     "ArtifactManifestTests",
+    "ComparisonAnalysisExtensionTests",
     "CoreModelTests",
+    "CostEfficiencyTests",
     "CostModelTests",
+    "CrossMetricConsistencyTests",
     "CurveMeanMetricTests",
     "DataPlanTests",
     "DesignPreflightTests",
@@ -60,16 +72,20 @@ __all__ = [
     "EdgeCaseRegressionTestsPart2",
     "EnvironmentSnapshotTests",
     "ExampleConsistencyTests",
+    "ExtrapolationRiskTests",
     "GroupClusterRegressionTests",
     "NearDuplicateDataTests",
     "NumericalScaleTests",
     "PreregistrationTests",
     "ProcessTests",
     "ReproducibilityTests",
+    "ResultVerdictTests",
     "ResultsAnalysisDiagnosticsTests",
+    "RoutingSpecializationFdrTests",
     "RoutingTests",
     "RunAuditTests",
     "SchemaStructureTests",
     "StatisticsTests",
+    "WindowSizeSensitivityTests",
     "_DesignPreparationTestsBase",
 ]

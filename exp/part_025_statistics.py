@@ -13,6 +13,40 @@ _SIGNIFICANCE_LEVEL = 0.05
 _TARGET_POWER = 0.80
 _MIN_SEEDS_FOR_STATS = 3
 
+# 跨指标一致性分析用的「同源指标族」划分。族内指标互相高度
+# 相关（例如 val_loss / val_ppl / val_bits_per_byte 互为单调
+# 变换），不能当作多份独立证据；跨族汇总才近似独立证据。
+_CROSS_METRIC_FAMILIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (
+        "loss",
+        (
+            "val_loss",
+            "val_ppl",
+            "val_bits_per_byte",
+            "val_macro_nll",
+        ),
+    ),
+    (
+        "accuracy",
+        (
+            "val_token_accuracy",
+            "val_micro_f1",
+            "val_macro_f1",
+            "val_weighted_f1",
+        ),
+    ),
+    (
+        "precision",
+        ("val_precision_macro", "val_precision_weighted"),
+    ),
+    (
+        "recall",
+        ("val_recall_macro", "val_recall_weighted"),
+    ),
+    ("auc", ("val_pr_auc_macro", "val_roc_auc_macro")),
+    ("pr_auc_lift", ("val_pr_auc_macro_lift",)),
+)
+
 
 def _fragility_summary(
     contrasts: Sequence[Dict[str, object]],
@@ -1986,6 +2020,242 @@ def _bayesian_contrast(
     return entry
 
 
+def _result_fingerprints(
+    rows: List[Dict[str, object]],
+) -> Dict[str, object]:
+    """收集本轮结果的追溯指纹（数据/切分/代码/环境）。
+
+    人类可读的结果摘要必须能回答「这份结论对应哪份数据、哪份
+    代码、哪个环境」；指纹不一致时不能只报一个值——那会把
+    不可归因的对比伪装成同一份实验。
+    """
+    keys = (
+        "data_sha256",
+        "split_sha256",
+        "effective_train_sha256",
+        "seq_len",
+        "source_tree_sha256",
+        "script_sha256",
+        "environment_id",
+        "git_commit",
+    )
+    fingerprints: Dict[str, object] = {}
+    for key in keys:
+        values: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            protocol = row.get("protocol")
+            value = None
+            if isinstance(protocol, dict):
+                value = protocol.get(key)
+            if value is None:
+                value = row.get(key)
+            if value is None:
+                continue
+            text = str(value)
+            if text not in values:
+                values.append(text)
+        if not values:
+            continue
+        fingerprints[key] = (
+            values[0] if len(values) == 1 else values
+        )
+    fingerprints["consistent"] = all(
+        not isinstance(value, list)
+        for key, value in fingerprints.items()
+        if key != "consistent"
+    )
+    fingerprints["note"] = (
+        "同一键出现多个取值时列出全部：该轮对比涉及多份数据/"
+        "代码/环境，结论不能整体归因"
+    )
+    return fingerprints
+
+
+def _extrapolation_risk_report(
+    rows: List[Dict[str, object]],
+    threshold: float = 1e-4,
+) -> Dict[str, object]:
+    """评估集「未见标签」占比与外推风险标记。
+
+    字节级 LM 只能通过上下文降低**已见**标签的 NLL；训练集从未
+    出现的字节类在评估 token 上的 NLL 存在不可约的下界（只能
+    退到平滑/先验）。这部分误差与方法优劣无关，却会直接进入
+    指标均值：覆盖率不同的两臂，指标差里混着「谁的评估集更
+    可预测」，不能直接当成方法收益。
+
+    判定：任一运行/任一 split 的 ``unseen_label_token_share``
+    超过阈值即标记 ``[extrapolation-risk]``，并给出受影响运行
+    与占比。没有标签覆盖记录（旧运行）时只报告「不可核对」，
+    不假装没有风险。
+    """
+    affected: List[Dict[str, object]] = []
+    unknown_runs: List[str] = []
+    max_share: Optional[float] = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        coverage = row.get("label_coverage")
+        if not isinstance(coverage, dict) or not coverage:
+            unknown_runs.append(str(row.get("run")))
+            continue
+        for split, info in coverage.items():
+            if not isinstance(info, dict):
+                continue
+            share = _finite_float(
+                info.get("unseen_label_token_share")
+            )
+            if share is None:
+                continue
+            if max_share is None or share > max_share:
+                max_share = share
+            if share > threshold:
+                affected.append({
+                    "run": str(row.get("run")),
+                    "split": str(split),
+                    "unseen_label_token_share": share,
+                    "unseen_label_classes": info.get(
+                        "unseen_label_classes"
+                    ),
+                })
+    return {
+        "available": bool(affected) or bool(unknown_runs),
+        "threshold": float(threshold),
+        "max_unseen_label_token_share": max_share,
+        "affected_runs": affected,
+        "n_affected": len(affected),
+        "runs_without_coverage_record": unknown_runs,
+        "extrapolation_risk": bool(affected),
+        "marker": "[extrapolation-risk]" if affected else None,
+        "note": (
+            "未见标签的 NLL 含不可约的外推误差：覆盖率不同的两臂"
+            "不能直接比较指标。阈值以上的占比会被标出；没有标签"
+            "覆盖记录（旧运行）时只能报告「不可核对」"
+        ),
+    }
+
+
+def build_result_analysis_extensions(
+    rows: List[Dict[str, object]],
+    aggregates: List[Dict[str, object]],
+    contrasts: List[Dict[str, object]],
+    reference: List[Dict[str, object]],
+    metric: str,
+    group_keys: List[str],
+) -> Dict[str, object]:
+    """把结果分析层面的稳健性诊断合成为一个可落盘的扩展块。
+
+    扩展块内容：
+
+    - ``cross_metric``：单因子对比与直接基线对比的跨指标一致性
+      与族级综合秩效应量（见 ``_cross_metric_effect_profile``）；
+    - ``result_verdicts``：每个对比的机器可读裁决与下一步建议
+      （见 ``_result_verdict``）；
+    - ``cost_efficiency``：精度增益与效率代价的联合判定
+      （见 ``_cost_efficiency_assessment``）；
+    - ``routing_specialization_fdr``：路由专家分离的 BH-FDR 与
+      跨种子一致性（见 ``_routing_specialization_fdr``）；
+    - ``extrapolation_risk``：评估集未见标签占比带来的外推风险
+      （见 ``_extrapolation_risk_report``）。
+
+    这些字段全部是**追加**的：既有键名与含义不变，老的下游脚本
+    仍然可用。
+    """
+    higher_is_better = metric_higher_is_better(metric)
+    reference = _cross_metric_consistency_analysis(
+        reference, metric, aggregates
+    )
+
+    verdict_entries: List[Dict[str, object]] = []
+    cost_entries: List[Dict[str, object]] = []
+    verdict_counts: Dict[str, int] = {}
+    action_counts: Dict[str, int] = {}
+    for family, family_contrasts in (
+        ("single_factor", contrasts),
+        ("baseline", reference),
+    ):
+        for contrast in family_contrasts:
+            if not isinstance(contrast, dict):
+                continue
+            verdict = _result_verdict(contrast)
+            contrast["result_verdict"] = verdict
+            cost = _cost_efficiency_assessment(
+                contrast, higher_is_better=higher_is_better
+            )
+            contrast["cost_efficiency"] = cost
+            label = (
+                f"{contrast.get('baseline')}→{contrast.get('variant')}"
+            )
+            entry = {
+                "family": family,
+                "baseline": contrast.get("baseline"),
+                "variant": contrast.get("variant"),
+                "label": label,
+                "verdict": verdict.get("verdict"),
+                "action": verdict.get("action"),
+                "reasons": verdict.get("reasons"),
+                "significant": verdict.get("significant"),
+                "equivalent": verdict.get("equivalent"),
+                "cross_metric_divergent": bool(
+                    contrast.get("cross_metric_divergent")
+                ),
+                "cost_inefficient": bool(
+                    cost.get("cost_inefficient")
+                ),
+            }
+            verdict_entries.append(entry)
+            key = str(verdict.get("verdict"))
+            verdict_counts[key] = verdict_counts.get(key, 0) + 1
+            action = str(verdict.get("action"))
+            action_counts[action] = action_counts.get(action, 0) + 1
+            cost_entries.append({
+                "family": family,
+                "baseline": contrast.get("baseline"),
+                "variant": contrast.get("variant"),
+                "label": label,
+                "available": bool(cost.get("available")),
+                "basis": cost.get("basis"),
+                "cost_ratio": cost.get("cost_ratio"),
+                "relative_gain": cost.get("relative_gain"),
+                "gain_per_cost": cost.get("gain_per_cost"),
+                "gain_per_cost_ci95": cost.get("gain_per_cost_ci95"),
+                "cost_inefficient": bool(
+                    cost.get("cost_inefficient")
+                ),
+                "cost_unproven": bool(
+                    cost.get("cost_unproven")
+                ),
+                "marker": cost.get("marker"),
+                "reason": cost.get("reason"),
+            })
+
+    routing_fdr = _routing_specialization_fdr(rows, group_keys)
+    extrapolation = _extrapolation_risk_report(rows)
+    return {
+        "schema": "smelt-isr/result-analysis-extensions/v1",
+        "metric": metric,
+        "fingerprints": _result_fingerprints(rows),
+        "cross_metric": {
+            "n_contrasts": len(contrasts),
+            "n_divergent": sum(
+                1
+                for contrast in contrasts
+                if isinstance(contrast, dict)
+                and contrast.get("cross_metric_divergent")
+            ),
+        },
+        "result_verdicts": {
+            "entries": verdict_entries,
+            "verdict_counts": verdict_counts,
+            "action_counts": action_counts,
+        },
+        "cost_efficiency": cost_entries,
+        "routing_specialization_fdr": routing_fdr,
+        "extrapolation_risk": extrapolation,
+    }
+
+
 def _bayesian_analysis_summary(
     entries: List[Dict[str, object]],
     prior_scale: float,
@@ -2043,198 +2313,897 @@ def _bayesian_analysis_summary(
 
 
 def _window_size_sensitivity_analysis(
-    contrast_a: Dict[str, object],
-    contrast_b: Dict[str, object],
+    per_seed_differences: Dict[int, List[float]],
 ) -> Dict[str, object]:
-    """Report how results vary with evaluation window size.
-    
-    Perturbs the current fixed window by ±20% and observes effect
-    estimate stability.
+    """评估集规模敏感性：固定窗口集合下换用不同规模的窗口子集。
+
+    固定评估窗口的长度在训练期就定好了，分析期无法重算更短/
+    更长的窗口；能做且有意义的是**换用不同规模的窗口子集**，
+    观察配对效应估计随评估集规模变化的漂移。它回答的是
+    「结论是不是靠某一批评估窗口撑起来的」以及「扩大评估集
+    能把区间收窄多少」，不能回答「窗口长度本身变了会怎样」
+    （后者需要按不同 seq_len 重新评估）。
+
+    漂移与噪声比较：完整窗口集的逐种子窗口均值差给出效应
+    点估计；窗口层噪声用「合并后的窗口均值标准误」衡量
+    （每个种子内窗口差值的样本标准差 / √窗口数，再对种子
+    取均方根）。漂移超过该噪声尺度才算「对评估集规模敏感」，
+    否则只是评估集抽样噪声，不能读成结论不稳。
+
+    方向稳定性单独判定：任一子集的均值差与完整集反号时，
+    结论的方向依赖于具体用了哪批窗口，必须显式披露。
     """
-    windows_a = contrast_a.get("windows") or contrast_a.get("eval_windows")
-    windows_b = contrast_b.get("windows") or contrast_b.get("eval_windows")
-    
-    if not isinstance(windows_a, list) or not isinstance(windows_b, list):
+    cleaned = _clean_window_differences(per_seed_differences)
+    usable = {
+        seed: values
+        for seed, values in cleaned.items()
+        if len(values) >= 4
+    }
+    if len(usable) < 2:
         return {
-            "status": "missing_window_data",
-            "reason": "评估窗口记录缺失，无法进行窗口大小敏感性分析",
+            "available": False,
+            "reason": "insufficient_seeds_or_windows",
+            "n_seeds": len(usable),
+            "n_windows": (
+                len(next(iter(usable.values()))) if usable else 0
+            ),
+            "note": (
+                "评估集规模敏感性至少需要 2 个种子且每个种子至少 "
+                "4 个评估窗口；不足时不伪造敏感性结论"
+            ),
         }
-    
-    if len(windows_a) != len(windows_b):
+
+    seed_order = sorted(usable)
+    window_counts = {len(usable[seed]) for seed in seed_order}
+    if len(window_counts) != 1:
         return {
-            "status": "window_count_mismatch",
-            "n_windows_a": len(windows_a),
-            "n_windows_b": len(windows_b),
-            "reason": "两个运行的窗口数不同，无法配对敏感性分析",
+            "available": False,
+            "reason": "unbalanced_window_counts",
+            "n_seeds": len(seed_order),
+            "window_counts": sorted(window_counts),
+            "note": (
+                "固定评估窗口在各运行间应逐位相同；窗口数不一致"
+                "时不能用同一组窗口下标做子集敏感性分析"
+            ),
         }
-    
-    if not windows_a:
+
+    window_count = window_counts.pop()
+    seed_means = {
+        seed: float(_mean(usable[seed])) for seed in seed_order
+    }
+    full_mean = float(_mean(list(seed_means.values())))
+    if full_mean is None or not math.isfinite(full_mean):
         return {
-            "status": "missing_window_data",
-            "reason": "评估窗口记录为空，无法进行敏感性分析",
+            "available": False,
+            "reason": "invalid_mean_difference",
+            "note": "窗口差值均值不是有限数，无法做敏感性分析",
         }
-    
-    # Compute base differences using current windows
-    base_diffs = []
-    for wa, wb in zip(windows_a, windows_b):
-        loss_a = wa.get("loss")
-        loss_b = wb.get("loss")
-        if loss_a is not None and loss_b is not None:
-            base_diffs.append(loss_b - loss_a)  # b - a
-    
-    if not base_diffs:
-        return {
-            "status": "no_valid_diffs",
-            "reason": "无法从窗口记录中提取有效损失差异",
-        }
-    
-    base_mean = np.mean(base_diffs)
-    base_std = np.std(base_diffs, ddof=1) if len(base_diffs) > 1 else 0.0
-    
-    # Perturb windows by ±20% and recompute
-    perturbation_results: List[Dict[str, object]] = []
-    for wa, wb in zip(windows_a, windows_b):
-        loss_a = wa.get("loss")
-        loss_b = wb.get("loss")
-        n_a = wa.get("n_tokens", 1)
-        n_b = wb.get("n_tokens", 1)
-        
-        # Try smaller window (±20%)
-        small_n_a = max(1, int(n_a * 0.8))
-        small_n_b = max(1, int(n_b * 0.8))
-        small_loss_a = wa.get("loss_at_reduced_window", loss_a) if wa.get("loss_at_reduced_window") is not None else None
-        small_loss_b = wb.get("loss_at_reduced_window", loss_b) if wb.get("loss_at_reduced_window") is not None else None
-        
-        # Try larger window (±20%)
-        large_n_a = max(1, int(n_a * 1.2))
-        large_n_b = max(1, int(n_b * 1.2))
-        large_loss_a = wa.get("loss_at_expanded_window", loss_a) if wa.get("loss_at_expanded_window") is not None else None
-        large_loss_b = wb.get("loss_at_expanded_window", loss_b) if wb.get("loss_at_expanded_window") is not None else None
-        
-        perturbation_entry: Dict[str, object] = {
-            "run": contrast_a.get("run"),
-        }
-        
-        # Current window result
-        perturbation_entry["current_mean_diff"] = base_mean
-        perturbation_entry["current_std"] = base_std
-        
-        # Small window
-        if small_loss_a is not None and small_loss_b is not None:
-            small_diff = small_loss_b - small_loss_a
-            perturbation_entry["small_window_mean_diff"] = small_diff
-            perturbation_entry["small_window_stable"] = abs(small_diff - base_mean) < abs(base_std * 0.5) if base_std > 0 else True
-        else:
-            perturbation_entry["small_window_mean_diff"] = None
-            perturbation_entry["small_window_stable"] = None
-        
-        # Large window
-        if large_loss_a is not None and large_loss_b is not None:
-            large_diff = large_loss_b - large_loss_a
-            perturbation_entry["large_window_mean_diff"] = large_diff
-            perturbation_entry["large_window_stable"] = abs(large_diff - base_mean) < abs(base_std * 0.5) if base_std > 0 else True
-        else:
-            perturbation_entry["large_window_mean_diff"] = None
-            perturbation_entry["large_window_stable"] = None
-        
-        perturbation_results.append(perturbation_entry)
-    
-    # Overall stability assessment
-    all_diffs = [p.get("current_mean_diff") for p in perturbation_results if p.get("current_mean_diff") is not None]
-    stable = True
-    if len(all_diffs) > 1:
-        diff_means = [p.get("small_window_mean_diff") for p in perturbation_results if p.get("small_window_mean_diff") is not None]
-        diff_means_large = [p.get("large_window_mean_diff") for p in perturbation_results if p.get("large_window_mean_diff") is not None]
-        if diff_means:
-            mean_shift_small = abs(np.mean(diff_means) - np.mean(all_diffs)) if all_diffs else 0
-            stable = mean_shift_small < (np.mean([p.get("current_std", 0) for p in perturbation_results if p.get("current_mean_diff") is not None]) * 0.5) if any(p.get("current_std", 0) for p in perturbation_results if p.get("current_mean_diff") is not None) else True
-    
+
+    # 窗口层噪声：每个种子内窗口差值的标准误，再对种子取
+    # 均方根（种子间差异由 seed_means 单独承担）。
+    window_variances: List[float] = []
+    for seed in seed_order:
+        values = usable[seed]
+        std = _sample_std(values)
+        if std is None:
+            continue
+        variance = (std * std) / float(max(len(values), 1))
+        if math.isfinite(variance):
+            window_variances.append(variance)
+    window_level_se = (
+        math.sqrt(sum(window_variances) / len(window_variances))
+        if window_variances
+        else None
+    )
+    window_level_variance = (
+        window_level_se * window_level_se
+        if window_level_se is not None
+        else None
+    )
+
+    def _subset_mean(seed: int, start: int, stop: int) -> Optional[float]:
+        values = usable[seed][start:stop]
+        if not values:
+            return None
+        return _mean(values)
+
+    subsets: List[Dict[str, object]] = []
+    for fraction, anchors in (
+        (0.8, ("head", "tail", "middle")),
+        (0.5, ("head", "tail")),
+    ):
+        size = max(2, int(round(fraction * window_count)))
+        if size >= window_count:
+            continue
+        for anchor in anchors:
+            if anchor == "head":
+                start, stop = 0, size
+            elif anchor == "tail":
+                start, stop = window_count - size, window_count
+            else:
+                start = (window_count - size) // 2
+                stop = start + size
+            subset_means = {
+                seed: _subset_mean(seed, start, stop)
+                for seed in seed_order
+            }
+            usable_means = [
+                value
+                for value in subset_means.values()
+                if value is not None
+            ]
+            if not usable_means:
+                continue
+            subset_mean = float(_mean(usable_means))
+            drift = subset_mean - full_mean
+            direction_same = bool(
+                (subset_mean > 0.0 and full_mean > 0.0)
+                or (subset_mean < 0.0 and full_mean < 0.0)
+                or (subset_mean == 0.0 and full_mean == 0.0)
+            )
+            subset_se = None
+            subset_significant = None
+            if window_level_variance is not None:
+                subset_se = math.sqrt(
+                    window_level_variance / float(max(size, 1))
+                )
+                if subset_se > 0.0:
+                    subset_significant = bool(
+                        abs(subset_mean) > 1.959963984540054 * subset_se
+                    )
+            full_significant = None
+            if window_level_se is not None and window_level_se > 0.0:
+                full_significant = bool(
+                    abs(full_mean) > 1.959963984540054 * window_level_se
+                )
+            significance_same = None
+            if (
+                subset_significant is not None
+                and full_significant is not None
+            ):
+                significance_same = bool(
+                    subset_significant == full_significant
+                )
+            relative_drift = None
+            if abs(full_mean) > 1e-12:
+                relative_drift = abs(drift) / abs(full_mean)
+            subsets.append({
+                "subset": f"{anchor}_{int(round(fraction * 100))}pct",
+                "fraction": float(fraction),
+                "anchor": anchor,
+                "n_windows": size,
+                "mean_diff": subset_mean,
+                "drift": drift,
+                "relative_drift": relative_drift,
+                "direction_same_as_full": direction_same,
+                "subset_se": subset_se,
+                "subset_significant": subset_significant,
+                "significance_same_as_full": significance_same,
+            })
+
+    drifts = [
+        abs(float(entry["drift"]))
+        for entry in subsets
+        if _finite_float(entry.get("drift")) is not None
+    ]
+    max_abs_drift = max(drifts) if drifts else None
+    direction_flipped = [
+        str(entry["subset"])
+        for entry in subsets
+        if not entry.get("direction_same_as_full")
+    ]
+    significance_flipped = [
+        str(entry["subset"])
+        for entry in subsets
+        if entry.get("significance_same_as_full") is False
+    ]
+    exceeds_noise = None
+    material_drift = None
+    if max_abs_drift is not None and window_level_se is not None:
+        # 阈值取两者的较大者：漂移要同时超过普通抽样波动的 2 倍
+        # 标准误**并且**相对效应本身不可忽略，才算「结论随评估集
+        # 规模改变」。只看标准误会把正常抽样波动误判成不稳定；
+        # 只看相对量会把与效应无关的小噪声判成敏感。
+        exceeds_noise = bool(max_abs_drift > 2.0 * window_level_se)
+    if max_abs_drift is not None and abs(full_mean) > 1e-12:
+        material_drift = bool(
+            max_abs_drift > 0.2 * abs(full_mean)
+        )
+    if direction_flipped or significance_flipped:
+        verdict = "sensitive"
+    elif exceeds_noise and material_drift:
+        verdict = "sensitive"
+    else:
+        verdict = "stable"
     return {
-        "status": "completed" if stable else "unstable",
-        "base_window_mean_diff": base_mean,
-        "base_window_std": base_std,
-        "perturbation_results": perturbation_results,
-        "stable_under_20_percent_window_variation": stable,
+        "available": True,
+        "verdict": verdict,
+        "method": "window_subset_resampling",
+        "n_seeds": len(seed_order),
+        "n_windows": window_count,
+        "full_mean_diff": full_mean,
+        "seed_mean_differences": {
+            str(seed): seed_means[seed] for seed in seed_order
+        },
+        "window_level_se": window_level_se,
+        "max_abs_drift": max_abs_drift,
+        "drift_exceeds_window_noise": exceeds_noise,
+        "drift_material_relative_to_effect": material_drift,
+        "direction_flipped_subsets": direction_flipped,
+        "significance_flipped_subsets": significance_flipped,
+        "subsets": subsets,
         "note": (
-            "窗口大小敏感性：在当前固定评估窗口基础上，对窗口长度"
-            "进行 ±20% 扰动。如果效应估计在扰动后仍保持方向和大小"
-            "基本不变，则结论具有鲁棒性；否则请在报告中注明窗口选择"
-            "的影响，并考虑扩大评估集而非单纯加种子"
+            "评估集规模敏感性：固定窗口长度下改用不同规模的窗口"
+            "子集重算配对效应。方向翻转、显著性翻转，或漂移同时"
+            "超过窗口层噪声的 2 倍标准误与效应量的 20% 时，"
+            "结论对评估集敏感，应扩大评估集而不是只加种子；"
+            "它不等价于窗口长度敏感性（后者需要按不同 seq_len "
+            "重新评估）"
         ),
     }
 
 
-def _cross_metric_consistency_check(
-    contrast: Dict[str, object],
+def _cross_metric_effect_profile(
+    cell_a: Dict[str, object],
+    cell_b: Dict[str, object],
+    metrics: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    """Check consistency of direction across multiple pre-registered metrics.
-    
-    Returns whether all significant metrics point in the same direction,
-    and flags any metric divergence.
+    """同一对比在多个预注册指标上的效应剖面。
+
+    单因子对比只在**一个**判定指标上做检验，因此「换指标看
+    结论是否翻转」无法从对比记录本身读出。这里对两个实验单元
+    在所有可用的最终评估点指标上重算效应，方向统一折算成
+    「变体相对基线是改善还是变差」，并给出：
+
+    - 每个指标的 Δ、相对变化、秩效应量（Cliff's δ，按改善
+      方向折算）、p 值与显著性；
+    - 按**同源指标族**（互相高度相关、不能当作独立证据的
+      指标归为一族）聚合后的族级方向与族级秩效应量中位数；
+    - 跨族综合秩效应量（族级中位数的中位数与 IQR），避免
+      只挑一个「最好看」的指标下结论。
+
+    指标族划分是分析口径的一部分，必须随结果一起落盘：把
+    val_loss / val_ppl / val_bits_per_byte 这类互为单调变换
+    的指标当作三份独立证据，会人为放大「一致性」。
     """
-    verdict = contrast.get("verdict")
-    delta = contrast.get("delta")
-    significant_metrics: List[str] = []
-    divergent_metrics: List[str] = []
-    
-    # Check each comparison metric for direction consistency
-    metric_directions: Dict[str, str] = {}
-    
-    # val_loss: lower is better
-    val_loss = contrast.get("val_loss")
-    if val_loss is not None and contrast.get("significant"):
-        # delta is already variant - baseline, so positive = variant worse (loss higher)
-        metric_directions["val_loss"] = "loss_lower_is_better"
-        significant_metrics.append("val_loss")
-    
-    # val_ppl: lower is better
-    val_ppl = contrast.get("val_ppl")
-    if val_ppl is not None and contrast.get("significant"):
-        metric_directions["val_ppl"] = "loss_lower_is_better"
-        significant_metrics.append("val_ppl")
-    
-    # val_macro_f1: higher is better
-    val_macro_f1 = contrast.get("val_macro_f1")
-    if val_macro_f1 is not None and contrast.get("significant"):
-        metric_directions["val_macro_f1"] = "higher_is_better"
-        significant_metrics.append("val_macro_f1")
-    
-    # val_token_accuracy: higher is better
-    val_token_accuracy = contrast.get("val_token_accuracy")
-    if val_token_accuracy is not None and contrast.get("significant"):
-        metric_directions["val_token_accuracy"] = "higher_is_better"
-        significant_metrics.append("val_token_accuracy")
-    
-    # val_macro_nll: lower is better (like loss)
-    val_macro_nll = contrast.get("val_macro_nll")
-    if val_macro_nll is not None and contrast.get("significant"):
-        metric_directions["val_macro_nll"] = "loss_lower_is_better"
-        significant_metrics.append("val_macro_nll")
-    
-    # Determine consistency
-    if len(significant_metrics) >= 2:
-        directions = set(metric_directions.values())
-        all_same_direction = len(directions) == 1
-        
-        # Check if any metrics are divergent (significant but opposite direction)
-        for metric, direction in metric_directions.items():
-            opposite = (
-                "loss_lower_is_better" if direction == "higher_is_better"
-                else "higher_is_better"
+    if metrics is None:
+        metrics = tuple(
+            name
+            for _family, names in _CROSS_METRIC_FAMILIES
+            for name in names
+        )
+    samples_a = _as_dict(cell_a.get("samples"))
+    samples_b = _as_dict(cell_b.get("samples"))
+    family_of = {
+        name: family
+        for family, names in _CROSS_METRIC_FAMILIES
+        for name in names
+    }
+
+    entries: List[Dict[str, object]] = []
+    for metric in metrics:
+        raw_a = samples_a.get(metric)
+        raw_b = samples_b.get(metric)
+        if not isinstance(raw_a, list) or not isinstance(raw_b, list):
+            continue
+        if not raw_a or not raw_b:
+            continue
+        collapsed_a = _collapse_seed_samples(raw_a)
+        collapsed_b = _collapse_seed_samples(raw_b)
+        values_a = [
+            float(sample["value"]) for sample in collapsed_a
+        ]
+        values_b = [
+            float(sample["value"]) for sample in collapsed_b
+        ]
+        if not values_a or not values_b:
+            continue
+        mean_a = _mean(values_a)
+        mean_b = _mean(values_b)
+        if mean_a is None or mean_b is None:
+            continue
+        delta = mean_b - mean_a
+        if not math.isfinite(delta):
+            continue
+        higher_is_better = metric_higher_is_better(metric)
+        improvement = delta if higher_is_better else -delta
+        if improvement > 0.0:
+            direction = "improves"
+        elif improvement < 0.0:
+            direction = "degrades"
+        else:
+            direction = "tie"
+        relative_delta = (
+            delta / abs(mean_a)
+            if abs(mean_a) > 1e-12
+            else None
+        )
+        cliffs = _cliffs_delta(values_a, values_b)
+        # Cliff's δ 以「基线 - 变体」为符号：正值表示基线更大。
+        # 折算成「变体是否更好」：越低越好的指标取原值，越高越
+        # 好的指标取相反数。
+        improvement_cliffs = (
+            cliffs if not higher_is_better else (
+                None if cliffs is None else -cliffs
             )
-            # If we have both types of directions, there's divergence
-        has_divergence = len(directions) > 1
-    else:
-        all_same_direction = True
-        has_divergence = False
-    
+        )
+        test = _contrast_test(list(raw_a), list(raw_b))
+        p_value = _finite_float(test.get("p_value"))
+        hedges = _compute_cohens_d(values_a, values_b)
+        improvement_hedges = (
+            hedges if not higher_is_better else (
+                None if hedges is None else -hedges
+            )
+        )
+        entries.append({
+            "metric": metric,
+            "family": family_of.get(metric, "other"),
+            "higher_is_better": bool(higher_is_better),
+            "n_baseline": len(values_a),
+            "n_variant": len(values_b),
+            "mean_baseline": mean_a,
+            "mean_variant": mean_b,
+            "delta": delta,
+            "relative_delta": relative_delta,
+            "improvement": improvement,
+            "improvement_direction": direction,
+            "cliffs_delta": cliffs,
+            "improvement_cliffs_delta": improvement_cliffs,
+            "hedges_g": hedges,
+            "improvement_hedges_g": improvement_hedges,
+            "test": test.get("test"),
+            "p_value": p_value,
+            "significant": bool(
+                p_value is not None and p_value <= _SIGNIFICANCE_LEVEL
+            ),
+        })
+
+    families: List[Dict[str, object]] = []
+    for family, names in _CROSS_METRIC_FAMILIES:
+        family_entries = [
+            entry for entry in entries if entry["family"] == family
+        ]
+        if not family_entries:
+            continue
+        cliffs_values = [
+            float(entry["improvement_cliffs_delta"])
+            for entry in family_entries
+            if _finite_float(entry.get("improvement_cliffs_delta"))
+            is not None
+        ]
+        family_cliffs = (
+            float(_median(cliffs_values)) if cliffs_values else None
+        )
+        significant_entries = [
+            entry
+            for entry in family_entries
+            if entry.get("significant")
+        ]
+        significant_directions = {
+            str(entry["improvement_direction"])
+            for entry in significant_entries
+        }
+        if "improves" in significant_directions and (
+            "degrades" in significant_directions
+        ):
+            family_direction = "mixed"
+        elif significant_directions == {"improves"}:
+            family_direction = "improves"
+        elif significant_directions == {"degrades"}:
+            family_direction = "degrades"
+        elif significant_directions == {"tie"}:
+            family_direction = "tie"
+        elif significant_entries:
+            family_direction = "undetermined"
+        elif family_cliffs is not None:
+            if family_cliffs > 0.0:
+                family_direction = "improves"
+            elif family_cliffs < 0.0:
+                family_direction = "degrades"
+            else:
+                family_direction = "tie"
+        else:
+            family_direction = "undetermined"
+        families.append({
+            "family": family,
+            "metrics": [str(entry["metric"]) for entry in family_entries],
+            "n_metrics": len(family_entries),
+            "median_improvement_cliffs_delta": family_cliffs,
+            "improvement_direction": family_direction,
+            "significant_metrics": [
+                str(entry["metric"]) for entry in significant_entries
+            ],
+            "n_significant": len(significant_entries),
+        })
+
     return {
-        "cross_metric_consistent": all_same_direction,
-        "cross_metric_divergent": has_divergence,
+        "schema": "smelt-isr/cross-metric-profile/v1",
+        "available": bool(entries),
+        "n_metrics": len(entries),
+        "metrics": entries,
+        "families": families,
+        "metric_families": {
+            family: list(names)
+            for family, names in _CROSS_METRIC_FAMILIES
+        },
+        "note": (
+            "所有指标都在**最终评估点**上计算（不含共同步数/等"
+            "计算量等派生口径）；方向统一折算成「变体相对基线是"
+            "改善还是变差」。同源指标族内的指标互相高度相关，"
+            "跨族汇总才近似独立证据"
+        ),
+    }
+
+
+def _cross_metric_consistency_report(
+    profile: Dict[str, object],
+) -> Dict[str, object]:
+    """把跨指标效应剖面合成一致性与综合秩效应量判定。"""
+    entries = profile.get("metrics")
+    families = profile.get("families")
+    if not isinstance(entries, list) or not isinstance(families, list):
+        entries = []
+        families = []
+
+    metric_directions: Dict[str, str] = {}
+    significant_metrics: List[str] = []
+    improving_metrics: List[str] = []
+    degrading_metrics: List[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        metric = str(entry.get("metric"))
+        direction = str(entry.get("improvement_direction"))
+        metric_directions[metric] = direction
+        if entry.get("significant"):
+            significant_metrics.append(metric)
+            if direction == "improves":
+                improving_metrics.append(metric)
+            elif direction == "degrades":
+                degrading_metrics.append(metric)
+
+    family_directions: Dict[str, str] = {}
+    for family in families:
+        if not isinstance(family, dict):
+            continue
+        family_directions[str(family.get("family"))] = str(
+            family.get("improvement_direction")
+        )
+
+    # 分歧只看「有显著证据」的族：没有显著证据的族方向只是噪声，
+    # 拿它判定分歧会把正常的无效应指标误报成结论冲突。
+    informative = {
+        name: direction
+        for name, direction in family_directions.items()
+        if direction in ("improves", "degrades", "mixed")
+    }
+    divergent = bool(
+        "mixed" in informative.values()
+        or ("improves" in informative.values()
+            and "degrades" in informative.values())
+    )
+    divergent_families = [
+        name
+        for name, direction in informative.items()
+        if direction == "mixed"
+    ]
+    if divergent and not divergent_families:
+        divergent_families = sorted(informative)
+
+    family_cliffs = [
+        float(family["median_improvement_cliffs_delta"])
+        for family in families
+        if isinstance(family, dict)
+        and _finite_float(
+            family.get("median_improvement_cliffs_delta")
+        )
+        is not None
+    ]
+    composite = (
+        float(_median(family_cliffs)) if family_cliffs else None
+    )
+    iqr = None
+    if len(family_cliffs) >= 2:
+        ordered = sorted(family_cliffs)
+        middle = len(ordered) // 2
+        if len(ordered) % 2 == 1:
+            low = ordered[middle]
+            high = ordered[middle]
+        else:
+            low = ordered[middle - 1]
+            high = ordered[middle]
+        iqr = high - low
+
+    return {
+        "available": bool(entries),
+        "cross_metric_consistent": bool(entries) and not divergent,
+        "cross_metric_divergent": divergent,
         "significant_metrics": significant_metrics,
+        "improving_metrics": improving_metrics,
+        "degrading_metrics": degrading_metrics,
         "metric_directions": metric_directions,
+        "family_directions": family_directions,
+        "divergent_families": divergent_families,
+        "composite_cliffs_delta": composite,
+        "composite_cliffs_delta_iqr": iqr,
+        "composite_n_families": len(family_cliffs),
+        "marker": "[metric-divergence]" if divergent else None,
+        "note": (
+            "跨指标一致性：方向统一折算为「变体相对基线是改善还是"
+            "变差」，只在有显著证据的同源指标族之间判定分歧。"
+            "综合秩效应量是族级 Cliff's δ 的中位数（中位数与其"
+            "IQR），正号表示变体整体更优；它用于防止只挑单个指标"
+            "下结论，不替代 Holm 校正后的显著性判定"
+        ),
+    }
+
+
+def _result_verdict(
+    contrast: Dict[str, object],
+    alpha: float = _SIGNIFICANCE_LEVEL,
+) -> Dict[str, object]:
+    """把一个对比的既有判定合成为机器可读的裁决与下一步建议。
+
+    判定树（按优先级）：
+
+    1. 混杂对比（同时改了多个因子）→ ``confounded``：先统一协议
+       再重跑，任何统计量都不能归因；
+    2. 显著但脆弱（删掉少量种子即失效）→ ``inconclusive_fragile``；
+    3. 显著但缺失/失败运行的极端赋值可改变方向 →
+       ``inconclusive_attrition``；
+    4. 显著但功效低于目标 → ``significant_underpowered``；
+    5. 显著且稳健 → ``significant``；
+    6. TOST 通过 → ``equivalent``（支持无实质差异）；
+    7. 不显著且点估计已越出等价界 → ``reject_equivalence``
+       （确有差异，不能读成「无差异」）；
+    8. 不显著且卡在精度 → ``inconclusive_precision``（加种子，
+       不要事后放宽等价界）；
+    9. 不显著且功效不足 → ``underpowered``；
+    10. 其余 → ``not_significant``。
+
+    ``recommended_action`` 给出可执行的下一步：``add_seeds`` /
+    ``expand_eval_set`` / ``add_seeds_and_expand_eval_set`` /
+    ``complete_runs`` / ``fix_protocol`` / ``none``。方差分解显示
+    不确定性主要来自评估窗口时，优先建议扩大评估集而不是加种子。
+    """
+    reasons: List[str] = []
+    action = "none"
+
+    if contrast.get("confounded"):
+        return {
+            "verdict": "confounded",
+            "action": "fix_protocol",
+            "reasons": [
+                "同时改变了多个因子，统计显著也不能归因到待验证模块"
+            ],
+            "significant": bool(contrast.get("significant")),
+            "equivalent": bool(contrast.get("equivalent")),
+            "note": (
+                "混杂对比必须先统一协议重跑；本裁决不解读统计量"
+            ),
+        }
+
+    significant = bool(contrast.get("significant"))
+    equivalent = bool(contrast.get("equivalent"))
+    fragility = _as_dict(contrast.get("fragility"))
+    attrition = _as_dict(contrast.get("attrition_bounds"))
+    power_at_effect = _finite_float(contrast.get("power_at_effect"))
+    blocker = contrast.get("equivalence_blocker")
+
+    if significant:
+        verdict = "significant"
+        fragility_verdict = str(fragility.get("verdict") or "")
+        attrition_verdict = str(attrition.get("verdict") or "")
+        if fragility_verdict == "fragile":
+            verdict = "inconclusive_fragile"
+            action = "add_seeds"
+            reasons.append(
+                "删除少量随机种子后显著性即消失：结论依赖个别种子"
+            )
+        elif attrition_verdict in ("crosses_zero", "unbounded") or (
+            attrition.get("sign_robust") is False
+        ):
+            verdict = "inconclusive_attrition"
+            action = "complete_runs"
+            reasons.append(
+                "缺失/失败运行的极端赋值可改变效应方向：显著结论"
+                "可能由「哪些运行留下了」驱动"
+            )
+        elif (
+            power_at_effect is not None
+            and power_at_effect < _TARGET_POWER
+        ):
+            verdict = "significant_underpowered"
+            action = "add_seeds"
+            reasons.append(
+                f"当前功效 {power_at_effect:.0%} 低于 "
+                f"{_TARGET_POWER:.0%} 目标：结论方向可用，强度不足"
+            )
+        else:
+            reasons.append(
+                "Holm 校正后显著，且未触发脆弱性/缺失/低功效标记"
+            )
+    elif equivalent:
+        verdict = "equivalent"
+        reasons.append("TOST 通过：支持两臂无实质差异")
+    else:
+        if blocker == "effect_exceeds_margin":
+            verdict = "reject_equivalence"
+            reasons.append(
+                "点估计已超出等价界：不显著不是「无差异」，而是确有"
+                "差异，增加种子只会让这一点更确定"
+            )
+        elif blocker == "insufficient_precision":
+            verdict = "inconclusive_precision"
+            action = "add_seeds"
+            reasons.append(
+                "点估计落在等价界内但精度不足：TOST 未通过不能读成"
+                "两者不同，应增加种子而不是事后放宽等价界"
+            )
+        elif power_at_effect is not None and power_at_effect < 0.5:
+            verdict = "underpowered"
+            action = "add_seeds"
+            reasons.append(
+                f"观测效应的功效仅 {power_at_effect:.0%}：本轮"
+                "没有能力区分「无效应」与「未检出」"
+            )
+        else:
+            verdict = "not_significant"
+            reasons.append(
+                "未检出显著差异，且等价性与功效均未给出额外判定"
+            )
+
+    window_paired = _as_dict(contrast.get("window_paired"))
+    components = _as_dict(window_paired.get("variance_components"))
+    dominant = components.get("dominant_source")
+    if dominant == "evaluation_windows":
+        reasons.append(
+            "方差分解显示不确定性主要来自评估窗口：扩大评估集比"
+            "加种子更经济"
+        )
+        action = "expand_eval_set"
+    elif dominant in ("seed_window_interaction", "mixed"):
+        reasons.append(
+            "方差分解显示种子×窗口交互或混合来源占主导：需要同时"
+            "增加独立种子并扩大评估集"
+        )
+        action = "add_seeds_and_expand_eval_set"
+
+    return {
         "verdict": verdict,
-        "delta": delta,
+        "action": action,
+        "reasons": reasons,
+        "significant": significant,
+        "equivalent": equivalent,
+        "power_at_effect": power_at_effect,
+        "fragility_verdict": fragility.get("verdict"),
+        "attrition_verdict": attrition.get("verdict"),
+        "equivalence_blocker": blocker,
+        "dominant_uncertainty_source": dominant,
+        "alpha": float(alpha),
+        "note": (
+            "裁决由既有判定字段机械合成，不替代人工审阅；"
+            "recommended_action 只提示性价比最高的下一步"
+        ),
+    }
+
+
+def _cost_efficiency_assessment(
+    contrast: Dict[str, object],
+    higher_is_better: bool = False,
+) -> Dict[str, object]:
+    """精度增益与效率代价的联合判定（gain per cost）。
+
+    只报「涨点 + 效率倍率」不足以支持选型：涨点幅度要与**额外**
+    代价成比例才划算。这里用相对增益除以额外成本倍率
+    （``cost_ratio − 1``）得到 ``gain_per_cost``：>1 表示相对增益
+    以 1:1 以上的比例赚回多花的那部分成本，≤1 表示代价没有赚回。
+    区间用效应区间与成本倍率区间给出保守口径（增益取最不利端、
+    成本取最有利端）。
+
+    成本倍率 ≥1.5× 时：
+
+    - 区间整体 ≤1 → ``cost_inefficient``（额外代价明确没赚回）；
+    - 区间跨过 1 → ``cost_unproven``（无法证明代价被赚回）。
+
+    变体不比基线贵时不存在取舍，判定为 ``no_extra_cost``。
+    """
+    cost = _as_dict(contrast.get("cost"))
+    ratios = _as_dict(cost.get("ratios"))
+    uncertainty = _as_dict(cost.get("uncertainty"))
+    if not ratios:
+        return {
+            "available": False,
+            "reason": "no_cost_measurement",
+            "note": "缺少效率测量，无法做精度/效率联合判定",
+        }
+
+    basis = None
+    for field in ("flops_per_forward", "n_params"):
+        if field in ratios:
+            basis = field
+            break
+    if basis is None:
+        basis = sorted(ratios)[0] if ratios else None
+    if basis is None:
+        return {
+            "available": False,
+            "reason": "no_cost_measurement",
+            "note": "缺少效率测量，无法做精度/效率联合判定",
+        }
+    cost_ratio = _finite_float(ratios.get(basis))
+    if cost_ratio is None or cost_ratio <= 0.0:
+        return {
+            "available": False,
+            "reason": "invalid_cost_ratio",
+            "basis": basis,
+            "note": "成本倍率不可用，无法做精度/效率联合判定",
+        }
+
+    mean_baseline = _finite_float(contrast.get("mean_baseline"))
+    mean_variant = _finite_float(contrast.get("mean_variant"))
+    delta = _finite_float(contrast.get("delta"))
+    if mean_baseline is None or mean_variant is None or delta is None:
+        return {
+            "available": False,
+            "reason": "missing_effect_estimate",
+            "basis": basis,
+            "note": "缺少效应估计，无法做精度/效率联合判定",
+        }
+    if abs(mean_baseline) <= 1e-12:
+        return {
+            "available": False,
+            "reason": "degenerate_baseline_mean",
+            "basis": basis,
+            "note": "基线均值为 0，相对增益无定义",
+        }
+
+    relative_gain = (
+        (mean_variant - mean_baseline) / abs(mean_baseline)
+    )
+    if not higher_is_better:
+        relative_gain = -relative_gain
+    extra_cost_ratio = cost_ratio - 1.0
+    if extra_cost_ratio <= 0.0:
+        # 变体不比基线贵：没有额外代价，也就没有效率取舍。
+        return {
+            "available": True,
+            "basis": basis,
+            "cost_ratio": cost_ratio,
+            "material_cost": False,
+            "extra_cost_ratio": 0.0,
+            "relative_gain": relative_gain,
+            "gain_per_cost": None,
+            "gain_per_cost_ci95": None,
+            "ci_crosses_one": False,
+            "cost_inefficient": False,
+            "cost_unproven": False,
+            "marker": None,
+            "reason": (
+                f"成本倍率 {cost_ratio:.2f}× ≤1：变体没有额外成本，"
+                "不存在效率取舍"
+            ),
+            "note": (
+                "gain_per_cost = 相对增益 / 额外成本倍率"
+                "（cost_ratio − 1）；>1 表示额外代价被赚回"
+            ),
+        }
+    gain_per_cost = relative_gain / extra_cost_ratio
+
+    ci_low = _finite_float(contrast.get("ci95_low"))
+    ci_high = _finite_float(contrast.get("ci95_high"))
+    if ci_low is None or ci_high is None:
+        delta_ci = _as_dict(contrast.get("delta_ci95"))
+        ci_low = _finite_float(delta_ci.get("low"))
+        ci_high = _finite_float(delta_ci.get("high"))
+    if ci_low is None or ci_high is None:
+        # 对比载荷里常规只有 delta/se/df：效应区间按同一个 t 分布
+        # 还原（与显著性判定同一个 t 临界值），不另造口径。
+        se = _finite_float(contrast.get("se"))
+        df = _finite_float(contrast.get("df"))
+        critical = (
+            _t_critical(df) if df is not None else None
+        )
+        if se is not None and critical is not None:
+            ci_low = delta - critical * se
+            ci_high = delta + critical * se
+    detail = _as_dict(uncertainty.get(basis))
+    ratio_ci = detail.get("ratio_ci95")
+    ratio_low = None
+    ratio_high = None
+    if isinstance(ratio_ci, (list, tuple)) and len(ratio_ci) == 2:
+        ratio_low = _finite_float(ratio_ci[0])
+        ratio_high = _finite_float(ratio_ci[1])
+    # 区间要与点估计同一口径：分母是**额外**成本倍率，不是总倍率。
+    extra_low = None
+    extra_high = None
+    if ratio_low is not None:
+        extra_low = max(ratio_low - 1.0, 0.0)
+    if ratio_high is not None:
+        extra_high = max(ratio_high - 1.0, 0.0)
+
+    gain_low = None
+    gain_high = None
+    if ci_low is not None and ci_high is not None:
+        # 区间端点是**差值**（variant − baseline），换算成相对基线
+        # 的相对增益；越低越好的指标取反后区间要重新排序。
+        raw_low = ci_low / abs(mean_baseline)
+        raw_high = ci_high / abs(mean_baseline)
+        if not higher_is_better:
+            raw_low, raw_high = -raw_low, -raw_high
+        gain_low = min(raw_low, raw_high)
+        gain_high = max(raw_low, raw_high)
+
+    interval_low = None
+    interval_high = None
+    if gain_low is not None and extra_high is not None and extra_high > 0:
+        interval_low = gain_low / extra_high
+    if gain_high is not None and extra_low is not None and extra_low > 0:
+        interval_high = gain_high / extra_low
+
+    material = bool(cost_ratio >= _COST_RATIO_MATERIAL)
+    crosses_one = None
+    below_one = None
+    if interval_low is not None and interval_high is not None:
+        crosses_one = bool(interval_low < 1.0 < interval_high)
+        below_one = bool(interval_high <= 1.0)
+    elif interval_low is not None:
+        # 成本区间下端 ≤1：变体可能根本不更贵，效率取舍无法判定
+        # 为「不划算」，只能记为「没有被证明」。
+        crosses_one = bool(interval_low < 1.0)
+        below_one = False
+    cost_inefficient = bool(material and below_one)
+    cost_unproven = bool(material and crosses_one)
+    if cost_inefficient:
+        reason = (
+            f"成本倍率 {cost_ratio:.2f}×（≥1.5×）且增益/额外成本区间"
+            "整体不超过 1：额外代价没有被赚回"
+        )
+    elif cost_unproven:
+        reason = (
+            f"成本倍率 {cost_ratio:.2f}×（≥1.5×）且增益/额外成本区间"
+            "跨过 1：额外代价没有被证明换来成比例的收益"
+        )
+    elif material:
+        reason = (
+            f"成本倍率 {cost_ratio:.2f}×（≥1.5×），但增益/额外成本区间"
+            "仍在 1 以上：代价与收益成比例"
+        )
+    else:
+        reason = (
+            f"成本倍率 {cost_ratio:.2f}× 未达 1.5× 门槛：效率代价"
+            "相对收益不构成取舍问题"
+        )
+    marker = None
+    if cost_inefficient:
+        marker = "[cost-inefficient]"
+    elif cost_unproven:
+        marker = "[cost-unproven]"
+    return {
+        "available": True,
+        "basis": basis,
+        "cost_ratio": cost_ratio,
+        "material_cost": material,
+        "extra_cost_ratio": extra_cost_ratio,
+        "relative_gain": relative_gain,
+        "gain_per_cost": gain_per_cost,
+        "gain_per_cost_ci95": (
+            [interval_low, interval_high]
+            if interval_low is not None and interval_high is not None
+            else None
+        ),
+        "ci_crosses_one": crosses_one,
+        "ci_below_one": below_one,
+        "cost_inefficient": cost_inefficient,
+        "cost_unproven": cost_unproven,
+        "marker": marker,
+        "reason": reason,
+        "note": (
+            "gain_per_cost = 相对增益 / 额外成本倍率（cost_ratio − 1）；"
+            ">1 表示额外代价被赚回。区间用最不利增益与最有利成本"
+            "组合，属保守口径。该判定只描述精度与效率的取舍，"
+            "不参与显著性判定"
+        ),
     }
 
 

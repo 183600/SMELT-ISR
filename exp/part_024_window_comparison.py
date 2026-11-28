@@ -970,6 +970,9 @@ def _cell_window_paired_analysis(
     variance_components = _window_variance_components(
         seed_loss_differences
     )
+    window_sensitivity = _window_size_sensitivity_analysis(
+        seed_loss_differences
+    )
     overlap_fractions = [
         entry.get("overlap_fraction")
         for entry in usable
@@ -1011,6 +1014,7 @@ def _cell_window_paired_analysis(
         "hierarchical_bootstrap_ci95": hierarchical,
         "hierarchical_group_bootstrap_ci95": hierarchical_group,
         "variance_components": variance_components,
+        "window_size_sensitivity": window_sensitivity,
         "seeds": [int(entry["seed"]) for entry in usable],
         "per_seed": per_seed,
         "mean_loss_diff": overall_mean,

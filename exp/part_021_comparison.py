@@ -547,6 +547,15 @@ def compare_runs(paths: List[str]) -> List[Dict[str, object]]:
         row["routing_interventions_available"] = isinstance(
             interventions, dict
         )
+        # 标签覆盖：训练集从未出现的字节类在评估 token 中的占比。
+        # 它决定指标里有多少是**不可约的外推误差**（字节级 LM
+        # 只能靠上下文降低已见标签的 NLL）。对比分析用它标注
+        # 外推风险：覆盖率不同的两臂不能直接比指标。
+        row["label_coverage"] = _as_dict(
+            _as_dict(config_payload.get("data_audit")).get(
+                "label_coverage"
+            )
+        ) or None
         for key in _ROUTING_ROW_FIELDS:
             row[key] = None
         if isinstance(routing, dict):

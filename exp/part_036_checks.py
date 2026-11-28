@@ -1393,6 +1393,13 @@ def write_comparison_report_file(
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
     print(f"[report] 对比分析已写入 {path}")
+    # 人类可读摘要：与 JSON 同目录同名的 .md 文件。JSON 是完整
+    # 证据结构，Markdown 是同一份证据的可读视图（只转述，不重算）。
+    # 摘要写入失败不应影响 JSON 报告。
+    try:
+        write_comparison_report_markdown(path.with_suffix(".md"), analysis)
+    except Exception:
+        pass
     # 负结果注册表：把未显著且未等价的对比追加写入
     # null_results_registry.jsonl，防止「文件柜效应」（只报显著结果、
     # 隐藏零结果）。注册表写入失败不应阻断主报告落盘。
@@ -1500,6 +1507,240 @@ def write_comparison_report(
 
 
 
+def write_comparison_report_markdown(
+    path: Path,
+    analysis: Dict[str, object],
+) -> Path:
+    """把对比分析写成人类可读的 Markdown 摘要（--compare-report-md）。
+
+    JSON 报告是完整但嵌套的证据结构，适合机器复核；Markdown
+    摘要给出同一份证据的可读视图：判定指标、每个对比的效应/
+    显著性/等价性/功效/脆弱性/裁决/效率权衡，以及数据、代码、
+    环境指纹与所有警告标记。
+
+    摘要只做**转述**，不重算统计量：数字全部来自 analysis 载荷，
+    因此与 JSON 报告逐位一致。写文件失败不影响 JSON 报告。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    metric = str(analysis.get("metric", "val_loss"))
+    extensions = _as_dict(analysis.get("result_extensions"))
+    verdicts = _as_dict(extensions.get("result_verdicts"))
+    fingerprints = _as_dict(extensions.get("fingerprints"))
+    lines: List[str] = []
+    lines.append(f"# SMELT-ISR 对比分析摘要（{metric}）")
+    lines.append("")
+    lines.append(
+        f"- 判定指标：`{metric}`（"
+        + ("越高越好" if metric_higher_is_better(metric) else "越低越好")
+        + "）"
+    )
+    lines.append(f"- 分析运行数：{analysis.get('n_runs')}")
+    lines.append(
+        "- 生成时间："
+        + datetime.datetime.now().isoformat(timespec="seconds")
+    )
+    lines.append("")
+
+    if fingerprints:
+        lines.append("## 追溯指纹")
+        lines.append("")
+        lines.append("| 键 | 取值 |")
+        lines.append("| --- | --- |")
+        for key in sorted(fingerprints):
+            if key in ("note", "consistent"):
+                continue
+            value = fingerprints.get(key)
+            if isinstance(value, (list, tuple)):
+                shown = "<br>".join(str(item) for item in value)
+            else:
+                shown = str(value)
+            lines.append(f"| {key} | {shown} |")
+        if fingerprints.get("consistent") is False:
+            lines.append("")
+            lines.append(
+                "> [warn] 同一指纹键出现多个取值：该轮对比涉及多份"
+                "数据/代码/环境，结论不能整体归因。"
+            )
+        lines.append("")
+
+    verdict_counts = _as_dict(verdicts.get("verdict_counts"))
+    if verdict_counts:
+        lines.append("## 裁决分布")
+        lines.append("")
+        for key in sorted(verdict_counts):
+            lines.append(f"- `{key}`：{verdict_counts[key]}")
+        lines.append("")
+
+    lines.append("## 对比明细")
+    lines.append("")
+    header = (
+        "| 对比 | Δ | Holm p | 显著 | 等价 | 功效 | 脆弱性 | "
+        "裁决 | 建议 |"
+    )
+    lines.append(header)
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    families = (
+        ("单因子", "contrasts"),
+        ("基线直接", "reference_contrasts"),
+    )
+    for label, key in families:
+        entries = analysis.get(key)
+        if not isinstance(entries, list):
+            continue
+        for contrast in entries:
+            if not isinstance(contrast, dict):
+                continue
+            if contrast.get("confounded"):
+                lines.append(
+                    f"| {label} {contrast.get('baseline')}→"
+                    f"{contrast.get('variant')} | - | - | 混杂 | - | - "
+                    "| - | confounded | fix_protocol |"
+                )
+                continue
+            verdict = _as_dict(contrast.get("result_verdict"))
+            fragility = _as_dict(contrast.get("fragility"))
+            lines.append(
+                "| {label} {baseline}→{variant} | {delta} | {p} | "
+                "{sig} | {eq} | {power} | {frag} | {verdict} | "
+                "{action} |".format(
+                    label=label,
+                    baseline=contrast.get("baseline"),
+                    variant=contrast.get("variant"),
+                    delta=_format_finite(
+                        contrast.get("delta"), '+.4f'
+                    ),
+                    p=_format_finite(
+                        contrast.get("p_value_holm"), '.3g'
+                    ),
+                    sig="是" if contrast.get("significant") else "否",
+                    eq="是" if contrast.get("equivalent") else "否",
+                    power=_format_finite(
+                        contrast.get("power_at_effect"), '.0%'
+                    ),
+                    frag=str(fragility.get("verdict") or "-"),
+                    verdict=str(verdict.get("verdict") or "-"),
+                    action=str(verdict.get("action") or "none"),
+                )
+            )
+    lines.append("")
+
+    extensions_result = _as_dict(extensions.get("result_verdicts"))
+    entries = extensions_result.get("entries")
+    if isinstance(entries, list) and entries:
+        lines.append("## 裁决理由与标记")
+        lines.append("")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            markers = []
+            if entry.get("cross_metric_divergent"):
+                markers.append("[metric-divergence]")
+            if entry.get("cost_inefficient"):
+                markers.append("[cost-inefficient]")
+            elif entry.get("cost_unproven"):
+                markers.append("[cost-unproven]")
+            marker_text = (" " + " ".join(markers)) if markers else ""
+            lines.append(
+                f"### {entry.get('label')} → "
+                f"`{entry.get('verdict')}`{marker_text}"
+            )
+            for reason in entry.get("reasons") or []:
+                lines.append(f"- {reason}")
+            lines.append("")
+
+    cost_entries = extensions.get("cost_efficiency")
+    if isinstance(cost_entries, list) and cost_entries:
+        lines.append("## 精度/效率权衡")
+        lines.append("")
+        lines.append(
+            "| 对比 | 成本口径 | 成本倍率 | 相对增益 | 增益/额外成本 | 判定 |"
+        )
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for entry in cost_entries:
+            if not isinstance(entry, dict) or not entry.get("available"):
+                continue
+            flag = "ok"
+            if entry.get("cost_inefficient"):
+                flag = "[cost-inefficient]"
+            elif entry.get("cost_unproven"):
+                flag = "[cost-unproven]"
+            lines.append(
+                "| {label} | {basis} | {ratio} | {gain} | {gpc} | "
+                "{flag} |".format(
+                    label=entry.get("label"),
+                    basis=entry.get("basis"),
+                    ratio=_format_finite(entry.get("cost_ratio"), '.2f'),
+                    gain=_format_finite(
+                        entry.get("relative_gain"), '+.2%'
+                    ),
+                    gpc=_format_finite(
+                        entry.get("gain_per_cost"), '+.3f'
+                    ),
+                    flag=flag,
+                )
+            )
+        lines.append("")
+
+    extrapolation = _as_dict(extensions.get("extrapolation_risk"))
+    if extrapolation.get("extrapolation_risk"):
+        lines.append("## 外推风险")
+        lines.append("")
+        lines.append(
+            f"- [extrapolation-risk] "
+            f"{extrapolation.get('n_affected')} 个运行/split 的未见标签"
+            f" token 占比超过阈值 "
+            f"{_format_finite(extrapolation.get('threshold'), '.2%')}"
+        )
+        lines.append(
+            "- 未见标签的 NLL 含不可约外推误差：覆盖率不同的两臂不能"
+            "直接比较指标。"
+        )
+        lines.append("")
+
+    lines.append("## 解读边界")
+    lines.append("")
+    lines.append(
+        "- 显著性以家族内 Holm 校正后的 p 值为准；不显著 ≠ 等价。"
+    )
+    lines.append(
+        "- 脆弱性、缺失界与功效是描述性敏感性分析，不替代主检验；"
+        "「显著」若依赖少数种子，应增加独立种子或调查异常运行。"
+    )
+    lines.append(
+        "- 跨指标综合效应量按同源指标族汇总，正号表示变体整体更优；"
+        "它用于防止只挑单个指标下结论。"
+    )
+    lines.append(
+        "- 本摘要由 JSON 报告转述，不重算统计量；数字与 "
+        "`comparison_analysis.json` 逐位一致。"
+    )
+    lines.append("")
+
+    text = "\n".join(lines)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    print(f"[report-md] 对比分析摘要已写入 {path}")
+    return path
+
+
+
 # CSV 导出的对比表列名（顺序固定）。列名只增不改：后续版本
 # 可以在末尾新增列，但不能重命名或删除既有列，否则下游分析
 # 脚本会静默失配。
@@ -1561,6 +1802,21 @@ _COMPARISON_CSV_CONTRAST_COLUMNS = (
     "equivalence_margin_abs",
     "verdict",
     "cost_verdict",
+    # 结果分析扩展列（只增不改）：跨指标一致性、机器可读裁决
+    # 与精度/效率联合判定。
+    "result_verdict",
+    "result_verdict_action",
+    "cross_metric_consistent",
+    "cross_metric_divergent",
+    "cross_metric_composite_cliffs_delta",
+    "cross_metric_composite_cliffs_delta_iqr",
+    "cross_metric_divergent_families",
+    "cost_inefficient",
+    "cost_unproven",
+    "gain_per_cost",
+    "gain_per_cost_ci95_low",
+    "gain_per_cost_ci95_high",
+    "cost_ratio",
 )
 
 _COMPARISON_CSV_AGGREGATE_COLUMNS = (
@@ -1614,6 +1870,18 @@ def _comparison_contrast_row(
     dz_ci = _as_dict(contrast.get("cohens_dz_ci95"))
     gz_ci = _as_dict(contrast.get("hedges_gz_ci95"))
     cliff_ci = _as_dict(contrast.get("cliffs_delta_ci95"))
+    result_verdict = _as_dict(contrast.get("result_verdict"))
+    cross_metric = _as_dict(contrast.get("cross_metric_summary"))
+    cost_efficiency = _as_dict(contrast.get("cost_efficiency"))
+    gain_per_cost_ci = cost_efficiency.get("gain_per_cost_ci95")
+    gain_per_cost_low = None
+    gain_per_cost_high = None
+    if (
+        isinstance(gain_per_cost_ci, (list, tuple))
+        and len(gain_per_cost_ci) == 2
+    ):
+        gain_per_cost_low = gain_per_cost_ci[0]
+        gain_per_cost_high = gain_per_cost_ci[1]
     row: Dict[str, object] = {
         "family": family,
         "cells": contrast.get("cells"),
@@ -1692,6 +1960,29 @@ def _comparison_contrast_row(
         ),
         "verdict": contrast.get("verdict"),
         "cost_verdict": contrast.get("cost_verdict"),
+        "result_verdict": result_verdict.get("verdict"),
+        "result_verdict_action": result_verdict.get("action"),
+        "cross_metric_consistent": contrast.get(
+            "cross_metric_consistent"
+        ),
+        "cross_metric_divergent": contrast.get(
+            "cross_metric_divergent"
+        ),
+        "cross_metric_composite_cliffs_delta": cross_metric.get(
+            "composite_cliffs_delta"
+        ),
+        "cross_metric_composite_cliffs_delta_iqr": cross_metric.get(
+            "composite_cliffs_delta_iqr"
+        ),
+        "cross_metric_divergent_families": cross_metric.get(
+            "divergent_families"
+        ),
+        "cost_inefficient": cost_efficiency.get("cost_inefficient"),
+        "cost_unproven": cost_efficiency.get("cost_unproven"),
+        "gain_per_cost": cost_efficiency.get("gain_per_cost"),
+        "gain_per_cost_ci95_low": gain_per_cost_low,
+        "gain_per_cost_ci95_high": gain_per_cost_high,
+        "cost_ratio": cost_efficiency.get("cost_ratio"),
     }
     return row
 

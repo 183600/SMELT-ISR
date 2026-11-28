@@ -457,155 +457,279 @@ def _apply_multiple_comparison_correction(
 def _cross_metric_consistency_analysis(
     contrasts: List[Dict[str, object]],
     metric: str,
+    aggregates: Optional[List[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
-    """Check cross-metric consistency for each contrast.
+    """对每个对比补上跨指标一致性判定与综合秩效应量。
 
-    For each contrast, checks whether multiple pre-registered metrics
-    point in the same direction. Returns contrasts with added
-    cross_metric_consistency fields.
+    单因子对比只在判定指标上做检验，因此「换指标结论是否翻转」
+    必须另算：这里对构成该对比的两个实验单元，在所有可用的最终
+    评估点指标上重算效应（见 ``_cross_metric_effect_profile``），
+    再合成一致性与族级综合秩效应量（见
+    ``_cross_metric_consistency_report``）。
+
+    ``aggregates`` 提供实验单元的逐指标样本；缺单元时只保留
+    「不可用」标记，不伪造一致性结论。
     """
-    from .part_025_statistics import _cross_metric_consistency_check
+    cells_by_label: Dict[str, Dict[str, object]] = {}
+    if isinstance(aggregates, list):
+        for aggregate in aggregates:
+            if not isinstance(aggregate, dict):
+                continue
+            label = aggregate.get("label")
+            if label is None:
+                continue
+            cells_by_label[str(label)] = aggregate
 
-    results = []
     for contrast in contrasts:
-        # Skip confounded contrasts
-        if contrast.get("confounded"):
-            results.append(contrast)
+        if not isinstance(contrast, dict):
             continue
+        if contrast.get("confounded"):
+            continue
+        cell_a = cells_by_label.get(str(contrast.get("baseline")))
+        cell_b = cells_by_label.get(str(contrast.get("variant")))
+        if cell_a is None or cell_b is None:
+            # 没拿到实验单元就无法核对跨指标一致性：记「待定」而
+            # 不是默认「一致」——默认一致会把「没检查」说成「检查
+            # 过且一致」。
+            contrast["cross_metric_consistent"] = None
+            contrast["cross_metric_divergent"] = False
+            contrast["significant_metrics"] = []
+            contrast["metric_directions"] = {}
+            contrast["cross_metric_summary"] = {
+                "available": False,
+                "reason": "missing_cell_aggregates",
+                "marker": None,
+            }
+            continue
+        profile = _cross_metric_effect_profile(cell_a, cell_b)
+        report = _cross_metric_consistency_report(profile)
+        contrast["cross_metric"] = profile
+        contrast["cross_metric_consistent"] = report[
+            "cross_metric_consistent"
+        ]
+        contrast["cross_metric_divergent"] = report[
+            "cross_metric_divergent"
+        ]
+        contrast["significant_metrics"] = report[
+            "significant_metrics"
+        ]
+        contrast["metric_directions"] = report["metric_directions"]
+        contrast["cross_metric_summary"] = {
+            "available": report["available"],
+            "family_directions": report["family_directions"],
+            "divergent_families": report["divergent_families"],
+            "composite_cliffs_delta": report[
+                "composite_cliffs_delta"
+            ],
+            "composite_cliffs_delta_iqr": report[
+                "composite_cliffs_delta_iqr"
+            ],
+            "composite_n_families": report["composite_n_families"],
+            "marker": report["marker"],
+        }
+    return contrasts
 
-        result = _cross_metric_consistency_check(contrast)
-        # Add the cross-metric consistency fields to the contrast
-        contrast["cross_metric_consistent"] = result.get("cross_metric_consistent", True)
-        contrast["cross_metric_divergent"] = result.get("cross_metric_divergent", False)
-        contrast["significant_metrics"] = result.get("significant_metrics", [])
-        contrast["metric_directions"] = result.get("metric_directions", {})
-        results.append(contrast)
 
-    return results
+def _routing_specialization_fdr(
+    rows: List[Dict[str, object]],
+    group_keys: Sequence[str],
+    alpha: float = 0.05,
+) -> Dict[str, object]:
+    """路由专家分离的 BH-FDR 校正与跨种子一致性汇总。
 
+    每个运行的 ``expert_drop`` 干预给出 E 个专家的 Δloss 与配对
+    bootstrap 95% 区间。「某专家被屏蔽后损失显著上升」是 E 个
+    并行假设：逐个看区间、不做多重比较校正，就把「最重与最轻
+    专家的区间分离」当成了专门化证据（分离只是相对排序，不是
+    任何一个专家确实重要的确证）。
 
-def _routing_fdr_correction(
-    contrasts: List[Dict[str, object]],
-) -> List[Dict[str, object]]:
-    """Apply Benjamini-Hochberg FDR correction to routing intervention p-values.
+    校正口径：
 
-    For each contrast with routing_interventions, applies BH correction
-    to the expert drop p-values, reporting adjusted p-values and FDR-significant
-    expert count.
+    1. **运行内**做 Benjamini-Hochberg FDR（族 = 该运行的 E 个
+       专家），给出每个专家的校正后 p 值；
+    2. **实验单元内**按种子汇总：某专家被判为专门化需要在过半
+       有数据的运行中都通过 FDR 校正（跨种子一致支持）。
+
+    p 值来源：干预记录只保存了逐专家的配对 bootstrap 95% 区间，
+    没有保存原始重采样分布。区间 → p 值用正态近似
+    （se ≈ (high-low)/(2·1.96)，单侧 p = 1-Φ(Δ/se)，检验
+    「屏蔽该专家不损失」），并在结果里显式声明这是近似口径；
+    区间不可用时该专家的 p 值记为 1（不当作有证据）。
     """
-    import numpy as np
-
-    eligible: List[Tuple[Dict[str, object], List[float]]] = []
-    for contrast in contrasts:
-        interventions = contrast.get("routing_interventions")
+    per_run: List[Dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        interventions = row.get("routing_interventions")
         if not isinstance(interventions, dict):
             continue
-        p_values = interventions.get("expert_drop_p_values") or interventions.get(
-            "expert_drop_p_value"
+        drop = _as_dict(
+            _as_dict(interventions.get("interventions")).get(
+                "expert_drop"
+            )
         )
-        if p_values is None or not isinstance(p_values, (list, tuple)):
+        per_expert = drop.get("per_expert")
+        if not isinstance(per_expert, dict) or not per_expert:
             continue
-        # Convert to list of floats, skipping invalid values
-        valid_p = []
-        for p in p_values:
-            fp = _finite_probability(p)
-            if fp is not None:
-                valid_p.append(fp)
-        if valid_p:
-            eligible.append((contrast, valid_p))
+        expert_ids: List[str] = []
+        p_values: List[float] = []
+        details: Dict[str, Dict[str, object]] = {}
+        for expert_id in sorted(per_expert, key=lambda key: str(key)):
+            entry = per_expert.get(expert_id)
+            if not isinstance(entry, dict):
+                continue
+            delta = _finite_float(entry.get("loss_delta"))
+            interval = _as_dict(entry.get("loss_delta_ci95"))
+            low = _finite_float(interval.get("low"))
+            high = _finite_float(interval.get("high"))
+            p_value = 1.0
+            method = "ci_unavailable"
+            if delta is not None and low is not None and high is not None:
+                if low > 0.0 and high > low:
+                    standard_error = (high - low) / (2.0 * 1.959963984540054)
+                    if standard_error > 0.0:
+                        z_score = delta / standard_error
+                        p_value = max(
+                            0.0,
+                            min(1.0, 1.0 - _normal_cdf(z_score)),
+                        )
+                        method = "normal_approx_from_bootstrap_ci"
+                    else:
+                        method = "degenerate_ci"
+                else:
+                    method = "ci_includes_zero"
+            expert_ids.append(str(expert_id))
+            p_values.append(float(p_value))
+            details[str(expert_id)] = {
+                "loss_delta": delta,
+                "ci95_low": low,
+                "ci95_high": high,
+                "p_value_one_sided": float(p_value),
+                "p_value_method": method,
+            }
+        if not expert_ids:
+            continue
+        adjusted, rejected = _benjamini_hochberg_fdr(
+            p_values, alpha=alpha
+        )
+        significant_experts: List[str] = []
+        for index, expert_id in enumerate(expert_ids):
+            details[expert_id]["p_value_bh"] = adjusted[index]
+            details[expert_id]["fdr_significant"] = bool(
+                rejected[index]
+            )
+            if rejected[index]:
+                significant_experts.append(expert_id)
+        per_run.append({
+            "run": str(row.get("run")),
+            "mode": row.get("mode"),
+            "seed": row.get("seed"),
+            "cell": _routing_cell_label(row, group_keys),
+            "n_experts": len(expert_ids),
+            "experts": details,
+            "n_fdr_significant": len(significant_experts),
+            "fdr_significant_experts": significant_experts,
+            "specialization_evidence_raw": drop.get(
+                "specialization_evidence"
+            ),
+        })
 
-    # Apply BH correction across all eligible contrasts
-    all_p_values: List[float] = []
-    for _contrast, pvals in eligible:
-        all_p_values.extend(pvals)
+    cells: Dict[str, Dict[str, object]] = {}
+    for entry in per_run:
+        label = str(entry["cell"])
+        cell = cells.setdefault(label, {
+            "cell": label,
+            "n_runs": 0,
+            "n_experts": int(entry["n_experts"]),
+            "experts": {},
+        })
+        cell["n_runs"] = int(cell["n_runs"]) + 1
+        experts = cell["experts"]
+        for expert_id, detail in entry["experts"].items():
+            row = experts.setdefault(expert_id, {
+                "expert": expert_id,
+                "n_runs": 0,
+                "n_fdr_significant": 0,
+                "loss_deltas": [],
+            })
+            row["n_runs"] = int(row["n_runs"]) + 1
+            if detail.get("fdr_significant"):
+                row["n_fdr_significant"] = (
+                    int(row["n_fdr_significant"]) + 1
+                )
+            delta = detail.get("loss_delta")
+            if _finite_float(delta) is not None:
+                row["loss_deltas"].append(float(delta))
 
-    if not all_p_values:
-        # No routing p-values to correct
-        for contrast in contrasts:
-            contrast["routing_fdr_applied"] = False
-            contrast["routing_fdr_expert_count"] = 0
-            contrast["routing_fdr_threshold"] = 1.0
-        return contrasts
+    cell_summaries: List[Dict[str, object]] = []
+    for label in sorted(cells):
+        cell = cells[label]
+        consensus: List[str] = []
+        expert_rows: List[Dict[str, object]] = []
+        for expert_id in sorted(cell["experts"], key=lambda key: str(key)):
+            row = cell["experts"][expert_id]
+            n_runs = int(row["n_runs"])
+            n_significant = int(row["n_fdr_significant"])
+            deltas = row["loss_deltas"]
+            share = (
+                float(n_significant) / float(n_runs)
+                if n_runs > 0
+                else None
+            )
+            is_consensus = bool(
+                n_runs >= 2 and n_significant * 2 > n_runs
+            )
+            if is_consensus:
+                consensus.append(expert_id)
+            expert_rows.append({
+                "expert": expert_id,
+                "n_runs": n_runs,
+                "n_fdr_significant": n_significant,
+                "fdr_significant_share": share,
+                "mean_loss_delta": (
+                    float(sum(deltas) / len(deltas)) if deltas else None
+                ),
+                "consensus_specialized": is_consensus,
+            })
+        cell_summaries.append({
+            "cell": label,
+            "n_runs": int(cell["n_runs"]),
+            "n_experts": int(cell["n_experts"]),
+            "experts": expert_rows,
+            "n_consensus_specialized_experts": len(consensus),
+            "consensus_specialized_experts": consensus,
+        })
 
-    # Benjamini-Hochberg correction
-    m = len(all_p_values)
-    sorted_indices = np.argsort(all_p_values)
-    sorted_p = np.array([all_p_values[i] for i in sorted_indices])
-    ranks = np.arange(1, m + 1, dtype=float)
-    thresholds = 0.05 * ranks / m
+    return {
+        "schema": "smelt-isr/routing-specialization-fdr/v1",
+        "available": bool(per_run),
+        "alpha": float(alpha),
+        "method": "bh_within_run_then_seed_consensus",
+        "p_value_source": "normal_approx_from_paired_bootstrap_ci",
+        "n_runs": len(per_run),
+        "cells": cell_summaries,
+        "per_run": per_run,
+        "note": (
+            "运行内对 E 个专家做 BH-FDR；实验单元内按种子一致性"
+            "汇总（过半运行通过校正）。p 值由配对 bootstrap 95% "
+            "区间按正态近似换算（单侧），不是原始重采样分布的"
+            "精确 p 值；区间不可用时按 p=1 处理，不当作有证据"
+        ),
+    }
 
-    # Find largest k where p_(k) <= alpha * k / n
-    rejected_sorted = sorted_p <= thresholds
-    k_max = 0
-    for i in range(m):
-        if rejected_sorted[i]:
-            k_max = i + 1
 
-    # Compute adjusted p-values
-    adjusted = np.empty(m)
-    for i in range(m):
-        min_ratio = np.min(all_p_values[sorted_indices[i:]] * m / (np.arange(i, m) + 1))
-        adjusted[sorted_indices[i]] = min(min_ratio, 1.0)
-    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
-    adjusted = np.minimum(adjusted, 1.0)
-
-    # Map adjusted p-values back to contrasts
-    contrast_adjusted: Dict[int, dict] = {}
-    contrast_expert_counts: Dict[int, int] = {}
-
-    pos = 0
-    for contrast, pvals in eligible:
-        contrast_id = id(contrast)
-        n_experts = len(pvals)
-
-        # Get adjusted p-values for this contrast's experts
-        contrast_p_adjusted = []
-        for j, p in enumerate(pvals):
-            # Find position in sorted array
-            p_rank = None
-            for k, sp in enumerate(sorted_p):
-                if abs(sp - p) < 1e-10:
-                    p_rank = k
-                    break
-            if p_rank is not None:
-                # BH adjusted p for this position
-                adj_p = min(1.0, all_p_values[sorted_indices[p_rank]] * m / (p_rank + 1))
-                # Apply accumulation - take min with all subsequent
-                for t in range(p_rank, m):
-                    adj_p = min(adj_p, all_p_values[sorted_indices[t]] * m / (t + 1))
-                contrast_p_adjusted.append(adj_p)
-            else:
-                contrast_p_adjusted.append(1.0)
-
-        # Count FDR-significant experts (adjusted p <= 0.05)
-        significant_count = sum(1 for p in contrast_p_adjusted if p <= 0.05)
-
-        contrast_adjusted[contrast_id] = {
-            "p_values": pvals,
-            "adjusted": contrast_p_adjusted,
-            "significant_count": significant_count,
-            "n_experts": n_experts,
-        }
-        contrast_expert_counts[contrast_id] = significant_count
-
-        # Update the contrast
-        contrast["routing_fdr_applied"] = True
-        contrast["routing_fdr_expert_count"] = significant_count
-        contrast["routing_fdr_threshold"] = 0.05
-        contrast["routing_fdr_significant_experts"] = [
-            p for p in contrast_p_adjusted if p <= 0.05
-        ]
-
-        pos += 1
-
-    # Fill in contrasts that weren't eligible
-    for contrast in contrasts:
-        if not contrast.get("routing_fdr_applied", False):
-            contrast["routing_fdr_applied"] = False
-            contrast["routing_fdr_expert_count"] = 0
-            contrast["routing_fdr_threshold"] = 1.0
-
-    return contrasts
+def _routing_cell_label(
+    row: Dict[str, object],
+    group_keys: Sequence[str],
+) -> str:
+    """按与 ``aggregate_runs`` 相同的口径生成实验单元标签。"""
+    if not group_keys:
+        return "(全部运行)"
+    values = []
+    for key in group_keys:
+        value = _row_factor_value(row, key)
+        values.append(f"{key}={_format_factor_value(value)}")
+    return ", ".join(values)
 
 def _controlled_confound_keys_for_cells(
     cell_a: Dict[str, object],
@@ -1069,7 +1193,9 @@ def factor_contrasts(
     # 家族的显著性判定必须在全部对比都生成后统一校正，
     # 否则先创建的对比不知道家族里还有多少检验。
     _apply_multiple_comparison_correction(contrasts)
-    contrasts = _cross_metric_consistency_analysis(contrasts, metric)
+    contrasts = _cross_metric_consistency_analysis(
+        contrasts, metric, aggregates
+    )
 
     return contrasts
 
