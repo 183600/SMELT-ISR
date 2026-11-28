@@ -131,16 +131,23 @@ _NGRAM_PER_WINDOW_CLASSIFICATION_METRICS = frozenset({
 
 # 因子的自然排序（未循环基线 → 立即合并对照 → 延迟合并），
 # 用于让「基线→改进」的差值符号可解释。
+# 注意：这里是全仓库唯一权威定义（exec 组合后 part_027/part_031
+# 若再定义会在加载期覆盖本字典，导致 base/smelt/dense/ngram 等
+# 模式名退化为按字母序排序，对比方向的「基线→改进」约定失效）。
+# off/on 是均衡强度开关档（balance=0 → off），与模式名排序互不
+# 干扰，并入同一全序避免同名分桶。
 _FACTOR_VALUE_ORDER = {
-    "base": 0,
-    "smelt": 1,
-    "local_base": 2,
-    "local_base_k2": 3,
-    "A": 4,
-    "B": 5,
-    "B_early": 6,
-    "dense": 7,
-    "ngram": 8,
+    "off": 0,
+    "on": 1,
+    "base": 2,
+    "smelt": 3,
+    "local_base": 4,
+    "local_base_k2": 5,
+    "A": 6,
+    "B": 7,
+    "B_early": 8,
+    "dense": 9,
+    "ngram": 10,
 }
 
 

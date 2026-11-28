@@ -174,14 +174,9 @@ def _factor_sort_rank(value):
     return (4, 0.0, repr(value))
 
 
-_FACTOR_VALUE_ORDER = {
-    "off": 0,
-    "on": 1,
-    "local_base": 0,
-    "A": 1,
-    "B": 2,
-}
 
+# _FACTOR_VALUE_ORDER 的权威定义在 part_022_comparison_protocol：
+# 这里不再重复定义（exec 组合后重复定义会覆盖权威版本）。
 
 def _finite_values(values: List[float]) -> Optional[List[float]]:
     """把数值列表统一转成有限 float；任一值不可用则返回 None。"""
