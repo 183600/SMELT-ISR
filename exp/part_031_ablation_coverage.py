@@ -197,7 +197,15 @@ def _mean(values: List[float]) -> Optional[float]:
 
 
 def _sample_std(values: List[float]) -> Optional[float]:
-    """样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时返回 None。"""
+    """
+    样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时
+    返回 None。
+
+    与 part_023_factorial_helpers 的同名实现保持同一算法：正常
+    量级先用原公式；平方溢出/下溢时按最大绝对值缩放、围绕
+    均值计算，避免偏差绕过均值（对首元素求偏差会把 [5,7] 这
+    类数据算成 range 级别）。
+    """
     import math
     numeric = _finite_values(values)
     if numeric is None or len(numeric) < 2:
@@ -210,47 +218,39 @@ def _sample_std(values: List[float]) -> Optional[float]:
         direct = math.sqrt(max(0.0, variance))
     except OverflowError:
         direct = None
+    # direct == 0 只有在观测完全相等时才是真零标准差：极小但
+    # 非零的差值在平方时会下溢为 0，必须同样回退到缩放计算，
+    # 否则 1e-200 量级的种子间波动会被报告成零方差。
     if (
         direct is not None
-        and direct == 0.0
-        and any(v != numeric[0] for v in numeric)
+        and math.isfinite(direct)
+        and (
+            direct > 0.0
+            or all(value == numeric[0] for value in numeric)
+        )
     ):
-        # 在直接计算下溢为 0 时（如极小值的平方），
-        # 且数值非全部相等，使用基于范围的估计
-        # 对于 3 个均匀间距的值，std = range / 2
-        n = len(numeric)
-        if n == 3:
-            return (max(numeric) - min(numeric)) / 2
-        direct = None
-    if direct is not None and math.isfinite(direct):
         return direct
-    # 标准路径：使用缩放避免精度下溢
-    scale_candidates = [
-        max(abs(v - numeric[0]) for v in numeric) if numeric else 1.0,
-        max(abs(v) for v in numeric) if numeric else 1.0,
-        (max(numeric) - min(numeric)) / 2 if numeric else 1.0,
-    ]
-    for scale in scale_candidates:
-        if not math.isfinite(scale) or scale == 0.0:
-            continue
-        try:
-            total = math.fsum(((v - numeric[0]) / scale) ** 2 for v in numeric)
-            if not math.isfinite(total):
-                continue
-            variance_scaled = total / (len(numeric) - 1)
-            if not math.isfinite(variance_scaled):
-                continue
-            result = math.sqrt(max(0.0, variance_scaled)) * scale
-            if math.isfinite(result):
-                return result
-        except (OverflowError, ValueError):
-            continue
+
+    scale = max(abs(value) for value in numeric)
+    if scale == 0.0:
+        return 0.0
+    normalized = [value / scale for value in numeric]
+    mean = (math.fsum(normalized) / max(len(normalized), 1)) if normalized else float("nan")
+    variance = math.fsum(
+        (value - mean) ** 2 for value in normalized
+    ) / (len(normalized) - 1)
+    if not math.isfinite(variance) or variance < 0.0:
+        return None
+    result = math.sqrt(max(0.0, variance)) * scale
+    if math.isfinite(result):
+        return result
     # 所有缩放方案都失败，回退到一个保守的估计
-    # 对于两个值，std = |a-b|/sqrt(2) 是不可能的（ddof=1时std=|a-b|/sqrt(2)）
-    # 对于一般情况，返回范围的半部作为保守估计
     n = len(numeric)
     if n >= 2:
-        return (max(numeric) - min(numeric)) / (2.0 * math.sqrt(max(n - 1, 1)))
+        conservative = (max(numeric) - min(numeric)) / (2.0 * math.sqrt(max(n - 1, 1)))
+        if math.isfinite(conservative):
+            return conservative
+        return None
     return None
 
 

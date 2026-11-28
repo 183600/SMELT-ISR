@@ -207,7 +207,11 @@ def _mean(values: List[float]) -> Optional[float]:
 
 
 def _sample_std(values: List[float]) -> Optional[float]:
-    """样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时返回 None。"""
+    """
+    样本标准差（ddof=1）；少于 2 个观测或结果超出 float 范围时
+    返回 None。与 part_023_factorial_helpers / part_031 的权威
+    实现保持同一算法（缩放时围绕均值，而不是对首元素求偏差）。
+    """
     import math
     numeric = _finite_values(values)
     if numeric is None or len(numeric) < 2:
@@ -222,18 +226,24 @@ def _sample_std(values: List[float]) -> Optional[float]:
         direct = None
     if (
         direct is not None
-        and direct == 0.0
-        and any(v != numeric[0] for v in numeric)
+        and math.isfinite(direct)
+        and (
+            direct > 0.0
+            or all(value == numeric[0] for value in numeric)
+        )
     ):
-        direct = None
-    if direct is not None and math.isfinite(direct):
         return direct
-    scale = max(abs(v - numeric[0]) for v in numeric) if numeric else 1.0
+    scale = max(abs(value) for value in numeric)
     if scale == 0.0:
         return 0.0
-    total = math.fsum(((v - numeric[0]) / scale) ** 2 for v in numeric)
-    variance_scaled = total / (len(numeric) - 1)
-    result = math.sqrt(max(0.0, variance_scaled)) * scale
+    normalized = [value / scale for value in numeric]
+    mean = (math.fsum(normalized) / max(len(normalized), 1)) if normalized else float("nan")
+    variance = math.fsum(
+        (value - mean) ** 2 for value in normalized
+    ) / (len(normalized) - 1)
+    if not math.isfinite(variance) or variance < 0.0:
+        return None
+    result = math.sqrt(max(0.0, variance)) * scale
     return result if math.isfinite(result) else None
 
 
