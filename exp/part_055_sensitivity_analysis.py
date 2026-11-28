@@ -117,7 +117,7 @@ def run_sensitivity_analysis(
                 perturbed_config = dict(base_config)
                 perturbed_config[hp] = perturbed_val
 
-                cmd = build_experiment_command(perturbed_config, seed, str(run_dir))
+                cmd = _build_sensitivity_command(perturbed_config, seed, str(run_dir))
                 result = subprocess.run(cmd, capture_output=True, text=True)
 
                 if result.returncode == 0:
@@ -225,7 +225,7 @@ def run_sensitivity_analysis(
     return report
 
 
-def build_experiment_command(
+def _build_sensitivity_command(
     config: Dict[str, Any],
     seed: int,
     out_dir: str,
@@ -298,7 +298,7 @@ def run_grid_sensitivity(
             run_dir = Path(base_config["out"]) / f"grid_{'_'.join(f'{n}{v}' for n,v in zip(param_names, combo))}_seed{seed}"
             run_dir.mkdir(parents=True, exist_ok=True)
 
-            cmd = build_experiment_command(config, seed, str(run_dir))
+            cmd = _build_sensitivity_command(config, seed, str(run_dir))
             result = subprocess.run(cmd, capture_output=True, text=True)
 
             if result.returncode == 0:
